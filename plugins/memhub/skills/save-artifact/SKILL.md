@@ -32,6 +32,22 @@ Do exactly this:
    Optional flags when relevant: `--agent-brain-id <id>` to save into an agent
    brain, `--parent-id <id>` to version an existing artifact, `--rationale "..."`
    to note why this version supersedes the last, `--tags a,b`.
+
+   If (and only if) the user explicitly asks for client-side encryption, add
+   `--encrypt`, include the XTrace SDK dependency, and require that they have
+   set `$MEMHUB_ENCRYPTION_PASSPHRASE` locally:
+
+   ```bash
+   uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+     python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+     --file "<path>" --name "<name>" --type "<type>" --encrypt
+   ```
+
+   This encrypts the artifact body only. Name/type/tags remain plaintext, and
+   the server cannot semantically search or extract the opaque body. The same
+   passphrase is required to load it by id with
+   `scripts/load_encrypted_artifact.py`; there is no key exchange or recovery
+   yet. Never put the passphrase itself in the command or tool arguments.
 4. Report the returned `{id, action}` to the user. On first ever run the script may
    open the browser once for OAuth approval (same flow as /mcp; token cached
    after that) — that is expected, not an error.

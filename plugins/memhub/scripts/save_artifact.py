@@ -15,6 +15,12 @@ Run (mcp SDK pulled ephemerally by uv):
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
         [--tags a,b]
 
+    # Opt-in client-side encryption (after securely exporting
+    # MEMHUB_ENCRYPTION_PASSPHRASE; crypto comes from xtrace-ai-sdk):
+    uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+      python scripts/save_artifact.py --file private.md \
+        --name "Private notes" --encrypt
+
     # or pipe terminal output straight in:
     pytest -q | uv run --with mcp python scripts/save_artifact.py \
         --stdin --name "test run 2026-06-09" --type runbook
@@ -36,6 +42,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_crypto import EncryptionConfigurationError  # noqa: E402
 
 
 def unwrap(result) -> dict:
@@ -51,6 +58,24 @@ def unwrap(result) -> dict:
     return {"_raw": str(result)}
 
 
+def _prepare_content(
+    content: str, raw_tags: str | None, encrypt: bool,
+) -> tuple[str, list[str]]:
+    """Return the exact artifact body/tags that will enter the MCP request."""
+    tags = [t.strip() for t in (raw_tags or "").split(",") if t.strip()]
+    if not encrypt:
+        return content, tags
+
+    # Lazy import keeps the existing plaintext path dependency-compatible:
+    # callers only need xtrace-ai-sdk when they explicitly request crypto.
+    from _memhub_crypto import ENCRYPTED_ARTIFACT_TAG, XTraceTextCipher
+
+    stored_content = XTraceTextCipher.from_env().encrypt(content)
+    if ENCRYPTED_ARTIFACT_TAG not in tags:
+        tags.append(ENCRYPTED_ARTIFACT_TAG)
+    return stored_content, tags
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Store a file/stdin as a MemHub artifact.")
     src = ap.add_mutually_exclusive_group(required=True)
@@ -62,6 +87,11 @@ async def main() -> int:
     ap.add_argument("--parent-id", default=None, help="version an existing artifact by id")
     ap.add_argument("--rationale", default=None, help="why this version supersedes the last")
     ap.add_argument("--tags", default=None, help="comma-separated tags")
+    ap.add_argument(
+        "--encrypt", action="store_true",
+        help="AES-encrypt content locally with xtrace-ai-sdk before upload; "
+             "requires $MEMHUB_ENCRYPTION_PASSPHRASE",
+    )
     ap.add_argument("--url", default=None)
     args = ap.parse_args()
 
@@ -73,20 +103,32 @@ async def main() -> int:
         print("ERROR: artifact body is empty", file=sys.stderr)
         return 2
 
-    call_args: dict = {"name": args.name, "content": content, "artifact_type": args.type}
+    try:
+        stored_content, tags = _prepare_content(content, args.tags, args.encrypt)
+    except EncryptionConfigurationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    call_args: dict = {
+        "name": args.name,
+        "content": stored_content,
+        "artifact_type": args.type,
+    }
     if args.agent_brain_id:
         call_args["agent_brain_id"] = args.agent_brain_id
     if args.parent_id:
         call_args["parent_id"] = args.parent_id
     if args.rationale:
         call_args["rationale"] = args.rationale
-    if args.tags:
-        call_args["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    if tags:
+        call_args["tags"] = tags
 
     url, headers, auth = resolve_url_and_auth(args.url)
     src_desc = "stdin" if args.stdin else str(args.file)
-    print(f"source   : {src_desc}  ({len(content):,} chars)")
+    print(f"source   : {src_desc}  ({len(content):,} plaintext chars)")
     print(f"name     : {args.name}   type={args.type}")
+    if args.encrypt:
+        print(f"encrypted: yes ({len(stored_content):,} chars sent; plaintext stays local)")
     print(f"endpoint : {url}")
     print("-" * 56)
 
@@ -95,6 +137,10 @@ async def main() -> int:
             await session.initialize()
             res = await session.call_tool("save_artifact", arguments=call_args)
             out = unwrap(res)
+    if getattr(res, "isError", False):
+        detail = out.get("_raw") or out.get("error") or json.dumps(out)
+        print(f"ERROR: save_artifact failed: {detail}", file=sys.stderr)
+        return 1
     print(json.dumps(out, indent=2))
     return 0
 

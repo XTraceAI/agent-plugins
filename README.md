@@ -113,6 +113,64 @@ memhub terminal script interactively — e.g. `/memhub:import-session` — or by
 setting `$MEMHUB_TOKEN`. Until then the hook degrades silently (the
 SessionEnd agent hook still captures everything at close).
 
+## Client-side encrypted text (proof of concept)
+
+Artifact content can be encrypted locally before upload and decrypted locally
+after retrieval. This path is deliberately opt-in while MemHub has no client /
+server key exchange and the backend's extraction pipeline still expects
+plaintext session records.
+
+The cryptography comes entirely from the official `xtrace-ai-sdk==0.1.1`
+package (imported as `xtrace_sdk`): its `PassphraseKeyProvider` derives the key
+and its `AESClient` performs authenticated AES-256-GCM encryption/decryption.
+The plugin adds only a version marker around the SDK's ciphertext so a loader
+can recognize it.
+
+Set a passphrase without putting it in the command line, then upload:
+
+```bash
+read -rsp "MemHub encryption passphrase: " MEMHUB_ENCRYPTION_PASSPHRASE
+export MEMHUB_ENCRYPTION_PASSPHRASE
+
+uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+  python plugins/memhub/scripts/save_artifact.py \
+  --file private-notes.md --name "Private notes" --type document --encrypt
+```
+
+The upload prints the artifact id. Fetch that artifact by id and decrypt its
+body locally with the same passphrase:
+
+```bash
+uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+  python plugins/memhub/scripts/load_encrypted_artifact.py \
+  --artifact-id "<artifact-id>"
+
+# Or keep plaintext out of terminal output:
+uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+  python plugins/memhub/scripts/load_encrypted_artifact.py \
+  --artifact-id "<artifact-id>" --output restored-private-notes.md
+```
+
+Current limitations are intentional:
+
+- There is no key exchange or recovery. The passphrase stays local and must be
+  supplied out of band on every machine that decrypts; losing it loses access
+  to the content.
+- Only the artifact body is encrypted. Its name, type, tags, id, and other MCP
+  metadata remain plaintext.
+- The server receives opaque ciphertext, so it cannot extract, summarize, or
+  semantically search this artifact. Load it directly by id.
+- Session imports, automatic flushes, directives, and ordinary MCP tool calls
+  retain their current plaintext behavior. Encrypting transcripts now would
+  break server-side agentic extraction.
+
+Run the offline SDK-backed tests with:
+
+```bash
+uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+  python plugins/memhub/scripts/test_encrypted_artifacts.py
+```
+
 ## Skills (v0.6)
 
 Five skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
