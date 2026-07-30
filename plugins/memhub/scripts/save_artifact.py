@@ -38,7 +38,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from room_map import env_for_url, read_room  # noqa: E402
+from room_map import env_for_url, read_room, repo_root  # noqa: E402
 
 
 def unwrap(result) -> dict:
@@ -107,10 +107,16 @@ async def main() -> int:
     # override.
     room = None
     if not args.agent_brain_id and not args.no_room:
-        if not args.stdin:
-            room = read_room(args.file.resolve().parent, env_for_url(url))
-        if room is None:
-            room = read_room(None, env_for_url(url))
+        env = env_for_url(url)
+        file_dir = None if args.stdin else args.file.resolve().parent
+        if file_dir is not None and repo_root(file_dir) is not None:
+            # The file lives in a repo — that repo is authoritative, and if it
+            # has no cached room the artifact stays personal. Falling back to
+            # the caller here would file repo Y's doc into repo X's room, since
+            # "no room cached" and "not in a repo" are both None from read_room.
+            room = read_room(file_dir, env)
+        else:
+            room = read_room(None, env)
         if room:
             call_args["agent_brain_id"] = room["brain_id"]
 
