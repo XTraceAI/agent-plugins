@@ -263,7 +263,12 @@ async def main() -> int:
     # from a different directory than the session it is importing.
     room = None
     if not args.agent_brain_id and not args.no_room:
-        room = read_room(_cwd_from_records(records), env_for_url(url))
+        # Only when the transcript says where it ran. read_room(None) would fall
+        # back to THIS process's cwd — and this script is routinely run from a
+        # different repo than the session it imports, so that would file the
+        # session under an unrelated room. Unknown origin → stays personal.
+        rec_cwd = _cwd_from_records(records)
+        room = read_room(rec_cwd, env_for_url(url)) if rec_cwd else None
         if room:
             args.agent_brain_id = room["brain_id"]
 

@@ -102,7 +102,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # hold different brain ids for the same repo. No cache (or no repo) → the
     # import stays personal, exactly as it behaved before, rather than guessing
     # a brain. `/memhub:onboard` and `/memhub:spec init` populate the cache.
-    room = read_room(cwd, env_for_url(url))
+    #
+    # Only when the TRANSCRIPT told us where it ran. read_room(None) would fall
+    # back to this process's cwd, and a hook can fire from a different repo than
+    # the session's — routing the session into a room it has nothing to do with.
+    # Unknown origin must degrade to personal, never to a guess.
+    room = read_room(cwd, env_for_url(url)) if cwd else None
 
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as session:

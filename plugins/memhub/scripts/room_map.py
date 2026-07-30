@@ -178,7 +178,14 @@ def _load() -> dict:
 
 
 def read_room(cwd: str | Path | None = None, env: str | None = None) -> dict | None:
-    """The cached room for this repo+backend, or None. Never raises."""
+    """The cached room for this repo+backend, or None. Never raises.
+
+    ``cwd=None`` means "the calling process's directory". Only pass None when
+    that is genuinely the repo you mean (e.g. reading a body from stdin). A
+    caller that knows the content's true origin — a transcript's ``cwd``, a
+    file's directory — must skip the lookup when that origin is unknown rather
+    than passing None, or an unrelated repo's room gets used.
+    """
     key = room_name(cwd)
     if key is None:
         return None

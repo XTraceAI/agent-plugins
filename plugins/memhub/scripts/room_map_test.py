@@ -84,6 +84,13 @@ def test_room_name_from_remote() -> None:
         # Case is the tiebreaker between two distinct brains — never lowercase.
         _git(repo, "remote", "set-url", "origin", "git@github.com:XTraceAI/xmem.git")
         check("case preserved", rm.room_name(repo), "Repo: XTraceAI/xmem")
+        # A port must not be mistaken for the scp `host:path` separator.
+        _git(repo, "remote", "set-url", "origin", "ssh://git@host:22/org/name.git")
+        check("ssh port kept out of the name", rm.room_name(repo), "Repo: org/name")
+        # Org-less scp remote (self-hosted). One segment is CORRECT here: the
+        # remote is still stable per clone, where the no-remote fallback isn't.
+        _git(repo, "remote", "set-url", "origin", "git@host:name.git")
+        check("org-less remote -> one segment", rm.room_name(repo), "Repo: name")
 
     with tempfile.TemporaryDirectory() as td:
         repo = _repo(Path(td), None)

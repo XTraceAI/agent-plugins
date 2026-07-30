@@ -39,6 +39,15 @@ Normalization, in order:
 
 Result: `Repo: XTraceAI/xmem`.
 
+**A remote with no org** (`git@host:name.git`, common on self-hosted servers)
+yields a one-segment `Repo: name`. Keep it — the remote is still stable across
+clones and worktrees, which is the property the key needs. Do NOT substitute
+the no-remote fallback below: that keys on a local directory basename, which
+differs between clones and would split the room. Note the resulting name is
+shaped like the no-remote form, so a no-remote repo whose directory happens to
+share that basename lands in the same room; prefer `room_map.py name` over
+deriving by hand so every caller at least agrees.
+
 ## 2. Edge cases
 
 **Worktrees and subdirectories.** All worktrees of a repo, and any

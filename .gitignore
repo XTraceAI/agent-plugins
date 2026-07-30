@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
-.claude/worktrees/
-.claude/scheduled_tasks.lock
+# Local + account state (brain ids, worktrees, locks). This repo is
+# public — nothing under .claude/ belongs in it.
+.claude/
