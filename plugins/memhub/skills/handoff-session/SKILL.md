@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants to hand off the current session/work to a teammate via MemHub (e.g. "hand this off to Alice", "handoff this session to Bob", "share my context with Carol so she can pick this up", "pass this work to X"). Creates a shareable agent brain holding a handoff brief plus the full session's extracted memory, and shares it read-only with the teammate.
 argument-hint: <teammate> [title...]
-allowed-tools: mcp__memhub__list_teammates, mcp__memhub__create_agent_brain, mcp__memhub__save_artifact, mcp__memhub__share_agent_brain, Bash
+allowed-tools: mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, Bash
 ---
 
 Hand the current session off to a teammate: bundle a concise handoff brief and

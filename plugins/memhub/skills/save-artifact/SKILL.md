@@ -16,6 +16,14 @@ Arguments: `$ARGUMENTS`
 - Remaining text = the artifact name (optional; if omitted, use the file's base
   name as a readable title).
 
+**One canonical artifact per topic.** When a conclusion changes, VERSION that
+artifact (same `--name`, or `--parent-id` its latest version) — never publish a
+parallel one. Retrieval is semantic, so an un-retracted stale claim can outrank
+its own correction and mislead the next agent. Before uploading something that
+restates or corrects existing knowledge, `search_memory` for the artifact it
+supersedes and pass `--parent-id`; if a prior conclusion is now wrong, say so
+explicitly in the new version rather than leaving both to compete.
+
 Do exactly this:
 
 1. Resolve the file path (`$1`) and a name. If no name was given, derive a short

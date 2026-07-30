@@ -22,7 +22,8 @@ refreshed automatically. interactive=False — a background hook must never
 pop a browser, so with no cached token it degrades quietly (run any memhub
 terminal script once, e.g. /memhub:import-session, to seed the cache).
 Endpoint: $MEMHUB_MCP_BASE_URL(+_SERVER_PATH) > the plugin's .mcp.json
-mcpServers.*.url > staging default.
+mcpServers.*.url > a default derived from the plugin install path (prod for
+`memhub`, staging for `memhub-staging`).
 """
 from __future__ import annotations
 

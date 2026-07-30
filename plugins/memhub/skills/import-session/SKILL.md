@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks to import, upload, or save a Claude Code session/conversation/transcript into MemHub or team memory (e.g. "import this session into memhub", "save session <id> to memhub", "put that conversation in an agent brain"). Ships the transcript via a terminal upload script — any size, no token-by-token re-emit.
 argument-hint: <session-id-or-path> [title...]
-allowed-tools: Bash
+allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains
 ---
 
 Import a past Claude Code session into MemHub team memory on demand. A helper
@@ -23,16 +23,28 @@ Arguments: `$ARGUMENTS`
 
 Do exactly this:
 
-1. Run the import via Bash — one command, substitute the real values:
+1. **Resolve the destination — default to the repo's room.** A session about a
+   repo belongs in that repo's brain, where teammates and future sessions can
+   find it; raw workspace memory is the fallback, not the default.
+   - Derive `Repo: <org>/<name>` from `git remote get-url origin` (host and
+     `.git` stripped), then `list_agent_brains` → **exact-name match**. Found →
+     use its `agent_brain_id`.
+   - **No match, or not in a git repo → do NOT create a brain.** Import into
+     workspace memory (omit `--agent-brain-id`) and say so, mentioning that
+     `/memhub:onboard` sets up the repo's room if they want one.
+   - The user naming a brain explicitly always wins over both.
+   - Edge cases (SSH remotes, no remote, worktrees) are in
+     `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
+
+2. Run the import via Bash — one command, substitute the real values:
 
    ```bash
    uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
      --session "<session-id-or-path>" [--title "<title>"] \
      [--agent-brain-id "<id>"]
 
-   Pass `--agent-brain-id` when the user wants the session's memories in an
-   isolated, shareable agent brain instead of raw workspace memory (find or
-   create one via the memhub MCP's `list_agent_brains` / `create_agent_brain`).
+   Pass `--agent-brain-id` with the id resolved in step 1. Omit it only for
+   the workspace-memory fallback.
    NOTE: re-imports dedup per conversation_id GLOBALLY — to re-extract an
    already-imported session into an agent brain, pass a fresh
    `--conversation-id`.
@@ -44,15 +56,18 @@ Do exactly this:
    just let the command run.
    ```
 
-2. Report back the returned `conversation_id`, `path` (should be `"agentic"`
+3. Report back the returned `conversation_id`, `path` (should be `"agentic"`
    for Claude Code sessions), `messages_received`, and scope. Tell the user:
+   - **where it landed, by name** — "imported into `Repo: <org>/<name>`" or
+     "imported into your workspace memory" — so a wrong destination is
+     obvious now rather than weeks from now;
    - extraction runs in the background (allow several minutes for large
      sessions) — facts, episodes, artifacts, and the session **gist** land in
      `search_memory` as it completes;
    - re-importing the same session later is **incremental** (only new records
      are processed; the gist folds forward — nothing duplicates).
 
-3. If the script prints an auth error, no setup is needed — the script runs the same
+4. If the script prints an auth error, no setup is needed — the script runs the same
    OAuth flow as /mcp and will open the browser ONCE for approval (token is
    cached after that). If it can't find the session id, ask the user for the
    transcript path.

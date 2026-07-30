@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks what the team knows, decided, discussed, or saved about a topic, or wants to check MemHub/team memory (e.g. "what do we know about X", "did we decide on Y", "search memhub for Z", "is there a spec for W"). Read-only — searches facts, episodes, artifacts, and documents.
 argument-hint: <what to look for>
-allowed-tools: mcp__memhub__search_memory, mcp__memhub__list_agent_brains, mcp__memhub__list_tags
+allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags
 ---
 
 Search MemHub team memory and report what it holds about the user's topic.

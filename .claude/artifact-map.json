@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "links": [
+    {
+      "glob": "plugins/memhub/scripts/artifact_{sync_reminder,map}.py|plugins/memhub/hooks/hooks.json|plugins/memhub/skills/spec/SKILL.md",
+      "brain_id": "8801666d-c575-4b49-b97c-3a4013dd4723",
+      "artifact_id": "7aa3d2c9-5158-5fda-99eb-9f889386f5e4",
+      "artifact_name": "Spec: Artifact-Sync Reminder Hook (code → artifact)"
+    }
+  ]
+}

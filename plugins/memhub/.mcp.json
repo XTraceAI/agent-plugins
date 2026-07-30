@@ -6,7 +6,7 @@
       "oauth": {
         "clientId": "xHoQkYd7uNUfaNX6Tyv143e1Ev7u3XS0",
         "callbackPort": 8765,
-        "authServerMetadataUrl": "https://memhub.us.auth0.com/.well-known/openid-configuration"
+        "authServerMetadataUrl": "https://memhub-prod.us.auth0.com/.well-known/openid-configuration"
       }
     }
   }

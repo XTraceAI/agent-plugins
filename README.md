@@ -205,6 +205,48 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   Sharing is read-only, so the room's creator owns revisions; teammates
   propose spec changes through the normal repo/PR flow.
 
+## Artifact-sync reminder (v0.11)
+
+Agents keep memory current by **appending** new artifacts as conclusions
+evolve, instead of **versioning** the canonical one. Retrieval is semantic, so
+the co-existing versions compete — and a stale claim can rank ABOVE its own
+correction. Measured 2026-07-20: an over-read "AppWorld ON tripled partial
+progress" artifact scored 0.596 for the query "does memory help?" while its
+correction ("within the noise floor") scored 0.466, so a fresh agent read the
+wrong conclusion first.
+
+`save_artifact` already supports supersession (reuse the `name`, or pass
+`parent_id`). What was missing is a prompt to use it at the moment the code
+moves. A `PostToolUse` hook on `Edit|MultiEdit|Write|NotebookEdit` matches the
+edited file against the repo's **artifact map** and, on a hit, injects the
+exact `save_artifact(...)` call that versions the linked artifact — debounced
+to once per artifact per session.
+
+The map is repo-local, at `.claude/artifact-map.json`, so links version with
+the code:
+
+```json
+{"version": 1, "links": [
+  {"glob": "app/retry.py|app/**/backoff.py",
+   "brain_id": "<agent-brain-id>",
+   "artifact_id": "<root-version-id>",
+   "artifact_name": "Spec: Retry policy"}]}
+```
+
+Globs are repo-relative POSIX with `*` (stops at `/`), `**`, `{a,b}` braces,
+and `|` alternatives. `/memhub:spec` writes and refreshes these links at
+`init`/`revise` time via `scripts/artifact_map.py`, so **which files a spec
+governs** is a byproduct of spec-driven development rather than a separate
+chore — and `/memhub:spec check` uses the same links in reverse, reporting
+mapped files that changed since the spec's last revision. To inspect or hand-
+manage links: `python3 scripts/artifact_map.py list [--for <path>]`.
+
+Hooks cannot call MCP tools, so this only **reminds** — the agent performs the
+`save_artifact` itself. That is deliberate for a memory product: the version
+bump stays visible and auditable instead of team memory being silently
+rewritten on every keystroke. Missing or malformed map, no git root, unwritable
+state → exit 0, no output; a reminder never blocks an edit.
+
 ## Fleet plugin (v0.1)
 
 `plugins/fleet/` is a separate, local-only plugin for running **many Claude

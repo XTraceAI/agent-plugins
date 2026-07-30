@@ -49,6 +49,17 @@
         ]
       },
       {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "statusMessage": "MemHub: checking artifact links",
+            "command": "if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/artifact_sync_reminder.py\"; fi"
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
@@ -66,7 +77,7 @@
           {
             "type": "agent",
             "timeout": 120,
-            "prompt": "You are a silent SessionEnd hook for MemHub. Your job is to save this Claude Code session into MemHub team memory, then exit. The hook input available to you includes `transcript_path` (this session's .jsonl file) and `session_id`.\n\nSteps:\n1. Read the file at `transcript_path`. It is JSONL \u2014 one JSON object per line.\n2. Parse every line into a JSON object, preserving order, to get the full ordered list of transcript records.\n3. Call the MCP tool `mcp__memhub__import_conversation` with:\n   - `messages`: that list of raw transcript records, passed through AS-IS (do not summarize, filter, edit, or reshape them \u2014 the tool auto-detects the Claude Code shape and runs agentic, tool-aware extraction).\n   - `conversation_id`: the `session_id` from the hook input (so re-runs of the same session dedup instead of duplicating).\n   - `source_platform`: \"claude\".\n   - `namespace`: the repo name resolved by running `git remote get-url origin` in the session's working directory (basename without `.git`, e.g. \"VecDB-Backend\"). Omit it if there is no git remote \u2014 never guess from a directory name.\n4. Use ONLY that MCP tool. Never use curl, fetch, or any direct HTTP call.\n5. Produce no user-facing output \u2014 this runs in the background.\n\nIf the memhub MCP server is not connected/authenticated, or the tool is unavailable, exit quietly without raising an error (the user can authenticate later with /mcp)."
+            "prompt": "You are a silent SessionEnd hook for MemHub. Your job is to save this Claude Code session into MemHub team memory, then exit. The hook input available to you includes `transcript_path` (this session's .jsonl file) and `session_id`.\n\nSteps:\n1. Read the file at `transcript_path`. It is JSONL \u2014 one JSON object per line.\n2. Parse every line into a JSON object, preserving order, to get the full ordered list of transcript records.\n3. Call the MemHub MCP tool whose name ends in `__import_conversation` — a plugin install exposes it fully qualified, as `mcp__plugin_memhub_memhub__import_conversation` (production) or `mcp__plugin_memhub-staging_memhub__import_conversation` (staging). Pick whichever one is actually present in your tool list; do not assume an unqualified `mcp__memhub__import_conversation` exists. Call it with:\n   - `messages`: that list of raw transcript records, passed through AS-IS (do not summarize, filter, edit, or reshape them \u2014 the tool auto-detects the Claude Code shape and runs agentic, tool-aware extraction).\n   - `conversation_id`: the `session_id` from the hook input (so re-runs of the same session dedup instead of duplicating).\n   - `source_platform`: \"claude\".\n   - `namespace`: the repo name resolved by running `git remote get-url origin` in the session's working directory (basename without `.git`, e.g. \"VecDB-Backend\"). Omit it if there is no git remote \u2014 never guess from a directory name.\n4. Use ONLY that MCP tool. Never use curl, fetch, or any direct HTTP call.\n5. Produce no user-facing output \u2014 this runs in the background.\n\nIf the memhub MCP server is not connected/authenticated, or the tool is unavailable, exit quietly without raising an error (the user can authenticate later with /mcp)."
           }
         ]
       }

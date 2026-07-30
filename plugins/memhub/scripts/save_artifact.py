@@ -27,7 +27,9 @@ Run (mcp SDK pulled ephemerally by uv):
 
 Endpoint resolution (so the script hits the SAME server the plugin connector
 uses, by construction): --url > $MEMHUB_MCP_BASE_URL(+$MEMHUB_MCP_SERVER_PATH) >
-the plugin's .mcp.json `mcpServers.*.url` > staging default.
+the plugin's .mcp.json `mcpServers.*.url` > a default derived from the plugin
+install path (prod for `memhub`, staging for `memhub-staging`). There is no
+fixed fallback env — see `_memhub_auth.default_url`.
 """
 from __future__ import annotations
 
