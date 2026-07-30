@@ -16,10 +16,14 @@ already resolved.
    `gh pr view --json number,url,state,headRefName` on the current branch.
    PR merged or closed → report that and END the loop (no further passes).
 2. **Resolve the repo's room** (first pass only — reuse the id afterwards).
-   Name `Repo: <org>/<name>` from `git remote get-url origin` (host and
-   `.git` stripped). Match it EXACTLY in `list_agent_brains` — a teammate may
-   have created it; use theirs. No match → `create_agent_brain` (omit
-   `workspace_id`). Edge cases (SSH remotes, no remote, worktrees, not a git
+   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show` prints it when the
+   repo is already cached — take that id and skip the lookup. Otherwise: name
+   `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
+   stripped), match it EXACTLY in `list_agent_brains` — a teammate may have
+   created it; use theirs. No match → `create_agent_brain` (omit
+   `workspace_id`). Either way, persist what you resolved with `room_map.py set
+   --brain-id <id>` so later passes and the capture hooks route without
+   repeating this. Edge cases (SSH remotes, no remote, worktrees, not a git
    repo) and the create-time rules — resolve before create, required
    description, report where it landed — are in
    `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.

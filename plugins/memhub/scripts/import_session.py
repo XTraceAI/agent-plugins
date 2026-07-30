@@ -39,6 +39,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from room_map import env_for_url, read_room  # noqa: E402
 
 
 def load_transcript(path: Path) -> tuple[list[dict], int]:
@@ -173,15 +174,20 @@ def call_error(result, payload: dict) -> str | None:
     return None
 
 
+def _cwd_from_records(records: list[dict]) -> str | None:
+    """The directory the session ran in, per the transcript's own records."""
+    return next((r.get("cwd") for r in records
+                 if isinstance(r, dict) and isinstance(r.get("cwd"), str)
+                 and r.get("cwd")), None)
+
+
 def _namespace_from_records(records: list[dict]) -> str | None:
     """The session's working context: git remote basename resolved from the
     transcript's ``cwd`` (client-side — the server never derives this, since a
     worktree dir basename would stamp a scope that HIDES directives from the
     canonical repo's scoped recalls). None when it can't be resolved
     confidently — unscoped stores serve everywhere, a wrong scope doesn't."""
-    cwd = next((r.get("cwd") for r in records
-                if isinstance(r, dict) and isinstance(r.get("cwd"), str)
-                and r.get("cwd")), None)
+    cwd = _cwd_from_records(records)
     if not cwd:
         return None
     try:
@@ -206,7 +212,12 @@ async def main() -> int:
     ap.add_argument("--title", default=None)
     ap.add_argument("--agent-brain-id", default=None,
                     help="route the extracted facts/episodes into an agent brain "
-                         "(isolated, shareable) instead of raw workspace memory")
+                         "(isolated, shareable) instead of raw workspace memory. "
+                         "Default: the repo's cached room "
+                         "(.claude/memhub-room.json), if any")
+    ap.add_argument("--no-room", action="store_true",
+                    help="ignore the repo's cached room and import into personal "
+                         "memory")
     ap.add_argument("--namespace", default=None,
                     help="Working-context name for captured directives (the "
                          "repo). Default: resolved from the transcript's cwd "
@@ -245,6 +256,17 @@ async def main() -> int:
                  else _namespace_from_records(records)) or None
     url, headers, auth = resolve_url_and_auth(args.url)
 
+    # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
+    # cached room so a plain `--session X` import lands in team memory instead of
+    # personal memory. Keyed by the resolved endpoint's backend, and derived from
+    # the TRANSCRIPT's cwd rather than the caller's — the script is often run
+    # from a different directory than the session it is importing.
+    room = None
+    if not args.agent_brain_id and not args.no_room:
+        room = read_room(_cwd_from_records(records), env_for_url(url))
+        if room:
+            args.agent_brain_id = room["brain_id"]
+
     slices = _slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
     print(f"session file    : {f}")
@@ -252,7 +274,8 @@ async def main() -> int:
     print(f"conversation_id : {conv_id}")
     print(f"endpoint        : {url}")
     if args.agent_brain_id:
-        print(f"agent brain     : {args.agent_brain_id}")
+        src = f' (repo room "{room.get("name", "?")}")' if room else ""
+        print(f"agent brain     : {args.agent_brain_id}{src}")
     if namespace:
         print(f"namespace       : {namespace}")
     print("-" * 56)

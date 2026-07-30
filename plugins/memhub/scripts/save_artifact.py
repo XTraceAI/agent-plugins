@@ -38,6 +38,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from room_map import env_for_url, read_room  # noqa: E402
 
 
 def unwrap(result) -> dict:
@@ -60,7 +61,12 @@ async def main() -> int:
     src.add_argument("--stdin", action="store_true", help="read body from stdin")
     ap.add_argument("--name", required=True, help="artifact title (re-using a name versions it)")
     ap.add_argument("--type", default="document", help="artifact_type (spec/design_doc/runbook/...)")
-    ap.add_argument("--agent-brain-id", default=None)
+    ap.add_argument("--agent-brain-id", default=None,
+                    help="agent brain to save into. Default: the repo's cached "
+                         "room (.claude/memhub-room.json), if any")
+    ap.add_argument("--no-room", action="store_true",
+                    help="ignore the repo's cached room and save into personal "
+                         "workspace memory")
     ap.add_argument("--parent-id", default=None, help="version an existing artifact by id")
     ap.add_argument("--rationale", default=None, help="why this version supersedes the last")
     ap.add_argument("--tags", default=None, help="comma-separated tags")
@@ -86,9 +92,24 @@ async def main() -> int:
         call_args["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
 
     url, headers, auth = resolve_url_and_auth(args.url)
+
+    # An explicit --agent-brain-id wins; otherwise route to the repo's cached
+    # room so a spec saved from a repo lands where teammates search. Resolved
+    # from the FILE's directory, not the caller's cwd — the artifact belongs to
+    # the repo it lives in, which isn't always the one the script runs from.
+    room = None
+    if not args.agent_brain_id and not args.no_room:
+        room = read_room(None if args.stdin else args.file.resolve().parent,
+                         env_for_url(url))
+        if room:
+            call_args["agent_brain_id"] = room["brain_id"]
+
     src_desc = "stdin" if args.stdin else str(args.file)
     print(f"source   : {src_desc}  ({len(content):,} chars)")
     print(f"name     : {args.name}   type={args.type}")
+    if call_args.get("agent_brain_id"):
+        origin = f' (repo room "{room.get("name", "?")}")' if room else ""
+        print(f"brain    : {call_args['agent_brain_id']}{origin}")
     print(f"endpoint : {url}")
     print("-" * 56)
 

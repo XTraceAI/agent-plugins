@@ -37,10 +37,17 @@ Do exactly this:
      --file "<path>" --name "<name>" --type "<type>"
    ```
 
-   Optional flags when relevant: `--agent-brain-id <id>` to save into an agent
-   brain, `--parent-id <id>` to version an existing artifact, `--rationale "..."`
-   to note why this version supersedes the last, `--tags a,b`.
-4. Report the returned `{id, action}` to the user. On first ever run the script may
+   The artifact routes to the repo's room automatically when one is cached in
+   `.claude/memhub-room.json` (the script prints which room it used), so a file
+   in a repo lands where teammates search without any extra flag.
+
+   Optional flags when relevant: `--agent-brain-id <id>` to override the
+   destination brain, `--no-room` to save into personal workspace memory
+   instead, `--parent-id <id>` to version an existing artifact, `--rationale
+   "..."` to note why this version supersedes the last, `--tags a,b`.
+4. Report the returned `{id, action}` to the user, **and which brain it landed
+   in, by name** — automatic routing that happens silently reads as losing
+   things. On first ever run the script may
    open the browser once for OAuth approval (same flow as /mcp; token cached
    after that) — that is expected, not an error.
 

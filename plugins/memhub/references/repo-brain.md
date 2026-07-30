@@ -118,7 +118,43 @@ Duplicate brains are the main way a MemHub org degrades: cross-brain routing
 ranks brains by their overview, so several near-identical rooms on one
 subject make the right one harder to find for every future search.
 
-## 4. Every brain you create needs a real description
+## 4. Cache the resolution — resolve once, route forever
+
+Once §3 gives you an id, **persist it** so nothing has to redo the lookup:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>"
+```
+
+That writes `.claude/memhub-room.json` in the repo, keyed by backend
+(`production` / `staging` hold different ids for the same repo, so a single
+flat id would write to the wrong brain on whichever install didn't match).
+
+Read it back — bare id on stdout, exit 1 and silence when nothing is cached:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" name   # the §1 name
+```
+
+Why this exists: the two AUTOMATIC capture paths — the SessionEnd hook and the
+commit/PR flush — run with no model in the loop for the `list_agent_brains`
+match, so before the cache they passed only `namespace` and their memories
+landed in **personal memory, never in the room**. The cache is what lets them
+route. It also collapses five skills' worth of independent re-derivation into
+one answer, which is the drift §1 warns about.
+
+`import_session.py` and `save_artifact.py` read it automatically when
+`--agent-brain-id` is not passed (`--no-room` opts out), so a plain invocation
+lands in the room.
+
+The file is repo-local and **meant to be committed**: the room is shared
+team-wide, so checking it in routes a teammate's first session with no lookup,
+and worktrees inherit it from the branch. A branch cut before the cache existed
+simply has no file — that reads as "no room", which is the safe default, not an
+error.
+
+## 5. Every brain you create needs a real description
 
 `create_agent_brain` accepts a `description`. It is not decoration — it is
 the text an agent reads when choosing between brains, and a brain with no
@@ -131,7 +167,7 @@ subject and the kind of content.
   reviews, and imported implementation sessions."
 - Useless — "xmem stuff", "notes", or an empty description.
 
-## 5. Say where things landed
+## 6. Say where things landed
 
 After any write, tell the user which brain received it, by name:
 

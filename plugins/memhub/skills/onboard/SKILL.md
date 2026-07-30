@@ -30,6 +30,16 @@ Do exactly this:
   `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
   above doesn't apply cleanly.
 - Record the `agent_brain_id`; call it `ROOM`.
+- **Cache it — this is the step that turns on automatic capture:**
+
+  ```bash
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>"
+  ```
+
+  Until this runs, the SessionEnd hook and the commit/PR flush cannot resolve
+  the room, so everything they capture lands in personal memory instead of the
+  brain being onboarded. Tell the user to commit `.claude/memhub-room.json` —
+  that's what routes teammates' sessions and every worktree of this repo.
 
 ## 2. Seed it — ONE substantive session (cross the cold start)
 Seed from **exactly one** session, not many. One is enough to fire recall + get a
