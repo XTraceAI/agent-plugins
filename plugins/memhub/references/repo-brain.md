@@ -126,9 +126,15 @@ Once §3 gives you an id, **persist it** so nothing has to redo the lookup:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>"
 ```
 
-That writes `.claude/memhub-room.json` in the repo, keyed by backend
-(`production` / `staging` hold different ids for the same repo, so a single
-flat id would write to the wrong brain on whichever install didn't match).
+That writes `~/.config/memhub-plugin/rooms.json` — the plugin's per-user state
+dir, alongside the OAuth token cache. **Never inside the repo.** A brain id is
+account state, not project state: writing it into the working tree would push a
+private id into whatever repo the user happens to be in, including public ones,
+and force every user to decide whether to commit it.
+
+Entries are keyed by the repo's room name (§1), then by backend (`production` /
+`staging` hold different ids for the same repo, so a single flat id would write
+to the wrong brain on whichever install didn't match).
 
 Read it back — bare id on stdout, exit 1 and silence when nothing is cached:
 
@@ -148,11 +154,11 @@ one answer, which is the drift §1 warns about.
 `--agent-brain-id` is not passed (`--no-room` opts out), so a plain invocation
 lands in the room.
 
-The file is repo-local and **meant to be committed**: the room is shared
-team-wide, so checking it in routes a teammate's first session with no lookup,
-and worktrees inherit it from the branch. A branch cut before the cache existed
-simply has no file — that reads as "no room", which is the safe default, not an
-error.
+Because the key is the room NAME (derived from the remote), every worktree and
+subdirectory of a repo shares one entry automatically, with no dependence on
+which branch is checked out. Each teammate resolves once on their own machine —
+one `list_agent_brains` call — which is the price of keeping the id out of the
+working tree.
 
 ## 5. Every brain you create needs a real description
 

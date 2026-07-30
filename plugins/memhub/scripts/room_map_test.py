@@ -10,13 +10,26 @@ Run: python3 room_map_test.py  (stdlib only).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+# Redirect the cache BEFORE importing room_map (it resolves ROOMS_PATH at
+# import time) so no test can touch the real ~/.config/memhub-plugin. Exported,
+# not just patched, so the CLI subprocesses below inherit the same isolation.
+_TMP_HOME = tempfile.mkdtemp(prefix="room-map-test-")
+os.environ["MEMHUB_ROOMS_FILE"] = str(Path(_TMP_HOME) / "rooms.json")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import room_map as rm  # noqa: E402
+
+
+def _fresh_rooms() -> None:
+    """Start a test from an empty cache — one file holds every repo, so state
+    leaks between tests otherwise."""
+    rm.ROOMS_PATH.unlink(missing_ok=True)
 
 PROD = "11111111-1111-4111-8111-111111111111"
 STAGING = "22222222-2222-4222-8222-222222222222"
@@ -38,7 +51,7 @@ def _git(repo: Path, *args: str) -> None:
 
 def _repo(tmp: Path, remote: str | None) -> Path:
     repo = tmp / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     _git(repo, "init", "-q")
     if remote:
         _git(repo, "remote", "add", "origin", remote)
@@ -92,6 +105,7 @@ def test_room_name_from_remote() -> None:
 
 def test_write_then_read_per_backend() -> None:
     print("write/read")
+    _fresh_rooms()
     with tempfile.TemporaryDirectory() as td:
         repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
         rm.write_room(PROD, cwd=repo, env="production")
@@ -99,8 +113,7 @@ def test_write_then_read_per_backend() -> None:
 
         check("prod id", (rm.read_room(repo, "production") or {}).get("brain_id"), PROD)
         check("staging id", (rm.read_room(repo, "staging") or {}).get("brain_id"), STAGING)
-        # The name is captured once at write time so a later read doesn't need git.
-        check("name recorded", (rm.read_room(repo, "production") or {}).get("name"),
+        check("name reported", (rm.read_room(repo, "production") or {}).get("name"),
               "Repo: XTraceAI/memhub-claude-plugin")
 
         # Re-writing one backend must not disturb the other — a repo used from
@@ -109,29 +122,53 @@ def test_write_then_read_per_backend() -> None:
         check("staging survives prod rewrite",
               (rm.read_room(repo, "staging") or {}).get("brain_id"), STAGING)
 
-        # Committed file, so it must be readable/diffable, not opaque.
-        raw = json.loads((repo / rm.ROOM_RELPATH).read_text())
+        # A second repo must not clobber the first — one file holds all repos.
+        other = _repo(Path(td) / "sub", "git@github.com:XTraceAI/xmem.git")
+        rm.write_room(STAGING, cwd=other, env="production")
+        check("other repo isolated",
+              (rm.read_room(repo, "production") or {}).get("brain_id"),
+              PROD.replace("1", "9"))
+
+        raw = json.loads(rm.ROOMS_PATH.read_text())
         check("version stamped", raw.get("version"), 1)
-        check("both backends present", sorted(raw["rooms"]), ["production", "staging"])
+        check("keyed by room name", sorted(raw["repos"]),
+              ["Repo: XTraceAI/memhub-claude-plugin", "Repo: XTraceAI/xmem"])
+        check("both backends present",
+              sorted(raw["repos"]["Repo: XTraceAI/memhub-claude-plugin"]),
+              ["production", "staging"])
+
+        # THE constraint: a brain id is account state. Nothing may be written
+        # into the working tree — this plugin is installed into public repos.
+        stray = [p for p in repo.rglob("*") if ".git" not in p.parts]
+        check("nothing written into the repo", stray, [])
 
 
 def test_reads_never_raise() -> None:
     print("degradation")
+    _fresh_rooms()
     with tempfile.TemporaryDirectory() as td:
         repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
+        key = "Repo: XTraceAI/memhub-claude-plugin"
         check("no cache -> None", rm.read_room(repo, "production"), None)
 
-        path = repo / rm.ROOM_RELPATH
+        path = rm.ROOMS_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         # A half-written cache is the realistic corruption (interrupted write).
-        path.write_text('{"version": 1, "rooms": {"produc')
+        path.write_text('{"version": 1, "repos": {"Repo: XTrace')
         check("corrupt cache -> None", rm.read_room(repo, "production"), None)
 
-        path.write_text('{"version": 1, "rooms": []}')
+        path.write_text('{"version": 1, "repos": []}')
         check("wrong shape -> None", rm.read_room(repo, "production"), None)
 
-        path.write_text('{"version": 1, "rooms": {"production": {"name": "x"}}}')
+        path.write_text(json.dumps({"version": 1, "repos": {key: {"production": {}}}}))
         check("entry without brain_id -> None", rm.read_room(repo, "production"), None)
+
+        path.write_text(json.dumps(
+            {"version": 1, "repos": {"Repo: someone/else": {"production":
+                                                            {"brain_id": PROD}}}}))
+        check("another repo's entry is not used",
+              rm.read_room(repo, "production"), None)
+        path.unlink()
 
     with tempfile.TemporaryDirectory() as td:
         check("outside a repo -> None", rm.read_room(Path(td), "production"), None)
@@ -151,6 +188,7 @@ def test_env_keying() -> None:
 
 def test_cli() -> None:
     print("cli")
+    _fresh_rooms()
     script = Path(__file__).resolve().parent / "room_map.py"
     with tempfile.TemporaryDirectory() as td:
         repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")

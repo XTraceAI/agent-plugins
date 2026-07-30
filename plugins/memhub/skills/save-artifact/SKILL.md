@@ -38,8 +38,8 @@ Do exactly this:
    ```
 
    The artifact routes to the repo's room automatically when one is cached in
-   `.claude/memhub-room.json` (the script prints which room it used), so a file
-   in a repo lands where teammates search without any extra flag.
+   `~/.config/memhub-plugin/rooms.json` (the script prints which room it used),
+   so a file in a repo lands where teammates search without any extra flag.
 
    Optional flags when relevant: `--agent-brain-id <id>` to override the
    destination brain, `--no-room` to save into personal workspace memory

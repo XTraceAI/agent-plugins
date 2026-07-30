@@ -38,8 +38,9 @@ Do exactly this:
 
   Until this runs, the SessionEnd hook and the commit/PR flush cannot resolve
   the room, so everything they capture lands in personal memory instead of the
-  brain being onboarded. Tell the user to commit `.claude/memhub-room.json` —
-  that's what routes teammates' sessions and every worktree of this repo.
+  brain being onboarded. It writes to `~/.config/memhub-plugin/rooms.json` —
+  the user's own config, never the repo — and covers every worktree of this
+  repo. Teammates run `/memhub:onboard` once themselves.
 
 ## 2. Seed it — ONE substantive session (cross the cold start)
 Seed from **exactly one** session, not many. One is enough to fire recall + get a

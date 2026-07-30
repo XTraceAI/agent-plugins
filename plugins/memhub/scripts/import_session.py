@@ -214,7 +214,7 @@ async def main() -> int:
                     help="route the extracted facts/episodes into an agent brain "
                          "(isolated, shareable) instead of raw workspace memory. "
                          "Default: the repo's cached room "
-                         "(.claude/memhub-room.json), if any")
+                         "(~/.config/memhub-plugin/rooms.json), if any")
     ap.add_argument("--no-room", action="store_true",
                     help="ignore the repo's cached room and import into personal "
                          "memory")

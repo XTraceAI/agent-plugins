@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Resolve the repo's MemHub room (agent brain) ONCE and cache it in
-`.claude/memhub-room.json`, so every writer routes to the same brain.
+"""Resolve the repo's MemHub room (agent brain) ONCE and cache it, so every
+writer routes to the same brain.
 
 Before this, each writer re-derived the room independently: five SKILL.md files
 each told the agent to build the name `Repo: <org>/<name>` and exact-match it in
@@ -10,17 +10,25 @@ all — their memories landed in personal memory. A cached id makes the routing 
 property of the repo rather than something each caller rediscovers (and
 occasionally gets wrong).
 
-The cache is repo-local and MEANT to be committed: the room is shared team-wide,
-so checking it in routes a teammate's first session correctly with no lookup, and
-git worktrees inherit it from the branch instead of each needing their own copy.
+The cache lives in the user's own config dir, NEVER inside the repo:
 
-Entries are keyed by BACKEND, because prod and staging are separate deployments
-with different brain ids for the same repo — one flat id would silently write to
-the wrong backend's brain on whichever install didn't match:
+    ~/.config/memhub-plugin/rooms.json
 
-    {"version": 1, "rooms": {
-       "production": {"brain_id": "<uuid>", "name": "Repo: XTraceAI/memhub-claude-plugin"},
-       "staging":    {"brain_id": "<uuid>", "name": "Repo: XTraceAI/memhub-claude-plugin"}}}
+A brain id is account state, not project state. Writing it into the working tree
+would push a private id into whatever repo the user is in — including public
+ones — and make every user decide whether to commit it. Keying on the repo's
+canonical room NAME (derived from the git remote) also means all worktrees of a
+repo share one entry automatically, with no dependence on which branch is
+checked out.
+
+Entries are keyed by repo, then by BACKEND — prod and staging are separate
+deployments with different brain ids for the same repo, so one flat id would
+silently write to the wrong backend's brain on whichever install didn't match:
+
+    {"version": 1, "repos": {
+       "Repo: XTraceAI/memhub-claude-plugin": {
+          "production": {"brain_id": "<uuid>"},
+          "staging":    {"brain_id": "<uuid>"}}}}
 
     # what room does this repo route to? (prints the brain id, or nothing)
     python3 room_map.py show [--cwd <dir>] [--env production|staging]
@@ -45,7 +53,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOM_RELPATH = Path(".claude") / "memhub-room.json"
+#: Shared with _memhub_auth's token cache — this is already the plugin's
+#: per-user state dir, and the room id belongs there for the same reason the
+#: OAuth token does: it is account state, not project state.
+#: $MEMHUB_ROOMS_FILE relocates it (tests, CI, sandboxed homes).
+ROOMS_PATH = Path(
+    os.environ.get("MEMHUB_ROOMS_FILE")
+    or Path.home() / ".config" / "memhub-plugin" / "rooms.json"
+)
 
 #: Fallback when the backend can't be determined. Prod is the safe default: the
 #: staging install is the deliberate opt-in, so a mis-detected env writes to the
@@ -151,27 +166,29 @@ def room_name(cwd: str | Path | None = None) -> str | None:
     return f"Repo: {path}" if path else _no_remote_name(root, cwd)
 
 
-def _load(path: Path) -> dict:
-    empty = {"version": 1, "rooms": {}}
+def _load() -> dict:
+    empty = {"version": 1, "repos": {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(ROOMS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return empty
-    if not isinstance(data, dict) or not isinstance(data.get("rooms"), dict):
+    if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
         return empty
     return data
 
 
 def read_room(cwd: str | Path | None = None, env: str | None = None) -> dict | None:
     """The cached room for this repo+backend, or None. Never raises."""
-    root = repo_root(cwd)
-    if root is None:
+    key = room_name(cwd)
+    if key is None:
         return None
-    rooms = _load(root / ROOM_RELPATH).get("rooms") or {}
-    entry = rooms.get(env or current_env())
+    repo = _load()["repos"].get(key)
+    if not isinstance(repo, dict):
+        return None
+    entry = repo.get(env or current_env())
     if not isinstance(entry, dict) or not entry.get("brain_id"):
         return None
-    return entry
+    return {**entry, "name": key}
 
 
 def write_room(
@@ -180,36 +197,31 @@ def write_room(
     cwd: str | Path | None = None,
     env: str | None = None,
 ) -> Path:
-    root = repo_root(cwd)
-    if root is None:
-        sys.exit("not a git repository — the room cache is repo-local")
-    path = root / ROOM_RELPATH
-    data = _load(path)
-    rooms = data.get("rooms")
-    if not isinstance(rooms, dict):
-        rooms = {}
-    entry = {"brain_id": brain_id}
-    resolved_name = name or room_name(root)
-    if resolved_name:
-        entry["name"] = resolved_name
+    key = name or room_name(cwd)
+    if key is None:
+        sys.exit("not a git repository — nothing to key a room on")
+    data = _load()
+    repo = data["repos"].get(key)
+    if not isinstance(repo, dict):
+        repo = {}
     # Only this backend's entry is replaced — a repo used from both installs
-    # keeps both ids.
-    rooms[env or current_env()] = entry
-    data["rooms"] = rooms
+    # keeps both ids, and other repos' entries are untouched.
+    repo[env or current_env()] = {"brain_id": brain_id}
+    data["repos"][key] = repo
     data.setdefault("version", 1)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ROOMS_PATH.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    # Atomic for the same reason artifact_map.py is: a half-written cache reads
-    # as "no room", which would silently send a session to personal memory.
-    tmp = path.with_name(path.name + ".tmp")
+    # Atomic: a half-written cache reads as "no room", which would silently
+    # send sessions to personal memory until someone noticed.
+    tmp = ROOMS_PATH.with_name(ROOMS_PATH.name + ".tmp")
     try:
         tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, path)
+        os.replace(tmp, ROOMS_PATH)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
-    return path
+    return ROOMS_PATH
 
 
 def cmd_show(args: argparse.Namespace) -> int:

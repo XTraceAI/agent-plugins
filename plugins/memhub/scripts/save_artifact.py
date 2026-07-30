@@ -63,7 +63,7 @@ async def main() -> int:
     ap.add_argument("--type", default="document", help="artifact_type (spec/design_doc/runbook/...)")
     ap.add_argument("--agent-brain-id", default=None,
                     help="agent brain to save into. Default: the repo's cached "
-                         "room (.claude/memhub-room.json), if any")
+                         "room (~/.config/memhub-plugin/rooms.json), if any")
     ap.add_argument("--no-room", action="store_true",
                     help="ignore the repo's cached room and save into personal "
                          "workspace memory")
