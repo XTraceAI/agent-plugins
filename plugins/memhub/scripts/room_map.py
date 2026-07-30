@@ -47,6 +47,7 @@ never disturb the user's session.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -166,6 +167,33 @@ def room_name(cwd: str | Path | None = None) -> str | None:
     return f"Repo: {path}" if path else _no_remote_name(root, cwd)
 
 
+@contextlib.contextmanager
+def _locked():
+    """Serialize the load→mutate→replace window across processes.
+
+    One file now holds every repo, so a plain read-modify-write can lose an
+    update: two writers both read, both replace, and the first writer's new
+    entry is gone. `os.replace` makes each write atomic but does nothing about
+    the window around it. Parallel agents across repos (a fleet) make this
+    reachable, so take an exclusive lock and re-read inside it.
+
+    A separate .lock file, not the cache itself — locking the file you are
+    about to replace releases the lock with the old inode.
+    """
+    ROOMS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:  # native Windows — unsupported platform, degrade
+        yield
+        return
+    with open(ROOMS_PATH.with_name(ROOMS_PATH.name + ".lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _load() -> dict:
     empty = {"version": 1, "repos": {}}
     try:
@@ -193,9 +221,15 @@ def read_room(cwd: str | Path | None = None, env: str | None = None) -> dict | N
     if not isinstance(repo, dict):
         return None
     entry = repo.get(env or current_env())
-    if not isinstance(entry, dict) or not entry.get("brain_id"):
+    if not isinstance(entry, dict):
         return None
-    return {**entry, "name": key}
+    # `isinstance(str)`, not just truthiness: a hand-edited cache can hold a
+    # number here, and callers format the id (`brain_id[:8]`). Returning a
+    # non-str would turn a successful write into a crash in the logging line.
+    brain_id = entry.get("brain_id")
+    if not isinstance(brain_id, str) or not brain_id:
+        return None
+    return {**entry, "brain_id": brain_id, "name": key}
 
 
 def write_room(
@@ -207,27 +241,31 @@ def write_room(
     key = name or room_name(cwd)
     if key is None:
         sys.exit("not a git repository — nothing to key a room on")
-    data = _load()
-    repo = data["repos"].get(key)
-    if not isinstance(repo, dict):
-        repo = {}
-    # Only this backend's entry is replaced — a repo used from both installs
-    # keeps both ids, and other repos' entries are untouched.
-    repo[env or current_env()] = {"brain_id": brain_id}
-    data["repos"][key] = repo
-    data.setdefault("version", 1)
 
-    ROOMS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    # Atomic: a half-written cache reads as "no room", which would silently
-    # send sessions to personal memory until someone noticed.
-    tmp = ROOMS_PATH.with_name(ROOMS_PATH.name + ".tmp")
-    try:
-        tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, ROOMS_PATH)
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    with _locked():
+        # Re-read INSIDE the lock: anything another writer added since this
+        # process started must survive our replace.
+        data = _load()
+        repo = data["repos"].get(key)
+        if not isinstance(repo, dict):
+            repo = {}
+        # Only this backend's entry is replaced — a repo used from both installs
+        # keeps both ids, and other repos' entries are untouched.
+        repo[env or current_env()] = {"brain_id": brain_id}
+        data["repos"][key] = repo
+        data.setdefault("version", 1)
+
+        body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        # Atomic: a half-written cache reads as "no room", which would silently
+        # send sessions to personal memory until someone noticed. Unique temp
+        # name so two writers can't share one temp file.
+        tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, ROOMS_PATH)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
     return ROOMS_PATH
 
 

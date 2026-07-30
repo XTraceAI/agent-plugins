@@ -181,6 +181,45 @@ def test_reads_never_raise() -> None:
         check("outside a repo -> None", rm.read_room(Path(td), "production"), None)
 
 
+def test_concurrent_writers_dont_lose_entries() -> None:
+    """One file holds every repo, so a lost update silently unroutes a repo."""
+    print("concurrency")
+    _fresh_rooms()
+    script = Path(__file__).resolve().parent / "room_map.py"
+    with tempfile.TemporaryDirectory() as td:
+        # 12 writers, each claiming a DIFFERENT repo, launched together. Without
+        # a lock the read-modify-write window drops most of them.
+        procs = []
+        for i in range(12):
+            procs.append(subprocess.Popen(
+                [sys.executable, str(script), "set",
+                 "--brain-id", f"{i:08d}-1111-4111-8111-111111111111",
+                 "--name", f"Repo: org/repo{i}", "--env", "production"],
+                cwd=td, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE))
+        errs = [p.communicate()[1] for p in procs]
+        check("all writers exited 0", [p.returncode for p in procs], [0] * 12)
+        if any(errs):
+            check("no writer stderr", [e for e in errs if e], [])
+
+        raw = json.loads(rm.ROOMS_PATH.read_text())
+        check("every repo survived", sorted(raw["repos"]),
+              sorted(f"Repo: org/repo{i}" for i in range(12)))
+
+
+def test_non_string_brain_id_is_rejected() -> None:
+    """A hand-edited cache must not hand callers something they can't format."""
+    print("type guard")
+    _fresh_rooms()
+    with tempfile.TemporaryDirectory() as td:
+        repo = _repo(Path(td), "git@github.com:XTraceAI/xmem.git")
+        rm.ROOMS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rm.ROOMS_PATH.write_text(json.dumps(
+            {"version": 1, "repos": {"Repo: XTraceAI/xmem":
+                                     {"production": {"brain_id": 12345}}}}))
+        # Truthy but not a str — callers do brain_id[:8], which would raise.
+        check("numeric brain_id -> None", rm.read_room(repo, "production"), None)
+
+
 def test_env_keying() -> None:
     print("env_for_url")
     check("staging host",
@@ -227,7 +266,8 @@ def test_cli() -> None:
 
 if __name__ == "__main__":
     for test in (test_room_name_from_remote, test_write_then_read_per_backend,
-                 test_reads_never_raise, test_env_keying, test_cli):
+                 test_reads_never_raise, test_concurrent_writers_dont_lose_entries,
+                 test_non_string_brain_id_is_rejected, test_env_keying, test_cli):
         test()
     if failures:
         print("\nFAILED:")

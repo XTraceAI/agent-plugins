@@ -94,13 +94,23 @@ async def main() -> int:
     url, headers, auth = resolve_url_and_auth(args.url)
 
     # An explicit --agent-brain-id wins; otherwise route to the repo's cached
-    # room so a spec saved from a repo lands where teammates search. Resolved
-    # from the FILE's directory, not the caller's cwd — the artifact belongs to
-    # the repo it lives in, which isn't always the one the script runs from.
+    # room so a spec saved from a repo lands where teammates search.
+    #
+    # The FILE's repo first — a doc living in repo Y is Y's, even when invoked
+    # from elsewhere — then the caller's repo, which covers the common case of
+    # saving an ad-hoc file (a rendered page, a download) from a temp path while
+    # working in a repo. Neither resolves → personal memory.
+    #
+    # A file sitting inside an UNRELATED repo therefore routes to that repo's
+    # room. That is why the destination is printed below and the skill reports
+    # it: automatic routing is only safe if it's visible. Use --no-room to
+    # override.
     room = None
     if not args.agent_brain_id and not args.no_room:
-        room = read_room(None if args.stdin else args.file.resolve().parent,
-                         env_for_url(url))
+        if not args.stdin:
+            room = read_room(args.file.resolve().parent, env_for_url(url))
+        if room is None:
+            room = read_room(None, env_for_url(url))
         if room:
             call_args["agent_brain_id"] = room["brain_id"]
 
