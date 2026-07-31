@@ -39,6 +39,15 @@ Normalization, in order:
 
 Result: `Repo: XTraceAI/xmem`.
 
+**A remote with no org** (`git@host:name.git`, common on self-hosted servers)
+yields a one-segment `Repo: name`. Keep it — the remote is still stable across
+clones and worktrees, which is the property the key needs. Do NOT substitute
+the no-remote fallback below: that keys on a local directory basename, which
+differs between clones and would split the room. Note the resulting name is
+shaped like the no-remote form, so a no-remote repo whose directory happens to
+share that basename lands in the same room; prefer `room_map.py name` over
+deriving by hand so every caller at least agrees.
+
 ## 2. Edge cases
 
 **Worktrees and subdirectories.** All worktrees of a repo, and any
@@ -118,7 +127,49 @@ Duplicate brains are the main way a MemHub org degrades: cross-brain routing
 ranks brains by their overview, so several near-identical rooms on one
 subject make the right one harder to find for every future search.
 
-## 4. Every brain you create needs a real description
+## 4. Cache the resolution — resolve once, route forever
+
+Once §3 gives you an id, **persist it** so nothing has to redo the lookup:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>"
+```
+
+That writes `~/.config/memhub-plugin/rooms.json` — the plugin's per-user state
+dir, alongside the OAuth token cache. **Never inside the repo.** A brain id is
+account state, not project state: writing it into the working tree would push a
+private id into whatever repo the user happens to be in, including public ones,
+and force every user to decide whether to commit it.
+
+Entries are keyed by the repo's room name (§1), then by backend (`production` /
+`staging` hold different ids for the same repo, so a single flat id would write
+to the wrong brain on whichever install didn't match).
+
+Read it back — bare id on stdout, exit 1 and silence when nothing is cached:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" name   # the §1 name
+```
+
+Why this exists: the two AUTOMATIC capture paths — the SessionEnd hook and the
+commit/PR flush — run with no model in the loop for the `list_agent_brains`
+match, so before the cache they passed only `namespace` and their memories
+landed in **personal memory, never in the room**. The cache is what lets them
+route. It also collapses five skills' worth of independent re-derivation into
+one answer, which is the drift §1 warns about.
+
+`import_session.py` and `save_artifact.py` read it automatically when
+`--agent-brain-id` is not passed (`--no-room` opts out), so a plain invocation
+lands in the room.
+
+Because the key is the room NAME (derived from the remote), every worktree and
+subdirectory of a repo shares one entry automatically, with no dependence on
+which branch is checked out. Each teammate resolves once on their own machine —
+one `list_agent_brains` call — which is the price of keeping the id out of the
+working tree.
+
+## 5. Every brain you create needs a real description
 
 `create_agent_brain` accepts a `description`. It is not decoration — it is
 the text an agent reads when choosing between brains, and a brain with no
@@ -131,7 +182,7 @@ subject and the kind of content.
   reviews, and imported implementation sessions."
 - Useless — "xmem stuff", "notes", or an empty description.
 
-## 5. Say where things landed
+## 6. Say where things landed
 
 After any write, tell the user which brain received it, by name:
 

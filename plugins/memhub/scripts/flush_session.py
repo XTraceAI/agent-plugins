@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import NonInteractiveAuthRequired, resolve_url_and_auth  # noqa: E402
+from room_map import env_for_url, read_room  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception (with traceback) before it
 # propagates to us; a background hook must stay quiet, so silence that logger
@@ -95,6 +96,19 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             pass
 
     url, headers, auth = resolve_url_and_auth(interactive=False)
+
+    # Route into the repo's room. Read AFTER the url resolves so the lookup is
+    # keyed by the backend we're actually about to write to — prod and staging
+    # hold different brain ids for the same repo. No cache (or no repo) → the
+    # import stays personal, exactly as it behaved before, rather than guessing
+    # a brain. `/memhub:onboard` and `/memhub:spec init` populate the cache.
+    #
+    # Only when the TRANSCRIPT told us where it ran. read_room(None) would fall
+    # back to this process's cwd, and a hook can fire from a different repo than
+    # the session's — routing the session into a room it has nothing to do with.
+    # Unknown origin must degrade to personal, never to a guess.
+    room = read_room(cwd, env_for_url(url)) if cwd else None
+
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as session:
             await session.initialize()
@@ -103,6 +117,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 "conversation_id": session_id,
                 "source_platform": "claude",
             }
+            if room:
+                arguments["agent_brain_id"] = room["brain_id"]
             if namespace:
                 # Server ignores unknown args pre-#722; stamps directive
                 # scope after.
@@ -128,9 +144,15 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                     except json.JSONDecodeError:
                         continue
             if isinstance(out, dict) and "conversation_id" in out:
+                # Name the destination: "flushed N records" alone can't
+                # distinguish a room write from a personal one, which is the
+                # failure mode this routing exists to fix.
+                dest = (f'room {room["brain_id"][:8]}' if room
+                        else "personal memory (no room cached)")
                 _log(f"flushed {out.get('messages_received')} records "
                      f"(conv {str(out.get('conversation_id'))[:8]}, "
-                     f"path={out.get('path')}) — server processes the delta")
+                     f"path={out.get('path')}) -> {dest} "
+                     "— server processes the delta")
             else:
                 # Not an error per the protocol, but not the shape
                 # import_conversation returns either — log what came back

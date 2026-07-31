@@ -26,14 +26,19 @@ Do exactly this:
 1. **Resolve the destination — default to the repo's room.** A session about a
    repo belongs in that repo's brain, where teammates and future sessions can
    find it; raw workspace memory is the fallback, not the default.
-   - Derive `Repo: <org>/<name>` from `git remote get-url origin` (host and
-     `.git` stripped), then `list_agent_brains` → **exact-name match**. Found →
-     use its `agent_brain_id`.
+   - **Check the cache first** — `python3
+     "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show` prints the room's brain
+     id when the repo has one. The import script reads that same cache, so on a
+     cached repo you can simply omit `--agent-brain-id` and let it route.
+   - Nothing cached → derive `Repo: <org>/<name>` from `git remote get-url
+     origin` (host and `.git` stripped), then `list_agent_brains` →
+     **exact-name match**. Found → use its `agent_brain_id`, and persist it
+     (`room_map.py set --brain-id <id>`) so nothing repeats this lookup.
    - **No match, or not in a git repo → do NOT create a brain.** Import into
-     workspace memory (omit `--agent-brain-id`) and say so, mentioning that
+     workspace memory (pass `--no-room`) and say so, mentioning that
      `/memhub:onboard` sets up the repo's room if they want one.
-   - The user naming a brain explicitly always wins over both.
-   - Edge cases (SSH remotes, no remote, worktrees) are in
+   - The user naming a brain explicitly always wins over all of the above.
+   - Edge cases (SSH remotes, no remote, worktrees) and the cache's rules are in
      `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
 
 2. Run the import via Bash — one command, substitute the real values:
@@ -43,8 +48,9 @@ Do exactly this:
      --session "<session-id-or-path>" [--title "<title>"] \
      [--agent-brain-id "<id>"]
 
-   Pass `--agent-brain-id` with the id resolved in step 1. Omit it only for
-   the workspace-memory fallback.
+   Pass `--agent-brain-id` only when step 1 resolved a room the cache did not
+   already hold, or when the user named a brain explicitly; a cached repo
+   routes on its own. Use `--no-room` for the workspace-memory fallback.
    NOTE: re-imports dedup per conversation_id GLOBALLY — to re-extract an
    already-imported session into an agent brain, pass a fresh
    `--conversation-id`.

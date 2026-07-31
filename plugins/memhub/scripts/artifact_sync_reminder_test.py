@@ -20,8 +20,8 @@ import artifact_sync_reminder as asr  # noqa: E402
 
 HOOK = Path(__file__).resolve().parent / "artifact_sync_reminder.py"
 
-BRAIN = "968e7580-50f8-43d9-828b-0dfb4b1f3342"
-ARTIFACT = "6dfde613-66d1-5abe-bd8e-af34b3ffd866"
+BRAIN = "11111111-1111-4111-8111-111111111111"
+ARTIFACT = "22222222-2222-4222-8222-222222222222"
 MAP = {
     "version": 1,
     "links": [
@@ -34,7 +34,7 @@ MAP = {
         {
             "glob": "xmem/**/reanchor.py|xmem/serve/entities.py",
             "brain_id": BRAIN,
-            "artifact_id": "8f7331dd-022c-57c2-9ac0-229b93bc8747",
+            "artifact_id": "33333333-3333-4333-8333-333333333333",
             "artifact_name": "Directive-anchoring handoff",
         },
     ],
