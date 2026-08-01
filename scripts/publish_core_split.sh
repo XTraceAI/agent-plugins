@@ -56,31 +56,44 @@ fi
 # scratch each time costs nothing and keeps this branch's history clean.
 echo "splitting $PREFIX -> $BRANCH ..."
 
-# `git subtree split -b` refuses to overwrite an existing branch, so a rerun has
-# to delete it first. Only ever delete something that IS a previous split:
-# `-D` discards unmerged commits, and blowing away someone's unrelated
-# `core-split` branch with the output suppressed is not a thing a sync script
-# gets to do quietly.
+# Compute the split into a scratch branch FIRST, so the identity check below
+# compares real history instead of guessing from filenames.
+#
+# -q: subtree streams a per-commit progress counter that scrolls the real output
+# away. Read the tip from the branch afterwards rather than parsing stdout,
+# whose format ("<sha>" vs "Created branch '<name>'") is not stable.
+TMP="${BRANCH}-split-$$"
+git branch -D "$TMP" >/dev/null 2>&1 || true
+git subtree split -q --prefix="$PREFIX" -b "$TMP" >/dev/null
+tip="$(git rev-parse "$TMP")"
+trap 'git branch -D "$TMP" >/dev/null 2>&1 || true' EXIT
+
 if git show-ref -q --verify "refs/heads/$BRANCH"; then
-  expected="$(git ls-files -- "$PREFIX" | sed "s|^$PREFIX/||" | sort)"
-  found="$(git ls-tree --name-only "$BRANCH" | sort)"
-  if [ "$expected" != "$found" ]; then
-    echo "ERROR: branch '$BRANCH' exists but does not look like a previous" >&2
-    echo "       split of $PREFIX — refusing to delete it." >&2
-    echo "       expected: $(echo "$expected" | tr '\n' ' ')" >&2
-    echo "       found:    $(echo "$found" | tr '\n' ' ')" >&2
+  # `git subtree split` is deterministic and history-preserving, so a genuine
+  # PREVIOUS split of this prefix is an ancestor of the new tip (equal when the
+  # core hasn't changed). Anything else is an unrelated branch that merely
+  # shares the name — and `-D` discards unmerged commits, so refuse.
+  #
+  # Comparing file NAMES is not enough: a branch whose root happens to hold
+  # files called room_map.py etc. would pass that check and lose real work.
+  if ! git merge-base --is-ancestor "$BRANCH" "$tip"; then
+    echo "ERROR: branch '$BRANCH' exists but is not an ancestor of the split" >&2
+    echo "       just computed from $PREFIX — it is not a previous split of" >&2
+    echo "       this prefix, so replacing it could discard real work." >&2
+    echo "       existing: $(git rev-parse --short "$BRANCH")   new: ${tip:0:7}" >&2
     echo "       Rename or delete it yourself, then re-run." >&2
     exit 1
   fi
-  echo "  replacing previous split branch '$BRANCH' ($(git rev-parse --short "$BRANCH"))"
-  git branch -D "$BRANCH" >/dev/null
+  if [ "$(git rev-parse "$BRANCH")" = "$tip" ]; then
+    echo "  '$BRANCH' already up to date ($(git rev-parse --short "$BRANCH"))"
+  else
+    echo "  advancing '$BRANCH' $(git rev-parse --short "$BRANCH") -> ${tip:0:7}"
+  fi
 fi
 
-# -q: subtree streams a per-commit progress counter that scrolls the real
-# output away. Read the tip from the branch afterwards rather than parsing
-# stdout, whose format ("<sha>" vs "Created branch '<name>'") is not stable.
-git subtree split -q --prefix="$PREFIX" -b "$BRANCH" >/dev/null
-tip="$(git rev-parse "$BRANCH")"
+# -f moves the ref forward without ever needing -D, so there is no window in
+# which the branch does not exist.
+git branch -f "$BRANCH" "$tip"
 
 echo
 echo "branch '$BRANCH' @ ${tip:0:12} now holds $PREFIX at its root:"
