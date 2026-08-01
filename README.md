@@ -15,6 +15,16 @@ plugins/memhub/                     # PROD build — install this one
 ├── .claude-plugin/plugin.json      # plugin manifest
 ├── .mcp.json                       # the memhub MCP server → prod (per-user OAuth)
 ├── hooks/hooks.json                # SessionEnd → agent hook → import_conversation
+├── core/                           # host-agnostic core — SHARED with the Codex repo
+│   ├── _memhub_auth.py             # endpoint resolution + OAuth (PKCE)
+│   ├── import_session.py           # the transcript upload path
+│   ├── room_map.py                 # per-user repo → room cache
+│   └── README.md                   # the rules for editing/syncing it
+├── scripts/                        # Claude-only shell; core files are symlinks
+│   ├── _memhub_auth.py   → ../core/_memhub_auth.py
+│   ├── import_session.py → ../core/import_session.py
+│   ├── room_map.py       → ../core/room_map.py
+│   └── directive_recall.py, flush_session.py, ...  (real files)
 └── skills/                         # /memhub:* skills (also auto-invoked by Claude)
     ├── handoff-session/            # hand the current session to a teammate
     ├── import-session/             # import a past session, any size
@@ -34,18 +44,23 @@ plugins/fleet/
 ├── scripts/fleet_start_launch.sh   # session launcher (tmux/iTerm/Terminal/headless)
 ├── skills/start/                   # /fleet:start — decompose, provision, launch
 └── skills/status/                  # /fleet:status — pretty-print the board
-codex/                              # OpenAI Codex integration (not a Claude plugin)
-├── codex_to_claude.py              # transform a Codex rollout → Claude Code record shape
-├── import_codex_session.py         # import a Codex session into MemHub (reuses import_session.py)
-├── codex_notify.py                 # optional `notify` hook for auto-capture
-└── README.md                       # Codex MCP config + session capture
+scripts/publish_core_split.sh       # publish plugins/memhub/core/ for the Codex repo
 ```
 
-**Using Codex instead of Claude Code?** See [`codex/README.md`](codex/README.md):
-the MemHub MCP server drops into `~/.codex/config.toml`, and
-`import_codex_session.py` captures Codex sessions into the same team memory (it
-reshapes the rollout so MemHub's agentic extraction kicks in — no backend
-change).
+**Using Codex instead of Claude Code?** MemHub for OpenAI Codex lives in its own
+repo: **[XTraceAI/memhub-codex-plugin](https://github.com/XTraceAI/memhub-codex-plugin)**.
+It gives Codex the same capture value — the MemHub MCP server drops into
+`~/.codex/config.toml`, and `import_codex_session.py` reshapes a Codex rollout
+into the Claude Code record shape so MemHub's agentic extraction kicks in with
+no backend change.
+
+That repo **vendors `plugins/memhub/core/` from here** via `git subtree`, so
+auth, upload, and repo→room routing are one implementation shared by both
+integrations. The sync is one-way: **edit the core in this repo**, publish it
+with `scripts/publish_core_split.sh --push`, then run `scripts/sync_core.sh`
+over there. See [`plugins/memhub/core/README.md`](plugins/memhub/core/README.md)
+for the boundary rules and the `.mcp.json` contract a consuming repo must
+satisfy.
 
 ## Install
 
@@ -226,6 +241,37 @@ history in MemHub, so an agent that needs the *why* behind a sibling's
 change searches team memory with the session id from the board entry.
 Each board entry costs ~1 short line of injected context; everything fails
 soft (not a git repo / hook error → silent no-op).
+
+## Shared core (Claude + Codex)
+
+Three modules are host-agnostic — `_memhub_auth.py` (endpoint + OAuth),
+`import_session.py` (transcript upload), `room_map.py` (repo → room routing).
+Nothing in them knows what a Claude Code hook is, and the MemHub server contract
+is platform-agnostic too (`import_conversation` auto-detects by record
+structure, not by a platform tag). They are what lets Codex reuse this
+integration wholesale instead of reimplementing it.
+
+They live in **`plugins/memhub/core/`** so that `git subtree` can sync them:
+subtree moves a *directory prefix* and cannot move a subset of a directory, and
+these files previously sat in `scripts/` among a dozen Claude-only hook scripts.
+
+`scripts/` still reaches them at their historical paths through **symlinks**
+(`scripts/import_session.py → ../core/import_session.py`), so every hook command
+string, SKILL.md invocation, and sibling import is unchanged — and
+`_memhub_auth._plugin_root()` still resolves to `plugins/memhub/` (or
+`plugins/memhub-staging/` when `$CLAUDE_PLUGIN_ROOT` says so), reading the right
+`.mcp.json` for the right backend. `plugins/memhub/core/core_boundary_test.py`
+enforces all of that: it AST-walks every core module for imports outside the
+stdlib/`mcp`/core, pins the two sanctioned Claude references, and fails if a
+real file ever shadows a symlink.
+
+```bash
+scripts/publish_core_split.sh --push    # here: publish the core-split branch
+scripts/sync_core.sh                    # there: pull it into memhub_core/
+```
+
+One-way by design. A fix made in the Codex repo's `memhub_core/` is a fix the
+next pull deletes and the Claude plugin never gets.
 
 ## Notes & trade-offs
 
