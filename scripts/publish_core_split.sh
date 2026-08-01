@@ -23,7 +23,9 @@ PUSH=0
 for arg in "$@"; do
   case "$arg" in
     --push) PUSH=1 ;;
-    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print the header comment block, stopping at the first non-comment line —
+    # a fixed line range drifts the moment the header is edited.
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -36,10 +38,15 @@ if [ ! -d "$PREFIX" ]; then
 fi
 
 # A split of a dirty tree silently publishes only what is COMMITTED, which is a
-# confusing way to ship a stale core. Refuse instead.
-if ! git diff --quiet -- "$PREFIX" || ! git diff --cached --quiet -- "$PREFIX"; then
+# confusing way to ship a stale core. Refuse instead. Untracked files count:
+# a brand-new core module is invisible to `git diff` and is exactly the thing
+# you'd be surprised to find missing downstream.
+untracked="$(git ls-files -o --exclude-standard -- "$PREFIX")"
+if ! git diff --quiet -- "$PREFIX" || ! git diff --cached --quiet -- "$PREFIX" \
+   || [ -n "$untracked" ]; then
   echo "ERROR: uncommitted changes under $PREFIX — commit them first," >&2
   echo "       otherwise the split would publish the previous core." >&2
+  [ -n "$untracked" ] && echo "       untracked: $(echo "$untracked" | tr '\n' ' ')" >&2
   exit 1
 fi
 
@@ -48,8 +55,32 @@ fi
 # touch the core. The core is a handful of files, so recomputing the split from
 # scratch each time costs nothing and keeps this branch's history clean.
 echo "splitting $PREFIX -> $BRANCH ..."
-git branch -D "$BRANCH" >/dev/null 2>&1 || true
-tip="$(git subtree split --prefix="$PREFIX" -b "$BRANCH" | tail -1)"
+
+# `git subtree split -b` refuses to overwrite an existing branch, so a rerun has
+# to delete it first. Only ever delete something that IS a previous split:
+# `-D` discards unmerged commits, and blowing away someone's unrelated
+# `core-split` branch with the output suppressed is not a thing a sync script
+# gets to do quietly.
+if git show-ref -q --verify "refs/heads/$BRANCH"; then
+  expected="$(git ls-files -- "$PREFIX" | sed "s|^$PREFIX/||" | sort)"
+  found="$(git ls-tree --name-only "$BRANCH" | sort)"
+  if [ "$expected" != "$found" ]; then
+    echo "ERROR: branch '$BRANCH' exists but does not look like a previous" >&2
+    echo "       split of $PREFIX — refusing to delete it." >&2
+    echo "       expected: $(echo "$expected" | tr '\n' ' ')" >&2
+    echo "       found:    $(echo "$found" | tr '\n' ' ')" >&2
+    echo "       Rename or delete it yourself, then re-run." >&2
+    exit 1
+  fi
+  echo "  replacing previous split branch '$BRANCH' ($(git rev-parse --short "$BRANCH"))"
+  git branch -D "$BRANCH" >/dev/null
+fi
+
+# -q: subtree streams a per-commit progress counter that scrolls the real
+# output away. Read the tip from the branch afterwards rather than parsing
+# stdout, whose format ("<sha>" vs "Created branch '<name>'") is not stable.
+git subtree split -q --prefix="$PREFIX" -b "$BRANCH" >/dev/null
+tip="$(git rev-parse "$BRANCH")"
 
 echo
 echo "branch '$BRANCH' @ ${tip:0:12} now holds $PREFIX at its root:"

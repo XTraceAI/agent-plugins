@@ -44,6 +44,22 @@ A real file at either path would silently shadow the core and drift from it —
 the same failure `plugins/memhub-staging/`'s symlinks prevent. Also enforced by
 `core_boundary_test.py`.
 
+## Symlinks and Windows
+
+`../scripts/` reaches these files through git symlinks (mode `120000`). A
+checkout with `core.symlinks=false` — the Git-for-Windows default when the
+account cannot create symlinks (no Developer Mode, no admin) — materializes each
+one as a small text file containing its target path, and every
+`scripts/<core>.py` invocation then fails with a `SyntaxError`.
+
+The staging plugin has always depended on symlinks (`memhub-staging/scripts →
+../memhub/scripts`), so this is not new — but it now reaches the **prod** build
+too. On Windows, either enable Developer Mode or set
+`git config --global core.symlinks true` before installing.
+
+It is at least diagnosable rather than mysterious: `core_boundary_test.py`'s
+`test_scripts_symlinks` fails loudly on such a checkout, naming the file.
+
 ## The contract a host repo must satisfy
 
 `_memhub_auth.build_oauth()` reads `<plugin_root>/.mcp.json` for the OAuth

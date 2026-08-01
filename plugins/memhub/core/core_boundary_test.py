@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +45,12 @@ CORE_FILES = {
     "core_boundary_test.py",
 }
 
+#: Non-Python files that legitimately ship with the core. Kept separate from
+#: CORE_FILES because only the .py members are import-scanned — but BOTH are
+#: enumerated, so a stray .sh/.json/.env dropped in here is caught rather than
+#: silently published to every consumer repo.
+CORE_NON_PY = {"README.md"}
+
 #: Core modules may import each other, the stdlib, and the `mcp` SDK (the one
 #: third-party dep, pulled ephemerally by `uv run --with mcp`). Anything else
 #: is either a Claude-only shell module or a new dependency the Codex repo
@@ -58,23 +65,31 @@ ALLOWED_THIRD_PARTY = {"mcp"}
 #: - `_memhub_auth.CLAUDE_PLUGIN_ROOT` — preferred when Claude Code sets it;
 #:   `_plugin_root()` falls back to `__file__.parent.parent` otherwise, which
 #:   is why a vendoring repo puts its .mcp.json at the core's parent.
-#: - `import_session.~/.claude` — host session DISCOVERY, used only when
-#:   `--session` is a bare id. Codex passes an explicit transcript path, so
-#:   `resolve_session_file()` returns at its `p.is_file()` branch and the glob
-#:   is unreachable there. Cosmetic in a vendored copy, not functional.
+#: - `import_session`'s `~/.claude` / `.claude/` — host session DISCOVERY, used
+#:   only when `--session` is a bare id (the docstring form and the actual
+#:   `Path.home().glob(".claude/projects/...")`). Codex passes an explicit
+#:   transcript path, so `resolve_session_file()` returns at its `p.is_file()`
+#:   branch and the glob is unreachable there. Cosmetic in a vendored copy,
+#:   not functional.
 ALLOWED_CLAUDE_REFS = {
     "_memhub_auth.py": {"CLAUDE_PLUGIN_ROOT"},
-    "import_session.py": {"~/.claude"},
+    "import_session.py": {"~/.claude", ".claude/"},
 }
 
 #: The core's own tests name these tokens in order to guard them; scanning
 #: them for the tokens would be self-defeating.
 TOKEN_SCAN_EXEMPT = {"core_boundary_test.py", "room_map_test.py"}
 
-#: Cosmetic-only mentions: prose in docstrings/comments describing the Claude
-#: side. Checked separately from code so a real dependency can't hide in a
-#: string literal.
-CLAUDE_TOKENS = ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR", "~/.claude")
+#: Any CLAUDE_* env var plus the Claude state dir. A regex rather than a fixed
+#: list so a NEW variable (CLAUDE_CODE_*, CLAUDE_SESSION_*, ...) is caught the
+#: day it appears instead of the day someone remembers to extend the list.
+#:
+#: This is a substring scan over the whole file, so it flags prose mentions
+#: too — deliberately, since a docstring promising Claude behavior in
+#: host-agnostic code is its own defect. It does NOT defeat a determined
+#: evasion (`"CLAUDE_PLUGIN" + "_ROOT"`); it is a guard against the accidental
+#: coupling that actually happens in review, not an adversary.
+CLAUDE_TOKEN_RE = re.compile(r"CLAUDE_[A-Z_]+|~/\.claude|\.claude/")
 
 #: This file travels WITH the core into every consumer repo, so it has to be
 #: meaningful in both places. The boundary + host-contract checks are
@@ -113,6 +128,17 @@ def _imports(path: Path) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.Call):
+            # importlib.import_module("x") / __import__("x") bypass the plain
+            # Import nodes above. Only literal names are resolvable here; a
+            # computed one is flagged so a human looks at it.
+            fn = node.func
+            fname = (getattr(fn, "attr", None) or getattr(fn, "id", None) or "")
+            if fname in {"import_module", "__import__"} and node.args:
+                a = node.args[0]
+                names.add(a.value.split(".")[0]
+                          if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                          else "<dynamic-import>")
         elif isinstance(node, ast.ImportFrom):
             if node.level:  # relative import — impossible in a flat core
                 names.add(f"<relative:{node.module}>")
@@ -122,13 +148,24 @@ def _imports(path: Path) -> set[str]:
 
 
 def test_core_file_set() -> None:
-    """The core dir holds exactly the syncable unit — no strays."""
+    """The core dir holds exactly the syncable unit — no strays.
+
+    Enumerates EVERY file, not just *.py: whatever lands here is vendored into
+    a public consumer repo verbatim, so a stray .json/.sh/.env matters at
+    least as much as a stray module.
+    """
+    expected = CORE_FILES | CORE_NON_PY
     actual = {p.name for p in CORE.iterdir()
-              if p.is_file() and p.suffix == ".py"}
+              if p.is_file() and p.name != "__pycache__"}
     check("core contains exactly the declared file set",
-          actual == CORE_FILES,
-          f"unexpected={sorted(actual - CORE_FILES)} "
-          f"missing={sorted(CORE_FILES - actual)}")
+          actual == expected,
+          f"unexpected={sorted(actual - expected)} "
+          f"missing={sorted(expected - actual)}")
+    # A symlink here would vendor as a dangling link (or, worse, silently
+    # capture whatever it points at). The core must be real files only.
+    links = sorted(p.name for p in CORE.iterdir() if p.is_symlink())
+    check("core holds no symlinks (subtree vendors real files)",
+          not links, str(links))
 
 
 def test_no_shell_imports() -> None:
@@ -160,7 +197,7 @@ def test_claude_coupling_is_pinned() -> None:
     """Claude-specific identifiers appear only where sanctioned."""
     for name in sorted(CORE_FILES - TOKEN_SCAN_EXEMPT):
         text = (CORE / name).read_text()
-        found = {t for t in CLAUDE_TOKENS if t in text}
+        found = set(CLAUDE_TOKEN_RE.findall(text))
         allowed = ALLOWED_CLAUDE_REFS.get(name, set())
         check(f"{name}: Claude coupling within the allowed set",
               found <= allowed,
@@ -214,6 +251,73 @@ def test_staging_shares_the_core() -> None:
           not unexpected, str(unexpected))
 
 
+def _mcp_entry(cfg: Path) -> dict:
+    servers = json.loads(cfg.read_text()).get("mcpServers", {})
+    name = next((k for k in servers if k.lower().startswith("memhub")), None)
+    return servers.get(name, {}) if name else {}
+
+
+def test_prod_and_staging_point_at_different_backends() -> None:
+    """The ONE thing the two builds are allowed to differ in — and therefore
+    the one thing worth machine-checking.
+
+    Everything else is symlinked, so drift is structurally impossible. The
+    backend config is hand-maintained in two files, and the Auth0 tenant names
+    read crossed (prod is `memhub-prod.us.auth0.com`, staging is plain
+    `memhub.us.auth0.com`), which is exactly the shape of thing a human
+    transposes. A staging build silently talking to production is the worst
+    outcome this repo can ship: it writes test junk into a real team's brain.
+    """
+    if not IN_PLUGIN_REPO:
+        skip("prod/staging backend split", "not the plugin repo (vendored copy)")
+        return
+    prod_cfg = REPO / "plugins" / "memhub" / ".mcp.json"
+    stg_cfg = REPO / "plugins" / "memhub-staging" / ".mcp.json"
+
+    # Each build must own its config outright. A symlink to the other's would
+    # slip past a file-set check while collapsing the two backends into one.
+    check("staging owns a real .mcp.json (not a symlink to prod's)",
+          stg_cfg.is_file() and not stg_cfg.is_symlink())
+    check("prod owns a real .mcp.json (not a symlink)",
+          prod_cfg.is_file() and not prod_cfg.is_symlink())
+    if not (prod_cfg.is_file() and stg_cfg.is_file()):
+        return
+
+    prod, stg = _mcp_entry(prod_cfg), _mcp_entry(stg_cfg)
+    p_url, s_url = prod.get("url", ""), stg.get("url", "")
+    p_oauth, s_oauth = prod.get("oauth", {}), stg.get("oauth", {})
+
+    check("prod points at the production backend",
+          "api.memhub.xtrace.ai" in p_url and "staging" not in p_url, p_url)
+    check("staging points at the staging backend",
+          "api.staging.memhub.xtrace.ai" in s_url, s_url)
+    check("the two urls differ", p_url != s_url, f"both {p_url}")
+    check("prod uses the prod Auth0 tenant",
+          "memhub-prod.us.auth0.com" in p_oauth.get("authServerMetadataUrl", ""),
+          p_oauth.get("authServerMetadataUrl", ""))
+    check("staging uses the staging Auth0 tenant",
+          "//memhub.us.auth0.com" in s_oauth.get("authServerMetadataUrl", ""),
+          s_oauth.get("authServerMetadataUrl", ""))
+    check("the two OAuth clients differ",
+          bool(p_oauth.get("clientId")) and bool(s_oauth.get("clientId"))
+          and p_oauth["clientId"] != s_oauth["clientId"],
+          "same clientId — one build authenticates against the wrong tenant")
+
+
+def test_plugin_versions_are_in_lockstep() -> None:
+    """The two manifests bump together; a version skew is how the marketplace
+    ends up offering two builds that are not, in fact, the same plugin."""
+    if not IN_PLUGIN_REPO:
+        skip("plugin version lockstep", "not the plugin repo (vendored copy)")
+        return
+    def _ver(name: str) -> str:
+        p = REPO / "plugins" / name / ".claude-plugin" / "plugin.json"
+        return json.loads(p.read_text()).get("version", "") if p.is_file() else ""
+    prod_v, stg_v = _ver("memhub"), _ver("memhub-staging")
+    check("memhub and memhub-staging versions match",
+          bool(prod_v) and prod_v == stg_v, f"memhub={prod_v} staging={stg_v}")
+
+
 def test_host_repo_contract() -> None:
     """`_memhub_auth` needs a plugin-shaped .mcp.json at <core>/.. — the
     contract a vendoring repo (memhub-codex-plugin) must also satisfy."""
@@ -254,6 +358,8 @@ if __name__ == "__main__":
     for fn in (test_core_file_set, test_no_shell_imports,
                test_no_relative_imports, test_claude_coupling_is_pinned,
                test_scripts_symlinks, test_staging_shares_the_core,
+               test_prod_and_staging_point_at_different_backends,
+               test_plugin_versions_are_in_lockstep,
                test_host_repo_contract, test_codex_glue_is_gone):
         print(f"{fn.__name__}:")
         fn()
