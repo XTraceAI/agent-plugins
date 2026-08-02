@@ -193,12 +193,14 @@ def test_cache_hit_costs_no_recall_and_no_git_subprocess():
         dr._repo_name, dr._recall, sys.stdin, dr._STATE_DIR = saved
 
 
-def test_render_crash_leaves_the_handle_retryable():
-    """A post-recall exception must not cache the handle.
+def test_render_crash_is_contained_and_still_caches():
+    """A post-recall crash must neither escape nor un-cache the handle.
 
-    The recall succeeded but the injection never reached the agent, so the next
-    touch has to be able to try again — otherwise one transient render/stdout
-    failure silently suppresses that file for the rest of the session.
+    The emit is best-effort like the rest of the hook: it logs and moves on. The
+    handle is still recorded, because a DETERMINISTIC emit failure (broken
+    stdout, an unstringifiable payload) would otherwise re-buy a ~2.5s recall on
+    every later touch — the latency cliff the cache exists to prevent. Only a
+    failed RECALL stays uncached; that case is covered above.
     """
     import io
     import tempfile
@@ -217,8 +219,10 @@ def test_render_crash_leaves_the_handle_retryable():
             dr._STATE_DIR = Path(td)
             dr._recall, dr._render = fake_recall, _boom
             sys.stdin = io.StringIO(json.dumps(hook))
-            assert dr.main() == 0                       # still fails open
-            assert dr._load_handles("render-boom") == []  # …but retryable
+            assert dr.main() == 0  # contained: still fails open, no traceback
+            expected = dr._handle_key("Edit", {"file_path": "app/main.py"}, "/tmp")
+            # …and recorded, so a deterministic crash can't re-buy the recall.
+            assert dr._load_handles("render-boom") == [expected]
     finally:
         dr._render, dr._recall, sys.stdin, dr._STATE_DIR = saved
 

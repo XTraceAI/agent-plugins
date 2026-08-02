@@ -545,30 +545,41 @@ def main() -> int:
         # Re-impose the symbol-tripwire contract for servers predating the
         # match-semantics funnel: only triggers that concretely hit this call —
         # where "this call" includes the failing output on the reactive path.
-        items = _precision_filter(items, recall_args, cwd, output or "")
-        items = _rank(items)[:_MAX_DIRECTIVES]
-        if items:
-            _log(f"{len(items)} directive(s) fired for {tool}"
-                 + (" (reactive, on failure output)" if output else ""))
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse" if reactive else "PreToolUse",
-                    "additionalContext": _render(items),
-                }
-            }))
-            # Record INJECTIONS only, and only after a successful emit — a
-            # recalled-but-not-shown directive keeps its chance at its real
-            # moment later in the session.
-            new_ids = [str(d["id"]) for d in items if str(d.get("id") or "").strip()]
-            if new_ids and session_id:
-                _save_fired(session_id, fired + new_ids)
-        # Cache the handle LAST, once the pass has fully succeeded. It covers an
-        # empty answer and one whose candidates were all dropped — re-asking the
-        # same handle re-buys the same answer (drops are deterministic and
-        # `already_fired` only grows), so the deliberate trade-off is that a
-        # handle answered once isn't re-asked this session. But anything that
-        # raises above — filter, rank, render, a broken stdout — skips this line
-        # via the handler, so a crashed injection leaves the handle retryable.
+        # The emit is self-contained and CANNOT raise past this block: a render
+        # or stdout failure must not decide whether the handle gets cached.
+        # Placement alone can't satisfy both sides — cache before the emit and a
+        # transient crash costs an injection; cache after and a DETERMINISTIC
+        # one (broken stdout, an unstringifiable payload, _save_fired raising a
+        # non-OSError) re-buys a ~2.5s recall on every later touch of that
+        # handle. Containing the failure removes the dilemma: whatever happens
+        # in here, we asked the server once and we record that.
+        try:
+            items = _precision_filter(items, recall_args, cwd, output or "")
+            items = _rank(items)[:_MAX_DIRECTIVES]
+            if items:
+                _log(f"{len(items)} directive(s) fired for {tool}"
+                     + (" (reactive, on failure output)" if output else ""))
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse" if reactive else "PreToolUse",
+                        "additionalContext": _render(items),
+                    }
+                }))
+                # Record INJECTIONS only, and only after a successful emit — a
+                # recalled-but-not-shown directive keeps its chance at its real
+                # moment later in the session.
+                new_ids = [str(d["id"]) for d in items
+                           if str(d.get("id") or "").strip()]
+                if new_ids and session_id:
+                    _save_fired(session_id, fired + new_ids)
+        except Exception as e:  # noqa: BLE001 — the emit is best-effort like the rest
+            _log(f"emit skipped ({type(e).__name__}: {str(e)[:120]})")
+        # We got an ANSWER, so the handle is recorded — including an empty answer
+        # and one whose candidates were all dropped. Re-asking re-buys the same
+        # answer (drops are deterministic, `already_fired` only grows), so the
+        # deliberate trade-off is that a handle answered once isn't re-asked this
+        # session. Only a FAILED recall (`items is None`, returned above) stays
+        # uncached, so a transport blip can still retry.
         if handle and session_id:
             _save_handles(session_id, handles + [handle])
     # BaseException (not Exception): anyio task groups can surface a
