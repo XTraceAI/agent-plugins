@@ -108,13 +108,20 @@ def test_handle_cache_roundtrip(tmp_dir=None):
         try:
             sid = "sess-abc"
             key = dr._handle_key("Edit", {"file_path": "app/main.py"}, "/w/xmem")
-            assert key == "/w/xmem:Edit:app/main.py"
+            assert key.startswith("/w/xmem:Edit:app/main.py:")
             assert dr._load_handles(sid) == []
             dr._save_handles(sid, [key])
             assert dr._load_handles(sid) == [key]
             # Bash commands normalize whitespace; non-handle args disable caching.
-            assert dr._handle_key("Bash", {"command": "git  status\n"}, "/w") == "/w:Bash:git status"
+            assert dr._handle_key("Bash", {"command": "git  status\n"}, "/w") \
+                == dr._handle_key("Bash", {"command": "git status"}, "/w")
             assert dr._handle_key("Grep", {"pattern": "x"}, "/w") == ""
+            # Long commands differing only past the readable head must NOT
+            # collide — a false cache hit silently skips recall on the second.
+            long_a = "uv run python x.py " + "a" * 400 + " --flag-one"
+            long_b = "uv run python x.py " + "a" * 400 + " --flag-two"
+            assert (dr._handle_key("Bash", {"command": long_a}, "/w")
+                    != dr._handle_key("Bash", {"command": long_b}, "/w"))
             # Two WORKTREES of one repo share a remote basename but not a cwd:
             # the same relative path in each must not share a cache slot.
             assert (dr._handle_key("Edit", {"file_path": "app/main.py"}, "/w/xmem")

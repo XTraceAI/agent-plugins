@@ -61,6 +61,7 @@ hook JSON on stdin.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import subprocess
@@ -169,7 +170,13 @@ def _handle_key(tool: str, recall_args: dict, cwd: str = "") -> str:
     for k in _ID_ARG_KEYS:
         v = recall_args.get(k)
         if isinstance(v, str) and v:
-            return f"{cwd}:{tool}:{' '.join(v.split())[:300]}"
+            # Hash the FULL normalized handle: prefix-truncating collided two
+            # long pipelines differing only past the cut, silently skipping
+            # recall on the second. Readable head kept for eyeballing the
+            # state file; the digest is what makes the key injective.
+            norm = " ".join(v.split())
+            digest = hashlib.sha256(norm.encode("utf-8", "replace")).hexdigest()[:16]
+            return f"{cwd}:{tool}:{norm[:120]}:{digest}"
     return ""
 
 
