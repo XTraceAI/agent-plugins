@@ -48,7 +48,7 @@ Do exactly this:
 5. Ship the full session into the same agent brain via Bash — one command:
 
    ```bash
-   uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
+   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
      --session "<current-session-id-or-path>" \
      --agent-brain-id "<id-from-step-2>" \
      --conversation-id "$(uuidgen)" \

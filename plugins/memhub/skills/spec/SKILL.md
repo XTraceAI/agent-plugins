@@ -48,7 +48,7 @@ File uploads ALWAYS go through the helper script (never call the
 `save_artifact` MCP tool directly, never re-emit file contents):
 
 ```bash
-uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
   --file "<path>" --name "Spec: <title>" --type spec \
   --agent-brain-id "<repo-ab-id>" --tags "spec,spec:<slug>,path:<repo-relative-path>" \
   [--parent-id "<latest-version-id>"] [--rationale "<why>"]
@@ -213,7 +213,7 @@ fresh conversation id (re-imports dedup per conversation_id globally) and a
 title naming the spec:
 
 ```bash
-uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
+uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
   --session "<session-id-or-path>" --agent-brain-id "<repo-ab-id>" \
   --conversation-id "$(uuidgen)" --title "Spec: <title> — <what was built>"
 ```

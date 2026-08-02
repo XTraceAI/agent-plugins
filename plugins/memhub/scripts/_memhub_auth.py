@@ -18,7 +18,7 @@ Usage from a sibling script:
     url, headers, auth = resolve_url_and_auth()
     async with streamablehttp_client(url, headers=headers, auth=auth) as ...
 
-Self-check:  uv run --with mcp python _memhub_auth.py
+Self-check:  uv run --with 'mcp<2' python _memhub_auth.py
 """
 from __future__ import annotations
 

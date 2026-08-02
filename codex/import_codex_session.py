@@ -10,8 +10,8 @@ tool-aware **agentic** ingestion path with no backend change.
 
 Usage (mcp SDK pulled ephemerally by uv):
 
-    uv run --with mcp python codex/import_codex_session.py --session latest
-    uv run --with mcp python codex/import_codex_session.py \
+    uv run --with 'mcp<2' python codex/import_codex_session.py --session latest
+    uv run --with 'mcp<2' python codex/import_codex_session.py \
         --session <rollout-path|session-id|latest> \
         [--agent-brain-id <id>] [--conversation-id <id>] [--title "..."] \
         [--url <mcp-url>]
@@ -152,7 +152,9 @@ def main() -> int:
 
     try:
         cmd = [
-            "uv", "run", "--with", "mcp", "python", str(_IMPORT_SESSION),
+            # Pinned like every other invocation site: mcp 2.x renamed
+            # streamablehttp_client, breaking import_session.py's transport.
+            "uv", "run", "--with", "mcp<2", "python", str(_IMPORT_SESSION),
             "--session", str(transcript),
             "--conversation-id", conv_id,
         ]
