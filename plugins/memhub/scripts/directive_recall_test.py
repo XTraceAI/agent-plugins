@@ -193,6 +193,36 @@ def test_cache_hit_costs_no_recall_and_no_git_subprocess():
         dr._repo_name, dr._recall, sys.stdin, dr._STATE_DIR = saved
 
 
+def test_render_crash_leaves_the_handle_retryable():
+    """A post-recall exception must not cache the handle.
+
+    The recall succeeded but the injection never reached the agent, so the next
+    touch has to be able to try again — otherwise one transient render/stdout
+    failure silently suppresses that file for the rest of the session.
+    """
+    import io
+    import tempfile
+    hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
+            "cwd": "/tmp", "session_id": "render-boom"}
+    saved = (dr._render, dr._recall, sys.stdin, dr._STATE_DIR)
+
+    async def fake_recall(*a, **kw):
+        return [_mk("a", ["app/main.py"])]
+
+    def _boom(_items):
+        raise RuntimeError("render exploded")
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            dr._STATE_DIR = Path(td)
+            dr._recall, dr._render = fake_recall, _boom
+            sys.stdin = io.StringIO(json.dumps(hook))
+            assert dr.main() == 0                       # still fails open
+            assert dr._load_handles("render-boom") == []  # …but retryable
+    finally:
+        dr._render, dr._recall, sys.stdin, dr._STATE_DIR = saved
+
+
 def test_empty_shapes_are_answers_not_failures():
     """Only a MISSING payload is a failure; an odd empty shape is an answer.
 

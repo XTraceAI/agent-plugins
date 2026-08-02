@@ -535,18 +535,8 @@ def main() -> int:
                 _RECALL_TIMEOUT_S,
             )
         )
-        # Cache the handle once we have an ANSWER — including an empty one, and
-        # including one whose candidates all get dropped below. Re-asking the
-        # same handle re-buys the same answer (the drops are deterministic, and
-        # `already_fired` only ever grows), so the deliberate trade-off is: a
-        # handle answered once is not re-asked this session, even if nothing
-        # was injected. `None` means the recall FAILED — never cached, so a
-        # transient blip doesn't suppress the handle. Exceptions skip this line
-        # entirely (see the handler).
-        if items is not None and handle and session_id:
-            _save_handles(session_id, handles + [handle])
         if items is None:
-            return 0
+            return 0  # recall FAILED — never cached, so a blip can't suppress
         # Belt-and-braces dedup for servers predating already_fired — repeats
         # were 76% of all injection noise, so this must not depend on the
         # server version.
@@ -572,6 +562,15 @@ def main() -> int:
             new_ids = [str(d["id"]) for d in items if str(d.get("id") or "").strip()]
             if new_ids and session_id:
                 _save_fired(session_id, fired + new_ids)
+        # Cache the handle LAST, once the pass has fully succeeded. It covers an
+        # empty answer and one whose candidates were all dropped — re-asking the
+        # same handle re-buys the same answer (drops are deterministic and
+        # `already_fired` only grows), so the deliberate trade-off is that a
+        # handle answered once isn't re-asked this session. But anything that
+        # raises above — filter, rank, render, a broken stdout — skips this line
+        # via the handler, so a crashed injection leaves the handle retryable.
+        if handle and session_id:
+            _save_handles(session_id, handles + [handle])
     # BaseException (not Exception): anyio task groups can surface a
     # BaseExceptionGroup (e.g. auth cancelling siblings). This hook is
     # best-effort — never fail or block the tool call. Emit nothing, exit 0.
