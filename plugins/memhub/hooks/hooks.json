@@ -8,7 +8,7 @@
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking for relevant directives",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | uv run --with mcp python \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | uv run --with 'mcp>=1.28,<2' python \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
           }
         ]
       },
@@ -19,7 +19,7 @@
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking for relevant directives",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_prefilter.py\"; then printf %s \"$IN\" | uv run --with mcp python \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_prefilter.py\"; then printf %s \"$IN\" | uv run --with 'mcp>=1.28,<2' python \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
           }
         ]
       }
@@ -32,7 +32,7 @@
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking directives for this failure",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reactive_prefilter.py\"; then printf %s \"$IN\" | uv run --with mcp python \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reactive_prefilter.py\"; then printf %s \"$IN\" | uv run --with 'mcp>=1.28,<2' python \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
           }
         ]
       },
@@ -44,7 +44,7 @@
             "async": true,
             "timeout": 300,
             "statusMessage": "MemHub: flushing session memory",
-            "command": "IN=$(cat); case \"$IN\" in *git*commit*|*\"gh pr\"*) if [ -z \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then echo \"[memhub-flush] CLAUDE_PLUGIN_ROOT unset; cannot locate flush scripts, skipping\" >&2; elif printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_prefilter.py\"; then printf %s \"$IN\" | uv run --with mcp python \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi ;; esac"
+            "command": "IN=$(cat); case \"$IN\" in *git*commit*|*\"gh pr\"*) if [ -z \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then echo \"[memhub-flush] CLAUDE_PLUGIN_ROOT unset; cannot locate flush scripts, skipping\" >&2; elif printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_prefilter.py\"; then printf %s \"$IN\" | uv run --with 'mcp>=1.28,<2' python \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi ;; esac"
           }
         ]
       },

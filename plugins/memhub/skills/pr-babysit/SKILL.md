@@ -94,7 +94,7 @@ on top of it.
    auto-chunks huge sessions:
 
    ```bash
-   uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
+   uv run --with 'mcp>=1.28,<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
      --session "<transcript-path>" \
      --conversation-id "pr-babysit-<owner>-<repo>-<n>" \
      --title "PR babysit — <owner>/<repo>#<n>" \

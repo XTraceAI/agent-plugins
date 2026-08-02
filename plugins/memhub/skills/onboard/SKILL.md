@@ -55,7 +55,7 @@ Import it via the helper script (never call `import_conversation` yourself; it
 handles any size):
 
 ```bash
-uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
+uv run --with 'mcp>=1.28,<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
   --session "<session-id-or-path>" \
   --conversation-id "onboard-seed-<org>-<repo>" \
   --title "Onboarding seed — <org>/<repo>" \

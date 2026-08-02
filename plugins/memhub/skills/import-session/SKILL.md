@@ -44,7 +44,7 @@ Do exactly this:
 2. Run the import via Bash — one command, substitute the real values:
 
    ```bash
-   uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
+   uv run --with 'mcp>=1.28,<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
      --session "<session-id-or-path>" [--title "<title>"] \
      [--agent-brain-id "<id>"]
 

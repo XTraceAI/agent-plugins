@@ -10,13 +10,13 @@ $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 
 Run (mcp SDK pulled ephemerally by uv):
-    uv run --with mcp python scripts/save_artifact.py \
+    uv run --with 'mcp>=1.28,<2' python scripts/save_artifact.py \
         --file spec.md --name "Retry Policy Spec" --type spec \
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
         [--tags a,b]
 
     # or pipe terminal output straight in:
-    pytest -q | uv run --with mcp python scripts/save_artifact.py \
+    pytest -q | uv run --with 'mcp>=1.28,<2' python scripts/save_artifact.py \
         --stdin --name "test run 2026-06-09" --type runbook
 
 Endpoint resolution (so the script hits the SAME server the plugin connector

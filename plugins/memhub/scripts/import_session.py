@@ -19,7 +19,7 @@ $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 
 Usage (mcp SDK pulled ephemerally by uv):
-    uv run --with mcp python import_session.py --session <session-id-or-path>
+    uv run --with 'mcp>=1.28,<2' python import_session.py --session <session-id-or-path>
         [--conversation-id <id>] [--title "..."] [--url <mcp-url>]
 
 `--session` accepts either a path to a .jsonl transcript or a bare session id,

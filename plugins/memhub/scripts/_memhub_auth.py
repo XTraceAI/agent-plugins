@@ -18,7 +18,26 @@ Usage from a sibling script:
     url, headers, auth = resolve_url_and_auth()
     async with streamablehttp_client(url, headers=headers, auth=auth) as ...
 
-Self-check:  uv run --with mcp python _memhub_auth.py
+Self-check:  uv run --with 'mcp>=1.28,<2' python _memhub_auth.py
+
+WHY THE mcp PIN IS EVERYWHERE — do not drop it casually. Every ``uv run`` in
+this repo pins ``mcp>=1.28,<2`` because the SDK's 2.0.0 release (2026-07-28)
+is a rework these scripts do NOT yet target:
+
+- ``streamablehttp_client`` became ``streamable_http_client``, and its
+  signature dropped ``headers=``/``auth=`` for a prebuilt ``http_client``,
+  yielding ``TransportStreams`` instead of a 3-tuple. The call above, and
+  every caller of ``resolve_url_and_auth``, assumes the v1 shape — so an
+  unpinned ``uv run`` resolves 2.x and dies at import.
+- The HTTP stack moved to ``httpx2``, whose types are NOT interchangeable
+  with ``httpx``: passing an ``httpx.AsyncClient`` does not raise, it
+  silently stops delivering server-initiated messages. A half-finished
+  migration fails QUIETLY, which is why this is pinned rather than shimmed.
+
+Porting to v2 is real work (auth moves into client construction) and should be
+checked against the deployed server's protocol revision first, since the
+2026-07-28 spec drops the streamable-HTTP initialize handshake. Upstream keeps
+v1 patched on its own branch and recommends exactly this constraint.
 """
 from __future__ import annotations
 

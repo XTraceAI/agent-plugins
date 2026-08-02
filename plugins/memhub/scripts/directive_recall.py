@@ -41,7 +41,7 @@ because the command said ``npm run gen:types``.
 trigger-in-handle contract before injection — transitional belt-and-braces for
 servers predating the match-semantics funnel; fail-open.
 
-Invoked as: ``uv run --with mcp python directive_recall.py`` with the PreToolUse
+Invoked as: ``uv run --with 'mcp>=1.28,<2' python directive_recall.py`` with the PreToolUse
 hook JSON on stdin.
 """
 from __future__ import annotations

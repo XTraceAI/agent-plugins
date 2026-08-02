@@ -12,7 +12,7 @@ $MEMHUB_TOKEN if set, else the cached plugin OAuth token, else a one-time
 browser approval.
 
 Run (mcp SDK pulled ephemerally by uv):
-    uv run --with mcp python scripts/import_session_test.py \
+    uv run --with 'mcp>=1.28,<2' python scripts/import_session_test.py \
         --session /path/to/<session>.jsonl \
         --max-bytes 800000 \
         --query "context agent creation"
