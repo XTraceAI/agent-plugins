@@ -402,7 +402,15 @@ def _render(items: list[dict]) -> str:
 async def _recall(
     tool: str, args: dict, repo: str, fired: list[str], output: str | None = None,
     session_id: str = "",
-) -> list[dict]:
+) -> list[dict] | None:
+    """Recalled directives, or ``None`` when the recall itself FAILED.
+
+    The distinction is load-bearing for the first-touch handle cache: a genuine
+    empty result (``[]``) means "asked, nothing matched" and is worth caching,
+    while a server error or an unparseable response means we never got an
+    answer — caching that would suppress this handle for the rest of the
+    session on a transient blip.
+    """
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
@@ -444,7 +452,7 @@ async def _recall(
                 texts = [t for t in (getattr(b, "text", None)
                          for b in getattr(res, "content", []) or []) if t]
                 _log(f"recall FAILED: {(texts[0] if texts else 'no detail')[:160]}")
-                return []
+                return None  # failure ≠ empty: don't let it poison the cache
             out = getattr(res, "structuredContent", None)
             if isinstance(out, dict) and isinstance(out.get("result"), dict) \
                     and "items" not in out:
@@ -459,7 +467,9 @@ async def _recall(
                         except json.JSONDecodeError:
                             continue
             items = out.get("items") if isinstance(out, dict) else None
-            return items if isinstance(items, list) else []
+            # An unparseable / unexpected payload is a failed answer, not an
+            # empty one — same cache reasoning as the isError path above.
+            return items if isinstance(items, list) else None
 
 
 def main() -> int:
@@ -495,10 +505,14 @@ def main() -> int:
                 _RECALL_TIMEOUT_S,
             )
         )
-        # The recall completed — remember the handle even on zero hits, so a
-        # later touch of the same file/command doesn't re-buy the same answer.
-        if handle and session_id:
+        # Cache the handle only when we actually got an ANSWER (including a
+        # genuinely empty one) — `None` means the recall failed, and caching
+        # that would suppress this handle for the rest of the session over a
+        # transient blip. Exceptions skip this line entirely (see the handler).
+        if items is not None and handle and session_id:
             _save_handles(session_id, handles + [handle])
+        if items is None:
+            return 0
         # Belt-and-braces dedup for servers predating already_fired — repeats
         # were 76% of all injection noise, so this must not depend on the
         # server version.

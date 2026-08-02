@@ -8,6 +8,7 @@ alias. These tests replay that exact case through the gate functions.
 Run: python3 directive_recall_test.py  (stdlib only — the mcp import in
 directive_recall is lazy, inside _recall).
 """
+import json
 import sys
 from pathlib import Path
 
@@ -105,6 +106,58 @@ def test_handle_cache_roundtrip(tmp_dir=None):
             assert dr._handle_key("Grep", {"pattern": "x"}) == ""
         finally:
             dr._STATE_DIR = orig
+
+
+def _run_main(hook_input: dict, recall_result, td: str) -> tuple[int, str, list[str]]:
+    """Drive main() end-to-end with _recall stubbed; returns (rc, stdout, cache)."""
+    import io
+    import contextlib
+    orig_recall, orig_stdin, orig_dir = dr._recall, sys.stdin, dr._STATE_DIR
+    dr._STATE_DIR = Path(td)
+
+    async def fake_recall(*a, **kw):
+        return recall_result
+
+    dr._recall = fake_recall
+    sys.stdin = io.StringIO(json.dumps(hook_input))
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = dr.main()
+        return rc, buf.getvalue(), dr._load_handles(hook_input.get("session_id", ""))
+    finally:
+        dr._recall, sys.stdin, dr._STATE_DIR = orig_recall, orig_stdin, orig_dir
+
+
+def test_failed_recall_does_not_poison_the_handle_cache():
+    """A recall FAILURE must stay distinguishable from an empty result.
+
+    ``_recall`` returns None on server error / unparseable payload and [] when
+    the server genuinely matched nothing. Caching a failure would suppress that
+    file/command for the whole session over a transient blip.
+    """
+    import tempfile
+    hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
+            "cwd": "/tmp", "session_id": "cache-test"}
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, cache = _run_main(hook, None, td)  # failure
+        assert rc == 0 and out == "" and cache == []
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, cache = _run_main(hook, [], td)  # genuine empty → cache it
+        assert rc == 0 and out == "" and cache == ["Edit:app/main.py"]
+
+
+def test_hit_injects_and_caches_the_handle():
+    import tempfile
+    hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
+            "cwd": "/tmp", "session_id": "hit-test"}
+    d = _mk("z", ["app/main.py"])
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, cache = _run_main(hook, [d], td)
+        assert rc == 0 and cache == ["Edit:app/main.py"]
+        payload = json.loads(out)["hookSpecificOutput"]
+        assert payload["hookEventName"] == "PreToolUse"
+        assert "fired on: app/main.py" in payload["additionalContext"]
 
 
 if __name__ == "__main__":

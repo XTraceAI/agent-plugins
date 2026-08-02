@@ -152,7 +152,9 @@ def main() -> int:
 
     try:
         cmd = [
-            "uv", "run", "--with", "mcp", "python", str(_IMPORT_SESSION),
+            # Pinned like every other invocation site: mcp 2.x renamed
+            # streamablehttp_client, breaking import_session.py's transport.
+            "uv", "run", "--with", "mcp<2", "python", str(_IMPORT_SESSION),
             "--session", str(transcript),
             "--conversation-id", conv_id,
         ]
