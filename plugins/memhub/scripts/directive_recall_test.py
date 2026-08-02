@@ -82,6 +82,17 @@ def test_rank_prefers_specific_match_then_seen_and_caps():
     assert dr._MAX_DIRECTIVES == 2
 
 
+def test_no_trigger_branch_clears_both_match_fields():
+    """A dict reused across filter passes must not keep a stale `_match_len`,
+    which would misorder it against its unmatched peers in `_rank`."""
+    d = _mk("a", ["swerex/deployment/modal.py"])
+    dr._precision_filter([d], {"command": "vim swerex/deployment/modal.py"}, "")
+    assert d["_match_len"] > 0
+    d["triggers"] = None  # now unverifiable
+    dr._precision_filter([d], {"command": "vim other.py"}, "")
+    assert "_match" not in d and "_match_len" not in d
+
+
 def test_render_shows_the_matched_trigger():
     d = _mk("a", ["swerex/deployment/modal.py", "boto3"], seen=3)
     kept = dr._precision_filter([d], {"command": "vim swerex/deployment/modal.py"}, "")
@@ -96,14 +107,17 @@ def test_handle_cache_roundtrip(tmp_dir=None):
         dr._STATE_DIR = Path(td)
         try:
             sid = "sess-abc"
-            key = dr._handle_key("Edit", {"file_path": "app/main.py"})
-            assert key == "Edit:app/main.py"
+            key = dr._handle_key("Edit", {"file_path": "app/main.py"}, "xmem")
+            assert key == "xmem:Edit:app/main.py"
             assert dr._load_handles(sid) == []
             dr._save_handles(sid, [key])
             assert dr._load_handles(sid) == [key]
             # Bash commands normalize whitespace; non-handle args disable caching.
-            assert dr._handle_key("Bash", {"command": "git  status\n"}) == "Bash:git status"
-            assert dr._handle_key("Grep", {"pattern": "x"}) == ""
+            assert dr._handle_key("Bash", {"command": "git  status\n"}, "r") == "r:Bash:git status"
+            assert dr._handle_key("Grep", {"pattern": "x"}, "r") == ""
+            # Same relative path in two checkouts must not share a cache slot.
+            assert (dr._handle_key("Edit", {"file_path": "app/main.py"}, "repo-a")
+                    != dr._handle_key("Edit", {"file_path": "app/main.py"}, "repo-b"))
         finally:
             dr._STATE_DIR = orig
 
@@ -139,12 +153,14 @@ def test_failed_recall_does_not_poison_the_handle_cache():
     import tempfile
     hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
             "cwd": "/tmp", "session_id": "cache-test"}
+    expected = dr._handle_key("Edit", {"file_path": "app/main.py"},
+                              dr._repo_name("/tmp"))
     with tempfile.TemporaryDirectory() as td:
         rc, out, cache = _run_main(hook, None, td)  # failure
         assert rc == 0 and out == "" and cache == []
     with tempfile.TemporaryDirectory() as td:
         rc, out, cache = _run_main(hook, [], td)  # genuine empty → cache it
-        assert rc == 0 and out == "" and cache == ["Edit:app/main.py"]
+        assert rc == 0 and out == "" and cache == [expected]
 
 
 def test_empty_shapes_are_answers_not_failures():
@@ -176,9 +192,11 @@ def test_hit_injects_and_caches_the_handle():
     hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
             "cwd": "/tmp", "session_id": "hit-test"}
     d = _mk("z", ["app/main.py"])
+    expected = dr._handle_key("Edit", {"file_path": "app/main.py"},
+                              dr._repo_name("/tmp"))
     with tempfile.TemporaryDirectory() as td:
         rc, out, cache = _run_main(hook, [d], td)
-        assert rc == 0 and cache == ["Edit:app/main.py"]
+        assert rc == 0 and cache == [expected]
         payload = json.loads(out)["hookSpecificOutput"]
         assert payload["hookEventName"] == "PreToolUse"
         assert "fired on: app/main.py" in payload["additionalContext"]

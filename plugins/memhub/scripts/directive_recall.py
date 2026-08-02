@@ -156,13 +156,18 @@ def _handles_path(session_id: str) -> Path | None:
     return (_STATE_DIR / f"{sid}-handles.json") if sid else None
 
 
-def _handle_key(tool: str, recall_args: dict) -> str:
+def _handle_key(tool: str, recall_args: dict, repo: str = "") -> str:
     """The handle identity for the cache: the file path for an edit, the
-    normalized command for Bash. Empty string disables caching for the call."""
+    normalized command for Bash. Empty string disables caching for the call.
+
+    Keyed by repo too: one session often spans two checkouts, and a relative
+    path like ``app/main.py`` exists in both — an unqualified key would let the
+    first repo's answer suppress recall for the second's file.
+    """
     for k in _ID_ARG_KEYS:
         v = recall_args.get(k)
         if isinstance(v, str) and v:
-            return f"{tool}:{' '.join(v.split())[:300]}"
+            return f"{repo}:{tool}:{' '.join(v.split())[:300]}"
     return ""
 
 
@@ -334,6 +339,7 @@ def _precision_filter(
             triggers = d.get("triggers")
             if not isinstance(triggers, list) or not triggers:
                 d.pop("_match", None)
+                d.pop("_match_len", None)  # both, or _rank sorts on a stale length
                 kept.append(d)  # no declared triggers → can't verify → keep
                 continue
             best_tok, best_trg = "", ""
@@ -478,10 +484,17 @@ async def _recall(
                 detail = (texts[0] if texts else "")[:200]
                 if re.search(r"unexpected|repo|already_fired|session_id|validation",
                              detail, re.I):
-                    _log("server predates repo/already_fired; retrying legacy")
-                    res = await session.call_tool("recall_directives", arguments={
-                        "tool": tool, "args": args,
-                    })
+                    _log("server predates repo/already_fired/session_id; "
+                         "retrying legacy")
+                    # Keep `output`: it predates the params being rejected and
+                    # is the reactive path's whole firing signal — dropping it
+                    # would silently reduce a failure recall to command-line
+                    # matching, the exact miss the reactive hook exists to fix.
+                    legacy: dict = {"tool": tool, "args": args}
+                    if output:
+                        legacy["output"] = output
+                    res = await session.call_tool("recall_directives",
+                                                  arguments=legacy)
             return _parse_recall_result(res)
 
 
@@ -507,21 +520,25 @@ def main() -> int:
         # First-touch-once: skip the round-trip when this session already
         # recalled on this exact handle (proactive path only — a failure must
         # always be allowed to re-fire reactively).
-        handle = "" if reactive else _handle_key(tool, recall_args)
+        repo = _repo_name(cwd)
+        handle = "" if reactive else _handle_key(tool, recall_args, repo)
         handles = _load_handles(session_id) if handle else []
         if handle and handle in handles:
             return 0
         items = asyncio.run(
             asyncio.wait_for(
-                _recall(tool, recall_args, _repo_name(cwd), fired, output,
-                        session_id),
+                _recall(tool, recall_args, repo, fired, output, session_id),
                 _RECALL_TIMEOUT_S,
             )
         )
-        # Cache the handle only when we actually got an ANSWER (including a
-        # genuinely empty one) — `None` means the recall failed, and caching
-        # that would suppress this handle for the rest of the session over a
-        # transient blip. Exceptions skip this line entirely (see the handler).
+        # Cache the handle once we have an ANSWER — including an empty one, and
+        # including one whose candidates all get dropped below. Re-asking the
+        # same handle re-buys the same answer (the drops are deterministic, and
+        # `already_fired` only ever grows), so the deliberate trade-off is: a
+        # handle answered once is not re-asked this session, even if nothing
+        # was injected. `None` means the recall FAILED — never cached, so a
+        # transient blip doesn't suppress the handle. Exceptions skip this line
+        # entirely (see the handler).
         if items is not None and handle and session_id:
             _save_handles(session_id, handles + [handle])
         if items is None:
