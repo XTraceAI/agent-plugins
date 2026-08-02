@@ -156,18 +156,20 @@ def _handles_path(session_id: str) -> Path | None:
     return (_STATE_DIR / f"{sid}-handles.json") if sid else None
 
 
-def _handle_key(tool: str, recall_args: dict, repo: str = "") -> str:
+def _handle_key(tool: str, recall_args: dict, cwd: str = "") -> str:
     """The handle identity for the cache: the file path for an edit, the
     normalized command for Bash. Empty string disables caching for the call.
 
-    Keyed by repo too: one session often spans two checkouts, and a relative
-    path like ``app/main.py`` exists in both — an unqualified key would let the
-    first repo's answer suppress recall for the second's file.
+    Qualified by the absolute ``cwd``, not the repo name, for two reasons: it
+    actually distinguishes checkouts (two worktrees of one repo share a remote
+    basename but never a cwd, and a relative ``app/main.py`` exists in both),
+    and reading it costs nothing — deriving a repo name here would spawn a git
+    subprocess on every call, including the cache hits this exists to make free.
     """
     for k in _ID_ARG_KEYS:
         v = recall_args.get(k)
         if isinstance(v, str) and v:
-            return f"{repo}:{tool}:{' '.join(v.split())[:300]}"
+            return f"{cwd}:{tool}:{' '.join(v.split())[:300]}"
     return ""
 
 
@@ -520,14 +522,16 @@ def main() -> int:
         # First-touch-once: skip the round-trip when this session already
         # recalled on this exact handle (proactive path only — a failure must
         # always be allowed to re-fire reactively).
-        repo = _repo_name(cwd)
-        handle = "" if reactive else _handle_key(tool, recall_args, repo)
+        handle = "" if reactive else _handle_key(tool, recall_args, cwd)
         handles = _load_handles(session_id) if handle else []
         if handle and handle in handles:
             return 0
+        # Only now derive the repo — it spawns a git subprocess, so it must sit
+        # AFTER the cache early-out or every cached hit pays for it.
         items = asyncio.run(
             asyncio.wait_for(
-                _recall(tool, recall_args, repo, fired, output, session_id),
+                _recall(tool, recall_args, _repo_name(cwd), fired, output,
+                        session_id),
                 _RECALL_TIMEOUT_S,
             )
         )

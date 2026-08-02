@@ -107,17 +107,18 @@ def test_handle_cache_roundtrip(tmp_dir=None):
         dr._STATE_DIR = Path(td)
         try:
             sid = "sess-abc"
-            key = dr._handle_key("Edit", {"file_path": "app/main.py"}, "xmem")
-            assert key == "xmem:Edit:app/main.py"
+            key = dr._handle_key("Edit", {"file_path": "app/main.py"}, "/w/xmem")
+            assert key == "/w/xmem:Edit:app/main.py"
             assert dr._load_handles(sid) == []
             dr._save_handles(sid, [key])
             assert dr._load_handles(sid) == [key]
             # Bash commands normalize whitespace; non-handle args disable caching.
-            assert dr._handle_key("Bash", {"command": "git  status\n"}, "r") == "r:Bash:git status"
-            assert dr._handle_key("Grep", {"pattern": "x"}, "r") == ""
-            # Same relative path in two checkouts must not share a cache slot.
-            assert (dr._handle_key("Edit", {"file_path": "app/main.py"}, "repo-a")
-                    != dr._handle_key("Edit", {"file_path": "app/main.py"}, "repo-b"))
+            assert dr._handle_key("Bash", {"command": "git  status\n"}, "/w") == "/w:Bash:git status"
+            assert dr._handle_key("Grep", {"pattern": "x"}, "/w") == ""
+            # Two WORKTREES of one repo share a remote basename but not a cwd:
+            # the same relative path in each must not share a cache slot.
+            assert (dr._handle_key("Edit", {"file_path": "app/main.py"}, "/w/xmem")
+                    != dr._handle_key("Edit", {"file_path": "app/main.py"}, "/w/xmem-wt2"))
         finally:
             dr._STATE_DIR = orig
 
@@ -153,14 +154,43 @@ def test_failed_recall_does_not_poison_the_handle_cache():
     import tempfile
     hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
             "cwd": "/tmp", "session_id": "cache-test"}
-    expected = dr._handle_key("Edit", {"file_path": "app/main.py"},
-                              dr._repo_name("/tmp"))
+    expected = dr._handle_key("Edit", {"file_path": "app/main.py"}, "/tmp")
     with tempfile.TemporaryDirectory() as td:
         rc, out, cache = _run_main(hook, None, td)  # failure
         assert rc == 0 and out == "" and cache == []
     with tempfile.TemporaryDirectory() as td:
         rc, out, cache = _run_main(hook, [], td)  # genuine empty → cache it
         assert rc == 0 and out == "" and cache == [expected]
+
+
+def test_cache_hit_costs_no_recall_and_no_git_subprocess():
+    """A cached handle must short-circuit before ANY expensive work.
+
+    `_repo_name` shells out to git; if it (or the recall) runs on a cache hit,
+    the cache stops being the latency win it exists to be.
+    """
+    import io
+    import tempfile
+    hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
+            "cwd": "/tmp", "session_id": "hit-free"}
+    key = dr._handle_key("Edit", {"file_path": "app/main.py"}, "/tmp")
+
+    def _boom(*a, **kw):
+        raise AssertionError("ran on a cache hit")
+
+    git_calls = []
+    saved = (dr._repo_name, dr._recall, sys.stdin, dr._STATE_DIR)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            dr._STATE_DIR = Path(td)
+            dr._save_handles("hit-free", [key])
+            dr._repo_name = lambda cwd: git_calls.append(cwd) or "repo"
+            dr._recall = _boom
+            sys.stdin = io.StringIO(json.dumps(hook))
+            assert dr.main() == 0
+        assert git_calls == [], f"_repo_name spawned git on a cache hit: {git_calls}"
+    finally:
+        dr._repo_name, dr._recall, sys.stdin, dr._STATE_DIR = saved
 
 
 def test_empty_shapes_are_answers_not_failures():
@@ -192,8 +222,7 @@ def test_hit_injects_and_caches_the_handle():
     hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},
             "cwd": "/tmp", "session_id": "hit-test"}
     d = _mk("z", ["app/main.py"])
-    expected = dr._handle_key("Edit", {"file_path": "app/main.py"},
-                              dr._repo_name("/tmp"))
+    expected = dr._handle_key("Edit", {"file_path": "app/main.py"}, "/tmp")
     with tempfile.TemporaryDirectory() as td:
         rc, out, cache = _run_main(hook, [d], td)
         assert rc == 0 and cache == [expected]
