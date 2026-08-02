@@ -147,6 +147,30 @@ def test_failed_recall_does_not_poison_the_handle_cache():
         assert rc == 0 and out == "" and cache == ["Edit:app/main.py"]
 
 
+def test_empty_shapes_are_answers_not_failures():
+    """Only a MISSING payload is a failure; an odd empty shape is an answer.
+
+    A server that spells "nothing matched" as `{"items": null}` (or omits the
+    key) must still cache the handle — classifying it as failure would re-buy
+    a ~2s recall on every later touch for the whole session.
+    """
+    class _Res:
+        content = []
+
+        def __init__(self, sc, is_error=False):
+            self.structuredContent = sc
+            self.isError = is_error
+
+    parse = dr._parse_recall_result
+    assert parse(_Res({"items": [{"id": "a"}]})) == [{"id": "a"}]
+    assert parse(_Res({"items": []})) == []
+    assert parse(_Res({"items": None})) == []              # odd empty → answer
+    assert parse(_Res({"count": 0})) == []                 # key absent → answer
+    assert parse(_Res({"result": {"items": []}})) == []    # FastMCP wrap
+    assert parse(_Res(None)) is None                       # no payload → failure
+    assert parse(_Res({"items": []}, is_error=True)) is None  # isError → failure
+
+
 def test_hit_injects_and_caches_the_handle():
     import tempfile
     hook = {"tool_name": "Edit", "tool_input": {"file_path": "app/main.py"},

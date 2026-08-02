@@ -399,6 +399,40 @@ def _render(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _parse_recall_result(res) -> list[dict] | None:
+    """Directives from a tool result, or ``None`` when there was NO answer.
+
+    Failure is narrow on purpose: an ``isError`` result or a payload we cannot
+    parse into a dict at all. A well-formed dict IS an answer even when
+    ``items`` is absent or not a list — a server may spell "nothing matched" as
+    ``null`` / ``{}``, and calling that a failure would stop the handle cache
+    from ever recording it, turning every later touch into a fresh ~2s recall.
+    """
+    if getattr(res, "isError", False):
+        texts = [t for t in (getattr(b, "text", None)
+                 for b in getattr(res, "content", []) or []) if t]
+        _log(f"recall FAILED: {(texts[0] if texts else 'no detail')[:160]}")
+        return None  # failure ≠ empty: don't let it poison the cache
+    out = getattr(res, "structuredContent", None)
+    if isinstance(out, dict) and isinstance(out.get("result"), dict) \
+            and "items" not in out:
+        out = out["result"]  # FastMCP sometimes wraps in {"result": …}
+    if not isinstance(out, dict):
+        for b in getattr(res, "content", []) or []:
+            text = getattr(b, "text", None)
+            if text:
+                try:
+                    out = json.loads(text)
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if not isinstance(out, dict):
+        _log("recall returned an unparseable payload")
+        return None
+    items = out.get("items")
+    return items if isinstance(items, list) else []
+
+
 async def _recall(
     tool: str, args: dict, repo: str, fired: list[str], output: str | None = None,
     session_id: str = "",
@@ -448,28 +482,7 @@ async def _recall(
                     res = await session.call_tool("recall_directives", arguments={
                         "tool": tool, "args": args,
                     })
-            if getattr(res, "isError", False):
-                texts = [t for t in (getattr(b, "text", None)
-                         for b in getattr(res, "content", []) or []) if t]
-                _log(f"recall FAILED: {(texts[0] if texts else 'no detail')[:160]}")
-                return None  # failure ≠ empty: don't let it poison the cache
-            out = getattr(res, "structuredContent", None)
-            if isinstance(out, dict) and isinstance(out.get("result"), dict) \
-                    and "items" not in out:
-                out = out["result"]  # FastMCP sometimes wraps in {"result": …}
-            if not isinstance(out, dict):
-                for b in getattr(res, "content", []) or []:
-                    text = getattr(b, "text", None)
-                    if text:
-                        try:
-                            out = json.loads(text)
-                            break
-                        except json.JSONDecodeError:
-                            continue
-            items = out.get("items") if isinstance(out, dict) else None
-            # An unparseable / unexpected payload is a failed answer, not an
-            # empty one — same cache reasoning as the isError path above.
-            return items if isinstance(items, list) else None
+            return _parse_recall_result(res)
 
 
 def main() -> int:
