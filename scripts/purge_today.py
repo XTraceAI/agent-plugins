@@ -9,8 +9,8 @@ Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
 $MEMHUB_TOKEN if set, else the cached plugin OAuth token, else a one-time
 browser approval.
 
-    uv run --with mcp python scripts/purge_today.py --since 2026-06-09           # dry-run
-    uv run --with mcp python scripts/purge_today.py --since 2026-06-09 --execute # delete
+    uv run --with 'mcp<2' python scripts/purge_today.py --since 2026-06-09           # dry-run
+    uv run --with 'mcp<2' python scripts/purge_today.py --since 2026-06-09 --execute # delete
 """
 from __future__ import annotations
 import argparse, asyncio, json, sys

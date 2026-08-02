@@ -25,6 +25,20 @@ candidates. Repeats measured as 76% of all injection noise.
 as ``repo``: the server scopes recall to directives learned there (legacy
 unscoped rows still pass) and discounts the repo's own name as a trigger.
 
+**Self-echo exclusion.** The Claude Code ``session_id`` is sent so the server
+can skip directives minted from this session's own conversation. A 90-site
+transcript audit (2026-08-02) found replayed same-session lessons — delivered
+minutes after the agent already applied them — were the dominant ignored-
+injection class; excluding them is a server-side filter, this client just
+supplies the id (with a legacy retry for servers predating the param).
+
+**First-touch-once + ranked cap.** The proactive path recalls at most once per
+identifying handle (file path / command string) per session — repeat touches
+re-bought the same answer at ~2s a call with zero measured conversions — and
+injects at most ``_MAX_DIRECTIVES`` survivors, ranked by match specificity,
+each rendered with the concrete trigger that fired (``fired on: …``) so the
+agent can validate applicability in one glance.
+
 **Reactive (PostToolUse) recall on failure.** The same script serves a second
 hook: when a tool call FAILS, the error text itself is the richest firing
 signal — a traceback names the module, a codegen error names the schema path,
@@ -41,7 +55,7 @@ because the command said ``npm run gen:types``.
 trigger-in-handle contract before injection — transitional belt-and-braces for
 servers predating the match-semantics funnel; fail-open.
 
-Invoked as: ``uv run --with mcp python directive_recall.py`` with the PreToolUse
+Invoked as: ``uv run --with 'mcp<2' python directive_recall.py`` with the PreToolUse
 hook JSON on stdin.
 """
 from __future__ import annotations
@@ -61,7 +75,10 @@ from _memhub_auth import resolve_url_and_auth  # noqa: E402
 # hung server can't be allowed to stall the agent; the server's own LLM-gate
 # budget (0.8s, fail-open) fits inside with headroom. Fail-open on hit.
 _RECALL_TIMEOUT_S = 2.5
-_MAX_DIRECTIVES = 5
+# Transcript audit (2026-08-02, 90 firing sites): 5-item blocks get skimmed —
+# the one costly miss was the right directive buried under leftovers. Fewer,
+# ranked, each with its concrete match shown.
+_MAX_DIRECTIVES = 2
 
 # The firing signal for a tool call is its identifying handle — the file path
 # for an edit/write, the command for Bash — NOT the file body or diff hunks.
@@ -123,6 +140,52 @@ def _save_fired(session_id: str, ids: list[str]) -> None:
                 old.unlink(missing_ok=True)
     except OSError:
         pass  # state is an optimization, never worth failing the hook
+
+
+# --- per-session first-touch handle cache ----------------------------------
+# One recall per identifying handle per session (PreToolUse only): once we've
+# asked the server about a given file path or command string, re-asking on
+# every later touch re-buys the same answer at ~2s a call — the audit measured
+# repeat-handle recalls as pure latency with zero conversions. The reactive
+# (failure) path bypasses this cache: a repeated failing command is exactly
+# when recall must fire again. A transient recall error does NOT record the
+# handle, so the next touch retries.
+
+def _handles_path(session_id: str) -> Path | None:
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", session_id or "")
+    return (_STATE_DIR / f"{sid}-handles.json") if sid else None
+
+
+def _handle_key(tool: str, recall_args: dict) -> str:
+    """The handle identity for the cache: the file path for an edit, the
+    normalized command for Bash. Empty string disables caching for the call."""
+    for k in _ID_ARG_KEYS:
+        v = recall_args.get(k)
+        if isinstance(v, str) and v:
+            return f"{tool}:{' '.join(v.split())[:300]}"
+    return ""
+
+
+def _load_handles(session_id: str) -> list[str]:
+    path = _handles_path(session_id)
+    if not path:
+        return []
+    try:
+        keys = json.loads(path.read_text())
+        return [str(k) for k in keys] if isinstance(keys, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _save_handles(session_id: str, keys: list[str]) -> None:
+    path = _handles_path(session_id)
+    if not path:
+        return
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(keys[-_MAX_FIRED_SENT:]))
+    except OSError:
+        pass  # the cache is an optimization, never worth failing the hook
 
 
 def _repo_name(cwd: str) -> str:
@@ -197,6 +260,11 @@ _GENERIC_TOKENS = frozenset({
     "true", "false", "none", "null", "self", "this", "that", "with",
     "from", "when", "into", "your", "code", "file", "path", "main",
     "test", "tests", "todo", "temp", "data",
+    # Workspace-universal git words (audit: `origin/staging` word-tokens alone
+    # drove 1,461 injections). The full path token "origin/staging" stays
+    # matchable, so a directive anchored on it still fires on commands that
+    # literally name it — just not on every `git push origin <branch>`.
+    "origin", "staging", "master", "branch", "commit",
 })
 _MIN_TOKEN_LEN = 4
 
@@ -247,6 +315,11 @@ def _precision_filter(
     on the CAUSE named in the error must survive even when the command line
     only shows an alias. Fail-open: any error returns ``items`` unchanged, so
     the gate can never suppress the feature.
+
+    Survivors are annotated in place with ``_match`` — the declared trigger
+    whose longest token hit the haystack — which drives both the ranked
+    truncation to ``_MAX_DIRECTIVES`` and the rendered "fired on" line, so the
+    agent can validate applicability in one glance.
     """
     try:
         haystack = " ".join(
@@ -260,18 +333,40 @@ def _precision_filter(
         for d in items:
             triggers = d.get("triggers")
             if not isinstance(triggers, list) or not triggers:
+                d.pop("_match", None)
                 kept.append(d)  # no declared triggers → can't verify → keep
                 continue
-            tokens = {
-                tok
-                for t in triggers if isinstance(t, str)
-                for tok in _trigger_tokens(t)
-                if tok not in blocked
-            }
-            if any(tok in haystack for tok in tokens):
+            best_tok, best_trg = "", ""
+            for t in triggers:
+                if not isinstance(t, str):
+                    continue
+                for tok in _trigger_tokens(t):
+                    if tok not in blocked and tok in haystack and len(tok) > len(best_tok):
+                        best_tok, best_trg = tok, t
+            if best_tok:
+                d["_match"] = best_trg
+                d["_match_len"] = len(best_tok)
                 kept.append(d)
         return kept
     except Exception:  # noqa: BLE001 — the gate must never break the hook
+        return items
+
+
+def _rank(items: list[dict]) -> list[dict]:
+    """Order survivors so the ranked cap keeps the most defensible ones:
+    concretely-verified matches first, more specific (longer) matched tokens
+    before generic ones, then more-often-confirmed directives. Stable, so the
+    server's own ordering breaks remaining ties."""
+    try:
+        return sorted(
+            items,
+            key=lambda d: (
+                -int("_match" in d),
+                -int(d.get("_match_len") or 0),
+                -(d.get("seen") if isinstance(d.get("seen"), int) else 0),
+            ),
+        )
+    except Exception:  # noqa: BLE001 — ranking must never break the hook
         return items
 
 
@@ -283,7 +378,13 @@ def _render(items: list[dict]) -> str:
     for d in items:
         kind = str(d.get("type", "directive")).upper()
         text = str(d.get("content", "")).strip()
-        triggers = ", ".join(str(t) for t in (d.get("triggers") or [])[:4])
+        # "Why fired": the one trigger that concretely hit this call beats a
+        # trigger list the agent would have to cross-check itself.
+        matched = str(d.get("_match") or "").strip()
+        anchor = (f"fired on: {matched}" if matched
+                  else ", ".join(str(t) for t in (d.get("triggers") or [])[:4]))
+        if anchor and not matched:
+            anchor = f"triggers: {anchor}"
         # Provenance the agent can weight instead of re-verifying: when the
         # directive was last confirmed and how often it has been observed.
         prov = []
@@ -292,16 +393,15 @@ def _render(items: list[dict]) -> str:
         if isinstance(d.get("seen"), int) and d["seen"] > 1:
             prov.append(f"seen {d['seen']}×")
         suffix = ""
-        if triggers or prov:
-            suffix = "  _(" + "; ".join(
-                p for p in (f"triggers: {triggers}" if triggers else "", *prov) if p
-            ) + ")_"
+        if anchor or prov:
+            suffix = "  _(" + "; ".join(p for p in (anchor, *prov) if p) + ")_"
         lines.append(f"- **[{kind}]** {text}{suffix}")
     return "\n".join(lines)
 
 
 async def _recall(
     tool: str, args: dict, repo: str, fired: list[str], output: str | None = None,
+    session_id: str = "",
 ) -> list[dict]:
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -320,15 +420,22 @@ async def _recall(
                 arguments["repo"] = repo
             if fired:
                 arguments["already_fired"] = fired[-_MAX_FIRED_SENT:]
+            if session_id:
+                # Self-echo exclusion: the server skips directives minted from
+                # this session's own conversation — the audit's dominant noise
+                # class (lessons replayed minutes after the agent applied them).
+                arguments["session_id"] = session_id
             res = await session.call_tool("recall_directives", arguments=arguments)
-            if getattr(res, "isError", False) and (repo or fired):
+            if getattr(res, "isError", False) and (repo or fired or session_id):
                 # Rolling-upgrade compat: a server predating the repo /
-                # already_fired params rejects unknown arguments. Retry once
-                # legacy-shaped — client-side dedup still covers repeats.
+                # already_fired / session_id params rejects unknown arguments.
+                # Retry once legacy-shaped — client-side dedup still covers
+                # repeats.
                 texts = [t for t in (getattr(b, "text", None)
                          for b in getattr(res, "content", []) or []) if t]
                 detail = (texts[0] if texts else "")[:200]
-                if re.search(r"unexpected|repo|already_fired|validation", detail, re.I):
+                if re.search(r"unexpected|repo|already_fired|session_id|validation",
+                             detail, re.I):
                     _log("server predates repo/already_fired; retrying legacy")
                     res = await session.call_tool("recall_directives", arguments={
                         "tool": tool, "args": args,
@@ -374,12 +481,24 @@ def main() -> int:
         session_id = str(hook_input.get("session_id") or "")
         fired = _load_fired(session_id)
         recall_args = _recall_args(args)
+        # First-touch-once: skip the round-trip when this session already
+        # recalled on this exact handle (proactive path only — a failure must
+        # always be allowed to re-fire reactively).
+        handle = "" if reactive else _handle_key(tool, recall_args)
+        handles = _load_handles(session_id) if handle else []
+        if handle and handle in handles:
+            return 0
         items = asyncio.run(
             asyncio.wait_for(
-                _recall(tool, recall_args, _repo_name(cwd), fired, output),
+                _recall(tool, recall_args, _repo_name(cwd), fired, output,
+                        session_id),
                 _RECALL_TIMEOUT_S,
             )
         )
+        # The recall completed — remember the handle even on zero hits, so a
+        # later touch of the same file/command doesn't re-buy the same answer.
+        if handle and session_id:
+            _save_handles(session_id, handles + [handle])
         # Belt-and-braces dedup for servers predating already_fired — repeats
         # were 76% of all injection noise, so this must not depend on the
         # server version.
@@ -389,7 +508,7 @@ def main() -> int:
         # match-semantics funnel: only triggers that concretely hit this call —
         # where "this call" includes the failing output on the reactive path.
         items = _precision_filter(items, recall_args, cwd, output or "")
-        items = items[:_MAX_DIRECTIVES]
+        items = _rank(items)[:_MAX_DIRECTIVES]
         if items:
             _log(f"{len(items)} directive(s) fired for {tool}"
                  + (" (reactive, on failure output)" if output else ""))

@@ -5,7 +5,7 @@ Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
 $MEMHUB_TOKEN if set, else the cached plugin OAuth token, else a one-time
 browser approval.
 
-    uv run --with mcp python scripts/search_verify.py \
+    uv run --with 'mcp<2' python scripts/search_verify.py \
         --query "context agent" --created-after 2026-06-09
 """
 from __future__ import annotations

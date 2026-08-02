@@ -51,6 +51,62 @@ def test_error_regexes_stay_in_sync():
     assert rp._ERROR_RE.pattern == dr._ERROR_RE.pattern
 
 
+# --- ranked cap + why-fired (2026-08-02 audit follow-ups) -------------------
+
+def _mk(i, triggers, seen=1):
+    return {"id": i, "type": "lesson", "content": f"lesson {i}",
+            "triggers": triggers, "seen": seen}
+
+
+def test_generic_git_words_cannot_carry_a_match():
+    # `origin` / `staging` word-tokens alone drove 1,461 audited injections:
+    # a directive anchored on the origin/staging PATH must not fire on a mere
+    # `git push origin <branch>` …
+    d = _mk("w", ["origin/staging"])
+    assert dr._precision_filter([d], {"command": "git push origin fm-feat/x"}, "") == []
+    # … but must still fire where the full path is literally named — the
+    # audited in-place-rebase failure is exactly this call.
+    kept = dr._precision_filter([d], {"command": "git rebase origin/staging"}, "")
+    assert kept and kept[0]["_match"] == "origin/staging"
+
+
+def test_rank_prefers_specific_match_then_seen_and_caps():
+    specific = _mk("a", ["swerex/deployment/modal.py"])
+    generic = _mk("b", ["modal"], seen=9)
+    unverified = _mk("c", None)
+    args = {"command": "uv run python swerex/deployment/modal.py --deploy"}
+    kept = dr._precision_filter([unverified, generic, specific], args, "")
+    top = dr._rank(kept)[:dr._MAX_DIRECTIVES]
+    assert [d["id"] for d in top] == ["a", "b"]  # match beats unverified; specificity beats seen
+    assert dr._MAX_DIRECTIVES == 2
+
+
+def test_render_shows_the_matched_trigger():
+    d = _mk("a", ["swerex/deployment/modal.py", "boto3"], seen=3)
+    kept = dr._precision_filter([d], {"command": "vim swerex/deployment/modal.py"}, "")
+    out = dr._render(kept)
+    assert "fired on: swerex/deployment/modal.py" in out and "seen 3×" in out
+
+
+def test_handle_cache_roundtrip(tmp_dir=None):
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        orig = dr._STATE_DIR
+        dr._STATE_DIR = Path(td)
+        try:
+            sid = "sess-abc"
+            key = dr._handle_key("Edit", {"file_path": "app/main.py"})
+            assert key == "Edit:app/main.py"
+            assert dr._load_handles(sid) == []
+            dr._save_handles(sid, [key])
+            assert dr._load_handles(sid) == [key]
+            # Bash commands normalize whitespace; non-handle args disable caching.
+            assert dr._handle_key("Bash", {"command": "git  status\n"}) == "Bash:git status"
+            assert dr._handle_key("Grep", {"pattern": "x"}) == ""
+        finally:
+            dr._STATE_DIR = orig
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
