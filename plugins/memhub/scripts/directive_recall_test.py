@@ -50,6 +50,51 @@ def test_error_output_gates_success_and_extracts_tail():
 def test_error_regexes_stay_in_sync():
     import reactive_prefilter as rp
     assert rp._ERROR_RE.pattern == dr._ERROR_RE.pattern
+    # The read-back gate must match too, or the cheap prefilter and the
+    # authoritative gate disagree about what a Read/BashOutput failure is.
+    assert rp._STRONG_ERROR_RE.pattern == dr._STRONG_ERROR_RE.pattern
+    assert rp._READBACK_TOOLS == dr._READBACK_TOOLS
+
+
+# --- reactive coverage: background read-backs + exit-0 failures (2026-08-03) --
+
+
+def test_ci_failure_in_a_successful_command_fires():
+    # `gh pr view --json statusCheckRollup` exits 0 and reports the failure in
+    # its payload; the lesson anchored on the named file never fired before.
+    ci = '{"checks":[{"conclusion":"FAILURE","name":"Verify app imports cleanly"}]}'
+    assert dr._error_output({"tool_name": "Bash", "tool_response": ci}) is not None
+
+
+def test_read_back_of_a_background_traceback_fires():
+    # A backgrounded run's failure is invisible to PostToolUse until the agent
+    # reads the output file — that read is the firing moment.
+    tb = ("Traceback (most recent call last):\n"
+          "  File \"anchor_ab.py\", line 26\n"
+          "ModuleNotFoundError: No module named 'dotenv'")
+    assert dr._error_output({"tool_name": "Read", "tool_response": tb}) is not None
+
+
+def test_reading_ordinary_source_does_not_fire():
+    # The reason read-back tools use the STRONG markers: ordinary source is
+    # full of the weak ones, and firing on every Read would be pure noise.
+    src = ("try:\n    run()\nexcept Exception as e:\n"
+           "    logger.error(f'Error: {e}')\n    raise ValueError('bad input')")
+    assert dr._error_output({"tool_name": "Read", "tool_response": src}) is None
+    # ...while the same text from a command still counts as a failure.
+    assert dr._error_output({"tool_name": "Bash", "tool_response": src}) is not None
+
+
+def test_session_budget_silences_proactive_but_never_reactive():
+    assert dr._session_budget() == 25
+    import os
+    os.environ["MEMHUB_DIRECTIVE_SESSION_BUDGET"] = "3"
+    try:
+        assert dr._session_budget() == 3
+        os.environ["MEMHUB_DIRECTIVE_SESSION_BUDGET"] = "junk"
+        assert dr._session_budget() == 25          # unparseable -> default
+    finally:
+        os.environ.pop("MEMHUB_DIRECTIVE_SESSION_BUDGET", None)
 
 
 # --- ranked cap + why-fired (2026-08-02 audit follow-ups) -------------------

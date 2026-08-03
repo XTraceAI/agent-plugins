@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -93,13 +94,46 @@ _MAX_OUTPUT_CHARS = 1500
 _ERROR_RE = re.compile(
     r"(?:Traceback \(most recent call last\)|\b[A-Z][a-zA-Z]*Error\b"
     r"|\bERROR\b|\bError\b|error:|✘|npm ERR!|FAILED\b|fatal:|Exception\b"
-    r"|command not found|No such file or directory)"
+    r"|command not found|No such file or directory"
+    # A command can exit 0 and still report failure in its payload — the CI
+    # status poll (`gh pr view --json statusCheckRollup`) is the measured case:
+    # the run succeeded, the output said "conclusion":"FAILURE", and the lesson
+    # anchored on the file it named never fired.
+    r"|\bFAILURE\b|\bTIMED_OUT\b)"
+)
+
+# Read-like tools return CONTENT, not execution output: a source file holding
+# the word "Error" (every except-clause, every error-message literal) would
+# trip the weak markers on every read. They sit in the PostToolUse matcher for
+# ONE reason — a background task's failure only becomes visible when the agent
+# reads the output back — so gate them on markers that appear in real failure
+# output and essentially never in source.
+_READBACK_TOOLS = frozenset({"Read", "BashOutput"})
+_STRONG_ERROR_RE = re.compile(
+    r"(?:Traceback \(most recent call last\)|npm ERR!|command not found"
+    r"|\bFAILURE\b|\bTIMED_OUT\b|✘|^fatal:|^FAILED\b|^E\s{3})",
+    re.MULTILINE,
 )
 
 # Session already_fired state: one small JSON list per session id, pruned by
 # age so the directory can't grow unbounded across months of sessions.
 _STATE_DIR = Path.home() / ".claude" / ".memhub" / "directive_fired"
 _STATE_MAX_AGE_S = 7 * 24 * 3600
+
+
+def _session_budget() -> int:
+    """Distinct directives the PROACTIVE channel may push in one session.
+
+    Measured 2026-08 over 70 sessions: ~82 injections/session, ~3% acted on,
+    one session took 811 — past some point more pushing only teaches the reader
+    to skim (the habituation the firing audit found). A flat per-session budget
+    is the cheapest volume control that needs no new infrastructure: the
+    already-tracked fired-id list IS the count. 0 disables the budget.
+    """
+    try:
+        return int(os.environ.get("MEMHUB_DIRECTIVE_SESSION_BUDGET") or 25)
+    except ValueError:
+        return 25
 _MAX_FIRED_SENT = 1024
 
 
@@ -240,7 +274,12 @@ def _error_output(hook_input: dict) -> str | None:
     else:
         text = str(resp)
     tail = text[-_MAX_OUTPUT_CHARS:].strip()
-    if not tail or not _ERROR_RE.search(tail):
+    marker = (
+        _STRONG_ERROR_RE
+        if (hook_input.get("tool_name") or "") in _READBACK_TOOLS
+        else _ERROR_RE
+    )
+    if not tail or not marker.search(tail):
         return None
     return tail
 
@@ -525,6 +564,15 @@ def main() -> int:
         cwd = hook_input.get("cwd") or ""
         session_id = str(hook_input.get("session_id") or "")
         fired = _load_fired(session_id)
+        # Per-session proactive budget: once this session has been handed
+        # ``_session_budget()`` distinct directives, the PROACTIVE channel goes
+        # quiet. The REACTIVE path is exempt by design — a failure is the
+        # highest-value moment there is, and it is already rare by construction
+        # (it needs an actual error marker), so it can never be the thing that
+        # exhausts the budget it is exempt from.
+        budget = _session_budget()
+        if not reactive and budget and len(fired) >= budget:
+            return 0
         recall_args = _recall_args(args)
         # First-touch-once: skip the round-trip when this session already
         # recalled on this exact handle (proactive path only — a failure must
