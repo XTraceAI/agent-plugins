@@ -132,28 +132,20 @@ def _read_cursor(state: dict, size: int) -> int:
     return offset if 0 <= offset <= size else 0
 
 
-def _write_cursor(session_id: str, offset: int, last_uuid: str | None,
-                  cwd: str | None, namespace: str | None) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_DIR / f"{session_id}.json.tmp"
-    # Written atomically: a torn cursor read as a larger offset than was
-    # actually shipped would skip records for good.
-    tmp.write_text(json.dumps({
-        "offset": offset, "last_uuid": last_uuid, "cwd": cwd,
-        "namespace": namespace, "at": time.time(),
-    }))
-    tmp.replace(STATE_DIR / f"{session_id}.json")
+def _save_state(session_id: str, **fields) -> None:
+    """Merge ``fields`` into the session's state and write it atomically.
 
+    MERGE, not replace: the session remembers several things resolved at
+    different moments — the cursor, the repo it ran in, its namespace, its
+    title — and a flush that only knows some of them must not erase the rest.
 
-def _mark_unsupported(session_id: str) -> None:
-    """Record that this server cannot do per-turn buffering.
-
-    The prefilter reads it and skips for the rest of the session, so the
-    warning is emitted once rather than on every turn.
+    Atomic, because a torn read that reported a larger offset than was actually
+    shipped would skip those records for good.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     state = _read_state(session_id)
-    state["unsupported"] = True
+    state.update(fields)
+    state["at"] = time.time()
     tmp = STATE_DIR / f"{session_id}.json.tmp"
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_DIR / f"{session_id}.json")
@@ -217,6 +209,28 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
     return records, consumed
 
 
+def _title(records: list[dict]) -> str | None:
+    """The session title Claude Code generated, if this delta carries one.
+
+    Claude Code writes its own title as an ``ai-title`` record (``aiTitle``),
+    and regenerates it as the session develops — so the LAST one wins. Without
+    this the automatic capture paths import every session unnamed, and a
+    sessions list reads as a wall of untitled rows.
+
+    Harvested even from deltas we do not send: ``ai-title`` is an inert
+    record type, so the title often arrives in a batch that is consumed
+    without a server call. Remembering it there is what makes it available to
+    the next real flush.
+    """
+    title = None
+    for r in records:
+        if isinstance(r, dict) and r.get("type") == "ai-title":
+            value = (r.get("aiTitle") or "").strip()
+            if value:
+                title = value
+    return title
+
+
 def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
     """(cwd, git-remote basename) — the session's working-context scope.
 
@@ -247,7 +261,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     from mcp.client.streamable_http import streamablehttp_client
 
     from _memhub_auth import resolve_url_and_auth
-    from room_map import env_for_url, read_room
+    from brain_resolve import resolve_repo_brain
+    from room_map import env_for_url
 
     size = os.path.getsize(transcript_path)
     state = _read_state(session_id)
@@ -267,8 +282,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # inert delta should cost nothing at all.
     if all(isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
            for r in records):
-        _write_cursor(session_id, consumed, state.get("last_uuid"),
-                      state.get("cwd"), state.get("namespace"))
+        # The title usually arrives in exactly this kind of batch, so read it
+        # before dropping the records on the floor.
+        inert_title = _title(records)
+        if inert_title:
+            _save_state(session_id, offset=consumed, title=inert_title)
+        else:
+            _save_state(session_id, offset=consumed)
         return
 
     # Each falls back INDEPENDENTLY. Tying the namespace's fallback to the cwd's
@@ -283,16 +303,22 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if not namespace:
         # Remembered, so this is a dict lookup rather than re-running git.
         namespace = state.get("namespace") or None
+
+    # This delta's title if it carries one, else whatever we last saw.
+    title = _title(records) or state.get("title") or None
     url, headers, auth = resolve_url_and_auth(interactive=False)
-    # Read AFTER the url resolves — prod and staging hold different brain ids
-    # for the same repo. Only when the TRANSCRIPT said where it ran: a hook can
-    # fire from a different repo than the session's, and an unknown origin must
+    # Resolved AFTER the url — prod and staging hold different brain ids for the
+    # same repo. Only when the TRANSCRIPT said where it ran: a hook can fire
+    # from a different repo than the session's, and an unknown origin must
     # degrade to personal memory rather than guess a room.
-    room = read_room(cwd, env_for_url(url)) if cwd else None
+    env = env_for_url(url)
 
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as session:
             await session.initialize()
+            # Cached hit is a dict lookup; a miss asks the server once and
+            # caches the answer, so this is not a per-turn round-trip.
+            room = await resolve_repo_brain(session, cwd, env) if cwd else None
             arguments = {
                 "messages": records,
                 "conversation_id": session_id,
@@ -304,6 +330,11 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 arguments["agent_brain_id"] = room["brain_id"]
             if namespace:
                 arguments["namespace"] = namespace
+            if title:
+                # Re-sent on every flush so a regenerated title updates the
+                # conversation rather than sticking at whatever the first
+                # turn happened to be called.
+                arguments["title"] = title
             res = await session.call_tool("import_conversation", arguments=arguments)
 
             # MCP signals tool failure via isError + a message, NOT an
@@ -350,12 +381,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                      "disabling per-turn flush for this session; commit/PR "
                      "and session-end capture still apply. Upgrade the MemHub "
                      "server to enable it.")
-                _mark_unsupported(session_id)
+                _save_state(session_id, unsupported=True)
                 return
 
             # Committed server-side — only now is it safe to move the cursor.
-            _write_cursor(session_id, consumed, out.get("ack_through"), cwd,
-                          namespace)
+            _save_state(session_id, offset=consumed,
+                        last_uuid=out.get("ack_through"), cwd=cwd,
+                        namespace=namespace, title=title)
             _log(f"+{len(records)} rec ({consumed - offset}B) "
                  f"new={out.get('records_new')} pending={out.get('pending')} "
                  f"draining={out.get('draining')}")

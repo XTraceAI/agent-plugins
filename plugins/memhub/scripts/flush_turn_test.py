@@ -114,11 +114,20 @@ def test_cursor_trust():
         ft.STATE_DIR = Path(d)
         check("no cursor -> 0", ft._read_cursor(ft._read_state("s1"), 500), 0)
 
-        ft._write_cursor("s1", 120, "u-1", "/repo", "my-project")
+        ft._save_state("s1", offset=120, last_uuid="u-1", cwd="/repo",
+                       namespace="my-project")
         check("round-trips", ft._read_cursor(ft._read_state("s1"), 500), 120)
         # Remembered so a delta of sidecar-only records (which never carry cwd)
         # still routes to the repo's room instead of personal memory.
         check("cwd remembered", ft._read_state("s1").get("cwd"), "/repo")
+        # Merging, not replacing: a later flush that only knows the offset must
+        # not erase the repo, namespace and title resolved earlier.
+        ft._save_state("s1", offset=200)
+        check("merge keeps cwd", ft._read_state("s1").get("cwd"), "/repo")
+        check("merge keeps namespace",
+              ft._read_state("s1").get("namespace"), "my-project")
+        check("merge updates offset", ft._read_state("s1").get("offset"), 200)
+        ft._save_state("s1", offset=120)
         # Remembered too, so the fallback never re-shells out to git.
         check("namespace remembered",
               ft._read_state("s1").get("namespace"), "my-project")
@@ -131,6 +140,31 @@ def test_cursor_trust():
 
         (Path(d) / "s2.json").write_text("{not json")
         check("corrupt cursor -> 0", ft._read_cursor(ft._read_state("s2"), 500), 0)
+
+
+def test_title_is_harvested_from_the_transcript():
+    """Claude Code already generates a session title and writes it as an
+    ``ai-title`` record. Without reading it the automatic capture paths import
+    every session unnamed, and the sessions list is a wall of untitled rows.
+
+    The last one wins, because Claude Code regenerates the title as a session
+    develops."""
+    print("_title")
+    check("none when absent", ft._title([_rec("a")]), None)
+    check("reads aiTitle",
+          ft._title([{"type": "ai-title", "aiTitle": "Review legacy skill code"}]),
+          "Review legacy skill code")
+    check("last one wins", ft._title([
+        {"type": "ai-title", "aiTitle": "first guess"},
+        _rec("a"),
+        {"type": "ai-title", "aiTitle": "better title"},
+    ]), "better title")
+    check("blank is not a title",
+          ft._title([{"type": "ai-title", "aiTitle": "   "}]), None)
+    # ai-title is an inert type, so the title usually arrives in a batch that is
+    # consumed WITHOUT a server call — it has to be read before dropping it.
+    check("an ai-title batch is inert",
+          _all_inert([{"type": "ai-title", "aiTitle": "x"}]), True)
 
 
 def _all_inert(records):
@@ -288,6 +322,7 @@ if __name__ == "__main__":
                test_tail_stops_before_partial_line, test_cursor_trust,
                test_inert_only_delta_is_consumed_but_attachments_are_not,
                test_timeout_override_never_breaks_the_hook,
+               test_title_is_harvested_from_the_transcript,
                test_lock, test_prefilter):
         fn()
     print()

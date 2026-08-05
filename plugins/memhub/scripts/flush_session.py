@@ -36,7 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import NonInteractiveAuthRequired, resolve_url_and_auth  # noqa: E402
-from room_map import env_for_url, read_room  # noqa: E402
+from brain_resolve import resolve_repo_brain  # noqa: E402
+from room_map import env_for_url  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception (with traceback) before it
 # propagates to us; a background hook must stay quiet, so silence that logger
@@ -107,11 +108,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # back to this process's cwd, and a hook can fire from a different repo than
     # the session's — routing the session into a room it has nothing to do with.
     # Unknown origin must degrade to personal, never to a guess.
-    room = read_room(cwd, env_for_url(url)) if cwd else None
+    env = env_for_url(url)
 
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as session:
             await session.initialize()
+            # Cached hit is a dict lookup; a miss asks the server once and
+            # caches the answer, so this is not a per-flush round-trip.
+            room = await resolve_repo_brain(session, cwd, env) if cwd else None
             arguments = {
                 "messages": records,
                 "conversation_id": session_id,
