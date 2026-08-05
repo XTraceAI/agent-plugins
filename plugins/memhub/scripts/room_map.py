@@ -51,6 +51,7 @@ import contextlib
 import json
 import os
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -267,6 +268,62 @@ def write_room(
             tmp.unlink(missing_ok=True)
             raise
     return ROOMS_PATH
+
+
+# How long a "this repo has no brain" answer is trusted before we look again.
+# Without a negative entry every capture would re-query on every turn for repos
+# that simply have no room; with one that never expires, a brain created next
+# week would never be picked up.
+MISS_TTL_S = 24 * 60 * 60
+
+
+def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
+    """True when this repo's room should be looked up on the server.
+
+    False when a brain id is already cached (nothing to do) or when a recent
+    lookup found none (do not re-ask on every turn). A miss older than
+    :data:`MISS_TTL_S` is due again, so a brain created later is picked up.
+    """
+    key = room_name(cwd)
+    if key is None:
+        return False  # not a git repo — there is no room to resolve
+    entry = _load()["repos"].get(key)
+    entry = entry.get(env or current_env()) if isinstance(entry, dict) else None
+    if not isinstance(entry, dict):
+        return True
+    if isinstance(entry.get("brain_id"), str) and entry["brain_id"]:
+        return False
+    try:
+        return (time.time() - float(entry.get("missed_at", 0))) > MISS_TTL_S
+    except (TypeError, ValueError):
+        return True
+
+
+def write_miss(cwd: str | Path | None = None, env: str | None = None) -> None:
+    """Record that this repo has no room on this backend, as of now.
+
+    Stored WITHOUT a ``brain_id`` so :func:`read_room` keeps returning None and
+    every existing caller behaves exactly as before — this is a rate limit on
+    asking, not a routing decision.
+    """
+    key = room_name(cwd)
+    if key is None:
+        return
+    with _locked():
+        data = _load()
+        repo = data["repos"].get(key)
+        if not isinstance(repo, dict):
+            repo = {}
+        repo[env or current_env()] = {"missed_at": time.time()}
+        data["repos"][key] = repo
+        data.setdefault("version", 1)
+        body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, ROOMS_PATH)
+        except OSError:
+            tmp.unlink(missing_ok=True)
 
 
 def cmd_show(args: argparse.Namespace) -> int:

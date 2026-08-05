@@ -261,7 +261,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     from mcp.client.streamable_http import streamablehttp_client
 
     from _memhub_auth import resolve_url_and_auth
-    from room_map import env_for_url, read_room
+    from brain_resolve import resolve_repo_brain
+    from room_map import env_for_url
 
     size = os.path.getsize(transcript_path)
     state = _read_state(session_id)
@@ -306,15 +307,18 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # This delta's title if it carries one, else whatever we last saw.
     title = _title(records) or state.get("title") or None
     url, headers, auth = resolve_url_and_auth(interactive=False)
-    # Read AFTER the url resolves — prod and staging hold different brain ids
-    # for the same repo. Only when the TRANSCRIPT said where it ran: a hook can
-    # fire from a different repo than the session's, and an unknown origin must
+    # Resolved AFTER the url — prod and staging hold different brain ids for the
+    # same repo. Only when the TRANSCRIPT said where it ran: a hook can fire
+    # from a different repo than the session's, and an unknown origin must
     # degrade to personal memory rather than guess a room.
-    room = read_room(cwd, env_for_url(url)) if cwd else None
+    env = env_for_url(url)
 
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as session:
             await session.initialize()
+            # Cached hit is a dict lookup; a miss asks the server once and
+            # caches the answer, so this is not a per-turn round-trip.
+            room = await resolve_repo_brain(session, cwd, env) if cwd else None
             arguments = {
                 "messages": records,
                 "conversation_id": session_id,
