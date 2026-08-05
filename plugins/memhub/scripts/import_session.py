@@ -306,8 +306,8 @@ async def main() -> int:
                 if args.agent_brain_id:
                     call_args["agent_brain_id"] = args.agent_brain_id
                 if namespace:
-                    # Server ignores unknown args pre-#722; stamps directive
-                    # scope after.
+                    # Older servers ignore unknown arguments; newer ones
+                    # stamp the directive scope from it. Safe either way.
                     call_args["namespace"] = namespace
                 if len(slices) > 1:
                     print(f"--- slice {i}/{len(slices)}: {len(sl)} records ---")

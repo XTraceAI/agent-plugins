@@ -235,8 +235,8 @@ soft (not a git repo / hook error → silent no-op).
 - **Cost.** The agent hook reads the full transcript and passes it to the tool
   at session end. For long sessions that's a non-trivial token cost once per
   session. (A future refinement: incremental capture via a transcript watermark.)
-- **Requires** the backend `import_conversation` tool (MemHub-Backend branch
-  `fm-feat/mcp-agentic-session-ingest`) to be deployed to staging.
+- **Requires** the MemHub server to expose the `import_conversation` MCP tool.
+  If your `/mcp` connection lists it, you're good.
 
 ## Configuration
 

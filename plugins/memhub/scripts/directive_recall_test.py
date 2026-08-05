@@ -26,7 +26,7 @@ GEN_TYPES_ERROR = (
     " ✘  Can't resolve $ref at #/components/schemas/Memory/properties/details/oneOf/3\n"
     "Error: Can't resolve $ref at #/components/schemas/Memory/properties/details/oneOf/3"
 )
-CWD = "/Users/felixmeng/xtrace/memory-sdk-ts"
+CWD = "/Users/x/my-project"
 
 
 def test_pretool_path_misses_the_alias():
