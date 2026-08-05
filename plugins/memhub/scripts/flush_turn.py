@@ -271,11 +271,17 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                       state.get("cwd"), state.get("namespace"))
         return
 
+    # Each falls back INDEPENDENTLY. Tying the namespace's fallback to the cwd's
+    # left a real gap: a delta can carry a cwd while git resolution fails on it
+    # (a timeout, or a checkout with no origin). Then cwd is set, the fallback is
+    # skipped, and the namespace is silently None for that flush — so its
+    # directives extract unscoped and are recalled in every repo, even though an
+    # earlier flush had already resolved the name.
     cwd, namespace = _namespace(records)
     if not cwd:
-        # Remembered from an earlier flush. The namespace is remembered too, so
-        # this costs a dict lookup rather than re-running git every time.
         cwd = state.get("cwd") or None
+    if not namespace:
+        # Remembered, so this is a dict lookup rather than re-running git.
         namespace = state.get("namespace") or None
     url, headers, auth = resolve_url_and_auth(interactive=False)
     # Read AFTER the url resolves — prod and staging hold different brain ids
