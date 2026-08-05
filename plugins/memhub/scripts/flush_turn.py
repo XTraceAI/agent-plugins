@@ -60,7 +60,30 @@ STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 # Cap on one flush's whole round-trip. The flock is held for its duration and
 # the prefilter skips while held, so this is also the longest a hung server
 # can stall capture for the session.
-_FLUSH_TIMEOUT_S = float(os.environ.get("MEMHUB_TURN_FLUSH_TIMEOUT_S", 60))
+_DEFAULT_FLUSH_TIMEOUT_S = 60.0
+
+
+def _flush_timeout_s() -> float:
+    """The round-trip cap, from the env with the default as a floor.
+
+    Read at CALL time and never allowed to raise. Parsing this at import
+    time meant a non-numeric or empty override crashed the module before the
+    handler that keeps this hook quiet could run — a traceback in the user's
+    session, which is the one thing this script must never produce.
+
+    Zero or negative is rejected rather than honoured: it would time every
+    flush out instantly, so the cursor would never advance and per-turn
+    capture would be silently dead. ``MEMHUB_TURN_FLUSH=0`` is how you turn
+    this off; a timeout of nothing is a misconfiguration, not an intent.
+    """
+    raw = (os.environ.get("MEMHUB_TURN_FLUSH_TIMEOUT_S") or "").strip()
+    if not raw:
+        return _DEFAULT_FLUSH_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_FLUSH_TIMEOUT_S
+    return value if value > 0 else _DEFAULT_FLUSH_TIMEOUT_S
 
 # UI bookkeeping the client writes for its own display: mode switches, the
 # generated title, queue state. They carry no content and no ``message``, and
@@ -381,14 +404,15 @@ def main() -> int:
         # is far longer than a small delta needs and an order of magnitude
         # tighter than that. Timing out is safe: the cursor has not moved, so
         # the next turn re-sends.
+        timeout_s = _flush_timeout_s()
         asyncio.run(asyncio.wait_for(
-            _flush(session_id, transcript_path), timeout=_FLUSH_TIMEOUT_S))
+            _flush(session_id, transcript_path), timeout=timeout_s))
     # BaseException, not Exception: anyio mixes CancelledError into task
     # groups, producing a BaseExceptionGroup that an Exception handler would
     # miss — killing the hook with a traceback in the user's session.
     except BaseException as e:  # noqa: BLE001 — never fail the hook
         if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
-            _log(f"timed out after {_FLUSH_TIMEOUT_S:.0f}s — the next turn retries (cursor unmoved)")
+            _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
         elif _auth_required(e):
             _log("no cached OAuth token; run /memhub:import-session once "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")

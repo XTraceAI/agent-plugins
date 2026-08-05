@@ -157,6 +157,32 @@ def test_inert_only_delta_is_consumed_but_attachments_are_not():
     check("a real turn keeps it live", _all_inert(sidecars + [_rec("a")]), False)
 
 
+def test_timeout_override_never_breaks_the_hook():
+    """The override is parsed at CALL time and floors at the default. Parsing it
+    at import meant a bad value crashed the module before the handler that keeps
+    this hook quiet could run — a traceback in the user's session. And 0 would
+    time every flush out instantly, silently killing capture; MEMHUB_TURN_FLUSH=0
+    is how you disable this, a timeout of nothing is a misconfiguration."""
+    print("timeout override")
+    d = ft._DEFAULT_FLUSH_TIMEOUT_S
+    for raw, want, label in [
+        (None, d, "unset -> default"),
+        ("", d, "empty -> default"),
+        ("   ", d, "blank -> default"),
+        ("abc", d, "non-numeric -> default, no raise"),
+        ("0", d, "zero -> default, not instant-timeout"),
+        ("-5", d, "negative -> default"),
+        ("12.5", 12.5, "valid float honoured"),
+        ("90", 90.0, "valid int honoured"),
+    ]:
+        if raw is None:
+            os.environ.pop("MEMHUB_TURN_FLUSH_TIMEOUT_S", None)
+        else:
+            os.environ["MEMHUB_TURN_FLUSH_TIMEOUT_S"] = raw
+        check(label, ft._flush_timeout_s(), want)
+    os.environ.pop("MEMHUB_TURN_FLUSH_TIMEOUT_S", None)
+
+
 # ── lock ──────────────────────────────────────────────────────────────
 
 def test_lock():
@@ -261,6 +287,7 @@ if __name__ == "__main__":
     for fn in (test_tail, test_tail_is_bytes_not_chars,
                test_tail_stops_before_partial_line, test_cursor_trust,
                test_inert_only_delta_is_consumed_but_attachments_are_not,
+               test_timeout_override_never_breaks_the_hook,
                test_lock, test_prefilter):
         fn()
     print()
