@@ -93,6 +93,7 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         result = await session.call_tool("list_agent_brains", arguments={})
         if getattr(result, "isError", False):
             return None
+        matches = []
         for brain in _brains_from(result):
             # Exact match, and only on the id being a usable string — a
             # malformed row must not become the routing target.
@@ -100,8 +101,24 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
                 continue
             brain_id = brain.get("agent_brain_id") or brain.get("id")
             if isinstance(brain_id, str) and brain_id:
-                write_room(brain_id, name=name, env=env)
-                return {"brain_id": brain_id}
+                matches.append(brain_id)
+
+        if len(matches) == 1:
+            write_room(matches[0], name=name, env=env)
+            return {"brain_id": matches[0]}
+
+        if len(matches) > 1:
+            # Duplicate rooms for one repo do happen, and picking whichever the
+            # listing returned first would route this repo's memory into an
+            # arbitrary one of them — invisibly, and differently for different
+            # teammates. Ambiguity is not something a background hook should
+            # resolve by guessing. Capture continues to personal memory and the
+            # lookup stays DUE (no miss recorded), so merging the duplicates
+            # takes effect on the next flush rather than after a TTL.
+            print(f"[memhub] {len(matches)} agent brains are named {name!r} — "
+                  "cannot tell which is the repo's room, so this session is "
+                  "not routed to one. Merge or rename the duplicates.")
+            return None
         # Looked, found nothing. Remember that so the next turn does not ask
         # again; the entry carries no brain_id, so routing is unchanged.
         write_miss(cwd, env)

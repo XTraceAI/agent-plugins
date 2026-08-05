@@ -305,6 +305,14 @@ def write_miss(cwd: str | Path | None = None, env: str | None = None) -> None:
     Stored WITHOUT a ``brain_id`` so :func:`read_room` keeps returning None and
     every existing caller behaves exactly as before — this is a rate limit on
     asking, not a routing decision.
+
+    A miss NEVER overwrites a resolved id. The lookup that produced this miss
+    listed the brains at some earlier moment, so by the time it writes, someone
+    else may have resolved or created the room — `/memhub:onboard` racing a
+    background flush is the obvious case. Clobbering there would silently send
+    capture to personal memory for the whole TTL, immediately after the user did
+    the very thing meant to fix that. Checked inside the lock, so the read and
+    the decision cannot be split.
     """
     key = room_name(cwd)
     if key is None:
@@ -314,6 +322,10 @@ def write_miss(cwd: str | Path | None = None, env: str | None = None) -> None:
         repo = data["repos"].get(key)
         if not isinstance(repo, dict):
             repo = {}
+        existing = repo.get(env or current_env())
+        if isinstance(existing, dict) and isinstance(existing.get("brain_id"), str) \
+                and existing["brain_id"]:
+            return  # someone resolved it while we were looking — theirs wins
         repo[env or current_env()] = {"missed_at": time.time()}
         data["repos"][key] = repo
         data.setdefault("version", 1)
