@@ -12,6 +12,7 @@ uses (``flush_prefilter.py``).
 Skips when:
 
 * ``MEMHUB_TURN_FLUSH`` is set to ``0`` / ``off`` / ``false`` — the opt-out,
+* the flush already found this server cannot buffer per turn (dormant),
 * the hook input has no usable ``session_id`` / ``transcript_path``,
 * a flush for this session is already running (see below), or
 * the transcript has not grown past the cursor — nothing new to ship.
@@ -92,6 +93,12 @@ def main() -> int:
         offset = int(state.get("offset", 0))
     except (OSError, ValueError, TypeError):
         return 0  # no cursor yet — first turn of the session, always flush
+
+    # The flush found a server without per-turn support and went dormant for
+    # this session. Skip silently: the warning was emitted once, and the
+    # commit/PR and session-end hooks still capture the session.
+    if state.get("unsupported"):
+        return 1
 
     # Grew → new turns to ship. Shrank → the transcript was rewritten and the
     # offset is meaningless, so the flush must re-send from the top; either way

@@ -57,6 +57,23 @@ logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
+# UI bookkeeping the client writes for its own display: mode switches, the
+# generated title, queue state. They carry no content and no ``message``, and
+# a batch made only of them is REJECTED by the server — with no ``message``
+# among the records it reads the batch as plain chat and fails role
+# validation. Consuming them avoids a round-trip that could never succeed.
+#
+# ``attachment`` is deliberately absent from this set. It has no ``message``
+# either, so an attachment-only delta is rejected the same way — but an
+# attachment is real content (a pasted file, an image). Leaving the cursor
+# pinned means the next turn re-sends it alongside the message records that
+# make the batch valid. One wasted call beats dropping the file.
+_INERT_RECORD_TYPES = frozenset({
+    "mode", "last-prompt", "pr-link", "queue-operation",
+    "permission-mode", "ai-title", "file-history-snapshot",
+    "file-history-delta",
+})
+
 
 def _log(msg: str) -> None:
     print(f"[memhub-turn] {msg}")
@@ -88,15 +105,29 @@ def _read_cursor(state: dict, size: int) -> int:
 
 
 def _write_cursor(session_id: str, offset: int, last_uuid: str | None,
-                  cwd: str | None) -> None:
+                  cwd: str | None, namespace: str | None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_DIR / f"{session_id}.json.tmp"
     # Written atomically: a torn cursor read as a larger offset than was
     # actually shipped would skip records for good.
     tmp.write_text(json.dumps({
         "offset": offset, "last_uuid": last_uuid, "cwd": cwd,
-        "at": time.time(),
+        "namespace": namespace, "at": time.time(),
     }))
+    tmp.replace(STATE_DIR / f"{session_id}.json")
+
+
+def _mark_unsupported(session_id: str) -> None:
+    """Record that this server cannot do per-turn buffering.
+
+    The prefilter reads it and skips for the rest of the session, so the
+    warning is emitted once rather than on every turn.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = _read_state(session_id)
+    state["unsupported"] = True
+    tmp = STATE_DIR / f"{session_id}.json.tmp"
+    tmp.write_text(json.dumps(state))
     tmp.replace(STATE_DIR / f"{session_id}.json")
 
 
@@ -204,22 +235,20 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # un-namespaced source_id — splitting one session across two conversations,
     # half in the repo's room and half outside it. So the first flush that
     # resolves a cwd remembers it for the rest of the session.
+    # Checked BEFORE resolving cwd, because resolving shells out to git and an
+    # inert delta should cost nothing at all.
+    if all(isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
+           for r in records):
+        _write_cursor(session_id, consumed, state.get("last_uuid"),
+                      state.get("cwd"), state.get("namespace"))
+        return
+
     cwd, namespace = _namespace(records)
     if not cwd:
+        # Remembered from an earlier flush. The namespace is remembered too, so
+        # this costs a dict lookup rather than re-running git every time.
         cwd = state.get("cwd") or None
-        if cwd:
-            cwd, namespace = _namespace([{"cwd": cwd}])
-
-    # A delta can consist entirely of UI sidecar records (ai-title, mode,
-    # last-prompt, …) when the transcript grew without a turn completing. They
-    # carry nothing ingestable, and sending them is not merely wasteful: with no
-    # ``message`` among them the server reads the batch as plain chat and
-    # rejects it on role validation. Because the cursor only advances on
-    # success, that would re-send and re-fail on EVERY subsequent turn until a
-    # conversational record finally appeared. Consume them and stay quiet.
-    if not any(isinstance(r, dict) and r.get("message") for r in records):
-        _write_cursor(session_id, consumed, state.get("last_uuid"), cwd)
-        return
+        namespace = state.get("namespace") or None
     url, headers, auth = resolve_url_and_auth(interactive=False)
     # Read AFTER the url resolves — prod and staging hold different brain ids
     # for the same repo. Only when the TRANSCRIPT said where it ran: a hook can
@@ -276,12 +305,23 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # loudly; silently doing the expensive wrong thing is worse than
             # noisy logs a user can act on.
             if "ack_through" not in out:
-                _log("server does not support per-turn buffering — every turn "
-                     "will be extracted immediately. Upgrade the MemHub server, "
-                     "or set MEMHUB_TURN_FLUSH=0 to disable this hook.")
+                # This server queues the import in the background instead of
+                # committing it before replying, so a well-formed response
+                # does NOT mean the records are durable — advancing on it
+                # could drop them. It also extracts every turn immediately,
+                # which is the cost this hook exists to avoid. Go dormant for
+                # the session rather than pay for the wrong behaviour: the
+                # commit/PR and SessionEnd hooks still capture it.
+                _log("server has no per-turn support (no ack_through) — "
+                     "disabling per-turn flush for this session; commit/PR "
+                     "and session-end capture still apply. Upgrade the MemHub "
+                     "server to enable it.")
+                _mark_unsupported(session_id)
+                return
 
             # Committed server-side — only now is it safe to move the cursor.
-            _write_cursor(session_id, consumed, out.get("ack_through"), cwd)
+            _write_cursor(session_id, consumed, out.get("ack_through"), cwd,
+                          namespace)
             _log(f"+{len(records)} rec ({consumed - offset}B) "
                  f"new={out.get('records_new')} pending={out.get('pending')} "
                  f"draining={out.get('draining')}")

@@ -114,11 +114,14 @@ def test_cursor_trust():
         ft.STATE_DIR = Path(d)
         check("no cursor -> 0", ft._read_cursor(ft._read_state("s1"), 500), 0)
 
-        ft._write_cursor("s1", 120, "u-1", "/repo")
+        ft._write_cursor("s1", 120, "u-1", "/repo", "my-project")
         check("round-trips", ft._read_cursor(ft._read_state("s1"), 500), 120)
         # Remembered so a delta of sidecar-only records (which never carry cwd)
         # still routes to the repo's room instead of personal memory.
         check("cwd remembered", ft._read_state("s1").get("cwd"), "/repo")
+        # Remembered too, so the fallback never re-shells out to git.
+        check("namespace remembered",
+              ft._read_state("s1").get("namespace"), "my-project")
 
         # A file smaller than the cursor means the transcript was rewritten:
         # the offset now points into different content, so every byte must be
@@ -130,20 +133,28 @@ def test_cursor_trust():
         check("corrupt cursor -> 0", ft._read_cursor(ft._read_state("s2"), 500), 0)
 
 
-def test_sidecar_only_delta_is_not_sent():
-    """A delta can be nothing but UI sidecar records (ai-title, mode,
-    last-prompt) when the transcript grew without a turn completing. They carry
-    no ``message``, so the server reads the batch as plain chat and rejects it
-    on role validation — and since the cursor only advances on success, that
-    re-sends and re-fails on EVERY later turn until a real record shows up.
-    They must be consumed silently instead."""
-    print("sidecar-only delta")
+def _all_inert(records):
+    return all(r.get("type") in ft._INERT_RECORD_TYPES for r in records)
+
+
+def test_inert_only_delta_is_consumed_but_attachments_are_not():
+    """A delta of pure UI bookkeeping (ai-title, mode, …) is rejected by the
+    server — no ``message`` means it reads as plain chat and fails role
+    validation — so sending it can never succeed and would re-fail every turn.
+    Consume it.
+
+    An attachment record has no ``message`` either and is rejected the same way
+    (verified against the server), but it carries real content. It must NOT be
+    consumed: leaving the cursor pinned lets the next turn re-send it with the
+    message records that make the batch valid."""
+    print("inert vs attachment deltas")
     sidecars = [{"type": "ai-title", "title": "x"}, {"type": "mode", "mode": "y"}]
-    check("no message among them",
-          any(r.get("message") for r in sidecars), False)
-    mixed = sidecars + [_rec("a")]
-    check("a mixed delta still sends",
-          any(r.get("message") for r in mixed), True)
+    check("pure UI bookkeeping is inert", _all_inert(sidecars), True)
+    check("an attachment is NOT inert",
+          _all_inert([{"type": "attachment", "uuid": "a1"}]), False)
+    check("attachment among sidecars keeps the delta live",
+          _all_inert(sidecars + [{"type": "attachment", "uuid": "a1"}]), False)
+    check("a real turn keeps it live", _all_inert(sidecars + [_rec("a")]), False)
 
 
 # ── lock ──────────────────────────────────────────────────────────────
@@ -221,6 +232,11 @@ def test_prefilter():
         (state / "s1.json").write_text(json.dumps({"offset": 10_000}))
         check("file shrank -> flush", _prefilter(base, home), 0)
 
+        # Dormant after the flush found a server without per-turn support.
+        (state / "s1.json").write_text(json.dumps({"offset": 0, "unsupported": True}))
+        check("unsupported server -> skip", _prefilter(base, home), 1)
+        (state / "s1.json").write_text(json.dumps({"offset": 0}))
+
         # A live flock means a flush is in flight; skipping costs nothing
         # because the cursor has not moved.
         (state / "s1.json").write_text(json.dumps({"offset": 0}))
@@ -244,7 +260,7 @@ def test_prefilter():
 if __name__ == "__main__":
     for fn in (test_tail, test_tail_is_bytes_not_chars,
                test_tail_stops_before_partial_line, test_cursor_trust,
-               test_sidecar_only_delta_is_not_sent,
+               test_inert_only_delta_is_consumed_but_attachments_are_not,
                test_lock, test_prefilter):
         fn()
     print()
