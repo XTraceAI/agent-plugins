@@ -57,6 +57,11 @@ logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
+# Cap on one flush's whole round-trip. The flock is held for its duration and
+# the prefilter skips while held, so this is also the longest a hung server
+# can stall capture for the session.
+_FLUSH_TIMEOUT_S = float(os.environ.get("MEMHUB_TURN_FLUSH_TIMEOUT_S", 60))
+
 # UI bookkeeping the client writes for its own display: mode switches, the
 # generated title, queue state. They carry no content and no ``message``, and
 # a batch made only of them is REJECTED by the server — with no ``message``
@@ -369,12 +374,22 @@ def main() -> int:
         lock_fd = _acquire(session_id)
         if lock_fd is None:
             return 0  # a flush is already in flight; its successor carries ours
-        asyncio.run(_flush(session_id, transcript_path))
+        # Bounded, because the lock is held for the whole round-trip and the
+        # prefilter skips every later turn while it is held. Without a cap, one
+        # hung request would stall capture for this session until the hook's own
+        # 300s timeout — five minutes of turns silently not shipping. A minute
+        # is far longer than a small delta needs and an order of magnitude
+        # tighter than that. Timing out is safe: the cursor has not moved, so
+        # the next turn re-sends.
+        asyncio.run(asyncio.wait_for(
+            _flush(session_id, transcript_path), timeout=_FLUSH_TIMEOUT_S))
     # BaseException, not Exception: anyio mixes CancelledError into task
     # groups, producing a BaseExceptionGroup that an Exception handler would
     # miss — killing the hook with a traceback in the user's session.
     except BaseException as e:  # noqa: BLE001 — never fail the hook
-        if _auth_required(e):
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
+            _log(f"timed out after {_FLUSH_TIMEOUT_S:.0f}s — the next turn retries (cursor unmoved)")
+        elif _auth_required(e):
             _log("no cached OAuth token; run /memhub:import-session once "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
         else:
