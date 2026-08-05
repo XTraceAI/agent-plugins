@@ -26,42 +26,39 @@ this pass declines to send is simply carried by the next turn's flush.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
-# A lock older than this is treated as abandoned. Must exceed the flush hook's
-# own timeout, or a slow-but-live flush would be reclaimed underneath itself.
-_LOCK_STALE_S = 360
-
 
 def _lock_is_held(lock_path: Path) -> bool:
-    """True when another flush for this session is genuinely still running.
+    """True when another flush for this session is still running.
 
-    Checked two ways because either alone is wrong: a bare PID check leaks the
-    lock forever if the pid was recycled by an unrelated process, and a bare
-    age check reclaims a live-but-slow flush. Both must agree.
+    Probes the same ``flock`` the flush takes: acquire non-blocking, and if that
+    succeeds nobody held it — release immediately and say so. No pid liveness or
+    age heuristics, because the kernel already releases the lock when a flush
+    dies, however it dies. A missing file means no flush has ever run.
+
+    The gap between releasing this probe and the flush taking the lock for real
+    is harmless: the flush re-acquires atomically and skips if it loses.
     """
-    try:
-        raw = json.loads(lock_path.read_text())
-    except (OSError, ValueError):
-        return False
-    if time.time() - float(raw.get("at", 0)) > _LOCK_STALE_S:
-        return False  # abandoned — the flush will reclaim it
-    pid = raw.get("pid")
-    if not isinstance(pid, int):
+    if not lock_path.exists():
         return False
     try:
-        os.kill(pid, 0)  # signal 0 = liveness probe, sends nothing
-    except ProcessLookupError:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError:
         return False
-    except PermissionError:
-        return True  # alive, owned by another user
-    return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True  # someone is holding it
+    finally:
+        os.close(fd)  # also drops the lock if we took it
+    return False
 
 
 def main() -> int:

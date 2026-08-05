@@ -112,40 +112,70 @@ def test_cursor_trust():
     print("_read_cursor")
     with tempfile.TemporaryDirectory() as d:
         ft.STATE_DIR = Path(d)
-        check("no cursor -> 0", ft._read_cursor("s1", 500), 0)
+        check("no cursor -> 0", ft._read_cursor(ft._read_state("s1"), 500), 0)
 
-        ft._write_cursor("s1", 120, "u-1")
-        check("round-trips", ft._read_cursor("s1", 500), 120)
+        ft._write_cursor("s1", 120, "u-1", "/repo")
+        check("round-trips", ft._read_cursor(ft._read_state("s1"), 500), 120)
+        # Remembered so a delta of sidecar-only records (which never carry cwd)
+        # still routes to the repo's room instead of personal memory.
+        check("cwd remembered", ft._read_state("s1").get("cwd"), "/repo")
 
         # A file smaller than the cursor means the transcript was rewritten:
         # the offset now points into different content, so every byte must be
         # re-sent. Trusting it would skip records permanently.
-        check("shrunken file -> 0", ft._read_cursor("s1", 50), 0)
-        check("exactly at eof kept", ft._read_cursor("s1", 120), 120)
+        check("shrunken file -> 0", ft._read_cursor(ft._read_state("s1"), 50), 0)
+        check("exactly at eof kept", ft._read_cursor(ft._read_state("s1"), 120), 120)
 
         (Path(d) / "s2.json").write_text("{not json")
-        check("corrupt cursor -> 0", ft._read_cursor("s2", 500), 0)
+        check("corrupt cursor -> 0", ft._read_cursor(ft._read_state("s2"), 500), 0)
+
+
+def test_sidecar_only_delta_is_not_sent():
+    """A delta can be nothing but UI sidecar records (ai-title, mode,
+    last-prompt) when the transcript grew without a turn completing. They carry
+    no ``message``, so the server reads the batch as plain chat and rejects it
+    on role validation — and since the cursor only advances on success, that
+    re-sends and re-fails on EVERY later turn until a real record shows up.
+    They must be consumed silently instead."""
+    print("sidecar-only delta")
+    sidecars = [{"type": "ai-title", "title": "x"}, {"type": "mode", "mode": "y"}]
+    check("no message among them",
+          any(r.get("message") for r in sidecars), False)
+    mixed = sidecars + [_rec("a")]
+    check("a mixed delta still sends",
+          any(r.get("message") for r in mixed), True)
 
 
 # ── lock ──────────────────────────────────────────────────────────────
 
 def test_lock():
+    """flock, so the kernel owns the lifetime. There is no stale-lock case to
+    test because there is no such thing: a crashed flush releases on exit,
+    including SIGKILL. That removes the reclaim path entirely, and with it the
+    race where two hooks both judge a lock abandoned and both take it."""
     print("_acquire")
     with tempfile.TemporaryDirectory() as d:
         ft.STATE_DIR = Path(d)
         first = ft._acquire("s1")
         check("first acquires", first is not None, True)
-        check("second is refused", ft._acquire("s1"), None)
+        check("second is refused while held", ft._acquire("s1"), None)
+        check("a different session is unaffected", ft._acquire("s2") is not None, True)
 
-        first.unlink()
+        os.close(first)
         again = ft._acquire("s1")
         check("re-acquires once released", again is not None, True)
-        again.unlink()
+        os.close(again)
 
-        # A crashed flush must not wedge capture for the rest of the session.
-        lock = Path(d) / "s2.lock"
-        lock.write_text(json.dumps({"pid": os.getpid(), "at": time.time() - 10_000}))
-        check("stale lock reclaimed", ft._acquire("s2") is not None, True)
+        # The crash case: a child holds it, then dies. The kernel releases.
+        code = ("import fcntl,os,sys;"
+                "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600);"
+                "fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)")
+        held = subprocess.Popen([sys.executable, "-c", code + ";import time;time.sleep(30)",
+                                 str(Path(d) / "s3.lock")])
+        time.sleep(0.4)
+        check("held by a live process", ft._acquire("s3"), None)
+        held.kill(); held.wait()
+        check("released when that process dies", ft._acquire("s3") is not None, True)
 
 
 # ── prefilter ─────────────────────────────────────────────────────────
@@ -191,25 +221,30 @@ def test_prefilter():
         (state / "s1.json").write_text(json.dumps({"offset": 10_000}))
         check("file shrank -> flush", _prefilter(base, home), 0)
 
-        # A live lock means a flush is in flight; skipping costs nothing
+        # A live flock means a flush is in flight; skipping costs nothing
         # because the cursor has not moved.
         (state / "s1.json").write_text(json.dumps({"offset": 0}))
-        (state / "s1.lock").write_text(
-            json.dumps({"pid": os.getpid(), "at": time.time()}))
-        check("live lock -> skip", _prefilter(base, home), 1)
+        lock = state / "s1.lock"
+        code = ("import fcntl,os,sys;"
+                "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600);"
+                "fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB);"
+                "import time;time.sleep(30)")
+        held = subprocess.Popen([sys.executable, "-c", code, str(lock)])
+        time.sleep(0.4)
+        check("held flock -> skip", _prefilter(base, home), 1)
 
-        (state / "s1.lock").write_text(
-            json.dumps({"pid": os.getpid(), "at": time.time() - 10_000}))
-        check("stale lock -> flush", _prefilter(base, home), 0)
+        # The crash case needs no staleness rule: the kernel released it.
+        held.kill(); held.wait()
+        check("holder died -> flush", _prefilter(base, home), 0)
 
-        (state / "s1.lock").write_text(
-            json.dumps({"pid": 999_999_999, "at": time.time()}))
-        check("dead pid -> flush", _prefilter(base, home), 0)
+        # An unlocked leftover file is not a lock.
+        check("leftover lock file -> flush", _prefilter(base, home), 0)
 
 
 if __name__ == "__main__":
     for fn in (test_tail, test_tail_is_bytes_not_chars,
                test_tail_stops_before_partial_line, test_cursor_trust,
+               test_sidecar_only_delta_is_not_sent,
                test_lock, test_prefilter):
         fn()
     print()

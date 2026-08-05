@@ -22,9 +22,9 @@ over-sending costs bandwidth while under-sending leaves a gap nothing will ever
 notice. That asymmetry is the whole reason this file is written the way it is.
 
 **One flush per session at a time.** The server expects a session's turns to
-arrive in order, so an atomic lockfile keeps two hooks from overlapping when one
-turn finishes before the previous flush has returned. Losing that race is not an
-error: the cursor did not move, so the next turn's flush carries both.
+arrive in order, so an advisory ``flock`` keeps two hooks from overlapping when
+one turn finishes before the previous flush has returned. Losing that race is
+not an error: the cursor did not move, so the next turn's flush carries both.
 
 Discipline mirrors the other capture hooks: THIS SCRIPT NEVER FAILS LOUDLY.
 Any error exits 0 quietly — memory capture must never disturb the session.
@@ -35,6 +35,7 @@ interactive: a per-turn background hook must never pop a browser.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -55,8 +56,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
-# Must match turn_flush_prefilter._LOCK_STALE_S.
-_LOCK_STALE_S = 360
 
 
 def _log(msg: str) -> None:
@@ -65,7 +64,15 @@ def _log(msg: str) -> None:
 
 # ── cursor ────────────────────────────────────────────────────────────
 
-def _read_cursor(session_id: str, size: int) -> int:
+def _read_state(session_id: str) -> dict:
+    try:
+        state = json.loads((STATE_DIR / f"{session_id}.json").read_text())
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _read_cursor(state: dict, size: int) -> int:
     """Byte offset to resume from — 0 whenever the cursor cannot be trusted.
 
     A file SMALLER than the cursor means the transcript was rewritten under us,
@@ -74,54 +81,49 @@ def _read_cursor(session_id: str, size: int) -> int:
     would skip records permanently.
     """
     try:
-        state = json.loads((STATE_DIR / f"{session_id}.json").read_text())
         offset = int(state.get("offset", 0))
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return 0
     return offset if 0 <= offset <= size else 0
 
 
-def _write_cursor(session_id: str, offset: int, last_uuid: str | None) -> None:
+def _write_cursor(session_id: str, offset: int, last_uuid: str | None,
+                  cwd: str | None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_DIR / f"{session_id}.json.tmp"
     # Written atomically: a torn cursor read as a larger offset than was
     # actually shipped would skip records for good.
     tmp.write_text(json.dumps({
-        "offset": offset, "last_uuid": last_uuid, "at": time.time(),
+        "offset": offset, "last_uuid": last_uuid, "cwd": cwd,
+        "at": time.time(),
     }))
     tmp.replace(STATE_DIR / f"{session_id}.json")
 
 
 # ── lock ──────────────────────────────────────────────────────────────
 
-def _acquire(session_id: str) -> Path | None:
-    """Atomically claim this session's flush slot, or return None.
+def _acquire(session_id: str) -> int | None:
+    """Claim this session's flush slot via ``flock``, or return None.
 
-    ``O_CREAT | O_EXCL`` is the actual guard — the prefilter's check is only an
-    optimisation to avoid paying for a process spawn we would then discard.
+    Returns the held file descriptor — the caller must keep it OPEN for the
+    lock to hold, and closing it releases.
+
+    ``flock`` rather than an ``O_EXCL`` lockfile because the kernel owns the
+    lifetime: it releases on process exit however that happens, including a
+    SIGKILL. A lockfile needs staleness heuristics to recover from a crashed
+    flush, and reclaiming a stale one is inherently racy — two hooks can both
+    judge it abandoned and both take it, which is exactly the overlap the lock
+    exists to prevent. There is no such thing as a stale flock.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock = STATE_DIR / f"{session_id}.lock"
-    payload = json.dumps({"pid": os.getpid(), "at": time.time()})
+    fd = os.open(STATE_DIR / f"{session_id}.lock",
+                 os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        # Reclaim only if genuinely abandoned — a crashed flush must not wedge
-        # capture for the rest of the session.
-        try:
-            held = json.loads(lock.read_text())
-            if time.time() - float(held.get("at", 0)) <= _LOCK_STALE_S:
-                return None
-        except (OSError, ValueError, TypeError):
-            pass
-        try:
-            lock.write_text(payload)
-            return lock
-        except OSError:
-            return None
-    with os.fdopen(fd, "w") as fh:
-        fh.write(payload)
-    return lock
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None  # another flush holds it; ours is redundant anyway
+    return fd
 
 
 # ── flush ─────────────────────────────────────────────────────────────
@@ -189,12 +191,35 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     from room_map import env_for_url, read_room
 
     size = os.path.getsize(transcript_path)
-    offset = _read_cursor(session_id, size)
+    state = _read_state(session_id)
+    offset = _read_cursor(state, size)
     records, consumed = _read_tail(transcript_path, offset)
     if not records:
         return
 
+    # Only user / assistant / attachment records carry ``cwd`` — the UI sidecar
+    # types (mode, last-prompt, ai-title, …) never do. A delta made up solely of
+    # sidecars therefore resolves no cwd, and without the remembered one this
+    # flush would route to personal memory AND key the conversation on the
+    # un-namespaced source_id — splitting one session across two conversations,
+    # half in the repo's room and half outside it. So the first flush that
+    # resolves a cwd remembers it for the rest of the session.
     cwd, namespace = _namespace(records)
+    if not cwd:
+        cwd = state.get("cwd") or None
+        if cwd:
+            cwd, namespace = _namespace([{"cwd": cwd}])
+
+    # A delta can consist entirely of UI sidecar records (ai-title, mode,
+    # last-prompt, …) when the transcript grew without a turn completing. They
+    # carry nothing ingestable, and sending them is not merely wasteful: with no
+    # ``message`` among them the server reads the batch as plain chat and
+    # rejects it on role validation. Because the cursor only advances on
+    # success, that would re-send and re-fail on EVERY subsequent turn until a
+    # conversational record finally appeared. Consume them and stay quiet.
+    if not any(isinstance(r, dict) and r.get("message") for r in records):
+        _write_cursor(session_id, consumed, state.get("last_uuid"), cwd)
+        return
     url, headers, auth = resolve_url_and_auth(interactive=False)
     # Read AFTER the url resolves — prod and staging hold different brain ids
     # for the same repo. Only when the TRANSCRIPT said where it ran: a hook can
@@ -243,8 +268,20 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 _log(f"response unrecognized: {(texts[0] if texts else '')[:120]!r}")
                 return
 
+            # ``ack_through`` is only returned by a server that performed the
+            # durable receive this hook depends on. Without it we are talking to
+            # an older server that queues the import in the background and
+            # treats every turn as an immediate extraction — per-turn LLM cost,
+            # and the episode fragmentation the batching exists to avoid. Say so
+            # loudly; silently doing the expensive wrong thing is worse than
+            # noisy logs a user can act on.
+            if "ack_through" not in out:
+                _log("server does not support per-turn buffering — every turn "
+                     "will be extracted immediately. Upgrade the MemHub server, "
+                     "or set MEMHUB_TURN_FLUSH=0 to disable this hook.")
+
             # Committed server-side — only now is it safe to move the cursor.
-            _write_cursor(session_id, consumed, out.get("ack_through"))
+            _write_cursor(session_id, consumed, out.get("ack_through"), cwd)
             _log(f"+{len(records)} rec ({consumed - offset}B) "
                  f"new={out.get('records_new')} pending={out.get('pending')} "
                  f"draining={out.get('draining')}")
@@ -281,7 +318,7 @@ def _auth_required(e: BaseException) -> bool:
 
 
 def main() -> int:
-    lock: Path | None = None
+    lock_fd: int | None = None
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
         session_id = (hook_input.get("session_id") or "").strip()
@@ -289,8 +326,8 @@ def main() -> int:
         if not session_id or not transcript_path \
                 or not Path(transcript_path).exists():
             return 0
-        lock = _acquire(session_id)
-        if lock is None:
+        lock_fd = _acquire(session_id)
+        if lock_fd is None:
             return 0  # a flush is already in flight; its successor carries ours
         asyncio.run(_flush(session_id, transcript_path))
     # BaseException, not Exception: anyio mixes CancelledError into task
@@ -303,11 +340,13 @@ def main() -> int:
         else:
             _log(f"skipped ({type(e).__name__}: {e})")
     finally:
-        if lock is not None:
+        if lock_fd is not None:
+            # Closing releases the flock. The kernel would do this at exit
+            # anyway; doing it here keeps the held window tight.
             try:
-                lock.unlink()
+                os.close(lock_fd)
             except OSError:
-                pass  # stale-reclaim handles it
+                pass
     return 0
 
 
