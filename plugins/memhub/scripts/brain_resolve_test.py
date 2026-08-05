@@ -134,6 +134,48 @@ def test_never_routes_on_a_fuzzy_or_broken_match():
               run(br.resolve_repo_brain(session, "/repo", "staging")), None)
 
 
+def test_a_miss_never_clobbers_a_resolved_room():
+    """The lookup behind a miss listed brains at some EARLIER moment, so by the
+    time it writes, someone else may have resolved or created the room —
+    /memhub:onboard racing a background flush is the obvious case. Clobbering
+    there would silently send capture to personal memory for the whole TTL,
+    right after the user did the thing meant to fix that."""
+    print("miss vs resolved id")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+        rm.write_room(BID, name=NAME, env="staging")
+        rm.write_miss("/repo", "staging")          # the racing loser
+        check("resolved id survives",
+              (rm.read_room("/repo", "staging") or {}).get("brain_id"), BID)
+        check("still not due", rm.resolve_due("/repo", "staging"), False)
+
+        # A miss on a repo with nothing cached is still recorded.
+        rm.room_name = lambda cwd=None: "Repo: XTraceAI/other"
+        rm.write_miss("/other", "staging")
+        check("plain miss still recorded",
+              rm.resolve_due("/other", "staging"), False)
+
+
+def test_duplicate_room_names_are_not_guessed_between():
+    """Duplicate rooms for one repo happen. Picking whichever came first would
+    route this repo's memory into an arbitrary one — invisibly, and differently
+    for different teammates."""
+    print("duplicate room names")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+        session = _Session(_Result({"agent_brains": [
+            {"name": NAME, "agent_brain_id": BID},
+            {"name": NAME, "agent_brain_id": "22222222-3333-4444-5555-666666666666"},
+        ]}))
+        check("ambiguous -> no room",
+              run(br.resolve_repo_brain(session, "/repo", "staging")), None)
+        check("nothing cached", rm.read_room("/repo", "staging"), None)
+        # Deliberately NOT a miss: merging the duplicates should take effect on
+        # the next flush, not after a 24h TTL.
+        check("stays due so a fix applies immediately",
+              rm.resolve_due("/repo", "staging"), True)
+
+
 def test_failures_degrade_to_no_room():
     """A capture hook must never fail because a lookup did."""
     print("failure handling")
@@ -169,6 +211,8 @@ def test_result_shapes_are_tolerated():
 
 if __name__ == "__main__":
     for fn in (test_resolves_and_caches, test_no_brain_is_remembered_as_a_miss,
+               test_a_miss_never_clobbers_a_resolved_room,
+               test_duplicate_room_names_are_not_guessed_between,
                test_never_routes_on_a_fuzzy_or_broken_match,
                test_failures_degrade_to_no_room, test_result_shapes_are_tolerated):
         fn()
