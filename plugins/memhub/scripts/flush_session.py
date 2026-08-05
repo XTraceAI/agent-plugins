@@ -120,8 +120,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             if room:
                 arguments["agent_brain_id"] = room["brain_id"]
             if namespace:
-                # Server ignores unknown args pre-#722; stamps directive
-                # scope after.
+                # Older servers ignore unknown arguments; newer ones
+                # stamp the directive scope from it. Safe either way.
                 arguments["namespace"] = namespace
             res = await session.call_tool("import_conversation", arguments=arguments)
             texts = [t for t in (getattr(b, "text", None)
