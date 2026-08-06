@@ -33,13 +33,18 @@ Do exactly this:
 3. Run the upload via Bash — substitute the real values, keep it one command:
 
    ```bash
-   uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
      --file "<path>" --name "<name>" --type "<type>"
    ```
 
-   Optional flags when relevant: `--agent-brain-id <id>` to save into an agent
-   brain, `--parent-id <id>` to version an existing artifact, `--rationale "..."`
-   to note why this version supersedes the last, `--tags a,b`.
+   The artifact routes to the repo's room automatically when one is cached in
+   `~/.config/memhub-plugin/rooms.json` (the script prints which room it used),
+   so a file in a repo lands where teammates search without any extra flag.
+
+   Optional flags when relevant: `--agent-brain-id <id>` to override the
+   destination brain, `--no-room` to save into personal workspace memory
+   instead, `--parent-id <id>` to version an existing artifact, `--rationale
+   "..."` to note why this version supersedes the last, `--tags a,b`.
 
    If (and only if) the user explicitly asks for client-side encryption, add
    `--encrypt` and include the XTrace SDK dependency. The helper resolves its
@@ -56,11 +61,14 @@ Do exactly this:
    This encrypts the artifact body only. Name/type/tags remain plaintext, and
    the server cannot semantically search or extract the opaque body. The same
    passphrase is required to load it by id with
-   `scripts/load_encrypted_artifact.py`; pass the same `--agent-brain-id` when
-   the artifact was stored in a brain. There is no key exchange or recovery
-   yet. Never put the passphrase itself in command/tool arguments, and never
-   open, print, grep, or ask the user to paste their passphrase or `.env` file.
-4. Report the returned `{id, action}` to the user. On first ever run the script may
+   `scripts/load_encrypted_artifact.py`; when it was stored in a brain, pass
+   the brain id printed by this script as the loader's `--agent-brain-id`.
+   There is no key exchange or recovery yet. Never put the passphrase itself
+   in command/tool arguments, and never open, print, grep, or ask the user to
+   paste their passphrase or `.env` file.
+4. Report the returned `{id, action}` to the user, **and which brain it landed
+   in, by name** — automatic routing that happens silently reads as losing
+   things. On first ever run the script may
    open the browser once for OAuth approval (same flow as /mcp; token cached
    after that) — that is expected, not an error.
 

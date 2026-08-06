@@ -8,11 +8,14 @@ Run spec-driven development on top of MemHub. The model:
 
 - **One agent brain per repo** — the repo's shared room, named
   `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
-  stripped — e.g. `Repo: XTraceAI/memhub-claude-plugin`). Match it EXACTLY in
-  `list_agent_brains` and reuse what you find — a teammate may have created
-  it. Edge cases (SSH remotes, no remote, worktrees, not a git repo) and the
-  create-time rules — resolve before create, required description, report
-  where it landed — are in `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
+  stripped — e.g. `Repo: XTraceAI/memhub-claude-plugin`). Resolve it once with
+  `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show`; when that prints
+  nothing, match the name EXACTLY in `list_agent_brains` and reuse what you
+  find — a teammate may have created it — then cache it with `room_map.py set
+  --brain-id <id>`. Edge cases (SSH remotes, no remote, worktrees, not a git
+  repo) and the create-time rules — resolve before create, required
+  description, report where it landed — are in
+  `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
   ALL of the repo's specs live there, alongside reviews, ADRs, and imported
   implementation sessions — share it once per teammate and every current and
   future spec in the repo is visible to them.
@@ -45,7 +48,7 @@ File uploads ALWAYS go through the helper script (never call the
 `save_artifact` MCP tool directly, never re-emit file contents):
 
 ```bash
-uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
   --file "<path>" --name "Spec: <title>" --type spec \
   --agent-brain-id "<repo-ab-id>" --tags "spec,spec:<slug>,path:<repo-relative-path>" \
   [--parent-id "<latest-version-id>"] [--rationale "<why>"]
@@ -210,7 +213,7 @@ fresh conversation id (re-imports dedup per conversation_id globally) and a
 title naming the spec:
 
 ```bash
-uv run --with mcp python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
+uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
   --session "<session-id-or-path>" --agent-brain-id "<repo-ab-id>" \
   --conversation-id "$(uuidgen)" --title "Spec: <title> — <what was built>"
 ```

@@ -10,7 +10,7 @@ $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 
 Run (mcp SDK pulled ephemerally by uv):
-    uv run --with mcp python scripts/save_artifact.py \
+    uv run --with 'mcp<2' python scripts/save_artifact.py \
         --file spec.md --name "Retry Policy Spec" --type spec \
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
         [--tags a,b]
@@ -22,7 +22,7 @@ Run (mcp SDK pulled ephemerally by uv):
         --name "Private notes" --encrypt
 
     # or pipe terminal output straight in:
-    pytest -q | uv run --with mcp python scripts/save_artifact.py \
+    pytest -q | uv run --with 'mcp<2' python scripts/save_artifact.py \
         --stdin --name "test run 2026-06-09" --type runbook
 
 Endpoint resolution (so the script hits the SAME server the plugin connector
@@ -46,6 +46,7 @@ from mcp.client.streamable_http import streamablehttp_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from _memhub_crypto import EncryptionConfigurationError  # noqa: E402
+from room_map import env_for_url, read_room, repo_root  # noqa: E402
 
 
 def unwrap(result) -> dict:
@@ -93,7 +94,17 @@ async def main() -> int:
     ap.add_argument(
         "--type", default="document", help="artifact_type (spec/design_doc/runbook/...)"
     )
-    ap.add_argument("--agent-brain-id", default=None)
+    ap.add_argument(
+        "--agent-brain-id",
+        default=None,
+        help="agent brain to save into. Default: the repo's cached "
+        "room (~/.config/memhub-plugin/rooms.json), if any",
+    )
+    ap.add_argument(
+        "--no-room",
+        action="store_true",
+        help="ignore the repo's cached room and save into personal workspace memory",
+    )
     ap.add_argument(
         "--parent-id", default=None, help="version an existing artifact by id"
     )
@@ -151,6 +162,34 @@ async def main() -> int:
         call_args["tags"] = tags
 
     url, headers, auth = resolve_url_and_auth(args.url)
+
+    # An explicit --agent-brain-id wins; otherwise route to the repo's cached
+    # room so a spec saved from a repo lands where teammates search.
+    #
+    # The FILE's repo first — a doc living in repo Y is Y's, even when invoked
+    # from elsewhere — then the caller's repo, which covers the common case of
+    # saving an ad-hoc file (a rendered page, a download) from a temp path while
+    # working in a repo. Neither resolves → personal memory.
+    #
+    # A file sitting inside an UNRELATED repo therefore routes to that repo's
+    # room. That is why the destination is printed below and the skill reports
+    # it: automatic routing is only safe if it's visible. Use --no-room to
+    # override.
+    room = None
+    if not args.agent_brain_id and not args.no_room:
+        env = env_for_url(url)
+        file_dir = None if args.stdin else args.file.resolve().parent
+        if file_dir is not None and repo_root(file_dir) is not None:
+            # The file lives in a repo — that repo is authoritative, and if it
+            # has no cached room the artifact stays personal. Falling back to
+            # the caller here would file repo Y's doc into repo X's room, since
+            # "no room cached" and "not in a repo" are both None from read_room.
+            room = read_room(file_dir, env)
+        else:
+            room = read_room(None, env)
+        if room:
+            call_args["agent_brain_id"] = room["brain_id"]
+
     src_desc = "stdin" if args.stdin else str(args.file)
     print(f"source   : {src_desc}  ({len(content):,} plaintext chars)")
     print(f"name     : {args.name}   type={args.type}")
@@ -158,6 +197,9 @@ async def main() -> int:
         print(
             f"encrypted: yes ({len(stored_content):,} chars sent; plaintext stays local)"
         )
+    if call_args.get("agent_brain_id"):
+        origin = f' (repo room "{room.get("name", "?")}")' if room else ""
+        print(f"brain    : {call_args['agent_brain_id']}{origin}")
     print(f"endpoint : {url}")
     print("-" * 56)
 

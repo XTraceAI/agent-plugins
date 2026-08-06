@@ -19,7 +19,7 @@ $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 
 Usage (mcp SDK pulled ephemerally by uv):
-    uv run --with mcp python import_session.py --session <session-id-or-path>
+    uv run --with 'mcp<2' python import_session.py --session <session-id-or-path>
         [--conversation-id <id>] [--title "..."] [--url <mcp-url>]
 
 `--session` accepts either a path to a .jsonl transcript or a bare session id,
@@ -39,6 +39,8 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from room_map import env_for_url, read_room  # noqa: E402
+from transcript_filter import drop_command_wrappers  # noqa: E402
 
 
 def load_transcript(path: Path) -> tuple[list[dict], int]:
@@ -173,15 +175,20 @@ def call_error(result, payload: dict) -> str | None:
     return None
 
 
+def _cwd_from_records(records: list[dict]) -> str | None:
+    """The directory the session ran in, per the transcript's own records."""
+    return next((r.get("cwd") for r in records
+                 if isinstance(r, dict) and isinstance(r.get("cwd"), str)
+                 and r.get("cwd")), None)
+
+
 def _namespace_from_records(records: list[dict]) -> str | None:
     """The session's working context: git remote basename resolved from the
     transcript's ``cwd`` (client-side — the server never derives this, since a
     worktree dir basename would stamp a scope that HIDES directives from the
     canonical repo's scoped recalls). None when it can't be resolved
     confidently — unscoped stores serve everywhere, a wrong scope doesn't."""
-    cwd = next((r.get("cwd") for r in records
-                if isinstance(r, dict) and isinstance(r.get("cwd"), str)
-                and r.get("cwd")), None)
+    cwd = _cwd_from_records(records)
     if not cwd:
         return None
     try:
@@ -206,7 +213,12 @@ async def main() -> int:
     ap.add_argument("--title", default=None)
     ap.add_argument("--agent-brain-id", default=None,
                     help="route the extracted facts/episodes into an agent brain "
-                         "(isolated, shareable) instead of raw workspace memory")
+                         "(isolated, shareable) instead of raw workspace memory. "
+                         "Default: the repo's cached room "
+                         "(~/.config/memhub-plugin/rooms.json), if any")
+    ap.add_argument("--no-room", action="store_true",
+                    help="ignore the repo's cached room and import into personal "
+                         "memory")
     ap.add_argument("--namespace", default=None,
                     help="Working-context name for captured directives (the "
                          "repo). Default: resolved from the transcript's cwd "
@@ -241,18 +253,50 @@ async def main() -> int:
 
     conv_id = args.conversation_id or f.stem
     # --namespace wins; '' explicitly disables; default = resolve from records.
+    # Resolved from the FULL list, ahead of the filter below: ``cwd`` rides on
+    # every user record, including the slash-command ones.
     namespace = (args.namespace if args.namespace is not None
                  else _namespace_from_records(records)) or None
+
+    # Slash-command bookkeeping is transcript plumbing, not conversation. The
+    # per-turn path applies the same filter, so a session cannot come out clean
+    # or dirty depending on which path happened to capture it.
+    kept = drop_command_wrappers(records)
+    dropped = len(records) - len(kept)
+    records = kept
+    if not records:
+        print(f"ERROR: {f} holds only slash-command records", file=sys.stderr)
+        return 2
+
     url, headers, auth = resolve_url_and_auth(args.url)
+
+    # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
+    # cached room so a plain `--session X` import lands in team memory instead of
+    # personal memory. Keyed by the resolved endpoint's backend, and derived from
+    # the TRANSCRIPT's cwd rather than the caller's — the script is often run
+    # from a different directory than the session it is importing.
+    room = None
+    if not args.agent_brain_id and not args.no_room:
+        # Only when the transcript says where it ran. read_room(None) would fall
+        # back to THIS process's cwd — and this script is routinely run from a
+        # different repo than the session it imports, so that would file the
+        # session under an unrelated room. Unknown origin → stays personal.
+        rec_cwd = _cwd_from_records(records)
+        room = read_room(rec_cwd, env_for_url(url)) if rec_cwd else None
+        if room:
+            args.agent_brain_id = room["brain_id"]
 
     slices = _slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
     print(f"session file    : {f}")
-    print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)")
+    filtered = f"   (+{dropped} slash-command dropped)" if dropped else ""
+    print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)"
+          f"{filtered}")
     print(f"conversation_id : {conv_id}")
     print(f"endpoint        : {url}")
     if args.agent_brain_id:
-        print(f"agent brain     : {args.agent_brain_id}")
+        src = f' (repo room "{room.get("name", "?")}")' if room else ""
+        print(f"agent brain     : {args.agent_brain_id}{src}")
     if namespace:
         print(f"namespace       : {namespace}")
     print("-" * 56)
@@ -278,8 +322,8 @@ async def main() -> int:
                 if args.agent_brain_id:
                     call_args["agent_brain_id"] = args.agent_brain_id
                 if namespace:
-                    # Server ignores unknown args pre-#722; stamps directive
-                    # scope after.
+                    # Older servers ignore unknown arguments; newer ones
+                    # stamp the directive scope from it. Safe either way.
                     call_args["namespace"] = namespace
                 if len(slices) > 1:
                     print(f"--- slice {i}/{len(slices)}: {len(sl)} records ---")
