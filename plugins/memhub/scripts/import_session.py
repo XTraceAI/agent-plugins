@@ -45,6 +45,10 @@ from session_title import (  # noqa: E402
     generated_title,
     prompt_title,
 )
+from transcript_chunks import (  # noqa: E402
+    DEFAULT_CHUNK_BYTES,
+    slices as make_slices,
+)
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 
@@ -96,26 +100,6 @@ def resolve_session_file(session: str) -> tuple[Path | None, str]:
         return None, (f"no session {sid!r} found under ~/.claude/projects/*/ "
                       "(pass a transcript path instead?)")
     return candidates[0], ""
-
-
-def _slices(records: list[dict], chunk_bytes: int) -> list[list[dict]]:
-    """Split records into consecutive disjoint slices under chunk_bytes each
-    (single oversized records still go through alone). Disjointness matters:
-    each slice is its own incremental import, so no record is ever extracted
-    twice regardless of watermark timing."""
-    out: list[list[dict]] = []
-    cur: list[dict] = []
-    size = 0
-    for rec in records:
-        b = len(json.dumps(rec, separators=(",", ":")))
-        if cur and size + b > chunk_bytes:
-            out.append(cur)
-            cur, size = [], 0
-        cur.append(rec)
-        size += b
-    if cur:
-        out.append(cur)
-    return out
 
 
 async def _gist_hash(
@@ -263,7 +247,7 @@ async def main() -> int:
                          "which is why an --agent-brain-id created in ANOTHER "
                          "org fails with 'Agent brain not found'.")
     ap.add_argument("--url", default=None)
-    ap.add_argument("--chunk-bytes", type=int, default=3_500_000,
+    ap.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES,
                     help="transcripts larger than this are sent as sequential "
                          "disjoint slices under the same conversation_id "
                          "(server extracts each incrementally; the session "
@@ -333,7 +317,7 @@ async def main() -> int:
         if room:
             args.agent_brain_id = room["brain_id"]
 
-    slices = _slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
+    slices = make_slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
     print(f"session file    : {f}")
     filtered = f"   (+{dropped} slash-command dropped)" if dropped else ""

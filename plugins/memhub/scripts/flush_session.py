@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
-"""Incremental session flush — fired by PostToolUse hooks on commit/PR events.
+"""Whole-transcript session flush — fired on commit/PR events and at SessionEnd.
 
 Reads the Claude Code hook input JSON from stdin (``session_id``,
-``transcript_path``), sends the transcript-so-far to ``import_conversation``
-with ``conversation_id = session_id`` — the SAME id the SessionEnd hook uses,
-so every trigger feeds one conversation and one server-side watermark
-(``agentic_seen_uuids``): the full transcript is re-sent, but only the DELTA
-since the last flush is processed. Commits/PRs are semantic work boundaries,
-so flushing here makes memory available mid-session (parallel sessions see
-fresh decisions), shapes batch episodes into work-unit narratives, and gives
-the gist's fold-forward an outcome-flavored cadence. SessionEnd remains the
-backstop for sessions that never commit.
+``transcript_path``) and sends the transcript-so-far to ``import_conversation``
+with ``conversation_id = session_id``, so every trigger feeds one conversation
+and one server-side watermark (``agentic_seen_uuids``): the full transcript is
+re-sent, but only the DELTA since the last flush is processed. Commits/PRs are
+semantic work boundaries, so flushing there makes memory available mid-session
+(parallel sessions see fresh decisions), shapes batch episodes into work-unit
+narratives, and gives the gist's fold-forward an outcome-flavored cadence.
 
-Discipline mirrors the SessionEnd hook: THIS SCRIPT NEVER FAILS LOUDLY —
+**Also the SessionEnd hook**, which used to be an ``agent``-type hook told in
+prose to read the transcript and re-emit every record inline. That could not
+work on a long session — an agent cannot re-emit a 16 MB transcript — and the
+breadcrumb file it was instructed to write on BOTH success and failure had
+never been created on any machine, so it was failing silently. Being a script
+also means it stays in step with the other capture paths rather than drifting:
+the prose version sent no ``org_id`` (every room in a non-default org failed
+with "Agent brain not found"), filtered no slash-command wrappers, and derived
+no title.
+
+Deliberately INDEPENDENT of the per-turn hook rather than reusing its cursor.
+This is the backstop for exactly the cases where per-turn capture is dormant —
+disabled, unauthenticated, or failing — so inheriting its state would mean
+inheriting whatever went wrong with it. Re-sending everything and letting the
+server's watermark dedup is the property that makes it a second witness.
+
+Discipline mirrors the per-turn hook: THIS SCRIPT NEVER FAILS LOUDLY —
 any error exits 0 quietly (the hook is async fire-and-forget; memory capture
 must never disturb the user's session).
 
@@ -38,6 +52,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import NonInteractiveAuthRequired, resolve_url_and_auth  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from room_map import env_for_url  # noqa: E402
+from session_title import (  # noqa: E402
+    custom_title,
+    generated_title,
+    prompt_title,
+)
+from transcript_chunks import slices as make_slices  # noqa: E402
+from transcript_filter import drop_command_wrappers  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception (with traceback) before it
 # propagates to us; a background hook must stay quiet, so silence that logger
@@ -75,6 +96,25 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if not records:
         _log("empty transcript; nothing to flush")
         return
+
+    # Slash-command bookkeeping never leaves the machine. Applied HERE as well
+    # as in the other two upload paths deliberately: the filter's own contract
+    # is that a session cannot come out clean or dirty depending on which path
+    # captured it, and this path was the one still shipping `/model` and its
+    # reply as things the user said.
+    kept = drop_command_wrappers(records)
+    if len(kept) != len(records):
+        _log(f"dropped {len(records) - len(kept)} slash-command record(s)")
+    records = kept
+    if not records:
+        _log("transcript holds only slash-command records; nothing to flush")
+        return
+
+    # The name the transcript carries — the user's rename first, then the one
+    # Claude Code generated, then the session's first prompt for a headless run
+    # that has neither. Without it this path imports every session unnamed.
+    title = custom_title(records) or generated_title(records) \
+        or prompt_title(records) or None
 
     # Working-context scope for captured directives: git remote basename from
     # the transcript's cwd, resolved client-side (a worktree dir name would
@@ -116,53 +156,90 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # Cached hit is a dict lookup; a miss asks the server once and
             # caches the answer, so this is not a per-flush round-trip.
             room = await resolve_repo_brain(session, cwd, env) if cwd else None
-            arguments = {
-                "messages": records,
-                "conversation_id": session_id,
-                "source_platform": "claude",
-            }
-            if room:
-                arguments["agent_brain_id"] = room["brain_id"]
-            if namespace:
-                # Older servers ignore unknown arguments; newer ones
-                # stamp the directive scope from it. Safe either way.
-                arguments["namespace"] = namespace
-            res = await session.call_tool("import_conversation", arguments=arguments)
-            texts = [t for t in (getattr(b, "text", None)
-                                 for b in getattr(res, "content", []) or []) if t]
-            # MCP signals tool failure via isError + a message in content,
-            # NOT via an exception — without this check a bad token or
-            # server error logs as success while memory never updates.
-            if getattr(res, "isError", False):
-                _log(f"flush FAILED: {(texts[0] if texts else 'no detail')[:200]}")
-                return
-            out = getattr(res, "structuredContent", None)
-            if isinstance(out, dict) and "conversation_id" not in out \
-                    and isinstance(out.get("result"), dict):
-                out = out["result"]  # FastMCP wraps some returns in {"result": …}
-            if not isinstance(out, dict):
-                for text in texts:
-                    try:
-                        out = json.loads(text)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            if isinstance(out, dict) and "conversation_id" in out:
-                # Name the destination: "flushed N records" alone can't
-                # distinguish a room write from a personal one, which is the
-                # failure mode this routing exists to fix.
-                dest = (f'room {room["brain_id"][:8]}' if room
-                        else "personal memory (no room cached)")
-                _log(f"flushed {out.get('messages_received')} records "
-                     f"(conv {str(out.get('conversation_id'))[:8]}, "
-                     f"path={out.get('path')}) -> {dest} "
-                     "— server processes the delta")
-            else:
-                # Not an error per the protocol, but not the shape
-                # import_conversation returns either — log what came back
-                # instead of claiming success on an arbitrary body.
-                _log("flush response unrecognized: "
-                     f"{(texts[0] if texts else '')[:120]!r}")
+
+            # Chunked, because this path sends the WHOLE transcript in one
+            # call and real sessions outgrow one payload: of 185 local
+            # transcripts, 74 exceed 1 MB and the largest is 46 MB. Unchunked,
+            # this works on ordinary sessions and fails on precisely the long
+            # ones — and as the backstop for when per-turn capture is dormant,
+            # failing on the biggest sessions is failing where it matters most.
+            # Slices are disjoint and sent in order against one conversation,
+            # so the server's watermark sees a normal incremental import.
+            payloads = make_slices(records)
+            for index, payload in enumerate(payloads, 1):
+                arguments = {
+                    "messages": payload,
+                    "conversation_id": session_id,
+                    "source_platform": "claude",
+                }
+                if not await _send(session, arguments, room, title, namespace,
+                                   index, len(payloads)):
+                    return
+
+
+async def _send(session, arguments, room, title, namespace,
+                index: int, total: int) -> bool:
+    """Send one slice. False means stop — a later slice cannot help.
+
+    Sequential and fail-closed: the slices are ordered, so pressing on after a
+    rejection would leave a hole in the middle of the conversation while the
+    log reported the later slices as fine.
+    """
+    if room:
+        arguments["agent_brain_id"] = room["brain_id"]
+        # The org that OWNS the room, when it is not the caller's default. A
+        # brain resolves inside exactly ONE org, and the default follows
+        # whichever org was last selected in the MemHub app. Sending the id
+        # without its org is how every capture into such a room fails with
+        # "Agent brain not found" — an error that reads like a deleted brain.
+        if room.get("org_id"):
+            arguments["org_id"] = room["org_id"]
+    if title:
+        arguments["title"] = title
+    if namespace:
+        # Older servers ignore unknown arguments; newer ones stamp the
+        # directive scope from it. Safe either way.
+        arguments["namespace"] = namespace
+
+    label = f"slice {index}/{total}: " if total > 1 else ""
+    res = await session.call_tool("import_conversation", arguments=arguments)
+    texts = [t for t in (getattr(b, "text", None)
+                         for b in getattr(res, "content", []) or []) if t]
+    # MCP signals tool failure via isError + a message in content, NOT via an
+    # exception — without this check a bad token or server error logs as
+    # success while memory never updates.
+    if getattr(res, "isError", False):
+        _log(f"{label}flush FAILED: "
+             f"{(texts[0] if texts else 'no detail')[:200]}")
+        return False
+    out = getattr(res, "structuredContent", None)
+    if isinstance(out, dict) and "conversation_id" not in out \
+            and isinstance(out.get("result"), dict):
+        out = out["result"]  # FastMCP wraps some returns in {"result": …}
+    if not isinstance(out, dict):
+        for text in texts:
+            try:
+                out = json.loads(text)
+                break
+            except json.JSONDecodeError:
+                continue
+    if isinstance(out, dict) and "conversation_id" in out:
+        # Name the destination: "flushed N records" alone can't distinguish a
+        # room write from a personal one, which is the failure mode this
+        # routing exists to fix.
+        dest = (f'room {room["brain_id"][:8]}' if room
+                else "personal memory (no room cached)")
+        _log(f"{label}flushed {out.get('messages_received')} records "
+             f"(conv {str(out.get('conversation_id'))[:8]}, "
+             f"path={out.get('path')}) -> {dest} "
+             "— server processes the delta")
+        return True
+    # Not an error per the protocol, but not the shape import_conversation
+    # returns either — log what came back instead of claiming success on an
+    # arbitrary body, and stop: an unrecognised reply is not a slice landing.
+    _log(f"{label}flush response unrecognized: "
+         f"{(texts[0] if texts else '')[:120]!r}")
+    return False
 
 
 def _auth_required(e: BaseException) -> bool:
@@ -195,8 +272,11 @@ def main() -> int:
         if not session_id or not transcript_path or not Path(transcript_path).exists():
             _log("missing session_id/transcript_path; skipping")
             return 0
+        # SessionEnd carries no tool_input; it reports its reason instead.
         cmd = str((hook_input.get("tool_input") or {}).get("command", ""))[:120]
-        _log(f"trigger: {cmd!r}")
+        reason = str(hook_input.get("reason") or "")[:40]
+        _log(f"trigger: {cmd!r}" if cmd
+             else f"trigger: session end ({reason or 'no reason given'})")
         asyncio.run(_flush(session_id, transcript_path))
     # BaseException, not Exception: when anyio's task group mixes a
     # CancelledError into the group (e.g. the auth failure cancelling sibling
