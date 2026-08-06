@@ -223,6 +223,11 @@ async def main() -> int:
                     help="Working-context name for captured directives (the "
                          "repo). Default: resolved from the transcript's cwd "
                          "via the git remote basename; pass '' to disable.")
+    ap.add_argument("--org-id", default=None,
+                    help="Organization to import into, for accounts in more "
+                         "than one. Default: the connection's default org — "
+                         "which is why an --agent-brain-id created in ANOTHER "
+                         "org fails with 'Agent brain not found'.")
     ap.add_argument("--url", default=None)
     ap.add_argument("--chunk-bytes", type=int, default=3_500_000,
                     help="transcripts larger than this are sent as sequential "
@@ -317,6 +322,12 @@ async def main() -> int:
                     "conversation_id": conv_id,
                     "source_platform": "claude",
                 }
+                if args.org_id:
+                    # Brains are looked up inside ONE org. Without this, an
+                    # --agent-brain-id belonging to a non-default org fails
+                    # with "Agent brain not found" — which reads like a stale
+                    # or deleted id rather than a wrong-org lookup.
+                    call_args["org_id"] = args.org_id
                 if args.title:
                     call_args["title"] = args.title
                 if args.agent_brain_id:
