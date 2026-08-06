@@ -113,13 +113,24 @@ def _slices(records: list[dict], chunk_bytes: int) -> list[list[dict]]:
     return out
 
 
-async def _gist_hash(session, agent_brain_id: str | None) -> str | None:
-    """Content hash of the session gist (episode starting '## GOAL'), or None."""
+async def _gist_hash(
+    session, agent_brain_id: str | None, org_id: str | None = None,
+) -> str | None:
+    """Content hash of the session gist (episode starting '## GOAL'), or None.
+
+    ``org_id`` must match the one the import itself uses. A brain is resolved
+    inside ONE org, so searching without it falls back to the caller's default
+    org and finds nothing for a brain that lives elsewhere — which does not
+    read as an error, it reads as "the gist has not appeared yet", and every
+    inter-slice wait then burns its full timeout.
+    """
     import hashlib
     args = {"query": "GOAL INTENT OUTCOME ROUTE RESUME STATE next step",
             "memory_type": "episodes", "top_k": 5}
     if agent_brain_id:
         args["agent_brain_id"] = agent_brain_id
+    if org_id:
+        args["org_id"] = org_id
     try:
         res = await session.call_tool("search_memory", arguments=args)
         d = unwrap(res)
@@ -132,16 +143,24 @@ async def _gist_hash(session, agent_brain_id: str | None) -> str | None:
     return None
 
 
-async def _wait_gist_change(session, agent_brain_id, prev_hash, timeout=1800):
+async def _wait_gist_change(
+    session, agent_brain_id, prev_hash, timeout=1800, org_id=None,
+):
     """Block until the gist appears (prev None) or its content changes
     (fold-forward happened) — the end-of-slice extraction signal. On timeout,
     warn and proceed (the next slice still imports safely; worst case the
-    gist upserts race and one fold is lost to last-writer-wins)."""
+    gist upserts race and one fold is lost to last-writer-wins).
+
+    ``org_id`` rides through to the search for the reason in :func:`_gist_hash`:
+    without it a cross-org import never observes its own gist, so this waits
+    the full ``timeout`` at EVERY slice boundary — 30 minutes each by default,
+    turning a chunked import into hours of doing nothing.
+    """
     import time as _time
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline:
         await asyncio.sleep(20)
-        h = await _gist_hash(session, agent_brain_id)
+        h = await _gist_hash(session, agent_brain_id, org_id)
         if h is not None and h != prev_hash:
             print("  slice extraction complete (gist updated)")
             return h
@@ -315,7 +334,8 @@ async def main() -> int:
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
-            prev_gist_hash = await _gist_hash(s, args.agent_brain_id)
+            prev_gist_hash = await _gist_hash(
+                s, args.agent_brain_id, args.org_id)
             for i, sl in enumerate(slices, 1):
                 call_args: dict = {
                     "messages": sl,
@@ -359,7 +379,7 @@ async def main() -> int:
                           "(gist appear/fold-forward) before next slice ...")
                     prev_gist_hash = await _wait_gist_change(
                         s, args.agent_brain_id, prev_gist_hash,
-                        timeout=args.slice_timeout,
+                        timeout=args.slice_timeout, org_id=args.org_id,
                     )
     print("-" * 56)
     print("Queued. Extraction runs in the background (minutes for large "
