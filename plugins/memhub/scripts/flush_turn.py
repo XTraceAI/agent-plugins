@@ -46,6 +46,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Stdlib-only and side-effect free, so it imports at module scope like the
+# rest of the cursor/tail logic and stays testable under a bare python3.
+from transcript_filter import drop_command_wrappers  # noqa: E402
+
 # ``_memhub_auth`` pulls in the mcp SDK, so it is imported lazily inside
 # :func:`_flush` rather than at module scope. That keeps this module importable
 # under a bare python3 — which is what lets the cursor/tail/lock logic, where
@@ -280,8 +284,16 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # resolves a cwd remembers it for the rest of the session.
     # Checked BEFORE resolving cwd, because resolving shells out to git and an
     # inert delta should cost nothing at all.
-    if all(isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
-           for r in records):
+    # Slash-command bookkeeping never leaves the machine. Dropped from what is
+    # SENT, not from what is read: the metadata harvest below still sees every
+    # record, and the cursor still advances past these, because they are
+    # deliberately never shipped rather than deferred.
+    sendable = drop_command_wrappers(records)
+
+    if not sendable or all(
+        isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
+        for r in sendable
+    ):
         # The title usually arrives in exactly this kind of batch, so read it
         # before dropping the records on the floor.
         inert_title = _title(records)
@@ -320,7 +332,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # caches the answer, so this is not a per-turn round-trip.
             room = await resolve_repo_brain(session, cwd, env) if cwd else None
             arguments = {
-                "messages": records,
+                "messages": sendable,
                 "conversation_id": session_id,
                 "source_platform": "claude",
                 # The whole point: durable on arrival, extracted in batches.
