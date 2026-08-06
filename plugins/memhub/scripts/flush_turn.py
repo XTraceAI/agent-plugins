@@ -400,8 +400,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             _save_state(session_id, offset=consumed,
                         last_uuid=out.get("ack_through"), cwd=cwd,
                         namespace=namespace, title=title)
-            _log(f"+{len(records)} rec ({consumed - offset}B) "
-                 f"new={out.get('records_new')} pending={out.get('pending')} "
+            # Sent count, not read count — and the byte span stays the READ
+            # span, because that is what the cursor just advanced past. The
+            # filtered records are the difference between the two, so showing
+            # it makes an under-sent delta diagnosable from the log alone.
+            filtered = len(records) - len(sendable)
+            _log(f"+{len(sendable)} rec ({consumed - offset}B) "
+                 + (f"filtered={filtered} " if filtered else "")
+                 + f"new={out.get('records_new')} pending={out.get('pending')} "
                  f"draining={out.get('draining')}")
 
 
