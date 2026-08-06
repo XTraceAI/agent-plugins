@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.env
 # Local + account state (brain ids, worktrees, locks). This repo is
 # public — nothing under .claude/ belongs in it.
 .claude/

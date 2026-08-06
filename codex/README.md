@@ -70,7 +70,31 @@ agentic path always tags the platform `claude`.
 
 Run the tests: `python3 codex/test_codex_to_claude.py`.
 
-## 3. Auto-capture (optional, verify on your Codex version)
+## 3. Client-side encrypted artifacts from Codex
+
+The same SDK-backed artifact scripts work when Codex is the client. Configure
+the private `~/.config/memhub-plugin/.env` described in the root README, then
+have Codex run the file-to-file flow without reading or echoing that file:
+
+```bash
+uv run --with 'mcp<2' --with xtrace-ai-sdk==0.1.1 \
+  python plugins/memhub/scripts/save_artifact.py \
+  --file private-notes.md --name "Private notes" --encrypt \
+  --agent-brain-id "<brain-id>"
+
+uv run --with 'mcp<2' --with xtrace-ai-sdk==0.1.1 \
+  python plugins/memhub/scripts/load_encrypted_artifact.py \
+  --artifact-id "<artifact-id>" --agent-brain-id "<brain-id>" \
+  --output /tmp/private-notes.decrypted
+```
+
+Codex can read the locally decrypted output, while MemHub receives and returns
+only the SDK ciphertext. Names, tags, and other artifact metadata remain
+visible. This is intentionally different from the session importer in section
+2: normal session imports are plaintext so the server can perform agentic
+extraction; encrypted artifacts are opaque and must be loaded directly by id.
+
+## 4. Auto-capture (optional, verify on your Codex version)
 
 Codex's `notify` config runs a program on session events. Point it at a wrapper
 that imports the newest rollout when a session ends:

@@ -45,6 +45,27 @@ Do exactly this:
    destination brain, `--no-room` to save into personal workspace memory
    instead, `--parent-id <id>` to version an existing artifact, `--rationale
    "..."` to note why this version supersedes the last, `--tags a,b`.
+
+   If (and only if) the user explicitly asks for client-side encryption, add
+   `--encrypt` and include the XTrace SDK dependency. The helper resolves its
+   local passphrase from `$MEMHUB_ENCRYPTION_PASSPHRASE` or the private
+   `~/.config/memhub-plugin/.env` file (an explicit `--env-file` can override
+   the file location):
+
+   ```bash
+   uv run --with 'mcp<2' --with xtrace-ai-sdk==0.1.1 \
+     python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+     --file "<path>" --name "<name>" --type "<type>" --encrypt
+   ```
+
+   This encrypts the artifact body only. Name/type/tags remain plaintext, and
+   the server cannot semantically search or extract the opaque body. The same
+   passphrase is required to load it by id with
+   `scripts/load_encrypted_artifact.py`; when it was stored in a brain, pass
+   the brain id printed by this script as the loader's `--agent-brain-id`.
+   There is no key exchange or recovery yet. Never put the passphrase itself
+   in command/tool arguments, and never open, print, grep, or ask the user to
+   paste their passphrase or `.env` file.
 4. Report the returned `{id, action}` to the user, **and which brain it landed
    in, by name** — automatic routing that happens silently reads as losing
    things. On first ever run the script may
