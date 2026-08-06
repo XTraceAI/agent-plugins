@@ -25,6 +25,7 @@ somewhere nobody expects.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -66,9 +67,8 @@ def _payload(result, expected: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _brains_from(result) -> list[dict]:
-    """The brain list out of a ``list_agent_brains`` result, tolerantly."""
-    payload = _payload(result, "agent_brains")
+def _brains_in(payload: dict) -> list[dict]:
+    """The brain rows out of an already-unwrapped listing payload."""
     for key in ("agent_brains", "brains", "items"):
         value = payload.get(key)
         if isinstance(value, list):
@@ -76,8 +76,16 @@ def _brains_from(result) -> list[dict]:
     return []
 
 
-async def _org_ids(session) -> list[str]:
-    """Every org this account can act in, default first.
+def _brains_from(result) -> list[dict]:
+    """The brain list out of a ``list_agent_brains`` result, tolerantly."""
+    return _brains_in(_payload(result, "agent_brains"))
+
+
+async def _org_ids(session) -> list[tuple[str, str | None]]:
+    """Every org this account can act in as ``(id, name)``, default first.
+
+    The NAME rides along so a listing can be checked against the scope the
+    server says it applied — see the scope guard in :func:`resolve_repo_brain`.
 
     Returns ``[]`` on any problem, which collapses resolution back to
     default-org-only behaviour — a lookup helper must never be the thing that
@@ -90,14 +98,16 @@ async def _org_ids(session) -> list[str]:
         orgs = _payload(result, "orgs").get("orgs")
         if not isinstance(orgs, list):
             return []
-        ids = [
-            (o["org_id"], bool(o.get("is_default"))) for o in orgs
+        rows = [
+            (o["org_id"], o.get("name"), bool(o.get("is_default")))
+            for o in orgs
             if isinstance(o, dict)
             and isinstance(o.get("org_id"), str) and o["org_id"]
         ]
-        # Default first: it is the one the room is usually in, so the search
-        # stops on the first listing in the common case.
-        return [i for i, d in ids if d] + [i for i, d in ids if not d]
+        # Default first: it decides which org is RECORDED for a room visible
+        # from more than one, never which brain wins.
+        return ([(i, n) for i, n, d in rows if d]
+                + [(i, n) for i, n, d in rows if not d])
     except Exception:  # noqa: BLE001
         return []
 
@@ -141,9 +151,9 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         # RECORDED for a room visible in more than one; it never decides which
         # brain wins.
         known_orgs = list(await _org_ids(session))
-        # ``[None]`` keeps a single default-org listing when ``list_orgs`` is
-        # unavailable, exactly as before.
-        org_ids: list[str | None] = known_orgs or [None]
+        # ``[(None, None)]`` keeps a single default-org listing when
+        # ``list_orgs`` is unavailable, exactly as before.
+        scopes: list[tuple[str | None, str | None]] = known_orgs or [(None, None)]
 
         # Two different kinds of "not everything was seen", and they carry
         # different weight.
@@ -162,14 +172,37 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         # an org, which leaves the entry due for a rate-limited upgrade later.
         listings_ok = True
 
-        matches: list[tuple[str, str | None]] = []
-        for org_id in org_ids:
+        # Concurrently: every org must be listed before deciding, and the calls
+        # are independent, so paying for them one after another would put N
+        # sequential round trips inside a per-turn flush. Order still comes
+        # from ``scopes``, which is what decides the org recorded.
+        async def _list(org_id: str | None):
             args = {"org_id": org_id} if org_id else {}
-            result = await session.call_tool("list_agent_brains", arguments=args)
-            if getattr(result, "isError", False):
+            return await session.call_tool("list_agent_brains", arguments=args)
+
+        results = await asyncio.gather(
+            *(_list(org_id) for org_id, _ in scopes), return_exceptions=True,
+        )
+
+        matches: list[tuple[str, str | None]] = []
+        for (org_id, org_name), result in zip(scopes, results):
+            if isinstance(result, BaseException) \
+                    or getattr(result, "isError", False):
                 listings_ok = False
                 continue
-            for brain in _brains_from(result):
+            payload = _payload(result, "agent_brains")
+            # The server echoes the scope it applied. Checking it means the
+            # recorded org is confirmed by the responder rather than assumed
+            # from the request — the brain rows themselves carry no org, so
+            # this echo is the only confirmation available. A mismatch means
+            # the listing was not scoped as asked, so its contents say nothing
+            # about that org and are dropped rather than mis-attributed.
+            applied = (payload.get("scope") or {}).get("org_name") \
+                if isinstance(payload.get("scope"), dict) else None
+            if org_name and applied and applied != org_name:
+                listings_ok = False
+                continue
+            for brain in _brains_in(payload):
                 # Exact match, and only on the id being a usable string — a
                 # malformed row must not become the routing target.
                 if brain.get("name") != name:

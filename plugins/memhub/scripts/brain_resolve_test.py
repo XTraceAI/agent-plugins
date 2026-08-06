@@ -386,6 +386,55 @@ def test_one_org_failing_to_list_does_not_settle_a_duplicate():
               rm.resolve_due("/repo", "staging"), False)
 
 
+def test_a_listing_that_ignored_our_org_scope_is_not_trusted():
+    """The recorded org must be confirmed by the responder, not assumed from
+    the request. Brain rows carry no org, so the listing's echoed
+    ``scope.org_name`` is the only confirmation available — and a server that
+    returned the same brains regardless of scope would otherwise have its
+    contents attributed to whichever org we happened to ask about first.
+    """
+    print("scope echo guard")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-other")
+            # Ignores org_id: always answers as the DEFAULT org.
+            return _Result({
+                "agent_brains": [{"name": NAME, "agent_brain_id": BID}],
+                "scope": {"org_name": "org-default"},
+            })
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        # The default-org listing is honoured and matches; the other org's
+        # listing came back scoped to org-default, so it is dropped rather
+        # than crediting org-other with a brain it may not hold.
+        check("routed on the honoured listing", (room or {}).get("brain_id"), None)
+        check("nothing cached from an unscoped listing",
+              rm.read_room("/repo", "staging"), None)
+
+
+def test_a_scoped_listing_is_trusted():
+    """The same shape, answering correctly per org, must still resolve."""
+    print("scope echo honoured")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-other")
+            org = args.get("org_id")
+            brains = ([{"name": NAME, "agent_brain_id": BID}]
+                      if org == "org-default" else [])
+            return _Result({"agent_brains": brains,
+                            "scope": {"org_name": org}})
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("resolved", (room or {}).get("brain_id"), BID)
+        check("with its org", (room or {}).get("org_id"), "org-default")
+
+
 def test_a_complete_search_still_records_a_miss():
     """The negative cache must survive the change above, or a genuinely
     room-less repo re-queries on every single turn."""
@@ -474,6 +523,8 @@ if __name__ == "__main__":
                test_a_cross_org_duplicate_is_not_settled_by_org_order,
                test_an_incomplete_search_does_not_brand_a_repo_room_less,
                test_one_org_failing_to_list_does_not_settle_a_duplicate,
+               test_a_listing_that_ignored_our_org_scope_is_not_trusted,
+               test_a_scoped_listing_is_trusted,
                test_a_complete_search_still_records_a_miss,
                test_a_room_cached_without_an_org_is_resolved_again,
                test_an_unknowable_org_does_not_re_resolve_every_turn):
