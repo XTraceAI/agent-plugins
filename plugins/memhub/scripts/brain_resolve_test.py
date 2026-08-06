@@ -346,9 +346,44 @@ def test_an_incomplete_search_does_not_brand_a_repo_room_less():
 
         room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
         check("no room", room, None)
-        check("no miss recorded", rm.read_room("/repo", "staging"), None)
-        check("retried next turn, not in 24h",
+        check("nothing routed", rm.read_room("/repo", "staging"), None)
+        # Backed off, not branded: a short pause rather than a day of personal
+        # memory — and not a re-query on every single turn either, which is the
+        # storm the backoff exists to prevent.
+        check("backed off", rm.resolve_due("/repo", "staging"), False)
+
+        data = json.loads(rm.ROOMS_PATH.read_text())
+        entry = data["repos"][NAME]["staging"]
+        check("no 24h miss was written", "missed_at" in entry, False)
+        entry["probed_at"] = time.time() - rm.PROBE_BACKOFF_S - 1
+        rm.ROOMS_PATH.write_text(json.dumps(data))
+        check("due again in minutes, not a day",
               rm.resolve_due("/repo", "staging"), True)
+
+
+def test_one_org_failing_to_list_does_not_settle_a_duplicate():
+    """The nastiest shape. Two brains share the name across two orgs, and the
+    org holding the second transiently fails to list. Exactly one match comes
+    back — indistinguishable from an unambiguous hit — and committing it would
+    cache an arbitrary pick for a day. A hole in the search has to beat a
+    confident-looking result."""
+    print("duplicate hidden by an error")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-broken")
+            if args.get("org_id") == "org-broken":
+                return _Result(None, is_error=True)   # the hidden duplicate
+            return _Result({"agent_brains": [
+                {"name": NAME, "agent_brain_id": BID}]})
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("did not commit the visible half", room, None)
+        check("cached no brain_id", rm.read_room("/repo", "staging"), None)
+        check("backed off rather than branding",
+              rm.resolve_due("/repo", "staging"), False)
 
 
 def test_a_complete_search_still_records_a_miss():
@@ -438,6 +473,7 @@ if __name__ == "__main__":
                test_a_room_visible_from_several_orgs_is_not_a_duplicate,
                test_a_cross_org_duplicate_is_not_settled_by_org_order,
                test_an_incomplete_search_does_not_brand_a_repo_room_less,
+               test_one_org_failing_to_list_does_not_settle_a_duplicate,
                test_a_complete_search_still_records_a_miss,
                test_a_room_cached_without_an_org_is_resolved_again,
                test_an_unknowable_org_does_not_re_resolve_every_turn):

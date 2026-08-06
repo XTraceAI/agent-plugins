@@ -289,6 +289,56 @@ def write_room(
 # week would never be picked up.
 MISS_TTL_S = 24 * 60 * 60
 
+# How long an INCOMPLETE lookup (the server could not answer for every org)
+# suppresses the next one. Deliberately short: nothing was learned, so this is
+# only a rate limit on retrying, not a claim about the repo. Without it a
+# sustained backend outage turns a once-a-day negative lookup into a round trip
+# on every single turn — hammering a backend that is already struggling.
+PROBE_BACKOFF_S = 5 * 60
+
+
+def write_probe_backoff(
+    cwd: str | Path | None = None, env: str | None = None,
+) -> None:
+    """Record that a lookup was attempted but could not complete.
+
+    Distinct from :func:`write_miss`, which asserts "this repo has no room" and
+    is trusted for a day. An incomplete search asserts nothing — some org could
+    not be listed — so it must not brand the repo room-less; it only stops the
+    next few turns from re-asking.
+
+    Never touches ``brain_id`` or ``missed_at``: an entry that already routes
+    must keep routing, and a real miss must keep its own clock.
+    """
+    key = room_name(cwd)
+    if key is None:
+        return
+    try:
+        with _locked():
+            data = _load()
+            repo = data["repos"].get(key)
+            if not isinstance(repo, dict):
+                repo = {}
+            slot = repo.get(env or current_env())
+            if not isinstance(slot, dict):
+                slot = {}
+            slot["probed_at"] = time.time()
+            repo[env or current_env()] = slot
+            data["repos"][key] = repo
+            data.setdefault("version", 1)
+            tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
+            try:
+                tmp.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, ROOMS_PATH)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+    except Exception:  # noqa: BLE001 — a rate limit must never fail a capture
+        return
+
 
 def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     """True when this repo's room should be looked up on the server.
@@ -315,6 +365,16 @@ def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     entry = entry.get(env or current_env()) if isinstance(entry, dict) else None
     if not isinstance(entry, dict):
         return True
+    # A recent INCOMPLETE probe suppresses the next one whatever else the entry
+    # says. Checked first because it is a rate limit on ASKING, and it applies
+    # to every reason for asking — an unresolved repo, and an org-less entry
+    # waiting to be upgraded. Without it in front, the upgrade path re-probes
+    # on every turn for as long as the backend stays unable to answer.
+    try:
+        if (time.time() - float(entry.get("probed_at", 0))) < PROBE_BACKOFF_S:
+            return False
+    except (TypeError, ValueError):
+        pass
     if isinstance(entry.get("brain_id"), str) and entry["brain_id"]:
         if isinstance(entry.get("org_id"), str) and entry["org_id"]:
             return False

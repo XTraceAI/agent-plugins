@@ -35,6 +35,7 @@ from room_map import (  # noqa: E402
     resolve_due,
     room_name,
     write_miss,
+    write_probe_backoff,
     write_room,
 )
 
@@ -144,11 +145,29 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         # unavailable, exactly as before.
         org_ids: list[str | None] = known_orgs or [None]
 
+        # Two different kinds of "not everything was seen", and they carry
+        # different weight.
+        #
+        # ``listings_ok`` — every scope this pass DID try answered. A listing
+        # that errored leaves a known hole: the room, or the second half of a
+        # duplicate, could be in exactly the org that failed. Deciding anything
+        # on that is deciding on missing evidence.
+        #
+        # ``known_orgs`` empty means ``list_orgs`` was unavailable, so there is
+        # only ever one scope to try and no way to learn of others. That is not
+        # a hole this pass can close by retrying — it is simply the pre-org
+        # behaviour, and refusing to route there would break room routing
+        # entirely on any backend that cannot enumerate orgs. So a clean
+        # default-org answer is still acted on; it just cannot be recorded with
+        # an org, which leaves the entry due for a rate-limited upgrade later.
+        listings_ok = True
+
         matches: list[tuple[str, str | None]] = []
         for org_id in org_ids:
             args = {"org_id": org_id} if org_id else {}
             result = await session.call_tool("list_agent_brains", arguments=args)
             if getattr(result, "isError", False):
+                listings_ok = False
                 continue
             for brain in _brains_from(result):
                 # Exact match, and only on the id being a usable string — a
@@ -170,7 +189,7 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         # to be visible, not settled by a UI artifact.
         distinct = {bid for bid, _ in matches}
 
-        if len(distinct) == 1:
+        if len(distinct) == 1 and listings_ok:
             # One brain, possibly visible from several orgs (a shared room).
             # Record the FIRST org it was seen in — the list is default-first,
             # so that is the one nearest the user. Which org is recorded only
@@ -179,6 +198,21 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
             brain_id, org_id = matches[0]
             write_room(brain_id, name=name, env=env, org_id=org_id)
             return {"brain_id": brain_id, **({"org_id": org_id} if org_id else {})}
+
+        if not listings_ok:
+            # A match found while some org could not be listed is not the same
+            # fact as a match found across all of them: the org that failed is
+            # precisely where a second brain of the same name would sit, so
+            # committing here would cache an arbitrary pick for a day and
+            # reintroduce the ambiguity this function refuses to guess at. The
+            # zero-match case lands here too — "not found" is equally unsafe
+            # when part of the search did not happen.
+            #
+            # Nothing is recorded but a short backoff, so the decision is
+            # retried in minutes rather than branded for a day or re-asked
+            # every turn.
+            write_probe_backoff(cwd, env)
+            return room
 
         if len(distinct) > 1:
             # Duplicate rooms for one repo do happen, and picking whichever the
@@ -195,18 +229,18 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
             # a working cached id, and newly-created duplicates elsewhere must
             # not un-route it.
             return room
-        # Looked, found nothing. Remember that so the next turn does not ask
-        # again; the entry carries no brain_id, so routing is unchanged.
-        #
-        # ONLY when the search was complete. If ``list_orgs`` was unavailable
-        # this pass looked at the default org alone, and a repo whose room
-        # lives in another org would be branded room-less for the full
-        # MISS_TTL_S — a transient outage silently sending a whole day of
-        # sessions to personal memory. An incomplete look records nothing and
-        # is simply retried; the per-turn cost of that only applies while the
-        # server cannot answer, which is not a state to optimise for.
+        # Found nothing, and every scope tried answered. Remember that so the
+        # next turn does not ask again; the entry carries no brain_id, so
+        # routing is unchanged.
         if known_orgs:
             write_miss(cwd, env)
+        else:
+            # ...but only the DEFAULT org could be tried, because ``list_orgs``
+            # was unavailable. A day-long "this repo has no room" is too strong
+            # a conclusion to draw from a search that could not see other orgs,
+            # and both deployed backends do expose ``list_orgs`` — so this is a
+            # transient state, and minutes is the right retry, not a day.
+            write_probe_backoff(cwd, env)
     except Exception:  # noqa: BLE001 — capture must never fail on a lookup
         return room
     return room
