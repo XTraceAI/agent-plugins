@@ -312,6 +312,13 @@ def _auth_required(e: BaseException) -> bool:
 
 
 def main() -> int:
+    # Bound BEFORE the try, because the handler reads them. Assigned inside it,
+    # any failure earlier in the block — a malformed stdin payload is enough —
+    # would make the handler itself raise NameError, and this script's one hard
+    # rule is that it never surfaces a traceback in the user's session.
+    session_id = ""
+    timeout_s = _deadline_s()
+    started = time.monotonic()
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
         session_id = hook_input.get("session_id")
@@ -331,7 +338,7 @@ def main() -> int:
         # which is the exact ending that check exists to avoid, and the one
         # case it cannot see. Ending ourselves first is what guarantees the
         # breadcrumb below is always written.
-        timeout_s = _deadline_s()
+        started = time.monotonic()
         asyncio.run(asyncio.wait_for(
             _flush(session_id, transcript_path), timeout=timeout_s))
     # BaseException, not Exception: when anyio's task group mixes a
@@ -340,10 +347,18 @@ def main() -> int:
     # would skip an Exception handler and kill the hook with a traceback.
     # This is a fire-and-forget background hook: exit 0 quietly, always.
     except BaseException as e:  # noqa: BLE001 — never fail the hook
-        if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
+        # Told apart by ELAPSED TIME, not by type. Since 3.11 ``socket.timeout``
+        # IS ``TimeoutError``, so a network read that gave up inside the client
+        # arrives here indistinguishable from our own wall clock — and reporting
+        # "timed out after 240s" for a socket that died in 3s sends whoever
+        # reads the log looking for a slow transcript instead of a sick
+        # connection. Our deadline is the only one that can have consumed the
+        # whole budget.
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)) \
+                and time.monotonic() - started >= timeout_s * 0.99:
             # Slices already sent are durable and deduped, so this is a
             # partial capture rather than a lost one — say which it is.
-            _log(f"timed out after {_deadline_s():.0f}s; slices already sent "
+            _log(f"timed out after {timeout_s:.0f}s; slices already sent "
                  "are stored. Re-run /memhub:import-session --session "
                  f"{session_id} to finish (it resumes from the server's "
                  "watermark).")
