@@ -202,6 +202,15 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
             if org_name and applied and applied != org_name:
                 listings_ok = False
                 continue
+            # A scope was asked for but none came back: the brains are real,
+            # but WHICH org holds them is unconfirmed. Record the match without
+            # an org rather than attributing it to the org we happened to ask
+            # about. That degrades to the pre-org behaviour — routing still
+            # works, the entry is simply org-less and due for a rate-limited
+            # upgrade — instead of either inventing an attribution or refusing
+            # to resolve at all, which would break every backend that does not
+            # echo a scope.
+            attributed = org_id if (applied or not org_name) else None
             for brain in _brains_in(payload):
                 # Exact match, and only on the id being a usable string — a
                 # malformed row must not become the routing target.
@@ -209,7 +218,7 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
                     continue
                 brain_id = brain.get("agent_brain_id") or brain.get("id")
                 if isinstance(brain_id, str) and brain_id:
-                    matches.append((brain_id, org_id))
+                    matches.append((brain_id, attributed))
 
         # EVERY org is searched before deciding, deliberately — no early break
         # on the first org that has a hit. Stopping early would hide a genuine

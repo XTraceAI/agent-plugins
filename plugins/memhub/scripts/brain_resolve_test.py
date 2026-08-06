@@ -62,6 +62,13 @@ class _Session:
         return result
 
 
+def _listing(org_id, brains):
+    """A ``list_agent_brains`` payload that echoes its scope, as the real
+    server does — verified against staging, where every listing carries
+    ``scope.org_name``."""
+    return _Result({"agent_brains": brains, "scope": {"org_name": org_id}})
+
+
 def _orgs(*org_ids):
     """A ``list_orgs`` payload. The FIRST id is the default org."""
     return _Result({"orgs": [
@@ -253,9 +260,9 @@ def test_finds_a_room_outside_the_default_org():
             if name == "list_orgs":
                 return _orgs("org-default", "org-with-room")
             if args.get("org_id") == "org-with-room":
-                return _Result({"agent_brains": [
-                    {"name": NAME, "agent_brain_id": BID}]})
-            return _Result({"agent_brains": []})  # default org has nothing
+                return _listing("org-with-room",
+                                [{"name": NAME, "agent_brain_id": BID}])
+            return _listing(args.get("org_id"), [])  # default org has nothing
 
         session = _Session(answer)
         room = run(br.resolve_repo_brain(session, "/repo", "staging"))
@@ -283,8 +290,8 @@ def test_a_room_visible_from_several_orgs_is_not_a_duplicate():
         def answer(name_, args):
             if name_ == "list_orgs":
                 return _orgs("org-default", "org-other")
-            return _Result({"agent_brains": [
-                {"name": NAME, "agent_brain_id": BID}]})
+            return _listing(args.get("org_id"),
+                            [{"name": NAME, "agent_brain_id": BID}])
 
         session = _Session(answer)
         room = run(br.resolve_repo_brain(session, "/repo", "staging"))
@@ -415,6 +422,33 @@ def test_a_listing_that_ignored_our_org_scope_is_not_trusted():
               rm.read_room("/repo", "staging"), None)
 
 
+def test_a_listing_with_no_scope_echo_is_used_but_not_attributed():
+    """A server that answers without echoing a scope: the brain is real, but
+    which org holds it is unconfirmed.
+
+    Refusing to resolve would break every backend that does not echo a scope;
+    attributing it to the org we happened to ask about would record a tenancy
+    claim nothing confirmed. So the match is used and the org is left off —
+    the pre-org behaviour, plus a rate-limited upgrade later.
+    """
+    print("no scope echo")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-other")
+            brains = ([{"name": NAME, "agent_brain_id": BID}]
+                      if args.get("org_id") == "org-default" else [])
+            return _Result({"agent_brains": brains})   # no scope key at all
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("still routes", (room or {}).get("brain_id"), BID)
+        check("but claims no org", (room or {}).get("org_id"), None)
+        check("cached without an org",
+              (rm.read_room("/repo", "staging") or {}).get("org_id"), None)
+
+
 def test_a_scoped_listing_is_trusted():
     """The same shape, answering correctly per org, must still resolve."""
     print("scope echo honoured")
@@ -473,9 +507,9 @@ def test_a_room_cached_without_an_org_is_resolved_again():
             if name == "list_orgs":
                 return _orgs("org-default", "org-with-room")
             if args.get("org_id") == "org-with-room":
-                return _Result({"agent_brains": [
-                    {"name": NAME, "agent_brain_id": BID}]})
-            return _Result({"agent_brains": []})
+                return _listing("org-with-room",
+                                [{"name": NAME, "agent_brain_id": BID}])
+            return _listing(args.get("org_id"), [])
 
         run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
         check("upgraded in place",
@@ -524,6 +558,7 @@ if __name__ == "__main__":
                test_an_incomplete_search_does_not_brand_a_repo_room_less,
                test_one_org_failing_to_list_does_not_settle_a_duplicate,
                test_a_listing_that_ignored_our_org_scope_is_not_trusted,
+               test_a_listing_with_no_scope_echo_is_used_but_not_attributed,
                test_a_scoped_listing_is_trusted,
                test_a_complete_search_still_records_a_miss,
                test_a_room_cached_without_an_org_is_resolved_again,
