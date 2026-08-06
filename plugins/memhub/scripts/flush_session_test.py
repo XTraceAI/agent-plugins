@@ -129,6 +129,22 @@ check("the loop gives up before the hard timeout is reached",
       fs._DEFAULT_DEADLINE_S * 0.9 < fs._DEFAULT_DEADLINE_S)
 
 
+# ── the first slice always goes ───────────────────────────────────────
+# A backstop that sends nothing is not a degraded capture, it is no capture,
+# and these are the sessions per-turn capture already missed.
+
+PAST, FUTURE = 100.0, 1_000_000.0
+check("slice 1 goes even past the deadline",
+      fs._stop_before_slice(1, PAST + 1, PAST) is False)
+check("slice 1 goes when the deadline is already behind us",
+      fs._stop_before_slice(1, 1e9, PAST) is False)
+check("slice 2 stops past the deadline",
+      fs._stop_before_slice(2, PAST + 1, PAST) is True)
+check("slice 2 continues before the deadline",
+      fs._stop_before_slice(2, PAST, FUTURE) is False)
+check("exactly at the deadline stops", fs._stop_before_slice(3, PAST, PAST))
+
+
 # ── which timeout is being reported ───────────────────────────────────
 # Since 3.11 socket.timeout IS TimeoutError, so a network read that gave up
 # inside the client reaches main() indistinguishable BY TYPE from our own

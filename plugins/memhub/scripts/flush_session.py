@@ -81,6 +81,24 @@ def _log(msg: str) -> None:
 _DEFAULT_DEADLINE_S = 240.0
 
 
+def _stop_before_slice(index: int, now: float, deadline: float) -> bool:
+    """Whether to give up rather than send slice ``index`` (1-based).
+
+    The FIRST slice always goes. A backstop that sends nothing is not a
+    degraded capture, it is no capture — and the sessions reaching this path
+    are the ones per-turn capture already missed, so "some of it" and "none of
+    it" are the two outcomes that matter most to keep apart.
+
+    As the code stands the check could not fire on slice 1 anyway: the deadline
+    is established after every piece of setup, so no time has passed when the
+    first slice is considered. But that is a property of where ONE LINE sits,
+    and moving it would silently convert "captured a prefix" into "captured
+    nothing" with the log still reading like a bounded, deliberate stop. The
+    guarantee is written down here so it cannot be lost by accident.
+    """
+    return index > 1 and now >= deadline
+
+
 def _deadline_s() -> float:
     """How long this flush may spend sending, from the env with a sane floor.
 
@@ -207,7 +225,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # — instead of being cancelled where it cannot.
             deadline = time.monotonic() + _deadline_s() * 0.9
             for index, payload in enumerate(payloads, 1):
-                if time.monotonic() >= deadline:
+                if _stop_before_slice(index, time.monotonic(), deadline):
                     remaining = sum(len(p) for p in payloads[index - 1:])
                     _log(f"deadline reached after {index - 1}/{len(payloads)} "
                          f"slices; {remaining} record(s) not sent. Re-run "
