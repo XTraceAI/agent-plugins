@@ -238,6 +238,7 @@ def write_room(
     name: str | None = None,
     cwd: str | Path | None = None,
     env: str | None = None,
+    org_id: str | None = None,
 ) -> Path:
     key = name or room_name(cwd)
     if key is None:
@@ -252,7 +253,19 @@ def write_room(
             repo = {}
         # Only this backend's entry is replaced — a repo used from both installs
         # keeps both ids, and other repos' entries are untouched.
-        repo[env or current_env()] = {"brain_id": brain_id}
+        # ``resolved_at`` stamps every write, including one that could not
+        # determine the org. It is what bounds the org re-probe below to once a
+        # day instead of once a turn.
+        entry = {"brain_id": brain_id, "resolved_at": time.time()}
+        # The org that OWNS the brain, recorded because a brain is resolved
+        # inside exactly one org and the caller's default org is not
+        # necessarily that one — it follows whichever org was last selected in
+        # the MemHub app, so it changes under a running session. Without this,
+        # every capture into a room outside the default org fails with
+        # "Agent brain not found".
+        if isinstance(org_id, str) and org_id:
+            entry["org_id"] = org_id
+        repo[env or current_env()] = entry
         data["repos"][key] = repo
         data.setdefault("version", 1)
 
@@ -283,6 +296,17 @@ def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     False when a brain id is already cached (nothing to do) or when a recent
     lookup found none (do not re-ask on every turn). A miss older than
     :data:`MISS_TTL_S` is due again, so a brain created later is picked up.
+
+    An entry cached WITHOUT an ``org_id`` is due again, so a cache written
+    before rooms carried their org gets upgraded rather than failing forever.
+    Without that, an existing install stays broken after the fix ships: the id
+    is present, so nothing would ever re-ask, and every capture keeps resolving
+    the brain in the wrong org.
+
+    That re-probe is rate-limited by ``resolved_at`` on the same
+    :data:`MISS_TTL_S` clock as a miss. A backend that cannot report orgs at all
+    would otherwise leave the entry permanently org-less and re-resolve on EVERY
+    turn — trading a silent failure for a per-turn round trip.
     """
     key = room_name(cwd)
     if key is None:
@@ -292,7 +316,12 @@ def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     if not isinstance(entry, dict):
         return True
     if isinstance(entry.get("brain_id"), str) and entry["brain_id"]:
-        return False
+        if isinstance(entry.get("org_id"), str) and entry["org_id"]:
+            return False
+        try:
+            return (time.time() - float(entry.get("resolved_at", 0))) > MISS_TTL_S
+        except (TypeError, ValueError):
+            return True
     try:
         return (time.time() - float(entry.get("missed_at", 0))) > MISS_TTL_S
     except (TypeError, ValueError):

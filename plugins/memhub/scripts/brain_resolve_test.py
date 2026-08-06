@@ -39,15 +39,35 @@ class _Result:
 
 
 class _Session:
+    """Fake MCP session.
+
+    ``result`` is either one result returned for every tool, or a callable
+    ``(name, arguments) -> result`` when a test needs different answers per
+    tool or per org — which resolution now needs, since it asks ``list_orgs``
+    and then ``list_agent_brains`` once per org until it finds the room.
+    """
+
     def __init__(self, result, record=None):
         self._result = result
         self.calls = record if record is not None else []
+        self.args = []
 
     async def call_tool(self, name, arguments=None):
         self.calls.append(name)
-        if isinstance(self._result, Exception):
-            raise self._result
-        return self._result
+        self.args.append((name, dict(arguments or {})))
+        result = (self._result(name, arguments or {})
+                  if callable(self._result) else self._result)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _orgs(*org_ids):
+    """A ``list_orgs`` payload. The FIRST id is the default org."""
+    return _Result({"orgs": [
+        {"org_id": o, "name": o, "is_default": i == 0}
+        for i, o in enumerate(org_ids)
+    ]})
 
 
 NAME = "Repo: XTraceAI/memhub-claude-plugin"
@@ -79,7 +99,10 @@ def test_resolves_and_caches():
         ]}))
         room = run(br.resolve_repo_brain(session, "/repo", "staging"))
         check("found the exact match", (room or {}).get("brain_id"), BID)
-        check("asked the server once", session.calls, ["list_agent_brains"])
+        # Orgs are enumerated first so the match can be cached WITH its org.
+        # The guarantee that matters is below: this happens once, then never
+        # again for this repo.
+        check("listed brains once", session.calls.count("list_agent_brains"), 1)
         check("cached for next time",
               (rm.read_room("/repo", "staging") or {}).get("brain_id"), BID)
 
@@ -209,12 +232,126 @@ def test_result_shapes_are_tolerated():
               BID)
 
 
+def test_finds_a_room_outside_the_default_org():
+    """The failure this exists to fix. A room in a non-default org was
+    invisible to resolution — ``list_agent_brains`` lists ONE org — and every
+    capture into it then died with "Agent brain not found"."""
+    print("cross-org resolution")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name, args):
+            if name == "list_orgs":
+                return _orgs("org-default", "org-with-room")
+            if args.get("org_id") == "org-with-room":
+                return _Result({"agent_brains": [
+                    {"name": NAME, "agent_brain_id": BID}]})
+            return _Result({"agent_brains": []})  # default org has nothing
+
+        session = _Session(answer)
+        room = run(br.resolve_repo_brain(session, "/repo", "staging"))
+        check("found it in the non-default org", (room or {}).get("brain_id"), BID)
+        check("returned the org too", (room or {}).get("org_id"), "org-with-room")
+        cached = rm.read_room("/repo", "staging") or {}
+        check("cached the org alongside the id", cached.get("org_id"),
+              "org-with-room")
+        check("searched the default org first",
+              [a.get("org_id") for n, a in session.args if n == "list_agent_brains"],
+              ["org-default", "org-with-room"])
+
+
+def test_stops_at_the_default_org_when_the_room_is_there():
+    """The common case must not pay for the cross-org search."""
+    print("default-org fast path")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name, args):
+            if name == "list_orgs":
+                return _orgs("org-default", "org-other")
+            return _Result({"agent_brains": [
+                {"name": NAME, "agent_brain_id": BID}]})
+
+        session = _Session(answer)
+        room = run(br.resolve_repo_brain(session, "/repo", "staging"))
+        check("resolved", (room or {}).get("brain_id"), BID)
+        check("did not widen past the default org",
+              session.calls.count("list_agent_brains"), 1)
+        check("recorded the default org", (room or {}).get("org_id"),
+              "org-default")
+
+
+def test_a_room_cached_without_an_org_is_resolved_again():
+    """Upgrade path. A cache written before rooms carried their org holds a
+    brain_id, so nothing would ever re-ask — and every capture would keep
+    resolving that brain in the wrong org, forever."""
+    print("legacy cache upgrade")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+        # Exactly what an older plugin wrote.
+        rm.write_room(BID, name=NAME, env="staging")
+        entry = rm._load()["repos"][NAME]["staging"]
+        entry.pop("org_id", None)
+        entry.pop("resolved_at", None)
+        rm.ROOMS_PATH.write_text(
+            json.dumps({"version": 1, "repos": {NAME: {"staging": entry}}}),
+            encoding="utf-8")
+
+        check("due again", rm.resolve_due("/repo", "staging"), True)
+
+        def answer(name, args):
+            if name == "list_orgs":
+                return _orgs("org-default", "org-with-room")
+            if args.get("org_id") == "org-with-room":
+                return _Result({"agent_brains": [
+                    {"name": NAME, "agent_brain_id": BID}]})
+            return _Result({"agent_brains": []})
+
+        run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("upgraded in place",
+              (rm.read_room("/repo", "staging") or {}).get("org_id"),
+              "org-with-room")
+        check("and settles", rm.resolve_due("/repo", "staging"), False)
+
+
+def test_an_unknowable_org_does_not_re_resolve_every_turn():
+    """If the backend cannot report orgs, the entry stays org-less. It must
+    still be rate-limited, or a silent failure is traded for a per-turn
+    round trip on every single flush."""
+    print("org-less rate limit")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name, args):
+            if name == "list_orgs":
+                return _Result(None, is_error=True)
+            return _Result({"agent_brains": [
+                {"name": NAME, "agent_brain_id": BID}]})
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("still routes without an org", (room or {}).get("brain_id"), BID)
+        check("no org recorded", (rm.read_room("/repo", "staging") or {})
+              .get("org_id"), None)
+        check("not due again immediately", rm.resolve_due("/repo", "staging"),
+              False)
+
+        # ...but due again after the TTL, so a fixed backend is picked up.
+        data = rm._load()
+        data["repos"][NAME]["staging"]["resolved_at"] = 0
+        rm.ROOMS_PATH.write_text(json.dumps(data), encoding="utf-8")
+        check("due again after the TTL", rm.resolve_due("/repo", "staging"), True)
+
+
 if __name__ == "__main__":
     for fn in (test_resolves_and_caches, test_no_brain_is_remembered_as_a_miss,
                test_a_miss_never_clobbers_a_resolved_room,
                test_duplicate_room_names_are_not_guessed_between,
                test_never_routes_on_a_fuzzy_or_broken_match,
-               test_failures_degrade_to_no_room, test_result_shapes_are_tolerated):
+               test_failures_degrade_to_no_room, test_result_shapes_are_tolerated,
+               test_finds_a_room_outside_the_default_org,
+               test_stops_at_the_default_org_when_the_room_is_there,
+               test_a_room_cached_without_an_org_is_resolved_again,
+               test_an_unknowable_org_does_not_re_resolve_every_turn):
         fn()
     print()
     if _failures:

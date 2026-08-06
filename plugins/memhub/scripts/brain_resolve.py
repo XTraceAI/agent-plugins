@@ -39,16 +39,17 @@ from room_map import (  # noqa: E402
 )
 
 
-def _brains_from(result) -> list[dict]:
-    """Pull the brain list out of an MCP tool result, tolerantly.
+def _payload(result, expected: str) -> dict:
+    """Pull the JSON body out of an MCP tool result, tolerantly.
 
     The payload arrives as ``structuredContent`` or as JSON in a text block,
-    and FastMCP sometimes wraps a return in ``{"result": …}``. None of that is
-    worth failing a capture over, so anything unrecognised yields no brains and
-    the caller treats it as "not found".
+    and FastMCP sometimes wraps a return in ``{"result": …}`` — ``expected`` is
+    the key that tells those two apart. None of this is worth failing a capture
+    over, so anything unrecognised yields ``{}`` and the caller treats it as
+    "not found".
     """
     payload = getattr(result, "structuredContent", None)
-    if isinstance(payload, dict) and "agent_brains" not in payload \
+    if isinstance(payload, dict) and expected not in payload \
             and isinstance(payload.get("result"), dict):
         payload = payload["result"]
     if not isinstance(payload, dict):
@@ -61,13 +62,43 @@ def _brains_from(result) -> list[dict]:
                 break
             except json.JSONDecodeError:
                 continue
-    if not isinstance(payload, dict):
-        return []
+    return payload if isinstance(payload, dict) else {}
+
+
+def _brains_from(result) -> list[dict]:
+    """The brain list out of a ``list_agent_brains`` result, tolerantly."""
+    payload = _payload(result, "agent_brains")
     for key in ("agent_brains", "brains", "items"):
         value = payload.get(key)
         if isinstance(value, list):
             return [b for b in value if isinstance(b, dict)]
     return []
+
+
+async def _org_ids(session) -> list[str]:
+    """Every org this account can act in, default first.
+
+    Returns ``[]`` on any problem, which collapses resolution back to
+    default-org-only behaviour — a lookup helper must never be the thing that
+    fails a capture.
+    """
+    try:
+        result = await session.call_tool("list_orgs", arguments={})
+        if getattr(result, "isError", False):
+            return []
+        orgs = _payload(result, "orgs").get("orgs")
+        if not isinstance(orgs, list):
+            return []
+        ids = [
+            (o["org_id"], bool(o.get("is_default"))) for o in orgs
+            if isinstance(o, dict)
+            and isinstance(o.get("org_id"), str) and o["org_id"]
+        ]
+        # Default first: it is the one the room is usually in, so the search
+        # stops on the first listing in the common case.
+        return [i for i, d in ids if d] + [i for i, d in ids if not d]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
@@ -82,32 +113,63 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
     function.
     """
     room = read_room(cwd, env)
-    if room or not resolve_due(cwd, env):
+    # ``resolve_due`` is consulted even when a room is already cached, because
+    # an entry written before rooms carried their org is present-but-unusable:
+    # the id resolves in the wrong org at write time. Guarding on ``room`` alone
+    # meant such an entry could never be upgraded — it short-circuited here
+    # forever while every capture failed.
+    if not resolve_due(cwd, env):
         return room
 
     name = room_name(cwd)
     if not name:
-        return None
+        return room
 
     try:
-        result = await session.call_tool("list_agent_brains", arguments={})
-        if getattr(result, "isError", False):
-            return None
-        matches = []
-        for brain in _brains_from(result):
-            # Exact match, and only on the id being a usable string — a
-            # malformed row must not become the routing target.
-            if brain.get("name") != name:
+        # EVERY org, not just the default one. A brain is resolved inside
+        # exactly one org, and the caller's default follows whichever org was
+        # last selected in the MemHub app — so it changes under a running
+        # session and is routinely NOT the org holding the repo's room. Listing
+        # only the default made such a room invisible to resolution and, once
+        # cached, unusable at write time: every capture failed with "Agent brain
+        # not found", an error that reads like a deleted brain.
+        #
+        # Orgs are enumerated FIRST so the org holding the match is known and
+        # can be cached WITH it — that pairing is what makes the entry usable
+        # later. They come back default-first, so the common case still stops at
+        # one listing. Falling back to ``[None]`` keeps a single default-org
+        # listing when ``list_orgs`` is unavailable, exactly as before.
+        org_ids: list[str | None] = list(await _org_ids(session)) or [None]
+
+        matches: list[tuple[str, str | None]] = []
+        for org_id in org_ids:
+            args = {"org_id": org_id} if org_id else {}
+            result = await session.call_tool("list_agent_brains", arguments=args)
+            if getattr(result, "isError", False):
                 continue
-            brain_id = brain.get("agent_brain_id") or brain.get("id")
-            if isinstance(brain_id, str) and brain_id:
-                matches.append(brain_id)
+            for brain in _brains_from(result):
+                # Exact match, and only on the id being a usable string — a
+                # malformed row must not become the routing target.
+                if brain.get("name") != name:
+                    continue
+                brain_id = brain.get("agent_brain_id") or brain.get("id")
+                if isinstance(brain_id, str) and brain_id:
+                    matches.append((brain_id, org_id))
+            if matches:
+                # Stop at the first org that has it. Orgs are ordered default
+                # first, so the common case costs one listing — and a room
+                # SHARED into several orgs resolves to the one nearest the
+                # user rather than looking like a duplicate.
+                break
 
-        if len(matches) == 1:
-            write_room(matches[0], name=name, env=env)
-            return {"brain_id": matches[0]}
+        distinct = {bid for bid, _ in matches}
 
-        if len(matches) > 1:
+        if len(distinct) == 1:
+            brain_id, org_id = matches[0]
+            write_room(brain_id, name=name, env=env, org_id=org_id)
+            return {"brain_id": brain_id, **({"org_id": org_id} if org_id else {})}
+
+        if len(distinct) > 1:
             # Duplicate rooms for one repo do happen, and picking whichever the
             # listing returned first would route this repo's memory into an
             # arbitrary one of them — invisibly, and differently for different
@@ -115,13 +177,16 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
             # resolve by guessing. Capture continues to personal memory and the
             # lookup stays DUE (no miss recorded), so merging the duplicates
             # takes effect on the next flush rather than after a TTL.
-            print(f"[memhub] {len(matches)} agent brains are named {name!r} — "
+            print(f"[memhub] {len(distinct)} agent brains are named {name!r} — "
                   "cannot tell which is the repo's room, so this session is "
                   "not routed to one. Merge or rename the duplicates.")
-            return None
+            # ``room``, not None: on a re-resolution this repo may already have
+            # a working cached id, and newly-created duplicates elsewhere must
+            # not un-route it.
+            return room
         # Looked, found nothing. Remember that so the next turn does not ask
         # again; the entry carries no brain_id, so routing is unchanged.
         write_miss(cwd, env)
     except Exception:  # noqa: BLE001 — capture must never fail on a lookup
-        return None
-    return None
+        return room
+    return room
