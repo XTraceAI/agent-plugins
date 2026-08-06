@@ -40,6 +40,7 @@ from mcp.client.streamable_http import streamablehttp_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from room_map import env_for_url, read_room  # noqa: E402
+from transcript_filter import drop_command_wrappers  # noqa: E402
 
 
 def load_transcript(path: Path) -> tuple[list[dict], int]:
@@ -252,8 +253,21 @@ async def main() -> int:
 
     conv_id = args.conversation_id or f.stem
     # --namespace wins; '' explicitly disables; default = resolve from records.
+    # Resolved from the FULL list, ahead of the filter below: ``cwd`` rides on
+    # every user record, including the slash-command ones.
     namespace = (args.namespace if args.namespace is not None
                  else _namespace_from_records(records)) or None
+
+    # Slash-command bookkeeping is transcript plumbing, not conversation. The
+    # per-turn path applies the same filter, so a session cannot come out clean
+    # or dirty depending on which path happened to capture it.
+    kept = drop_command_wrappers(records)
+    dropped = len(records) - len(kept)
+    records = kept
+    if not records:
+        print(f"ERROR: {f} holds only slash-command records", file=sys.stderr)
+        return 2
+
     url, headers, auth = resolve_url_and_auth(args.url)
 
     # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
@@ -275,7 +289,9 @@ async def main() -> int:
     slices = _slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
     print(f"session file    : {f}")
-    print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)")
+    filtered = f"   (+{dropped} slash-command dropped)" if dropped else ""
+    print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)"
+          f"{filtered}")
     print(f"conversation_id : {conv_id}")
     print(f"endpoint        : {url}")
     if args.agent_brain_id:
