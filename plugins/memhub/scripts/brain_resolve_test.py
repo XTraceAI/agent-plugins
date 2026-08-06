@@ -119,13 +119,22 @@ def test_no_brain_is_remembered_as_a_miss():
     print("negative cache")
     with tempfile.TemporaryDirectory() as tmp:
         _isolate(tmp)
-        session = _Session(_Result({"agent_brains": [
-            {"name": "Repo: someone/else", "agent_brain_id": "x"}]}))
+
+        # ``list_orgs`` has to answer for real now: a miss is only recorded
+        # after a COMPLETE search, so a fixture that cannot enumerate orgs
+        # would (correctly) decline to brand this repo room-less.
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default")
+            return _Result({"agent_brains": [
+                {"name": "Repo: someone/else", "agent_brain_id": "x"}]})
+
+        session = _Session(answer)
         room = run(br.resolve_repo_brain(session, "/repo", "staging"))
         check("no match -> no room", room, None)
         check("miss recorded", rm.resolve_due("/repo", "staging"), False)
 
-        session2 = _Session(_Result({"agent_brains": []}))
+        session2 = _Session(answer)
         run(br.resolve_repo_brain(session2, "/repo", "staging"))
         check("does not re-ask inside the TTL", session2.calls, [])
 
@@ -260,25 +269,102 @@ def test_finds_a_room_outside_the_default_org():
               ["org-default", "org-with-room"])
 
 
-def test_stops_at_the_default_org_when_the_room_is_there():
-    """The common case must not pay for the cross-org search."""
-    print("default-org fast path")
+def test_a_room_visible_from_several_orgs_is_not_a_duplicate():
+    """The SAME brain id seen from two orgs is one room, not an ambiguity.
+
+    Every org is still searched — that is what makes a real cross-org duplicate
+    visible — so this also pins the cost: one listing per org, paid once on a
+    cache miss and never again.
+    """
+    print("shared room across orgs")
     with tempfile.TemporaryDirectory() as tmp:
         _isolate(tmp)
 
-        def answer(name, args):
-            if name == "list_orgs":
+        def answer(name_, args):
+            if name_ == "list_orgs":
                 return _orgs("org-default", "org-other")
             return _Result({"agent_brains": [
                 {"name": NAME, "agent_brain_id": BID}]})
 
         session = _Session(answer)
         room = run(br.resolve_repo_brain(session, "/repo", "staging"))
-        check("resolved", (room or {}).get("brain_id"), BID)
-        check("did not widen past the default org",
-              session.calls.count("list_agent_brains"), 1)
-        check("recorded the default org", (room or {}).get("org_id"),
+        check("resolved to the one brain", (room or {}).get("brain_id"), BID)
+        check("recorded the org nearest the user", (room or {}).get("org_id"),
               "org-default")
+        check("searched every org", session.calls.count("list_agent_brains"), 2)
+
+        # ...and the cost is paid once.
+        session2 = _Session(answer)
+        run(br.resolve_repo_brain(session2, "/repo", "staging"))
+        check("cache hit costs nothing", session2.calls, [])
+
+
+def test_a_cross_org_duplicate_is_not_settled_by_org_order():
+    """Two DIFFERENT brains sharing this repo's room name, one per org.
+
+    Stopping at the first org with a hit would route to whichever org came
+    first — and that order starts from the default org, which follows the last
+    org selected in the MemHub app. The target would change when a user merely
+    clicks around the UI, and two teammates would send the same repo's memory to
+    different brains. So every org is searched before deciding, and a genuine
+    ambiguity stays visible.
+    """
+    print("cross-org duplicates")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+        other = "99999999-8888-7777-6666-555555555555"
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-other")
+            which = BID if args.get("org_id") == "org-default" else other
+            return _Result({"agent_brains": [
+                {"name": NAME, "agent_brain_id": which}]})
+
+        session = _Session(answer)
+        room = run(br.resolve_repo_brain(session, "/repo", "staging"))
+        check("did not route", room, None)
+        check("looked in BOTH orgs before deciding",
+              session.calls.count("list_agent_brains"), 2)
+        check("cached nothing", rm.read_room("/repo", "staging"), None)
+        # Stays DUE, so merging the duplicates takes effect next flush.
+        check("still due", rm.resolve_due("/repo", "staging"), True)
+
+
+def test_an_incomplete_search_does_not_brand_a_repo_room_less():
+    """If list_orgs is unavailable, only the default org was searched. Writing
+    a miss then would send a repo whose room lives elsewhere to personal memory
+    for the whole TTL, on the strength of a look that never happened."""
+    print("incomplete search")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _Result(None, is_error=True)
+            return _Result({"agent_brains": []})  # default org has nothing
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("no room", room, None)
+        check("no miss recorded", rm.read_room("/repo", "staging"), None)
+        check("retried next turn, not in 24h",
+              rm.resolve_due("/repo", "staging"), True)
+
+
+def test_a_complete_search_still_records_a_miss():
+    """The negative cache must survive the change above, or a genuinely
+    room-less repo re-queries on every single turn."""
+    print("complete search records a miss")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-other")
+            return _Result({"agent_brains": []})
+
+        run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("miss recorded", rm.resolve_due("/repo", "staging"), False)
 
 
 def test_a_room_cached_without_an_org_is_resolved_again():
@@ -349,7 +435,10 @@ if __name__ == "__main__":
                test_never_routes_on_a_fuzzy_or_broken_match,
                test_failures_degrade_to_no_room, test_result_shapes_are_tolerated,
                test_finds_a_room_outside_the_default_org,
-               test_stops_at_the_default_org_when_the_room_is_there,
+               test_a_room_visible_from_several_orgs_is_not_a_duplicate,
+               test_a_cross_org_duplicate_is_not_settled_by_org_order,
+               test_an_incomplete_search_does_not_brand_a_repo_room_less,
+               test_a_complete_search_still_records_a_miss,
                test_a_room_cached_without_an_org_is_resolved_again,
                test_an_unknowable_org_does_not_re_resolve_every_turn):
         fn()

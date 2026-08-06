@@ -136,10 +136,13 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         #
         # Orgs are enumerated FIRST so the org holding the match is known and
         # can be cached WITH it — that pairing is what makes the entry usable
-        # later. They come back default-first, so the common case still stops at
-        # one listing. Falling back to ``[None]`` keeps a single default-org
-        # listing when ``list_orgs`` is unavailable, exactly as before.
-        org_ids: list[str | None] = list(await _org_ids(session)) or [None]
+        # later. They come back default-first, which decides only which org is
+        # RECORDED for a room visible in more than one; it never decides which
+        # brain wins.
+        known_orgs = list(await _org_ids(session))
+        # ``[None]`` keeps a single default-org listing when ``list_orgs`` is
+        # unavailable, exactly as before.
+        org_ids: list[str | None] = known_orgs or [None]
 
         matches: list[tuple[str, str | None]] = []
         for org_id in org_ids:
@@ -155,16 +158,24 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
                 brain_id = brain.get("agent_brain_id") or brain.get("id")
                 if isinstance(brain_id, str) and brain_id:
                     matches.append((brain_id, org_id))
-            if matches:
-                # Stop at the first org that has it. Orgs are ordered default
-                # first, so the common case costs one listing — and a room
-                # SHARED into several orgs resolves to the one nearest the
-                # user rather than looking like a duplicate.
-                break
 
+        # EVERY org is searched before deciding, deliberately — no early break
+        # on the first org that has a hit. Stopping early would hide a genuine
+        # cross-org ambiguity: two DIFFERENT brains sharing this repo's room
+        # name in two orgs would resolve to whichever org happened to be
+        # ordered first. That order comes from the default org, which follows
+        # the last org selected in the MemHub app — so the routing target would
+        # change when a user merely clicks around the UI, and two teammates
+        # would send the same repo's memory to different brains. Ambiguity has
+        # to be visible, not settled by a UI artifact.
         distinct = {bid for bid, _ in matches}
 
         if len(distinct) == 1:
+            # One brain, possibly visible from several orgs (a shared room).
+            # Record the FIRST org it was seen in — the list is default-first,
+            # so that is the one nearest the user. Which org is recorded only
+            # affects how the id is looked up later; it is the same brain
+            # either way.
             brain_id, org_id = matches[0]
             write_room(brain_id, name=name, env=env, org_id=org_id)
             return {"brain_id": brain_id, **({"org_id": org_id} if org_id else {})}
@@ -186,7 +197,16 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
             return room
         # Looked, found nothing. Remember that so the next turn does not ask
         # again; the entry carries no brain_id, so routing is unchanged.
-        write_miss(cwd, env)
+        #
+        # ONLY when the search was complete. If ``list_orgs`` was unavailable
+        # this pass looked at the default org alone, and a repo whose room
+        # lives in another org would be branded room-less for the full
+        # MISS_TTL_S — a transient outage silently sending a whole day of
+        # sessions to personal memory. An incomplete look records nothing and
+        # is simply retried; the per-turn cost of that only applies while the
+        # server cannot answer, which is not a state to optimise for.
+        if known_orgs:
+            write_miss(cwd, env)
     except Exception:  # noqa: BLE001 — capture must never fail on a lookup
         return room
     return room
