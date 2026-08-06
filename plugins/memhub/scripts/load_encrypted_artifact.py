@@ -2,21 +2,24 @@
 """Fetch an encrypted MemHub artifact and decrypt its text locally.
 
 The artifact body remains ciphertext throughout the MCP round-trip.  Only this
-process receives ``MEMHUB_ENCRYPTION_PASSPHRASE``; it is consumed by
-``xtrace-ai-sdk`` locally and is never included in tool arguments.
+process receives the passphrase (from the environment or a private local
+``.env``); it is consumed by ``xtrace-ai-sdk`` locally and is never included in
+tool arguments.
 
 Usage:
-    # After securely exporting MEMHUB_ENCRYPTION_PASSPHRASE:
-    uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
-      python load_encrypted_artifact.py --artifact-id <id>
+    uv run --with 'mcp<2' --with xtrace-ai-sdk==0.1.1 \
+      python load_encrypted_artifact.py --artifact-id <id> \
+        --agent-brain-id <brain-id>
 
 Use ``--output`` to write the plaintext to a file instead of stdout.
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -67,6 +70,40 @@ def _artifact_id_argument(tool) -> str:
     )
 
 
+def _brain_id_argument(tool) -> str | None:
+    """Resolve an optional agent-brain field from the live MCP schema."""
+    schema = getattr(tool, "inputSchema", None) or {}
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    for candidate in ("agent_brain_id", "agentBrainId", "brain_id", "brainId"):
+        if candidate in properties:
+            return candidate
+    return None
+
+
+def _artifact_arguments(
+    tool,
+    artifact_id: str,
+    agent_brain_id: str | None,
+) -> dict[str, str]:
+    """Build a schema-compatible request, including scoped brain context."""
+    schema = getattr(tool, "inputSchema", None) or {}
+    required = set(schema.get("required", [])) if isinstance(schema, dict) else set()
+    id_argument = _artifact_id_argument(tool)
+    brain_argument = _brain_id_argument(tool)
+
+    if agent_brain_id and not brain_argument:
+        raise RuntimeError(
+            "get_artifact does not expose a recognized agent brain argument"
+        )
+    if brain_argument in required and not agent_brain_id:
+        raise RuntimeError("get_artifact requires brain context; pass --agent-brain-id")
+
+    arguments = {id_argument: artifact_id}
+    if agent_brain_id and brain_argument:
+        arguments[brain_argument] = agent_brain_id
+    return arguments
+
+
 def _artifact_content(payload: dict) -> str:
     """Find the stored artifact body in common FastMCP response wrappers."""
     queue: list[object] = [payload]
@@ -89,15 +126,38 @@ def _artifact_content(payload: dict) -> str:
     raise RuntimeError("get_artifact response did not contain a text content field")
 
 
-async def _load(artifact_id: str, url_override: str | None) -> tuple[object, dict]:
+def _write_private_text(path: Path, plaintext: str) -> None:
+    """Write decrypted text without a group/world-readable creation window."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        os.ftruncate(descriptor, 0)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = -1  # ownership transferred to the file object
+            output.write(plaintext)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+async def _load(
+    artifact_id: str,
+    agent_brain_id: str | None,
+    url_override: str | None,
+) -> tuple[object, dict]:
     url, headers, auth = resolve_url_and_auth(url_override)
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (read, write, _):
+    async with streamablehttp_client(url, headers=headers, auth=auth) as (
+        read,
+        write,
+        _,
+    ):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tool = _get_artifact_tool(await session.list_tools())
-            id_argument = _artifact_id_argument(tool)
             result = await session.call_tool(
-                "get_artifact", arguments={id_argument: artifact_id},
+                "get_artifact",
+                arguments=_artifact_arguments(tool, artifact_id, agent_brain_id),
             )
             return result, unwrap(result)
 
@@ -107,8 +167,24 @@ async def main() -> int:
         description="Fetch a MemHub artifact and decrypt its SDK-encrypted text locally."
     )
     ap.add_argument("--artifact-id", required=True)
-    ap.add_argument("--output", type=Path, default=None,
-                    help="write plaintext to this path instead of stdout")
+    ap.add_argument(
+        "--agent-brain-id",
+        default=None,
+        help="brain containing the artifact (required for brain-scoped artifacts)",
+    )
+    ap.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="private dotenv file for encryption (default: "
+        "~/.config/memhub-plugin/.env; direct environment variable wins)",
+    )
+    ap.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="write plaintext to this path instead of stdout",
+    )
     ap.add_argument("--url", default=None)
     args = ap.parse_args()
 
@@ -121,8 +197,12 @@ async def main() -> int:
     )
 
     try:
-        cipher = XTraceTextCipher.from_env()
-        result, payload = await _load(args.artifact_id, args.url)
+        cipher = XTraceTextCipher.from_env(env_file=args.env_file)
+        result, payload = await _load(
+            args.artifact_id,
+            args.agent_brain_id,
+            args.url,
+        )
         if getattr(result, "isError", False):
             detail = payload.get("_raw") or payload.get("error") or json.dumps(payload)
             print(f"ERROR: get_artifact failed: {detail}", file=sys.stderr)
@@ -133,7 +213,14 @@ async def main() -> int:
         return 2
 
     if args.output is not None:
-        args.output.write_text(plaintext, encoding="utf-8")
+        try:
+            _write_private_text(args.output, plaintext)
+        except OSError as exc:
+            print(
+                f"ERROR: cannot write decrypted output {args.output}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
         print(f"decrypted {len(plaintext):,} chars -> {args.output}")
     else:
         sys.stdout.write(plaintext)

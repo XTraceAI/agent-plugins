@@ -42,11 +42,13 @@ Do exactly this:
    to note why this version supersedes the last, `--tags a,b`.
 
    If (and only if) the user explicitly asks for client-side encryption, add
-   `--encrypt`, include the XTrace SDK dependency, and require that they have
-   set `$MEMHUB_ENCRYPTION_PASSPHRASE` locally:
+   `--encrypt` and include the XTrace SDK dependency. The helper resolves its
+   local passphrase from `$MEMHUB_ENCRYPTION_PASSPHRASE` or the private
+   `~/.config/memhub-plugin/.env` file (an explicit `--env-file` can override
+   the file location):
 
    ```bash
-   uv run --with mcp --with xtrace-ai-sdk==0.1.1 \
+   uv run --with 'mcp<2' --with xtrace-ai-sdk==0.1.1 \
      python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
      --file "<path>" --name "<name>" --type "<type>" --encrypt
    ```
@@ -54,8 +56,10 @@ Do exactly this:
    This encrypts the artifact body only. Name/type/tags remain plaintext, and
    the server cannot semantically search or extract the opaque body. The same
    passphrase is required to load it by id with
-   `scripts/load_encrypted_artifact.py`; there is no key exchange or recovery
-   yet. Never put the passphrase itself in the command or tool arguments.
+   `scripts/load_encrypted_artifact.py`; pass the same `--agent-brain-id` when
+   the artifact was stored in a brain. There is no key exchange or recovery
+   yet. Never put the passphrase itself in command/tool arguments, and never
+   open, print, grep, or ask the user to paste their passphrase or `.env` file.
 4. Report the returned `{id, action}` to the user. On first ever run the script may
    open the browser once for OAuth approval (same flow as /mcp; token cached
    after that) — that is expected, not an error.
