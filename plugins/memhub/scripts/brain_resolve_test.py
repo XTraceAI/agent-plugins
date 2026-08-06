@@ -449,6 +449,32 @@ def test_a_listing_with_no_scope_echo_is_used_but_not_attributed():
               (rm.read_room("/repo", "staging") or {}).get("org_id"), None)
 
 
+def test_a_confirmed_org_beats_an_unconfirmed_sighting():
+    """A backend that echoes a scope for some listings but not others.
+
+    The same brain is visible from both orgs; the DEFAULT org's listing carries
+    no echo, the other one does. Taking the first sighting would cache the
+    entry org-less and leave it due for a re-probe it does not need, throwing
+    away an org the server actually confirmed.
+    """
+    print("confirmed org wins")
+    with tempfile.TemporaryDirectory() as tmp:
+        _isolate(tmp)
+        rows = [{"name": NAME, "agent_brain_id": BID}]
+
+        def answer(name_, args):
+            if name_ == "list_orgs":
+                return _orgs("org-default", "org-other")
+            if args.get("org_id") == "org-other":
+                return _listing("org-other", rows)      # echoes its scope
+            return _Result({"agent_brains": rows})      # no echo
+
+        room = run(br.resolve_repo_brain(_Session(answer), "/repo", "staging"))
+        check("same brain either way", (room or {}).get("brain_id"), BID)
+        check("took the confirmed org", (room or {}).get("org_id"), "org-other")
+        check("and settled", rm.resolve_due("/repo", "staging"), False)
+
+
 def test_a_scoped_listing_is_trusted():
     """The same shape, answering correctly per org, must still resolve."""
     print("scope echo honoured")
@@ -559,6 +585,7 @@ if __name__ == "__main__":
                test_one_org_failing_to_list_does_not_settle_a_duplicate,
                test_a_listing_that_ignored_our_org_scope_is_not_trusted,
                test_a_listing_with_no_scope_echo_is_used_but_not_attributed,
+               test_a_confirmed_org_beats_an_unconfirmed_sighting,
                test_a_scoped_listing_is_trusted,
                test_a_complete_search_still_records_a_miss,
                test_a_room_cached_without_an_org_is_resolved_again,

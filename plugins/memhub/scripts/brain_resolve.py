@@ -233,11 +233,16 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
 
         if len(distinct) == 1 and listings_ok:
             # One brain, possibly visible from several orgs (a shared room).
-            # Record the FIRST org it was seen in — the list is default-first,
-            # so that is the one nearest the user. Which org is recorded only
-            # affects how the id is looked up later; it is the same brain
-            # either way.
-            brain_id, org_id = matches[0]
+            # Prefer a sighting whose org the server CONFIRMED, then fall back
+            # to the first. Taking ``matches[0]`` blindly would throw away a
+            # confirmed org whenever the default-org listing happened to be the
+            # one without a scope echo — caching the entry org-less, and so
+            # leaving it due for a re-probe it did not need.
+            brain_id = next(iter(distinct))
+            org_id = next(
+                (o for b, o in matches if b == brain_id and o),
+                matches[0][1],
+            )
             write_room(brain_id, name=name, env=env, org_id=org_id)
             return {"brain_id": brain_id, **({"org_id": org_id} if org_id else {})}
 
