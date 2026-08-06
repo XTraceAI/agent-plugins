@@ -1,7 +1,7 @@
 ---
-description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save the whole fixing process to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or auto-armed by the memhub hook right after `gh pr create`). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
+description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or auto-armed by the memhub hook right after `gh pr create`). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
 argument-hint: [pr-number-or-url]
-allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__import_conversation, mcp__plugin_memhub-staging_memhub__import_conversation, Bash, Read, Edit, Write, Glob, Grep
+allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__import_conversation, mcp__plugin_memhub-staging_memhub__import_conversation, Bash, Read, Edit, Write, Glob, Grep
 ---
 
 Babysit a pull request until its review bots are satisfied, then bank what
@@ -67,66 +67,71 @@ already resolved.
 
 ## Final pass — save the process to MemHub, then end the loop
 
-Ship the fixing process into the repo's room by importing THIS SESSION'S
-transcript through the **agentic** ingestion path. The session gist — the
-structured episode folding goals, decisions, errors, and outcome — is
-composed ONLY on the agentic path (Claude Code `.jsonl` transcripts);
-hand-built plain-chat `messages` route to the regular bulk importer, where
-gist composition is off, and produce loose per-batch episodes instead. The
-transcript already contains every finding read, every accept/reject
-judgment, and every fix commit — do NOT hand-write `{role, content}` pairs
-on top of it.
+Save a **PR-scoped artifact** — the review record — into the repo's room.
+Do NOT import the session transcript. The Stop-hook capture already ships
+this session to this same room continuously, routed by `resolve_repo_brain`,
+so an import would write a SECOND copy of the same conversation under a
+different id. Two transcripts of one session in one room produce competing
+facts and episodes that BOTH surface in retrieval — the exact failure
+artifact versioning exists to prevent — and it costs megabytes to do it.
 
-1. **Resolve this session's transcript**: the most recently modified
-   `.jsonl` sitting DIRECTLY inside the `~/.claude/projects/` directory
-   matching the current working directory (top level only — `.jsonl` files
-   in subdirectories are subagent/workflow transcripts, not sessions).
+What capture does not record is the judgment: which findings were real,
+which were rejected and why, and which commit answered each. That is this
+step's whole value, and it is a page of text.
 
-   **Mixed-session check**: if this session visibly spanned more than one
-   repo (you changed working directories into another checkout, committed
-   to another repo, or babysat alongside unrelated work elsewhere), the
-   import still lands the WHOLE transcript in THIS repo's room — the other
-   repos' work included, while their rooms get none of it. Do NOT try to
-   slice the transcript; import as-is and say exactly that in the report
-   (step 4) so nobody mistakes the room for repo-pure memory.
-2. **Import via the helper script** — never call `import_conversation`
-   with transcript content yourself; the script handles any size and
-   auto-chunks huge sessions:
+1. **Compose the review record.** Write it yourself from the pass history in
+   this loop's context — you read every finding and made every call, so
+   nothing needs re-deriving. Keep it to what a future reader needs:
+   - **PR** — url, title, head branch, final state.
+   - **Findings** — one entry each: the bot, the finding in one line, the
+     verdict (fixed / rejected), and the fix commit SHA or the rejection
+     rationale. Rejections matter MORE than fixes here; they are the part
+     no diff records.
+   - **Patterns worth carrying** — a bot's false-positive tendency, a
+     finding created by an earlier fix, a repo-specific trap. Skip this
+     section rather than padding it.
+2. **Save it** into the repo's room with `save_artifact`:
+   `name: "PR review record — <owner>/<repo>#<n>"`,
+   `artifact_type: "document"`, `tags: ["pr-review", "<repo>"]`,
+   `agent_brain_id: <repo-room-id-from-step-2>`.
+
+   The stable `name` is load-bearing: saving it again VERSIONS the record,
+   so a later babysit of the same PR supersedes the earlier one instead of
+   competing with it in retrieval.
+
+   `save_artifact` failing with the brain not found usually means the
+   WRONG-ORG lookup, not a stale id — CLI/MCP calls resolve the caller's
+   default org, which follows the org last selected in the MemHub app, and
+   a repo room in another org is invisible from it. Re-resolve the room
+   ONCE (re-run "Every pass" step 2); still failing → report the error in
+   step 4 rather than retrying.
+3. **Import the transcript ONLY in the cross-repo case.** Capture routes by
+   the session's `cwd`; this babysit routes by the PR's repo. If they
+   differ — you babysat a PR in repo B from a checkout of repo A — B's room
+   never receives this session, and the artifact alone loses the reasoning
+   trail. Only then:
 
    ```bash
    uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
      --session "<transcript-path>" \
      --conversation-id "pr-babysit-<owner>-<repo>-<n>" \
      --title "PR babysit — <owner>/<repo>#<n>" \
-     --agent-brain-id "<repo-room-id-from-step-2>"
+     --agent-brain-id "<repo-room-id-from-step-2>" \
+     --org-id "<org that owns the room, if not your default>"
    ```
 
-   The deterministic `--conversation-id` keeps re-runs incremental: a later
-   babysit of the same PR folds the gist forward instead of duplicating.
-
-   The script exits non-zero with the server's error on stderr when an
-   import is rejected — that is a FAILED save, never report it as queued.
-   If the error says the agent brain can't be found or accessed, the
-   cached room id went stale mid-loop: re-resolve the room ONCE (re-run
-   "Every pass" step 2 — exact-name match in `list_agent_brains`, create
-   if missing) and retry the import with the fresh id. Fails again →
-   report the error in step 4 instead of retrying further.
-3. **Verify the path**: the script's output should report `path:
-   "agentic"`. If it reports `"regular"`, the transcript resolution picked
-   a wrong file — stop and re-resolve rather than accepting a gist-less
-   import.
-4. Add one short top-level outcome note IN THE REPORT to the user (not as
-   extra imported messages): PR url and title, branch, findings per bot
-   with accepted/rejected counts, and any repo-specific gotcha or bot
-   false-positive tendency observed.
-
-Fallback: if no transcript file can be found (e.g. a headless runner with
-no `~/.claude/projects/` dir), fall back to ONE `import_conversation` call
-with plain-chat pairs per finding (user = bot name + finding verbatim +
-`file:line` + PR/commit refs; assistant = the fix + commit SHA, or the
-rejection rationale), same `conversation_id`/`title`/`agent_brain_id` —
-and tell the user this path produces episodes and facts but NO session
-gist.
+   The transcript is the most recently modified `.jsonl` sitting DIRECTLY
+   inside the `~/.claude/projects/` directory matching the current working
+   directory (top level only — `.jsonl` files in subdirectories are
+   subagent/workflow transcripts). The deterministic `--conversation-id`
+   keeps re-runs incremental. Verify the output reports `path: "agentic"`;
+   `"regular"` means the wrong file was picked — re-resolve rather than
+   accept a gist-less import. And say plainly in the report that the WHOLE
+   transcript landed in this room, other repos' work included, so nobody
+   mistakes it for repo-pure memory.
+4. Add one short top-level outcome note IN THE REPORT to the user: PR url
+   and title, branch, findings per bot with accepted/rejected counts, and
+   any repo-specific gotcha or bot false-positive tendency observed.
 
 Then report to the user (PR state, what was fixed, where the memory went)
 and END the loop — do not schedule another wake-up.
