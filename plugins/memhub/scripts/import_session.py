@@ -40,6 +40,11 @@ from mcp.client.streamable_http import streamablehttp_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from room_map import env_for_url, read_room  # noqa: E402
+from session_title import (  # noqa: E402
+    custom_title,
+    generated_title,
+    prompt_title,
+)
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 
@@ -302,6 +307,14 @@ async def main() -> int:
         print(f"ERROR: {f} holds only slash-command records", file=sys.stderr)
         return 2
 
+    # An explicit --title always wins; otherwise take the name the transcript
+    # itself carries, the same way per-turn capture does. Without this a plain
+    # `--session X` import lands unnamed even when the client wrote a perfectly
+    # good title into the file — and a headless session, which writes no title
+    # record at all, is named by what it was asked to do.
+    title = args.title or custom_title(records) or generated_title(records) \
+        or prompt_title(records) or None
+
     url, headers, auth = resolve_url_and_auth(args.url)
 
     # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
@@ -327,6 +340,9 @@ async def main() -> int:
     print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)"
           f"{filtered}")
     print(f"conversation_id : {conv_id}")
+    if title:
+        src = "explicit" if args.title else "from transcript"
+        print(f'title           : "{title}"   ({src})')
     print(f"endpoint        : {url}")
     if args.agent_brain_id:
         src = f' (repo room "{room.get("name", "?")}")' if room else ""
@@ -358,8 +374,8 @@ async def main() -> int:
                     # with "Agent brain not found" — which reads like a stale
                     # or deleted id rather than a wrong-org lookup.
                     call_args["org_id"] = args.org_id
-                if args.title:
-                    call_args["title"] = args.title
+                if title:
+                    call_args["title"] = title
                 if args.agent_brain_id:
                     call_args["agent_brain_id"] = args.agent_brain_id
                 if namespace:
