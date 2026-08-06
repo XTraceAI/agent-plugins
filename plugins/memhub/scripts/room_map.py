@@ -238,6 +238,7 @@ def write_room(
     name: str | None = None,
     cwd: str | Path | None = None,
     env: str | None = None,
+    org_id: str | None = None,
 ) -> Path:
     key = name or room_name(cwd)
     if key is None:
@@ -252,7 +253,19 @@ def write_room(
             repo = {}
         # Only this backend's entry is replaced — a repo used from both installs
         # keeps both ids, and other repos' entries are untouched.
-        repo[env or current_env()] = {"brain_id": brain_id}
+        # ``resolved_at`` stamps every write, including one that could not
+        # determine the org. It is what bounds the org re-probe below to once a
+        # day instead of once a turn.
+        entry = {"brain_id": brain_id, "resolved_at": time.time()}
+        # The org that OWNS the brain, recorded because a brain is resolved
+        # inside exactly one org and the caller's default org is not
+        # necessarily that one — it follows whichever org was last selected in
+        # the MemHub app, so it changes under a running session. Without this,
+        # every capture into a room outside the default org fails with
+        # "Agent brain not found".
+        if isinstance(org_id, str) and org_id:
+            entry["org_id"] = org_id
+        repo[env or current_env()] = entry
         data["repos"][key] = repo
         data.setdefault("version", 1)
 
@@ -276,6 +289,56 @@ def write_room(
 # week would never be picked up.
 MISS_TTL_S = 24 * 60 * 60
 
+# How long an INCOMPLETE lookup (the server could not answer for every org)
+# suppresses the next one. Deliberately short: nothing was learned, so this is
+# only a rate limit on retrying, not a claim about the repo. Without it a
+# sustained backend outage turns a once-a-day negative lookup into a round trip
+# on every single turn — hammering a backend that is already struggling.
+PROBE_BACKOFF_S = 5 * 60
+
+
+def write_probe_backoff(
+    cwd: str | Path | None = None, env: str | None = None,
+) -> None:
+    """Record that a lookup was attempted but could not complete.
+
+    Distinct from :func:`write_miss`, which asserts "this repo has no room" and
+    is trusted for a day. An incomplete search asserts nothing — some org could
+    not be listed — so it must not brand the repo room-less; it only stops the
+    next few turns from re-asking.
+
+    Never touches ``brain_id`` or ``missed_at``: an entry that already routes
+    must keep routing, and a real miss must keep its own clock.
+    """
+    key = room_name(cwd)
+    if key is None:
+        return
+    try:
+        with _locked():
+            data = _load()
+            repo = data["repos"].get(key)
+            if not isinstance(repo, dict):
+                repo = {}
+            slot = repo.get(env or current_env())
+            if not isinstance(slot, dict):
+                slot = {}
+            slot["probed_at"] = time.time()
+            repo[env or current_env()] = slot
+            data["repos"][key] = repo
+            data.setdefault("version", 1)
+            tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
+            try:
+                tmp.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, ROOMS_PATH)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+    except Exception:  # noqa: BLE001 — a rate limit must never fail a capture
+        return
+
 
 def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     """True when this repo's room should be looked up on the server.
@@ -283,6 +346,17 @@ def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     False when a brain id is already cached (nothing to do) or when a recent
     lookup found none (do not re-ask on every turn). A miss older than
     :data:`MISS_TTL_S` is due again, so a brain created later is picked up.
+
+    An entry cached WITHOUT an ``org_id`` is due again, so a cache written
+    before rooms carried their org gets upgraded rather than failing forever.
+    Without that, an existing install stays broken after the fix ships: the id
+    is present, so nothing would ever re-ask, and every capture keeps resolving
+    the brain in the wrong org.
+
+    That re-probe is rate-limited by ``resolved_at`` on the same
+    :data:`MISS_TTL_S` clock as a miss. A backend that cannot report orgs at all
+    would otherwise leave the entry permanently org-less and re-resolve on EVERY
+    turn — trading a silent failure for a per-turn round trip.
     """
     key = room_name(cwd)
     if key is None:
@@ -291,8 +365,23 @@ def resolve_due(cwd: str | Path | None = None, env: str | None = None) -> bool:
     entry = entry.get(env or current_env()) if isinstance(entry, dict) else None
     if not isinstance(entry, dict):
         return True
+    # A recent INCOMPLETE probe suppresses the next one whatever else the entry
+    # says. Checked first because it is a rate limit on ASKING, and it applies
+    # to every reason for asking — an unresolved repo, and an org-less entry
+    # waiting to be upgraded. Without it in front, the upgrade path re-probes
+    # on every turn for as long as the backend stays unable to answer.
+    try:
+        if (time.time() - float(entry.get("probed_at", 0))) < PROBE_BACKOFF_S:
+            return False
+    except (TypeError, ValueError):
+        pass
     if isinstance(entry.get("brain_id"), str) and entry["brain_id"]:
-        return False
+        if isinstance(entry.get("org_id"), str) and entry["org_id"]:
+            return False
+        try:
+            return (time.time() - float(entry.get("resolved_at", 0))) > MISS_TTL_S
+        except (TypeError, ValueError):
+            return True
     try:
         return (time.time() - float(entry.get("missed_at", 0))) > MISS_TTL_S
     except (TypeError, ValueError):

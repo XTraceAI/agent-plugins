@@ -340,6 +340,16 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             }
             if room:
                 arguments["agent_brain_id"] = room["brain_id"]
+                # The org that OWNS the room, when it is not the caller's
+                # default. A brain resolves inside exactly ONE org, and the
+                # default follows whichever org was last selected in the MemHub
+                # app — so it changes under a running session. Sending the id
+                # without its org is how every capture into such a room failed
+                # with "Agent brain not found": silently, because this hook is
+                # async and its output goes nowhere, and indistinguishably from
+                # a deleted brain.
+                if room.get("org_id"):
+                    arguments["org_id"] = room["org_id"]
             if namespace:
                 arguments["namespace"] = namespace
             if title:
