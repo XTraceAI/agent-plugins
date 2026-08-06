@@ -202,9 +202,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # early turns that into a partial capture that REPORTS what it did
             # not send, which is the difference between a gap you can act on
             # and one you never learn about.
-            deadline = time.monotonic() + _deadline_s()
+            # Slightly INSIDE the hard timeout in main(), so a run that is
+            # merely slow stops here — where it can name what it did not send
+            # — instead of being cancelled where it cannot.
+            deadline = time.monotonic() + _deadline_s() * 0.9
             for index, payload in enumerate(payloads, 1):
-                if index > 1 and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     remaining = sum(len(p) for p in payloads[index - 1:])
                     _log(f"deadline reached after {index - 1}/{len(payloads)} "
                          f"slices; {remaining} record(s) not sent. Re-run "
@@ -321,14 +324,30 @@ def main() -> int:
         reason = str(hook_input.get("reason") or "")[:40]
         _log(f"trigger: {cmd!r}" if cmd
              else f"trigger: session end ({reason or 'no reason given'})")
-        asyncio.run(_flush(session_id, transcript_path))
+        # HARD bound on the whole flush, not just on the gaps between slices.
+        # The between-slice deadline can only stop the loop where it looks;
+        # ONE slow call — an oversized record riding alone, a stalled server —
+        # runs past the hook's budget and the process is killed mid-upload,
+        # which is the exact ending that check exists to avoid, and the one
+        # case it cannot see. Ending ourselves first is what guarantees the
+        # breadcrumb below is always written.
+        timeout_s = _deadline_s()
+        asyncio.run(asyncio.wait_for(
+            _flush(session_id, transcript_path), timeout=timeout_s))
     # BaseException, not Exception: when anyio's task group mixes a
     # CancelledError into the group (e.g. the auth failure cancelling sibling
     # tasks), the result is a BaseExceptionGroup — a BaseException — which
     # would skip an Exception handler and kill the hook with a traceback.
     # This is a fire-and-forget background hook: exit 0 quietly, always.
     except BaseException as e:  # noqa: BLE001 — never fail the hook
-        if _auth_required(e):
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
+            # Slices already sent are durable and deduped, so this is a
+            # partial capture rather than a lost one — say which it is.
+            _log(f"timed out after {_deadline_s():.0f}s; slices already sent "
+                 "are stored. Re-run /memhub:import-session --session "
+                 f"{session_id} to finish (it resumes from the server's "
+                 "watermark).")
+        elif _auth_required(e):
             _log("no cached OAuth token; run /memhub:import-session once "
                  "(or set MEMHUB_TOKEN) to enable commit flush — skipping")
         else:
