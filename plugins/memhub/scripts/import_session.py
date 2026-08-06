@@ -40,6 +40,15 @@ from mcp.client.streamable_http import streamablehttp_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from room_map import env_for_url, read_room  # noqa: E402
+from session_title import (  # noqa: E402
+    custom_title,
+    generated_title,
+    prompt_title,
+)
+from transcript_chunks import (  # noqa: E402
+    DEFAULT_CHUNK_BYTES,
+    slices as make_slices,
+)
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 
@@ -91,26 +100,6 @@ def resolve_session_file(session: str) -> tuple[Path | None, str]:
         return None, (f"no session {sid!r} found under ~/.claude/projects/*/ "
                       "(pass a transcript path instead?)")
     return candidates[0], ""
-
-
-def _slices(records: list[dict], chunk_bytes: int) -> list[list[dict]]:
-    """Split records into consecutive disjoint slices under chunk_bytes each
-    (single oversized records still go through alone). Disjointness matters:
-    each slice is its own incremental import, so no record is ever extracted
-    twice regardless of watermark timing."""
-    out: list[list[dict]] = []
-    cur: list[dict] = []
-    size = 0
-    for rec in records:
-        b = len(json.dumps(rec, separators=(",", ":")))
-        if cur and size + b > chunk_bytes:
-            out.append(cur)
-            cur, size = [], 0
-        cur.append(rec)
-        size += b
-    if cur:
-        out.append(cur)
-    return out
 
 
 async def _gist_hash(
@@ -258,7 +247,7 @@ async def main() -> int:
                          "which is why an --agent-brain-id created in ANOTHER "
                          "org fails with 'Agent brain not found'.")
     ap.add_argument("--url", default=None)
-    ap.add_argument("--chunk-bytes", type=int, default=3_500_000,
+    ap.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES,
                     help="transcripts larger than this are sent as sequential "
                          "disjoint slices under the same conversation_id "
                          "(server extracts each incrementally; the session "
@@ -302,6 +291,14 @@ async def main() -> int:
         print(f"ERROR: {f} holds only slash-command records", file=sys.stderr)
         return 2
 
+    # An explicit --title always wins; otherwise take the name the transcript
+    # itself carries, the same way per-turn capture does. Without this a plain
+    # `--session X` import lands unnamed even when the client wrote a perfectly
+    # good title into the file — and a headless session, which writes no title
+    # record at all, is named by what it was asked to do.
+    title = args.title or custom_title(records) or generated_title(records) \
+        or prompt_title(records) or None
+
     url, headers, auth = resolve_url_and_auth(args.url)
 
     # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
@@ -320,13 +317,16 @@ async def main() -> int:
         if room:
             args.agent_brain_id = room["brain_id"]
 
-    slices = _slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
+    slices = make_slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
     print(f"session file    : {f}")
     filtered = f"   (+{dropped} slash-command dropped)" if dropped else ""
     print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)"
           f"{filtered}")
     print(f"conversation_id : {conv_id}")
+    if title:
+        src = "explicit" if args.title else "from transcript"
+        print(f'title           : "{title}"   ({src})')
     print(f"endpoint        : {url}")
     if args.agent_brain_id:
         src = f' (repo room "{room.get("name", "?")}")' if room else ""
@@ -358,8 +358,8 @@ async def main() -> int:
                     # with "Agent brain not found" — which reads like a stale
                     # or deleted id rather than a wrong-org lookup.
                     call_args["org_id"] = args.org_id
-                if args.title:
-                    call_args["title"] = args.title
+                if title:
+                    call_args["title"] = title
                 if args.agent_brain_id:
                     call_args["agent_brain_id"] = args.agent_brain_id
                 if namespace:

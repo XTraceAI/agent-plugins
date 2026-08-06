@@ -149,22 +149,84 @@ def test_title_is_harvested_from_the_transcript():
 
     The last one wins, because Claude Code regenerates the title as a session
     develops."""
-    print("_title")
-    check("none when absent", ft._title([_rec("a")]), None)
+    print("_titles")
+    title = lambda recs, state=None: ft._titles(recs, state or {})[0]  # noqa: E731
+    # Nothing to go on: no title record, and no user prose to fall back to.
+    check("none when absent", title([{"type": "assistant", "uuid": "a"}]), None)
     check("reads aiTitle",
-          ft._title([{"type": "ai-title", "aiTitle": "Review legacy skill code"}]),
+          title([{"type": "ai-title", "aiTitle": "Review legacy skill code"}]),
           "Review legacy skill code")
-    check("last one wins", ft._title([
+    check("last one wins", title([
         {"type": "ai-title", "aiTitle": "first guess"},
         _rec("a"),
         {"type": "ai-title", "aiTitle": "better title"},
     ]), "better title")
     check("blank is not a title",
-          ft._title([{"type": "ai-title", "aiTitle": "   "}]), None)
+          title([{"type": "ai-title", "aiTitle": "   "}]), None)
     # ai-title is an inert type, so the title usually arrives in a batch that is
     # consumed WITHOUT a server call — it has to be read before dropping it.
     check("an ai-title batch is inert",
           _all_inert([{"type": "ai-title", "aiTitle": "x"}]), True)
+
+
+def test_a_title_already_resolved_survives_a_delta_without_one():
+    """Most deltas carry no title record at all. Recomputing from each one
+    would drop the name the session already has — and, once there is a prompt
+    fallback, replace it with whatever that delta happened to open with."""
+    print("remembered titles")
+    state = {"title": "Review legacy skill code"}
+    check("a remembered title is reused",
+          ft._titles([_rec("a")], state)[0], "Review legacy skill code")
+    check("a fresh generated title beats the remembered one",
+          ft._titles([{"type": "ai-title", "aiTitle": "regenerated"}],
+                     state)[0], "regenerated")
+    check("a remembered title beats the prompt fallback",
+          ft._titles([_rec("a", "some later question")], state)[0],
+          "Review legacy skill code")
+
+
+def test_a_rename_outranks_the_stale_generated_title():
+    """When the user renames a session the client writes a ``custom-title``
+    record and KEEPS EMITTING the pre-rename ``ai-title`` beside it, often
+    last. Measured on a real renamed session: 130 stale ai-title records
+    interleaved with 47 custom-title ones. So precedence is by TYPE, and the
+    rename is remembered separately — otherwise the next ai-title-only delta
+    takes the old name back."""
+    print("rename precedence")
+    renamed = [{"type": "ai-title", "aiTitle": "stale generated"},
+               {"type": "custom-title", "customTitle": "what the user chose"},
+               {"type": "ai-title", "aiTitle": "stale generated"}]
+    sent, custom = ft._titles(renamed, {})
+    check("the rename wins over a later stale ai-title",
+          sent, "what the user chose")
+    check("the rename is handed back to be remembered",
+          custom, "what the user chose")
+    # The next delta carries only the stale generated title.
+    check("a remembered rename is not taken back",
+          ft._titles([{"type": "ai-title", "aiTitle": "stale generated"}],
+                     {"title": "what the user chose",
+                      "custom_title": "what the user chose"})[0],
+          "what the user chose")
+    # Same shape as ai-title: no ``message``, so a batch of them alone is
+    # rejected by the server and must be consumed rather than sent.
+    check("a custom-title batch is inert",
+          _all_inert([{"type": "custom-title", "customTitle": "x"}]), True)
+
+
+def test_a_headless_session_is_named_by_its_first_prompt():
+    """A session started through the SDK or ``claude -p`` emits no title
+    record at all — title generation is a UI feature — so capture worked and
+    the session still arrived unnamed. Falling back to its first prompt is
+    what gives it a name; it is LAST in precedence, so it can never displace
+    a title the client did write."""
+    print("headless fallback")
+    check("no title record falls back to the prompt",
+          ft._titles([_rec("a", "Reply with exactly: ok")], {})[0],
+          "Reply with exactly: ok")
+    check("a generated title still wins over the prompt",
+          ft._titles([_rec("a", "Reply with exactly: ok"),
+                      {"type": "ai-title", "aiTitle": "Generated"}], {})[0],
+          "Generated")
 
 
 def _all_inert(records):
@@ -323,6 +385,9 @@ if __name__ == "__main__":
                test_inert_only_delta_is_consumed_but_attachments_are_not,
                test_timeout_override_never_breaks_the_hook,
                test_title_is_harvested_from_the_transcript,
+               test_a_title_already_resolved_survives_a_delta_without_one,
+               test_a_rename_outranks_the_stale_generated_title,
+               test_a_headless_session_is_named_by_its_first_prompt,
                test_lock, test_prefilter):
         fn()
     print()

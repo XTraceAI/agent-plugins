@@ -48,6 +48,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Stdlib-only and side-effect free, so it imports at module scope like the
 # rest of the cursor/tail logic and stays testable under a bare python3.
+from session_title import (  # noqa: E402
+    custom_title,
+    generated_title,
+    prompt_title,
+)
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 # ``_memhub_auth`` pulls in the mcp SDK, so it is imported lazily inside
@@ -102,8 +107,8 @@ def _flush_timeout_s() -> float:
 # make the batch valid. One wasted call beats dropping the file.
 _INERT_RECORD_TYPES = frozenset({
     "mode", "last-prompt", "pr-link", "queue-operation",
-    "permission-mode", "ai-title", "file-history-snapshot",
-    "file-history-delta",
+    "permission-mode", "ai-title", "custom-title",
+    "file-history-snapshot", "file-history-delta",
 })
 
 
@@ -213,26 +218,31 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
     return records, consumed
 
 
-def _title(records: list[dict]) -> str | None:
-    """The session title Claude Code generated, if this delta carries one.
+def _titles(records: list[dict], state: dict) -> tuple[str | None, str | None]:
+    """``(title_to_send, custom_title_to_remember)`` for this delta.
 
-    Claude Code writes its own title as an ``ai-title`` record (``aiTitle``),
-    and regenerates it as the session develops — so the LAST one wins. Without
-    this the automatic capture paths import every session unnamed, and a
-    sessions list reads as a wall of untitled rows.
+    Three sources, in strict precedence — see ``session_title`` for the
+    measurements behind the order:
 
-    Harvested even from deltas we do not send: ``ai-title`` is an inert
-    record type, so the title often arrives in a batch that is consumed
-    without a server call. Remembering it there is what makes it available to
-    the next real flush.
+    1. the name the USER gave the session, which the client keeps re-emitting
+       the stale generated title alongside, so it must win by TYPE rather than
+       by whichever record came last;
+    2. the name Claude Code generated, freshest first — it is regenerated as
+       the session develops, so this delta's beats the remembered one;
+    3. failing both, the session's first real prompt. Only a client that never
+       writes a title record at all reaches here, which in practice means a
+       headless run — without it those import unnamed.
+
+    Each is remembered, so a delta that carries no title at all keeps sending
+    the one already resolved rather than reverting to a fresh guess.
+
+    Harvested even from deltas we do not send: the title records are inert, so
+    a title often arrives in a batch that is consumed without a server call.
+    Remembering it there is what makes it available to the next real flush.
     """
-    title = None
-    for r in records:
-        if isinstance(r, dict) and r.get("type") == "ai-title":
-            value = (r.get("aiTitle") or "").strip()
-            if value:
-                title = value
-    return title
+    custom = custom_title(records) or state.get("custom_title") or None
+    generated = generated_title(records) or state.get("title") or None
+    return custom or generated or prompt_title(records) or None, custom
 
 
 def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
@@ -296,11 +306,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     ):
         # The title usually arrives in exactly this kind of batch, so read it
         # before dropping the records on the floor.
-        inert_title = _title(records)
+        inert_title, inert_custom = _titles(records, state)
+        fields = {"offset": consumed}
         if inert_title:
-            _save_state(session_id, offset=consumed, title=inert_title)
-        else:
-            _save_state(session_id, offset=consumed)
+            fields["title"] = inert_title
+        if inert_custom:
+            fields["custom_title"] = inert_custom
+        _save_state(session_id, **fields)
         return
 
     # Each falls back INDEPENDENTLY. Tying the namespace's fallback to the cwd's
@@ -317,7 +329,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         namespace = state.get("namespace") or None
 
     # This delta's title if it carries one, else whatever we last saw.
-    title = _title(records) or state.get("title") or None
+    title, custom = _titles(records, state)
     url, headers, auth = resolve_url_and_auth(interactive=False)
     # Resolved AFTER the url — prod and staging hold different brain ids for the
     # same repo. Only when the TRANSCRIPT said where it ran: a hook can fire
@@ -407,9 +419,15 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 return
 
             # Committed server-side — only now is it safe to move the cursor.
+            # ``custom_title`` is stored SEPARATELY from the title that was
+            # sent, and only when there is one: it is the one source a later
+            # delta must not be able to override, and merging a None over it
+            # would let the next ``ai-title`` — which the client keeps
+            # emitting with the pre-rename value — take the name back.
             _save_state(session_id, offset=consumed,
                         last_uuid=out.get("ack_through"), cwd=cwd,
-                        namespace=namespace, title=title)
+                        namespace=namespace, title=title,
+                        **({"custom_title": custom} if custom else {}))
             # Sent count, not read count — and the byte span stays the READ
             # span, because that is what the cursor just advanced past. The
             # filtered records are the difference between the two, so showing
