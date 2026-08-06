@@ -11,14 +11,17 @@ semantic work boundaries, so flushing there makes memory available mid-session
 narratives, and gives the gist's fold-forward an outcome-flavored cadence.
 
 **Also the SessionEnd hook**, which used to be an ``agent``-type hook told in
-prose to read the transcript and re-emit every record inline. That could not
-work on a long session — an agent cannot re-emit a 16 MB transcript — and the
-breadcrumb file it was instructed to write on BOTH success and failure had
-never been created on any machine, so it was failing silently. Being a script
-also means it stays in step with the other capture paths rather than drifting:
-the prose version sent no ``org_id`` (every room in a non-default org failed
-with "Agent brain not found"), filtered no slash-command wrappers, and derived
-no title.
+prose to read the transcript and re-emit every record inline. Three things say
+it was not capturing anything. A headless run rejects it outright — measured:
+``Agent stop hooks are not yet supported outside REPL``. An agent cannot
+re-emit a 16 MB transcript even where it does run. And the breadcrumb file it
+was instructed to write on BOTH success and failure has never been created on
+any machine, which is what let all of that stay invisible.
+
+Being a script also keeps it in step with the other capture paths rather than
+drifting: the prose version sent no ``org_id`` (every room in a non-default org
+failed with "Agent brain not found"), filtered no slash-command wrappers, and
+derived no title.
 
 Deliberately INDEPENDENT of the per-turn hook rather than reusing its cursor.
 This is the backstop for exactly the cases where per-turn capture is dormant —
@@ -44,8 +47,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -69,6 +74,29 @@ logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 def _log(msg: str) -> None:
     # Hook stdout is only shown in verbose/error views; keep one-liners.
     print(f"[memhub-flush] {msg}")
+
+
+# Comfortably inside the hooks' 300s budget, so the script decides when to
+# stop rather than being killed at an arbitrary point mid-upload.
+_DEFAULT_DEADLINE_S = 240.0
+
+
+def _deadline_s() -> float:
+    """How long this flush may spend sending, from the env with a sane floor.
+
+    Read at CALL time and never allowed to raise: parsing at import time means
+    a malformed override crashes the module before the handler that keeps this
+    hook quiet exists. Zero or negative is rejected rather than honoured — it
+    would abandon every session after one slice.
+    """
+    raw = (os.environ.get("MEMHUB_FLUSH_DEADLINE_S") or "").strip()
+    if not raw:
+        return _DEFAULT_DEADLINE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_DEADLINE_S
+    return value if value > 0 else _DEFAULT_DEADLINE_S
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
@@ -166,7 +194,23 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # Slices are disjoint and sent in order against one conversation,
             # so the server's watermark sees a normal incremental import.
             payloads = make_slices(records)
+
+            # Bounded by wall clock, not just by slice count. The hook's own
+            # budget is 300s; a many-slice session can exceed it, and being
+            # KILLED there is the bad ending — the process dies mid-upload,
+            # the tail is lost, and nothing says so. Stopping cleanly a minute
+            # early turns that into a partial capture that REPORTS what it did
+            # not send, which is the difference between a gap you can act on
+            # and one you never learn about.
+            deadline = time.monotonic() + _deadline_s()
             for index, payload in enumerate(payloads, 1):
+                if index > 1 and time.monotonic() >= deadline:
+                    remaining = sum(len(p) for p in payloads[index - 1:])
+                    _log(f"deadline reached after {index - 1}/{len(payloads)} "
+                         f"slices; {remaining} record(s) not sent. Re-run "
+                         f"/memhub:import-session --session {session_id} to "
+                         "finish (it resumes from the server's watermark).")
+                    return
                 arguments = {
                     "messages": payload,
                     "conversation_id": session_id,

@@ -143,9 +143,16 @@ check("an empty list is fine", drop_command_wrappers([]) == [])
 import glob  # noqa: E402
 import json  # noqa: E402
 
-real = sorted(glob.glob(str(
-    Path.home() / ".claude" / "projects" / "*" / "*.jsonl"
-)))[-4:]
+# Sampled by SIZE, not by path order. Taking the alphabetically-last few made
+# the sample depend on directory names: a handful of throwaway sessions in a
+# scratch directory sorted last, displaced every real transcript, and failed
+# this check with "0/4 user records filtered" — a green filter reported as
+# broken. The biggest sessions are also where slash commands actually occur.
+real = sorted(
+    glob.glob(str(Path.home() / ".claude" / "projects" / "*" / "*.jsonl")),
+    key=lambda p: Path(p).stat().st_size,
+    reverse=True,
+)[:25]
 if real:
     seen = dropped = 0
     for path in real:
@@ -159,8 +166,13 @@ if real:
             seen += 1
             if is_command_wrapper(rec):
                 dropped += 1
-    print(f"real transcripts: {dropped}/{seen} user records filtered")
-    check("real transcripts contain wrappers to filter", dropped > 0)
+    print(f"real transcripts: {dropped}/{seen} user records filtered "
+          f"(across {len(real)} of the largest sessions)")
+    # Only assert a rate when the sample is big enough to have one. A machine
+    # with a couple of tiny sessions genuinely has no wrappers, and failing
+    # there would be the fixture reporting on itself rather than on the filter.
+    if seen >= 100:
+        check("real transcripts contain wrappers to filter", dropped > 0)
     # A filter eating most of a session means the anchor broke.
     check("the filter is not eating the conversation", dropped < seen * 0.5)
 else:
