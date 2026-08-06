@@ -138,8 +138,18 @@ async def _gist_hash(
             c = str(it.get("content", "")).lstrip()
             if c.startswith("## GOAL"):
                 return hashlib.sha256(c.encode()).hexdigest()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Still swallowed — a gist read must never fail an import that already
+        # succeeded — but no longer SILENT. "search failed" and "gist has not
+        # appeared yet" produce the same None here, and the caller reacts to
+        # None by waiting the full slice timeout. Without this line, a
+        # persistent error is indistinguishable from slow extraction for 30
+        # minutes per slice boundary, which is precisely how the cross-org bug
+        # above hid. Printed once per call, and only on the error path.
+        if not getattr(_gist_hash, "_warned", False):
+            _gist_hash._warned = True
+            print(f"  NOTE: gist lookup failed ({type(exc).__name__}: "
+                  f"{str(exc)[:120]}); slice waits will run to timeout")
     return None
 
 
