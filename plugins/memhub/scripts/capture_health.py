@@ -221,15 +221,25 @@ def _token_problem(host: str) -> str | None:
     # immune to that entire failure mode.
     key = _stored_key(host)
     if key is _HEALTHY:
-        return None       # a good key; the OAuth cache is irrelevant now
-    if key is not None:
-        return key        # a key that has lapsed or is about to
+        return None            # a good key; the OAuth cache is irrelevant now
+    if key == "key_expiring":
+        return "key_expiring"  # still the live credential, just not for long
+
+    # An EXPIRED key is not the end of the story, because `resolve_url_and_auth`
+    # does not treat it as one — it falls through to the OAuth cache, which may
+    # still work. Short-circuiting here announced "capture is not running" at
+    # people whose capture was running fine. So mirror the fallback: judge OAuth
+    # too, and only speak if that is broken as well.
     try:
         cached = json.loads(
             (CACHE_DIR / f"tokens-{host.replace(':', '_')}.json")
             .read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return "never"
+        # Nothing to fall back to. Name the KEY when there was one — someone
+        # whose key lapsed has plainly authenticated before, and telling them
+        # they never did describes the wrong problem even though the remedy
+        # happens to match.
+        return "key_expired" if key == "key_expired" else "never"
     renewable = bool(cached.get("refresh_token"))
     exp = _jwt_exp(cached.get("access_token") or "")
     if exp is not None and time.time() >= exp:

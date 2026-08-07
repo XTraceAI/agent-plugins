@@ -114,6 +114,91 @@ def test_expiry():
     check("past is negative", past is not None and past < 0, True)
 
 
+def test_expiry_is_utc_regardless_of_local_zone():
+    """Expiry must not drift with the machine's timezone or DST.
+
+    The original computed `mktime(struct) - time.timezone`, which reads a UTC
+    struct as LOCAL time and then corrects with the zone's NON-DST offset —
+    measured at exactly -3600s for a summer expiry under America/Los_Angeles
+    and 0 for a winter one. Correct half the year is the worst shape a bug can
+    have, so this pins both halves in a DST zone.
+    """
+    print("\nexpiry is UTC")
+    import calendar
+    import importlib
+    import os as _os
+
+    previous = _os.environ.get("TZ")
+    try:
+        _os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        importlib.reload(pak)
+        for label, raw in [("summer (DST)", "2026-07-15T12:00:00Z"),
+                           ("winter (no DST)", "2026-12-15T12:00:00Z")]:
+            true_epoch = calendar.timegm(
+                time.strptime(raw.replace("Z", ""), "%Y-%m-%dT%H:%M:%S"))
+            got = pak.expires_in_s({"expires_at": raw}) + time.time()
+            check(f"{label} has no skew", round(got - true_epoch), 0)
+    finally:
+        if previous is None:
+            _os.environ.pop("TZ", None)
+        else:
+            _os.environ["TZ"] = previous
+        time.tzset()
+        importlib.reload(pak)
+
+
+def test_cap_is_checked_before_anything_is_revoked():
+    """A machine must never be left with no key and no way to mint one.
+
+    Revoking this machine's orphan and only then discovering the cap is full
+    destroys the one credential it had. Refusing first leaves that key working,
+    which is strictly the better failure.
+    """
+    print("\ncap is checked first")
+    _reset()
+    keys = [{"id": f"k{i}", "label": f"other-{i}", "revoked_at": None}
+            for i in range(pak.MAX_KEYS)]
+    keys.append({"id": "mine", "label": "test-machine", "revoked_at": None})
+    _fake_server(keys)
+    try:
+        pak.ensure(MCP, "bearer")
+        check("refuses", False, True)
+    except pak.PakError:
+        check("refuses", True, True)
+    check("did not revoke this machine's key",
+          [c for c in calls if c[0] == "DELETE"], [])
+    check("did not mint", [c for c in calls if c[0] == "POST"], [])
+
+
+def test_a_failed_orphan_revoke_does_not_block_minting():
+    """Revoking an orphan is housekeeping, not the goal.
+
+    One stale id that 404s on delete must not block every future login on this
+    machine — that turns tidying-up into a permanent capture outage.
+    """
+    print("\nfailed orphan revoke")
+    _reset()
+    _fake_server([{"id": "ghost", "label": "test-machine", "revoked_at": None}])
+    real = pak._call
+
+    def _revoke_explodes(base, bearer, method, path, body=None):
+        if method == "DELETE":
+            calls.append((method, path, body))
+            raise pak.PakError("DELETE failed (404): gone")
+        return real(base, bearer, method, path, body)
+
+    pak._call = _revoke_explodes
+    try:
+        record, how = pak.ensure(MCP, "bearer")
+        check("still minted", how, "replaced")
+        check("key is stored", bool(pak.load(MCP)), True)
+    except pak.PakError as exc:
+        check(f"still minted (raised {exc})", False, True)
+    finally:
+        pak._call = real
+
+
 def test_reuses_a_good_stored_key():
     print("\nreuse")
     _reset()
@@ -213,6 +298,9 @@ def test_envelope_errors_surface():
 if __name__ == "__main__":
     real_call = pak._call
     for test in (test_paths_and_labels, test_store_roundtrip, test_expiry,
+                 test_expiry_is_utc_regardless_of_local_zone,
+                 test_cap_is_checked_before_anything_is_revoked,
+                 test_a_failed_orphan_revoke_does_not_block_minting,
                  test_reuses_a_good_stored_key, test_expired_stored_key_is_replaced,
                  test_orphan_is_revoked_before_minting, test_mints_when_nothing_exists,
                  test_cap_is_reported_not_hit, test_envelope_errors_surface):

@@ -29,6 +29,7 @@ replacement so the cap counts real credentials rather than debris.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import socket
@@ -119,7 +120,17 @@ def forget(mcp_url: str) -> None:
 
 
 def expires_in_s(record: dict | None) -> float | None:
-    """Seconds until the stored key lapses; None if unknown or non-expiring."""
+    """Seconds until the stored key lapses; None if unknown or non-expiring.
+
+    ``calendar.timegm`` and NOT ``time.mktime`` minus an offset. The server
+    returns UTC, and ``mktime`` reads a struct as LOCAL time while ignoring the
+    zone baked into it, so the difference has to be corrected by hand — and
+    ``time.timezone`` is the zone's NON-DST offset, so on any machine currently
+    observing DST the correction is an hour short. Measured on this codebase at
+    exactly -3600s for a summer expiry under America/Los_Angeles, and 0 for a
+    winter one, which is the worst shape a bug can have: correct half the year.
+    ``timegm`` interprets the fields as UTC directly, which is what they are.
+    """
     if not record:
         return None
     raw = record.get("expires_at")
@@ -127,8 +138,8 @@ def expires_in_s(record: dict | None) -> float | None:
         return None
     try:
         # Stored as the server returned it: ISO-8601, Zulu.
-        stamp = time.strptime(raw.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z")
-        return time.mktime(stamp) - time.timezone - time.time()
+        stamp = time.strptime(raw.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+        return calendar.timegm(stamp) - time.time()
     except (ValueError, OverflowError):
         return None
 
@@ -224,16 +235,30 @@ def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, s
     keys = list_keys(base, bearer)
     orphans = [k for k in keys
                if k.get("label") == label and _is_live(k) and k.get("id")]
-    for orphan in orphans:
-        revoke(base, bearer, orphan["id"])
 
-    live = [k for k in keys if _is_live(k) and k.get("label") != label]
-    if len(live) >= MAX_KEYS:
+    # Cap FIRST, and never counting our own orphan — which is about to be
+    # freed and is not competing for a slot. Checking after revoking would
+    # destroy this machine's only key and only then discover it cannot mint a
+    # replacement, stranding it with no credential at all and no way back
+    # except a manual revoke elsewhere. Refusing before touching anything
+    # leaves the existing key working, which is the strictly better failure.
+    others = [k for k in keys if _is_live(k) and k.get("label") != label]
+    if len(others) >= MAX_KEYS:
         raise PakError(
-            f"you already hold {len(live)} live access keys, the maximum is "
+            f"you already hold {len(others)} live access keys, the maximum is "
             f"{MAX_KEYS}. Revoke one you no longer use, then run "
             f"/memhub:login again. Existing labels: "
-            f"{', '.join(sorted(str(k.get('label')) for k in live))}")
+            f"{', '.join(sorted(str(k.get('label')) for k in others))}")
+
+    for orphan in orphans:
+        # Best-effort: this is housekeeping, not the goal. A revoke that fails
+        # (already gone, transient 5xx) must not abort the mint the user is
+        # actually here for — otherwise one stale id blocks every future login
+        # on this machine, turning tidying-up into a permanent outage.
+        try:
+            revoke(base, bearer, orphan["id"])
+        except PakError:
+            pass
 
     record = mint(base, bearer, label)
     save(mcp_url, record)

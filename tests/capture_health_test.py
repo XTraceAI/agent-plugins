@@ -160,9 +160,27 @@ def test_stored_key_outranks_the_oauth_cache() -> None:
     check("good key wins over a dead OAuth token",
           ch._token_problem(HOST), None)
 
+    # An expired key is NOT terminal on its own: resolve_url_and_auth falls
+    # through to the OAuth cache, so capture may well still be running. The
+    # health check has to model that fallback or it announces an outage to
+    # someone whose capture is fine.
     pak.save(ch._mcp_url_for(HOST),
              {"secret": "mhk_x", "label": "test", "expires_at": _iso(days=-1)})
-    check("expired key is reported", ch._token_problem(HOST), "key_expired")
+    _write_token(exp=time.time() + 3600, refresh=True)
+    check("expired key + working OAuth -> silent",
+          ch._token_problem(HOST), None)
+
+    _write_token(exp=time.time() - 3600, refresh=False)
+    check("expired key + dead OAuth -> reported",
+          ch._token_problem(HOST), "unrenewable")
+
+    # Nothing to fall back to: name the key, because someone whose key lapsed
+    # has plainly authenticated before and "never authenticated" is the wrong
+    # problem even though the remedy coincides.
+    (ch.CACHE_DIR / f"tokens-{HOST}.json").unlink()
+    check("expired key + no OAuth at all -> key_expired",
+          ch._token_problem(HOST), "key_expired")
+    _write_token(exp=time.time() - 3600, refresh=False)
 
     pak.save(ch._mcp_url_for(HOST),
              {"secret": "mhk_x", "label": "test", "expires_at": _iso(days=2)})
