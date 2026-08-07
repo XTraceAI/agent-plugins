@@ -58,10 +58,19 @@ def load_transcript(path: Path) -> tuple[list[dict], int]:
     Returns ``(records, malformed_count)`` — malformed lines are skipped, not
     fatal, because real transcripts occasionally carry a truncated final line
     (interrupted write). The caller decides what to do when nothing parses.
+
+    ``encoding="utf-8"`` is NOT optional: transcripts are UTF-8 whatever the OS
+    locale is, but a bare ``read_text()`` decodes with the LOCALE codec — on a
+    non-UTF-8 default (cp950, cp1252, …) an ordinary em-dash in the transcript
+    raises UnicodeDecodeError and every import on that machine dies. And since
+    Claude Code is the primary caller, the user has no workaround: the
+    permission classifier refuses both `PYTHONUTF8=1 uv run …` and `-X utf8`.
+    ``errors="replace"`` extends the tolerant contract above to the decode
+    step: one bad byte must not lose the whole session, only the char it hit.
     """
     records: list[dict] = []
     malformed = 0
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue

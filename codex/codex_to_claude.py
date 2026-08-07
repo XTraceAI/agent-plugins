@@ -67,10 +67,14 @@ def clean_user_text(text: str) -> str | None:
 
 def load_rollout(path) -> list[dict]:
     """Parse a Codex rollout .jsonl tolerantly (skip malformed lines, e.g. a
-    truncated final line from an interrupted write)."""
+    truncated final line from an interrupted write).
+
+    Explicit utf-8 for the same reason as the Claude transcript reader: rollouts
+    are UTF-8, a bare read_text() decodes with the OS locale codec, and one
+    em-dash then kills the whole import on a cp950/cp1252 box."""
     from pathlib import Path
     records: list[dict] = []
-    for line in Path(path).read_text().splitlines():
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue

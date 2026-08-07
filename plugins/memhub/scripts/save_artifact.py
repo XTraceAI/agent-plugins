@@ -76,7 +76,22 @@ async def main() -> int:
     if not args.stdin and not args.file.is_file():
         print(f"ERROR: file not found: {args.file}", file=sys.stderr)
         return 2
-    content = sys.stdin.read() if args.stdin else args.file.read_text()
+    # Explicit utf-8 on BOTH inputs: the default codec is the OS locale, so on a
+    # non-UTF-8 box (cp950, cp1252, …) a piped or on-disk artifact carrying an
+    # em-dash either mangles or raises. Unlike the transcript readers this does
+    # NOT swallow decode errors — an artifact is the user's content and silently
+    # replacing bytes in it would save a corrupted document under their name.
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):  # already-wrapped or non-reconfigurable stream
+        pass
+    try:
+        content = sys.stdin.read() if args.stdin else args.file.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        src = "stdin" if args.stdin else str(args.file)
+        print(f"ERROR: {src} is not valid UTF-8 ({exc.reason}); convert it first",
+              file=sys.stderr)
+        return 2
     if not content.strip():
         print("ERROR: artifact body is empty", file=sys.stderr)
         return 2

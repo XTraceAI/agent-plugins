@@ -120,7 +120,7 @@ def _log(msg: str) -> None:
 
 def _read_state(session_id: str) -> dict:
     try:
-        state = json.loads((STATE_DIR / f"{session_id}.json").read_text())
+        state = json.loads((STATE_DIR / f"{session_id}.json").read_text(encoding="utf-8"))
         return state if isinstance(state, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
@@ -156,7 +156,7 @@ def _save_state(session_id: str, **fields) -> None:
     state.update(fields)
     state["at"] = time.time()
     tmp = STATE_DIR / f"{session_id}.json.tmp"
-    tmp.write_text(json.dumps(state))
+    tmp.write_text(json.dumps(state), encoding="utf-8")
     tmp.replace(STATE_DIR / f"{session_id}.json")
 
 

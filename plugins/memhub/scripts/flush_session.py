@@ -126,9 +126,15 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # is the EXPECTED case here, not corruption. One partial line must not
     # silently kill the whole flush (the outer except would eat it) — skip
     # it; the next flush's watermark pass picks the record up once complete.
+    #
+    # Explicit utf-8: transcripts are UTF-8 regardless of the OS locale, and a
+    # bare open() decodes with the locale codec — on a non-UTF-8 default
+    # (cp950, cp1252, …) one em-dash raises UnicodeDecodeError and this hook
+    # dies silently on EVERY commit/PR and at SessionEnd. errors="replace" so a
+    # single bad byte degrades one character instead of dropping the flush.
     records = []
     malformed = 0
-    with open(transcript_path) as fh:
+    with open(transcript_path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if not line:
