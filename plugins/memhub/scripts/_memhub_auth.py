@@ -64,7 +64,7 @@ def _plugin_root() -> Path:
 def _plugin_mcp_config() -> dict:
     """The memhub server entry from the plugin's .mcp.json (url, oauth)."""
     cfg = _plugin_root() / ".mcp.json"
-    servers = json.loads(cfg.read_text()).get("mcpServers", {})
+    servers = json.loads(cfg.read_text(encoding="utf-8")).get("mcpServers", {})
     name = next((k for k in servers if k.lower().startswith("memhub")),
                 next(iter(servers)) if len(servers) == 1 else None)
     if not name:
@@ -118,13 +118,13 @@ class _FileTokenStorage(TokenStorage):
 
     async def get_tokens(self) -> OAuthToken | None:
         try:
-            return OAuthToken.model_validate_json(self._path.read_text())
+            return OAuthToken.model_validate_json(self._path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             return None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(tokens.model_dump_json())
+        self._path.write_text(tokens.model_dump_json(), encoding="utf-8")
         self._path.chmod(0o600)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
@@ -368,7 +368,7 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     host = urlparse(url).netloc.replace(":", "_")
     path = _CACHE_DIR / f"tokens-{host}.json"
     try:
-        cached = json.loads(path.read_text())
+        cached = json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — no/unreadable cache → nothing to refresh
         return
     refresh_token = cached.get("refresh_token")
@@ -417,7 +417,7 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         updated["refresh_token"] = fresh["refresh_token"]
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(updated))
+        path.write_text(json.dumps(updated), encoding="utf-8")
         path.chmod(0o600)
     except OSError:
         return

@@ -187,7 +187,8 @@ def _locked():
     except ImportError:  # native Windows — unsupported platform, degrade
         yield
         return
-    with open(ROOMS_PATH.with_name(ROOMS_PATH.name + ".lock"), "w") as fh:
+    with open(ROOMS_PATH.with_name(ROOMS_PATH.name + ".lock"), "w",
+              encoding="utf-8") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
             yield

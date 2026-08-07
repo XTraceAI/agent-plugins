@@ -138,7 +138,7 @@ def main() -> int:
         # accumulate) and left in place for inspection — that's the point of
         # --dry-run.
         transcript = Path(tempfile.gettempdir()) / f"memhub-codex-dryrun-{sid}.jsonl"
-        transcript.write_text(body)
+        transcript.write_text(body, encoding="utf-8")
         print(f"[dry-run] wrote {len(records)} records -> {transcript}")
         print("[dry-run] skipping import_conversation (file left for inspection)")
         return 0
@@ -148,7 +148,7 @@ def main() -> int:
     # from the file stem.
     tmpdir = Path(tempfile.mkdtemp(prefix="memhub-codex-"))
     transcript = tmpdir / f"codex-{sid}.jsonl"
-    transcript.write_text(body)
+    transcript.write_text(body, encoding="utf-8")
 
     try:
         cmd = [

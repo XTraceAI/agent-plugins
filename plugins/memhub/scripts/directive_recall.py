@@ -121,7 +121,7 @@ def _load_fired(session_id: str) -> list[str]:
     if not path:
         return []
     try:
-        ids = json.loads(path.read_text())
+        ids = json.loads(path.read_text(encoding="utf-8"))
         return [str(i) for i in ids if str(i).strip()] if isinstance(ids, list) else []
     except (OSError, json.JSONDecodeError):
         return []
@@ -134,7 +134,7 @@ def _save_fired(session_id: str, ids: list[str]) -> None:
         return
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(ids[-_MAX_FIRED_SENT:]))
+        path.write_text(json.dumps(ids[-_MAX_FIRED_SENT:]), encoding="utf-8")
         cutoff = time.time() - _STATE_MAX_AGE_S
         for old in _STATE_DIR.glob("*.json"):
             if old != path and old.stat().st_mtime < cutoff:
@@ -185,7 +185,7 @@ def _load_handles(session_id: str) -> list[str]:
     if not path:
         return []
     try:
-        keys = json.loads(path.read_text())
+        keys = json.loads(path.read_text(encoding="utf-8"))
         return [str(k) for k in keys] if isinstance(keys, list) else []
     except (OSError, json.JSONDecodeError):
         return []
@@ -197,7 +197,7 @@ def _save_handles(session_id: str, keys: list[str]) -> None:
         return
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(keys[-_MAX_FIRED_SENT:]))
+        path.write_text(json.dumps(keys[-_MAX_FIRED_SENT:]), encoding="utf-8")
     except OSError:
         pass  # the cache is an optimization, never worth failing the hook
 

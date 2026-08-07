@@ -89,7 +89,8 @@ def main() -> int:
         return 1
 
     try:
-        state = json.loads((STATE_DIR / f"{session_id}.json").read_text())
+        state = json.loads(
+            (STATE_DIR / f"{session_id}.json").read_text(encoding="utf-8"))
         offset = int(state.get("offset", 0))
     except (OSError, ValueError, TypeError):
         return 0  # no cursor yet — first turn of the session, always flush
