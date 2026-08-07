@@ -208,15 +208,13 @@ whole repo.
    spec artifact itself, say so plainly — no implementation session touching
    this spec has been imported yet.
 
-To land an implementation session into the repo's room, import it with a
-fresh conversation id (re-imports dedup per conversation_id globally) and a
-title naming the spec:
-
-```bash
-uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
-  --session "<session-id-or-path>" --agent-brain-id "<repo-ab-id>" \
-  --conversation-id "$(uuidgen)" --title "Spec: <title> — <what was built>"
-```
+Do NOT import implementation sessions. Per-turn capture already ships each one
+into this same room as it happens, under the session's own id, and the server
+has already extracted it — an import would re-upload the transcript to have the
+watermark discard it. If a session genuinely never landed (capture dormant, or
+it predates capture), tell the user to run `/memhub:import-session`; that is the
+one skill that backfills, and it imports under the session's own id so the
+session stays a single conversation.
 
 Plain-English output throughout; surface ids only where the user needs them
 (artifact id, agent brain id for scripts). On first ever script run the

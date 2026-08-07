@@ -227,7 +227,14 @@ async def main() -> int:
     ap.add_argument("--session", required=True,
                     help="path to a .jsonl transcript, or a bare session id")
     ap.add_argument("--conversation-id", default=None,
-                    help="override the conversation id (default: session id, for incremental dedup)")
+                    help="override the conversation id. Default (and what you "
+                         "almost always want): the session id, which is what "
+                         "per-turn capture uses — so the session stays ONE "
+                         "conversation per room and re-imports are incremental. "
+                         "An id that is not the session's SPLITS that session "
+                         "across two conversations; only pass one for a "
+                         "transcript that has no session id of its own (e.g. a "
+                         "synthesized Codex rollout)")
     ap.add_argument("--title", default=None)
     ap.add_argument("--agent-brain-id", default=None,
                     help="route the extracted facts/episodes into an agent brain "
@@ -275,6 +282,18 @@ async def main() -> int:
         return 2
 
     conv_id = args.conversation_id or f.stem
+    # An override that is not the session's own id opens a SECOND conversation
+    # for this session — per-turn capture keys on the session id, so its records
+    # and this import's watermark diverge and the session's memory splits across
+    # two rows. Legitimate only for a transcript with no session id of its own
+    # (a synthesized Codex rollout). Warn rather than refuse: the caller may
+    # genuinely be in that case, and this script must stay scriptable.
+    if args.conversation_id and args.conversation_id != f.stem:
+        print(f"WARNING: --conversation-id {args.conversation_id!r} is not this "
+              f"session's id ({f.stem}). Per-turn capture writes under the "
+              "session id, so this import opens a SECOND conversation and the "
+              "session's memory is split across both. Drop the flag unless this "
+              "transcript has no session id of its own.", file=sys.stderr)
     # --namespace wins; '' explicitly disables; default = resolve from records.
     # Resolved from the FULL list, ahead of the filter below: ``cwd`` rides on
     # every user record, including the slash-command ones.

@@ -1,13 +1,14 @@
 ---
-description: Use when the user wants to hand off the current session/work to a teammate via MemHub (e.g. "hand this off to Alice", "handoff this session to Bob", "share my context with Carol so she can pick this up", "pass this work to X"). Creates a shareable agent brain holding a handoff brief plus the full session's extracted memory, and shares it read-only with the teammate.
+description: Use when the user wants to hand off the current session/work to a teammate via MemHub (e.g. "hand this off to Alice", "handoff this session to Bob", "share my context with Carol so she can pick this up", "pass this work to X"). Creates a shareable agent brain holding a handoff brief, and shares it read-only with the teammate along with the repo room where per-turn capture already extracted the session.
 argument-hint: <teammate> [title...]
 allowed-tools: mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, Bash
 ---
 
-Hand the current session off to a teammate: bundle a concise handoff brief and
-the session's full extracted memory into one agent brain and share it
-read-only. The teammate's agent then picks it up by searching that agent
-brain — no transcript pasting, no shoulder-tap walkthrough.
+Hand the current session off to a teammate: write a concise handoff brief into
+a shareable agent brain and share it read-only, alongside the repo room where
+per-turn capture has already extracted this session. The teammate's agent picks
+it up by searching — no transcript pasting, no re-import, no shoulder-tap
+walkthrough.
 
 Arguments: `$ARGUMENTS`
 - First token(s) = the teammate, by name or email (required). If missing, ask
@@ -45,36 +46,33 @@ Do exactly this:
 4. Share it: `share_agent_brain` with the agent brain id and the teammate's
    `user_id`. Read-only is what you get and all a handoff needs.
 
-5. Ship the full session into the same agent brain via Bash — one command:
+5. Give the teammate the session's memory — do NOT import the session.
+   Per-turn capture has been shipping this session into the repo's room since
+   it started, and the server has already extracted it. Re-importing would
+   re-upload the transcript and, into a second brain, extract every fact and
+   episode a second time — the same session's memory in two places, competing
+   in retrieval.
 
    ```bash
-   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
-     --session "<current-session-id-or-path>" \
-     --agent-brain-id "<id-from-step-2>" \
-     --conversation-id "$(uuidgen)" \
-     --title "Handoff: <title>"
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
    ```
 
-   - Current session = the most recently modified `.jsonl` sitting DIRECTLY
-     inside the `~/.claude/projects/` directory matching the current working
-     directory (top level only — `.jsonl` files in subdirectories are
-     subagent/workflow transcripts, not sessions).
-   - The fresh `--conversation-id` is REQUIRED: the flush hook has usually
-     already imported this session globally under its own id, and re-imports
-     dedup per conversation_id — without a fresh id nothing would land in the
-     handoff agent brain.
-   - Do NOT read or paste transcript content; the script ships any size and
-     auto-chunks. It waits on extraction, so it can run for minutes —
-     unattended, just let it finish.
+   - A room is cached → `share_agent_brain` that room with the teammate too,
+     read-only. That is where the session's facts, episodes and gist already
+     live; the handoff brain carries the brief that points into it.
+   - No room cached (`/memhub:onboard` never run here), or the session ran
+     before capture was working → say so plainly and tell the user to run
+     `/memhub:import-session`. That is the ONE skill that backfills a session,
+     and it imports under the session's own id so nothing is duplicated.
 
-6. Report back: the agent brain name, who it's shared with, and the
-   receiving line the user can send their teammate verbatim — e.g.:
+6. Report back: the agent brain name, who it's shared with (brief brain and
+   repo room), and the receiving line the user can send their teammate
+   verbatim — e.g.:
 
    > Ask your agent: *search the "Handoff: <title>" agent brain in memhub*
 
-   Note that the handoff brief is readable immediately, while facts, episodes,
-   artifacts, and the session gist from the full import land over the next few
-   minutes as extraction completes.
+   Both are readable immediately — the brief because you just wrote it, the
+   session's memory because capture extracted it as the session ran.
 
 If `share_agent_brain` fails on permissions, you don't have contributor
 access to the agent brain — this happens when reusing someone else's agent
