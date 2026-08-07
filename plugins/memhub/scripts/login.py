@@ -106,58 +106,83 @@ async def _run(status_only: bool, force: bool) -> int:
     env = env_for_url(url)
     cache = token_cache_path(url)
 
-    if force:
-        # Deliberate: the browser flow is the only way to replace a token whose
-        # refresh capability is dead, and leaving the corpse in place invites
-        # the SDK to spend a doomed 401 round-trip on it first.
-        cache.unlink(missing_ok=True)
-        print(f"discarded cached token for {env}")
+    # --force must move the old credential OUT OF THE WAY, not destroy it.
+    #
+    # Clearing the cache is what makes --force mean anything: a still-valid
+    # cached token would otherwise be used happily and no re-authentication
+    # would happen at all. But deleting outright is a durability foot-gun, and
+    # it bites hardest in the most likely case — force-refreshing a WORKING
+    # token to pick up a newly granted scope. If the browser flow then fails
+    # (tab closed, timeout, no network), the user has traded a working login
+    # for none at all. So it is set aside and restored unless a verified login
+    # replaces it.
+    stash: Path | None = None
+    if force and cache.exists():
+        stash = cache.with_suffix(".json.prelogin")
+        cache.replace(stash)
+        print(f"set aside the cached {env} token (restored if login fails)")
+
+    def _restore() -> None:
+        """Put the old credential back — only if nothing replaced it."""
+        if stash and stash.exists():
+            if cache.exists():
+                stash.unlink()  # a new token landed; the old one is garbage
+            else:
+                stash.replace(cache)
+                print(f"login did not complete — restored the previous {env} token")
 
     print(f"environment : {env} ({url})")
 
+    # ``finally``, so the stash is resolved on EVERY exit — a clean failure, an
+    # unexpected raise, or success. _restore() is a no-op once a new token has
+    # landed, which makes "always call it" the correct rule rather than a
+    # per-branch judgement that a later edit could forget.
     try:
-        url, headers, auth = resolve_url_and_auth(url, interactive=not status_only)
-    except Exception as exc:  # noqa: BLE001 — report, never traceback
-        print(f"status      : FAILED to prepare auth ({exc})")
-        return 1
-
-    print(f"mode        : "
-          f"{'bearer ($MEMHUB_TOKEN)' if headers else 'browser OAuth (plugin client)'}")
-
-    try:
-        tools = await _verify(url, headers, auth)
-    except BaseException as exc:  # noqa: BLE001 — anyio wraps failures in groups
-        if _is_noninteractive(exc):
-            # --status only. Says nothing about whether a browser login WOULD
-            # work; it reports that no usable token is cached right now.
-            print("status      : NOT LOGGED IN (no usable cached token)")
-            print("fix         : run /memhub:login")
+        try:
+            url, headers, auth = resolve_url_and_auth(url, interactive=not status_only)
+        except Exception as exc:  # noqa: BLE001 — report, never traceback
+            print(f"status      : FAILED to prepare auth ({exc})")
             return 1
-        print(f"status      : FAILED ({type(exc).__name__}: {exc})")
-        return 1
 
-    print(f"status      : OK — server exposes {tools} tools")
+        print(f"mode        : "
+              f"{'bearer ($MEMHUB_TOKEN)' if headers else 'browser OAuth (plugin client)'}")
 
-    if headers:
-        # An explicit bearer is provisioned outside this flow entirely; there is
-        # no refresh story to report and no cache to inspect.
-        print("renewal     : n/a ($MEMHUB_TOKEN is supplied explicitly)")
+        try:
+            tools = await _verify(url, headers, auth)
+        except BaseException as exc:  # noqa: BLE001 — anyio wraps failures in groups
+            if _is_noninteractive(exc):
+                # --status only. Says nothing about whether a browser login
+                # WOULD work; it reports that no usable token is cached now.
+                print("status      : NOT LOGGED IN (no usable cached token)")
+                print("fix         : run /memhub:login")
+                return 1
+            print(f"status      : FAILED ({type(exc).__name__}: {exc})")
+            return 1
+
+        print(f"status      : OK — server exposes {tools} tools")
+
+        if headers:
+            # An explicit bearer is provisioned outside this flow entirely;
+            # there is no refresh story to report and no cache to inspect.
+            print("renewal     : n/a ($MEMHUB_TOKEN is supplied explicitly)")
+            return 0
+
+        ok, detail = _renewal_report(url)
+        print(f"renewal     : {detail}")
+        if not ok:
+            # Not a failed login — the token works right now. It is a login
+            # with a known expiry date and no recovery, which is worth saying
+            # loudly here rather than discovering as silence tomorrow.
+            print()
+            print("WARNING: the authorization server issued no refresh token, so this")
+            print("login will stop working when the access token expires, and memory")
+            print("capture will go quiet until someone runs /memhub:login again.")
+            print("To fix it at the source, enable 'Allow Offline Access' on the")
+            print(f"{env} API in Auth0 and make sure 'offline_access' appears in the")
+            print("server's advertised scopes_supported, then re-run /memhub:login --force.")
         return 0
-
-    ok, detail = _renewal_report(url)
-    print(f"renewal     : {detail}")
-    if not ok:
-        # Not a failed login — the token works right now. It is a login with a
-        # known expiry date and no recovery, which is worth saying loudly here
-        # rather than discovering as silence tomorrow.
-        print()
-        print("WARNING: the authorization server issued no refresh token, so this")
-        print("login will stop working when the access token expires, and memory")
-        print("capture will go quiet until someone runs /memhub:login again.")
-        print("To fix it at the source, enable 'Allow Offline Access' on the")
-        print(f"{env} API in Auth0 and make sure 'offline_access' appears in the")
-        print("server's advertised scopes_supported, then re-run /memhub:login --force.")
-    return 0
+    finally:
+        _restore()
 
 
 def _is_noninteractive(exc: BaseException) -> bool:

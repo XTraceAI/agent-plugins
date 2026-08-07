@@ -355,6 +355,15 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             fields["title"] = inert_title
         if inert_custom:
             fields["custom_title"] = inert_custom
+        # Plain ``_save_state``, NOT ``_mark_success`` — deliberately. This
+        # branch returns above ``resolve_url_and_auth`` and never touches the
+        # network, so reaching it says nothing about whether the server or the
+        # credential is healthy. Clearing ``last_error`` here would retract a
+        # real, still-unresolved failure on the strength of a purely local
+        # no-op, and inert deltas are common enough (the title arrives in one)
+        # that a broken session would routinely erase its own alarm. Only a
+        # committed round-trip is evidence of recovery, which is why exactly
+        # one call site clears the error.
         _save_state(session_id, **fields)
         return
 
@@ -462,9 +471,23 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                      "disabling per-turn flush for this session; commit/PR "
                      "and session-end capture still apply. Upgrade the MemHub "
                      "server to enable it.")
+                # ``unsupported`` and NOT a failure breadcrumb. This is a
+                # deliberate degrade, not a break: per-turn goes dormant while
+                # the commit/PR and SessionEnd paths keep capturing, so there
+                # is nothing the user must drop what they are doing to fix.
+                #
+                # It also cannot be retracted. Dormancy means no further flush
+                # runs, so no success can ever clear a breadcrumb — and because
+                # the condition is environmental, every NEW session rediscovers
+                # it and warns again. That is a banner on every session start
+                # for a day, about a known state with a working fallback, which
+                # is precisely how a warning becomes wallpaper and stops being
+                # read on the day it matters.
+                #
+                # Surfacing it properly needs a once-ever channel keyed by
+                # server, not the per-session one; until then the log line
+                # above records it.
                 _save_state(session_id, unsupported=True)
-                _mark_failure(session_id, "server_too_old",
-                              "server returned no ack_through")
                 return
 
             # Committed server-side — only now is it safe to move the cursor.

@@ -253,6 +253,55 @@ def test_inert_only_delta_is_consumed_but_attachments_are_not():
     check("a real turn keeps it live", _all_inert(sidecars + [_rec("a")]), False)
 
 
+def test_only_a_server_round_trip_retracts_a_failure():
+    """A recorded failure survives every local-only state write.
+
+    This is a REGRESSION LOCK, and the tempting change it forbids looks like a
+    bug fix: the inert-delta branch advances the cursor with a plain
+    ``_save_state``, so a session that failed and then consumed an inert delta
+    still reads as failing. Making that branch clear the error would be wrong.
+    It returns above ``resolve_url_and_auth`` and never contacts the server, so
+    it is not evidence that anything recovered — and inert deltas are common
+    (the title usually arrives in one), so a genuinely broken session would
+    routinely erase its own alarm and go back to failing in silence.
+
+    Only ``_mark_success``, reached solely after a committed round-trip,
+    retracts a failure."""
+    print("failure retraction")
+    original = ft.STATE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        ft.STATE_DIR = Path(tmp)
+        try:
+            sid = "retract"
+            ft._mark_failure(sid, "auth", "no usable cached OAuth token")
+            check("failure is recorded", ft._read_state(sid).get("last_error"), "auth")
+
+            # Exactly what the inert-delta branch does.
+            ft._save_state(sid, offset=512, title="t")
+            state = ft._read_state(sid)
+            check("a local-only save advances the cursor", state.get("offset"), 512)
+            check("but does NOT retract the failure",
+                  state.get("last_error"), "auth")
+            check("and records no false success", state.get("last_ok_at"), None)
+
+            ft._mark_success(sid, offset=1024)
+            state = ft._read_state(sid)
+            check("a committed round-trip clears the error",
+                  state.get("last_error"), None)
+            check("it clears the detail too",
+                  state.get("last_error_detail"), None)
+            check("and stamps the success",
+                  isinstance(state.get("last_ok_at"), float), True)
+            check("while keeping the cursor", state.get("offset"), 1024)
+
+            # The health check must agree with the state it reads.
+            ft._mark_failure(sid, "timeout", "no response")
+            check("a fresh failure after a success stands again",
+                  ft._read_state(sid).get("last_error"), "timeout")
+        finally:
+            ft.STATE_DIR = original
+
+
 def test_timeout_override_never_breaks_the_hook():
     """The override is parsed at CALL time and floors at the default. Parsing it
     at import meant a bad value crashed the module before the handler that keeps

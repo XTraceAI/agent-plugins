@@ -64,10 +64,21 @@ _MAX_STATE_FILES = 40
 # truly terminal — no retry can mint a token, so capture stays dead until a
 # human re-authenticates. The rest are reported because they persisted, not
 # because a single occurrence means anything.
+# Deliberately absent: the server-too-old dormancy. It is a degrade with a
+# working fallback rather than a break, it can never be retracted (a dormant
+# session runs no further flush), and being environmental it recurs on every
+# new session — so routing it here would put a banner on every session start
+# for a day. `flush_turn` records it as `unsupported` instead and does not
+# breadcrumb it.
+#
+# Every slug ``flush_turn._mark_failure`` can write needs an entry here; the
+# generic fallback exists for forward compatibility, not as a place for slugs
+# to land silently. `flush_turn_test` asserts the two stay in step, because a
+# drifted vocabulary quietly degrades the exact diagnostic this feature is for.
 _REASONS = {
     "auth": "the plugin's saved login expired and could not be renewed",
     "server_rejected": "the server rejected the last upload",
-    "server_too_old": "the server is too old for per-turn capture",
+    "unrecognized_response": "the server sent a reply the plugin could not read",
     "timeout": "the server stopped responding",
     "error": "the capture hook hit an unexpected error",
 }
@@ -206,8 +217,11 @@ def _message(host: str, token_problem: str | None,
         detail = _REASONS.get(reason, "the capture hook failed")
         ago = max(0, int((time.time() - when) / 60))
         when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
+        # NOT "check /mcp" — the connector is a separate token store, so its
+        # status says nothing about capture health. Sending someone there to
+        # diagnose this would contradict the whole reason this check exists.
         tail = fix if reason == "auth" else (
-            "It may have recovered since; check /mcp if this repeats.")
+            "It may have recovered since; run /memhub:login --status to check.")
         return (f"MemHub capture last failed {when_txt} — {detail}. {tail}")
     return None
 

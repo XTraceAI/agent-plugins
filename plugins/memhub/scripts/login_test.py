@@ -109,6 +109,68 @@ def test_duration_format(login) -> None:
     check("already expired reads as zero", login._fmt_duration(-500), "0m")
 
 
+def test_force_restores_the_token_when_login_fails(login) -> None:
+    """--force must not leave the user with nothing.
+
+    Clearing the cache is what makes --force meaningful — a still-valid token
+    would otherwise be reused and no re-auth would happen. But the likeliest
+    use is force-refreshing a WORKING login to pick up a newly granted scope,
+    and if the browser flow then fails (tab closed, timeout, offline) deleting
+    up front would trade a working login for none at all.
+
+    Driven through the real entry point with a guaranteed-to-fail verify, so
+    the rollback is exercised by the same ``finally`` production uses.
+    """
+    print("\n--force rollback")
+    import asyncio
+
+    original = _write_token(login, PROD, refresh=True).read_text(encoding="utf-8")
+    stash = login.token_cache_path(PROD).with_suffix(".json.prelogin")
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("browser flow failed")
+
+    real_verify, real_url = login._verify, login.default_url
+    login._verify, login.default_url = _boom, lambda: PROD
+    try:
+        rc = asyncio.run(login._run(status_only=False, force=True))
+    finally:
+        login._verify, login.default_url = real_verify, real_url
+
+    check("failed login reports failure", rc, 1)
+    check("the previous token is back", login.token_cache_path(PROD).exists(), True)
+    check("and is byte-identical",
+          login.token_cache_path(PROD).read_text(encoding="utf-8"), original)
+    check("no stash is left behind", stash.exists(), False)
+    login.token_cache_path(PROD).unlink()
+
+
+def test_failure_slugs_all_have_health_messages() -> None:
+    """Every reason `flush_turn` can record must render a specific message.
+
+    The generic fallback in `capture_health._message` exists for forward
+    compatibility, not as a place for slugs to land silently. This caught
+    `unrecognized_response`, which was written by the flush but absent from the
+    health vocabulary, so it degraded to "the capture hook failed" — a weaker
+    diagnostic in the one feature whose entire purpose is diagnosis.
+    """
+    print("\nslug vocabulary")
+    import re
+
+    import capture_health as ch
+
+    source = (SCRIPTS / "flush_turn.py").read_text(encoding="utf-8")
+    # BOTH spellings. The in-flush paths pass the slug as a literal, while the
+    # top-level handler picks one into `reason` first — scanning only the call
+    # site silently covered two of five slugs while appearing to cover all of
+    # them, which is a worse failure than not testing this at all.
+    slugs = set(re.findall(r'_mark_failure\(\s*session_id,\s*"([a-z_]+)"', source))
+    slugs |= set(re.findall(r'reason,\s*detail\s*=\s*"([a-z_]+)"', source))
+    check("every known slug is discovered", len(slugs) >= 5, True)
+    for slug in sorted(slugs):
+        check(f"{slug!r} has a health message", slug in ch._REASONS, True)
+
+
 def test_flag_conflict() -> None:
     print("\nflag conflict")
     out = subprocess.run(
@@ -122,8 +184,10 @@ if __name__ == "__main__":
     login = _import()
     if login is not None:
         for test in (test_renewal_report, test_cache_is_per_environment,
-                     test_duration_format):
+                     test_duration_format,
+                     test_force_restores_the_token_when_login_fails):
             test(login)
+        test_failure_slugs_all_have_health_messages()
         test_flag_conflict()
     if failures:
         print("\nFAILED:")
