@@ -29,8 +29,10 @@ not an error: the cursor did not move, so the next turn's flush carries both.
 Discipline mirrors the other capture hooks: THIS SCRIPT NEVER FAILS LOUDLY.
 Any error exits 0 quietly — memory capture must never disturb the session.
 
-Auth = the SAME OAuth the /mcp connector uses (shared ``_memhub_auth``), non
-interactive: a per-turn background hook must never pop a browser.
+Auth = the plugin's OWN token cache (shared ``_memhub_auth``) — a different
+store from the /mcp connector's, so being connected in /mcp does NOT mean this
+hook can authenticate. Non-interactive: a per-turn background hook must never
+pop a browser, so it can only consume a token ``/memhub:login`` already minted.
 """
 from __future__ import annotations
 
@@ -551,7 +553,7 @@ def main() -> int:
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
             reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
         elif _auth_required(e):
-            _log("no cached OAuth token; run /memhub:import-session once "
+            _log("no cached OAuth token; run /memhub:login "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
             # The one failure the user must act on personally, and the one that
             # stays broken forever until they do: no retry can mint a token.

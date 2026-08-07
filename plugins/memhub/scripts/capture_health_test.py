@@ -154,12 +154,12 @@ def test_messages() -> None:
 
     msg = ch._message(HOST, "unrenewable", None)
     check("unrenewable names the fix",
-          bool(msg and "/memhub:import-session" in msg), True)
+          bool(msg and "/memhub:login" in msg), True)
     check("unrenewable names the host", bool(msg and HOST in msg), True)
 
     msg = ch._message(HOST, "never", None)
     check("never-authed names the fix",
-          bool(msg and "/memhub:import-session" in msg), True)
+          bool(msg and "/memhub:login" in msg), True)
 
     # The token problem is true right now; a breadcrumb only proves something
     # was broken when it was written. So the token check leads.

@@ -189,8 +189,11 @@ def _message(host: str, token_problem: str | None,
     act on and it is true right now — a breadcrumb only proves something was
     broken when it was written.
     """
-    fix = ("Run /memhub:import-session once to re-authenticate "
-           "(it opens the same browser flow as /mcp).")
+    # /memhub:login, not /memhub:import-session — importing a session is a
+    # different operation that does real unrequested work and can fail for
+    # reasons unrelated to auth, which muddies the very signal being reported.
+    fix = ("Run /memhub:login to authenticate "
+           "(the plugin has its own login, separate from /mcp).")
     if token_problem == "never":
         return (f"MemHub capture is not authenticated for {host}, so this "
                 f"session is not being saved to memory. {fix}")
