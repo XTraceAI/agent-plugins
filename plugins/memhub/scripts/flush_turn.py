@@ -160,6 +160,47 @@ def _save_state(session_id: str, **fields) -> None:
     tmp.replace(STATE_DIR / f"{session_id}.json")
 
 
+# ── health breadcrumb ─────────────────────────────────────────────────
+#
+# Everything below exists because this hook is `async: true`, and Claude Code
+# surfaces an async hook's stdout NOWHERE — not to the user, not to the agent.
+# So every failure path here ended in a print nobody could read, and the state
+# dir could not tell the two cases apart either: a session whose flushes all
+# failed left a `.lock` and no `.json`, byte-identical to a session where the
+# hook never ran. Per-turn capture died on prod when a token cached before the
+# server advertised `offline_access` expired unrenewably, and it stayed dead
+# for a day without a single visible symptom.
+#
+# The fix is to write the failure down where a SYNCHRONOUS hook can find it:
+# `capture_health.py` reads these fields on SessionStart and reports them via
+# `systemMessage`, the one channel that reaches the user.
+
+def _mark_failure(session_id: str, reason: str, detail: str = "") -> None:
+    """Record WHY this flush did not ship, for `capture_health.py` to surface.
+
+    Never raises and never touches ``offset``: a breadcrumb must not be able to
+    corrupt the cursor it is reporting on. ``reason`` is a stable slug the
+    health check branches on; ``detail`` is truncated free text for the human.
+    """
+    try:
+        _save_state(session_id, last_error=reason,
+                    last_error_detail=detail[:200] or None,
+                    last_error_at=time.time())
+    except OSError:
+        pass  # a breadcrumb is never worth failing the hook over
+
+
+def _mark_success(session_id: str, **fields) -> None:
+    """Save ``fields`` and clear any recorded failure in the same write.
+
+    One write, not two: a success that advanced the cursor but left the error
+    behind would have the health check crying wolf for the rest of the session,
+    and a crash between two writes would make that permanent.
+    """
+    _save_state(session_id, last_ok_at=time.time(), last_error=None,
+                last_error_detail=None, last_error_at=None, **fields)
+
+
 # ── lock ──────────────────────────────────────────────────────────────
 
 def _acquire(session_id: str) -> int | None:
@@ -377,7 +418,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             texts = [t for t in (getattr(b, "text", None)
                                  for b in getattr(res, "content", []) or []) if t]
             if getattr(res, "isError", False):
-                _log(f"flush FAILED: {(texts[0] if texts else 'no detail')[:200]}")
+                detail = (texts[0] if texts else "no detail")[:200]
+                _log(f"flush FAILED: {detail}")
+                _mark_failure(session_id, "server_rejected", detail)
                 return
 
             out = getattr(res, "structuredContent", None)
@@ -393,7 +436,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                         continue
             if not isinstance(out, dict) or "conversation_id" not in out:
                 # Unrecognized body: do NOT advance. Re-sending is free.
-                _log(f"response unrecognized: {(texts[0] if texts else '')[:120]!r}")
+                detail = (texts[0] if texts else "")[:120]
+                _log(f"response unrecognized: {detail!r}")
+                _mark_failure(session_id, "unrecognized_response", detail)
                 return
 
             # ``ack_through`` is only returned by a server that performed the
@@ -416,6 +461,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                      "and session-end capture still apply. Upgrade the MemHub "
                      "server to enable it.")
                 _save_state(session_id, unsupported=True)
+                _mark_failure(session_id, "server_too_old",
+                              "server returned no ack_through")
                 return
 
             # Committed server-side — only now is it safe to move the cursor.
@@ -424,10 +471,10 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # delta must not be able to override, and merging a None over it
             # would let the next ``ai-title`` — which the client keeps
             # emitting with the pre-rename value — take the name back.
-            _save_state(session_id, offset=consumed,
-                        last_uuid=out.get("ack_through"), cwd=cwd,
-                        namespace=namespace, title=title,
-                        **({"custom_title": custom} if custom else {}))
+            _mark_success(session_id, offset=consumed,
+                          last_uuid=out.get("ack_through"), cwd=cwd,
+                          namespace=namespace, title=title,
+                          **({"custom_title": custom} if custom else {}))
             # Sent count, not read count — and the byte span stays the READ
             # span, because that is what the cursor just advanced past. The
             # filtered records are the difference between the two, so showing
@@ -471,6 +518,11 @@ def _auth_required(e: BaseException) -> bool:
 
 def main() -> int:
     lock_fd: int | None = None
+    # Bound BEFORE the try so the handler can always write a breadcrumb. Reading
+    # stdin or parsing it is itself a failure path, and a NameError raised from
+    # inside the one handler that exists to keep this hook quiet would surface
+    # the traceback it was written to prevent.
+    session_id = ""
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
         session_id = (hook_input.get("session_id") or "").strip()
@@ -497,11 +549,23 @@ def main() -> int:
     except BaseException as e:  # noqa: BLE001 — never fail the hook
         if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
+            reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
         elif _auth_required(e):
             _log("no cached OAuth token; run /memhub:import-session once "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
+            # The one failure the user must act on personally, and the one that
+            # stays broken forever until they do: no retry can mint a token.
+            reason, detail = "auth", "no usable cached OAuth token"
         else:
             _log(f"skipped ({type(e).__name__}: {e})")
+            reason, detail = "error", f"{type(e).__name__}: {e}"
+        # Only with a session to file it under, and never at the cost of the
+        # quiet exit — a breadcrumb that raised would defeat this whole handler.
+        if session_id:
+            try:
+                _mark_failure(session_id, reason, detail)
+            except BaseException:  # noqa: BLE001
+                pass
     finally:
         if lock_fd is not None:
             # Closing releases the flock. The kernel would do this at exit
