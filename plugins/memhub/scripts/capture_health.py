@@ -133,30 +133,43 @@ def _jwt_exp(access_token: str) -> float | None:
 def _token_problem(host: str) -> str | None:
     """The reason capture cannot authenticate to ``host``, or None if it can.
 
-    Three states matter, and only two of them are faults:
+    The presence of a refresh token is checked INDEPENDENTLY of expiry, because
+    the two facts are known with different confidence. Whether the token has
+    lapsed depends on reading an ``exp`` we may not be able to decode; whether
+    it can ever renew itself is simply whether a refresh token is there. An
+    earlier version short-circuited on expiry first, so an unreadable ``exp``
+    returned "healthy" and threw away the second fact entirely — including for
+    a token that provably could never recover.
 
-    * no cache file — never authenticated on this machine, or it was cleared;
-    * expired WITH a refresh token — fine, and deliberately silent: the flush
-      renews it before the SDK runs, which is the normal overnight path;
-    * expired WITHOUT one — terminal. Nothing automatic can recover it, which
-      is exactly the case that went unnoticed for a day.
+    The states:
 
-    A token whose ``exp`` cannot be read is treated as healthy: refusing to
-    guess beats warning about a working setup, and a genuine failure will show
-    up as a breadcrumb anyway.
+    * no cache file — never authenticated here, or it was cleared;
+    * expired WITH a refresh token — healthy, and deliberately silent: the
+      flush renews it before the SDK runs. This is the normal overnight path
+      and warning about it every morning is how a banner becomes wallpaper;
+    * expired WITHOUT one — broken now, and nothing automatic recovers it;
+    * not known-expired but WITHOUT one — works today, dead within the access
+      token's lifetime, and no retry can save it. Reported for the same reason
+      ``login.py`` reports renewal at mint time: this is exactly the state that
+      killed production capture, and the day of warning it buys is the whole
+      difference between a fix and an outage.
+
+    An unreadable ``exp`` alone is never treated as a fault — that would be
+    guessing — but it no longer suppresses the refresh-token fact.
     """
     if os.environ.get("MEMHUB_TOKEN", "").strip():
-        return None  # explicit bearer wins; nothing here applies
+        return None  # explicit bearer (incl. an mhk_ key) — nothing here applies
     try:
         cached = json.loads(
             (CACHE_DIR / f"tokens-{host.replace(':', '_')}.json")
             .read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return "never"
+    renewable = bool(cached.get("refresh_token"))
     exp = _jwt_exp(cached.get("access_token") or "")
-    if exp is None or time.time() < exp:
-        return None
-    return None if cached.get("refresh_token") else "unrenewable"
+    if exp is not None and time.time() >= exp:
+        return None if renewable else "unrenewable"
+    return None if renewable else "no_refresh"
 
 
 def _recent_failure() -> tuple[str, float] | None:
@@ -212,6 +225,13 @@ def _message(host: str, token_problem: str | None,
         return (f"MemHub capture is broken: the saved login for {host} expired "
                 f"and cannot be renewed automatically, so nothing from this "
                 f"session is reaching memory. {fix}")
+    if token_problem == "no_refresh":
+        # Deliberately NOT phrased as "expired" — it works right now. The point
+        # is that it has no way to renew, so it will stop on its own schedule
+        # and the fix is cheapest before that happens rather than after.
+        return (f"MemHub capture is working but cannot renew its login for "
+                f"{host} — there is no refresh token, so it will stop when the "
+                f"current one expires and capture will go quiet. {fix}")
     if failure:
         reason, when = failure
         detail = _REASONS.get(reason, "the capture hook failed")

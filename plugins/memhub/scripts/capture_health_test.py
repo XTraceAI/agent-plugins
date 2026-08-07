@@ -96,13 +96,27 @@ def test_token_states() -> None:
     check("expired unrenewable -> problem",
           ch._token_problem(HOST), "unrenewable")
 
-    # An opaque token's expiry is unknowable; refusing to guess beats warning
-    # about a setup that works.
+    # Works today, no way to renew: the state that killed production. Reported
+    # while it is still cheap to fix, not after it lapses.
+    _write_token(exp=time.time() + 3600, refresh=False)
+    check("valid but unrenewable -> no_refresh",
+          ch._token_problem(HOST), "no_refresh")
+
+    # An unreadable exp is never a fault on its own — that would be guessing —
+    # but it must not suppress the refresh-token fact, which is known either
+    # way. Short-circuiting on expiry first threw that away.
     ch.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     (ch.CACHE_DIR / f"tokens-{HOST}.json").write_text(
         json.dumps({"access_token": "opaque", "refresh_token": None}),
         encoding="utf-8")
-    check("undecodable exp -> healthy", ch._token_problem(HOST), None)
+    check("undecodable exp + no refresh -> no_refresh",
+          ch._token_problem(HOST), "no_refresh")
+
+    (ch.CACHE_DIR / f"tokens-{HOST}.json").write_text(
+        json.dumps({"access_token": "opaque", "refresh_token": "rt"}),
+        encoding="utf-8")
+    check("undecodable exp + refresh -> healthy",
+          ch._token_problem(HOST), None)
 
     _write_token(exp=time.time() - 3600, refresh=False)
     os.environ["MEMHUB_TOKEN"] = "explicit-bearer"
@@ -159,6 +173,15 @@ def test_messages() -> None:
 
     msg = ch._message(HOST, "never", None)
     check("never-authed names the fix",
+          bool(msg and "/memhub:login" in msg), True)
+
+    msg = ch._message(HOST, "no_refresh", None)
+    check("no_refresh warns before it breaks", bool(msg), True)
+    # It works right now; calling it expired would be false and would teach the
+    # user that the banner overstates things.
+    check("no_refresh does not claim it already expired",
+          "expired" not in (msg or "").split("expires")[0], True)
+    check("no_refresh names the fix",
           bool(msg and "/memhub:login" in msg), True)
 
     # The token problem is true right now; a breadcrumb only proves something
