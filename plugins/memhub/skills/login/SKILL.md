@@ -30,9 +30,33 @@ Run exactly one command and report what it says:
 The command opens a browser tab on the first run. Tell the user to expect it and
 to complete the approval; it waits up to 5 minutes.
 
+## What it actually provisions
+
+A browser login is only the bootstrap. What the hooks end up using is a
+**personal access key** (`mhk_…`) that this command mints for you with the token
+the browser flow produced — one key per machine, scoped `memory:read` +
+`memory:write`, expiring in 90 days, stored at
+`~/.config/memhub-plugin/pak-<host>.json`.
+
+That indirection is the point. A hook is a cold background process that can
+never open a browser, so it cannot refresh an expiring OAuth token — which is
+how per-turn capture once died silently for a day. A key is a static bearer with
+none of that machinery.
+
+Re-running is safe and cheap: a stored key that is still valid is reused without
+touching the server at all. You hold at most five keys, so if minting reports the
+cap, revoke one in the MemHub app and re-run.
+
 ## Reading the output
 
-It prints `environment`, `mode`, `status`, and `renewal`. Relay them plainly.
+It prints `environment`, `mode`, `status`, `access key`, and `renewal`. Relay
+them plainly.
+
+- **`mode`** — which credential answered: `$MEMHUB_TOKEN`, a stored access key,
+  or the browser flow. This is the line that tells you what is actually in use.
+- **`access key`** — `created`, `reusing`, or `replaced orphaned key`. A
+  `NOT created` here is not a failed login: OAuth still verified and capture
+  works today, but it is back on the short-lived credential, so say so.
 
 - **`environment`** — say which one out loud. `production` and `staging` are
   separate tenants with separate logins, so authenticating one does nothing for

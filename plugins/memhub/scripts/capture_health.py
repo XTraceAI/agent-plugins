@@ -60,6 +60,13 @@ _STALE_AFTER_S = 24 * 3600
 # scan would get slower every day for information the newest few already carry.
 _MAX_STATE_FILES = 40
 
+# How close an unrenewable token must be to lapsing before this check speaks.
+# `login.py` already names the tenant fix at mint time; repeating it every
+# session for the token's whole life would be that message as wallpaper. A few
+# hours is enough warning to act and short enough that most sessions never see
+# it. Sized against the ~24h access token these grants issue.
+_NO_REFRESH_WARN_WITHIN_S = 6 * 3600
+
 # Failures worth interrupting someone over, and what to say. Only ``auth`` is
 # truly terminal — no retry can mint a token, so capture stays dead until a
 # human re-authenticates. The rest are reported because they persisted, not
@@ -130,6 +137,52 @@ def _jwt_exp(access_token: str) -> float | None:
         return None
 
 
+# A 90-day key is not news at day 30. This is the window where saying so is
+# actionable rather than noise — and unlike the OAuth "cannot renew" case, the
+# fix here genuinely is one command, because /memhub:login mints a fresh key.
+_KEY_EXPIRY_WARN_WITHIN_S = 7 * 86400
+
+
+def _stored_key(host: str) -> str | None | object:
+    """Verdict for a stored access key, or None if there is no key to judge.
+
+    Returns the sentinel ``_HEALTHY`` when a key exists and is fine — distinct
+    from ``None`` (no key at all), because the caller must be able to tell "the
+    key is good, stop looking" from "fall through to the OAuth cache".
+    """
+    try:
+        import pak  # noqa: PLC0415 — stdlib-only, beside this file
+        record = pak.load(_mcp_url_for(host))
+        if not record:
+            return None
+        remaining = pak.expires_in_s(record)
+        if remaining is None:
+            return _HEALTHY  # non-expiring key
+        if remaining <= 0:
+            return "key_expired"
+        if remaining <= _KEY_EXPIRY_WARN_WITHIN_S:
+            return "key_expiring"
+        return _HEALTHY
+    except Exception:  # noqa: BLE001 — a broken key module means "no key"
+        return None
+
+
+def _mcp_url_for(host: str) -> str:
+    """Reconstruct the endpoint `pak` keys its storage by.
+
+    `pak` keys on the URL's netloc, which is exactly the `host` this module
+    already resolved, so the path is irrelevant to the lookup.
+    """
+    return f"https://{host}/mcp-server/mcp"
+
+
+class _Healthy:
+    """Sentinel: a credential was found and it is fine."""
+
+
+_HEALTHY = _Healthy()
+
+
 def _token_problem(host: str) -> str | None:
     """The reason capture cannot authenticate to ``host``, or None if it can.
 
@@ -159,6 +212,17 @@ def _token_problem(host: str) -> str | None:
     """
     if os.environ.get("MEMHUB_TOKEN", "").strip():
         return None  # explicit bearer (incl. an mhk_ key) — nothing here applies
+
+    # A stored access key outranks the OAuth cache, exactly as it does in
+    # `resolve_url_and_auth`. Judging the OAuth token while the hooks
+    # authenticate with a key would report on a credential nothing uses — and
+    # would fire the "cannot renew" warning at someone whose setup is now
+    # immune to that entire failure mode.
+    key = _stored_key(host)
+    if key is _HEALTHY:
+        return None       # a good key; the OAuth cache is irrelevant now
+    if key is not None:
+        return key        # a key that has lapsed or is about to
     try:
         cached = json.loads(
             (CACHE_DIR / f"tokens-{host.replace(':', '_')}.json")
@@ -169,7 +233,17 @@ def _token_problem(host: str) -> str | None:
     exp = _jwt_exp(cached.get("access_token") or "")
     if exp is not None and time.time() >= exp:
         return None if renewable else "unrenewable"
-    return None if renewable else "no_refresh"
+    if renewable:
+        return None
+    # Unrenewable but still working. This is a SCHEDULED outage, and who says so
+    # depends on when: `login.py` reports it at mint time, with the tenant fix
+    # named, which is when it is cheapest to act on. Repeating that here every
+    # session for the token's whole life would just be that same message as
+    # wallpaper. So this check stays quiet until the outage is actually close —
+    # or until we cannot tell how close it is, where silence would be a guess.
+    if exp is None or exp - time.time() <= _NO_REFRESH_WARN_WITHIN_S:
+        return "no_refresh"
+    return None
 
 
 def _recent_failure() -> tuple[str, float] | None:
@@ -225,13 +299,26 @@ def _message(host: str, token_problem: str | None,
         return (f"MemHub capture is broken: the saved login for {host} expired "
                 f"and cannot be renewed automatically, so nothing from this "
                 f"session is reaching memory. {fix}")
+    if token_problem == "key_expired":
+        return (f"MemHub capture is not running: its access key for {host} has "
+                f"expired, so nothing from this session is reaching memory. {fix}")
+    if token_problem == "key_expiring":
+        # Unlike the OAuth "cannot renew" case, re-authenticating genuinely
+        # fixes this — /memhub:login mints a replacement — so it names the fix.
+        return (f"MemHub capture's access key for {host} expires soon. {fix}")
     if token_problem == "no_refresh":
-        # Deliberately NOT phrased as "expired" — it works right now. The point
-        # is that it has no way to renew, so it will stop on its own schedule
-        # and the fix is cheapest before that happens rather than after.
-        return (f"MemHub capture is working but cannot renew its login for "
-                f"{host} — there is no refresh token, so it will stop when the "
-                f"current one expires and capture will go quiet. {fix}")
+        # Deliberately NOT phrased as "expired" — it works right now. And
+        # deliberately NOT told to re-authenticate: logging in again cannot
+        # produce a refresh token the authorization server declined to issue,
+        # so `fix` here would send the user round a loop that never converges —
+        # banner, re-login, identical state, banner. Advice that cannot work is
+        # worse than no advice, because it spends the user's trust proving it.
+        return (f"MemHub capture for {host} will stop soon: its login has no "
+                f"refresh token, so it cannot renew itself. Re-authenticating "
+                f"will not help — the server is not issuing refresh tokens. "
+                f"Enable 'Allow Offline Access' on that API, or set "
+                f"$MEMHUB_TOKEN to a personal access key (mhk_…), which the "
+                f"hooks use directly and which does not expire.")
     if failure:
         reason, when = failure
         detail = _REASONS.get(reason, "the capture hook failed")
@@ -290,11 +377,20 @@ def main() -> int:
     if not host:
         return 0  # not running as an installed plugin — nothing to judge
 
-    message = _message(host, _token_problem(host), _recent_failure())
+    token_problem = _token_problem(host)
+    failure = _recent_failure()
+    message = _message(host, token_problem, failure)
     if not message:
         return 0
 
-    if _already_warned(session_id, message):
+    # Debounce on WHAT IS WRONG, not on the rendered sentence. The breadcrumb
+    # message embeds a "12m ago", so the text changes between every SessionStart
+    # — and SessionStart fires again on resume and /clear. Keying on the message
+    # meant the same unchanged problem produced a new signature each time and
+    # defeated the debounce it was supposed to drive. The cause is what should
+    # be shown once; only a genuinely DIFFERENT problem should interrupt again.
+    signature = f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
+    if _already_warned(session_id, signature):
         return 0
 
     print(json.dumps({

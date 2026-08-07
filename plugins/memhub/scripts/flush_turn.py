@@ -55,6 +55,7 @@ from session_title import (  # noqa: E402
     generated_title,
     prompt_title,
 )
+from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 # ``_memhub_auth`` pulls in the mcp SDK, so it is imported lazily inside
@@ -341,7 +342,11 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # SENT, not from what is read: the metadata harvest below still sees every
     # record, and the cursor still advances past these, because they are
     # deliberately never shipped rather than deferred.
-    sendable = drop_command_wrappers(records)
+    # Redact AFTER filtering and before anything leaves the machine. Applied to
+    # what is SENT rather than what is read, so the cursor still advances past
+    # a record whose secret was stripped — the alternative would pin the cursor
+    # on any turn that mentioned a key and stall capture permanently.
+    sendable = redact_records(drop_command_wrappers(records))
 
     if not sendable or all(
         isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES

@@ -49,6 +49,7 @@ from transcript_chunks import (  # noqa: E402
     DEFAULT_CHUNK_BYTES,
     slices as make_slices,
 )
+from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 
@@ -318,6 +319,11 @@ async def main() -> int:
     if not records:
         print(f"ERROR: {f} holds only slash-command records", file=sys.stderr)
         return 2
+
+    # Third and last upload path, redacting for the same reason it filters: the
+    # guarantee is that a captured session never carries a MemHub key, and a
+    # guarantee that holds on two paths out of three is not one.
+    records = redact_records(records)
 
     # An explicit --title always wins; otherwise take the name the transcript
     # itself carries, the same way per-turn capture does. Without this a plain

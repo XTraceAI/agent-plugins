@@ -1,0 +1,223 @@
+"""Self-test for the access-key lifecycle.
+
+The server calls are faked, so what is asserted is the part that can go quietly
+wrong: which key gets used, what happens to a key whose secret we lost, and
+whether the five-key cap is respected. Getting these wrong does not raise — it
+burns the user's key allowance or silently authenticates with nothing.
+
+Run: python3 pak_test.py  (stdlib only).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+_TMP_HOME = tempfile.mkdtemp(prefix="pak-test-")
+os.environ["HOME"] = _TMP_HOME
+os.environ["MEMHUB_PAK_LABEL"] = "test-machine"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pak  # noqa: E402
+
+MCP = "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"
+BASE = "https://api.staging.memhub.xtrace.ai"
+
+failures: list[str] = []
+calls: list[tuple] = []
+
+
+def check(label: str, got, want) -> None:
+    if got != want:
+        failures.append(f"{label}: got {got!r}, want {want!r}")
+    print(f"  {'ok ' if got == want else 'FAIL'} {label}")
+
+
+def _iso(offset_days: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(time.time() + offset_days * 86400))
+
+
+def _fake_server(existing: list[dict], mint_id: str = "new-id"):
+    """Install a fake transport and record what the module asks it to do."""
+    calls.clear()
+    state = {"keys": list(existing)}
+
+    def _call(base, bearer, method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            return state["keys"]
+        if method == "DELETE":
+            tid = path.rsplit("/", 1)[-1]
+            for k in state["keys"]:
+                if k.get("id") == tid:
+                    k["revoked_at"] = _iso(0)
+            return {}
+        if method == "POST":
+            return {"secret": "mhk_" + "x" * 43,
+                    "access_token": {"id": mint_id, "label": body["label"],
+                                     "scopes": body["scopes"],
+                                     "expires_at": body["expires_at"],
+                                     "created_at": _iso(0), "revoked_at": None}}
+        raise AssertionError(method)
+
+    pak._call = _call
+    return state
+
+
+def _reset():
+    pak.forget(MCP)
+
+
+def test_paths_and_labels():
+    print("\npaths and labels")
+    check("api base strips the mcp path", pak.api_base(MCP), BASE)
+    check("key file is per host",
+          pak.key_path(MCP).name, "pak-api.staging.memhub.xtrace.ai.json")
+    check("prod and staging differ",
+          pak.key_path(MCP) != pak.key_path("https://api.memhub.xtrace.ai/mcp-server/mcp"),
+          True)
+    check("label honours the override", pak.default_label(), "test-machine")
+
+
+def test_store_roundtrip():
+    print("\nstorage")
+    _reset()
+    check("missing reads as None", pak.load(MCP), None)
+    pak.save(MCP, {"secret": "mhk_abc", "label": "test-machine"})
+    check("round-trips", pak.load(MCP)["secret"], "mhk_abc")
+    check("mode is 0600", oct(pak.key_path(MCP).stat().st_mode)[-3:], "600")
+
+    # A record with no secret is not a credential, however well-formed.
+    pak.save(MCP, {"label": "test-machine"})
+    check("secretless record reads as None", pak.load(MCP), None)
+
+    pak.key_path(MCP).write_text("{not json", encoding="utf-8")
+    check("corrupt file reads as None", pak.load(MCP), None)
+    _reset()
+
+
+def test_expiry():
+    print("\nexpiry")
+    check("absent -> unknown", pak.expires_in_s({"secret": "x"}), None)
+    check("null -> unknown", pak.expires_in_s({"expires_at": None}), None)
+    check("garbage -> unknown", pak.expires_in_s({"expires_at": "soon"}), None)
+    future = pak.expires_in_s({"expires_at": _iso(10)})
+    check("future is positive", future is not None and future > 0, True)
+    past = pak.expires_in_s({"expires_at": _iso(-10)})
+    check("past is negative", past is not None and past < 0, True)
+
+
+def test_reuses_a_good_stored_key():
+    print("\nreuse")
+    _reset()
+    pak.save(MCP, {"secret": "mhk_stored", "label": "test-machine",
+                   "id": "old", "expires_at": _iso(30)})
+    _fake_server([])
+    record, how = pak.ensure(MCP, "bearer")
+    check("reused", how, "reused")
+    check("same secret", record["secret"], "mhk_stored")
+    # The whole point of reuse: no allowance spent, no server round-trip.
+    check("no server calls at all", calls, [])
+
+
+def test_expired_stored_key_is_replaced():
+    print("\nexpired stored key")
+    _reset()
+    pak.save(MCP, {"secret": "mhk_old", "label": "test-machine",
+                   "id": "old", "expires_at": _iso(-1)})
+    _fake_server([{"id": "old", "label": "test-machine", "revoked_at": None}])
+    record, how = pak.ensure(MCP, "bearer")
+    check("replaced", how, "replaced")
+    check("new secret stored", pak.load(MCP)["secret"], record["secret"])
+    check("the stale one was revoked",
+          ("DELETE", "/v1/developer/access-tokens/old", None) in calls, True)
+
+
+def test_orphan_is_revoked_before_minting():
+    print("\norphaned key")
+    _reset()
+    # Server has a key under our label, but we hold no secret for it — a lost
+    # cache. It can never be used again, so it must not keep occupying a slot.
+    _fake_server([{"id": "ghost", "label": "test-machine", "revoked_at": None}])
+    record, how = pak.ensure(MCP, "bearer")
+    check("replaced", how, "replaced")
+    check("ghost revoked",
+          ("DELETE", "/v1/developer/access-tokens/ghost", None) in calls, True)
+    check("a key is stored afterwards", bool(pak.load(MCP)), True)
+
+
+def test_mints_when_nothing_exists():
+    print("\nfirst mint")
+    _reset()
+    _fake_server([])
+    record, how = pak.ensure(MCP, "bearer")
+    check("minted", how, "minted")
+    check("nothing was revoked",
+          [c for c in calls if c[0] == "DELETE"], [])
+    posted = [c for c in calls if c[0] == "POST"][0][2]
+    check("asks for read and write",
+          sorted(posted["scopes"]), ["memory:read", "memory:write"])
+    check("sets an expiry", bool(posted.get("expires_at")), True)
+    check("secret persisted", pak.load(MCP)["secret"], record["secret"])
+
+
+def test_cap_is_reported_not_hit():
+    print("\nfive-key cap")
+    _reset()
+    others = [{"id": f"k{i}", "label": f"other-{i}", "revoked_at": None}
+              for i in range(pak.MAX_KEYS)]
+    _fake_server(others)
+    try:
+        pak.ensure(MCP, "bearer")
+        check("raises before minting", False, True)
+    except pak.PakError as exc:
+        check("raises before minting", True, True)
+        check("names the limit", str(pak.MAX_KEYS) in str(exc), True)
+        check("lists what is in the way", "other-0" in str(exc), True)
+    check("did not mint anyway", [c for c in calls if c[0] == "POST"], [])
+
+    # Revoked keys are not live and must not count toward the cap.
+    _reset()
+    dead = [{"id": f"k{i}", "label": f"other-{i}", "revoked_at": _iso(-1)}
+            for i in range(pak.MAX_KEYS)]
+    _fake_server(dead)
+    _, how = pak.ensure(MCP, "bearer")
+    check("revoked keys do not block", how, "minted")
+
+
+def test_envelope_errors_surface():
+    print("\nerror envelope")
+    _reset()
+
+    def _boom(base, bearer, method, path, body=None):
+        raise pak.PakError("POST failed (403): forbidden")
+
+    real = pak._call
+    pak._call = _boom
+    try:
+        pak.ensure(MCP, "bearer")
+        check("propagates as PakError", False, True)
+    except pak.PakError as exc:
+        check("propagates as PakError", "403" in str(exc), True)
+    finally:
+        pak._call = real
+
+
+if __name__ == "__main__":
+    real_call = pak._call
+    for test in (test_paths_and_labels, test_store_roundtrip, test_expiry,
+                 test_reuses_a_good_stored_key, test_expired_stored_key_is_replaced,
+                 test_orphan_is_revoked_before_minting, test_mints_when_nothing_exists,
+                 test_cap_is_reported_not_hit, test_envelope_errors_surface):
+        test()
+    pak._call = real_call
+    if failures:
+        print("\nFAILED:")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)
+    print("\nall pak checks passed")
