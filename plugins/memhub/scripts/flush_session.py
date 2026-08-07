@@ -33,11 +33,12 @@ Discipline mirrors the per-turn hook: THIS SCRIPT NEVER FAILS LOUDLY —
 any error exits 0 quietly (the hook is async fire-and-forget; memory capture
 must never disturb the user's session).
 
-Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
+Auth = the plugin's OWN token cache (shared `_memhub_auth`), which is a
+different store from the /mcp connector's despite sharing an Auth0 client:
 $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 refreshed automatically. interactive=False — a background hook must never
-pop a browser, so with no cached token it degrades quietly (run any memhub
-terminal script once, e.g. /memhub:import-session, to seed the cache).
+pop a browser, so with no cached token it degrades quietly (run
+/memhub:login once to seed the cache).
 Endpoint: $MEMHUB_MCP_BASE_URL(+_SERVER_PATH) > the plugin's .mcp.json
 mcpServers.*.url > a default derived from the plugin install path (prod for
 `memhub`, staging for `memhub-staging`).
@@ -387,7 +388,7 @@ def main() -> int:
                  f"{session_id} to finish (it resumes from the server's "
                  "watermark).")
         elif _auth_required(e):
-            _log("no cached OAuth token; run /memhub:import-session once "
+            _log("no cached OAuth token; run /memhub:login "
                  "(or set MEMHUB_TOKEN) to enable commit flush — skipping")
         else:
             _log(f"skipped ({type(e).__name__}: {e})")

@@ -1,5 +1,20 @@
-"""Shared auth for the plugin's terminal scripts — the SAME OAuth the /mcp
-connector uses, so there is no separate CLI token to provision.
+"""Shared auth for the plugin's scripts and hooks.
+
+**This is a SEPARATE token store from the /mcp connector's.** Both use the same
+Auth0 client (the ``clientId`` in the plugin's ``.mcp.json``), which makes them
+look interchangeable — this docstring used to claim outright that there was "no
+separate CLI token to provision", and that sentence was false in the way that
+matters. Claude Code keeps the /mcp connector's tokens in its own credential
+store; every token here is written by exactly one place, ``_FileTokenStorage``
+below, into ``~/.config/memhub-plugin/tokens-<host>.json``.
+
+The consequence is the whole reason ``/memhub:login`` exists: a user who
+installs the plugin and authenticates in ``/mcp`` gets working MCP tools and a
+completely unauthenticated capture pipeline. The hooks call
+``resolve_url_and_auth(interactive=False)``, find no token here, and — because a
+background hook must never pop a browser — skip in silence. Nothing can mint
+this token except a FOREGROUND run of a plugin script, so provisioning it must
+be something the user is told to do, not something they stumble into.
 
 Resolution order:
 1. ``$MEMHUB_TOKEN`` — explicit bearer for CI / headless runs.
@@ -105,14 +120,26 @@ def default_url() -> str:
     )
 
 
+def token_cache_path(url: str) -> Path:
+    """Where this backend's cached OAuth token lives.
+
+    Keyed by HOST, because prod and staging are different Auth0 tenants issuing
+    tokens that are not interchangeable — sharing one file would have a staging
+    login silently overwrite a prod one. Public because ``login.py`` inspects
+    the token this module just wrote (to report whether it can ever be renewed)
+    and must key it identically; the keying used to be spelled out separately at
+    each use, which is exactly how two copies drift.
+    """
+    return _CACHE_DIR / f"tokens-{urlparse(url).netloc.replace(':', '_')}.json"
+
+
 class _FileTokenStorage(TokenStorage):
     """Token cache keyed by server host; client info seeded statically from
     .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
     a pre-registered public client — same one /mcp uses)."""
 
     def __init__(self, url: str, client_id: str, redirect_uri: str):
-        host = urlparse(url).netloc.replace(":", "_")
-        self._path = _CACHE_DIR / f"tokens-{host}.json"
+        self._path = token_cache_path(url)
         self._client_id = client_id
         self._redirect_uri = redirect_uri
 
@@ -365,8 +392,7 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     endpoint, or a failed refresh all fall through to the SDK's own flow
     (which opens a browser when interactive, or degrades quietly when not).
     """
-    host = urlparse(url).netloc.replace(":", "_")
-    path = _CACHE_DIR / f"tokens-{host}.json"
+    path = token_cache_path(url)
     try:
         cached = json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — no/unreadable cache → nothing to refresh
