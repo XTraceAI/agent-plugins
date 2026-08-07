@@ -1,7 +1,7 @@
 ---
 description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or auto-armed by the memhub hook right after `gh pr create`). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
 argument-hint: [pr-number-or-url]
-allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__import_conversation, mcp__plugin_memhub-staging_memhub__import_conversation, Bash, Read, Edit, Write, Glob, Grep
+allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, Bash, Read, Edit, Write, Glob, Grep
 ---
 
 Babysit a pull request until its review bots are satisfied, then bank what
@@ -105,30 +105,19 @@ step's whole value, and it is a page of text.
    a repo room in another org is invisible from it. Re-resolve the room
    ONCE (re-run "Every pass" step 2); still failing → report the error in
    step 4 rather than retrying.
-3. **Import the transcript ONLY in the cross-repo case.** Capture routes by
-   the session's `cwd`; this babysit routes by the PR's repo. If they
-   differ — you babysat a PR in repo B from a checkout of repo A — B's room
-   never receives this session, and the artifact alone loses the reasoning
-   trail. Only then:
+3. **Never import the transcript.** Per-turn capture already ships this
+   session, as it happens, into the room its `cwd` resolves to. Importing it
+   again would re-upload megabytes for the watermark to discard, and into a
+   different room it would extract the same session's facts and episodes a
+   second time.
 
-   ```bash
-   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
-     --session "<transcript-path>" \
-     --conversation-id "pr-babysit-<owner>-<repo>-<n>" \
-     --title "PR babysit — <owner>/<repo>#<n>" \
-     --agent-brain-id "<repo-room-id-from-step-2>" \
-     --org-id "<org that owns the room, if not your default>"
-   ```
-
-   The transcript is the most recently modified `.jsonl` sitting DIRECTLY
-   inside the `~/.claude/projects/` directory matching the current working
-   directory (top level only — `.jsonl` files in subdirectories are
-   subagent/workflow transcripts). The deterministic `--conversation-id`
-   keeps re-runs incremental. Verify the output reports `path: "agentic"`;
-   `"regular"` means the wrong file was picked — re-resolve rather than
-   accept a gist-less import. And say plainly in the report that the WHOLE
-   transcript landed in this room, other repos' work included, so nobody
-   mistakes it for repo-pure memory.
+   The one gap: capture routes by the session's `cwd`, this babysit routes by
+   the PR's repo, so if you babysat a PR in repo B from a checkout of repo A,
+   B's room gets the artifact but not the reasoning trail. Do not paper over
+   it with an import — say so in the report (step 4), naming the room the
+   session DID land in, and let the user run `/memhub:import-session` if they
+   want it in B as well. That skill is the only one that imports, and it
+   imports under the session's own id.
 4. Add one short top-level outcome note IN THE REPORT to the user: PR url
    and title, branch, findings per bot with accepted/rejected counts, and
    any repo-specific gotcha or bot false-positive tendency observed.

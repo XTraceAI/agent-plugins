@@ -51,9 +51,14 @@ Do exactly this:
    Pass `--agent-brain-id` only when step 1 resolved a room the cache did not
    already hold, or when the user named a brain explicitly; a cached repo
    routes on its own. Use `--no-room` for the workspace-memory fallback.
-   NOTE: re-imports dedup per conversation_id GLOBALLY — to re-extract an
-   already-imported session into an agent brain, pass a fresh
-   `--conversation-id`.
+   NEVER pass `--conversation-id`. Omitted, it defaults to the session's own
+   id — the one per-turn capture already uses — which is what keeps a session
+   to ONE conversation per room. A fresh id would open a second conversation
+   for the same session and split its memory across both. Re-importing under
+   the default id is safe and incremental: the server watermarks it, so an
+   already-captured session simply reports nothing new rather than
+   duplicating. If nothing new lands, that is capture having done its job —
+   not a failure to work around with a new id.
    Very large transcripts are AUTO-CHUNKED (default threshold ~3.5MB): the
    script sends disjoint slices sequentially under one conversation_id and
    waits for each slice's extraction (the session gist folding forward)

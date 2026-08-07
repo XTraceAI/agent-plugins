@@ -121,7 +121,11 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 "what did we decide about X?" in plain language triggers the right skill.
 
 - `/memhub:import-session <id-or-path> [title]` — terminal upload of a past
-  session transcript; auto-chunks very large sessions.
+  session transcript; auto-chunks very large sessions. The ONLY skill that
+  imports: live sessions are captured per turn, so importing is for backfill —
+  sessions that predate capture, or ran while it was dormant. It imports under
+  the session's own id, the same id capture uses, so a session is one
+  conversation rather than two competing copies.
 - `/memhub:save-artifact <file> [name]` — terminal upload of a file as an
   artifact. Both upload skills exist so the model never re-emits file or
   transcript content token by token — a helper script ships the bytes.
@@ -129,9 +133,10 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   artifacts, and documents, with agent-brain / tag / time filters.
 - `/memhub:handoff-session <teammate> [title]` — hand the current session to a
   teammate: creates an agent brain holding a composed handoff brief (goal,
-  state, decisions, next steps, gotchas) plus the full session import, and
-  shares it read-only via `share_agent_brain`. The teammate's agent picks it
-  up by searching that agent brain.
+  state, decisions, next steps, gotchas) and shares it read-only via
+  `share_agent_brain`, alongside the repo room where per-turn capture already
+  extracted the session. No re-import: the session's memory exists once, and
+  the brief points into it.
 - `/memhub:spec <init|revise|check|status>` — spec-driven development on team
   memory. Each repo gets **one shared agent brain** (`Repo: <org>/<name>`,
   derived from the git remote) holding ALL its specs alongside reviews, ADRs,

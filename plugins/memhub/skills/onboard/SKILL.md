@@ -57,10 +57,14 @@ handles any size):
 ```bash
 uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
   --session "<session-id-or-path>" \
-  --conversation-id "onboard-seed-<org>-<repo>" \
   --title "Onboarding seed — <org>/<repo>" \
   --agent-brain-id "<ROOM>"
 ```
+Do NOT pass `--conversation-id`. Omitted, it defaults to the session's own id —
+the one per-turn capture uses — so the seed lands as ONE conversation in this
+room rather than a second copy of a session capture may have already sent. A
+re-run is safe either way: the server's watermark makes re-imports incremental.
+
 The script targets the plugin's default endpoint — **production**
 (`api.memhub.xtrace.ai`) when installed as `memhub`, staging when installed as
 `memhub-staging`. Do NOT pass `--url` to cross between them: `--url` overrides
