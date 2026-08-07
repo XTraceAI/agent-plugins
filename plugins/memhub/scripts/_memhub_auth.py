@@ -14,11 +14,19 @@ Resolution order:
 
 Usage from a sibling script:
 
-    from _memhub_auth import resolve_url_and_auth
-    url, headers, auth = resolve_url_and_auth()
-    async with streamablehttp_client(url, headers=headers, auth=auth) as ...
+    from _memhub_auth import open_session
+    async with open_session() as session:
+        await session.call_tool("search_memory", arguments={...})
 
-Self-check:  uv run --with 'mcp<2' python _memhub_auth.py
+Self-check:  uv run --with 'mcp>=2,<3' python _memhub_auth.py
+
+SDK 2.0 (pinned since 2026-08): auth moved out of the transport and onto the
+HTTP client, ``streamablehttp_client`` became ``streamable_http_client``
+yielding two streams instead of three, and the result models are snake_case
+(``is_error``, ``structured_content``). The first is silent when done wrong and
+so is the last — ``getattr(res, "isError", False)`` returns the DEFAULT against
+a v2 model, reading every failure as success. Hence :func:`open_session`: one
+place constructs the client, and no call site touches the transport directly.
 """
 from __future__ import annotations
 
@@ -32,6 +40,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -423,8 +432,47 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         return
 
 
+@asynccontextmanager
+async def open_session(url: str | None = None, interactive: bool = True,
+                       timeout: float = 60.0):
+    """Yield an INITIALIZED ``ClientSession`` against the MemHub MCP server.
+
+    Every caller in this repo wanted the same four lines — resolve auth, open
+    the transport, wrap it in a session, initialize — so they live here once.
+    That is not only tidiness: SDK 2.0 moved auth OUT of the transport and into
+    the HTTP client, and a call site that keeps passing ``auth=`` to the
+    transport does not fail loudly, it constructs a client with no credentials.
+    One chokepoint means one place that can be wrong.
+
+    ``httpx2``, not ``httpx``: the SDK moved to httpx2 in 2.0 and the two
+    libraries' types are NOT interchangeable. Handing the transport an
+    ``httpx.AsyncClient`` does not raise — it silently stops delivering
+    server-initiated messages, which for a background capture hook is a
+    failure nobody would ever see.
+
+    ``timeout`` bounds the whole HTTP client. Callers that need a tighter bound
+    on the round trip (the per-turn flush does) still wrap their own call in
+    ``asyncio.wait_for`` — this is a floor against a hung socket, not a budget.
+    """
+    import httpx2
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    url, headers, auth = resolve_url_and_auth(url, interactive=interactive)
+    async with httpx2.AsyncClient(auth=auth, headers=headers or {},
+                                  timeout=timeout) as http_client:
+        # 2.0 yields a 2-tuple of streams, not v1's (read, write, get_session_id).
+        async with streamable_http_client(url, http_client=http_client) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
 def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
-    """Return (url, headers, auth) for streamablehttp_client.
+    """Return (url, headers, auth) — the pieces :func:`open_session` assembles.
+
+    Prefer ``open_session`` unless you need the raw pieces: ``auth`` belongs on
+    the httpx2 client in SDK 2.0, and passing it anywhere else fails silently.
 
     $MEMHUB_TOKEN (if set) wins as a plain bearer header — CI/headless escape
     hatch. Otherwise an OAuthClientProvider that reuses the cached token,
@@ -445,17 +493,12 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
 
 
 if __name__ == "__main__":
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-
     async def _check():
-        url, headers, auth = resolve_url_and_auth()
+        url, headers, _ = resolve_url_and_auth()
         print(f"endpoint : {url}")
         print(f"mode     : {'bearer ($MEMHUB_TOKEN)' if headers else 'oauth (plugin client)'}")
-        async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-            async with ClientSession(r, w) as s:
-                await s.initialize()
-                tools = await s.list_tools()
-                print(f"AUTH OK — server exposes {len(tools.tools)} tools")
+        async with open_session() as s:
+            tools = await s.list_tools()
+            print(f"AUTH OK — server exposes {len(tools.tools)} tools")
 
     raise SystemExit(asyncio.run(_check()))

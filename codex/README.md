@@ -33,10 +33,10 @@ Verify with `codex mcp` / `codex doctor`.
 
 ```bash
 # newest session:
-uv run --with 'mcp<2' python codex/import_codex_session.py --session latest
+uv run --with 'mcp>=2,<3' python codex/import_codex_session.py --session latest
 
 # a specific session (rollout path, or the bare session id), into a shared room:
-uv run --with 'mcp<2' python codex/import_codex_session.py \
+uv run --with 'mcp>=2,<3' python codex/import_codex_session.py \
     --session 019c6e48-b66c-7881-9301-99c87fc66cf6 \
     --agent-brain-id <room-id>
 ```

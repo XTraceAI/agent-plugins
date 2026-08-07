@@ -245,8 +245,8 @@ def test_empty_shapes_are_answers_not_failures():
         content = []
 
         def __init__(self, sc, is_error=False):
-            self.structuredContent = sc
-            self.isError = is_error
+            self.structured_content = sc
+            self.is_error = is_error
 
     parse = dr._parse_recall_result
     assert parse(_Res({"items": [{"id": "a"}]})) == [{"id": "a"}]
@@ -255,7 +255,7 @@ def test_empty_shapes_are_answers_not_failures():
     assert parse(_Res({"count": 0})) == []                 # key absent → answer
     assert parse(_Res({"result": {"items": []}})) == []    # FastMCP wrap
     assert parse(_Res(None)) is None                       # no payload → failure
-    assert parse(_Res({"items": []}, is_error=True)) is None  # isError → failure
+    assert parse(_Res({"items": []}, is_error=True)) is None  # is_error → failure
 
 
 def test_hit_injects_and_caches_the_handle():

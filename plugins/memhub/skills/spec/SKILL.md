@@ -48,7 +48,7 @@ File uploads ALWAYS go through the helper script (never call the
 `save_artifact` MCP tool directly, never re-emit file contents):
 
 ```bash
-uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+uv run --with 'mcp>=2,<3' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
   --file "<path>" --name "Spec: <title>" --type spec \
   --agent-brain-id "<repo-ab-id>" --tags "spec,spec:<slug>,path:<repo-relative-path>" \
   [--parent-id "<latest-version-id>"] [--rationale "<why>"]
