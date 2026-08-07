@@ -27,7 +27,9 @@ from pathlib import Path
 _TMP_HOME = tempfile.mkdtemp(prefix="login-test-")
 os.environ["HOME"] = _TMP_HOME
 
-SCRIPTS = Path(__file__).resolve().parent
+# The tests live outside the plugin so they are not shipped to users;
+# the code under test is still in the plugin's scripts dir.
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 PROD = "https://api.memhub.xtrace.ai/mcp-server/mcp"

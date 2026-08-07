@@ -23,7 +23,8 @@ so a redacted record is still the same record. Never raises — a redaction bug
 must not become a capture outage. Failing closed would be worse than shipping
 the batch, so on error the caller keeps the original and this returns it.
 
-Run the self-test:  python3 redact_test.py
+Run the self-test:  python3 tests/redact_test.py  (from the repo root; tests
+live outside the plugin so they are not shipped to installs)
 """
 from __future__ import annotations
 

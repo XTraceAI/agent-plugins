@@ -20,7 +20,10 @@ _TMP_HOME = tempfile.mkdtemp(prefix="pak-test-")
 os.environ["HOME"] = _TMP_HOME
 os.environ["MEMHUB_PAK_LABEL"] = "test-machine"
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The tests live outside the plugin so they are not shipped to users;
+# the code under test is still in the plugin's scripts dir.
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import pak  # noqa: E402
 
 MCP = "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"

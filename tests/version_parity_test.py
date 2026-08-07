@@ -18,7 +18,7 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 MANIFESTS = {
     "memhub": ROOT / "plugins" / "memhub" / ".claude-plugin" / "plugin.json",
     "memhub-staging": ROOT / "plugins" / "memhub-staging" / ".claude-plugin" / "plugin.json",

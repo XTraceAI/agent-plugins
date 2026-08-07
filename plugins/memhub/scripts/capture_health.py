@@ -35,7 +35,8 @@ Stdlib only and no network: this runs before the user's first prompt, and every
 millisecond here is one they wait. Measured ~20ms. Never raises — a broken
 health check must not be the thing that breaks a session.
 
-Run the self-test:  python3 capture_health_test.py
+Run the self-test:  python3 tests/capture_health_test.py  (from the repo root;
+tests live outside the plugin so they are not shipped to installs)
 """
 from __future__ import annotations
 

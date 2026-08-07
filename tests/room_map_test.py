@@ -22,7 +22,10 @@ from pathlib import Path
 _TMP_HOME = tempfile.mkdtemp(prefix="room-map-test-")
 os.environ["MEMHUB_ROOMS_FILE"] = str(Path(_TMP_HOME) / "rooms.json")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The tests live outside the plugin so they are not shipped to users;
+# the code under test is still in the plugin's scripts dir.
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import room_map as rm  # noqa: E402
 
 
@@ -185,7 +188,7 @@ def test_concurrent_writers_dont_lose_entries() -> None:
     """One file holds every repo, so a lost update silently unroutes a repo."""
     print("concurrency")
     _fresh_rooms()
-    script = Path(__file__).resolve().parent / "room_map.py"
+    script = SCRIPTS / "room_map.py"
     with tempfile.TemporaryDirectory() as td:
         # 12 writers, each claiming a DIFFERENT repo, launched together. Without
         # a lock the read-modify-write window drops most of them.
@@ -235,7 +238,7 @@ def test_env_keying() -> None:
 def test_cli() -> None:
     print("cli")
     _fresh_rooms()
-    script = Path(__file__).resolve().parent / "room_map.py"
+    script = SCRIPTS / "room_map.py"
     with tempfile.TemporaryDirectory() as td:
         repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
         # `show` with nothing cached: exit 1 and silence, so callers can test

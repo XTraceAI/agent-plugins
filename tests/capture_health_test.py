@@ -34,7 +34,10 @@ os.environ.pop("MEMHUB_TOKEN", None)
 os.environ.pop("MEMHUB_TURN_FLUSH", None)
 os.environ.pop("MEMHUB_MCP_BASE_URL", None)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The tests live outside the plugin so they are not shipped to users;
+# the code under test is still in the plugin's scripts dir.
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import capture_health as ch  # noqa: E402
 
 HOST = "api.memhub.xtrace.ai"
@@ -282,7 +285,7 @@ def _run(payload: dict, env_extra: dict | None = None) -> str:
     env.pop("MEMHUB_MCP_BASE_URL", None)
     env.update(env_extra or {})
     out = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "capture_health.py")],
+        [sys.executable, str(SCRIPTS / "capture_health.py")],
         input=json.dumps(payload), capture_output=True, text=True, env=env)
     check("exit code is 0", out.returncode, 0)
     return out.stdout.strip()
