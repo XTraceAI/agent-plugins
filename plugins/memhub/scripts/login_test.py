@@ -145,6 +145,42 @@ def test_force_restores_the_token_when_login_fails(login) -> None:
     login.token_cache_path(PROD).unlink()
 
 
+def test_force_does_not_trust_an_unverified_token_file(login) -> None:
+    """A token FILE is not a successful login.
+
+    The SDK writes the cache the moment the grant returns, so a flow that then
+    dies during verification — or a truncated write — leaves a file behind that
+    proves nothing. Deciding "a new token landed" from `cache.exists()` would
+    discard the known-good backup in favour of something never shown to work,
+    which is the same foot-gun the stash exists to prevent, moved one step
+    later. Only a verified login may discard the stash.
+    """
+    print("\n--force does not trust an unverified file")
+    import asyncio
+
+    original = _write_token(login, PROD, refresh=True).read_text(encoding="utf-8")
+    cache = login.token_cache_path(PROD)
+    stash = cache.with_suffix(".json.prelogin")
+
+    async def _write_then_fail(*_args, **_kwargs):
+        # Exactly what a grant-then-die looks like on disk.
+        cache.write_text('{"access_token": "truncated', encoding="utf-8")
+        raise RuntimeError("verification failed after the token was written")
+
+    real_verify, real_url = login._verify, login.default_url
+    login._verify, login.default_url = _write_then_fail, lambda: PROD
+    try:
+        rc = asyncio.run(login._run(status_only=False, force=True))
+    finally:
+        login._verify, login.default_url = real_verify, real_url
+
+    check("reports failure", rc, 1)
+    check("the good token is restored over the partial write",
+          cache.read_text(encoding="utf-8"), original)
+    check("no stash is left behind", stash.exists(), False)
+    cache.unlink()
+
+
 def test_failure_slugs_all_have_health_messages() -> None:
     """Every reason `flush_turn` can record must render a specific message.
 
@@ -185,7 +221,8 @@ if __name__ == "__main__":
     if login is not None:
         for test in (test_renewal_report, test_cache_is_per_environment,
                      test_duration_format,
-                     test_force_restores_the_token_when_login_fails):
+                     test_force_restores_the_token_when_login_fails,
+                     test_force_does_not_trust_an_unverified_token_file):
             test(login)
         test_failure_slugs_all_have_health_messages()
         test_flag_conflict()

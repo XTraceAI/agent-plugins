@@ -122,14 +122,26 @@ async def _run(status_only: bool, force: bool) -> int:
         cache.replace(stash)
         print(f"set aside the cached {env} token (restored if login fails)")
 
+    # Set only after the new credential has been VERIFIED against the server.
+    # The stash is discarded on this flag and not on `cache.exists()`, because
+    # existence is not success: the SDK writes the token as soon as the grant
+    # returns, so a flow that dies during verification — or a truncated write —
+    # leaves a file behind that proves nothing. Keying on existence would trade
+    # a known-good credential for an unproven one, which is the same durability
+    # foot-gun the stash exists to prevent, just moved one step later.
+    verified = False
+
     def _restore() -> None:
-        """Put the old credential back — only if nothing replaced it."""
-        if stash and stash.exists():
-            if cache.exists():
-                stash.unlink()  # a new token landed; the old one is garbage
-            else:
-                stash.replace(cache)
-                print(f"login did not complete — restored the previous {env} token")
+        """Reinstate the old credential unless a verified one replaced it."""
+        if not (stash and stash.exists()):
+            return
+        if verified and cache.exists():
+            stash.unlink()  # superseded by a login we actually proved works
+        else:
+            # Atomic rename, so it also overwrites any unverified remnant the
+            # failed flow left at `cache`.
+            stash.replace(cache)
+            print(f"login did not complete — restored the previous {env} token")
 
     print(f"environment : {env} ({url})")
 
@@ -139,7 +151,14 @@ async def _run(status_only: bool, force: bool) -> int:
     # per-branch judgement that a later edit could forget.
     try:
         try:
-            url, headers, auth = resolve_url_and_auth(url, interactive=not status_only)
+            # The returned url is DISCARDED, deliberately. resolve_url_and_auth
+            # echoes back exactly the url it was given (it only substitutes
+            # default_url() when passed None, and we pass one), so rebinding it
+            # here would add nothing while making `cache`, computed above from
+            # the same url, look like it might refer to a different file than
+            # the one the SDK writes. It cannot; keeping one binding is what
+            # makes that obvious rather than merely true.
+            _, headers, auth = resolve_url_and_auth(url, interactive=not status_only)
         except Exception as exc:  # noqa: BLE001 — report, never traceback
             print(f"status      : FAILED to prepare auth ({exc})")
             return 1
@@ -159,6 +178,8 @@ async def _run(status_only: bool, force: bool) -> int:
             print(f"status      : FAILED ({type(exc).__name__}: {exc})")
             return 1
 
+        # Proven against the server — only now may the stash be discarded.
+        verified = True
         print(f"status      : OK — server exposes {tools} tools")
 
         if headers:
