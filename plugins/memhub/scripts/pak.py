@@ -29,11 +29,12 @@ replacement so the cap counts real credentials rather than debris.
 """
 from __future__ import annotations
 
-import calendar
 import json
 import os
+import re
 import socket
 import time
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -119,29 +120,52 @@ def forget(mcp_url: str) -> None:
     key_path(mcp_url).unlink(missing_ok=True)
 
 
-def expires_in_s(record: dict | None) -> float | None:
-    """Seconds until the stored key lapses; None if unknown or non-expiring.
+def parse_utc(raw: str) -> float | None:
+    """Epoch seconds for an ISO-8601 timestamp, or None if it cannot be read.
 
-    ``calendar.timegm`` and NOT ``time.mktime`` minus an offset. The server
-    returns UTC, and ``mktime`` reads a struct as LOCAL time while ignoring the
-    zone baked into it, so the difference has to be corrected by hand — and
-    ``time.timezone`` is the zone's NON-DST offset, so on any machine currently
-    observing DST the correction is an hour short. Measured on this codebase at
-    exactly -3600s for a summer expiry under America/Los_Angeles, and 0 for a
-    winter one, which is the worst shape a bug can have: correct half the year.
-    ``timegm`` interprets the fields as UTC directly, which is what they are.
+    Deliberately tolerant, because the exact spelling is the server's to choose
+    and we store whatever it sends. Two earlier versions each handled one shape
+    and quietly failed the others:
+
+    * ``mktime`` on a ``%z``-parsed struct read a UTC time as LOCAL and
+      corrected with ``time.timezone`` — the zone's NON-DST offset — so it was
+      an hour out for half the year;
+    * a bare ``%Y-%m-%dT%H:%M:%S`` after stripping ``Z`` rejected numeric
+      offsets, and also fractional seconds — which this very API returns on
+      ``created_at`` (``…T22:11:58.575503Z``), so the shape is not theoretical.
+
+    A rejected timestamp is not loud: it returns None, which every caller reads
+    as "no known expiry" and therefore as healthy — a key that never appears to
+    lapse. So the parser has to accept what it is actually given: ``Z``,
+    ``+HH:MM``, ``+HHMM``, fractional seconds, or no zone at all.
+
+    Naive stamps are read as UTC, which is what this API emits; guessing local
+    would reintroduce exactly the timezone skew this replaced.
     """
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    # `fromisoformat` before 3.11 rejects a colonless offset, and the hooks run
+    # under the system python3 (3.9 here), so normalise rather than assume.
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def expires_in_s(record: dict | None) -> float | None:
+    """Seconds until the stored key lapses; None if unknown or non-expiring."""
     if not record:
         return None
     raw = record.get("expires_at")
     if not isinstance(raw, str) or not raw:
         return None
-    try:
-        # Stored as the server returned it: ISO-8601, Zulu.
-        stamp = time.strptime(raw.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
-        return calendar.timegm(stamp) - time.time()
-    except (ValueError, OverflowError):
-        return None
+    epoch = parse_utc(raw)
+    return None if epoch is None else epoch - time.time()
 
 
 # ── server API ────────────────────────────────────────────────────────

@@ -148,6 +148,48 @@ def test_expiry_is_utc_regardless_of_local_zone():
         importlib.reload(pak)
 
 
+def test_every_timestamp_shape_the_server_might_send():
+    """The spelling of the timestamp is the server's choice, not ours.
+
+    A rejected stamp is not loud — it reads as "no known expiry", i.e. a key
+    that never appears to lapse — so the parser has to accept what it is
+    actually handed. Fractional seconds are not hypothetical: this very API
+    returns `created_at` as `…T22:11:58.575503Z`.
+    """
+    print("\ntimestamp shapes")
+    import calendar
+
+    want = calendar.timegm(time.strptime("2026-11-05T00:00:00",
+                                         "%Y-%m-%dT%H:%M:%S"))
+    for label, raw in [
+        ("zulu", "2026-11-05T00:00:00Z"),
+        ("lowercase z", "2026-11-05T00:00:00z"),
+        ("offset with colon", "2026-11-05T00:00:00+00:00"),
+        ("offset without colon", "2026-11-05T00:00:00+0000"),
+        ("naive (read as UTC)", "2026-11-05T00:00:00"),
+        ("surrounding whitespace", "  2026-11-05T00:00:00Z  "),
+    ]:
+        check(label, pak.parse_utc(raw), float(want))
+
+    # A non-UTC offset must be honoured, not ignored.
+    check("non-zero offset is applied",
+          pak.parse_utc("2026-11-05T05:30:00+05:30"), float(want))
+
+    # Fractional seconds — the shape this API actually emits on created_at.
+    frac = pak.parse_utc("2026-11-05T00:00:00.575503Z")
+    check("fractional seconds parse", frac is not None and abs(frac - want) < 1,
+          True)
+
+    # A date with no time is accepted as midnight UTC. Being permissive fails
+    # SAFE here: an unparseable stamp means "no known expiry", which every
+    # caller reads as healthy forever, so guessing midnight beats refusing.
+    check("date only -> midnight UTC", pak.parse_utc("2026-11-05"), float(want))
+
+    for label, raw in [("empty", ""), ("prose", "next tuesday"),
+                       ("nonsense", "T::Z")]:
+        check(f"unparseable: {label}", pak.parse_utc(raw), None)
+
+
 def test_cap_is_checked_before_anything_is_revoked():
     """A machine must never be left with no key and no way to mint one.
 
@@ -299,6 +341,7 @@ if __name__ == "__main__":
     real_call = pak._call
     for test in (test_paths_and_labels, test_store_roundtrip, test_expiry,
                  test_expiry_is_utc_regardless_of_local_zone,
+                 test_every_timestamp_shape_the_server_might_send,
                  test_cap_is_checked_before_anything_is_revoked,
                  test_a_failed_orphan_revoke_does_not_block_minting,
                  test_reuses_a_good_stored_key, test_expired_stored_key_is_replaced,
