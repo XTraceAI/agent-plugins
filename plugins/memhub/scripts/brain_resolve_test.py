@@ -33,8 +33,8 @@ class _Result:
     """Stand-in for an MCP tool result."""
 
     def __init__(self, payload=None, is_error=False, text=None):
-        self.structuredContent = payload
-        self.isError = is_error
+        self.structured_content = payload
+        self.is_error = is_error
         self.content = [type("B", (), {"text": text})()] if text else []
 
 

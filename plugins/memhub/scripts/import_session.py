@@ -19,7 +19,7 @@ $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 
 Usage (mcp SDK pulled ephemerally by uv):
-    uv run --with 'mcp<2' python import_session.py --session <session-id-or-path>
+    uv run --with 'mcp>=2,<3' python import_session.py --session <session-id-or-path>
         [--conversation-id <id>] [--title "..."] [--url <mcp-url>]
 
 `--session` accepts either a path to a .jsonl transcript or a bare session id,
@@ -34,11 +34,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_auth import open_session, resolve_url_and_auth  # noqa: E402
 from room_map import env_for_url, read_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
@@ -168,8 +166,8 @@ async def _wait_gist_change(
 
 
 def unwrap(result) -> dict:
-    if getattr(result, "structuredContent", None):
-        return result.structuredContent
+    if result.structured_content:
+        return result.structured_content
     for b in getattr(result, "content", []) or []:
         t = getattr(b, "text", None)
         if t:
@@ -183,11 +181,11 @@ def unwrap(result) -> dict:
 def call_error(result, payload: dict) -> str | None:
     """The server-side failure text of a tool call, or None on success.
 
-    Tool exceptions arrive as ``CallToolResult.isError`` with the message in
+    Tool exceptions arrive as ``CallToolResult.is_error`` with the message in
     the content blocks — ``unwrap`` can't distinguish that from a successful
     payload, so callers must check this BEFORE trusting the dict.
     """
-    if getattr(result, "isError", False):
+    if result.is_error:
         return str(payload.get("_raw") or payload.get("error")
                    or json.dumps(payload))
     return None
@@ -318,7 +316,7 @@ async def main() -> int:
     title = args.title or custom_title(records) or generated_title(records) \
         or prompt_title(records) or None
 
-    url, headers, auth = resolve_url_and_auth(args.url)
+    url, _headers, _auth = resolve_url_and_auth(args.url)
 
     # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
     # cached room so a plain `--session X` import lands in team memory instead of
@@ -360,56 +358,54 @@ async def main() -> int:
               "disjoint and sent sequentially — the gist folds forward "
               "after each)")
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            prev_gist_hash = await _gist_hash(
-                s, args.agent_brain_id, args.org_id)
-            for i, sl in enumerate(slices, 1):
-                call_args: dict = {
-                    "messages": sl,
-                    "conversation_id": conv_id,
-                    "source_platform": "claude",
-                }
-                if args.org_id:
-                    # Brains are looked up inside ONE org. Without this, an
-                    # --agent-brain-id belonging to a non-default org fails
-                    # with "Agent brain not found" — which reads like a stale
-                    # or deleted id rather than a wrong-org lookup.
-                    call_args["org_id"] = args.org_id
-                if title:
-                    call_args["title"] = title
-                if args.agent_brain_id:
-                    call_args["agent_brain_id"] = args.agent_brain_id
-                if namespace:
-                    # Older servers ignore unknown arguments; newer ones
-                    # stamp the directive scope from it. Safe either way.
-                    call_args["namespace"] = namespace
-                if len(slices) > 1:
-                    print(f"--- slice {i}/{len(slices)}: {len(sl)} records ---")
-                res = await s.call_tool("import_conversation", arguments=call_args)
-                payload = unwrap(res)
-                print(json.dumps(payload, indent=2))
-                err = call_error(res, payload)
-                if err:
-                    # No success epilogue — a headless caller (the pr-babysit
-                    # loop) must see this as a failed save, not "Queued".
-                    label = (f"slice {i}/{len(slices)}" if len(slices) > 1
-                             else "import")
-                    print(f"ERROR: {label} failed: {err}", file=sys.stderr)
-                    if i > 1:
-                        print(f"NOTE: slices 1..{i - 1} were already queued; "
-                              "re-running after fixing the error is safe "
-                              "(the server watermark skips them).",
-                              file=sys.stderr)
-                    return 1
-                if i < len(slices):
-                    print(f"waiting for slice {i} extraction "
-                          "(gist appear/fold-forward) before next slice ...")
-                    prev_gist_hash = await _wait_gist_change(
-                        s, args.agent_brain_id, prev_gist_hash,
-                        timeout=args.slice_timeout, org_id=args.org_id,
-                    )
+    async with open_session(url) as s:
+        prev_gist_hash = await _gist_hash(
+            s, args.agent_brain_id, args.org_id)
+        for i, sl in enumerate(slices, 1):
+            call_args: dict = {
+                "messages": sl,
+                "conversation_id": conv_id,
+                "source_platform": "claude",
+            }
+            if args.org_id:
+                # Brains are looked up inside ONE org. Without this, an
+                # --agent-brain-id belonging to a non-default org fails
+                # with "Agent brain not found" — which reads like a stale
+                # or deleted id rather than a wrong-org lookup.
+                call_args["org_id"] = args.org_id
+            if title:
+                call_args["title"] = title
+            if args.agent_brain_id:
+                call_args["agent_brain_id"] = args.agent_brain_id
+            if namespace:
+                # Older servers ignore unknown arguments; newer ones
+                # stamp the directive scope from it. Safe either way.
+                call_args["namespace"] = namespace
+            if len(slices) > 1:
+                print(f"--- slice {i}/{len(slices)}: {len(sl)} records ---")
+            res = await s.call_tool("import_conversation", arguments=call_args)
+            payload = unwrap(res)
+            print(json.dumps(payload, indent=2))
+            err = call_error(res, payload)
+            if err:
+                # No success epilogue — a headless caller (the pr-babysit
+                # loop) must see this as a failed save, not "Queued".
+                label = (f"slice {i}/{len(slices)}" if len(slices) > 1
+                         else "import")
+                print(f"ERROR: {label} failed: {err}", file=sys.stderr)
+                if i > 1:
+                    print(f"NOTE: slices 1..{i - 1} were already queued; "
+                          "re-running after fixing the error is safe "
+                          "(the server watermark skips them).",
+                          file=sys.stderr)
+                return 1
+            if i < len(slices):
+                print(f"waiting for slice {i} extraction "
+                      "(gist appear/fold-forward) before next slice ...")
+                prev_gist_hash = await _wait_gist_change(
+                    s, args.agent_brain_id, prev_gist_hash,
+                    timeout=args.slice_timeout, org_id=args.org_id,
+                )
     print("-" * 56)
     print("Queued. Extraction runs in the background (minutes for large "
           "sessions); facts/episodes/artifacts + the session gist appear in "

@@ -44,13 +44,13 @@ from room_map import (  # noqa: E402
 def _payload(result, expected: str) -> dict:
     """Pull the JSON body out of an MCP tool result, tolerantly.
 
-    The payload arrives as ``structuredContent`` or as JSON in a text block,
+    The payload arrives as ``structured_content`` or as JSON in a text block,
     and FastMCP sometimes wraps a return in ``{"result": …}`` — ``expected`` is
     the key that tells those two apart. None of this is worth failing a capture
     over, so anything unrecognised yields ``{}`` and the caller treats it as
     "not found".
     """
-    payload = getattr(result, "structuredContent", None)
+    payload = result.structured_content
     if isinstance(payload, dict) and expected not in payload \
             and isinstance(payload.get("result"), dict):
         payload = payload["result"]
@@ -93,7 +93,7 @@ async def _org_ids(session) -> list[tuple[str, str | None]]:
     """
     try:
         result = await session.call_tool("list_orgs", arguments={})
-        if getattr(result, "isError", False):
+        if result.is_error:
             return []
         orgs = _payload(result, "orgs").get("orgs")
         if not isinstance(orgs, list):
@@ -187,7 +187,7 @@ async def resolve_repo_brain(session, cwd, env: str) -> dict | None:
         matches: list[tuple[str, str | None]] = []
         for (org_id, org_name), result in zip(scopes, results):
             if isinstance(result, BaseException) \
-                    or getattr(result, "isError", False):
+                    or result.is_error:
                 listings_ok = False
                 continue
             payload = _payload(result, "agent_brains")

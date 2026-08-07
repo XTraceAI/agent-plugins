@@ -12,7 +12,7 @@ $MEMHUB_TOKEN if set, else the cached plugin OAuth token, else a one-time
 browser approval.
 
 Run (mcp SDK pulled ephemerally by uv):
-    uv run --with 'mcp<2' python scripts/import_session_test.py \
+    uv run --with 'mcp>=2,<3' python scripts/import_session_test.py \
         --session /path/to/<session>.jsonl \
         --max-bytes 800000 \
         --query "context agent creation"
@@ -25,11 +25,9 @@ import json
 import sys
 from pathlib import Path
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"))
-from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_auth import open_session, resolve_url_and_auth  # noqa: E402
 
 STAGING_MCP_URL = "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"
 
@@ -57,8 +55,8 @@ def slice_to_bytes(records: list[dict], max_bytes: int) -> tuple[list[dict], int
 
 def unwrap(result) -> dict:
     """Pull the tool's dict payload out of a CallToolResult."""
-    if getattr(result, "structuredContent", None):
-        return result.structuredContent
+    if result.structured_content:
+        return result.structured_content
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
         if text:
@@ -95,41 +93,39 @@ async def main() -> int:
     print(f"endpoint           : {args.url}")
     print("-" * 60)
 
-    url, headers, auth = resolve_url_and_auth(args.url)
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+    url, _headers, _auth = resolve_url_and_auth(args.url)
+    async with open_session(url) as session:
 
-            res = await session.call_tool(
-                "import_conversation",
-                arguments={
-                    "messages": records,
-                    "conversation_id": conv_id,
-                    "source_platform": "claude",
-                },
+        res = await session.call_tool(
+            "import_conversation",
+            arguments={
+                "messages": records,
+                "conversation_id": conv_id,
+                "source_platform": "claude",
+            },
+        )
+        imported = unwrap(res)
+        print("import_conversation ->")
+        print(json.dumps(imported, indent=2))
+
+        if imported.get("path") != "agentic":
+            print(f"\n!! expected path='agentic', got {imported.get('path')!r}")
+
+        if args.query:
+            print("-" * 60)
+            print(f"waiting {args.wait}s for background extraction ...")
+            await asyncio.sleep(args.wait)
+            sres = await session.call_tool(
+                "search_memory",
+                arguments={"query": args.query, "top_k": 8},
             )
-            imported = unwrap(res)
-            print("import_conversation ->")
-            print(json.dumps(imported, indent=2))
-
-            if imported.get("path") != "agentic":
-                print(f"\n!! expected path='agentic', got {imported.get('path')!r}")
-
-            if args.query:
-                print("-" * 60)
-                print(f"waiting {args.wait}s for background extraction ...")
-                await asyncio.sleep(args.wait)
-                sres = await session.call_tool(
-                    "search_memory",
-                    arguments={"query": args.query, "top_k": 8},
-                )
-                found = unwrap(sres)
-                items = found.get("items", []) if isinstance(found, dict) else []
-                print(f"search_memory({args.query!r}) -> {len(items)} items, "
-                      f"scope={found.get('scope') if isinstance(found, dict) else '?'}")
-                for it in items:
-                    print(f"  [{it.get('type')}] score={it.get('score'):.3f} "
-                          f"{str(it.get('content'))[:100].replace(chr(10), ' ')}")
+            found = unwrap(sres)
+            items = found.get("items", []) if isinstance(found, dict) else []
+            print(f"search_memory({args.query!r}) -> {len(items)} items, "
+                  f"scope={found.get('scope') if isinstance(found, dict) else '?'}")
+            for it in items:
+                print(f"  [{it.get('type')}] score={it.get('score'):.3f} "
+                      f"{str(it.get('content'))[:100].replace(chr(10), ' ')}")
     return 0
 
 

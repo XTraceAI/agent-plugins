@@ -33,7 +33,7 @@ Do exactly this:
 3. Run the upload via Bash — substitute the real values, keep it one command:
 
    ```bash
-   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+   uv run --with 'mcp>=2,<3' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
      --file "<path>" --name "<name>" --type "<type>"
    ```
 

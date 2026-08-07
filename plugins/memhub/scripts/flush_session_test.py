@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What the whole-transcript flush puts on the wire, and when it gives up.
 
-Run: uv run --with 'mcp<2' python plugins/memhub/scripts/flush_session_test.py
+Run: uv run --with 'mcp>=2,<3' python plugins/memhub/scripts/flush_session_test.py
 (the module imports the MCP SDK through ``_memhub_auth``)
 
 Covers the arguments assembly and the success/failure contract of one slice —
@@ -34,9 +34,9 @@ class FakeBlock:
 
 class FakeResult:
     def __init__(self, structured=None, texts=(), is_error=False):
-        self.structuredContent = structured
+        self.structured_content = structured
         self.content = [FakeBlock(t) for t in texts]
-        self.isError = is_error
+        self.is_error = is_error
 
 
 class FakeSession:
@@ -90,10 +90,10 @@ check("the namespace is sent", args.get("namespace") == "memhub")
 
 # ── the success / failure contract ────────────────────────────────────
 
-# MCP signals tool failure with isError, NOT an exception. Treating that as
+# MCP signals tool failure with is_error, NOT an exception. Treating that as
 # success would report a capture that never happened.
 ok, _ = send(FakeResult(texts=["Agent brain not found"], is_error=True))
-check("an isError reply stops the run", ok is False)
+check("an is_error reply stops the run", ok is False)
 
 # Not an error per the protocol, but not the shape import_conversation
 # returns either — a slice that cannot be confirmed did not land.

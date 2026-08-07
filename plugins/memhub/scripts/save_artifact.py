@@ -10,13 +10,13 @@ $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 
 Run (mcp SDK pulled ephemerally by uv):
-    uv run --with 'mcp<2' python scripts/save_artifact.py \
+    uv run --with 'mcp>=2,<3' python scripts/save_artifact.py \
         --file spec.md --name "Retry Policy Spec" --type spec \
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
         [--tags a,b]
 
     # or pipe terminal output straight in:
-    pytest -q | uv run --with 'mcp<2' python scripts/save_artifact.py \
+    pytest -q | uv run --with 'mcp>=2,<3' python scripts/save_artifact.py \
         --stdin --name "test run 2026-06-09" --type runbook
 
 Endpoint resolution (so the script hits the SAME server the plugin connector
@@ -33,17 +33,15 @@ import json
 import sys
 from pathlib import Path
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_auth import open_session, resolve_url_and_auth  # noqa: E402
 from room_map import env_for_url, read_room, repo_root  # noqa: E402
 
 
 def unwrap(result) -> dict:
-    if getattr(result, "structuredContent", None):
-        return result.structuredContent
+    if result.structured_content:
+        return result.structured_content
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
         if text:
@@ -91,7 +89,7 @@ async def main() -> int:
     if args.tags:
         call_args["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
 
-    url, headers, auth = resolve_url_and_auth(args.url)
+    url, _headers, _auth = resolve_url_and_auth(args.url)
 
     # An explicit --agent-brain-id wins; otherwise route to the repo's cached
     # room so a spec saved from a repo lands where teammates search.
@@ -129,11 +127,9 @@ async def main() -> int:
     print(f"endpoint : {url}")
     print("-" * 56)
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            res = await session.call_tool("save_artifact", arguments=call_args)
-            out = unwrap(res)
+    async with open_session(url) as session:
+        res = await session.call_tool("save_artifact", arguments=call_args)
+        out = unwrap(res)
     print(json.dumps(out, indent=2))
     return 0
 

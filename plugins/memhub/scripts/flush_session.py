@@ -54,7 +54,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _memhub_auth import NonInteractiveAuthRequired, resolve_url_and_auth  # noqa: E402
+from _memhub_auth import (NonInteractiveAuthRequired, open_session,
+                           resolve_url_and_auth)  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from room_map import env_for_url  # noqa: E402
 from session_title import (  # noqa: E402
@@ -118,8 +119,6 @@ def _deadline_s() -> float:
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
 
     # Tolerant parse, NOT json.loads-or-die: this hook reads the transcript
     # while Claude Code is still appending to it, so a truncated final line
@@ -182,7 +181,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    url, headers, auth = resolve_url_and_auth(interactive=False)
+    url, _headers, _auth = resolve_url_and_auth(interactive=False)
 
     # Route into the repo's room. Read AFTER the url resolves so the lookup is
     # keyed by the backend we're actually about to write to — prod and staging
@@ -196,50 +195,48 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Unknown origin must degrade to personal, never to a guess.
     env = env_for_url(url)
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            # Cached hit is a dict lookup; a miss asks the server once and
-            # caches the answer, so this is not a per-flush round-trip.
-            room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    async with open_session(url, interactive=False) as session:
+        # Cached hit is a dict lookup; a miss asks the server once and
+        # caches the answer, so this is not a per-flush round-trip.
+        room = await resolve_repo_brain(session, cwd, env) if cwd else None
 
-            # Chunked, because this path sends the WHOLE transcript in one
-            # call and real sessions outgrow one payload: of 185 local
-            # transcripts, 74 exceed 1 MB and the largest is 46 MB. Unchunked,
-            # this works on ordinary sessions and fails on precisely the long
-            # ones — and as the backstop for when per-turn capture is dormant,
-            # failing on the biggest sessions is failing where it matters most.
-            # Slices are disjoint and sent in order against one conversation,
-            # so the server's watermark sees a normal incremental import.
-            payloads = make_slices(records)
+        # Chunked, because this path sends the WHOLE transcript in one
+        # call and real sessions outgrow one payload: of 185 local
+        # transcripts, 74 exceed 1 MB and the largest is 46 MB. Unchunked,
+        # this works on ordinary sessions and fails on precisely the long
+        # ones — and as the backstop for when per-turn capture is dormant,
+        # failing on the biggest sessions is failing where it matters most.
+        # Slices are disjoint and sent in order against one conversation,
+        # so the server's watermark sees a normal incremental import.
+        payloads = make_slices(records)
 
-            # Bounded by wall clock, not just by slice count. The hook's own
-            # budget is 300s; a many-slice session can exceed it, and being
-            # KILLED there is the bad ending — the process dies mid-upload,
-            # the tail is lost, and nothing says so. Stopping cleanly a minute
-            # early turns that into a partial capture that REPORTS what it did
-            # not send, which is the difference between a gap you can act on
-            # and one you never learn about.
-            # Slightly INSIDE the hard timeout in main(), so a run that is
-            # merely slow stops here — where it can name what it did not send
-            # — instead of being cancelled where it cannot.
-            deadline = time.monotonic() + _deadline_s() * 0.9
-            for index, payload in enumerate(payloads, 1):
-                if _stop_before_slice(index, time.monotonic(), deadline):
-                    remaining = sum(len(p) for p in payloads[index - 1:])
-                    _log(f"deadline reached after {index - 1}/{len(payloads)} "
-                         f"slices; {remaining} record(s) not sent. Re-run "
-                         f"/memhub:import-session --session {session_id} to "
-                         "finish (it resumes from the server's watermark).")
-                    return
-                arguments = {
-                    "messages": payload,
-                    "conversation_id": session_id,
-                    "source_platform": "claude",
-                }
-                if not await _send(session, arguments, room, title, namespace,
-                                   index, len(payloads)):
-                    return
+        # Bounded by wall clock, not just by slice count. The hook's own
+        # budget is 300s; a many-slice session can exceed it, and being
+        # KILLED there is the bad ending — the process dies mid-upload,
+        # the tail is lost, and nothing says so. Stopping cleanly a minute
+        # early turns that into a partial capture that REPORTS what it did
+        # not send, which is the difference between a gap you can act on
+        # and one you never learn about.
+        # Slightly INSIDE the hard timeout in main(), so a run that is
+        # merely slow stops here — where it can name what it did not send
+        # — instead of being cancelled where it cannot.
+        deadline = time.monotonic() + _deadline_s() * 0.9
+        for index, payload in enumerate(payloads, 1):
+            if _stop_before_slice(index, time.monotonic(), deadline):
+                remaining = sum(len(p) for p in payloads[index - 1:])
+                _log(f"deadline reached after {index - 1}/{len(payloads)} "
+                     f"slices; {remaining} record(s) not sent. Re-run "
+                     f"/memhub:import-session --session {session_id} to "
+                     "finish (it resumes from the server's watermark).")
+                return
+            arguments = {
+                "messages": payload,
+                "conversation_id": session_id,
+                "source_platform": "claude",
+            }
+            if not await _send(session, arguments, room, title, namespace,
+                               index, len(payloads)):
+                return
 
 
 async def _send(session, arguments, room, title, namespace,
@@ -270,14 +267,14 @@ async def _send(session, arguments, room, title, namespace,
     res = await session.call_tool("import_conversation", arguments=arguments)
     texts = [t for t in (getattr(b, "text", None)
                          for b in getattr(res, "content", []) or []) if t]
-    # MCP signals tool failure via isError + a message in content, NOT via an
+    # MCP signals tool failure via is_error + a message in content, NOT via an
     # exception — without this check a bad token or server error logs as
     # success while memory never updates.
-    if getattr(res, "isError", False):
+    if res.is_error:
         _log(f"{label}flush FAILED: "
              f"{(texts[0] if texts else 'no detail')[:200]}")
         return False
-    out = getattr(res, "structuredContent", None)
+    out = res.structured_content
     if isinstance(out, dict) and "conversation_id" not in out \
             and isinstance(out.get("result"), dict):
         out = out["result"]  # FastMCP wraps some returns in {"result": …}
