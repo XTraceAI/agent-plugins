@@ -59,6 +59,10 @@ class McpError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+        # Set when the failure arrived inside a JSON-RPC envelope rather than as
+        # an HTTP status. Kept separate from `status` so the two numbering
+        # schemes never get confused for one another.
+        self.rpc_code: int | None = None
 
 
 class McpNoResponse(McpError):
@@ -262,7 +266,13 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
     envelope = _decode(body, content_type)
     if "error" in envelope:
         error = envelope["error"] or {}
-        raise McpError(f"{method}: {error.get('message') or error}")
+        # A server may report an auth failure inside a 200 envelope rather than
+        # as an HTTP status. Carry the JSON-RPC code so callers have something
+        # to classify on — `status` stays None, because it is documented as the
+        # HTTP status and inventing one here would make 401 mean two things.
+        exc = McpError(f"{method}: {error.get('message') or error}")
+        exc.rpc_code = error.get("code")
+        raise exc
     return envelope.get("result") or {}
 
 

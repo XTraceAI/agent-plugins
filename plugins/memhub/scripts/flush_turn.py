@@ -415,7 +415,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # the endpoint and the credential. Verified against the live server —
     # it negotiates no session id and does not require `initialize`, so this
     # is ONE round trip where the SDK did three.
-    session = mcp_http.Session(url, bearer, timeout=_flush_timeout_s())
+    # Per call, and deliberately less than the whole flush budget: this hook
+    # makes TWO calls on a cold cache — the room lookup and the import — so
+    # granting each the full timeout lets a stalled lookup consume the budget
+    # and the import, the only call that actually captures anything, never
+    # happens. Half guarantees the second call still gets a turn.
+    session = mcp_http.Session(url, bearer, timeout=_flush_timeout_s() / 2)
     # No `initialize` handshake: verified against the live server, a fresh
     # process can call a tool directly and get a result. Dropping it removes two
     # of the three round trips this hook used to make per turn.

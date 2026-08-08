@@ -267,7 +267,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
 
     # Stateless server, no handshake needed — see mcp_http for the probe
     # that established this. One round trip instead of three.
-    session = mcp_http.Session(url, bearer, timeout=_deadline_s())
+    # A PER-CALL cap, not the whole budget. This path sends a transcript in
+    # slices, and giving each call the entire deadline means one stalled slice
+    # consumes it and every later slice is skipped — with the between-slice
+    # deadline check unable to help, because it only runs between calls. A
+    # quarter leaves room for the run to make progress around one bad call,
+    # with a floor so a short deadline still permits a real upload.
+    session = mcp_http.Session(url, bearer,
+                               timeout=max(30.0, _deadline_s() / 4))
     # Cached hit is a dict lookup; a miss asks the server once and
     # caches the answer, so this is not a per-flush round-trip.
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
