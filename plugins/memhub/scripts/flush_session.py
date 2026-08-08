@@ -122,8 +122,25 @@ def _breadcrumb(session_id, reason: str, detail: str = "",
 _DEFAULT_DEADLINE_S = 240.0
 
 
+# The least time worth STARTING a slice with. Bounding each slice by the time
+# remaining (rather than a fixed share) fixed one overrun and created another
+# problem: as the loop approaches the deadline the remaining budget shrinks
+# toward nothing, so the last slice would be attempted with a sub-second network
+# timeout and fail — turning a clean "stopped at the deadline, N slices unsent"
+# ending into a spurious timeout error and a failure breadcrumb.
+#
+# A slice that cannot plausibly finish should not be started. Below this, stop
+# with the honest summary instead of making a doomed call.
+_MIN_SLICE_BUDGET_S = 10.0
+
+
 def _stop_before_slice(index: int, now: float, deadline: float) -> bool:
     """Whether to give up rather than send slice ``index`` (1-based).
+
+    Stops when there is less than ``_MIN_SLICE_BUDGET_S`` left, not merely when
+    the deadline has passed: starting a slice with two seconds of budget only
+    buys a guaranteed timeout, reported as a failure, in place of a clean stop
+    that names what was not sent.
 
     The FIRST slice always goes. A backstop that sends nothing is not a
     degraded capture, it is no capture — and the sessions reaching this path
@@ -137,7 +154,7 @@ def _stop_before_slice(index: int, now: float, deadline: float) -> bool:
     nothing" with the log still reading like a bounded, deliberate stop. The
     guarantee is written down here so it cannot be lost by accident.
     """
-    return index > 1 and now >= deadline
+    return index > 1 and (deadline - now) < _MIN_SLICE_BUDGET_S
 
 
 def _deadline_s() -> float:
@@ -329,7 +346,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # entire reason this path stops itself rather than being stopped.
         if not await _send(session, arguments, room, title, namespace,
                            index, len(payloads),
-                           budget=max(1.0, deadline - time.monotonic())):
+                           budget=max(_MIN_SLICE_BUDGET_S,
+                                      deadline - time.monotonic())):
             return
 
 

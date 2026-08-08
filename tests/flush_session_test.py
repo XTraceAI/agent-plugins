@@ -162,6 +162,19 @@ check("slice 2 continues before the deadline",
       fs._stop_before_slice(2, PAST, FUTURE) is False)
 check("exactly at the deadline stops", fs._stop_before_slice(3, PAST, PAST))
 
+# Stops with time still on the clock, if there is not ENOUGH of it. Bounding
+# each slice by the remaining budget means a slice started with two seconds left
+# gets a two-second network timeout and fails — reporting a spurious error in
+# place of a clean stop that names what was not sent.
+check("too little budget left stops before starting",
+      fs._stop_before_slice(2, 0.0, fs._MIN_SLICE_BUDGET_S - 1) is True)
+check("enough budget left proceeds",
+      fs._stop_before_slice(2, 0.0, fs._MIN_SLICE_BUDGET_S + 1) is False)
+# ...but the first slice still always goes: a backstop that sends nothing is
+# not a degraded capture, it is no capture.
+check("the first slice goes regardless",
+      fs._stop_before_slice(1, 0.0, 0.0) is False)
+
 
 # ── which timeout is being reported ───────────────────────────────────
 # Since 3.11 socket.timeout IS TimeoutError, so a network read that gave up
