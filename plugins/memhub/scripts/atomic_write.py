@@ -47,6 +47,13 @@ def publish(path: Path, text: str, mode: int = 0o600) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+        # os.open applies `mode` only when it CREATES the file. A leftover temp
+        # — from a crashed process whose pid has since been reused — keeps
+        # whatever mode it already had, so a secret could be published at 0644
+        # while this code looked like it set 0600. fchmod on the open
+        # descriptor settles it either way, and on the fd rather than the path
+        # so there is no window for a swap in between.
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
         tmp.replace(path)

@@ -170,9 +170,13 @@ def _file_token_storage(url: str, client_id: str, redirect_uri: str):
                 return None
 
         async def set_tokens(self, tokens) -> None:
-            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(tokens.model_dump_json(), encoding="utf-8")
-            self._path.chmod(0o600)
+            # Same writer as every other credential here. Written-then-chmod'd
+            # left the token at the process umask — 0644 by default — for a
+            # window, and non-atomically, so a hook reading concurrently could
+            # catch it half-written and conclude there was no credential.
+            import atomic_write  # noqa: PLC0415 — stdlib, beside this file
+
+            atomic_write.publish(self._path, tokens.model_dump_json())
 
         async def get_client_info(self):
             return OAuthClientInformationFull(
@@ -519,7 +523,28 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         return
 
 
-def resolve_bearer(url: str | None = None) -> tuple[str, str | None]:
+def _cached_access_token(url: str) -> str | None:
+    """The cached OAuth access token if it is present and not expired.
+
+    Pure file read — no network, so it is safe on a latency budget.
+    """
+    try:
+        cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    access = cached.get("access_token")
+    if not isinstance(access, str) or not access:
+        return None
+    exp = _access_token_expiry(access)
+    if exp is not None and time.time() >= exp:
+        return None
+    return access
+
+
+def resolve_bearer(url: str | None = None,
+                   refresh: bool = True) -> tuple[str, str | None]:
     """``(url, bearer)`` for a NON-INTERACTIVE caller — stdlib only, no SDK.
 
     This is what every hook uses now. It returns the same credential the SDK
@@ -546,11 +571,33 @@ def resolve_bearer(url: str | None = None) -> tuple[str, str | None]:
         return url, token
 
     record = _stored_pak(url)
-    if record:
+    # isinstance, not just truthy: the secret is formatted straight into an
+    # Authorization header, so a non-string would be rendered by f-string into
+    # a nonsense credential and fail as a puzzling 401 rather than as "no key".
+    if record and isinstance(record.get("secret"), str):
         return url, record["secret"]
 
     # Renew before reading: the cached access token is short-lived, and this
     # shim is the only thing that ever renews it from a cold process.
+    #
+    # ``refresh=False`` exists for callers on a LATENCY BUDGET, and it is not a
+    # micro-optimisation — it is the only real bound available to them. A
+    # refresh makes two blocking urllib calls (~25s of socket timeout), and
+    # offloading it with ``asyncio.to_thread`` does NOT make it cancellable:
+    # measured, a `wait_for(to_thread(...), 2.5)` around an 8s blocking call
+    # returned after 8.01s, not 2.5s — cancelling the future does not stop the
+    # thread, and the await does not finish until the thread does. So a
+    # synchronous hook cannot time-bound a refresh at all; it can only decline
+    # to attempt one.
+    #
+    # Declining is safe because the refresh is not this caller's job. The
+    # async capture hooks run with budgets that accommodate it and will renew
+    # the token; a caller that skips simply goes without a credential for one
+    # invocation, which for a best-effort context lookup means one recall
+    # missed rather than an edit stalled.
+    if not refresh:
+        cached_now = _cached_access_token(url)
+        return url, cached_now
     _refresh_cached_token_if_stale(url)
     try:
         cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))

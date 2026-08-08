@@ -462,13 +462,21 @@ async def _recall(
     """
     import mcp_http
 
-    # In a THREAD, and this is the path where it matters most. Resolving can
-    # renew the token with blocking urllib calls (~25s of socket timeout),
-    # while this hook is SYNCHRONOUS with an 8s budget and fires before every
-    # file edit. Run inline, a slow auth server would pin the event loop past
-    # the `wait_for` below AND past the hook's own timeout — the harness kills
-    # it mid-call, and the user waits the whole time before their edit runs.
-    url, bearer = await asyncio.to_thread(resolve_bearer)
+    # NO REFRESH on this path, and no thread either — both are deliberate.
+    #
+    # This hook is SYNCHRONOUS with an 8s budget and fires before every file
+    # edit, so it must not attempt a token refresh: that is two blocking urllib
+    # calls, ~25s of socket timeout. Offloading to a thread does not help, and
+    # believing it did was a mistake corrected here — measured, a
+    # `wait_for(to_thread(...), 2.5)` around an 8s blocking call returns after
+    # 8.01s, because cancelling the future does not stop the thread and
+    # `asyncio.run` then joins the executor on the way out. A blocking call
+    # simply cannot be time-bounded from the outside.
+    #
+    # So it reads the cached credential and nothing else. Stale token, no
+    # recall this once — the async capture hooks have the budget to renew it,
+    # and a missed context lookup costs infinitely less than a stalled edit.
+    url, bearer = resolve_bearer(refresh=False)
     if not bearer:
         # No credential is a failed recall, not an empty one — the distinction
         # the docstring above turns on. Returning [] would cache "nothing

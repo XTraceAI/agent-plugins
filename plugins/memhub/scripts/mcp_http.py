@@ -276,7 +276,22 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
         detail = error.get("message") or error
         raise McpError(f"{method}: {detail}"
                        + (f" (rpc code {code})" if code is not None else ""))
-    return envelope.get("result") or {}
+    # `envelope.get("result") or {}` silently turned a MISSING result into an
+    # empty one — and callers cannot tell those apart. For a tools/call that
+    # meant an empty ToolResult with isError=False, i.e. a reply that never
+    # arrived being read as a successful empty answer. A reply carrying neither
+    # result nor error is a protocol violation and should say so.
+    if "result" not in envelope:
+        raise McpNoResponse(
+            f"{method}: reply carried neither a result nor an error")
+    result = envelope["result"]
+    # A non-object result would be a protocol violation for the methods used
+    # here; every caller reads it with .get(), so refuse rather than hand back
+    # something that will fail confusingly one frame later.
+    if not isinstance(result, dict):
+        raise McpError(f"{method}: result was {type(result).__name__}, "
+                       "expected an object")
+    return result
 
 
 def call_tool(url: str, bearer: str, name: str, arguments: dict,

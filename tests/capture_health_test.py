@@ -226,6 +226,33 @@ def test_breadcrumbs() -> None:
                  last_ok_at=now - 60)
     check("retracted by later success", ch._recent_failure(), None)
 
+    # ACROSS the two capture paths. They keep separate files — they share no
+    # lock, so they must not share a mutable one — and retracting only within a
+    # file left the backstop warning after per-turn capture had gone on working.
+    # The question is "is capture working?", not "did one path once stumble?".
+    _reset()
+    _write_state("s2.sessionflush", last_error="rate_limited",
+                 last_error_at=now - 300)
+    got = ch._recent_failure()
+    check("a backstop failure alone is reported", got and got[0], "rate_limited")
+
+    _write_state("s2", last_ok_at=now - 60)
+    check("a per-turn success retracts it", ch._recent_failure(), None)
+
+    # ...and the reverse direction, so neither path is privileged.
+    _reset()
+    _write_state("s3", last_error="auth", last_error_at=now - 300)
+    _write_state("s3.sessionflush", last_ok_at=now - 60)
+    check("a backstop success retracts a per-turn failure",
+          ch._recent_failure(), None)
+
+    # An OLDER success must not retract a NEWER failure.
+    _reset()
+    _write_state("s4.sessionflush", last_error="error", last_error_at=now - 60)
+    _write_state("s4", last_ok_at=now - 300)
+    got = ch._recent_failure()
+    check("an older success does not retract", got and got[0], "error")
+
     _reset()
     _write_state("s1", last_error="timeout", last_error_at=now - 60,
                  last_ok_at=now - 300)

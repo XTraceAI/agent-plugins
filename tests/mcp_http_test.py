@@ -165,6 +165,52 @@ def test_jsonrpc_error_raises():
         m._decode = real
 
 
+def test_a_missing_result_is_not_an_empty_one():
+    """`envelope.get("result") or {}` erased the difference.
+
+    A reply carrying neither result nor error became an empty dict, which for a
+    tools/call is an empty ToolResult with isError=False — a reply that never
+    arrived, read as a successful empty answer. The capture hooks then advance
+    or breadcrumb on a fiction.
+    """
+    print("\nmissing vs empty result")
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body.encode()
+            self.headers = {"Content-Type": "application/json"}
+
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class _Opener:
+        def __init__(self, body): self._body = body
+        def open(self, req, timeout=None): return _Resp(self._body)
+
+    real = m._OPENER
+    try:
+        for label, body, expect in [
+            ("no result key", '{"jsonrpc":"2.0","id":1}', m.McpNoResponse),
+            ("null result", '{"jsonrpc":"2.0","id":1,"result":null}', m.McpError),
+            ("non-object result", '{"jsonrpc":"2.0","id":1,"result":[1,2]}',
+             m.McpError),
+        ]:
+            m._OPENER = _Opener(body)
+            try:
+                m.request("https://x/mcp", "k", "tools/call", {})
+                check(f"{label} raises", False, True)
+            except expect:
+                check(f"{label} raises", True, True)
+
+        # A real empty object is still a legitimate answer and must pass.
+        m._OPENER = _Opener('{"jsonrpc":"2.0","id":1,"result":{}}')
+        check("an genuinely empty object is returned",
+              m.request("https://x/mcp", "k", "tools/call", {}), {})
+    finally:
+        m._OPENER = real
+
+
 def test_redirects_are_refused():
     """A redirect must never carry the bearer to another host.
 
@@ -193,7 +239,9 @@ def test_redirects_are_refused():
 if __name__ == "__main__":
     for test in (test_sse_parsing, test_decode_picks_the_response,
                  test_tool_result_shape, test_rate_limit_is_its_own_error,
-                 test_jsonrpc_error_raises, test_redirects_are_refused):
+                 test_jsonrpc_error_raises,
+                 test_a_missing_result_is_not_an_empty_one,
+                 test_redirects_are_refused):
         test()
     if failures:
         print("\nFAILED:")
