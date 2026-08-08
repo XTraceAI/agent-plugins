@@ -86,6 +86,10 @@ _NO_REFRESH_WARN_WITHIN_S = 6 * 3600
 _REASONS = {
     "auth": "the plugin's saved login expired and could not be renewed",
     "server_rejected": "the server rejected the last upload",
+    # Backpressure, not a fault: a key runs at one seat's throughput and a fleet
+    # flushing every turn can reach it. Worded so it does not read as "your
+    # session was refused" — the cursor is unmoved and the next turn retries.
+    "rate_limited": "capture is being throttled and is retrying on its own",
     "unrecognized_response": "the server sent a reply the plugin could not read",
     "timeout": "the server stopped responding",
     "error": "the capture hook hit an unexpected error",

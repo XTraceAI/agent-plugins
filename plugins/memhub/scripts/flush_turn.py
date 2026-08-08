@@ -39,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -58,14 +57,15 @@ from session_title import (  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
-# ``_memhub_auth`` pulls in the mcp SDK, so it is imported lazily inside
-# :func:`_flush` rather than at module scope. That keeps this module importable
-# under a bare python3 — which is what lets the cursor/tail/lock logic, where
-# the silent failures live, be tested without the dependency.
-
-# The MCP SDK logs the OAuth flow's exception (with traceback) before it
-# propagates; a per-turn background hook must stay quiet.
-logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
+# All at module scope now. These used to be deferred into :func:`_flush`
+# because ``_memhub_auth`` dragged in the mcp SDK and this module has to stay
+# importable under a bare python3 — that is what lets the cursor/tail/lock
+# logic, where the silent failures live, be tested without the dependency.
+# Nothing here needs the SDK any more, so the indirection went with it.
+import mcp_http  # noqa: E402
+from _memhub_auth import resolve_bearer  # noqa: E402
+from brain_resolve import resolve_repo_brain  # noqa: E402
+from room_map import env_for_url  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -324,11 +324,6 @@ def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
-    import mcp_http
-
-    from _memhub_auth import resolve_bearer
-    from brain_resolve import resolve_repo_brain
-    from room_map import env_for_url
 
     size = os.path.getsize(transcript_path)
     state = _read_state(session_id)
@@ -395,7 +390,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
 
     # This delta's title if it carries one, else whatever we last saw.
     title, custom = _titles(records, state)
-    url, bearer = resolve_bearer()
+    # In a THREAD, because resolving can renew the token — two blocking urllib
+    # calls, up to ~25s of socket timeout. `asyncio.wait_for` cannot cancel a
+    # synchronous call, so run inline it would pin the event loop AND hold the
+    # flock past the flush deadline, blocking every later turn's capture for
+    # the session. Offloading is what makes the timeout mean anything here.
+    url, bearer = await asyncio.to_thread(resolve_bearer)
     if not bearer:
         # Not an error — the state a background hook must degrade quietly on.
         # Raised rather than returned so the one handler in main() records the
@@ -444,7 +444,30 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # conversation rather than sticking at whatever the first
         # turn happened to be called.
         arguments["title"] = title
-    res = await session.call_tool("import_conversation", arguments=arguments)
+    # Transport failures are CLASSIFIED here, not left to the catch-all in
+    # main(). Falling through to it recorded every one as reason="error" — a
+    # permanent-looking breadcrumb — which is actively wrong for the two cases
+    # that are not faults at all: a 429 is backpressure this design expects
+    # (one seat's throughput, a fleet flushing every turn), and a 401 is a
+    # revoked or lapsed credential whose fix is one command. Both were being
+    # reported to the user as "the capture hook hit an unexpected error".
+    #
+    # The cursor is unmoved in every branch, so all of them retry next turn.
+    try:
+        res = await session.call_tool("import_conversation", arguments=arguments)
+    except mcp_http.McpRateLimited as e:
+        wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
+        _log(f"rate limited{wait} — the next turn retries (cursor unmoved)")
+        _mark_failure(session_id, "rate_limited", str(e))
+        return
+    except mcp_http.McpError as e:
+        if e.status in (401, 403):
+            _log("credential rejected; run /memhub:login — skipping")
+            _mark_failure(session_id, "auth", f"server rejected the credential ({e.status})")
+            return
+        _log(f"transport error: {e}")
+        _mark_failure(session_id, "error", str(e))
+        return
 
     # MCP signals tool failure via isError + a message, NOT an
     # exception. Without this the cursor would advance past records the

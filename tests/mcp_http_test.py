@@ -63,6 +63,19 @@ def test_decode_picks_the_response():
     plain = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"v": 1}})
     check("plain json", m._decode(plain, "application/json")["result"], {"v": 1})
 
+    # Progress frames but no answer must RAISE, not yield a bogus empty result.
+    # Returning the notification gave `result: {}`, which the capture hooks read
+    # as "unrecognized response" — blaming the server's reply shape when the
+    # truth is that no reply arrived.
+    progress_only = _sse({"jsonrpc": "2.0", "method": "notifications/progress"},
+                         {"jsonrpc": "2.0", "method": "notifications/progress"})
+    try:
+        m._decode(progress_only, "text/event-stream")
+        check("notification-only stream raises", False, True)
+    except m.McpError as exc:
+        check("notification-only stream raises", True, True)
+        check("says what was missing", "no result or error" in str(exc), True)
+
     for label, body, ctype in [
         ("empty SSE", "", "text/event-stream"),
         ("non-json body", "<html>502</html>", "application/json"),

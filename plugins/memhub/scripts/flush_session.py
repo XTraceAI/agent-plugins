@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -55,6 +54,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from room_map import env_for_url  # noqa: E402
@@ -67,10 +67,6 @@ from transcript_chunks import slices as make_slices  # noqa: E402
 from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
-# The MCP SDK logs the OAuth flow's exception (with traceback) before it
-# propagates to us; a background hook must stay quiet, so silence that logger
-# — main() still reports the condition in one friendly line.
-logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 
 def _log(msg: str) -> None:
@@ -120,7 +116,6 @@ def _deadline_s() -> float:
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
-    import mcp_http
 
     # Tolerant parse, NOT json.loads-or-die: this hook reads the transcript
     # while Claude Code is still appending to it, so a truncated final line
@@ -199,7 +194,10 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    url, bearer = resolve_bearer()
+    # In a thread: resolving may renew the token with blocking urllib calls
+    # (~25s of socket timeout), and a synchronous call cannot be cancelled by
+    # the deadline this flush runs under.
+    url, bearer = await asyncio.to_thread(resolve_bearer)
     if not bearer:
         # Same contract the SDK's NonInteractiveAuthRequired had: a background
         # hook degrades quietly rather than popping a browser at the user.
@@ -289,7 +287,22 @@ async def _send(session, arguments, room, title, namespace,
         arguments["namespace"] = namespace
 
     label = f"slice {index}/{total}: " if total > 1 else ""
-    res = await session.call_tool("import_conversation", arguments=arguments)
+    # Transport failures return False like any other unsuccessful slice, rather
+    # than escaping to the outer catch-all. This path sends a whole transcript
+    # in slices, so one throttled or refused slice must stop the run cleanly —
+    # slices already sent stay durable and the server dedups on re-send.
+    try:
+        res = await session.call_tool("import_conversation", arguments=arguments)
+    except mcp_http.McpRateLimited as e:
+        wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
+        _log(f"{label}rate limited{wait}; slices already sent are stored")
+        return False
+    except mcp_http.McpError as e:
+        if e.status in (401, 403):
+            _log(f"{label}credential rejected ({e.status}); run /memhub:login")
+        else:
+            _log(f"{label}transport error: {e}")
+        return False
     texts = [t for t in (getattr(b, "text", None)
                          for b in getattr(res, "content", []) or []) if t]
     # MCP signals tool failure via isError + a message in content, NOT via an

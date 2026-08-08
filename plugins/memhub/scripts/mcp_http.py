@@ -132,12 +132,20 @@ def _decode(body: str, content_type: str) -> dict:
         messages = _parse_sse(body)
         if not messages:
             raise McpError(f"no JSON-RPC message in SSE reply: {body[:200]!r}")
-        # The response to our request is the last frame carrying an id/result;
-        # servers may interleave notifications ahead of it.
+        # The response to our request is the last frame carrying a result or an
+        # error; servers may interleave notifications ahead of it.
         for message in reversed(messages):
             if "result" in message or "error" in message:
                 return message
-        return messages[-1]
+        # Progress frames but no answer. Returning the last notification instead
+        # would yield an empty `result`, which the capture hooks read as an
+        # "unrecognized response" — a diagnosis that blames the server's reply
+        # shape when the truth is that no reply arrived. Both paths leave the
+        # cursor unmoved, so the difference is entirely in what the breadcrumb
+        # tells a human afterwards.
+        raise McpError(
+            f"SSE stream carried no result or error frame "
+            f"({len(messages)} notification-only frame(s))")
     try:
         return json.loads(body or "{}")
     except ValueError as exc:
