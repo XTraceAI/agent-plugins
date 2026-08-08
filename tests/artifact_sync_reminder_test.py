@@ -15,10 +15,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The tests live outside the plugin so they are not shipped to users;
+# the code under test is still in the plugin's scripts dir.
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import artifact_sync_reminder as asr  # noqa: E402
 
-HOOK = Path(__file__).resolve().parent / "artifact_sync_reminder.py"
+HOOK = SCRIPTS / "artifact_sync_reminder.py"
 
 BRAIN = "11111111-1111-4111-8111-111111111111"
 ARTIFACT = "22222222-2222-4222-8222-222222222222"

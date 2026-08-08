@@ -64,6 +64,7 @@ from session_title import (  # noqa: E402
     prompt_title,
 )
 from transcript_chunks import slices as make_slices  # noqa: E402
+from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception (with traceback) before it
@@ -163,9 +164,19 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _log("transcript holds only slash-command records; nothing to flush")
         return
 
+    # Same reasoning as the filter above: a session must not come out with
+    # credentials in it depending on which path captured it. Every upload path
+    # redacts, or none of them can be relied on.
+    records = redact_records(records)
+
     # The name the transcript carries — the user's rename first, then the one
     # Claude Code generated, then the session's first prompt for a headless run
     # that has neither. Without it this path imports every session unnamed.
+    #
+    # Derived AFTER the redaction above, and that order is load-bearing: a
+    # session whose first prompt is `export MEMHUB_TOKEN=mhk_…` would otherwise
+    # ship its key as the conversation's NAME. Moving this above the redaction
+    # would reintroduce that silently.
     title = custom_title(records) or generated_title(records) \
         or prompt_title(records) or None
 

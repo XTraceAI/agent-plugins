@@ -36,11 +36,15 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pak  # noqa: E402 — stdlib-only, sits beside this file
+from pak import PakError  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception WITH a traceback before letting it
 # propagate. Under --status a missing token is an expected, reported outcome —
@@ -59,8 +63,14 @@ from room_map import env_for_url  # noqa: E402
 
 
 def _fmt_duration(seconds: float) -> str:
+    """Human duration. Days once there are any — a 90-day key rendered as
+    "2159h59m" is technically right and unreadable, and the number people need
+    to sanity-check is "about three months", not the hour count."""
     seconds = max(0, int(seconds))
-    hours, minutes = seconds // 3600, (seconds % 3600) // 60
+    days, rem = seconds // 86400, seconds % 86400
+    hours, minutes = rem // 3600, (rem % 3600) // 60
+    if days:
+        return f"{days}d{hours:02d}h"
     return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
 
 
@@ -101,6 +111,60 @@ async def _verify(url: str, headers, auth) -> int:
             return len((await session.list_tools()).tools)
 
 
+def _describe_expiry(record: dict | None) -> str:
+    remaining = pak.expires_in_s(record)
+    if remaining is None:
+        return "does not expire"
+    return f"expires in {_fmt_duration(remaining)}"
+
+
+def _report_key(url: str, record: dict | None) -> int:
+    """Print the state of the access key that authenticated this run."""
+    if not record:
+        print("credential  : access key (details unavailable)")
+        return 0
+    print(f"credential  : access key '{record.get('label')}' "
+          f"({_describe_expiry(record)})")
+    print("renewal     : n/a — a key does not refresh; "
+          "/memhub:login mints a new one when this lapses")
+    return 0
+
+
+def _ensure_key(url: str, env: str) -> bool:
+    """Mint (or reuse) this machine's access key using the fresh OAuth token.
+
+    Returns whether a key is now in place — which decides whether the OAuth
+    token's own renewal is still worth reporting.
+
+    Best-effort by design. A failure here is NOT a failed login: OAuth just
+    verified, so capture works today either way, and turning a successful login
+    into an error over an optimisation would be the wrong trade. It is reported
+    plainly so the user knows they are still on the short-lived credential.
+    """
+    try:
+        cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
+        bearer = cached.get("access_token")
+        if not bearer:
+            raise PakError("no access token to authorise minting with")
+        record, how = pak.ensure(url, bearer)
+    except PakError as exc:
+        print(f"access key  : NOT created ({exc})")
+        print("              capture will keep using the OAuth token, which "
+              "expires; re-run /memhub:login when it does.")
+        return False
+    except Exception as exc:  # noqa: BLE001 — never fail a good login over this
+        print(f"access key  : NOT created ({type(exc).__name__}: {exc})")
+        return False
+
+    verb = {"reused": "reusing", "replaced": "replaced orphaned key",
+            "minted": "created"}.get(how, how)
+    print(f"access key  : {verb} '{record.get('label')}' "
+          f"({_describe_expiry(record)})")
+    print(f"              the {env} hooks now authenticate with this key "
+          "instead of the expiring OAuth token.")
+    return True
+
+
 async def _run(status_only: bool, force: bool) -> int:
     url = default_url()
     env = env_for_url(url)
@@ -122,6 +186,20 @@ async def _run(status_only: bool, force: bool) -> int:
         cache.replace(stash)
         print(f"set aside the cached {env} token (restored if login fails)")
 
+    # The stored key has to go too, and it is the more important half now: a
+    # valid key short-circuits auth entirely, so leaving it would make --force
+    # confirm the exact credential the user is trying to replace and never
+    # reach the browser at all. Dropping the LOCAL copy is safe on its own —
+    # `pak.ensure` revokes the server-side key it finds under this label before
+    # minting, so the cap keeps counting real credentials.
+    key_stash: dict | None = None
+    if force:
+        key_stash = pak.load(url)
+        if key_stash:
+            pak.forget(url)
+            print(f"set aside the stored {env} access key "
+                  f"'{key_stash.get('label')}' (restored if login fails)")
+
     # Set only after the new credential has been VERIFIED against the server.
     # The stash is discarded on this flag and not on `cache.exists()`, because
     # existence is not success: the SDK writes the token as soon as the grant
@@ -132,7 +210,15 @@ async def _run(status_only: bool, force: bool) -> int:
     verified = False
 
     def _restore() -> None:
-        """Reinstate the old credential unless a verified one replaced it."""
+        """Reinstate the old credentials unless a verified login replaced them."""
+        # The key first: if the login failed, the old key is very likely still
+        # valid server-side (nothing revokes it until `pak.ensure` runs, which
+        # only happens after verification), so putting it back restores working
+        # capture rather than merely restoring a file.
+        if key_stash and not (verified and pak.load(url)):
+            pak.save(url, key_stash)
+            print(f"login did not complete — restored the previous {env} access key")
+
         if not (stash and stash.exists()):
             return
         if verified and cache.exists():
@@ -163,8 +249,16 @@ async def _run(status_only: bool, force: bool) -> int:
             print(f"status      : FAILED to prepare auth ({exc})")
             return 1
 
-        print(f"mode        : "
-              f"{'bearer ($MEMHUB_TOKEN)' if headers else 'browser OAuth (plugin client)'}")
+        # Three sources now, not two. Inferring from `headers` alone reported a
+        # stored access key as "$MEMHUB_TOKEN" — naming the wrong credential in
+        # the one command whose job is telling you which credential you are on.
+        if os.environ.get("MEMHUB_TOKEN", "").strip():
+            source = "bearer ($MEMHUB_TOKEN)"
+        elif headers:
+            source = "stored access key (mhk_)"
+        else:
+            source = "browser OAuth (plugin client)"
+        print(f"mode        : {source}")
 
         try:
             tools = await _verify(url, headers, auth)
@@ -182,10 +276,29 @@ async def _run(status_only: bool, force: bool) -> int:
         verified = True
         print(f"status      : OK — server exposes {tools} tools")
 
-        if headers:
-            # An explicit bearer is provisioned outside this flow entirely;
-            # there is no refresh story to report and no cache to inspect.
+        if os.environ.get("MEMHUB_TOKEN", "").strip():
+            # Provisioned outside this flow entirely; nothing here owns its
+            # lifecycle, so there is no renewal story to tell and no key to mint.
             print("renewal     : n/a ($MEMHUB_TOKEN is supplied explicitly)")
+            return 0
+
+        if headers:
+            # A stored access key answered — this login had nothing to do but
+            # confirm it still works.
+            return _report_key(url, pak.load(url))
+
+        # OAuth verified. Trade that short-lived session for a durable key, so
+        # the hooks — which can never open a browser — stop depending on a
+        # credential that expires inside a day and needs a refresh they cannot
+        # perform from a cold process.
+        if _ensure_key(url, env):
+            # The OAuth token is now a bootstrap artefact, not the credential
+            # anything runs on. Reporting its renewal here would describe the
+            # wrong thing — and worse, an "issued no refresh token" warning
+            # would send the user to fix a tenant setting that no longer has
+            # any bearing on whether capture keeps working.
+            print("renewal     : not needed — the key is the credential now; "
+                  "/memhub:login mints a fresh one when it lapses")
             return 0
 
         ok, detail = _renewal_report(url)

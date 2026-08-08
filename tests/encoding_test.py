@@ -26,7 +26,7 @@ import ast
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 SCAN_DIRS = [ROOT / "plugins" / "memhub" / "scripts", ROOT / "codex"]
 
 FAILURES: list[str] = []

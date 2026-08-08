@@ -34,7 +34,10 @@ os.environ.pop("MEMHUB_TOKEN", None)
 os.environ.pop("MEMHUB_TURN_FLUSH", None)
 os.environ.pop("MEMHUB_MCP_BASE_URL", None)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The tests live outside the plugin so they are not shipped to users;
+# the code under test is still in the plugin's scripts dir.
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 import capture_health as ch  # noqa: E402
 
 HOST = "api.memhub.xtrace.ai"
@@ -62,6 +65,11 @@ def _write_token(*, exp: float, refresh: bool) -> None:
         "access_token": _jwt(exp),
         "refresh_token": "rt-value" if refresh else None,
     }), encoding="utf-8")
+
+
+def _iso(days: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(time.time() + days * 86400))
 
 
 def _write_state(name: str, **fields) -> None:
@@ -97,10 +105,18 @@ def test_token_states() -> None:
           ch._token_problem(HOST), "unrenewable")
 
     # Works today, no way to renew: the state that killed production. Reported
-    # while it is still cheap to fix, not after it lapses.
+    # once the outage is CLOSE — `login.py` already names the tenant fix at mint
+    # time, so repeating it every session for the token's whole life would just
+    # be that message as wallpaper.
     _write_token(exp=time.time() + 3600, refresh=False)
-    check("valid but unrenewable -> no_refresh",
+    check("unrenewable and expiring soon -> no_refresh",
           ch._token_problem(HOST), "no_refresh")
+
+    # A freshly minted unrenewable token is not yet news.
+    _write_token(exp=time.time() + ch._NO_REFRESH_WARN_WITHIN_S + 3600,
+                 refresh=False)
+    check("unrenewable but not due for hours -> silent",
+          ch._token_problem(HOST), None)
 
     # An unreadable exp is never a fault on its own — that would be guessing —
     # but it must not suppress the refresh-token fact, which is known either
@@ -122,6 +138,69 @@ def test_token_states() -> None:
     os.environ["MEMHUB_TOKEN"] = "explicit-bearer"
     check("explicit bearer overrides cache", ch._token_problem(HOST), None)
     os.environ.pop("MEMHUB_TOKEN")
+
+
+def test_stored_key_outranks_the_oauth_cache() -> None:
+    """A stored access key is the credential; the OAuth cache stops mattering.
+
+    Judging the OAuth token while the hooks authenticate with a key would report
+    on something nothing uses — and would fire "cannot renew" at a setup that is
+    now immune to that entire failure mode.
+    """
+    print("\nstored access key")
+    import pak
+
+    _reset()
+    # The worst case for the old logic: an OAuth token that is expired AND
+    # unrenewable sitting next to a perfectly good key.
+    _write_token(exp=time.time() - 3600, refresh=False)
+    pak.save(ch._mcp_url_for(HOST),
+             {"secret": "mhk_x", "label": "test",
+              "expires_at": _iso(days=30)})
+    check("good key wins over a dead OAuth token",
+          ch._token_problem(HOST), None)
+
+    # An expired key is NOT terminal on its own: resolve_url_and_auth falls
+    # through to the OAuth cache, so capture may well still be running. The
+    # health check has to model that fallback or it announces an outage to
+    # someone whose capture is fine.
+    pak.save(ch._mcp_url_for(HOST),
+             {"secret": "mhk_x", "label": "test", "expires_at": _iso(days=-1)})
+    _write_token(exp=time.time() + 3600, refresh=True)
+    check("expired key + working OAuth -> silent",
+          ch._token_problem(HOST), None)
+
+    _write_token(exp=time.time() - 3600, refresh=False)
+    check("expired key + dead OAuth -> reported",
+          ch._token_problem(HOST), "unrenewable")
+
+    # Nothing to fall back to: name the key, because someone whose key lapsed
+    # has plainly authenticated before and "never authenticated" is the wrong
+    # problem even though the remedy coincides.
+    (ch.CACHE_DIR / f"tokens-{HOST}.json").unlink()
+    check("expired key + no OAuth at all -> key_expired",
+          ch._token_problem(HOST), "key_expired")
+    _write_token(exp=time.time() - 3600, refresh=False)
+
+    pak.save(ch._mcp_url_for(HOST),
+             {"secret": "mhk_x", "label": "test", "expires_at": _iso(days=2)})
+    check("key expiring soon is reported",
+          ch._token_problem(HOST), "key_expiring")
+
+    pak.save(ch._mcp_url_for(HOST), {"secret": "mhk_x", "label": "test"})
+    check("key with no expiry is healthy", ch._token_problem(HOST), None)
+
+    # Both key messages name /memhub:login, because unlike the OAuth
+    # "cannot renew" case, re-running it genuinely does mint a replacement.
+    for state in ("key_expired", "key_expiring"):
+        msg = ch._message(HOST, state, None)
+        check(f"{state} names the fix",
+              bool(msg and "/memhub:login" in msg), True)
+
+    pak.forget(ch._mcp_url_for(HOST))
+    check("no key -> falls back to the OAuth cache",
+          ch._token_problem(HOST), "unrenewable")
+    _reset()
 
 
 def test_breadcrumbs() -> None:
@@ -181,8 +260,15 @@ def test_messages() -> None:
     # user that the banner overstates things.
     check("no_refresh does not claim it already expired",
           "expired" not in (msg or "").split("expires")[0], True)
-    check("no_refresh names the fix",
-          bool(msg and "/memhub:login" in msg), True)
+    # It must NOT send the user to re-authenticate. Logging in again cannot
+    # produce a refresh token the authorization server declined to issue, so
+    # that advice sends them round a loop that never converges — banner,
+    # re-login, identical state, banner. Advice that cannot work is worse than
+    # no advice, because it spends the user's trust proving it.
+    check("no_refresh does not tell them to re-login",
+          "/memhub:login" not in (msg or ""), True)
+    check("no_refresh names the remedy that can actually work",
+          bool(msg and "Offline Access" in msg and "mhk_" in msg), True)
 
     # The token problem is true right now; a breadcrumb only proves something
     # was broken when it was written. So the token check leads.
@@ -217,7 +303,7 @@ def _run(payload: dict, env_extra: dict | None = None) -> str:
     env.pop("MEMHUB_MCP_BASE_URL", None)
     env.update(env_extra or {})
     out = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "capture_health.py")],
+        [sys.executable, str(SCRIPTS / "capture_health.py")],
         input=json.dumps(payload), capture_output=True, text=True, env=env)
     check("exit code is 0", out.returncode, 0)
     return out.stdout.strip()
@@ -277,7 +363,8 @@ def test_never_raises() -> None:
 
 
 if __name__ == "__main__":
-    for test in (test_token_states, test_breadcrumbs, test_messages,
+    for test in (test_token_states, test_stored_key_outranks_the_oauth_cache,
+                 test_breadcrumbs, test_messages,
                  test_debounce, test_end_to_end, test_never_raises):
         test()
     if failures:

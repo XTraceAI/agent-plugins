@@ -449,6 +449,24 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         return
 
 
+def _stored_pak(url: str) -> dict | None:
+    """This backend's stored access key, if it exists and has not lapsed.
+
+    Imported lazily and guarded: ``pak`` is stdlib-only and sits beside this
+    file, but auth must not become the reason a hook dies. A missing or broken
+    key module simply means "no key", and the OAuth path still applies.
+    """
+    try:
+        import pak  # noqa: PLC0415 — local, stdlib-only
+        record = pak.load(url)
+        if not record:
+            return None
+        remaining = pak.expires_in_s(record)
+        return record if remaining is None or remaining > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     """Return (url, headers, auth) for streamablehttp_client.
 
@@ -466,6 +484,21 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     token = os.environ.get("MEMHUB_TOKEN", "").strip()
     if token:
         return url, {"Authorization": f"Bearer {token}"}, None
+
+    # A stored personal access key, minted by /memhub:login. Preferred over the
+    # OAuth cache because it is a STATIC bearer: no expiry inside a session, no
+    # refresh, and therefore none of the cold-process failure modes that made a
+    # background hook's credential unreliable. Checked before the OAuth path so
+    # an install that has one never touches the refresh machinery at all.
+    #
+    # An expired key deliberately falls THROUGH to OAuth rather than failing:
+    # the OAuth cache is the older credential and may still work, and a
+    # degraded-but-working capture beats a confident dead end. The health check
+    # reports the lapsed key either way.
+    record = _stored_pak(url)
+    if record:
+        return url, {"Authorization": f"Bearer {record['secret']}"}, None
+
     _refresh_cached_token_if_stale(url)
     return url, None, build_oauth(url, interactive=interactive)
 

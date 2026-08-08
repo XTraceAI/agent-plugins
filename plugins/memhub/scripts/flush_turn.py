@@ -55,6 +55,7 @@ from session_title import (  # noqa: E402
     generated_title,
     prompt_title,
 )
+from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
 # ``_memhub_auth`` pulls in the mcp SDK, so it is imported lazily inside
@@ -285,7 +286,16 @@ def _titles(records: list[dict], state: dict) -> tuple[str | None, str | None]:
     """
     custom = custom_title(records) or state.get("custom_title") or None
     generated = generated_title(records) or state.get("title") or None
-    return custom or generated or prompt_title(records) or None, custom
+    title = custom or generated or prompt_title(records) or None
+    # Redacted HERE, at the source, and not at the send site. A title is derived
+    # from the RAW records — the redaction downstream only covers `sendable` —
+    # so a session whose first prompt is `export MEMHUB_TOKEN=mhk_…` would ship
+    # its key as the conversation's NAME: the most visible field there is, and
+    # metadata that redaction was supposed to have covered. Doing it here also
+    # keeps the copy persisted into state clean, which matters because that copy
+    # is re-sent on every later flush.
+    return (redact_text(title) if title else None,
+            redact_text(custom) if custom else None)
 
 
 def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
@@ -341,7 +351,11 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # SENT, not from what is read: the metadata harvest below still sees every
     # record, and the cursor still advances past these, because they are
     # deliberately never shipped rather than deferred.
-    sendable = drop_command_wrappers(records)
+    # Redact AFTER filtering and before anything leaves the machine. Applied to
+    # what is SENT rather than what is read, so the cursor still advances past
+    # a record whose secret was stripped — the alternative would pin the cursor
+    # on any turn that mentioned a key and stall capture permanently.
+    sendable = redact_records(drop_command_wrappers(records))
 
     if not sendable or all(
         isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
