@@ -462,7 +462,13 @@ async def _recall(
     """
     import mcp_http
 
-    url, bearer = resolve_bearer()
+    # In a THREAD, and this is the path where it matters most. Resolving can
+    # renew the token with blocking urllib calls (~25s of socket timeout),
+    # while this hook is SYNCHRONOUS with an 8s budget and fires before every
+    # file edit. Run inline, a slow auth server would pin the event loop past
+    # the `wait_for` below AND past the hook's own timeout — the harness kills
+    # it mid-call, and the user waits the whole time before their edit runs.
+    url, bearer = await asyncio.to_thread(resolve_bearer)
     if not bearer:
         # No credential is a failed recall, not an empty one — the distinction
         # the docstring above turns on. Returning [] would cache "nothing
@@ -487,7 +493,19 @@ async def _recall(
         # this session's own conversation — the audit's dominant noise
         # class (lessons replayed minutes after the agent applied them).
         arguments["session_id"] = session_id
-    res = await session.call_tool("recall_directives", arguments=arguments)
+    # A transport failure is a FAILED recall, never an empty one. The
+    # difference is the whole contract of this function: `[]` means "asked,
+    # nothing matched" and gets cached against this handle for the session,
+    # so letting a 429 or a dropped connection reach that path would suppress
+    # recall on this handle for the rest of the session over a blip.
+    #
+    # It also fails OPEN. A recall that cannot happen must not block the edit
+    # the user is making — the hook contributes context, it does not gate work.
+    try:
+        res = await session.call_tool("recall_directives", arguments=arguments)
+    except mcp_http.McpError as e:
+        _log(f"recall unavailable ({e}) — proceeding without directives")
+        return None
     if getattr(res, "isError", False) and (repo or fired or session_id):
         # Rolling-upgrade compat: a server predating the repo /
         # already_fired / session_id params rejects unknown arguments.
@@ -507,8 +525,12 @@ async def _recall(
             legacy: dict = {"tool": tool, "args": args}
             if output:
                 legacy["output"] = output
-            res = await session.call_tool("recall_directives",
-                                          arguments=legacy)
+            try:
+                res = await session.call_tool("recall_directives",
+                                              arguments=legacy)
+            except mcp_http.McpError as e:
+                _log(f"legacy retry unavailable ({e})")
+                return None
     return _parse_recall_result(res)
 
 

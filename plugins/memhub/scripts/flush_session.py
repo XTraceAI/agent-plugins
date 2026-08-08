@@ -220,6 +220,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # the deadline this flush runs under.
     url, bearer = await asyncio.to_thread(resolve_bearer)
     if not bearer:
+        # Breadcrumb BEFORE raising. The raise is caught by main()'s catch-all,
+        # which logs to an async hook's discarded stdout and records nothing —
+        # so without this the backstop's most likely failure, having no
+        # credential at all, was the one condition it reported least. Every
+        # other failure on this path leaves a trace; this one has to as well.
+        _breadcrumb(session_id, "auth", "no usable credential")
         # Same contract the SDK's NonInteractiveAuthRequired had: a background
         # hook degrades quietly rather than popping a browser at the user.
         raise NonInteractiveAuthRequired(

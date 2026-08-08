@@ -163,6 +163,37 @@ def _decode(body: str, content_type: str) -> dict:
         raise McpError(f"reply was not JSON: {body[:200]!r}") from exc
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects instead of following them.
+
+    ``urlopen``'s default opener follows 30x and copies the request headers
+    onto the new request — including ``Authorization``. A redirect to another
+    host would therefore hand our bearer to that host, silently, while the call
+    still appeared to succeed. The SDK's httpx client does not follow redirects
+    by default, so following them was a behaviour change smuggled in with the
+    transport swap.
+
+    An MCP endpoint has no reason to redirect, so refusing loses nothing and
+    turns a credential leak into a visible error.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise McpError(
+            f"refusing to follow a {code} redirect to {newurl!r} — that would "
+            "resend the credential to another host", code)
+
+
+_OPENER = None
+
+
+def _opener():
+    """A module-wide opener that never redirects. Built once, lazily."""
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(_NoRedirects)
+    return _OPENER
+
+
 def request(url: str, bearer: str, method: str, params: dict | None = None,
             timeout: float = _DEFAULT_TIMEOUT_S) -> dict:
     """One JSON-RPC call. Returns the ``result`` object.
@@ -186,7 +217,7 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
         })
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             content_type = resp.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:

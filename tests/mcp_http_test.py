@@ -140,10 +140,8 @@ def test_jsonrpc_error_raises():
                                      "error": {"code": -32601,
                                                "message": "no such tool"}}
     try:
-        # urlopen is never reached: _decode is consulted after the HTTP call,
-        # so stub the transport too.
-        import urllib.request
-
+        # Stub the OPENER, not urlopen: requests go through a module-wide
+        # opener that refuses redirects, so patching urlopen would miss.
         class _Resp:
             headers = {"Content-Type": "application/json"}
             status = 200
@@ -152,22 +150,50 @@ def test_jsonrpc_error_raises():
             def __enter__(self): return self
             def __exit__(self, *a): return False
 
-        real_open, urllib.request.urlopen = urllib.request.urlopen, lambda *a, **k: _Resp()
+        class _Opener:
+            def open(self, req, timeout=None): return _Resp()
+
+        real_opener, m._OPENER = m._OPENER, _Opener()
         try:
             m.request("https://x/mcp", "k", "tools/call", {})
             check("raises on json-rpc error", False, True)
         except m.McpError as exc:
             check("raises on json-rpc error", "no such tool" in str(exc), True)
         finally:
-            urllib.request.urlopen = real_open
+            m._OPENER = real_opener
     finally:
         m._decode = real
+
+
+def test_redirects_are_refused():
+    """A redirect must never carry the bearer to another host.
+
+    urlopen's default opener follows 30x and copies request headers onto the
+    new request, Authorization included — so a redirect would hand the
+    credential to wherever it pointed, silently, while the call still looked
+    successful. The SDK's httpx client does not follow redirects, so following
+    them would have been a behaviour change smuggled in with the swap.
+    """
+    print("\nredirects")
+    handler = m._NoRedirects()
+    try:
+        handler.redirect_request(None, None, 302, "Found", {},
+                                 "https://evil.example.com/mcp")
+        check("refuses to follow", False, True)
+    except m.McpError as exc:
+        check("refuses to follow", True, True)
+        check("names the target", "evil.example.com" in str(exc), True)
+        check("carries the status", exc.status, 302)
+
+    # And the opener is actually wired to it.
+    check("opener installs the handler",
+          any(isinstance(h, m._NoRedirects) for h in m._opener().handlers), True)
 
 
 if __name__ == "__main__":
     for test in (test_sse_parsing, test_decode_picks_the_response,
                  test_tool_result_shape, test_rate_limit_is_its_own_error,
-                 test_jsonrpc_error_raises):
+                 test_jsonrpc_error_raises, test_redirects_are_refused):
         test()
     if failures:
         print("\nFAILED:")

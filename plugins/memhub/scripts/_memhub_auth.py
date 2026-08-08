@@ -468,10 +468,25 @@ def _refresh_cached_token_if_stale(url: str) -> None:
             updated[k] = fresh[k]
     if fresh.get("refresh_token"):
         updated["refresh_token"] = fresh["refresh_token"]
+    # ATOMIC, and that matters more now than it used to. Several hooks resolve
+    # a credential concurrently — the per-turn flush, the SessionEnd backstop,
+    # and the PreToolUse directive check, which fires on every edit — so a
+    # plain write_text leaves a window where another process reads a truncated
+    # file. That reader does not fail loudly: it decides there is no usable
+    # credential and skips, so a torn write reads exactly like "not logged in"
+    # and capture goes dark for that call.
+    #
+    # Written to a temp file and renamed, so a reader sees either the old token
+    # or the new one. Created 0600 by os.open rather than chmod'd afterwards,
+    # so the secret is never briefly world-readable. Two writers racing is
+    # harmless: both wrote a valid token, and rename picks one whole.
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(updated), encoding="utf-8")
-        path.chmod(0o600)
+        tmp = path.with_suffix(".json.tmp")
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(updated))
+        tmp.replace(path)
     except OSError:
         return
 
