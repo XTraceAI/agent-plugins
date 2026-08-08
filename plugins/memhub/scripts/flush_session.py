@@ -172,6 +172,11 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # The name the transcript carries — the user's rename first, then the one
     # Claude Code generated, then the session's first prompt for a headless run
     # that has neither. Without it this path imports every session unnamed.
+    #
+    # Derived AFTER the redaction above, and that order is load-bearing: a
+    # session whose first prompt is `export MEMHUB_TOKEN=mhk_…` would otherwise
+    # ship its key as the conversation's NAME. Moving this above the redaction
+    # would reintroduce that silently.
     title = custom_title(records) or generated_title(records) \
         or prompt_title(records) or None
 

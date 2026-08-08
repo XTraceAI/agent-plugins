@@ -86,6 +86,38 @@ def test_paths_and_labels():
     check("label honours the override", pak.default_label(), "test-machine")
 
 
+def test_credentials_never_go_over_cleartext():
+    """The OAuth token sent to this API can MINT credentials.
+
+    `mcp_url` can come from $MEMHUB_MCP_BASE_URL, so a misconfigured or planted
+    `http://` value would otherwise put that token on the wire in cleartext,
+    silently, while everything appeared to work.
+    """
+    print("\ntls is required")
+    check("https is fine", pak.api_base(MCP), BASE)
+    for label, url in [
+        ("plain http", "http://api.staging.memhub.xtrace.ai/mcp-server/mcp"),
+        ("http on a lookalike host", "http://evil.example.com/mcp-server/mcp"),
+    ]:
+        try:
+            pak.api_base(url)
+            check(f"rejects {label}", False, True)
+        except pak.PakError as exc:
+            check(f"rejects {label}", True, True)
+            check(f"{label} names the env var", "MEMHUB_MCP_BASE_URL" in str(exc),
+                  True)
+
+    # Loopback never leaves the machine, and refusing it would make a local
+    # backend impossible to develop against.
+    for label, url in [("localhost", "http://localhost:8080/mcp-server/mcp"),
+                       ("127.0.0.1", "http://127.0.0.1:8080/mcp-server/mcp")]:
+        try:
+            pak.api_base(url)
+            check(f"allows {label}", True, True)
+        except pak.PakError:
+            check(f"allows {label}", False, True)
+
+
 def test_store_roundtrip():
     print("\nstorage")
     _reset()
@@ -339,7 +371,8 @@ def test_envelope_errors_surface():
 
 if __name__ == "__main__":
     real_call = pak._call
-    for test in (test_paths_and_labels, test_store_roundtrip, test_expiry,
+    for test in (test_paths_and_labels, test_credentials_never_go_over_cleartext,
+                 test_store_roundtrip, test_expiry,
                  test_expiry_is_utc_regardless_of_local_zone,
                  test_every_timestamp_shape_the_server_might_send,
                  test_cap_is_checked_before_anything_is_revoked,

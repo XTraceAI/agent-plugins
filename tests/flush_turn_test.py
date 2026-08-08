@@ -305,6 +305,39 @@ def test_only_a_server_round_trip_retracts_a_failure():
             ft.STATE_DIR = original
 
 
+def test_a_title_never_carries_a_credential():
+    """A title is derived from the RAW records, so it needs its own redaction.
+
+    The batch redaction downstream only covers `sendable`. A session whose
+    first prompt is `export MEMHUB_TOKEN=mhk_…` would otherwise ship that key
+    as the conversation's NAME — the most visible field there is, and metadata
+    the redaction pass was supposed to have covered. The stored copy matters
+    too: it is re-sent on every later flush.
+    """
+    print("title redaction")
+    secret = "mhk_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0Uv2"
+
+    title, custom = ft._titles(
+        [{"type": "user", "uuid": "u1",
+          "message": {"role": "user", "content": f"export MEMHUB_TOKEN={secret}"}}],
+        {})
+    check("a prompt-derived title is redacted", secret in (title or ""), False)
+    check("but a title is still produced", bool(title), True)
+
+    title, custom = ft._titles([{"type": "custom-title", "customTitle": f"key {secret}"}], {})
+    check("a user's own title is redacted", secret in (title or ""), False)
+    check("the remembered custom title is too", secret in (custom or ""), False)
+
+    # A remembered title from an older build could carry one; it is re-sent
+    # every flush, so it has to be cleaned on the way out as well.
+    title, _ = ft._titles([], {"title": f"stale {secret}"})
+    check("a remembered title is redacted", secret in (title or ""), False)
+
+    check("ordinary titles are untouched",
+          ft._titles([{"type": "custom-title", "customTitle": "fix the auth bug"}], {})[0],
+          "fix the auth bug")
+
+
 def test_timeout_override_never_breaks_the_hook():
     """The override is parsed at CALL time and floors at the default. Parsing it
     at import meant a bad value crashed the module before the handler that keeps
@@ -432,16 +465,15 @@ def test_prefilter():
 
 
 if __name__ == "__main__":
-    for fn in (test_tail, test_tail_is_bytes_not_chars,
-               test_tail_stops_before_partial_line, test_cursor_trust,
-               test_inert_only_delta_is_consumed_but_attachments_are_not,
-               test_timeout_override_never_breaks_the_hook,
-               test_title_is_harvested_from_the_transcript,
-               test_a_title_already_resolved_survives_a_delta_without_one,
-               test_a_rename_outranks_the_stale_generated_title,
-               test_a_headless_session_is_named_by_its_first_prompt,
-               test_lock, test_prefilter):
-        fn()
+    # Discovered from globals(), NOT a hand-maintained tuple. The tuple silently
+    # dropped two tests — including the regression lock added in #53, which was
+    # described in that PR as protecting the retraction rule and had in fact
+    # never executed once. A registration list that must be edited in a second
+    # place is a list that will eventually disagree with the file, and the
+    # failure is invisible: the suite still passes, just over less.
+    for _name, _fn in sorted(globals().items()):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
     print()
     if _failures:
         print(f"{len(_failures)} FAILED")
