@@ -460,10 +460,28 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _log(f"rate limited{wait} — the next turn retries (cursor unmoved)")
         _mark_failure(session_id, "rate_limited", str(e))
         return
+    except mcp_http.McpNoResponse as e:
+        # Reached the server, it streamed, no answer came. That is a reply we
+        # could not use — the same bucket as a body we could not read — not a
+        # generic fault.
+        _log(f"no response frame: {e}")
+        _mark_failure(session_id, "unrecognized_response", str(e))
+        return
     except mcp_http.McpError as e:
-        if e.status in (401, 403):
+        if e.status == 401:
+            # Unauthenticated: no credential, or one the server won't accept.
+            # /memhub:login mints a new one, so the advice converges.
             _log("credential rejected; run /memhub:login — skipping")
-            _mark_failure(session_id, "auth", f"server rejected the credential ({e.status})")
+            _mark_failure(session_id, "auth", "server rejected the credential (401)")
+            return
+        if e.status == 403:
+            # Authorized-but-forbidden. Re-logging in mints an equivalent
+            # credential and changes NOTHING, so telling them to is the same
+            # non-converging loop the `no_refresh` advice was fixed for. The
+            # cause is scope or org access, and that is what to name.
+            _log("credential lacks permission (403) — check the key's scopes "
+                 "and that it can reach this brain's org; skipping")
+            _mark_failure(session_id, "forbidden", str(e))
             return
         _log(f"transport error: {e}")
         _mark_failure(session_id, "error", str(e))

@@ -60,6 +60,17 @@ class McpError(RuntimeError):
         self.status = status
 
 
+class McpNoResponse(McpError):
+    """The stream carried progress frames but no result and no error.
+
+    Its own type because the callers' vocabulary distinguishes "the reply made
+    no sense" from "something unexpected happened", and this is the former: we
+    reached the server, it streamed, and no answer arrived. Folding it into a
+    generic transport error would describe the wrong thing to whoever reads the
+    breadcrumb afterwards.
+    """
+
+
 class McpRateLimited(McpError):
     """429. A key runs at one seat's throughput, and a fleet of parallel
     sessions flushing every turn can genuinely reach it.
@@ -143,7 +154,7 @@ def _decode(body: str, content_type: str) -> dict:
         # shape when the truth is that no reply arrived. Both paths leave the
         # cursor unmoved, so the difference is entirely in what the breadcrumb
         # tells a human afterwards.
-        raise McpError(
+        raise McpNoResponse(
             f"SSE stream carried no result or error frame "
             f"({len(messages)} notification-only frame(s))")
     try:

@@ -90,6 +90,10 @@ _REASONS = {
     # flushing every turn can reach it. Worded so it does not read as "your
     # session was refused" — the cursor is unmoved and the next turn retries.
     "rate_limited": "capture is being throttled and is retrying on its own",
+    # Distinct from `auth`, and the distinction is the whole point: a new login
+    # mints an equivalent credential, so pointing there would not converge.
+    "forbidden": ("the credential is valid but not permitted to write here "
+                  "(check its scopes and org access)"),
     "unrecognized_response": "the server sent a reply the plugin could not read",
     "timeout": "the server stopped responding",
     "error": "the capture hook hit an unexpected error",

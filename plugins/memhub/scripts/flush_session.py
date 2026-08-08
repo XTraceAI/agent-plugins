@@ -74,6 +74,27 @@ def _log(msg: str) -> None:
     print(f"[memhub-flush] {msg}")
 
 
+def _breadcrumb(session_id, reason: str, detail: str = "") -> None:
+    """Record a transport failure where `capture_health` will find it.
+
+    Delegates to the per-turn hook's writer rather than reimplementing it.
+    That module OWNS this state file — its merge semantics, its atomic write,
+    its rule that a breadcrumb never touches the cursor — and a second
+    implementation of the same format is how two writers drift apart. The two
+    hooks key on the same session id, so a failure recorded here is retracted
+    by a later per-turn success exactly as its own failures are.
+
+    Never raises: a breadcrumb is not worth failing a flush over.
+    """
+    if not session_id:
+        return
+    try:
+        from flush_turn import _mark_failure  # noqa: PLC0415 — sibling hook
+        _mark_failure(str(session_id), reason, detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # Comfortably inside the hooks' 300s budget, so the script decides when to
 # stop rather than being killed at an arbitrary point mid-upload.
 _DEFAULT_DEADLINE_S = 240.0
@@ -287,21 +308,37 @@ async def _send(session, arguments, room, title, namespace,
         arguments["namespace"] = namespace
 
     label = f"slice {index}/{total}: " if total > 1 else ""
-    # Transport failures return False like any other unsuccessful slice, rather
-    # than escaping to the outer catch-all. This path sends a whole transcript
-    # in slices, so one throttled or refused slice must stop the run cleanly —
-    # slices already sent stay durable and the server dedups on re-send.
+    # Transport failures stop the run cleanly — slices already sent stay durable
+    # and the server dedups on re-send — AND leave a breadcrumb.
+    #
+    # The breadcrumb is the point. This hook is async fire-and-forget, so its
+    # stdout goes nowhere, and it is the BACKSTOP: the path that catches exactly
+    # the sessions per-turn capture already missed. Returning False silently
+    # would leave it failing invisibly, which is the precise bug this whole
+    # series exists to remove — and it would be worse here than in the per-turn
+    # path, because nothing downstream is left to notice.
     try:
         res = await session.call_tool("import_conversation", arguments=arguments)
     except mcp_http.McpRateLimited as e:
         wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
         _log(f"{label}rate limited{wait}; slices already sent are stored")
+        _breadcrumb(arguments.get("conversation_id"), "rate_limited", str(e))
+        return False
+    except mcp_http.McpNoResponse as e:
+        _log(f"{label}no response frame: {e}")
+        _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", str(e))
         return False
     except mcp_http.McpError as e:
-        if e.status in (401, 403):
-            _log(f"{label}credential rejected ({e.status}); run /memhub:login")
+        if e.status == 401:
+            _log(f"{label}credential rejected (401); run /memhub:login")
+            _breadcrumb(arguments.get("conversation_id"), "auth", str(e))
+        elif e.status == 403:
+            _log(f"{label}credential lacks permission (403); check its scopes "
+                 "and org access")
+            _breadcrumb(arguments.get("conversation_id"), "forbidden", str(e))
         else:
             _log(f"{label}transport error: {e}")
+            _breadcrumb(arguments.get("conversation_id"), "error", str(e))
         return False
     texts = [t for t in (getattr(b, "text", None)
                          for b in getattr(res, "content", []) or []) if t]
