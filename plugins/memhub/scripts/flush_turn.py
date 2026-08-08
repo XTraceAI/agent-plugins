@@ -158,9 +158,18 @@ def _save_state(session_id: str, **fields) -> None:
     state = _read_state(session_id)
     state.update(fields)
     state["at"] = time.time()
-    tmp = STATE_DIR / f"{session_id}.json.tmp"
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    tmp.replace(STATE_DIR / f"{session_id}.json")
+    # PER-PROCESS temp name. A shared one was safe while the flock made this the
+    # only writer of a session's state — but the SessionEnd backstop now records
+    # breadcrumbs here too, and it does NOT take that lock. Two processes
+    # sharing one temp path interleave their writes and publish a spliced file,
+    # which for this file means a corrupt cursor.
+    tmp = STATE_DIR / f"{session_id}.json.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(STATE_DIR / f"{session_id}.json")
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ── health breadcrumb ─────────────────────────────────────────────────

@@ -463,11 +463,23 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     # keys (e.g. id_token) the SDK's OAuthToken model wasn't already validating
     # here. Auth0 omits refresh_token when rotation is off; keep the old one.
     updated = dict(cached)
-    for k in ("access_token", "expires_in", "scope", "token_type"):
-        if k in fresh:
+    # Type-checked before merging. These fields are echoed straight back onto
+    # the wire as a bearer, and a malformed response — a dict where a string
+    # belongs — would be written to the cache and then formatted into an
+    # Authorization header, failing later as a puzzling 401 rather than here as
+    # a bad refresh. Skipping a wrong-typed field keeps the previous, valid one.
+    for k in ("access_token", "scope", "token_type"):
+        if isinstance(fresh.get(k), str) and fresh[k]:
             updated[k] = fresh[k]
-    if fresh.get("refresh_token"):
+    if isinstance(fresh.get("expires_in"), (int, float)):
+        updated["expires_in"] = fresh["expires_in"]
+    if isinstance(fresh.get("refresh_token"), str) and fresh["refresh_token"]:
         updated["refresh_token"] = fresh["refresh_token"]
+    # A refresh that returned no usable access token is not a refresh. Writing
+    # the old document back would be harmless but pointless; bailing keeps the
+    # cache untouched and lets the caller fall through to the existing token.
+    if not isinstance(updated.get("access_token"), str):
+        return
     # ATOMIC, and that matters more now than it used to. Several hooks resolve
     # a credential concurrently — the per-turn flush, the SessionEnd backstop,
     # and the PreToolUse directive check, which fires on every edit — so a
@@ -480,14 +492,27 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     # or the new one. Created 0600 by os.open rather than chmod'd afterwards,
     # so the secret is never briefly world-readable. Two writers racing is
     # harmless: both wrote a valid token, and rename picks one whole.
+    # The temp name is PER PROCESS. A single shared `.json.tmp` is not actually
+    # atomic under concurrency: two hooks refreshing at once would open the same
+    # temp file with O_TRUNC, interleave their writes, and rename whichever
+    # finished last — publishing a spliced file. Renaming a private temp means
+    # each writer publishes its own complete document, and the loser of the race
+    # is simply overwritten by an equally valid one.
+    #
+    # Cleaned up on failure, so a crashed refresh does not leave debris in the
+    # user's config dir forever.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
         fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(updated))
         tmp.replace(path)
     except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return
 
 

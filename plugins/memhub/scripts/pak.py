@@ -127,15 +127,23 @@ def save(mcp_url: str, record: dict) -> None:
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = key_path(mcp_url)
-    tmp = path.with_suffix(".json.tmp")
+    # Per-process temp name, so two logins racing cannot interleave into one
+    # shared file and publish a spliced secret — a rename only ever promotes a
+    # document one process wrote whole.
+    #
     # Created 0600 by os.open rather than written-then-chmod'd. The obvious
     # spelling leaves the secret briefly at the process umask — 0644 on a
     # default setup — which is a real window on a shared machine, and a
     # pointless one when opening with the mode costs nothing.
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(record))
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(record))
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def forget(mcp_url: str) -> None:
