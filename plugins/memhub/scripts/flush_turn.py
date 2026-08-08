@@ -62,6 +62,7 @@ from transcript_filter import drop_command_wrappers  # noqa: E402
 # importable under a bare python3 — that is what lets the cursor/tail/lock
 # logic, where the silent failures live, be tested without the dependency.
 # Nothing here needs the SDK any more, so the indirection went with it.
+import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
@@ -154,22 +155,16 @@ def _save_state(session_id: str, **fields) -> None:
     Atomic, because a torn read that reported a larger offset than was actually
     shipped would skip those records for good.
     """
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
     state = _read_state(session_id)
     state.update(fields)
     state["at"] = time.time()
-    # PER-PROCESS temp name. A shared one was safe while the flock made this the
-    # only writer of a session's state — but the SessionEnd backstop now records
-    # breadcrumbs here too, and it does NOT take that lock. Two processes
-    # sharing one temp path interleave their writes and publish a spliced file,
-    # which for this file means a corrupt cursor.
-    tmp = STATE_DIR / f"{session_id}.json.{os.getpid()}.tmp"
-    try:
-        tmp.write_text(json.dumps(state), encoding="utf-8")
-        tmp.replace(STATE_DIR / f"{session_id}.json")
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    # Shared writer, because this file has more than one. The flock used to make
+    # the per-turn hook its only writer, but the SessionEnd backstop now records
+    # breadcrumbs here too and does NOT take that lock — so the concurrency this
+    # guards against is real, and a spliced write here means a corrupt cursor.
+    # 0644: a cursor is not a secret, and the dir is the user's own.
+    atomic_write.publish(STATE_DIR / f"{session_id}.json",
+                            json.dumps(state), mode=0o644)
 
 
 # ── health breadcrumb ─────────────────────────────────────────────────

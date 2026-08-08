@@ -12,8 +12,18 @@ hole in the middle of the conversation.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+# HOME is redirected BEFORE the import, because this module resolves its
+# breadcrumb directory from Path.home() at import time. Without this the tests
+# write breadcrumbs into the developer's REAL ~/.config/memhub-plugin — which
+# they did, and which would also let a test's fake session id show up in the
+# health check's warnings on a real machine.
+_TMP_HOME = tempfile.mkdtemp(prefix="flush-session-test-")
+os.environ["HOME"] = _TMP_HOME
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.

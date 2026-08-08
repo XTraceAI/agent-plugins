@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # The version this client was written and verified against. Sent so the server
@@ -163,6 +164,30 @@ def _decode(body: str, content_type: str) -> dict:
         raise McpError(f"reply was not JSON: {body[:200]!r}") from exc
 
 
+def require_secure(url: str) -> None:
+    """Refuse to put a credential on a cleartext connection.
+
+    The endpoint ultimately comes from ``$MEMHUB_MCP_BASE_URL`` or the plugin's
+    ``.mcp.json``, so an ``http://`` value — misconfigured or planted — would
+    send the bearer in the clear while everything still appeared to work.
+
+    Loopback is exempt: it never leaves the machine, and refusing it would make
+    a local backend impossible to develop against.
+
+    Lives here rather than beside its first caller because there are now two
+    credential-carrying paths — the MCP endpoint and the access-key REST API —
+    and two copies of a security check is one copy too many.
+    """
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme == "https":
+        return
+    if (parts.hostname or "").lower() in ("localhost", "127.0.0.1", "::1"):
+        return
+    raise McpError(
+        f"refusing to send credentials to {parts.scheme}://{parts.netloc} in "
+        "cleartext — https is required. Check $MEMHUB_MCP_BASE_URL.")
+
+
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
     """Refuse redirects instead of following them.
 
@@ -201,6 +226,7 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
     Raises ``McpError`` (or ``McpRateLimited``) on anything that is not a
     well-formed successful reply.
     """
+    require_secure(url)
     payload = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         payload["params"] = params

@@ -54,6 +54,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
@@ -74,23 +75,44 @@ def _log(msg: str) -> None:
     print(f"[memhub-flush] {msg}")
 
 
-def _breadcrumb(session_id, reason: str, detail: str = "") -> None:
-    """Record a transport failure where `capture_health` will find it.
+# This hook's breadcrumbs go in their OWN file, beside the per-turn hook's.
+#
+# The obvious thing — write into the per-turn state file, which already has the
+# format and the writer — is wrong, and subtly so. `_save_state` is a
+# read-modify-write, and the per-turn flush serialises its own writes with a
+# flock that this hook does not hold. Making the files atomic fixed torn reads
+# but not LOST UPDATES: both processes read, both modify, both write, and the
+# later writer silently discards the earlier one's changes. For that file the
+# discarded change could be the cursor, which means re-sent or skipped records.
+#
+# Two files and no shared mutable state beats one file and a lock: there is no
+# window to get wrong, and `capture_health` already scans the directory rather
+# than any particular name.
+_SESSION_STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
-    Delegates to the per-turn hook's writer rather than reimplementing it.
-    That module OWNS this state file — its merge semantics, its atomic write,
-    its rule that a breadcrumb never touches the cursor — and a second
-    implementation of the same format is how two writers drift apart. The two
-    hooks key on the same session id, so a failure recorded here is retracted
-    by a later per-turn success exactly as its own failures are.
+
+def _breadcrumb(session_id, reason: str, detail: str = "",
+                ok: bool = False) -> None:
+    """Record this path's outcome where `capture_health` will find it.
+
+    Same field names as the per-turn hook, because the health check reads one
+    vocabulary; a separate FILE, because the two hooks have no lock in common.
 
     Never raises: a breadcrumb is not worth failing a flush over.
     """
     if not session_id:
         return
     try:
-        from flush_turn import _mark_failure  # noqa: PLC0415 — sibling hook
-        _mark_failure(str(session_id), reason, detail)
+        record = {"at": time.time()}
+        if ok:
+            record["last_ok_at"] = time.time()
+        else:
+            record.update(last_error=reason,
+                          last_error_detail=(detail or "")[:200] or None,
+                          last_error_at=time.time())
+        atomic_write.publish(
+            _SESSION_STATE_DIR / f"{session_id}.sessionflush.json",
+            json.dumps(record), mode=0o644)
     except Exception:  # noqa: BLE001
         pass
 
@@ -376,6 +398,11 @@ async def _send(session, arguments, room, title, namespace,
              f"(conv {str(out.get('conversation_id'))[:8]}, "
              f"path={out.get('path')}) -> {dest} "
              "— server processes the delta")
+        # Retract any earlier failure on this path. Without it a single
+        # throttled slice would keep warning for a day even though the backstop
+        # went on to work — the same crying-wolf the per-turn hook clears with
+        # `_mark_success`.
+        _breadcrumb(arguments.get("conversation_id"), "", ok=True)
         return True
     # Not an error per the protocol, but not the shape import_conversation
     # returns either — log what came back instead of claiming success on an

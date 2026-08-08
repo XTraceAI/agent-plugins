@@ -27,11 +27,14 @@ Resolution order:
    (below) before the SDK runs — see that function for why the SDK's own
    ``OAuthClientProvider`` refresh can't be relied on from a cold process.
 
-Usage from a sibling script:
+Usage — the HOOKS take the stdlib path and never load the SDK:
 
-    from _memhub_auth import resolve_url_and_auth
-    url, headers, auth = resolve_url_and_auth()
-    async with streamablehttp_client(url, headers=headers, auth=auth) as ...
+    from _memhub_auth import resolve_bearer
+    url, bearer = resolve_bearer()          # None when nothing is usable
+    mcp_http.call_tool(url, bearer, ...)
+
+Only the interactive browser flow still needs the SDK, via
+``resolve_url_and_auth`` / ``build_oauth``, and only ``login.py`` calls it.
 
 Self-check:  uv run --with 'mcp<2' python _memhub_auth.py
 """
@@ -424,6 +427,8 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         cached = json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — no/unreadable cache → nothing to refresh
         return
+    if not isinstance(cached, dict):
+        return  # valid JSON, wrong shape — nothing to refresh from
     refresh_token = cached.get("refresh_token")
     if not refresh_token:
         return
@@ -440,6 +445,12 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     token_endpoint = _auth_token_endpoint()
     client_id = _plugin_mcp_config().get("oauth", {}).get("clientId")
     if not token_endpoint or not client_id:
+        return
+    # The refresh token — a long-lived credential — is POSTed here, and the
+    # endpoint comes from a discovery document named in .mcp.json rather than
+    # from anything we control. Same rule as every other credentialed call:
+    # https, or don't send it.
+    if urlparse(token_endpoint).scheme != "https":
         return
 
     data = urllib.parse.urlencode({
@@ -492,27 +503,19 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     # or the new one. Created 0600 by os.open rather than chmod'd afterwards,
     # so the secret is never briefly world-readable. Two writers racing is
     # harmless: both wrote a valid token, and rename picks one whole.
-    # The temp name is PER PROCESS. A single shared `.json.tmp` is not actually
-    # atomic under concurrency: two hooks refreshing at once would open the same
-    # temp file with O_TRUNC, interleave their writes, and rename whichever
-    # finished last — publishing a spliced file. Renaming a private temp means
-    # each writer publishes its own complete document, and the loser of the race
-    # is simply overwritten by an equally valid one.
+    # Several hooks refresh concurrently — the per-turn flush, the SessionEnd
+    # backstop, and the PreToolUse check that fires on every edit — so a torn
+    # write here is not hypothetical, and a reader catching one concludes there
+    # is no usable credential and skips. See `atomic_write` for why the temp
+    # name has to be per-process rather than shared.
     #
-    # Cleaned up on failure, so a crashed refresh does not leave debris in the
-    # user's config dir forever.
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    # Best-effort, like the rest of this function: a refresh that cannot be
+    # persisted leaves the previous token in place for the caller to use.
     try:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(updated))
-        tmp.replace(path)
+        import atomic_write  # noqa: PLC0415 — stdlib, beside this file
+
+        atomic_write.publish(path, json.dumps(updated))
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return
 
 
@@ -552,6 +555,12 @@ def resolve_bearer(url: str | None = None) -> tuple[str, str | None]:
     try:
         cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
+        return url, None
+    # Valid JSON is not necessarily an OBJECT. A cache holding `"a string"`
+    # or `[1,2]` would reach .get() and raise AttributeError, which is not
+    # in the tuple above — so it would escape a function whose entire
+    # contract is to return None when there is nothing usable.
+    if not isinstance(cached, dict):
         return url, None
     access = cached.get("access_token")
     if not access:
