@@ -51,12 +51,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from mcp.client.auth import OAuthClientProvider, TokenStorage
-from mcp.shared.auth import (
-    OAuthClientInformationFull,
-    OAuthClientMetadata,
-    OAuthToken,
-)
+# The mcp SDK is imported LAZILY, inside `build_oauth`, and nowhere else.
+#
+# It is needed for exactly one thing: the interactive browser flow, whose PKCE
+# and token-exchange machinery is genuinely worth not hand-rolling. Everything
+# else here — reading a cached token, refreshing it, resolving a bearer — is
+# stdlib already.
+#
+# Keeping it out of module scope is what lets the hooks import this file under a
+# bare python3. Measured, that is 0.07s against 1.09s for `uv run --with
+# 'mcp<2'`, and three of the hooks paying that cost are SYNCHRONOUS — the
+# PreToolUse directive check has no prefilter, so it was a second of latency on
+# every single file edit.
 
 _CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 
@@ -133,38 +139,51 @@ def token_cache_path(url: str) -> Path:
     return _CACHE_DIR / f"tokens-{urlparse(url).netloc.replace(':', '_')}.json"
 
 
-class _FileTokenStorage(TokenStorage):
-    """Token cache keyed by server host; client info seeded statically from
-    .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
-    a pre-registered public client — same one /mcp uses)."""
+def _file_token_storage(url: str, client_id: str, redirect_uri: str):
+    """The SDK's ``TokenStorage`` over our cache file.
 
-    def __init__(self, url: str, client_id: str, redirect_uri: str):
-        self._path = token_cache_path(url)
-        self._client_id = client_id
-        self._redirect_uri = redirect_uri
+    Defined INSIDE a function because it subclasses an SDK type, and a
+    subclass at module scope would force the import that this module exists to
+    avoid — the whole point being that a hook can import this file under a bare
+    python3. It is only ever constructed by ``build_oauth``, which already has
+    the SDK loaded.
+    """
+    from mcp.client.auth import TokenStorage
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-    async def get_tokens(self) -> OAuthToken | None:
-        try:
-            return OAuthToken.model_validate_json(self._path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return None
+    class _FileTokenStorage(TokenStorage):
+        """Token cache keyed by server host; client info seeded statically from
+        .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
+        a pre-registered public client — same one /mcp uses)."""
 
-    async def set_tokens(self, tokens: OAuthToken) -> None:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(tokens.model_dump_json(), encoding="utf-8")
-        self._path.chmod(0o600)
+        def __init__(self):
+            self._path = token_cache_path(url)
 
-    async def get_client_info(self) -> OAuthClientInformationFull | None:
-        return OAuthClientInformationFull(
-            client_id=self._client_id,
-            redirect_uris=[self._redirect_uri],
-            token_endpoint_auth_method="none",
-            grant_types=["authorization_code", "refresh_token"],
-            response_types=["code"],
-        )
+        async def get_tokens(self):
+            try:
+                return OAuthToken.model_validate_json(
+                    self._path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                return None
 
-    async def set_client_info(self, info: OAuthClientInformationFull) -> None:
-        return None  # static public client — nothing to persist
+        async def set_tokens(self, tokens) -> None:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(tokens.model_dump_json(), encoding="utf-8")
+            self._path.chmod(0o600)
+
+        async def get_client_info(self):
+            return OAuthClientInformationFull(
+                client_id=client_id,
+                redirect_uris=[redirect_uri],
+                token_endpoint_auth_method="none",
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+            )
+
+        async def set_client_info(self, info) -> None:
+            return None  # static public client — nothing to persist
+
+    return _FileTokenStorage()
 
 
 class NonInteractiveAuthRequired(RuntimeError):
@@ -178,7 +197,15 @@ class NonInteractiveAuthRequired(RuntimeError):
     """
 
 
-def build_oauth(url: str, interactive: bool = True) -> OAuthClientProvider:
+def build_oauth(url: str, interactive: bool = True):
+    """The SDK's OAuth provider — the ONE place the mcp package is required.
+
+    Only ``login.py`` reaches here now. The hooks resolve a static bearer
+    instead (see ``resolve_bearer``) and never load the SDK at all.
+    """
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
+
     cfg = _plugin_mcp_config()
     oauth_cfg = cfg.get("oauth", {})
     client_id = oauth_cfg.get("clientId")
@@ -204,7 +231,7 @@ def build_oauth(url: str, interactive: bool = True) -> OAuthClientProvider:
             response_types=["code"],
             token_endpoint_auth_method="none",
         ),
-        storage=_FileTokenStorage(url, client_id, redirect_uri),
+        storage=_file_token_storage(url, client_id, redirect_uri),
         redirect_handler=redirect_handler,
         callback_handler=_make_callback_handler(port),
     )
@@ -447,6 +474,54 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         path.chmod(0o600)
     except OSError:
         return
+
+
+def resolve_bearer(url: str | None = None) -> tuple[str, str | None]:
+    """``(url, bearer)`` for a NON-INTERACTIVE caller — stdlib only, no SDK.
+
+    This is what every hook uses now. It returns the same credential the SDK
+    would have ended up putting on the wire, without loading the SDK to get
+    there:
+
+    1. ``$MEMHUB_TOKEN`` — explicit bearer, CI/headless;
+    2. a stored personal access key — the normal path once /memhub:login has
+       run, and a static string with no lifecycle to manage;
+    3. the cached OAuth access token, refreshed first if stale. Worth keeping
+       even though a key supersedes it: an install that has not re-logged-in
+       since keys existed keeps working instead of going dark on upgrade, and
+       the refresh shim was already pure stdlib.
+
+    ``bearer`` is None when there is nothing usable, which is not an error —
+    it is the state a background hook must degrade quietly on. The caller skips,
+    and `capture_health` is what tells the user, on a synchronous hook, where
+    saying it actually reaches them.
+    """
+    url = url or default_url()
+
+    token = os.environ.get("MEMHUB_TOKEN", "").strip()
+    if token:
+        return url, token
+
+    record = _stored_pak(url)
+    if record:
+        return url, record["secret"]
+
+    # Renew before reading: the cached access token is short-lived, and this
+    # shim is the only thing that ever renews it from a cold process.
+    _refresh_cached_token_if_stale(url)
+    try:
+        cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return url, None
+    access = cached.get("access_token")
+    if not access:
+        return url, None
+    # An expired token is not worth a round trip that will 401. Unknown expiry
+    # (opaque token) is sent anyway — refusing to guess beats refusing to work.
+    exp = _access_token_expiry(access)
+    if exp is not None and time.time() >= exp:
+        return url, None
+    return url, access
 
 
 def _stored_pak(url: str) -> dict | None:

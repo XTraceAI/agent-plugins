@@ -324,10 +324,9 @@ def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    import mcp_http
 
-    from _memhub_auth import resolve_url_and_auth
+    from _memhub_auth import resolve_bearer
     from brain_resolve import resolve_repo_brain
     from room_map import env_for_url
 
@@ -396,163 +395,159 @@ async def _flush(session_id: str, transcript_path: str) -> None:
 
     # This delta's title if it carries one, else whatever we last saw.
     title, custom = _titles(records, state)
-    url, headers, auth = resolve_url_and_auth(interactive=False)
+    url, bearer = resolve_bearer()
+    if not bearer:
+        # Not an error — the state a background hook must degrade quietly on.
+        # Raised rather than returned so the one handler in main() records the
+        # breadcrumb, keeping every failure path reported the same way.
+        raise _NoCredential("no usable credential (key, token or cached login)")
     # Resolved AFTER the url — prod and staging hold different brain ids for the
     # same repo. Only when the TRANSCRIPT said where it ran: a hook can fire
     # from a different repo than the session's, and an unknown origin must
     # degrade to personal memory rather than guess a room.
     env = env_for_url(url)
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            # Cached hit is a dict lookup; a miss asks the server once and
-            # caches the answer, so this is not a per-turn round-trip.
-            room = await resolve_repo_brain(session, cwd, env) if cwd else None
-            arguments = {
-                "messages": sendable,
-                "conversation_id": session_id,
-                "source_platform": "claude",
-                # The whole point: durable on arrival, extracted in batches.
-                "flush": "auto",
-            }
-            if room:
-                arguments["agent_brain_id"] = room["brain_id"]
-                # The org that OWNS the room, when it is not the caller's
-                # default. A brain resolves inside exactly ONE org, and the
-                # default follows whichever org was last selected in the MemHub
-                # app — so it changes under a running session. Sending the id
-                # without its org is how every capture into such a room failed
-                # with "Agent brain not found": silently, because this hook is
-                # async and its output goes nowhere, and indistinguishably from
-                # a deleted brain.
-                if room.get("org_id"):
-                    arguments["org_id"] = room["org_id"]
-            if namespace:
-                arguments["namespace"] = namespace
-            if title:
-                # Re-sent on every flush so a regenerated title updates the
-                # conversation rather than sticking at whatever the first
-                # turn happened to be called.
-                arguments["title"] = title
-            res = await session.call_tool("import_conversation", arguments=arguments)
+    # No connection to open: the server is stateless, so a Session is just
+    # the endpoint and the credential. Verified against the live server —
+    # it negotiates no session id and does not require `initialize`, so this
+    # is ONE round trip where the SDK did three.
+    session = mcp_http.Session(url, bearer, timeout=_flush_timeout_s())
+    # No `initialize` handshake: verified against the live server, a fresh
+    # process can call a tool directly and get a result. Dropping it removes two
+    # of the three round trips this hook used to make per turn.
+    # Cached hit is a dict lookup; a miss asks the server once and
+    # caches the answer, so this is not a per-turn round-trip.
+    room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    arguments = {
+        "messages": sendable,
+        "conversation_id": session_id,
+        "source_platform": "claude",
+        # The whole point: durable on arrival, extracted in batches.
+        "flush": "auto",
+    }
+    if room:
+        arguments["agent_brain_id"] = room["brain_id"]
+        # The org that OWNS the room, when it is not the caller's
+        # default. A brain resolves inside exactly ONE org, and the
+        # default follows whichever org was last selected in the MemHub
+        # app — so it changes under a running session. Sending the id
+        # without its org is how every capture into such a room failed
+        # with "Agent brain not found": silently, because this hook is
+        # async and its output goes nowhere, and indistinguishably from
+        # a deleted brain.
+        if room.get("org_id"):
+            arguments["org_id"] = room["org_id"]
+    if namespace:
+        arguments["namespace"] = namespace
+    if title:
+        # Re-sent on every flush so a regenerated title updates the
+        # conversation rather than sticking at whatever the first
+        # turn happened to be called.
+        arguments["title"] = title
+    res = await session.call_tool("import_conversation", arguments=arguments)
 
-            # MCP signals tool failure via isError + a message, NOT an
-            # exception. Without this the cursor would advance past records the
-            # server rejected, losing them permanently.
-            texts = [t for t in (getattr(b, "text", None)
-                                 for b in getattr(res, "content", []) or []) if t]
-            if getattr(res, "isError", False):
-                detail = (texts[0] if texts else "no detail")[:200]
-                _log(f"flush FAILED: {detail}")
-                _mark_failure(session_id, "server_rejected", detail)
-                return
+    # MCP signals tool failure via isError + a message, NOT an
+    # exception. Without this the cursor would advance past records the
+    # server rejected, losing them permanently.
+    texts = [t for t in (getattr(b, "text", None)
+                         for b in getattr(res, "content", []) or []) if t]
+    if getattr(res, "isError", False):
+        detail = (texts[0] if texts else "no detail")[:200]
+        _log(f"flush FAILED: {detail}")
+        _mark_failure(session_id, "server_rejected", detail)
+        return
 
-            out = getattr(res, "structuredContent", None)
-            if isinstance(out, dict) and "conversation_id" not in out \
-                    and isinstance(out.get("result"), dict):
-                out = out["result"]  # FastMCP wraps some returns
-            if not isinstance(out, dict):
-                for text in texts:
-                    try:
-                        out = json.loads(text)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            if not isinstance(out, dict) or "conversation_id" not in out:
-                # Unrecognized body: do NOT advance. Re-sending is free.
-                detail = (texts[0] if texts else "")[:120]
-                _log(f"response unrecognized: {detail!r}")
-                _mark_failure(session_id, "unrecognized_response", detail)
-                return
+    out = getattr(res, "structuredContent", None)
+    if isinstance(out, dict) and "conversation_id" not in out \
+            and isinstance(out.get("result"), dict):
+        out = out["result"]  # FastMCP wraps some returns
+    if not isinstance(out, dict):
+        for text in texts:
+            try:
+                out = json.loads(text)
+                break
+            except json.JSONDecodeError:
+                continue
+    if not isinstance(out, dict) or "conversation_id" not in out:
+        # Unrecognized body: do NOT advance. Re-sending is free.
+        detail = (texts[0] if texts else "")[:120]
+        _log(f"response unrecognized: {detail!r}")
+        _mark_failure(session_id, "unrecognized_response", detail)
+        return
 
-            # ``ack_through`` is only returned by a server that performed the
-            # durable receive this hook depends on. Without it we are talking to
-            # an older server that queues the import in the background and
-            # treats every turn as an immediate extraction — per-turn LLM cost,
-            # and the episode fragmentation the batching exists to avoid. Say so
-            # loudly; silently doing the expensive wrong thing is worse than
-            # noisy logs a user can act on.
-            if "ack_through" not in out:
-                # This server queues the import in the background instead of
-                # committing it before replying, so a well-formed response
-                # does NOT mean the records are durable — advancing on it
-                # could drop them. It also extracts every turn immediately,
-                # which is the cost this hook exists to avoid. Go dormant for
-                # the session rather than pay for the wrong behaviour: the
-                # commit/PR and SessionEnd hooks still capture it.
-                _log("server has no per-turn support (no ack_through) — "
-                     "disabling per-turn flush for this session; commit/PR "
-                     "and session-end capture still apply. Upgrade the MemHub "
-                     "server to enable it.")
-                # ``unsupported`` and NOT a failure breadcrumb. This is a
-                # deliberate degrade, not a break: per-turn goes dormant while
-                # the commit/PR and SessionEnd paths keep capturing, so there
-                # is nothing the user must drop what they are doing to fix.
-                #
-                # It also cannot be retracted. Dormancy means no further flush
-                # runs, so no success can ever clear a breadcrumb — and because
-                # the condition is environmental, every NEW session rediscovers
-                # it and warns again. That is a banner on every session start
-                # for a day, about a known state with a working fallback, which
-                # is precisely how a warning becomes wallpaper and stops being
-                # read on the day it matters.
-                #
-                # Surfacing it properly needs a once-ever channel keyed by
-                # server, not the per-session one; until then the log line
-                # above records it.
-                _save_state(session_id, unsupported=True)
-                return
+    # ``ack_through`` is only returned by a server that performed the
+    # durable receive this hook depends on. Without it we are talking to
+    # an older server that queues the import in the background and
+    # treats every turn as an immediate extraction — per-turn LLM cost,
+    # and the episode fragmentation the batching exists to avoid. Say so
+    # loudly; silently doing the expensive wrong thing is worse than
+    # noisy logs a user can act on.
+    if "ack_through" not in out:
+        # This server queues the import in the background instead of
+        # committing it before replying, so a well-formed response
+        # does NOT mean the records are durable — advancing on it
+        # could drop them. It also extracts every turn immediately,
+        # which is the cost this hook exists to avoid. Go dormant for
+        # the session rather than pay for the wrong behaviour: the
+        # commit/PR and SessionEnd hooks still capture it.
+        _log("server has no per-turn support (no ack_through) — "
+             "disabling per-turn flush for this session; commit/PR "
+             "and session-end capture still apply. Upgrade the MemHub "
+             "server to enable it.")
+        # ``unsupported`` and NOT a failure breadcrumb. This is a
+        # deliberate degrade, not a break: per-turn goes dormant while
+        # the commit/PR and SessionEnd paths keep capturing, so there
+        # is nothing the user must drop what they are doing to fix.
+        #
+        # It also cannot be retracted. Dormancy means no further flush
+        # runs, so no success can ever clear a breadcrumb — and because
+        # the condition is environmental, every NEW session rediscovers
+        # it and warns again. That is a banner on every session start
+        # for a day, about a known state with a working fallback, which
+        # is precisely how a warning becomes wallpaper and stops being
+        # read on the day it matters.
+        #
+        # Surfacing it properly needs a once-ever channel keyed by
+        # server, not the per-session one; until then the log line
+        # above records it.
+        _save_state(session_id, unsupported=True)
+        return
 
-            # Committed server-side — only now is it safe to move the cursor.
-            # ``custom_title`` is stored SEPARATELY from the title that was
-            # sent, and only when there is one: it is the one source a later
-            # delta must not be able to override, and merging a None over it
-            # would let the next ``ai-title`` — which the client keeps
-            # emitting with the pre-rename value — take the name back.
-            _mark_success(session_id, offset=consumed,
-                          last_uuid=out.get("ack_through"), cwd=cwd,
-                          namespace=namespace, title=title,
-                          **({"custom_title": custom} if custom else {}))
-            # Sent count, not read count — and the byte span stays the READ
-            # span, because that is what the cursor just advanced past. The
-            # filtered records are the difference between the two, so showing
-            # it makes an under-sent delta diagnosable from the log alone.
-            filtered = len(records) - len(sendable)
-            _log(f"+{len(sendable)} rec ({consumed - offset}B) "
-                 + (f"filtered={filtered} " if filtered else "")
-                 + f"new={out.get('records_new')} pending={out.get('pending')} "
-                 f"draining={out.get('draining')}")
+    # Committed server-side — only now is it safe to move the cursor.
+    # ``custom_title`` is stored SEPARATELY from the title that was
+    # sent, and only when there is one: it is the one source a later
+    # delta must not be able to override, and merging a None over it
+    # would let the next ``ai-title`` — which the client keeps
+    # emitting with the pre-rename value — take the name back.
+    _mark_success(session_id, offset=consumed,
+                  last_uuid=out.get("ack_through"), cwd=cwd,
+                  namespace=namespace, title=title,
+                  **({"custom_title": custom} if custom else {}))
+    # Sent count, not read count — and the byte span stays the READ
+    # span, because that is what the cursor just advanced past. The
+    # filtered records are the difference between the two, so showing
+    # it makes an under-sent delta diagnosable from the log alone.
+    filtered = len(records) - len(sendable)
+    _log(f"+{len(sendable)} rec ({consumed - offset}B) "
+         + (f"filtered={filtered} " if filtered else "")
+         + f"new={out.get('records_new')} pending={out.get('pending')} "
+         f"draining={out.get('draining')}")
 
 
-def _auth_required(e: BaseException) -> bool:
-    """True if NonInteractiveAuthRequired is anywhere in the exception tree.
+class _NoCredential(RuntimeError):
+    """No usable bearer. Replaces the SDK's NonInteractiveAuthRequired.
 
-    The MCP client runs auth inside anyio task groups, so our raise can surface
-    wrapped in ExceptionGroups or as a __cause__.
-
-    The import is lazy and guarded: when the mcp SDK itself is what failed to
-    load, there is no auth class to compare against and the answer is simply no.
+    A plain exception now, not something buried in an anyio task group, so the
+    handler recognises it by type instead of walking an exception tree — which
+    is what the SDK's wrapping forced.
     """
-    try:
-        from _memhub_auth import NonInteractiveAuthRequired
-    except Exception:  # noqa: BLE001 — the SDK is what's missing
-        return False
 
-    seen: set[int] = set()
-    stack: list[BaseException] = [e]
-    while stack:
-        exc = stack.pop()
-        if id(exc) in seen:
-            continue
-        seen.add(id(exc))
-        if isinstance(exc, NonInteractiveAuthRequired):
-            return True
-        stack.extend(getattr(exc, "exceptions", ()) or ())
-        for link in (exc.__cause__, exc.__context__):
-            if link is not None:
-                stack.append(link)
-    return False
+
+# `_auth_required` used to live here: thirty lines walking an exception tree
+# for NonInteractiveAuthRequired, because the SDK raised it inside anyio task
+# groups and it surfaced wrapped in ExceptionGroups or chained as __cause__.
+# Resolving the credential ourselves means the miss is now a plain exception
+# raised on our own stack, so `isinstance` is the whole check.
 
 
 def main() -> int:
@@ -589,8 +584,8 @@ def main() -> int:
         if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
             reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
-        elif _auth_required(e):
-            _log("no cached OAuth token; run /memhub:login "
+        elif isinstance(e, _NoCredential):
+            _log("no usable credential; run /memhub:login "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
             # The one failure the user must act on personally, and the one that
             # stays broken forever until they do: no retry can mint a token.
