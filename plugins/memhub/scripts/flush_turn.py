@@ -562,14 +562,23 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # Surfacing it properly needs a once-ever channel keyed by
         # server, not the per-session one; until then the log line
         # above records it.
-        # Clears any recorded failure, and stamps a success — because reaching
-        # this branch means the call WORKED. The credential, the transport and
-        # the server are all fine; the server merely lacks the feature. Leaving
-        # an older `last_error` here would strand it forever, since dormancy
-        # means no later flush ever runs to retract it, and the health check
-        # would keep reporting a problem that has been superseded by a
-        # deliberate, non-actionable state.
-        _mark_success(session_id, unsupported=True)
+        # Clears THIS path's stale error, and deliberately does NOT stamp
+        # `last_ok_at`.
+        #
+        # Stamping one was a bug: since the health check retracts a failure when
+        # any path reports success for the same session, a success recorded here
+        # would silently retract a REAL failure the SessionEnd backstop had
+        # recorded — reintroducing the invisible capture failure this whole
+        # series exists to remove, and doing it from a branch that captured
+        # nothing.
+        #
+        # Clearing the error is still right: dormancy means no later per-turn
+        # flush runs to retract it, so an older error would be stranded forever.
+        # But this branch speaks only for itself. It reached the server and got
+        # an answer; it did not capture anything, so it is in no position to
+        # vouch for another path.
+        _save_state(session_id, unsupported=True, last_error=None,
+                    last_error_detail=None, last_error_at=None)
         return
 
     # Committed server-side — only now is it safe to move the cursor.

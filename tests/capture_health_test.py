@@ -246,6 +246,17 @@ def test_breadcrumbs() -> None:
     check("a backstop success retracts a per-turn failure",
           ch._recent_failure(), None)
 
+    # Dormancy is not a success. The per-turn hook clears its OWN stale error
+    # when it goes dormant on an old server, but must not stamp `last_ok_at` —
+    # that would retract a REAL failure the backstop recorded for the same
+    # session, from a branch that captured nothing.
+    _reset()
+    _write_state("s5.sessionflush", last_error="auth", last_error_at=now - 60)
+    _write_state("s5", unsupported=True)          # dormant: no last_ok_at
+    got = ch._recent_failure()
+    check("dormancy does not retract a real backstop failure",
+          got and got[0], "auth")
+
     # An OLDER success must not retract a NEWER failure.
     _reset()
     _write_state("s4.sessionflush", last_error="error", last_error_at=now - 60)
