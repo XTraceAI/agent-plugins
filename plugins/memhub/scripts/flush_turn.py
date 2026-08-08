@@ -560,7 +560,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # Surfacing it properly needs a once-ever channel keyed by
         # server, not the per-session one; until then the log line
         # above records it.
-        _save_state(session_id, unsupported=True)
+        # Clears any recorded failure, and stamps a success — because reaching
+        # this branch means the call WORKED. The credential, the transport and
+        # the server are all fine; the server merely lacks the feature. Leaving
+        # an older `last_error` here would strand it forever, since dormancy
+        # means no later flush ever runs to retract it, and the health check
+        # would keep reporting a problem that has been superseded by a
+        # deliberate, non-actionable state.
+        _mark_success(session_id, unsupported=True)
         return
 
     # Committed server-side — only now is it safe to move the cursor.

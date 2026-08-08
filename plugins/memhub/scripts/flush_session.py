@@ -387,8 +387,13 @@ async def _send(session, arguments, room, title, namespace,
     # exception — without this check a bad token or server error logs as
     # success while memory never updates.
     if getattr(res, "isError", False):
-        _log(f"{label}flush FAILED: "
-             f"{(texts[0] if texts else 'no detail')[:200]}")
+        detail = (texts[0] if texts else "no detail")[:200]
+        _log(f"{label}flush FAILED: {detail}")
+        # Breadcrumbed like the transport failures above. Leaving this path
+        # silent made the backstop's MOST LIKELY server-side failure — a slice
+        # the server rejects — the one it reported least, which is the same
+        # asymmetry the transport paths were fixed for one round earlier.
+        _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
         return False
     out = getattr(res, "structuredContent", None)
     if isinstance(out, dict) and "conversation_id" not in out \
@@ -420,8 +425,11 @@ async def _send(session, arguments, room, title, namespace,
     # Not an error per the protocol, but not the shape import_conversation
     # returns either — log what came back instead of claiming success on an
     # arbitrary body, and stop: an unrecognised reply is not a slice landing.
-    _log(f"{label}flush response unrecognized: "
-         f"{(texts[0] if texts else '')[:120]!r}")
+    detail = (texts[0] if texts else "")[:120]
+    _log(f"{label}flush response unrecognized: {detail!r}")
+    # The last silent exit on this path. Every way `_send` can return False now
+    # leaves a trace — the guarantee is only worth something if it has no holes.
+    _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", detail)
     return False
 
 
