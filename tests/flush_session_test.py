@@ -12,8 +12,18 @@ hole in the middle of the conversation.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+# HOME is redirected BEFORE the import, because this module resolves its
+# breadcrumb directory from Path.home() at import time. Without this the tests
+# write breadcrumbs into the developer's REAL ~/.config/memhub-plugin — which
+# they did, and which would also let a test's fake session id show up in the
+# health check's warnings on a real machine.
+_TMP_HOME = tempfile.mkdtemp(prefix="flush-session-test-")
+os.environ["HOME"] = _TMP_HOME
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.
@@ -48,9 +58,14 @@ class FakeSession:
     def __init__(self, result):
         self.result = result
         self.sent = []
+        self.timeouts = []
 
-    async def call_tool(self, name, arguments=None):
+    async def call_tool(self, name, arguments=None, timeout=None):
+        # `timeout` is recorded, not ignored: each slice is bounded by the
+        # budget REMAINING rather than a fixed share, so a fake that silently
+        # swallowed it would let that bound regress unnoticed.
         self.sent.append((name, arguments))
+        self.timeouts.append(timeout)
         return self.result
 
 
@@ -146,6 +161,19 @@ check("slice 2 stops past the deadline",
 check("slice 2 continues before the deadline",
       fs._stop_before_slice(2, PAST, FUTURE) is False)
 check("exactly at the deadline stops", fs._stop_before_slice(3, PAST, PAST))
+
+# Stops with time still on the clock, if there is not ENOUGH of it. Bounding
+# each slice by the remaining budget means a slice started with two seconds left
+# gets a two-second network timeout and fails — reporting a spurious error in
+# place of a clean stop that names what was not sent.
+check("too little budget left stops before starting",
+      fs._stop_before_slice(2, 0.0, fs._MIN_SLICE_BUDGET_S - 1) is True)
+check("enough budget left proceeds",
+      fs._stop_before_slice(2, 0.0, fs._MIN_SLICE_BUDGET_S + 1) is False)
+# ...but the first slice still always goes: a backstop that sends nothing is
+# not a degraded capture, it is no capture.
+check("the first slice goes regardless",
+      fs._stop_before_slice(1, 0.0, 0.0) is False)
 
 
 # ── which timeout is being reported ───────────────────────────────────

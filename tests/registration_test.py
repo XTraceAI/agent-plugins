@@ -56,7 +56,43 @@ def main() -> int:
         orphans = sorted(defined - named)
         check(f"{path.name} runs every test it defines", orphans, [])
 
+    _check_every_failure_leaves_a_trace()
     return 1 if failures else 0
+
+
+def _check_every_failure_leaves_a_trace() -> None:
+    """Every way the backstop can fail must record a breadcrumb.
+
+    `flush_session._send` returns False on each failure, and this hook is async
+    fire-and-forget — its stdout goes nowhere — so a `return False` with no
+    breadcrumb is an invisible failure in the path whose whole job is catching
+    what per-turn capture missed.
+
+    That gap appeared twice: first the transport exceptions were silent, then
+    once those were fixed the isError and unrecognized-reply paths still were.
+    A guarantee with holes is not one, so it is checked structurally rather
+    than remembered.
+    """
+    print("\nbackstop failure paths")
+    source = (Path(__file__).resolve().parents[1] / "plugins" / "memhub"
+              / "scripts" / "flush_session.py").read_text(encoding="utf-8")
+    body = source.split("async def _send(")[-1].split("\ndef ")[0]
+
+    # Walk the function's lines; every `return False` must have a _breadcrumb
+    # call somewhere in the handful of lines before it.
+    lines = body.splitlines()
+    unguarded = []
+    for i, line in enumerate(lines):
+        if line.strip() != "return False":
+            continue
+        window = "\n".join(lines[max(0, i - 8):i])
+        if "_breadcrumb(" not in window:
+            unguarded.append(i)
+    check("every `return False` in _send breadcrumbs first", unguarded, [])
+    # And that the scan found the returns at all — a test that silently
+    # inspects nothing is worse than no test.
+    check("found the failure exits",
+          len([l for l in lines if l.strip() == "return False"]) >= 3, True)
 
 
 if __name__ == "__main__":

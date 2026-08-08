@@ -27,11 +27,14 @@ Resolution order:
    (below) before the SDK runs — see that function for why the SDK's own
    ``OAuthClientProvider`` refresh can't be relied on from a cold process.
 
-Usage from a sibling script:
+Usage — the HOOKS take the stdlib path and never load the SDK:
 
-    from _memhub_auth import resolve_url_and_auth
-    url, headers, auth = resolve_url_and_auth()
-    async with streamablehttp_client(url, headers=headers, auth=auth) as ...
+    from _memhub_auth import resolve_bearer
+    url, bearer = resolve_bearer()          # None when nothing is usable
+    mcp_http.call_tool(url, bearer, ...)
+
+Only the interactive browser flow still needs the SDK, via
+``resolve_url_and_auth`` / ``build_oauth``, and only ``login.py`` calls it.
 
 Self-check:  uv run --with 'mcp<2' python _memhub_auth.py
 """
@@ -42,6 +45,7 @@ import base64
 import errno
 import json
 import os
+import sys
 import threading
 import time
 import urllib.parse
@@ -51,12 +55,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from mcp.client.auth import OAuthClientProvider, TokenStorage
-from mcp.shared.auth import (
-    OAuthClientInformationFull,
-    OAuthClientMetadata,
-    OAuthToken,
-)
+# The mcp SDK is imported LAZILY, inside `build_oauth`, and nowhere else.
+#
+# It is needed for exactly one thing: the interactive browser flow, whose PKCE
+# and token-exchange machinery is genuinely worth not hand-rolling. Everything
+# else here — reading a cached token, refreshing it, resolving a bearer — is
+# stdlib already.
+#
+# Keeping it out of module scope is what lets the hooks import this file under a
+# bare python3. Measured, that is 0.07s against 1.09s for `uv run --with
+# 'mcp<2'`, and three of the hooks paying that cost are SYNCHRONOUS — the
+# PreToolUse directive check has no prefilter, so it was a second of latency on
+# every single file edit.
 
 _CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 
@@ -133,38 +143,55 @@ def token_cache_path(url: str) -> Path:
     return _CACHE_DIR / f"tokens-{urlparse(url).netloc.replace(':', '_')}.json"
 
 
-class _FileTokenStorage(TokenStorage):
-    """Token cache keyed by server host; client info seeded statically from
-    .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
-    a pre-registered public client — same one /mcp uses)."""
+def _file_token_storage(url: str, client_id: str, redirect_uri: str):
+    """The SDK's ``TokenStorage`` over our cache file.
 
-    def __init__(self, url: str, client_id: str, redirect_uri: str):
-        self._path = token_cache_path(url)
-        self._client_id = client_id
-        self._redirect_uri = redirect_uri
+    Defined INSIDE a function because it subclasses an SDK type, and a
+    subclass at module scope would force the import that this module exists to
+    avoid — the whole point being that a hook can import this file under a bare
+    python3. It is only ever constructed by ``build_oauth``, which already has
+    the SDK loaded.
+    """
+    from mcp.client.auth import TokenStorage
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-    async def get_tokens(self) -> OAuthToken | None:
-        try:
-            return OAuthToken.model_validate_json(self._path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return None
+    class _FileTokenStorage(TokenStorage):
+        """Token cache keyed by server host; client info seeded statically from
+        .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
+        a pre-registered public client — same one /mcp uses)."""
 
-    async def set_tokens(self, tokens: OAuthToken) -> None:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(tokens.model_dump_json(), encoding="utf-8")
-        self._path.chmod(0o600)
+        def __init__(self):
+            self._path = token_cache_path(url)
 
-    async def get_client_info(self) -> OAuthClientInformationFull | None:
-        return OAuthClientInformationFull(
-            client_id=self._client_id,
-            redirect_uris=[self._redirect_uri],
-            token_endpoint_auth_method="none",
-            grant_types=["authorization_code", "refresh_token"],
-            response_types=["code"],
-        )
+        async def get_tokens(self):
+            try:
+                return OAuthToken.model_validate_json(
+                    self._path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                return None
 
-    async def set_client_info(self, info: OAuthClientInformationFull) -> None:
-        return None  # static public client — nothing to persist
+        async def set_tokens(self, tokens) -> None:
+            # Same writer as every other credential here. Written-then-chmod'd
+            # left the token at the process umask — 0644 by default — for a
+            # window, and non-atomically, so a hook reading concurrently could
+            # catch it half-written and conclude there was no credential.
+            import atomic_write  # noqa: PLC0415 — stdlib, beside this file
+
+            atomic_write.publish(self._path, tokens.model_dump_json())
+
+        async def get_client_info(self):
+            return OAuthClientInformationFull(
+                client_id=client_id,
+                redirect_uris=[redirect_uri],
+                token_endpoint_auth_method="none",
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+            )
+
+        async def set_client_info(self, info) -> None:
+            return None  # static public client — nothing to persist
+
+    return _FileTokenStorage()
 
 
 class NonInteractiveAuthRequired(RuntimeError):
@@ -178,7 +205,15 @@ class NonInteractiveAuthRequired(RuntimeError):
     """
 
 
-def build_oauth(url: str, interactive: bool = True) -> OAuthClientProvider:
+def build_oauth(url: str, interactive: bool = True):
+    """The SDK's OAuth provider — the ONE place the mcp package is required.
+
+    Only ``login.py`` reaches here now. The hooks resolve a static bearer
+    instead (see ``resolve_bearer``) and never load the SDK at all.
+    """
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
+
     cfg = _plugin_mcp_config()
     oauth_cfg = cfg.get("oauth", {})
     client_id = oauth_cfg.get("clientId")
@@ -204,7 +239,7 @@ def build_oauth(url: str, interactive: bool = True) -> OAuthClientProvider:
             response_types=["code"],
             token_endpoint_auth_method="none",
         ),
-        storage=_FileTokenStorage(url, client_id, redirect_uri),
+        storage=_file_token_storage(url, client_id, redirect_uri),
         redirect_handler=redirect_handler,
         callback_handler=_make_callback_handler(port),
     )
@@ -356,8 +391,37 @@ def _auth_token_endpoint() -> str | None:
         meta_url = _plugin_mcp_config().get("oauth", {}).get("authServerMetadataUrl")
         if not meta_url:
             return None
+        # The metadata URL itself must be https: it is fetched over the network
+        # and its answer decides where a long-lived refresh token gets POSTed.
+        if urlparse(meta_url).scheme != "https":
+            return None
         with urllib.request.urlopen(meta_url, timeout=10) as resp:
-            return json.loads(resp.read()).get("token_endpoint")
+            endpoint = json.loads(resp.read()).get("token_endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            return None
+        # SAME ORIGIN as the document that named it. The refresh token is the
+        # most durable credential this plugin holds, and without this check a
+        # tampered discovery document could name any host and we would POST it
+        # there — the document is fetched from the network, so it is not ours
+        # to trust the way .mcp.json is.
+        #
+        # Verified non-breaking against both live tenants: staging and prod each
+        # serve a token_endpoint on their own discovery host.
+        if urlparse(endpoint).netloc != urlparse(meta_url).netloc:
+            # SAY SO. Rejecting silently would stop refresh, and a token that
+            # stops refreshing dies quietly a day later — the precise failure
+            # this plugin's health machinery exists to eliminate, reintroduced
+            # by the guard meant to make things safer. Auth0 serves the token
+            # endpoint on the discovery host (checked on both tenants, custom
+            # domains included by design), so reaching this line means either a
+            # tampered document or a deployment shape nobody has seen — and
+            # both are worth a line someone can find.
+            print(f"[memhub-auth] refusing token_endpoint "
+                  f"{urlparse(endpoint).netloc!r}: not the origin that named it "
+                  f"({urlparse(meta_url).netloc!r}). Token refresh is disabled "
+                  "until this is resolved.", file=sys.stderr)
+            return None
+        return endpoint
     except Exception:  # noqa: BLE001 — best-effort; caller falls back to SDK
         return None
 
@@ -397,6 +461,8 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         cached = json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — no/unreadable cache → nothing to refresh
         return
+    if not isinstance(cached, dict):
+        return  # valid JSON, wrong shape — nothing to refresh from
     refresh_token = cached.get("refresh_token")
     if not refresh_token:
         return
@@ -413,6 +479,12 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     token_endpoint = _auth_token_endpoint()
     client_id = _plugin_mcp_config().get("oauth", {}).get("clientId")
     if not token_endpoint or not client_id:
+        return
+    # The refresh token — a long-lived credential — is POSTed here, and the
+    # endpoint comes from a discovery document named in .mcp.json rather than
+    # from anything we control. Same rule as every other credentialed call:
+    # https, or don't send it.
+    if urlparse(token_endpoint).scheme != "https":
         return
 
     data = urllib.parse.urlencode({
@@ -436,17 +508,131 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     # keys (e.g. id_token) the SDK's OAuthToken model wasn't already validating
     # here. Auth0 omits refresh_token when rotation is off; keep the old one.
     updated = dict(cached)
-    for k in ("access_token", "expires_in", "scope", "token_type"):
-        if k in fresh:
+    # Type-checked before merging. These fields are echoed straight back onto
+    # the wire as a bearer, and a malformed response — a dict where a string
+    # belongs — would be written to the cache and then formatted into an
+    # Authorization header, failing later as a puzzling 401 rather than here as
+    # a bad refresh. Skipping a wrong-typed field keeps the previous, valid one.
+    for k in ("access_token", "scope", "token_type"):
+        if isinstance(fresh.get(k), str) and fresh[k]:
             updated[k] = fresh[k]
-    if fresh.get("refresh_token"):
+    if isinstance(fresh.get("expires_in"), (int, float)):
+        updated["expires_in"] = fresh["expires_in"]
+    if isinstance(fresh.get("refresh_token"), str) and fresh["refresh_token"]:
         updated["refresh_token"] = fresh["refresh_token"]
+    # A refresh that returned no usable access token is not a refresh. Writing
+    # the old document back would be harmless but pointless; bailing keeps the
+    # cache untouched and lets the caller fall through to the existing token.
+    if not isinstance(updated.get("access_token"), str):
+        return
+    # ATOMIC, and that matters more now than it used to. Several hooks resolve
+    # a credential concurrently — the per-turn flush, the SessionEnd backstop,
+    # and the PreToolUse directive check, which fires on every edit — so a
+    # plain write_text leaves a window where another process reads a truncated
+    # file. That reader does not fail loudly: it decides there is no usable
+    # credential and skips, so a torn write reads exactly like "not logged in"
+    # and capture goes dark for that call.
+    #
+    # Written to a temp file and renamed, so a reader sees either the old token
+    # or the new one. Created 0600 by os.open rather than chmod'd afterwards,
+    # so the secret is never briefly world-readable. Two writers racing is
+    # harmless: both wrote a valid token, and rename picks one whole.
+    # Several hooks refresh concurrently — the per-turn flush, the SessionEnd
+    # backstop, and the PreToolUse check that fires on every edit — so a torn
+    # write here is not hypothetical, and a reader catching one concludes there
+    # is no usable credential and skips. See `atomic_write` for why the temp
+    # name has to be per-process rather than shared.
+    #
+    # Best-effort, like the rest of this function: a refresh that cannot be
+    # persisted leaves the previous token in place for the caller to use.
     try:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(updated), encoding="utf-8")
-        path.chmod(0o600)
+        import atomic_write  # noqa: PLC0415 — stdlib, beside this file
+
+        atomic_write.publish(path, json.dumps(updated))
     except OSError:
         return
+
+
+def _cached_access_token(url: str) -> str | None:
+    """The cached OAuth access token if it is present and not expired.
+
+    Pure file read — no network, so it is safe on a latency budget.
+    """
+    try:
+        cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    access = cached.get("access_token")
+    if not isinstance(access, str) or not access:
+        return None
+    exp = _access_token_expiry(access)
+    if exp is not None and time.time() >= exp:
+        return None
+    return access
+
+
+def resolve_bearer(url: str | None = None,
+                   refresh: bool = True) -> tuple[str, str | None]:
+    """``(url, bearer)`` for a NON-INTERACTIVE caller — stdlib only, no SDK.
+
+    This is what every hook uses now. It returns the same credential the SDK
+    would have ended up putting on the wire, without loading the SDK to get
+    there:
+
+    1. ``$MEMHUB_TOKEN`` — explicit bearer, CI/headless;
+    2. a stored personal access key — the normal path once /memhub:login has
+       run, and a static string with no lifecycle to manage;
+    3. the cached OAuth access token, refreshed first if stale. Worth keeping
+       even though a key supersedes it: an install that has not re-logged-in
+       since keys existed keeps working instead of going dark on upgrade, and
+       the refresh shim was already pure stdlib.
+
+    ``bearer`` is None when there is nothing usable, which is not an error —
+    it is the state a background hook must degrade quietly on. The caller skips,
+    and `capture_health` is what tells the user, on a synchronous hook, where
+    saying it actually reaches them.
+    """
+    url = url or default_url()
+
+    token = os.environ.get("MEMHUB_TOKEN", "").strip()
+    if token:
+        return url, token
+
+    record = _stored_pak(url)
+    # isinstance, not just truthy: the secret is formatted straight into an
+    # Authorization header, so a non-string would be rendered by f-string into
+    # a nonsense credential and fail as a puzzling 401 rather than as "no key".
+    if record and isinstance(record.get("secret"), str):
+        return url, record["secret"]
+
+    # Renew before reading: the cached access token is short-lived, and this
+    # shim is the only thing that ever renews it from a cold process.
+    #
+    # ``refresh=False`` exists for callers on a LATENCY BUDGET, and it is not a
+    # micro-optimisation — it is the only real bound available to them. A
+    # refresh makes two blocking urllib calls (~25s of socket timeout), and
+    # offloading it with ``asyncio.to_thread`` does NOT make it cancellable:
+    # measured, a `wait_for(to_thread(...), 2.5)` around an 8s blocking call
+    # returned after 8.01s, not 2.5s — cancelling the future does not stop the
+    # thread, and the await does not finish until the thread does. So a
+    # synchronous hook cannot time-bound a refresh at all; it can only decline
+    # to attempt one.
+    #
+    # Declining is safe because the refresh is not this caller's job. The
+    # async capture hooks run with budgets that accommodate it and will renew
+    # the token; a caller that skips simply goes without a credential for one
+    # invocation, which for a best-effort context lookup means one recall
+    # missed rather than an edit stalled.
+    if refresh:
+        _refresh_cached_token_if_stale(url)
+    # ONE reader for both branches. They were written separately and had already
+    # started to diverge — the same two-copies-of-one-rule pattern that produced
+    # most of this PR's bugs — and here the drift would be silent: a stricter
+    # check on one path means capture works from one hook and not another, with
+    # nothing to indicate why.
+    return url, _cached_access_token(url)
 
 
 def _stored_pak(url: str) -> dict | None:
