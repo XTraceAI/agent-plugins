@@ -390,8 +390,25 @@ def _auth_token_endpoint() -> str | None:
         meta_url = _plugin_mcp_config().get("oauth", {}).get("authServerMetadataUrl")
         if not meta_url:
             return None
+        # The metadata URL itself must be https: it is fetched over the network
+        # and its answer decides where a long-lived refresh token gets POSTed.
+        if urlparse(meta_url).scheme != "https":
+            return None
         with urllib.request.urlopen(meta_url, timeout=10) as resp:
-            return json.loads(resp.read()).get("token_endpoint")
+            endpoint = json.loads(resp.read()).get("token_endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            return None
+        # SAME ORIGIN as the document that named it. The refresh token is the
+        # most durable credential this plugin holds, and without this check a
+        # tampered discovery document could name any host and we would POST it
+        # there — the document is fetched from the network, so it is not ours
+        # to trust the way .mcp.json is.
+        #
+        # Verified non-breaking against both live tenants: staging and prod each
+        # serve a token_endpoint on their own discovery host.
+        if urlparse(endpoint).netloc != urlparse(meta_url).netloc:
+            return None
+        return endpoint
     except Exception:  # noqa: BLE001 — best-effort; caller falls back to SDK
         return None
 
