@@ -45,6 +45,7 @@ import base64
 import errno
 import json
 import os
+import sys
 import threading
 import time
 import urllib.parse
@@ -407,6 +408,18 @@ def _auth_token_endpoint() -> str | None:
         # Verified non-breaking against both live tenants: staging and prod each
         # serve a token_endpoint on their own discovery host.
         if urlparse(endpoint).netloc != urlparse(meta_url).netloc:
+            # SAY SO. Rejecting silently would stop refresh, and a token that
+            # stops refreshing dies quietly a day later — the precise failure
+            # this plugin's health machinery exists to eliminate, reintroduced
+            # by the guard meant to make things safer. Auth0 serves the token
+            # endpoint on the discovery host (checked on both tenants, custom
+            # domains included by design), so reaching this line means either a
+            # tampered document or a deployment shape nobody has seen — and
+            # both are worth a line someone can find.
+            print(f"[memhub-auth] refusing token_endpoint "
+                  f"{urlparse(endpoint).netloc!r}: not the origin that named it "
+                  f"({urlparse(meta_url).netloc!r}). Token refresh is disabled "
+                  "until this is resolved.", file=sys.stderr)
             return None
         return endpoint
     except Exception:  # noqa: BLE001 — best-effort; caller falls back to SDK
