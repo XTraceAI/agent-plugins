@@ -335,9 +335,17 @@ class Session:
         self._bearer = bearer
         self._timeout = timeout
 
-    async def call_tool(self, name: str, arguments: dict | None = None):
+    async def call_tool(self, name: str, arguments: dict | None = None,
+                        timeout: float | None = None):
+        """``timeout`` overrides the session default for THIS call.
+
+        Needed because a caller working to a wall-clock deadline must bound each
+        call by the time it has LEFT, not by a fixed fraction of the budget: a
+        slice that starts just under the deadline would otherwise run a whole
+        per-call timeout past it.
+        """
         import asyncio  # noqa: PLC0415 — only needed on this path
 
         return await asyncio.to_thread(
             call_tool, self._url, self._bearer, name, arguments or {},
-            self._timeout)
+            self._timeout if timeout is None else timeout)

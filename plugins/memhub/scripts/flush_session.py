@@ -112,7 +112,7 @@ def _breadcrumb(session_id, reason: str, detail: str = "",
                           last_error_at=time.time())
         atomic_write.publish(
             _SESSION_STATE_DIR / f"{session_id}.sessionflush.json",
-            json.dumps(record), mode=0o644)
+            json.dumps(record))
     except Exception:  # noqa: BLE001
         pass
 
@@ -319,13 +319,22 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "conversation_id": session_id,
             "source_platform": "claude",
         }
+        # Bound this call by the time LEFT, not a fixed fraction of the
+        # budget. `_stop_before_slice` only checks BEFORE a slice, so a
+        # slice starting just under the deadline could otherwise run a full
+        # per-call timeout past it — and with the deadline tuned up (say
+        # MEMHUB_FLUSH_DEADLINE_S=300) that overrun crosses the hook's own
+        # 300s cap, so the process is killed mid-upload and the summary
+        # naming the unsent slices never gets written. That summary is the
+        # entire reason this path stops itself rather than being stopped.
         if not await _send(session, arguments, room, title, namespace,
-                           index, len(payloads)):
+                           index, len(payloads),
+                           budget=max(1.0, deadline - time.monotonic())):
             return
 
 
 async def _send(session, arguments, room, title, namespace,
-                index: int, total: int) -> bool:
+                index: int, total: int, budget: float | None = None) -> bool:
     """Send one slice. False means stop — a later slice cannot help.
 
     Sequential and fail-closed: the slices are ordered, so pressing on after a
@@ -359,7 +368,8 @@ async def _send(session, arguments, room, title, namespace,
     # series exists to remove — and it would be worse here than in the per-turn
     # path, because nothing downstream is left to notice.
     try:
-        res = await session.call_tool("import_conversation", arguments=arguments)
+        res = await session.call_tool("import_conversation",
+                                      arguments=arguments, timeout=budget)
     except mcp_http.McpRateLimited as e:
         wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
         _log(f"{label}rate limited{wait}; slices already sent are stored")

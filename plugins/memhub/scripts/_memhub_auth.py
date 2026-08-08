@@ -595,29 +595,14 @@ def resolve_bearer(url: str | None = None,
     # the token; a caller that skips simply goes without a credential for one
     # invocation, which for a best-effort context lookup means one recall
     # missed rather than an edit stalled.
-    if not refresh:
-        cached_now = _cached_access_token(url)
-        return url, cached_now
-    _refresh_cached_token_if_stale(url)
-    try:
-        cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return url, None
-    # Valid JSON is not necessarily an OBJECT. A cache holding `"a string"`
-    # or `[1,2]` would reach .get() and raise AttributeError, which is not
-    # in the tuple above — so it would escape a function whose entire
-    # contract is to return None when there is nothing usable.
-    if not isinstance(cached, dict):
-        return url, None
-    access = cached.get("access_token")
-    if not access:
-        return url, None
-    # An expired token is not worth a round trip that will 401. Unknown expiry
-    # (opaque token) is sent anyway — refusing to guess beats refusing to work.
-    exp = _access_token_expiry(access)
-    if exp is not None and time.time() >= exp:
-        return url, None
-    return url, access
+    if refresh:
+        _refresh_cached_token_if_stale(url)
+    # ONE reader for both branches. They were written separately and had already
+    # started to diverge — the same two-copies-of-one-rule pattern that produced
+    # most of this PR's bugs — and here the drift would be silent: a stricter
+    # check on one path means capture works from one hook and not another, with
+    # nothing to indicate why.
+    return url, _cached_access_token(url)
 
 
 def _stored_pak(url: str) -> dict | None:

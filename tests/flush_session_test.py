@@ -58,9 +58,14 @@ class FakeSession:
     def __init__(self, result):
         self.result = result
         self.sent = []
+        self.timeouts = []
 
-    async def call_tool(self, name, arguments=None):
+    async def call_tool(self, name, arguments=None, timeout=None):
+        # `timeout` is recorded, not ignored: each slice is bounded by the
+        # budget REMAINING rather than a fixed share, so a fake that silently
+        # swallowed it would let that bound regress unnoticed.
         self.sent.append((name, arguments))
+        self.timeouts.append(timeout)
         return self.result
 
 

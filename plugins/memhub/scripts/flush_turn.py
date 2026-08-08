@@ -158,13 +158,15 @@ def _save_state(session_id: str, **fields) -> None:
     state = _read_state(session_id)
     state.update(fields)
     state["at"] = time.time()
-    # Shared writer, because this file has more than one. The flock used to make
-    # the per-turn hook its only writer, but the SessionEnd backstop now records
-    # breadcrumbs here too and does NOT take that lock — so the concurrency this
-    # guards against is real, and a spliced write here means a corrupt cursor.
-    # 0644: a cursor is not a secret, and the dir is the user's own.
-    atomic_write.publish(STATE_DIR / f"{session_id}.json",
-                            json.dumps(state), mode=0o644)
+    # Atomic even though the flock makes this hook the only writer of this file
+    # today: the state carries the cursor, and a torn one means re-sent or
+    # skipped records. Cheap insurance against the next hook that needs to
+    # write here — the SessionEnd backstop briefly did, and the lost-update it
+    # caused is why it now keeps its own file.
+    #
+    # 0600 by default: not a secret exactly, but it holds the session title, the
+    # repo path and server error text, none of which needs to be world-readable.
+    atomic_write.publish(STATE_DIR / f"{session_id}.json", json.dumps(state))
 
 
 # ── health breadcrumb ─────────────────────────────────────────────────
