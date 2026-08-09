@@ -7,7 +7,8 @@ facts, episodes, and artifacts.
 
 ## What's in here
 
-This repo is a **marketplace** with three plugins:
+This repo is a **marketplace** with two installable plugins — `memhub` and
+`fleet`:
 
 ```
 .claude-plugin/marketplace.json     # makes the plugins installable
@@ -21,7 +22,9 @@ plugins/memhub/                     # PROD build — install this one
     ├── save-artifact/              # store a file as a MemHub artifact
     ├── search-memory/              # read-only team-memory recall
     └── spec/                       # spec-driven dev on versioned spec artifacts
-plugins/memhub-staging/             # STAGING build for MemHub devs (see below)
+plugins/.claude-plugin/             # internal-only marketplace (staging build)
+plugins/memhub-staging/             # INTERNAL staging build — not published here,
+                                    # see CONTRIBUTING.md
 ├── .claude-plugin/plugin.json      # its own manifest
 ├── .mcp.json                       # the memhub MCP server → staging
 ├── skills/  → ../memhub/skills     # symlinked: shared with memhub, never drifts
@@ -62,23 +65,12 @@ Then authenticate the MCP server once (the hook can't run until it's connected):
 
 Select `memhub`, choose **Authenticate**, and approve in the browser.
 
-### Prod vs. staging
+`memhub` is pinned to a released tag, so `/plugin install` always gives you a
+version that shipped — never whatever happens to be on `main` mid-development.
 
-Almost everyone wants **`memhub`** — it talks to the production backend.
-
-**MemHub developers** iterating on the service can install **`memhub-staging`**
-instead, which is byte-for-byte the same plugin (skills/hooks/scripts are
-symlinked, so they never drift) but pointed at the staging backend:
-
-```text
-/plugin install memhub-staging@memhub
-```
-
-Both plugins register an MCP server literally named `memhub` (that's what keeps
-the skills identical), so **install one or the other, never both** — two
-`memhub` servers in one client collide. The two differ only in `.mcp.json`
-(backend URL + OAuth client). Switching env = uninstall one, install the other,
-then re-run `/mcp` to authenticate against the new backend.
+> **Working on MemHub itself?** There's a staging build that points at the
+> staging backend. It is not part of this marketplace — see
+> [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## How it works
 

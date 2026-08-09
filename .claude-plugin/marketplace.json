@@ -8,13 +8,14 @@
   "plugins": [
     {
       "name": "memhub",
-      "source": "./plugins/memhub",
-      "description": "Auto-capture Claude Code sessions into MemHub team memory at session end. Points at the production backend — install this one."
-    },
-    {
-      "name": "memhub-staging",
-      "source": "./plugins/memhub-staging",
-      "description": "Staging build of memhub for MemHub developers iterating on the service — same skills/hooks, pointed at the staging backend. Install this OR memhub, never both."
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/XTraceAI/memhub-claude-plugin.git",
+        "path": "plugins/memhub",
+        "ref": "memhub--v0.24.0",
+        "sha": "326d827b5512b6037c9e3560b3d25830a158e849"
+      },
+      "description": "Auto-capture Claude Code sessions into MemHub team memory at session end. Points at the production backend."
     },
     {
       "name": "fleet",
