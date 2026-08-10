@@ -3,7 +3,10 @@
 
 Reads the Claude Code hook input JSON from stdin (``session_id``,
 ``transcript_path``) and sends the transcript-so-far to ``import_conversation``
-with ``conversation_id = session_id``, so every trigger feeds one conversation
+under the session's CHAIN-ROOT conversation id (``session_root``, which keys on
+the transcript's head uuids so a session re-entered after an idle gap keeps its
+original conversation instead of opening a same-named duplicate), so every
+trigger feeds one conversation
 and one server-side watermark (``agentic_seen_uuids``): the full transcript is
 re-sent, but only the DELTA since the last flush is processed. Commits/PRs are
 semantic work boundaries, so flushing there makes memory available mid-session
@@ -43,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -59,6 +61,8 @@ from session_title import (  # noqa: E402
     generated_title,
     prompt_title,
 )
+import session_scope  # noqa: E402
+from session_root import resolve as resolve_conversation  # noqa: E402
 from transcript_chunks import slices as make_slices  # noqa: E402
 from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
@@ -232,21 +236,46 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # the transcript's cwd, resolved client-side (a worktree dir name would
     # stamp a scope that hides directives from the canonical repo's recalls —
     # the remote is stable across worktrees). None → import stays unscoped.
-    cwd = next((r.get("cwd") for r in records
-                if isinstance(r, dict) and isinstance(r.get("cwd"), str)
-                and r.get("cwd")), None)
-    namespace = None
-    if cwd:
-        try:
-            out = subprocess.run(
-                ["git", "-C", cwd, "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=2,
-            )
-            u = out.stdout.strip()
-            if out.returncode == 0 and u:
-                namespace = u.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-        except (OSError, subprocess.SubprocessError):
-            pass
+    #
+    # The most recent cwd that is a REPO — not the first one in the file, which
+    # is what this used to take and is what forked sessions into two
+    # conversations. This path reads the WHOLE transcript, so "the first cwd" is
+    # the directory the session STARTED in; the per-turn hook reads only its
+    # delta, so it saw the CURRENT one. The two therefore disagreed on any
+    # session opened in a directory that CONTAINS several checkouts and then
+    # moved into one — and since that container is not a repo, the git lookup
+    # below failed on it, taking the namespace AND the room with it. The room
+    # and the scope going missing together is one root cause, and it is this
+    # line. See ``session_scope``.
+    # In a thread: probing candidates shells out to git, so this is now up to
+    # five subprocesses rather than the one it used to be, and this coroutine
+    # runs under a wall-clock deadline it must stay responsive to.
+    # From the TRANSCRIPT FILE, not the filtered `records` this path is about
+    # to send. Both capture paths resolve from the same bytes, so neither can
+    # decide on a different repo than the other — and `records` has already had
+    # slash-command wrappers dropped, some of which carry a cwd. Resolving from
+    # what we happen to be sending, rather than from what the session did, is
+    # how the two paths drifted apart in the first place.
+    cwd = await asyncio.to_thread(
+        session_scope.resolve_cwd_from_transcript, transcript_path)
+    namespace = await asyncio.to_thread(session_scope.namespace_for, cwd)
+
+    # Same conversation the per-turn hook feeds, resolved the same way — from
+    # the transcript's head uuids, not the session id, so a session re-entered
+    # after an idle gap keeps writing to the conversation it started rather
+    # than opening a same-named duplicate. See ``session_root``.
+    #
+    # This path deliberately shares no CURSOR with the per-turn hook — that is
+    # what makes it a second witness when per-turn capture is broken. Identity
+    # is the exception: the two must not be able to disagree about which
+    # conversation they are writing to, so both derive it from the transcript
+    # and both consult the same pin. A second opinion here is the bug.
+    conversation_id = await asyncio.to_thread(
+        resolve_conversation, session_id, transcript_path)
+    # Before the room lookup, which is keyed on the cwd.
+    pinned = session_scope.read_pin(conversation_id)
+    cwd = cwd or pinned.get("cwd") or None
+    namespace = namespace or pinned.get("namespace") or None
 
     # In a thread: resolving may renew the token with blocking urllib calls
     # (~25s of socket timeout), and a synchronous call cannot be cancelled by
@@ -295,6 +324,11 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Cached hit is a dict lookup; a miss asks the server once and
     # caches the answer, so this is not a per-flush round-trip.
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    # The pin decides — see ``session_scope.apply_pin``. This path is the one
+    # that historically resolved DIFFERENTLY from per-turn capture, so it is
+    # the one that most needs to be unable to.
+    room, cwd, namespace = await asyncio.to_thread(
+        session_scope.apply_pin, conversation_id, room, cwd, namespace)
 
     # Chunked, because this path sends the WHOLE transcript in one
     # call and real sessions can outgrow a single payload. Unchunked,
@@ -326,7 +360,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             return
         arguments = {
             "messages": payload,
-            "conversation_id": session_id,
+            "conversation_id": conversation_id,
             "source_platform": "claude",
         }
         # Bound this call by the time LEFT, not a fixed fraction of the
@@ -467,6 +501,13 @@ async def _send(session, arguments, room, title, namespace,
         # rescues the slice and touches no cache.
         if cwd is not None:
             forget_room(cwd, env)
+        # And the pin, or the next flush re-supplies the dead id: a pinned room
+        # outranks a fresh lookup by design, so clearing only the cache leaves
+        # capture wedged on a brain the server has disowned. Read off the
+        # payload rather than threaded through the signature — the id we are
+        # about to re-send unrouted is right there, and it is by construction
+        # the one this slice was pinned under.
+        session_scope.clear_room(arguments.get("conversation_id") or "")
         room = None
         arguments.pop("agent_brain_id", None)
         arguments.pop("org_id", None)
