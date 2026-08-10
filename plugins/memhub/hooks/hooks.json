@@ -78,6 +78,11 @@
             "type": "command",
             "timeout": 5,
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/capture_health.py\"; fi"
+          },
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" brief; fi"
           }
         ]
       }
@@ -90,6 +95,12 @@
             "async": true,
             "timeout": 300,
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/turn_flush_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_turn.py\"; fi"
+          },
+          {
+            "type": "command",
+            "async": true,
+            "timeout": 60,
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" refresh; fi"
           }
         ]
       }
