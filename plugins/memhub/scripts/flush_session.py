@@ -397,7 +397,21 @@ async def _send(session, arguments, room, title, namespace,
     # would leave it failing invisibly, which is the precise bug this whole
     # series exists to remove — and it would be worse here than in the per-turn
     # path, because nothing downstream is left to notice.
-    async def _import(args: dict):
+    # An ABSOLUTE deadline for this slice, derived once from the budget the
+    # caller measured when it called. The closure below can run twice, and
+    # closing over `budget` itself granted the second call the first call's
+    # time all over again — two sequential attempts, each up to the full
+    # per-slice budget, overrunning the very deadline that clamp exists to
+    # hold. Time already spent has to come off the second attempt, and only an
+    # absolute deadline says that.
+    slice_deadline = None if budget is None else time.monotonic() + budget
+
+    def _remaining() -> float | None:
+        """Seconds left for this slice, or None when it is unbudgeted."""
+        return (None if slice_deadline is None
+                else slice_deadline - time.monotonic())
+
+    async def _import(args: dict, timeout: float | None):
         """Send one import, classifying transport failures. None = already
         logged and breadcrumbed, and the caller must stop.
 
@@ -405,10 +419,14 @@ async def _send(session, arguments, room, title, namespace,
         slice can now be sent TWICE — once routed to the room, once unrouted
         after the server disowns it — and both must classify a 401 or a 429 the
         same way. One copy is what keeps that true.
+
+        ``timeout`` is a parameter and NOT the enclosing ``budget``, so each
+        call is bounded by the time actually left rather than by what was left
+        when the slice started.
         """
         try:
             return await session.call_tool("import_conversation",
-                                           arguments=args, timeout=budget)
+                                           arguments=args, timeout=timeout)
         except mcp_http.McpRateLimited as e:
             wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
             _log(f"{label}rate limited{wait}; slices already sent are stored")
@@ -433,7 +451,7 @@ async def _send(session, arguments, room, title, namespace,
         return [t for t in (getattr(b, "text", None)
                             for b in getattr(result, "content", []) or []) if t]
 
-    res = await _import(arguments)
+    res = await _import(arguments, budget)
     if res is None:
         return False, room
     texts = _texts(res)
@@ -451,10 +469,24 @@ async def _send(session, arguments, room, title, namespace,
         room = None
         arguments.pop("agent_brain_id", None)
         arguments.pop("org_id", None)
-        res = await _import(arguments)
-        if res is None:
-            return False, room
-        texts = _texts(res)
+        # Only re-send if there is plausibly time to finish. Below
+        # `_MIN_SLICE_BUDGET_S` a call buys a guaranteed timeout reported as a
+        # failure, which is the same doomed-call reasoning `_stop_before_slice`
+        # already applies to whole slices. Skipping costs little here: the dead
+        # id is ALREADY forgotten, so the next flush — SessionEnd, or the next
+        # commit — routes this session to long-term memory with a fresh budget.
+        left = _remaining()
+        if left is None or left >= _MIN_SLICE_BUDGET_S:
+            res = await _import(arguments, left)
+            if res is None:
+                return False, room
+            texts = _texts(res)
+        else:
+            # Falls through to the isError branch below, which reports and
+            # breadcrumbs the server's original rejection — still the accurate
+            # account of why this slice did not land.
+            _log(f"{label}no budget left to re-send unrouted; the room is "
+                 "dropped, so the next flush reaches long-term memory")
 
     # MCP signals tool failure via isError + a message in content, NOT via an
     # exception — without this check a bad token or server error logs as

@@ -132,12 +132,14 @@ class FakeSequenceSession:
     def __init__(self, *results):
         self.results = list(results)
         self.sent = []
+        self.timeouts = []
 
     async def call_tool(self, name, arguments=None, timeout=None):
         # Copy: `_send` mutates the caller's dict, so keeping the reference
         # would make the first call's record show the SECOND call's arguments
         # and the retry assertions below would pass vacuously.
         self.sent.append((name, dict(arguments or {})))
+        self.timeouts.append(timeout)
         return self.results[min(len(self.sent), len(self.results)) - 1]
 
 
@@ -145,7 +147,7 @@ MISSING = FakeResult(texts=["Error executing tool import_conversation: "
                             "Agent brain not found"], is_error=True)
 
 
-def send_seq(*results, room=None):
+def send_seq(*results, room=None, budget=None):
     session = FakeSequenceSession(*results)
     args = {"messages": [{"type": "user"}], "conversation_id": "s1",
             "source_platform": "claude"}
@@ -154,14 +156,14 @@ def send_seq(*results, room=None):
         forgot.append((cwd, env)) or True)
     try:
         ok, room_after = asyncio.run(
-            fs._send(session, args, room, None, None, 1, 1,
+            fs._send(session, args, room, None, None, 1, 1, budget=budget,
                      cwd="/repo", env="production"))
     finally:
         fs.forget_room = real
-    return ok, room_after, session.sent, forgot
+    return ok, room_after, session.sent, forgot, session.timeouts
 
 
-ok, room_after, sent, forgot = send_seq(
+ok, room_after, sent, forgot, timeouts = send_seq(
     MISSING, OK, room={"brain_id": "b1", "org_id": "o1"})
 check("a missing brain does not fail the slice", ok is True)
 check("a missing brain is retried", len(sent) == 2)
@@ -176,7 +178,7 @@ check("the caller is told the room is gone", room_after is None)
 # server says nothing about whether the brain exists, and dropping a good cache
 # entry over a transient outage would re-resolve — or mis-resolve — on the next
 # turn for no reason.
-ok, room_after, sent, forgot = send_seq(
+ok, room_after, sent, forgot, timeouts = send_seq(
     FakeResult(texts=["Not authenticated"], is_error=True),
     OK, room={"brain_id": "b1"})
 check("an unrelated error is not retried", len(sent) == 1)
@@ -187,11 +189,37 @@ check("an unrelated error still stops the run", ok is False)
 # Both attempts failing is a real failure — the fallback is one retry, not a
 # loop, and the caller must still stop rather than send later slices into a
 # conversation whose first slice never landed.
-ok, room_after, sent, forgot = send_seq(
+ok, room_after, sent, forgot, timeouts = send_seq(
     MISSING, FakeResult(texts=["still broken"], is_error=True),
     room={"brain_id": "b1"})
 check("a failed fallback stops the run", ok is False)
 check("a failed fallback still forgot the room", forgot != [])
+
+# The retry must be bounded by the time LEFT, not by the budget the slice
+# started with. Closing over one `budget` value granted the second attempt the
+# first attempt's time all over again — two sequential calls, each up to the
+# full per-slice budget, overrunning the deadline that clamp exists to hold.
+ok, room_after, sent, forgot, timeouts = send_seq(
+    MISSING, OK, room={"brain_id": "b1"}, budget=30.0)
+check("the first attempt gets the whole budget", timeouts[0] == 30.0)
+check("the retry is bounded by what is left",
+      timeouts[1] is not None and timeouts[1] < 30.0)
+
+# ...and below the floor a call cannot plausibly finish, so it is not made at
+# all — the same doomed-call reasoning `_stop_before_slice` applies to slices.
+# Skipping is cheap because the dead id is ALREADY forgotten: the next flush
+# reaches long-term memory with a fresh budget.
+ok, room_after, sent, forgot, timeouts = send_seq(
+    MISSING, OK, room={"brain_id": "b1"}, budget=0.0)
+check("an exhausted budget makes no doomed retry", len(sent) == 1)
+check("an exhausted budget still forgets the room", forgot != [])
+check("an exhausted budget still reports the failure", ok is False)
+
+# An unbudgeted send (no deadline in play) must keep retrying as before.
+ok, room_after, sent, forgot, timeouts = send_seq(
+    MISSING, OK, room={"brain_id": "b1"})
+check("an unbudgeted slice still retries", len(sent) == 2)
+check("an unbudgeted retry stays unbounded", timeouts[1] is None)
 
 ok, _ = send(FakeResult(texts=['{"conversation_id": "c1"}']))
 check("a JSON text body is understood", ok is True)
