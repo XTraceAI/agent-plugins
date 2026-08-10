@@ -215,6 +215,21 @@ check("an exhausted budget makes no doomed retry", len(sent) == 1)
 check("an exhausted budget still forgets the room", forgot != [])
 check("an exhausted budget still reports the failure", ok is False)
 
+# ...and it reports the CLOCK, not the brain. Falling through to the isError
+# branch would have breadcrumbed the original "Agent brain not found" — the one
+# thing no longer true, since the id was just forgotten — and `capture_health`
+# shows that breadcrumb to the user at SessionStart. They would go chasing a
+# brain problem that had already fixed itself.
+import json as _json  # noqa: E402 — local to this assertion
+
+_crumb = _json.loads(
+    (Path(_TMP_HOME) / ".config" / "memhub-plugin" / "turnflush"
+     / "s1.sessionflush.json").read_text(encoding="utf-8"))
+check("the breadcrumb names the budget, not the brain",
+      _crumb.get("last_error") == "budget_exhausted")
+check("the detail does not blame the forgotten brain",
+      "Agent brain not found" not in (_crumb.get("last_error_detail") or ""))
+
 # An unbudgeted send (no deadline in play) must keep retrying as before.
 ok, room_after, sent, forgot, timeouts = send_seq(
     MISSING, OK, room={"brain_id": "b1"})

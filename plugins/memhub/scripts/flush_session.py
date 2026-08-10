@@ -482,11 +482,19 @@ async def _send(session, arguments, room, title, namespace,
                 return False, room
             texts = _texts(res)
         else:
-            # Falls through to the isError branch below, which reports and
-            # breadcrumbs the server's original rejection — still the accurate
-            # account of why this slice did not land.
+            # Reported HERE rather than by falling through to the isError
+            # branch. Falling through would breadcrumb the original "Agent
+            # brain not found" — the one thing that is no longer true, since
+            # the id has just been forgotten — and `capture_health` renders
+            # that breadcrumb to the user at SessionStart. They would go
+            # hunting a brain problem that has already fixed itself, while the
+            # thing that actually stopped this slice, the clock, went unnamed.
             _log(f"{label}no budget left to re-send unrouted; the room is "
                  "dropped, so the next flush reaches long-term memory")
+            _breadcrumb(arguments.get("conversation_id"), "budget_exhausted",
+                        f"ran out of time before re-sending slice {index} "
+                        "unrouted")
+            return False, room
 
     # MCP signals tool failure via isError + a message in content, NOT via an
     # exception — without this check a bad token or server error logs as
