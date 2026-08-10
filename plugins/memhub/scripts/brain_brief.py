@@ -49,6 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import atomic_write  # noqa: E402
 import room_map  # noqa: E402
 
 #: Where the compiled overview is cached, keyed by backend AND brain so a prod
@@ -102,10 +103,10 @@ def _write_json(path: Path, data: dict) -> bool:
     persist its result is worth skipping entirely rather than repeating.
     """
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(path)
+        # The shared publisher, not a local tmp+replace: its temp file is
+        # pid-suffixed, and Stop fires per turn in EVERY session — parallel
+        # worktrees of one repo would otherwise race on a single `.tmp` name.
+        atomic_write.publish(path, json.dumps(data))
         return True
     except Exception:  # noqa: BLE001
         return False
