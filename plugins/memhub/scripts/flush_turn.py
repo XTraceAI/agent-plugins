@@ -40,7 +40,6 @@ import asyncio
 import fcntl
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -67,6 +66,8 @@ import mcp_http  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
+import session_scope  # noqa: E402
+from session_root import resolve as resolve_conversation  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -306,23 +307,19 @@ def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
     Resolved client-side from the transcript's cwd, never server-side: a
     worktree directory's basename would stamp a scope that HIDES directives
     from the canonical repo's recalls.
+
+    The cwd is the most recent one that is a REPO, not the first one seen —
+    see ``session_scope.resolve_cwd``. Taking the first meant a session that
+    opened in the folder CONTAINING its checkouts derived everything from that
+    folder, which is not a repo, so the remote lookup failed and both the
+    namespace and the room came back empty. That is how one session forks into
+    two conversations, and it is also why the two capture paths have to agree
+    on this: they used to read the same field and pick different records.
     """
-    cwd = next((r.get("cwd") for r in records
-                if isinstance(r, dict) and isinstance(r.get("cwd"), str)
-                and r.get("cwd")), None)
+    cwd = session_scope.resolve_cwd(records)
     if not cwd:
         return None, None
-    try:
-        out = subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2,
-        )
-        url = out.stdout.strip()
-        if out.returncode == 0 and url:
-            return cwd, url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return cwd, None
+    return cwd, session_scope.namespace_for(cwd)
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
@@ -383,7 +380,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # skipped, and the namespace is silently None for that flush — so its
     # directives extract unscoped and are recalled in every repo, even though an
     # earlier flush had already resolved the name.
-    cwd, namespace = _namespace(records)
+    cwd, namespace = await asyncio.to_thread(_namespace, records)
     if not cwd:
         cwd = state.get("cwd") or None
     if not namespace:
@@ -392,6 +389,42 @@ async def _flush(session_id: str, transcript_path: str) -> None:
 
     # This delta's title if it carries one, else whatever we last saw.
     title, custom = _titles(records, state)
+
+    # The conversation this session belongs to — its OWN id when it starts
+    # fresh, or the id of the session it was resumed from. Not the session id,
+    # because Claude Code mints a new one every time a session is re-entered
+    # and keying on it opened a duplicate conversation per resume; see
+    # ``session_root``.
+    #
+    # Resolved once and remembered: it takes a global flock and reads the
+    # transcript head, which is cheap but pointless to repeat every turn — the
+    # answer cannot change for a session whose transcript file never does.
+    conversation_id = state.get("conversation_id") or None
+    if not conversation_id:
+        conversation_id = await asyncio.to_thread(
+            resolve_conversation, session_id, transcript_path)
+
+    # Resolved BEFORE the room lookup, because the lookup is keyed on the cwd:
+    # a flush whose delta carries none would otherwise route to personal memory
+    # and fork the conversation, which is precisely the failure the pin exists
+    # to absorb.
+    pinned = session_scope.read_pin(conversation_id)
+    cwd = cwd or pinned.get("cwd") or None
+    namespace = namespace or pinned.get("namespace") or None
+
+    # Nothing known yet — so this is the session's FIRST resolution, and it must
+    # match what the whole-transcript path would decide. A delta is a subset of
+    # the file, and a subset window cannot agree with a superset one in general:
+    # when the recent cwds are all non-repos (a worktree since deleted, usually)
+    # the delta falls back to a non-repo while the whole file finds a repo
+    # further back, and the two paths route apart. Reading the file here costs
+    # one pass per SESSION, because from the next turn on the pin answers.
+    if not cwd:
+        cwd = await asyncio.to_thread(
+            session_scope.resolve_cwd_from_transcript, transcript_path)
+        if cwd and not namespace:
+            namespace = await asyncio.to_thread(
+                session_scope.namespace_for, cwd)
     # In a THREAD, because resolving can renew the token — two blocking urllib
     # calls, up to ~25s of socket timeout. `asyncio.wait_for` cannot cancel a
     # synchronous call, so run inline it would pin the event loop AND hold the
@@ -425,9 +458,18 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Cached hit is a dict lookup; a miss asks the server once and
     # caches the answer, so this is not a per-turn round-trip.
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    # The pin decides. The server namespaces the conversation by the brain
+    # (``cb:<id>:<conv>``), so a flush that resolves differently from its
+    # predecessors does not re-scope this session — it FORKS it into a second
+    # conversation with the same name and a disjoint half of the transcript.
+    # Whichever flush resolved first wins, and a lookup that comes back empty
+    # (a git timeout, a deleted worktree, a momentary miss) reuses it rather
+    # than degrading to personal memory.
+    room, cwd, namespace = await asyncio.to_thread(
+        session_scope.apply_pin, conversation_id, room, cwd, namespace)
     arguments = {
         "messages": sendable,
-        "conversation_id": session_id,
+        "conversation_id": conversation_id,
         "source_platform": "claude",
         # The whole point: durable on arrival, extracted in batches.
         "flush": "auto",
@@ -531,6 +573,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _log(f"room {room['brain_id'][:8]} does not exist on this backend — "
              "dropping it from the cache and flushing to long-term memory")
         forget_room(cwd, env)
+        # And the pin, which otherwise re-supplies the dead id on the very
+        # next turn — the pin outranks a fresh lookup by design, so clearing
+        # only the cache would leave capture wedged on a brain the server has
+        # already disowned. The SERVER saying the brain does not exist is the
+        # one thing allowed to retract a pinned room.
+        session_scope.clear_room(conversation_id)
         room = None
         arguments.pop("agent_brain_id", None)
         arguments.pop("org_id", None)
@@ -623,9 +671,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # delta must not be able to override, and merging a None over it
     # would let the next ``ai-title`` — which the client keeps
     # emitting with the pre-rename value — take the name back.
+    # ``conversation_id`` is remembered only HERE, on a committed round-trip.
+    # Caching it on a failed flush would pin the session to an id the server
+    # never acknowledged; re-resolving instead costs one index read and is
+    # idempotent — a registered chain returns the same root every time.
     _mark_success(session_id, offset=consumed,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,
+                  conversation_id=conversation_id,
                   **({"custom_title": custom} if custom else {}))
     # Sent count, not read count — and the byte span stays the READ
     # span, because that is what the cursor just advanced past. The

@@ -39,6 +39,8 @@ from mcp.client.streamable_http import streamablehttp_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from room_map import env_for_url, read_room  # noqa: E402
+import session_scope  # noqa: E402
+from session_root import resolve as resolve_conversation  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -203,9 +205,12 @@ def call_error(result, payload: dict) -> str | None:
 
 
 def _cwd_from_records(records: list[dict]) -> str | None:
-    return next((r.get("cwd") for r in records
-                 if isinstance(r, dict) and isinstance(r.get("cwd"), str)
-                 and r.get("cwd")), None)
+    # The most recent cwd that is a repo, not the first one in the file — the
+    # same correction the two hook paths took. Importing a session that opened
+    # in the folder CONTAINING its checkouts would otherwise resolve neither a
+    # room nor a namespace, because that container is not a repo, and land the
+    # whole transcript in personal memory with globally-scoped directives.
+    return session_scope.resolve_cwd(records)
 
 
 def _namespace_from_records(records: list[dict]) -> str | None:
@@ -289,19 +294,27 @@ async def main() -> int:
         print(f"ERROR: {f} contains no valid JSONL records", file=sys.stderr)
         return 2
 
-    conv_id = args.conversation_id or f.stem
-    # An override that is not the session's own id opens a SECOND conversation
-    # for this session — per-turn capture keys on the session id, so its records
-    # and this import's watermark diverge and the session's memory splits across
-    # two rows. Legitimate only for a transcript with no session id of its own
-    # (a synthesized Codex rollout). Warn rather than refuse: the caller may
-    # genuinely be in that case, and this script must stay scriptable.
-    if args.conversation_id and args.conversation_id != f.stem:
+    # The CHAIN ROOT, not the file stem. A transcript that Claude Code created
+    # by resuming an earlier session carries a new session id but copies the
+    # original's records, and capture keys on that chain (see ``session_root``)
+    # — so importing under the stem would open the very duplicate conversation
+    # the hooks now avoid. For a session that was never resumed this IS the
+    # stem, so the ordinary case is unchanged.
+    default_conv_id = resolve_conversation(f.stem, str(f))
+    conv_id = args.conversation_id or default_conv_id
+    # An override that is not the session's own conversation opens a SECOND
+    # conversation for this session — capture writes under the chain root, so
+    # its records and this import's watermark diverge and the session's memory
+    # splits across two rows. Legitimate only for a transcript with no session
+    # id of its own (a synthesized Codex rollout). Warn rather than refuse: the
+    # caller may genuinely be in that case, and this script must stay
+    # scriptable.
+    if args.conversation_id and args.conversation_id != default_conv_id:
         print(f"WARNING: --conversation-id {args.conversation_id!r} is not this "
-              f"session's id ({f.stem}). Per-turn capture writes under the "
-              "session id, so this import opens a SECOND conversation and the "
-              "session's memory is split across both. Drop the flag unless this "
-              "transcript has no session id of its own.", file=sys.stderr)
+              f"session's conversation ({default_conv_id}). Capture writes "
+              "under that id, so this import opens a SECOND conversation and "
+              "the session's memory is split across both. Drop the flag unless "
+              "this transcript has no session id of its own.", file=sys.stderr)
     # --namespace wins; '' explicitly disables; default = resolve from records.
     # Resolved from the FULL list, ahead of the filter below: ``cwd`` rides on
     # every user record, including the slash-command ones.
