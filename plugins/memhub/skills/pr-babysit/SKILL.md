@@ -125,6 +125,9 @@ step's whole value, and it is a page of text.
 Then report to the user (PR state, what was fixed, where the memory went)
 and END the loop — do not schedule another wake-up.
 
-Plain-English output throughout. If the memhub MCP is not
-connected, do the fixing anyway and tell the user the memory save needs
-`/mcp` authentication — don't fail the babysit over it.
+Plain-English output throughout. If the memory save fails on authentication, do
+the fixing anyway and send the user to `/memhub:login` — **not** `/mcp`. The
+save runs through the plugin's own credential (the personal access key
+`/memhub:login` mints), which is a separate store from the `/mcp` connector's
+token, so a connected `/mcp` does not mean the save can authenticate. Never fail
+the babysit over it.
