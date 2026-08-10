@@ -321,6 +321,18 @@ def test_messages() -> None:
     msg = ch._message(HOST, None, ("wat_is_this", time.time()))
     check("unknown reason still produces a message", bool(msg), True)
 
+    # Running out of the hook's own clock is not a credential question, so the
+    # generic "--status" tail would send someone to inspect the one thing that
+    # was definitely fine — the same misdirection this whole check exists to
+    # remove. It names the command that actually finishes the session instead.
+    msg = ch._message(HOST, None, ("budget_exhausted", time.time()))
+    check("budget exhaustion names the clock",
+          bool(msg and "ran out of time" in msg), True)
+    check("budget exhaustion does not send them to --status",
+          bool(msg and "--status" not in msg), True)
+    check("budget exhaustion names the finishing command",
+          bool(msg and "import-session" in msg), True)
+
 
 def test_debounce() -> None:
     print("\ndebounce")

@@ -65,8 +65,8 @@ from transcript_filter import drop_command_wrappers  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
-from room_map import env_for_url  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
+from room_map import env_for_url, forget_room  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -464,45 +464,85 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # reported to the user as "the capture hook hit an unexpected error".
     #
     # The cursor is unmoved in every branch, so all of them retry next turn.
-    try:
-        res = await session.call_tool("import_conversation", arguments=arguments)
-    except mcp_http.McpRateLimited as e:
-        wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
-        _log(f"rate limited{wait} — the next turn retries (cursor unmoved)")
-        _mark_failure(session_id, "rate_limited", str(e))
-        return
-    except mcp_http.McpNoResponse as e:
-        # Reached the server, it streamed, no answer came. That is a reply we
-        # could not use — the same bucket as a body we could not read — not a
-        # generic fault.
-        _log(f"no response frame: {e}")
-        _mark_failure(session_id, "unrecognized_response", str(e))
-        return
-    except mcp_http.McpError as e:
-        if e.status == 401:
-            # Unauthenticated: no credential, or one the server won't accept.
-            # /memhub:login mints a new one, so the advice converges.
-            _log("credential rejected; run /memhub:login — skipping")
-            _mark_failure(session_id, "auth", "server rejected the credential (401)")
-            return
-        if e.status == 403:
-            # Authorized-but-forbidden. Re-logging in mints an equivalent
-            # credential and changes NOTHING, so telling them to is the same
-            # non-converging loop the `no_refresh` advice was fixed for. The
-            # cause is scope or org access, and that is what to name.
-            _log("credential lacks permission (403) — check the key's scopes "
-                 "and that it can reach this brain's org; skipping")
-            _mark_failure(session_id, "forbidden", str(e))
-            return
-        _log(f"transport error: {e}")
-        _mark_failure(session_id, "error", str(e))
+    async def _import(args: dict):
+        """Send one import, classifying transport failures. None = already
+        reported, and the caller must return without touching the cursor.
+
+        A closure rather than the straight-line ladder it replaces because this
+        hook can now send TWICE — once routed to the repo's room, and again
+        unrouted when the server says that room does not exist. A 401 or a 429
+        must be classified identically on both, and keeping one copy is what
+        guarantees that; a second inline ladder is exactly how the two drift.
+        """
+        try:
+            return await session.call_tool("import_conversation", arguments=args)
+        except mcp_http.McpRateLimited as e:
+            wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
+            _log(f"rate limited{wait} — the next turn retries (cursor unmoved)")
+            _mark_failure(session_id, "rate_limited", str(e))
+        except mcp_http.McpNoResponse as e:
+            # Reached the server, it streamed, no answer came. That is a reply
+            # we could not use — the same bucket as a body we could not read —
+            # not a generic fault.
+            _log(f"no response frame: {e}")
+            _mark_failure(session_id, "unrecognized_response", str(e))
+        except mcp_http.McpError as e:
+            if e.status == 401:
+                # Unauthenticated: no credential, or one the server won't
+                # accept. /memhub:login mints a new one, so the advice
+                # converges.
+                _log("credential rejected; run /memhub:login — skipping")
+                _mark_failure(session_id, "auth",
+                              "server rejected the credential (401)")
+            elif e.status == 403:
+                # Authorized-but-forbidden. Re-logging in mints an equivalent
+                # credential and changes NOTHING, so telling them to is the
+                # same non-converging loop the `no_refresh` advice was fixed
+                # for. The cause is scope or org access, and that is what to
+                # name.
+                _log("credential lacks permission (403) — check the key's "
+                     "scopes and that it can reach this brain's org; skipping")
+                _mark_failure(session_id, "forbidden", str(e))
+            else:
+                _log(f"transport error: {e}")
+                _mark_failure(session_id, "error", str(e))
+        return None
+
+    def _texts(result) -> list[str]:
+        return [t for t in (getattr(b, "text", None)
+                            for b in getattr(result, "content", []) or []) if t]
+
+    res = await _import(arguments)
+    if res is None:
         return
 
     # MCP signals tool failure via isError + a message, NOT an
     # exception. Without this the cursor would advance past records the
     # server rejected, losing them permanently.
-    texts = [t for t in (getattr(b, "text", None)
-                         for b in getattr(res, "content", []) or []) if t]
+    texts = _texts(res)
+
+    # A cached room the backend does not have must not cost the turn. Routing
+    # already degrades to long-term memory when NO room is cached — but that
+    # check reads the CACHE, not the server, so a present-but-wrong id sailed
+    # past it and the flush simply died. That is how a `production` entry
+    # holding a staging brain id took out per-turn capture and the SessionEnd
+    # backstop together, for days: every turn re-sent an id the server had
+    # already rejected, and `write_miss` refused to overwrite it, so nothing
+    # could ever correct the cache. Forget the id — so the next turn resolves
+    # honestly — and send again unrouted, which is where the no-room path
+    # would have put this turn anyway.
+    if getattr(res, "isError", False) and room and is_missing_brain(texts):
+        _log(f"room {room['brain_id'][:8]} does not exist on this backend — "
+             "dropping it from the cache and flushing to long-term memory")
+        forget_room(cwd, env)
+        room = None
+        arguments.pop("agent_brain_id", None)
+        arguments.pop("org_id", None)
+        res = await _import(arguments)
+        if res is None:
+            return
+        texts = _texts(res)
+
     if getattr(res, "isError", False):
         detail = (texts[0] if texts else "no detail")[:200]
         _log(f"flush FAILED: {detail}")

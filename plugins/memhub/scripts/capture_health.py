@@ -96,6 +96,11 @@ _REASONS = {
                   "(check its scopes and org access)"),
     "unrecognized_response": "the server sent a reply the plugin could not read",
     "timeout": "the server stopped responding",
+    # Ran out of its own clock, not a fault of the server or the credential.
+    # Named separately because the alternative was reporting whatever error the
+    # attempt BEFORE it produced, which pointed at a cause that had already been
+    # dealt with.
+    "budget_exhausted": "capture ran out of time before it finished sending",
     "error": "the capture hook hit an unexpected error",
 }
 
@@ -379,8 +384,17 @@ def _message(host: str, token_problem: str | None,
         # NOT "check /mcp" — the connector is a separate token store, so its
         # status says nothing about capture health. Sending someone there to
         # diagnose this would contradict the whole reason this check exists.
-        tail = fix if reason == "auth" else (
-            "It may have recovered since; run /memhub:login --status to check.")
+        if reason == "auth":
+            tail = fix
+        elif reason == "budget_exhausted":
+            # Not a credential question at all, so `--status` would send them
+            # to inspect the one thing that was definitely fine. The session is
+            # partially captured and finishing it is a different command.
+            tail = ("Nothing is broken — later flushes continue it; run "
+                    "/memhub:import-session to finish that session now.")
+        else:
+            tail = ("It may have recovered since; "
+                    "run /memhub:login --status to check.")
         return (f"MemHub capture last failed {when_txt} — {detail}. {tail}")
     return None
 

@@ -267,8 +267,70 @@ def test_cli() -> None:
         check("name", out.stdout.strip(), "Repo: XTraceAI/memhub-claude-plugin")
 
 
+def test_forget_room() -> None:
+    """A cached id the server disowns must be droppable.
+
+    `write_miss` deliberately refuses to overwrite a resolved id, which is right
+    for a lookup that came back empty and wrong for a backend that answered
+    "Agent brain not found" about the id we just sent. Without a way to forget,
+    those two rules composed into a cache entry nothing could ever correct.
+    """
+    print("forget")
+    _fresh_rooms()
+    with tempfile.TemporaryDirectory() as td:
+        repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
+        rm.write_room(PROD, cwd=repo, env="production")
+        rm.write_room(STAGING, cwd=repo, env="staging")
+
+        check("forget reports the drop", rm.forget_room(repo, "production"), True)
+        check("the forgotten backend is gone", rm.read_room(repo, "production"), None)
+        # Prod and staging hold different ids for the same repo; only the
+        # backend that rejected the id is discredited.
+        check("the other backend survives",
+              (rm.read_room(repo, "staging") or {}).get("brain_id"), STAGING)
+
+        # Nothing to drop is not an error — two flushes can race on the same
+        # rejection and the second must not raise inside a capture hook.
+        check("forgetting twice is harmless", rm.forget_room(repo, "production"), False)
+
+        # No `missed_at`: the next resolution should genuinely re-ask. Branding
+        # the repo room-less here would be inferring absence from an error
+        # message rather than from a listing that actually came back empty.
+        raw = json.loads(rm.ROOMS_PATH.read_text())
+        entry = raw["repos"]["Repo: XTraceAI/memhub-claude-plugin"]
+        check("no negative cache is invented", sorted(entry), ["staging"])
+        check("re-resolution is due", rm.resolve_due(repo, "production"), True)
+
+        # Dropping the last backend removes the repo outright rather than
+        # leaving `{}` behind — `resolve_due` reads them identically and the
+        # file stays legible.
+        rm.forget_room(repo, "staging")
+        raw = json.loads(rm.ROOMS_PATH.read_text())
+        check("an empty repo entry is removed", raw["repos"], {})
+
+        # Another repo's rooms are untouched by any of it.
+        other = _repo(Path(td) / "sub", "git@github.com:XTraceAI/xmem.git")
+        rm.write_room(PROD, cwd=other, env="production")
+        rm.forget_room(repo, "production")
+        check("other repos are untouched",
+              (rm.read_room(other, "production") or {}).get("brain_id"), PROD)
+
+
+def test_forget_outside_a_repo_is_safe() -> None:
+    """Never raises. This runs inside a capture hook, so a cache that cannot be
+    corrected must degrade to the old behaviour, not take the flush down."""
+    print("forget/no-repo")
+    _fresh_rooms()
+    with tempfile.TemporaryDirectory() as td:
+        plain = Path(td) / "not-a-repo"
+        plain.mkdir()
+        check("no repo means nothing to forget", rm.forget_room(plain, "production"),
+              False)
+
+
 if __name__ == "__main__":
     for test in (test_room_name_from_remote, test_write_then_read_per_backend,
+                 test_forget_room, test_forget_outside_a_repo_is_safe,
                  test_reads_never_raise, test_concurrent_writers_dont_lose_entries,
                  test_non_string_brain_id_is_rejected, test_env_keying, test_cli):
         test()

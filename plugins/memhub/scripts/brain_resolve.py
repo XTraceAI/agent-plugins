@@ -41,6 +41,32 @@ from room_map import (  # noqa: E402
 )
 
 
+# What a backend says when the id we sent is not a brain it holds. Matched on
+# the message text because an MCP tool error carries no code — ``isError`` plus
+# prose is the whole protocol here. Substring and case-folded so neither the
+# server's wrapper prefix ("Error executing tool import_conversation: …") nor a
+# reworded sentence silently switches the fallback off.
+_MISSING_BRAIN = "agent brain not found"
+
+
+def is_missing_brain(texts) -> bool:
+    """True when a tool error says the brain we routed to does not exist.
+
+    Accepts a single message or the list of text blocks off an MCP result, so
+    callers can pass whatever they already extracted.
+
+    Worth being precise about what this does NOT cover: an unreachable server,
+    a rejected token, a malformed payload. Those say nothing about the room, and
+    treating them as "the brain is gone" would throw away a good cache entry
+    over a transient outage. Only this one sentence licenses forgetting.
+    """
+    if texts is None:
+        return False
+    if isinstance(texts, str):
+        texts = [texts]
+    return any(_MISSING_BRAIN in (t or "").lower() for t in texts)
+
+
 def _payload(result, expected: str) -> dict:
     """Pull the JSON body out of an MCP tool result, tolerantly.
 
