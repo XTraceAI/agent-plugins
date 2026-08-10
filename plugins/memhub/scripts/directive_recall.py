@@ -70,7 +70,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_auth import resolve_bearer  # noqa: E402
 
 # Bound on the recall round-trip. This runs synchronously before the tool, so a
 # hung server can't be allowed to stall the agent; the server's own LLM-gate
@@ -460,51 +460,86 @@ async def _recall(
     answer — caching that would suppress this handle for the rest of the
     session on a transient blip.
     """
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    import mcp_http
 
-    url, headers, auth = resolve_url_and_auth(interactive=False)
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            arguments: dict = {"tool": tool, "args": args}
+    # NO REFRESH on this path, and no thread either — both are deliberate.
+    #
+    # This hook is SYNCHRONOUS with an 8s budget and fires before every file
+    # edit, so it must not attempt a token refresh: that is two blocking urllib
+    # calls, ~25s of socket timeout. Offloading to a thread does not help, and
+    # believing it did was a mistake corrected here — measured, a
+    # `wait_for(to_thread(...), 2.5)` around an 8s blocking call returns after
+    # 8.01s, because cancelling the future does not stop the thread and
+    # `asyncio.run` then joins the executor on the way out. A blocking call
+    # simply cannot be time-bounded from the outside.
+    #
+    # So it reads the cached credential and nothing else. Stale token, no
+    # recall this once — the async capture hooks have the budget to renew it,
+    # and a missed context lookup costs infinitely less than a stalled edit.
+    url, bearer = resolve_bearer(refresh=False)
+    if not bearer:
+        # No credential is a failed recall, not an empty one — the distinction
+        # the docstring above turns on. Returning [] would cache "nothing
+        # matched" against this handle for the rest of the session.
+        return None
+    # Stateless server, no handshake — one round trip. This hook is
+    # SYNCHRONOUS and ungated on Edit/Write, so it ran before every single
+    # file edit; the SDK's startup was pure latency in that path.
+    session = mcp_http.Session(url, bearer, timeout=_RECALL_TIMEOUT_S)
+    arguments: dict = {"tool": tool, "args": args}
+    if output:
+        # Reactive path: the server extracts identifiers from the
+        # failing output too (`output` predates repo/already_fired,
+        # so it needs no legacy-retry handling).
+        arguments["output"] = output
+    if repo:
+        arguments["repo"] = repo
+    if fired:
+        arguments["already_fired"] = fired[-_MAX_FIRED_SENT:]
+    if session_id:
+        # Self-echo exclusion: the server skips directives minted from
+        # this session's own conversation — the audit's dominant noise
+        # class (lessons replayed minutes after the agent applied them).
+        arguments["session_id"] = session_id
+    # A transport failure is a FAILED recall, never an empty one. The
+    # difference is the whole contract of this function: `[]` means "asked,
+    # nothing matched" and gets cached against this handle for the session,
+    # so letting a 429 or a dropped connection reach that path would suppress
+    # recall on this handle for the rest of the session over a blip.
+    #
+    # It also fails OPEN. A recall that cannot happen must not block the edit
+    # the user is making — the hook contributes context, it does not gate work.
+    try:
+        res = await session.call_tool("recall_directives", arguments=arguments)
+    except mcp_http.McpError as e:
+        _log(f"recall unavailable ({e}) — proceeding without directives")
+        return None
+    if getattr(res, "isError", False) and (repo or fired or session_id):
+        # Rolling-upgrade compat: a server predating the repo /
+        # already_fired / session_id params rejects unknown arguments.
+        # Retry once legacy-shaped — client-side dedup still covers
+        # repeats.
+        texts = [t for t in (getattr(b, "text", None)
+                 for b in getattr(res, "content", []) or []) if t]
+        detail = (texts[0] if texts else "")[:200]
+        if re.search(r"unexpected|repo|already_fired|session_id|validation",
+                     detail, re.I):
+            _log("server predates repo/already_fired/session_id; "
+                 "retrying legacy")
+            # Keep `output`: it predates the params being rejected and
+            # is the reactive path's whole firing signal — dropping it
+            # would silently reduce a failure recall to command-line
+            # matching, the exact miss the reactive hook exists to fix.
+            legacy: dict = {"tool": tool, "args": args}
             if output:
-                # Reactive path: the server extracts identifiers from the
-                # failing output too (`output` predates repo/already_fired,
-                # so it needs no legacy-retry handling).
-                arguments["output"] = output
-            if repo:
-                arguments["repo"] = repo
-            if fired:
-                arguments["already_fired"] = fired[-_MAX_FIRED_SENT:]
-            if session_id:
-                # Self-echo exclusion: the server skips directives minted from
-                # this session's own conversation — the audit's dominant noise
-                # class (lessons replayed minutes after the agent applied them).
-                arguments["session_id"] = session_id
-            res = await session.call_tool("recall_directives", arguments=arguments)
-            if getattr(res, "isError", False) and (repo or fired or session_id):
-                # Rolling-upgrade compat: a server predating the repo /
-                # already_fired / session_id params rejects unknown arguments.
-                # Retry once legacy-shaped — client-side dedup still covers
-                # repeats.
-                texts = [t for t in (getattr(b, "text", None)
-                         for b in getattr(res, "content", []) or []) if t]
-                detail = (texts[0] if texts else "")[:200]
-                if re.search(r"unexpected|repo|already_fired|session_id|validation",
-                             detail, re.I):
-                    _log("server predates repo/already_fired/session_id; "
-                         "retrying legacy")
-                    # Keep `output`: it predates the params being rejected and
-                    # is the reactive path's whole firing signal — dropping it
-                    # would silently reduce a failure recall to command-line
-                    # matching, the exact miss the reactive hook exists to fix.
-                    legacy: dict = {"tool": tool, "args": args}
-                    if output:
-                        legacy["output"] = output
-                    res = await session.call_tool("recall_directives",
-                                                  arguments=legacy)
-            return _parse_recall_result(res)
+                legacy["output"] = output
+            try:
+                res = await session.call_tool("recall_directives",
+                                              arguments=legacy)
+            except mcp_http.McpError as e:
+                _log(f"legacy retry unavailable ({e})")
+                return None
+    return _parse_recall_result(res)
 
 
 def main() -> int:

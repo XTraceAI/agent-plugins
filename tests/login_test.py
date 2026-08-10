@@ -197,14 +197,21 @@ def test_failure_slugs_all_have_health_messages() -> None:
 
     import capture_health as ch
 
-    source = (SCRIPTS / "flush_turn.py").read_text(encoding="utf-8")
+    # BOTH hooks write breadcrumbs now, so both are scanned: the per-turn path
+    # and the SessionEnd backstop share one state format and must share one
+    # vocabulary, or the health check renders a generic fallback for whichever
+    # writer drifted.
+    source = "\n".join(
+        (SCRIPTS / name).read_text(encoding="utf-8")
+        for name in ("flush_turn.py", "flush_session.py"))
     # BOTH spellings. The in-flush paths pass the slug as a literal, while the
     # top-level handler picks one into `reason` first — scanning only the call
     # site silently covered two of five slugs while appearing to cover all of
     # them, which is a worse failure than not testing this at all.
     slugs = set(re.findall(r'_mark_failure\(\s*session_id,\s*"([a-z_]+)"', source))
     slugs |= set(re.findall(r'reason,\s*detail\s*=\s*"([a-z_]+)"', source))
-    check("every known slug is discovered", len(slugs) >= 5, True)
+    slugs |= set(re.findall(r'_breadcrumb\([^,]+,\s*"([a-z_]+)"', source))
+    check("every known slug is discovered", len(slugs) >= 7, True)
     for slug in sorted(slugs):
         check(f"{slug!r} has a health message", slug in ch._REASONS, True)
 

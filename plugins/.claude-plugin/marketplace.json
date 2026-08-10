@@ -1,0 +1,15 @@
+{
+  "name": "memhub-internal",
+  "description": "Internal MemHub builds for XTrace developers iterating on the service. Not for public consumers — see .claude-plugin/marketplace.json for the published plugins.",
+  "owner": {
+    "name": "XTrace",
+    "email": "felixmeng@xtrace.ai"
+  },
+  "plugins": [
+    {
+      "name": "memhub-staging",
+      "source": "./memhub-staging",
+      "description": "STAGING build of the MemHub plugin — pointed at api.staging.memhub.xtrace.ai. For XTrace developers only; installs from your local clone, so it reflects whatever branch you have checked out (use `staging`). A path source is required here, not git-subdir: this plugin's skills/hooks/scripts are symlinks into ../memhub/, and a git-subdir fetch pulls only its own subdirectory, leaving them dangling. Registers an MCP server named `memhub`, so it collides with the public `memhub` plugin: install one or the other, never both."
+    }
+  ]
+}

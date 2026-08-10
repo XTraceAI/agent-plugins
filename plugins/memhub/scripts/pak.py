@@ -35,11 +35,15 @@ import re
 import socket
 import time
 from datetime import datetime, timezone
+
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
+
+import atomic_write
+import mcp_http
 
 CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 
@@ -75,14 +79,12 @@ def api_base(mcp_url: str) -> str:
     Loopback is exempt: it never leaves the machine, and refusing it would make
     a local backend impossible to develop against.
     """
+    try:
+        mcp_http.require_secure(mcp_url)
+    except mcp_http.McpError as exc:
+        # Re-raised as this module's error so callers keep catching one type.
+        raise PakError(str(exc)) from exc
     parts = urlparse(mcp_url)
-    host = (parts.hostname or "").lower()
-    is_loopback = host in ("localhost", "127.0.0.1", "::1")
-    if parts.scheme != "https" and not is_loopback:
-        raise PakError(
-            f"refusing to send credentials to {parts.scheme}://{parts.netloc} "
-            "in cleartext — access-key operations require https. Check "
-            "$MEMHUB_MCP_BASE_URL.")
     return f"{parts.scheme}://{parts.netloc}"
 
 
@@ -125,17 +127,7 @@ def save(mcp_url: str, record: dict) -> None:
     truncated secret — which would authenticate as nothing while looking, to
     every check we have, exactly like a healthy install.
     """
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = key_path(mcp_url)
-    tmp = path.with_suffix(".json.tmp")
-    # Created 0600 by os.open rather than written-then-chmod'd. The obvious
-    # spelling leaves the secret briefly at the process umask — 0644 on a
-    # default setup — which is a real window on a shared machine, and a
-    # pointless one when opening with the mode costs nothing.
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(record))
-    tmp.replace(path)
+    atomic_write.publish(key_path(mcp_url), json.dumps(record))
 
 
 def forget(mcp_url: str) -> None:

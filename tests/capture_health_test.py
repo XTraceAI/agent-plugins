@@ -226,6 +226,44 @@ def test_breadcrumbs() -> None:
                  last_ok_at=now - 60)
     check("retracted by later success", ch._recent_failure(), None)
 
+    # ACROSS the two capture paths. They keep separate files — they share no
+    # lock, so they must not share a mutable one — and retracting only within a
+    # file left the backstop warning after per-turn capture had gone on working.
+    # The question is "is capture working?", not "did one path once stumble?".
+    _reset()
+    _write_state("s2.sessionflush", last_error="rate_limited",
+                 last_error_at=now - 300)
+    got = ch._recent_failure()
+    check("a backstop failure alone is reported", got and got[0], "rate_limited")
+
+    _write_state("s2", last_ok_at=now - 60)
+    check("a per-turn success retracts it", ch._recent_failure(), None)
+
+    # ...and the reverse direction, so neither path is privileged.
+    _reset()
+    _write_state("s3", last_error="auth", last_error_at=now - 300)
+    _write_state("s3.sessionflush", last_ok_at=now - 60)
+    check("a backstop success retracts a per-turn failure",
+          ch._recent_failure(), None)
+
+    # Dormancy is not a success. The per-turn hook clears its OWN stale error
+    # when it goes dormant on an old server, but must not stamp `last_ok_at` —
+    # that would retract a REAL failure the backstop recorded for the same
+    # session, from a branch that captured nothing.
+    _reset()
+    _write_state("s5.sessionflush", last_error="auth", last_error_at=now - 60)
+    _write_state("s5", unsupported=True)          # dormant: no last_ok_at
+    got = ch._recent_failure()
+    check("dormancy does not retract a real backstop failure",
+          got and got[0], "auth")
+
+    # An OLDER success must not retract a NEWER failure.
+    _reset()
+    _write_state("s4.sessionflush", last_error="error", last_error_at=now - 60)
+    _write_state("s4", last_ok_at=now - 300)
+    got = ch._recent_failure()
+    check("an older success does not retract", got and got[0], "error")
+
     _reset()
     _write_state("s1", last_error="timeout", last_error_at=now - 60,
                  last_ok_at=now - 300)
@@ -282,6 +320,18 @@ def test_messages() -> None:
 
     msg = ch._message(HOST, None, ("wat_is_this", time.time()))
     check("unknown reason still produces a message", bool(msg), True)
+
+    # Running out of the hook's own clock is not a credential question, so the
+    # generic "--status" tail would send someone to inspect the one thing that
+    # was definitely fine — the same misdirection this whole check exists to
+    # remove. It names the command that actually finishes the session instead.
+    msg = ch._message(HOST, None, ("budget_exhausted", time.time()))
+    check("budget exhaustion names the clock",
+          bool(msg and "ran out of time" in msg), True)
+    check("budget exhaustion does not send them to --status",
+          bool(msg and "--status" not in msg), True)
+    check("budget exhaustion names the finishing command",
+          bool(msg and "import-session" in msg), True)
 
 
 def test_debounce() -> None:

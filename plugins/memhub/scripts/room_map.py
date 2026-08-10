@@ -207,6 +207,25 @@ def _load() -> dict:
     return data
 
 
+def _write_atomic(data: dict) -> None:
+    """Replace the cache file with ``data``, all-or-nothing.
+
+    A half-written cache reads as "no room", which would silently send sessions
+    to personal memory until someone noticed. Unique temp name so two writers
+    cannot share one temp file. Raises ``OSError`` on failure — every caller
+    holds the lock and decides for itself whether a failed write is worth
+    propagating.
+    """
+    tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, ROOMS_PATH)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def read_room(cwd: str | Path | None = None, env: str | None = None) -> dict | None:
     """The cached room for this repo+backend, or None. Never raises.
 
@@ -269,18 +288,7 @@ def write_room(
         repo[env or current_env()] = entry
         data["repos"][key] = repo
         data.setdefault("version", 1)
-
-        body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-        # Atomic: a half-written cache reads as "no room", which would silently
-        # send sessions to personal memory until someone noticed. Unique temp
-        # name so two writers can't share one temp file.
-        tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(body, encoding="utf-8")
-            os.replace(tmp, ROOMS_PATH)
-        except OSError:
-            tmp.unlink(missing_ok=True)
-            raise
+        _write_atomic(data)
     return ROOMS_PATH
 
 
@@ -327,16 +335,7 @@ def write_probe_backoff(
             repo[env or current_env()] = slot
             data["repos"][key] = repo
             data.setdefault("version", 1)
-            tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
-            try:
-                tmp.write_text(
-                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                os.replace(tmp, ROOMS_PATH)
-            except OSError:
-                tmp.unlink(missing_ok=True)
-                raise
+            _write_atomic(data)
     except Exception:  # noqa: BLE001 — a rate limit must never fail a capture
         return
 
@@ -419,13 +418,65 @@ def write_miss(cwd: str | Path | None = None, env: str | None = None) -> None:
         repo[env or current_env()] = {"missed_at": time.time()}
         data["repos"][key] = repo
         data.setdefault("version", 1)
-        body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-        tmp = ROOMS_PATH.with_name(f"{ROOMS_PATH.name}.{os.getpid()}.tmp")
         try:
-            tmp.write_text(body, encoding="utf-8")
-            os.replace(tmp, ROOMS_PATH)
+            _write_atomic(data)
         except OSError:
-            tmp.unlink(missing_ok=True)
+            # A rate limit that could not be recorded costs one extra lookup
+            # next turn. Never worth failing the capture that called this.
+            pass
+
+
+def forget_room(cwd: str | Path | None = None, env: str | None = None) -> bool:
+    """Drop this repo's cached brain for ONE backend. True if an entry went.
+
+    The one thing :func:`write_miss` deliberately refuses to do, and for a good
+    reason: a lookup that came back empty is weak evidence — it may have raced
+    someone resolving the room — so it must never clobber an id somebody
+    resolved on purpose. But a backend answering "Agent brain not found" for the
+    id we just SENT is not weak evidence. That is the backend stating this id is
+    not a brain it has.
+
+    Without this the two rules composed into a cache that could not be
+    corrected. A ``production`` entry holding a staging brain id re-resolved on
+    every turn, found nothing, wrote a miss that declined to overwrite the id,
+    and handed the same dead id back to the caller (``brain_resolve`` returns
+    the stale ``room`` on every failure path) — so every flush re-sent it and
+    every flush was rejected. Per-turn capture AND the SessionEnd backstop both
+    failed that way for days, because both only fall back to long-term memory
+    when there is NO room, never when the room turns out not to exist.
+
+    Scoped to one env, because prod and staging hold different ids for the same
+    repo and only the backend that answered is discredited. Leaves no
+    ``missed_at``: the next resolution should genuinely re-ask, and if the room
+    really is absent that lookup writes its own miss and the day-long quiet
+    starts then, on evidence rather than on this inference.
+
+    Never raises — this runs inside a capture hook, so a cache that cannot be
+    corrected must degrade to the old behaviour rather than take the flush down.
+    """
+    key = room_name(cwd)
+    if key is None:
+        return False
+    try:
+        with _locked():
+            data = _load()
+            repo = data["repos"].get(key)
+            if not isinstance(repo, dict):
+                return False
+            if repo.pop(env or current_env(), None) is None:
+                return False
+            # A repo left with no backends at all is removed outright rather
+            # than kept as an empty object: `resolve_due` reads them
+            # identically, and the file stays legible to whoever opens it next.
+            if repo:
+                data["repos"][key] = repo
+            else:
+                data["repos"].pop(key, None)
+            data.setdefault("version", 1)
+            _write_atomic(data)
+        return True
+    except Exception:  # noqa: BLE001 — never fail a capture over the cache
+        return False
 
 
 def cmd_show(args: argparse.Namespace) -> int:

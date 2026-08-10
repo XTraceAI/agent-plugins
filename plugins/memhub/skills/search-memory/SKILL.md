@@ -20,9 +20,20 @@ Do exactly this:
      ingested files.
    - `top_k`: raise from the default 8 (max 50) when the user wants everything
      on a topic.
-   - `agent_brain_id`: only when the user names a specific agent brain —
-     resolve it via `list_agent_brains` first. Omit to search their own
-     workspace memory.
+   - `agent_brain_id`: **in a repo with an agent brain, search that brain
+     first.** The SessionStart brief names it (`MemHub: this repo's agent brain
+     is …`); `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show` prints
+     the id if the brief is not in context. That brain is where this repo's
+     sessions are captured, so it is where the answer usually is — omitting it
+     searches personal memory instead and reads as "the team never wrote that
+     down".
+     Then run the SAME query again WITHOUT `agent_brain_id` and merge: widen,
+     never replace. Personal workspace memory holds things the repo brain does
+     not, and silently dropping it is the failure this default exists to fix,
+     in the other direction. Skip the second call only when the user asked
+     about the repo/team specifically.
+     When the user names a DIFFERENT brain, resolve it via `list_agent_brains`
+     and search that one instead.
    - `tags` (+ `match`: `"all"`/`"any"`): narrows to artifacts carrying the
      tag(s) — check the vocabulary with `list_tags` first. Note that a tag
      filter restricts results to artifacts only.
@@ -32,8 +43,10 @@ Do exactly this:
    query or a different `memory_type` before concluding the memory isn't there.
 3. Answer the user's question from the results, citing which memories support
    it (type + a short quote). Mention the returned `scope` so they know where
-   the search ran. If nothing relevant exists, say so plainly — do not pad with
-   loosely related hits.
+   the search ran — and when you searched both, say which hits came from the
+   repo's brain and which from personal memory, because "the team decided this"
+   and "I noted this once" are different claims. If nothing relevant exists,
+   say so plainly — do not pad with loosely related hits.
 
 Plain-English output only: never surface internal ids, scores, or field names
 unless the user asks for them.

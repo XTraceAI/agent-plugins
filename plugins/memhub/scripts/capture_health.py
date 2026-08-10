@@ -86,8 +86,21 @@ _NO_REFRESH_WARN_WITHIN_S = 6 * 3600
 _REASONS = {
     "auth": "the plugin's saved login expired and could not be renewed",
     "server_rejected": "the server rejected the last upload",
+    # Backpressure, not a fault: a key runs at one seat's throughput and a fleet
+    # flushing every turn can reach it. Worded so it does not read as "your
+    # session was refused" — the cursor is unmoved and the next turn retries.
+    "rate_limited": "capture is being throttled and is retrying on its own",
+    # Distinct from `auth`, and the distinction is the whole point: a new login
+    # mints an equivalent credential, so pointing there would not converge.
+    "forbidden": ("the credential is valid but not permitted to write here "
+                  "(check its scopes and org access)"),
     "unrecognized_response": "the server sent a reply the plugin could not read",
     "timeout": "the server stopped responding",
+    # Ran out of its own clock, not a fault of the server or the credential.
+    # Named separately because the alternative was reporting whatever error the
+    # attempt BEFORE it produced, which pointed at a cause that had already been
+    # dealt with.
+    "budget_exhausted": "capture ran out of time before it finished sending",
     "error": "the capture hook hit an unexpected error",
 }
 
@@ -280,14 +293,47 @@ def _recent_failure() -> tuple[str, float] | None:
         reason, when = state.get("last_error"), state.get("last_error_at")
         if not reason or not isinstance(when, (int, float)) or when < cutoff:
             continue
-        # A later success in the SAME session retracts the failure. The flush
-        # clears both fields together, but a state file written by an older
-        # build carries the error with no clearing logic behind it.
-        ok_at = state.get("last_ok_at")
-        if isinstance(ok_at, (int, float)) and ok_at >= when:
+        # A later success retracts the failure — from EITHER capture path, not
+        # just the file the failure was recorded in.
+        #
+        # The two hooks keep separate files (they share no lock, so they must
+        # not share a mutable one). Retracting only within a file meant a
+        # backstop failure kept warning even after per-turn capture had gone on
+        # working — and the question this check answers is "is capture
+        # working?", not "did this particular path once stumble?".
+        if _succeeded_since(path, when):
             continue
         return str(reason), float(when)
     return None
+
+
+def _session_of(path: Path) -> str:
+    """The session id a state file belongs to, whichever hook wrote it.
+
+    `<id>.json` from the per-turn flush, `<id>.sessionflush.json` from the
+    backstop — both name the same session, which is what makes one path's
+    success able to speak for the other's failure.
+    """
+    name = path.name[: -len(".json")] if path.name.endswith(".json") else path.name
+    return name[: -len(".sessionflush")] if name.endswith(".sessionflush") else name
+
+
+def _succeeded_since(path: Path, when: float) -> bool:
+    """Whether any capture path recorded a success for this session after
+    ``when``. Reads only that session's files, so the scan stays bounded."""
+    session = _session_of(path)
+    for candidate in (STATE_DIR / f"{session}.json",
+                      STATE_DIR / f"{session}.sessionflush.json"):
+        try:
+            state = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(state, dict):
+            continue
+        ok_at = state.get("last_ok_at")
+        if isinstance(ok_at, (int, float)) and ok_at >= when:
+            return True
+    return False
 
 
 def _message(host: str, token_problem: str | None,
@@ -338,8 +384,17 @@ def _message(host: str, token_problem: str | None,
         # NOT "check /mcp" — the connector is a separate token store, so its
         # status says nothing about capture health. Sending someone there to
         # diagnose this would contradict the whole reason this check exists.
-        tail = fix if reason == "auth" else (
-            "It may have recovered since; run /memhub:login --status to check.")
+        if reason == "auth":
+            tail = fix
+        elif reason == "budget_exhausted":
+            # Not a credential question at all, so `--status` would send them
+            # to inspect the one thing that was definitely fine. The session is
+            # partially captured and finishing it is a different command.
+            tail = ("Nothing is broken — later flushes continue it; run "
+                    "/memhub:import-session to finish that session now.")
+        else:
+            tail = ("It may have recovered since; "
+                    "run /memhub:login --status to check.")
         return (f"MemHub capture last failed {when_txt} — {detail}. {tail}")
     return None
 

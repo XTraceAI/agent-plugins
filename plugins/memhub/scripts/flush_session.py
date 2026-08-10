@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -50,9 +49,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _memhub_auth import NonInteractiveAuthRequired, resolve_url_and_auth  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
-from room_map import env_for_url  # noqa: E402
+import atomic_write  # noqa: E402
+import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
+from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
+from room_map import env_for_url, forget_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -62,10 +63,6 @@ from transcript_chunks import slices as make_slices  # noqa: E402
 from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
 
-# The MCP SDK logs the OAuth flow's exception (with traceback) before it
-# propagates to us; a background hook must stay quiet, so silence that logger
-# — main() still reports the condition in one friendly line.
-logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 
 def _log(msg: str) -> None:
@@ -73,13 +70,72 @@ def _log(msg: str) -> None:
     print(f"[memhub-flush] {msg}")
 
 
+# This hook's breadcrumbs go in their OWN file, beside the per-turn hook's.
+#
+# The obvious thing — write into the per-turn state file, which already has the
+# format and the writer — is wrong, and subtly so. `_save_state` is a
+# read-modify-write, and the per-turn flush serialises its own writes with a
+# flock that this hook does not hold. Making the files atomic fixed torn reads
+# but not LOST UPDATES: both processes read, both modify, both write, and the
+# later writer silently discards the earlier one's changes. For that file the
+# discarded change could be the cursor, which means re-sent or skipped records.
+#
+# Two files and no shared mutable state beats one file and a lock: there is no
+# window to get wrong, and `capture_health` already scans the directory rather
+# than any particular name.
+_SESSION_STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
+
+
+def _breadcrumb(session_id, reason: str, detail: str = "",
+                ok: bool = False) -> None:
+    """Record this path's outcome where `capture_health` will find it.
+
+    Same field names as the per-turn hook, because the health check reads one
+    vocabulary; a separate FILE, because the two hooks have no lock in common.
+
+    Never raises: a breadcrumb is not worth failing a flush over.
+    """
+    if not session_id:
+        return
+    try:
+        record = {"at": time.time()}
+        if ok:
+            record["last_ok_at"] = time.time()
+        else:
+            record.update(last_error=reason,
+                          last_error_detail=(detail or "")[:200] or None,
+                          last_error_at=time.time())
+        atomic_write.publish(
+            _SESSION_STATE_DIR / f"{session_id}.sessionflush.json",
+            json.dumps(record))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # Comfortably inside the hooks' 300s budget, so the script decides when to
 # stop rather than being killed at an arbitrary point mid-upload.
 _DEFAULT_DEADLINE_S = 240.0
 
 
+# The least time worth STARTING a slice with. Bounding each slice by the time
+# remaining (rather than a fixed share) fixed one overrun and created another
+# problem: as the loop approaches the deadline the remaining budget shrinks
+# toward nothing, so the last slice would be attempted with a sub-second network
+# timeout and fail — turning a clean "stopped at the deadline, N slices unsent"
+# ending into a spurious timeout error and a failure breadcrumb.
+#
+# A slice that cannot plausibly finish should not be started. Below this, stop
+# with the honest summary instead of making a doomed call.
+_MIN_SLICE_BUDGET_S = 10.0
+
+
 def _stop_before_slice(index: int, now: float, deadline: float) -> bool:
     """Whether to give up rather than send slice ``index`` (1-based).
+
+    Stops when there is less than ``_MIN_SLICE_BUDGET_S`` left, not merely when
+    the deadline has passed: starting a slice with two seconds of budget only
+    buys a guaranteed timeout, reported as a failure, in place of a clean stop
+    that names what was not sent.
 
     The FIRST slice always goes. A backstop that sends nothing is not a
     degraded capture, it is no capture — and the sessions reaching this path
@@ -93,7 +149,7 @@ def _stop_before_slice(index: int, now: float, deadline: float) -> bool:
     nothing" with the log still reading like a bounded, deliberate stop. The
     guarantee is written down here so it cannot be lost by accident.
     """
-    return index > 1 and now >= deadline
+    return index > 1 and (deadline - now) < _MIN_SLICE_BUDGET_S
 
 
 def _deadline_s() -> float:
@@ -115,8 +171,6 @@ def _deadline_s() -> float:
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
 
     # Tolerant parse, NOT json.loads-or-die: this hook reads the transcript
     # while Claude Code is still appending to it, so a truncated final line
@@ -194,7 +248,21 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         except (OSError, subprocess.SubprocessError):
             pass
 
-    url, headers, auth = resolve_url_and_auth(interactive=False)
+    # In a thread: resolving may renew the token with blocking urllib calls
+    # (~25s of socket timeout), and a synchronous call cannot be cancelled by
+    # the deadline this flush runs under.
+    url, bearer = await asyncio.to_thread(resolve_bearer)
+    if not bearer:
+        # Breadcrumb BEFORE raising. The raise is caught by main()'s catch-all,
+        # which logs to an async hook's discarded stdout and records nothing —
+        # so without this the backstop's most likely failure, having no
+        # credential at all, was the one condition it reported least. Every
+        # other failure on this path leaves a trace; this one has to as well.
+        _breadcrumb(session_id, "auth", "no usable credential")
+        # Same contract the SDK's NonInteractiveAuthRequired had: a background
+        # hook degrades quietly rather than popping a browser at the user.
+        raise NonInteractiveAuthRequired(
+            "no usable credential (key, token or cached login)")
 
     # Route into the repo's room. Read AFTER the url resolves so the lookup is
     # keyed by the backend we're actually about to write to — prod and staging
@@ -208,58 +276,93 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Unknown origin must degrade to personal, never to a guess.
     env = env_for_url(url)
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            # Cached hit is a dict lookup; a miss asks the server once and
-            # caches the answer, so this is not a per-flush round-trip.
-            room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    # Stateless server, no handshake needed — see mcp_http for the probe
+    # that established this. One round trip instead of three.
+    # A PER-CALL cap, not the whole budget. This path sends a transcript in
+    # slices, and giving each call the entire deadline means one stalled slice
+    # consumes it and every later slice is skipped — the between-slice deadline
+    # check cannot help, because it only runs between calls.
+    #
+    # A quarter, floored so a short deadline still permits a real upload — and
+    # then CLAMPED BY THE DEADLINE ITSELF, because the floor could otherwise
+    # exceed it: `MEMHUB_FLUSH_DEADLINE_S=10` gave a 30s per-call cap, letting
+    # one call overrun the entire budget so the wall-clock check never got to
+    # stop the run cleanly. A per-call limit larger than the total is not a
+    # limit.
+    deadline = _deadline_s()
+    session = mcp_http.Session(url, bearer,
+                               timeout=min(deadline, max(30.0, deadline / 4)))
+    # Cached hit is a dict lookup; a miss asks the server once and
+    # caches the answer, so this is not a per-flush round-trip.
+    room = await resolve_repo_brain(session, cwd, env) if cwd else None
 
-            # Chunked, because this path sends the WHOLE transcript in one
-            # call and real sessions can outgrow a single payload. Unchunked,
-            # this works on ordinary sessions and fails on precisely the long
-            # ones — and as the backstop for when per-turn capture is dormant,
-            # failing on the biggest sessions is failing where it matters most.
-            # Slices are disjoint and sent in order against one conversation,
-            # so the server's watermark sees a normal incremental import.
-            payloads = make_slices(records)
+    # Chunked, because this path sends the WHOLE transcript in one
+    # call and real sessions can outgrow a single payload. Unchunked,
+    # this works on ordinary sessions and fails on precisely the long
+    # ones — and as the backstop for when per-turn capture is dormant,
+    # failing on the biggest sessions is failing where it matters most.
+    # Slices are disjoint and sent in order against one conversation,
+    # so the server's watermark sees a normal incremental import.
+    payloads = make_slices(records)
 
-            # Bounded by wall clock, not just by slice count. The hook's own
-            # budget is 300s; a many-slice session can exceed it, and being
-            # KILLED there is the bad ending — the process dies mid-upload,
-            # the tail is lost, and nothing says so. Stopping cleanly a minute
-            # early turns that into a partial capture that REPORTS what it did
-            # not send, which is the difference between a gap you can act on
-            # and one you never learn about.
-            # Slightly INSIDE the hard timeout in main(), so a run that is
-            # merely slow stops here — where it can name what it did not send
-            # — instead of being cancelled where it cannot.
-            deadline = time.monotonic() + _deadline_s() * 0.9
-            for index, payload in enumerate(payloads, 1):
-                if _stop_before_slice(index, time.monotonic(), deadline):
-                    remaining = sum(len(p) for p in payloads[index - 1:])
-                    _log(f"deadline reached after {index - 1}/{len(payloads)} "
-                         f"slices; {remaining} record(s) not sent. Re-run "
-                         f"/memhub:import-session --session {session_id} to "
-                         "finish (it resumes from the server's watermark).")
-                    return
-                arguments = {
-                    "messages": payload,
-                    "conversation_id": session_id,
-                    "source_platform": "claude",
-                }
-                if not await _send(session, arguments, room, title, namespace,
-                                   index, len(payloads)):
-                    return
+    # Bounded by wall clock, not just by slice count. The hook's own
+    # budget is 300s; a many-slice session can exceed it, and being
+    # KILLED there is the bad ending — the process dies mid-upload,
+    # the tail is lost, and nothing says so. Stopping cleanly a minute
+    # early turns that into a partial capture that REPORTS what it did
+    # not send, which is the difference between a gap you can act on
+    # and one you never learn about.
+    # Slightly INSIDE the hard timeout in main(), so a run that is
+    # merely slow stops here — where it can name what it did not send
+    # — instead of being cancelled where it cannot.
+    deadline = time.monotonic() + _deadline_s() * 0.9
+    for index, payload in enumerate(payloads, 1):
+        if _stop_before_slice(index, time.monotonic(), deadline):
+            remaining = sum(len(p) for p in payloads[index - 1:])
+            _log(f"deadline reached after {index - 1}/{len(payloads)} "
+                 f"slices; {remaining} record(s) not sent. Re-run "
+                 f"/memhub:import-session --session {session_id} to "
+                 "finish (it resumes from the server's watermark).")
+            return
+        arguments = {
+            "messages": payload,
+            "conversation_id": session_id,
+            "source_platform": "claude",
+        }
+        # Bound this call by the time LEFT, not a fixed fraction of the
+        # budget. `_stop_before_slice` only checks BEFORE a slice, so a
+        # slice starting just under the deadline could otherwise run a full
+        # per-call timeout past it — and with the deadline tuned up (say
+        # MEMHUB_FLUSH_DEADLINE_S=300) that overrun crosses the hook's own
+        # 300s cap, so the process is killed mid-upload and the summary
+        # naming the unsent slices never gets written. That summary is the
+        # entire reason this path stops itself rather than being stopped.
+        # ``room`` is fed back in: a slice that discovered the cached brain
+        # does not exist has already dropped it, and slices 2..N must not
+        # re-send an id the server just disowned.
+        ok, room = await _send(session, arguments, room, title, namespace,
+                               index, len(payloads),
+                               budget=max(_MIN_SLICE_BUDGET_S,
+                                          deadline - time.monotonic()),
+                               cwd=cwd, env=env)
+        if not ok:
+            return
 
 
 async def _send(session, arguments, room, title, namespace,
-                index: int, total: int) -> bool:
-    """Send one slice. False means stop — a later slice cannot help.
+                index: int, total: int, budget: float | None = None,
+                cwd=None, env=None) -> tuple[bool, dict | None]:
+    """Send one slice. Returns ``(keep_going, room)``.
 
-    Sequential and fail-closed: the slices are ordered, so pressing on after a
-    rejection would leave a hole in the middle of the conversation while the
-    log reported the later slices as fine.
+    ``keep_going`` False means stop — a later slice cannot help. Sequential and
+    fail-closed: the slices are ordered, so pressing on after a rejection would
+    leave a hole in the middle of the conversation while the log reported the
+    later slices as fine.
+
+    ``room`` comes back because this function may DISCOVER that the cached room
+    is not real — a backend answering "Agent brain not found" for the id it was
+    handed — and drop it. The caller loops over slices, so it needs the updated
+    value or every later slice re-sends the same disowned id.
     """
     if room:
         arguments["agent_brain_id"] = room["brain_id"]
@@ -278,16 +381,134 @@ async def _send(session, arguments, room, title, namespace,
         arguments["namespace"] = namespace
 
     label = f"slice {index}/{total}: " if total > 1 else ""
-    res = await session.call_tool("import_conversation", arguments=arguments)
-    texts = [t for t in (getattr(b, "text", None)
-                         for b in getattr(res, "content", []) or []) if t]
+    # Transport failures stop the run cleanly — slices already sent stay durable
+    # and the server dedups on re-send — AND leave a breadcrumb.
+    #
+    # The breadcrumb is the point. This hook is async fire-and-forget, so its
+    # stdout goes nowhere, and it is the BACKSTOP: the path that catches exactly
+    # the sessions per-turn capture already missed. Returning False silently
+    # would leave it failing invisibly, which is the precise bug this whole
+    # series exists to remove — and it would be worse here than in the per-turn
+    # path, because nothing downstream is left to notice.
+    # An ABSOLUTE deadline for this slice, derived once from the budget the
+    # caller measured when it called. The closure below can run twice, and
+    # closing over `budget` itself granted the second call the first call's
+    # time all over again — two sequential attempts, each up to the full
+    # per-slice budget, overrunning the very deadline that clamp exists to
+    # hold. Time already spent has to come off the second attempt, and only an
+    # absolute deadline says that.
+    slice_deadline = None if budget is None else time.monotonic() + budget
+
+    def _remaining() -> float | None:
+        """Seconds left for this slice, or None when it is unbudgeted."""
+        return (None if slice_deadline is None
+                else slice_deadline - time.monotonic())
+
+    async def _import(args: dict, timeout: float | None):
+        """Send one import, classifying transport failures. None = already
+        logged and breadcrumbed, and the caller must stop.
+
+        A closure rather than the straight-line ladder it replaces because a
+        slice can now be sent TWICE — once routed to the room, once unrouted
+        after the server disowns it — and both must classify a 401 or a 429 the
+        same way. One copy is what keeps that true.
+
+        ``timeout`` is a parameter and NOT the enclosing ``budget``, so each
+        call is bounded by the time actually left rather than by what was left
+        when the slice started.
+        """
+        try:
+            return await session.call_tool("import_conversation",
+                                           arguments=args, timeout=timeout)
+        except mcp_http.McpRateLimited as e:
+            wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
+            _log(f"{label}rate limited{wait}; slices already sent are stored")
+            _breadcrumb(args.get("conversation_id"), "rate_limited", str(e))
+        except mcp_http.McpNoResponse as e:
+            _log(f"{label}no response frame: {e}")
+            _breadcrumb(args.get("conversation_id"), "unrecognized_response", str(e))
+        except mcp_http.McpError as e:
+            if e.status == 401:
+                _log(f"{label}credential rejected (401); run /memhub:login")
+                _breadcrumb(args.get("conversation_id"), "auth", str(e))
+            elif e.status == 403:
+                _log(f"{label}credential lacks permission (403); check its "
+                     "scopes and org access")
+                _breadcrumb(args.get("conversation_id"), "forbidden", str(e))
+            else:
+                _log(f"{label}transport error: {e}")
+                _breadcrumb(args.get("conversation_id"), "error", str(e))
+        return None
+
+    def _texts(result) -> list[str]:
+        return [t for t in (getattr(b, "text", None)
+                            for b in getattr(result, "content", []) or []) if t]
+
+    res = await _import(arguments, budget)
+    if res is None:
+        return False, room
+    texts = _texts(res)
+
+    # A cached room the backend does not have must not cost the session. This
+    # path already degrades to long-term memory when NO room is cached, but
+    # that reads the CACHE, not the server — so a present-but-wrong id walked
+    # straight past it and killed the backstop, at the same time and for the
+    # same reason as the per-turn flush. Drop the id and re-send unrouted.
+    if getattr(res, "isError", False) and room and is_missing_brain(texts):
+        _log(f"{label}room {room['brain_id'][:8]} does not exist on this "
+             "backend — dropping it from the cache and flushing to long-term "
+             "memory")
+        # Only when the caller told us where this session ran. `forget_room`
+        # keys on the repo at `cwd`, and `room_name(None)` falls back to THIS
+        # PROCESS's directory — a hook can fire from a different repo than the
+        # session's, so forgetting on an unknown origin could delete an
+        # unrelated repo's cached room. `read_room`'s docstring warns about
+        # precisely this substitution. Unrouting still happens either way: it
+        # rescues the slice and touches no cache.
+        if cwd is not None:
+            forget_room(cwd, env)
+        room = None
+        arguments.pop("agent_brain_id", None)
+        arguments.pop("org_id", None)
+        # Only re-send if there is plausibly time to finish. Below
+        # `_MIN_SLICE_BUDGET_S` a call buys a guaranteed timeout reported as a
+        # failure, which is the same doomed-call reasoning `_stop_before_slice`
+        # already applies to whole slices. Skipping costs little here: the dead
+        # id is ALREADY forgotten, so the next flush — SessionEnd, or the next
+        # commit — routes this session to long-term memory with a fresh budget.
+        left = _remaining()
+        if left is None or left >= _MIN_SLICE_BUDGET_S:
+            res = await _import(arguments, left)
+            if res is None:
+                return False, room
+            texts = _texts(res)
+        else:
+            # Reported HERE rather than by falling through to the isError
+            # branch. Falling through would breadcrumb the original "Agent
+            # brain not found" — the one thing that is no longer true, since
+            # the id has just been forgotten — and `capture_health` renders
+            # that breadcrumb to the user at SessionStart. They would go
+            # hunting a brain problem that has already fixed itself, while the
+            # thing that actually stopped this slice, the clock, went unnamed.
+            _log(f"{label}no budget left to re-send unrouted; the room is "
+                 "dropped, so the next flush reaches long-term memory")
+            _breadcrumb(arguments.get("conversation_id"), "budget_exhausted",
+                        f"ran out of time before re-sending slice {index} "
+                        "unrouted")
+            return False, room
+
     # MCP signals tool failure via isError + a message in content, NOT via an
     # exception — without this check a bad token or server error logs as
     # success while memory never updates.
     if getattr(res, "isError", False):
-        _log(f"{label}flush FAILED: "
-             f"{(texts[0] if texts else 'no detail')[:200]}")
-        return False
+        detail = (texts[0] if texts else "no detail")[:200]
+        _log(f"{label}flush FAILED: {detail}")
+        # Breadcrumbed like the transport failures above. Leaving this path
+        # silent made the backstop's MOST LIKELY server-side failure — a slice
+        # the server rejects — the one it reported least, which is the same
+        # asymmetry the transport paths were fixed for one round earlier.
+        _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
+        return False, room
     out = getattr(res, "structuredContent", None)
     if isinstance(out, dict) and "conversation_id" not in out \
             and isinstance(out.get("result"), dict):
@@ -309,13 +530,21 @@ async def _send(session, arguments, room, title, namespace,
              f"(conv {str(out.get('conversation_id'))[:8]}, "
              f"path={out.get('path')}) -> {dest} "
              "— server processes the delta")
-        return True
+        # Retract any earlier failure on this path. Without it a single
+        # throttled slice would keep warning for a day even though the backstop
+        # went on to work — the same crying-wolf the per-turn hook clears with
+        # `_mark_success`.
+        _breadcrumb(arguments.get("conversation_id"), "", ok=True)
+        return True, room
     # Not an error per the protocol, but not the shape import_conversation
     # returns either — log what came back instead of claiming success on an
     # arbitrary body, and stop: an unrecognised reply is not a slice landing.
-    _log(f"{label}flush response unrecognized: "
-         f"{(texts[0] if texts else '')[:120]!r}")
-    return False
+    detail = (texts[0] if texts else "")[:120]
+    _log(f"{label}flush response unrecognized: {detail!r}")
+    # The last silent exit on this path. Every way `_send` can return False now
+    # leaves a trace — the guarantee is only worth something if it has no holes.
+    _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", detail)
+    return False, room
 
 
 def _auth_required(e: BaseException) -> bool:

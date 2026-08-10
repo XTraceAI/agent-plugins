@@ -575,6 +575,40 @@ def test_an_unknowable_org_does_not_re_resolve_every_turn():
         check("due again after the TTL", rm.resolve_due("/repo", "staging"), True)
 
 
+def test_is_missing_brain():
+    """Which server error licenses forgetting a cached room.
+
+    This is the trigger for the only path that deletes a resolved id, so both
+    directions matter: too narrow and a dead entry stays dead (capture fails on
+    every turn, which is the bug this shipped to fix); too broad and a transient
+    outage throws away a good room.
+    """
+    print("is_missing_brain")
+    check("the bare sentence", br.is_missing_brain("Agent brain not found"), True)
+    # What the server actually sends — the tool name is wrapped around it.
+    check("the server's wrapped form", br.is_missing_brain(
+        "Error executing tool import_conversation: Agent brain not found"), True)
+    check("case does not matter",
+          br.is_missing_brain("AGENT BRAIN NOT FOUND"), True)
+    # Callers pass the list of text blocks straight off an MCP result.
+    check("a list of blocks", br.is_missing_brain(
+        ["something else", "Agent brain not found"]), True)
+
+    # Everything below says nothing about whether the brain exists. Forgetting
+    # a room over any of these would drop a good cache entry over a blip.
+    check("auth failure is not a missing brain",
+          br.is_missing_brain("Not authenticated"), False)
+    check("a server error is not a missing brain",
+          br.is_missing_brain("500 Internal Server Error"), False)
+    check("a missing ARTIFACT is not a missing brain",
+          br.is_missing_brain("Artifact not found"), False)
+    check("no detail at all", br.is_missing_brain([]), False)
+    check("none is not a match", br.is_missing_brain(None), False)
+    # Blocks can carry a None text; the extractor upstream filters those, but
+    # this must not raise if one slips through.
+    check("a null block does not raise", br.is_missing_brain([None]), False)
+
+
 if __name__ == "__main__":
     for fn in (test_resolves_and_caches, test_no_brain_is_remembered_as_a_miss,
                test_a_miss_never_clobbers_a_resolved_room,
@@ -592,7 +626,8 @@ if __name__ == "__main__":
                test_a_scoped_listing_is_trusted,
                test_a_complete_search_still_records_a_miss,
                test_a_room_cached_without_an_org_is_resolved_again,
-               test_an_unknowable_org_does_not_re_resolve_every_turn):
+               test_an_unknowable_org_does_not_re_resolve_every_turn,
+               test_is_missing_brain):
         fn()
     print()
     if _failures:
