@@ -57,8 +57,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
-from room_map import env_for_url  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
+from room_map import env_for_url, forget_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -344,20 +344,32 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # 300s cap, so the process is killed mid-upload and the summary
         # naming the unsent slices never gets written. That summary is the
         # entire reason this path stops itself rather than being stopped.
-        if not await _send(session, arguments, room, title, namespace,
-                           index, len(payloads),
-                           budget=max(_MIN_SLICE_BUDGET_S,
-                                      deadline - time.monotonic())):
+        # ``room`` is fed back in: a slice that discovered the cached brain
+        # does not exist has already dropped it, and slices 2..N must not
+        # re-send an id the server just disowned.
+        ok, room = await _send(session, arguments, room, title, namespace,
+                               index, len(payloads),
+                               budget=max(_MIN_SLICE_BUDGET_S,
+                                          deadline - time.monotonic()),
+                               cwd=cwd, env=env)
+        if not ok:
             return
 
 
 async def _send(session, arguments, room, title, namespace,
-                index: int, total: int, budget: float | None = None) -> bool:
-    """Send one slice. False means stop — a later slice cannot help.
+                index: int, total: int, budget: float | None = None,
+                cwd=None, env=None) -> tuple[bool, dict | None]:
+    """Send one slice. Returns ``(keep_going, room)``.
 
-    Sequential and fail-closed: the slices are ordered, so pressing on after a
-    rejection would leave a hole in the middle of the conversation while the
-    log reported the later slices as fine.
+    ``keep_going`` False means stop — a later slice cannot help. Sequential and
+    fail-closed: the slices are ordered, so pressing on after a rejection would
+    leave a hole in the middle of the conversation while the log reported the
+    later slices as fine.
+
+    ``room`` comes back because this function may DISCOVER that the cached room
+    is not real — a backend answering "Agent brain not found" for the id it was
+    handed — and drop it. The caller loops over slices, so it needs the updated
+    value or every later slice re-sends the same disowned id.
     """
     if room:
         arguments["agent_brain_id"] = room["brain_id"]
@@ -385,32 +397,65 @@ async def _send(session, arguments, room, title, namespace,
     # would leave it failing invisibly, which is the precise bug this whole
     # series exists to remove — and it would be worse here than in the per-turn
     # path, because nothing downstream is left to notice.
-    try:
-        res = await session.call_tool("import_conversation",
-                                      arguments=arguments, timeout=budget)
-    except mcp_http.McpRateLimited as e:
-        wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
-        _log(f"{label}rate limited{wait}; slices already sent are stored")
-        _breadcrumb(arguments.get("conversation_id"), "rate_limited", str(e))
-        return False
-    except mcp_http.McpNoResponse as e:
-        _log(f"{label}no response frame: {e}")
-        _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", str(e))
-        return False
-    except mcp_http.McpError as e:
-        if e.status == 401:
-            _log(f"{label}credential rejected (401); run /memhub:login")
-            _breadcrumb(arguments.get("conversation_id"), "auth", str(e))
-        elif e.status == 403:
-            _log(f"{label}credential lacks permission (403); check its scopes "
-                 "and org access")
-            _breadcrumb(arguments.get("conversation_id"), "forbidden", str(e))
-        else:
-            _log(f"{label}transport error: {e}")
-            _breadcrumb(arguments.get("conversation_id"), "error", str(e))
-        return False
-    texts = [t for t in (getattr(b, "text", None)
-                         for b in getattr(res, "content", []) or []) if t]
+    async def _import(args: dict):
+        """Send one import, classifying transport failures. None = already
+        logged and breadcrumbed, and the caller must stop.
+
+        A closure rather than the straight-line ladder it replaces because a
+        slice can now be sent TWICE — once routed to the room, once unrouted
+        after the server disowns it — and both must classify a 401 or a 429 the
+        same way. One copy is what keeps that true.
+        """
+        try:
+            return await session.call_tool("import_conversation",
+                                           arguments=args, timeout=budget)
+        except mcp_http.McpRateLimited as e:
+            wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
+            _log(f"{label}rate limited{wait}; slices already sent are stored")
+            _breadcrumb(args.get("conversation_id"), "rate_limited", str(e))
+        except mcp_http.McpNoResponse as e:
+            _log(f"{label}no response frame: {e}")
+            _breadcrumb(args.get("conversation_id"), "unrecognized_response", str(e))
+        except mcp_http.McpError as e:
+            if e.status == 401:
+                _log(f"{label}credential rejected (401); run /memhub:login")
+                _breadcrumb(args.get("conversation_id"), "auth", str(e))
+            elif e.status == 403:
+                _log(f"{label}credential lacks permission (403); check its "
+                     "scopes and org access")
+                _breadcrumb(args.get("conversation_id"), "forbidden", str(e))
+            else:
+                _log(f"{label}transport error: {e}")
+                _breadcrumb(args.get("conversation_id"), "error", str(e))
+        return None
+
+    def _texts(result) -> list[str]:
+        return [t for t in (getattr(b, "text", None)
+                            for b in getattr(result, "content", []) or []) if t]
+
+    res = await _import(arguments)
+    if res is None:
+        return False, room
+    texts = _texts(res)
+
+    # A cached room the backend does not have must not cost the session. This
+    # path already degrades to long-term memory when NO room is cached, but
+    # that reads the CACHE, not the server — so a present-but-wrong id walked
+    # straight past it and killed the backstop, at the same time and for the
+    # same reason as the per-turn flush. Drop the id and re-send unrouted.
+    if getattr(res, "isError", False) and room and is_missing_brain(texts):
+        _log(f"{label}room {room['brain_id'][:8]} does not exist on this "
+             "backend — dropping it from the cache and flushing to long-term "
+             "memory")
+        forget_room(cwd, env)
+        room = None
+        arguments.pop("agent_brain_id", None)
+        arguments.pop("org_id", None)
+        res = await _import(arguments)
+        if res is None:
+            return False, room
+        texts = _texts(res)
+
     # MCP signals tool failure via isError + a message in content, NOT via an
     # exception — without this check a bad token or server error logs as
     # success while memory never updates.
@@ -422,7 +467,7 @@ async def _send(session, arguments, room, title, namespace,
         # the server rejects — the one it reported least, which is the same
         # asymmetry the transport paths were fixed for one round earlier.
         _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
-        return False
+        return False, room
     out = getattr(res, "structuredContent", None)
     if isinstance(out, dict) and "conversation_id" not in out \
             and isinstance(out.get("result"), dict):
@@ -449,7 +494,7 @@ async def _send(session, arguments, room, title, namespace,
         # went on to work — the same crying-wolf the per-turn hook clears with
         # `_mark_success`.
         _breadcrumb(arguments.get("conversation_id"), "", ok=True)
-        return True
+        return True, room
     # Not an error per the protocol, but not the shape import_conversation
     # returns either — log what came back instead of claiming success on an
     # arbitrary body, and stop: an unrecognised reply is not a slice landing.
@@ -458,7 +503,7 @@ async def _send(session, arguments, room, title, namespace,
     # The last silent exit on this path. Every way `_send` can return False now
     # leaves a trace — the guarantee is only worth something if it has no holes.
     _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", detail)
-    return False
+    return False, room
 
 
 def _auth_required(e: BaseException) -> bool:

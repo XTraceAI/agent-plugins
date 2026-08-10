@@ -77,8 +77,8 @@ def send(result, room=None, title=None, namespace=None, index=1, total=1):
     session = FakeSession(result)
     args = {"messages": [{"type": "user"}], "conversation_id": "s1",
             "source_platform": "claude"}
-    ok = asyncio.run(fs._send(session, args, room, title, namespace,
-                              index, total))
+    ok, _room = asyncio.run(fs._send(session, args, room, title, namespace,
+                                     index, total))
     return ok, (session.sent[0][1] if session.sent else None)
 
 
@@ -117,6 +117,81 @@ check("an isError reply stops the run", ok is False)
 # returns either — a slice that cannot be confirmed did not land.
 ok, _ = send(FakeResult(structured={"something": "else"}))
 check("an unrecognized body stops the run", ok is False)
+
+
+# ── a room the backend does not have ──────────────────────────────────
+#
+# The hole this closes: routing degrades to long-term memory when NO room is
+# cached, but that reads the CACHE, not the server. A cached id the backend has
+# never heard of walked past that check and killed the whole backstop — which is
+# exactly what a `production` entry holding a staging brain id did for days.
+
+class FakeSequenceSession:
+    """Replies with a different result per call, so a retry can be observed."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.sent = []
+
+    async def call_tool(self, name, arguments=None, timeout=None):
+        # Copy: `_send` mutates the caller's dict, so keeping the reference
+        # would make the first call's record show the SECOND call's arguments
+        # and the retry assertions below would pass vacuously.
+        self.sent.append((name, dict(arguments or {})))
+        return self.results[min(len(self.sent), len(self.results)) - 1]
+
+
+MISSING = FakeResult(texts=["Error executing tool import_conversation: "
+                            "Agent brain not found"], is_error=True)
+
+
+def send_seq(*results, room=None):
+    session = FakeSequenceSession(*results)
+    args = {"messages": [{"type": "user"}], "conversation_id": "s1",
+            "source_platform": "claude"}
+    forgot = []
+    real, fs.forget_room = fs.forget_room, lambda cwd=None, env=None: (
+        forgot.append((cwd, env)) or True)
+    try:
+        ok, room_after = asyncio.run(
+            fs._send(session, args, room, None, None, 1, 1,
+                     cwd="/repo", env="production"))
+    finally:
+        fs.forget_room = real
+    return ok, room_after, session.sent, forgot
+
+
+ok, room_after, sent, forgot = send_seq(
+    MISSING, OK, room={"brain_id": "b1", "org_id": "o1"})
+check("a missing brain does not fail the slice", ok is True)
+check("a missing brain is retried", len(sent) == 2)
+check("the retry drops the brain id", "agent_brain_id" not in sent[1][1])
+check("the retry drops the org too", "org_id" not in sent[1][1])
+check("the first attempt did carry the brain id",
+      sent[0][1].get("agent_brain_id") == "b1")
+check("the dead room is forgotten", forgot == [("/repo", "production")])
+check("the caller is told the room is gone", room_after is None)
+
+# Only THIS error licenses forgetting a room. A rejected token or an unreachable
+# server says nothing about whether the brain exists, and dropping a good cache
+# entry over a transient outage would re-resolve — or mis-resolve — on the next
+# turn for no reason.
+ok, room_after, sent, forgot = send_seq(
+    FakeResult(texts=["Not authenticated"], is_error=True),
+    OK, room={"brain_id": "b1"})
+check("an unrelated error is not retried", len(sent) == 1)
+check("an unrelated error keeps the room", room_after == {"brain_id": "b1"})
+check("an unrelated error forgets nothing", forgot == [])
+check("an unrelated error still stops the run", ok is False)
+
+# Both attempts failing is a real failure — the fallback is one retry, not a
+# loop, and the caller must still stop rather than send later slices into a
+# conversation whose first slice never landed.
+ok, room_after, sent, forgot = send_seq(
+    MISSING, FakeResult(texts=["still broken"], is_error=True),
+    room={"brain_id": "b1"})
+check("a failed fallback stops the run", ok is False)
+check("a failed fallback still forgot the room", forgot != [])
 
 ok, _ = send(FakeResult(texts=['{"conversation_id": "c1"}']))
 check("a JSON text body is understood", ok is True)

@@ -78,21 +78,44 @@ def _check_every_failure_leaves_a_trace() -> None:
               / "scripts" / "flush_session.py").read_text(encoding="utf-8")
     body = source.split("async def _send(")[-1].split("\ndef ")[0]
 
-    # Walk the function's lines; every `return False` must have a _breadcrumb
+    # Walk the function's lines; every failing return must have a _breadcrumb
     # call somewhere in the handful of lines before it.
+    #
+    # Matched on the `False` PREFIX, not the whole line: `_send` also hands the
+    # room back to its caller (`return False, room`), so pinning this to the
+    # bare `return False` would have quietly stopped matching anything the day
+    # that shape changed — and the check below, which exists to catch a scan
+    # that inspects nothing, is the only reason that was noticed.
+    def _is_failure_exit(line: str) -> bool:
+        stripped = line.strip()
+        return stripped == "return False" or stripped.startswith("return False,")
+
     lines = body.splitlines()
     unguarded = []
     for i, line in enumerate(lines):
-        if line.strip() != "return False":
+        if not _is_failure_exit(line):
             continue
         window = "\n".join(lines[max(0, i - 8):i])
-        if "_breadcrumb(" not in window:
+        # `await _import(` counts as a guard: the transport ladder moved inside
+        # that closure, which breadcrumbs on every branch before returning None,
+        # so `if res is None: return False, room` is already traced. The
+        # closure's own coverage is asserted separately below rather than
+        # assumed — otherwise this clause would be a hole disguised as a rule.
+        if "_breadcrumb(" not in window and "await _import(" not in window:
             unguarded.append(i)
-    check("every `return False` in _send breadcrumbs first", unguarded, [])
+    check("every failing return in _send breadcrumbs first", unguarded, [])
+
+    # The closure the clause above trusts: every way it can swallow a failure
+    # must breadcrumb. Counted against its `except` clauses, so adding a new
+    # handler without a breadcrumb fails here instead of silently widening the
+    # exemption granted above.
+    closure = body.split("async def _import(")[-1].split("\n    def ")[0]
+    check("_import breadcrumbs on every branch it handles",
+          closure.count("_breadcrumb(") >= closure.count("except "), True)
     # And that the scan found the returns at all — a test that silently
     # inspects nothing is worse than no test.
     check("found the failure exits",
-          len([l for l in lines if l.strip() == "return False"]) >= 3, True)
+          len([l for l in lines if _is_failure_exit(l)]) >= 3, True)
 
 
 if __name__ == "__main__":
