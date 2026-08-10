@@ -47,7 +47,6 @@ FRESH = {
 with tempfile.TemporaryDirectory() as td:
     dr._STATE_DIR = Path(td)
 
-    # 1. State round-trip: injected ids persist per session and reload.
     dr._save_fired("sess-A", ["d-babysit-1"])
     check("state round-trip", dr._load_fired("sess-A") == ["d-babysit-1"])
     check("unknown session is empty", dr._load_fired("sess-B") == [])
@@ -64,7 +63,6 @@ with tempfile.TemporaryDirectory() as td:
     #    NOT be recorded (it keeps its chance at its real moment).
     check("gate-dropped id not recorded", "d-fresh-1" not in dr._load_fired("sess-A"))
 
-    # 4. Stale-session pruning: old files go, current stays.
     old = dr._STATE_DIR / "old-sess.json"
     old.write_text("[]")
     import os

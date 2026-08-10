@@ -3,8 +3,7 @@
 
 The transcript is read off disk and shipped straight to the
 `import_conversation` MCP tool: the model never re-emits the content, so a
-session of ANY size works (validated end-to-end at 2,305 records /
-~1.4M tokens / 5.5MB in one call).
+session of ANY size works.
 
 Mirrors the SessionEnd hook's contract exactly:
 - raw transcript records passed AS-IS (the tool auto-detects the Claude Code
@@ -139,12 +138,12 @@ async def _gist_hash(
                 return hashlib.sha256(c.encode()).hexdigest()
     except Exception as exc:  # noqa: BLE001
         # Still swallowed — a gist read must never fail an import that already
-        # succeeded — but no longer SILENT. "search failed" and "gist has not
+        # succeeded — but not silent: "search failed" and "gist has not
         # appeared yet" produce the same None here, and the caller reacts to
         # None by waiting the full slice timeout. Without this line, a
         # persistent error is indistinguishable from slow extraction for 30
-        # minutes per slice boundary, which is precisely how the cross-org bug
-        # above hid. Printed once per call, and only on the error path.
+        # minutes per slice boundary. Printed once per call, and only on the
+        # error path.
         if not getattr(_gist_hash, "_warned", False):
             _gist_hash._warned = True
             print(f"  NOTE: gist lookup failed ({type(exc).__name__}: "
@@ -204,7 +203,6 @@ def call_error(result, payload: dict) -> str | None:
 
 
 def _cwd_from_records(records: list[dict]) -> str | None:
-    """The directory the session ran in, per the transcript's own records."""
     return next((r.get("cwd") for r in records
                  if isinstance(r, dict) and isinstance(r.get("cwd"), str)
                  and r.get("cwd")), None)
@@ -407,8 +405,8 @@ async def main() -> int:
                 print(json.dumps(payload, indent=2))
                 err = call_error(res, payload)
                 if err:
-                    # No success epilogue — a headless caller (the pr-babysit
-                    # loop) must see this as a failed save, not "Queued".
+                    # No success epilogue — a headless caller must see this
+                    # as a failed save, not "Queued".
                     label = (f"slice {i}/{len(slices)}" if len(slices) > 1
                              else "import")
                     print(f"ERROR: {label} failed: {err}", file=sys.stderr)

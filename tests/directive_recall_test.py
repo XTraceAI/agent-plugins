@@ -55,8 +55,6 @@ def test_error_regexes_stay_in_sync():
     assert rp._ERROR_RE.pattern == dr._ERROR_RE.pattern
 
 
-# --- ranked cap + why-fired (2026-08-02 audit follow-ups) -------------------
-
 def _mk(i, triggers, seen=1):
     return {"id": i, "type": "lesson", "content": f"lesson {i}",
             "triggers": triggers, "seen": seen}

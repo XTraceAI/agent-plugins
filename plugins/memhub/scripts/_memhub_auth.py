@@ -2,11 +2,10 @@
 
 **This is a SEPARATE token store from the /mcp connector's.** Both use the same
 Auth0 client (the ``clientId`` in the plugin's ``.mcp.json``), which makes them
-look interchangeable — this docstring used to claim outright that there was "no
-separate CLI token to provision", and that sentence was false in the way that
-matters. Claude Code keeps the /mcp connector's tokens in its own credential
-store; every token here is written by exactly one place, ``_FileTokenStorage``
-below, into ``~/.config/memhub-plugin/tokens-<host>.json``.
+easy to assume are interchangeable — they are not. Claude Code keeps the /mcp
+connector's tokens in its own credential store; every token here is written by
+exactly one place, ``_FileTokenStorage`` below, into
+``~/.config/memhub-plugin/tokens-<host>.json``.
 
 The consequence is the whole reason ``/memhub:login`` exists: a user who
 installs the plugin and authenticates in ``/mcp`` gets working MCP tools and a

@@ -39,7 +39,6 @@ _MARKER = Path.home() / ".config" / "memhub-plugin" / "codex-notify-last"
 
 
 def _debounced() -> bool:
-    """True if an auto-import fired within the last _MIN_INTERVAL_S seconds."""
     try:
         return time.time() - _MARKER.stat().st_mtime < _MIN_INTERVAL_S
     except OSError:

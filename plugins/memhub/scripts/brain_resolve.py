@@ -4,12 +4,11 @@
 ``room_map`` routes every writer to one brain — but only once its cache holds an
 id, and until now the only things that filled it were ``/memhub:onboard`` and
 ``/memhub:spec init``. So a user who never ran either had every automatic
-capture land in personal memory even when their team's repo brain existed. The
-plugin looked like it was working; the brain just stayed empty.
+capture land in personal memory even when their team's repo brain existed.
 
-This closes that: on a cache miss the capture path asks the server once, matches
-the repo's canonical room name, and writes the id back. Every later flush is a
-local lookup again.
+On a cache miss the capture path asks the server once, matches the repo's
+canonical room name, and writes the id back. Every later flush is a local
+lookup again.
 
 **Resolve, never create.** A brain is team-visible — teammates see it appear and
 it shapes where memory lands. A background hook firing after a turn is the wrong

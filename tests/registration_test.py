@@ -1,11 +1,10 @@
 """Every test function in this directory must actually run.
 
 This exists because one did not. `test_only_a_server_round_trip_retracts_a_
-failure` was written in #53, described in that PR as the lock protecting the
-retraction rule, and never registered in its file's hand-maintained tuple — so
-it never executed once. The suite stayed green the whole time, just over less,
-which is the failure mode that makes a registration list dangerous: it does not
-break, it silently shrinks.
+failure`, the lock protecting the retraction rule, was never registered in its
+file's hand-maintained tuple — so it never executed once. The suite stayed
+green the whole time, just over less, which is the failure mode that makes a
+registration list dangerous: it does not break, it silently shrinks.
 
 Two runner styles are legitimate here:
 
@@ -46,7 +45,6 @@ def main() -> int:
         if not defined:
             continue
 
-        # Everything from `if __name__` onward is the runner.
         runner = source.split("if __name__")[-1]
         if "globals()" in runner:
             print(f"  ok  {path.name} (discovers from globals)")

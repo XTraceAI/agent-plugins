@@ -25,7 +25,6 @@ def test_clean_user_text():
     assert clean_user_text(ide) == "Fix the flaky test"
     # IDE context with no request heading = context-only refresh → dropped
     assert clean_user_text("# Context from my IDE setup:\n\n## Open tabs:\n- a.py") is None
-    # plain CLI turn passes through
     assert clean_user_text("just do the thing") == "just do the thing"
     assert clean_user_text("   ") is None
     print("PASS test_clean_user_text")
@@ -87,7 +86,6 @@ def test_synthetic():
         assert r.get("cwd") == "/repo/proj", r
         assert "message" in r and "role" in r["message"], r
 
-    # tool_use parses JSON args to a dict; call_id preserved as tool id
     tu = recs[4]["message"]["content"][0]
     assert tu == {"type": "tool_use", "id": "call_1", "name": "exec_command",
                   "input": {"cmd": "ls"}}, tu
@@ -95,7 +93,6 @@ def test_synthetic():
     tu2 = recs[6]["message"]["content"][0]
     assert tu2["name"] == "apply_patch" and tu2["id"] == "call_2"
     assert tu2["input"] == {"input": "*** Begin Patch\n..."}, tu2
-    # tool_result links back via tool_use_id
     tr = recs[5]["message"]["content"][0]
     assert tr == {"type": "tool_result", "tool_use_id": "call_1",
                   "content": "file.py"}, tr
@@ -124,7 +121,7 @@ def test_missing_call_id():
     tr1 = recs[2]["message"]["content"][0]
     tr2 = recs[3]["message"]["content"][0]
     ids = [tu["id"], tr1["tool_use_id"], tr2["tool_use_id"]]
-    assert all(i for i in ids), ids               # never None/empty
+    assert all(i for i in ids), ids
     assert len(set(ids)) == 3, ids                # all distinct: no mispair, no dup-link
     print("PASS test_missing_call_id")
 

@@ -49,14 +49,21 @@ cap, revoke one in the MemHub app and re-run.
 
 ## Reading the output
 
-It prints `environment`, `mode`, `status`, `access key`, and `renewal`. Relay
-them plainly.
+It prints `environment`, `mode`, `status`, then one of `credential` or
+`access key`, and `renewal`. Relay them plainly.
 
 - **`mode`** — which credential answered: `$MEMHUB_TOKEN`, a stored access key,
   or the browser flow. This is the line that tells you what is actually in use.
-- **`access key`** — `created`, `reusing`, or `replaced orphaned key`. A
-  `NOT created` here is not a failed login: OAuth still verified and capture
-  works today, but it is back on the short-lived credential, so say so.
+- **`credential`** — printed instead of `access key` when a still-valid stored
+  key answered directly (the steady-state case on every run after the first,
+  for up to 90 days) — no server round trip needed to confirm it. `renewal`
+  beside it always reads `n/a — a key does not refresh`; that is expected, not
+  a warning — `/memhub:login` mints a fresh one once this one lapses.
+- **`access key`** — printed instead, on a run that went through the full
+  OAuth flow (first-ever login, after `--force`, or once the stored key has
+  expired): `created`, `reusing`, or `replaced orphaned key`. A `NOT created`
+  here is not a failed login: OAuth still verified and capture works today,
+  but it is back on the short-lived credential, so say so.
 
 - **`environment`** — say which one out loud. `production` and `staging` are
   separate tenants with separate logins, so authenticating one does nothing for

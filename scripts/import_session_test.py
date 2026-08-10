@@ -56,7 +56,6 @@ def slice_to_bytes(records: list[dict], max_bytes: int) -> tuple[list[dict], int
 
 
 def unwrap(result) -> dict:
-    """Pull the tool's dict payload out of a CallToolResult."""
     if getattr(result, "structuredContent", None):
         return result.structuredContent
     for block in getattr(result, "content", []) or []:

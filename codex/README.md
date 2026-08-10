@@ -89,4 +89,3 @@ right session only when a **single** Codex session is active — with concurrent
 sessions, prefer the manual import. Whether Codex emits a usable completion
 event (and which id fields it carries) varies by version — confirm with your
 build before relying on it; the manual import above always works.
-```
