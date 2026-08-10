@@ -465,7 +465,15 @@ async def _send(session, arguments, room, title, namespace,
         _log(f"{label}room {room['brain_id'][:8]} does not exist on this "
              "backend — dropping it from the cache and flushing to long-term "
              "memory")
-        forget_room(cwd, env)
+        # Only when the caller told us where this session ran. `forget_room`
+        # keys on the repo at `cwd`, and `room_name(None)` falls back to THIS
+        # PROCESS's directory — a hook can fire from a different repo than the
+        # session's, so forgetting on an unknown origin could delete an
+        # unrelated repo's cached room. `read_room`'s docstring warns about
+        # precisely this substitution. Unrouting still happens either way: it
+        # rescues the slice and touches no cache.
+        if cwd is not None:
+            forget_room(cwd, env)
         room = None
         arguments.pop("agent_brain_id", None)
         arguments.pop("org_id", None)

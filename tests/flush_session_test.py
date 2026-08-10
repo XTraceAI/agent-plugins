@@ -147,7 +147,7 @@ MISSING = FakeResult(texts=["Error executing tool import_conversation: "
                             "Agent brain not found"], is_error=True)
 
 
-def send_seq(*results, room=None, budget=None):
+def send_seq(*results, room=None, budget=None, cwd="/repo"):
     session = FakeSequenceSession(*results)
     args = {"messages": [{"type": "user"}], "conversation_id": "s1",
             "source_platform": "claude"}
@@ -157,7 +157,7 @@ def send_seq(*results, room=None, budget=None):
     try:
         ok, room_after = asyncio.run(
             fs._send(session, args, room, None, None, 1, 1, budget=budget,
-                     cwd="/repo", env="production"))
+                     cwd=cwd, env="production"))
     finally:
         fs.forget_room = real
     return ok, room_after, session.sent, forgot, session.timeouts
@@ -229,6 +229,17 @@ check("the breadcrumb names the budget, not the brain",
       _crumb.get("last_error") == "budget_exhausted")
 check("the detail does not blame the forgotten brain",
       "Agent brain not found" not in (_crumb.get("last_error_detail") or ""))
+
+# An UNKNOWN origin must never touch the cache. `forget_room` keys on the repo
+# at `cwd`, and `room_name(None)` falls back to the calling PROCESS's directory
+# — a hook can fire from a different repo than the session's, so forgetting here
+# could delete an unrelated repo's room. Unrouting still rescues the slice.
+ok, room_after, sent, forgot, timeouts = send_seq(
+    MISSING, OK, room={"brain_id": "b1"}, cwd=None)
+check("an unknown origin forgets nothing", forgot == [])
+check("an unknown origin still re-sends unrouted", len(sent) == 2)
+check("the unrouted re-send still drops the brain id",
+      "agent_brain_id" not in sent[1][1])
 
 # An unbudgeted send (no deadline in play) must keep retrying as before.
 ok, room_after, sent, forgot, timeouts = send_seq(
