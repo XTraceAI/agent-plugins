@@ -78,9 +78,12 @@ Do exactly this:
    - re-importing the same session later is **incremental** (only new records
      are processed; the gist folds forward — nothing duplicates).
 
-4. If the script prints an auth error, no setup is needed — the script runs the same
-   OAuth flow as /mcp and will open the browser ONCE for approval (token is
-   cached after that). If it can't find the session id, ask the user for the
-   transcript path.
+4. If the script prints an auth error, no setup is needed — it opens the browser
+   ONCE for approval and then mints a personal access key (`mhk_…`) that later
+   runs and the capture hooks reuse without a browser. `/memhub:login` does the
+   same thing deliberately if you would rather provision it up front. This is
+   the plugin's own credential, not the `/mcp` connector's, so being connected
+   in `/mcp` will not satisfy it. If it can't find the session id, ask the user
+   for the transcript path.
 
 Never use curl or raw HTTP; never pass transcript content as tool arguments.
