@@ -85,7 +85,6 @@ BID = "11111111-2222-3333-4444-555555555555"
 
 
 def _isolate(tmp):
-    """Point room_map at a scratch cache and pin the repo name."""
     rm.ROOMS_PATH = Path(tmp) / "rooms.json"
     br.read_room = rm.read_room
     br.resolve_due = rm.resolve_due
@@ -116,7 +115,6 @@ def test_resolves_and_caches():
         check("cached for next time",
               (rm.read_room("/repo", "staging") or {}).get("brain_id"), BID)
 
-        # Second call must be a local lookup — no second round-trip.
         session2 = _Session(_Result({"agent_brains": []}))
         room = run(br.resolve_repo_brain(session2, "/repo", "staging"))
         check("cache hit does not call the server", session2.calls, [])

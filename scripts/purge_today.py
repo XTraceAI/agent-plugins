@@ -60,8 +60,7 @@ async def main() -> int:
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
-            # enumerate
-            found: dict[str, dict] = {}  # id -> {type, content}
+            found: dict[str, dict] = {}
             for mtype in ("facts", "episodes", "artifacts"):
                 for q in QUERIES:
                     res = await s.call_tool("search_memory", arguments={
@@ -94,7 +93,6 @@ async def main() -> int:
                 print("\n(dry-run; re-run with --execute to delete)")
                 return 0
 
-            # delete
             print("\n--- deleting ---")
             ok = err = 0
             for t in ("fact", "episode", "artifact"):

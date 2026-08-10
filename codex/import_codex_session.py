@@ -169,7 +169,6 @@ def main() -> int:
 
         return subprocess.run(cmd).returncode
     finally:
-        # Always clean up the temp transcript — including on the dry-run path.
         try:
             transcript.unlink()
             tmpdir.rmdir()

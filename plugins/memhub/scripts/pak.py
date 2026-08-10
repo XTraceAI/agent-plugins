@@ -4,10 +4,9 @@
 **Why the plugin mints one at all.** Every hook here runs as a cold background
 process that must never open a browser, so it can only ever consume a
 credential something else provisioned. OAuth gives one that expires in ~24h and
-needs a refresh dance the MCP SDK cannot perform from a cold start — which is
-how per-turn capture died silently for a day on production. A personal access
-key has no such cycle: it is a static bearer, valid until it expires on a
-schedule we choose or is revoked.
+needs a refresh dance the MCP SDK cannot perform from a cold start. A personal
+access key has no such cycle: it is a static bearer, valid until it expires on
+a schedule we choose or is revoked.
 
 The trick is that minting one needs no separate credential. The access token
 the browser flow already produces is accepted by ``/v1/developer/access-tokens``
@@ -109,8 +108,6 @@ def default_label() -> str:
     return host[:64]
 
 
-# ── local storage ─────────────────────────────────────────────────────
-
 def load(mcp_url: str) -> dict | None:
     """The stored key record, or None. Never raises."""
     try:
@@ -181,8 +178,6 @@ def expires_in_s(record: dict | None) -> float | None:
     epoch = parse_utc(raw)
     return None if epoch is None else epoch - time.time()
 
-
-# ── server API ────────────────────────────────────────────────────────
 
 class PakError(RuntimeError):
     """A key operation failed, with a message fit to show a person."""

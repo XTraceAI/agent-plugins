@@ -128,9 +128,7 @@ def test_same_artifact_reminds_once_per_session():
         tmp = Path(tmp)
         root = _repo(tmp, json.dumps(MAP))
         assert _run(root, "appworld/run.py", "sess-c", tmp) != ""
-        # Second file, same artifact, same session -> debounced.
         assert _run(root, "appworld/worker.py", "sess-c", tmp) == ""
-        # A new session starts fresh.
         assert _run(root, "appworld/worker.py", "sess-d", tmp) != ""
 
 

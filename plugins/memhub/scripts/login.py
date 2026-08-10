@@ -4,21 +4,18 @@
 **Why a dedicated command.** The plugin's hooks authenticate from a token cache
 that only a FOREGROUND script can create (see ``_memhub_auth``: a background
 hook must never open a browser, so it can only ever consume a token someone
-else minted). Until this script existed, nothing in the product provisioned
-that token on purpose — it appeared as a side effect of running some unrelated
-foreground script, and the advice given to a stuck user was "run
-/memhub:import-session", which is a different operation that does real,
-unrequested work and can fail for reasons having nothing to do with auth. That
-made the one signal you were trying to read — am I authenticated? — impossible
-to read cleanly.
+else minted). Nothing else in the product provisions that token on purpose —
+pointing a stuck user at ``/memhub:import-session`` instead conflates login
+with a different operation that does real, unrequested work and can fail for
+reasons having nothing to do with auth, which makes the one signal you're
+trying to read — am I authenticated? — impossible to read cleanly.
 
 **What it checks beyond "did the browser flow succeed".** A login that works
 today and dies tomorrow is not a successful login. If the authorization server
 issues no refresh token, the access token simply expires (24h here) and every
-hook goes quiet until someone logs in again — which is exactly how per-turn
-capture died on production for a full day without a symptom. So this reports
-renewal as a first-class result, at the moment the token is minted, rather than
-leaving it to be discovered a day later by its absence.
+hook goes quiet until someone logs in again. So this reports renewal as a
+first-class result, at the moment the token is minted, rather than leaving it
+to be discovered a day later by its absence.
 
 Usage (all optional):
     login.py             log in if needed, then verify and report

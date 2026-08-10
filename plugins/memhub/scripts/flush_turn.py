@@ -169,18 +169,14 @@ def _save_state(session_id: str, **fields) -> None:
     atomic_write.publish(STATE_DIR / f"{session_id}.json", json.dumps(state))
 
 
-# ── health breadcrumb ─────────────────────────────────────────────────
-#
 # Everything below exists because this hook is `async: true`, and Claude Code
 # surfaces an async hook's stdout NOWHERE — not to the user, not to the agent.
 # So every failure path here ended in a print nobody could read, and the state
 # dir could not tell the two cases apart either: a session whose flushes all
 # failed left a `.lock` and no `.json`, byte-identical to a session where the
-# hook never ran. Per-turn capture died on prod when a token cached before the
-# server advertised `offline_access` expired unrenewably, and it stayed dead
-# for a day without a single visible symptom.
+# hook never ran.
 #
-# The fix is to write the failure down where a SYNCHRONOUS hook can find it:
+# The failure is written down where a SYNCHRONOUS hook can find it:
 # `capture_health.py` reads these fields on SessionStart and reports them via
 # `systemMessage`, the one channel that reaches the user.
 

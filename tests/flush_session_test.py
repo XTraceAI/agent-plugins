@@ -53,8 +53,6 @@ class FakeResult:
 
 
 class FakeSession:
-    """Records what was sent and replies with whatever it was primed with."""
-
     def __init__(self, result):
         self.result = result
         self.sent = []
@@ -82,8 +80,6 @@ def send(result, room=None, title=None, namespace=None, index=1, total=1):
     return ok, (session.sent[0][1] if session.sent else None)
 
 
-# ── what goes on the wire ─────────────────────────────────────────────
-
 ok, args = send(OK)
 check("a bare send succeeds", ok is True)
 check("no room means no brain id", "agent_brain_id" not in args)
@@ -105,8 +101,6 @@ ok, args = send(OK, title="Fix the flush hook", namespace="memhub")
 check("the title is sent", args.get("title") == "Fix the flush hook")
 check("the namespace is sent", args.get("namespace") == "memhub")
 
-
-# ── the success / failure contract ────────────────────────────────────
 
 # MCP signals tool failure with isError, NOT an exception. Treating that as
 # success would report a capture that never happened.
@@ -254,8 +248,6 @@ ok, _ = send(FakeResult(structured={"result": {"conversation_id": "c1"}}))
 check("a FastMCP-wrapped body is unwrapped", ok is True)
 
 
-# ── the deadline ──────────────────────────────────────────────────────
-
 import os  # noqa: E402
 
 for raw, want, why in (
@@ -276,7 +268,6 @@ check("the loop gives up before the hard timeout is reached",
       fs._DEFAULT_DEADLINE_S * 0.9 < fs._DEFAULT_DEADLINE_S)
 
 
-# ── the first slice always goes ───────────────────────────────────────
 # A backstop that sends nothing is not a degraded capture, it is no capture,
 # and these are the sessions per-turn capture already missed.
 
@@ -305,7 +296,6 @@ check("the first slice goes regardless",
       fs._stop_before_slice(1, 0.0, 0.0) is False)
 
 
-# ── which timeout is being reported ───────────────────────────────────
 # Since 3.11 socket.timeout IS TimeoutError, so a network read that gave up
 # inside the client reaches main() indistinguishable BY TYPE from our own
 # wall clock. Reporting "timed out after 240s" for a socket that died in 3s

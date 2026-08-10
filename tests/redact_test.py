@@ -91,7 +91,7 @@ def test_structure_is_preserved():
 
 def test_never_raises():
     print("\nnever raises")
-    # Deliberately hostile: an object json can't handle, and a self-reference.
+    # Deliberately hostile: an object json can't serialize, a non-string dict key.
     class Odd:
         pass
     weird = [Odd(), {1: "x"}, (SECRET,), None]

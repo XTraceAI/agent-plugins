@@ -61,7 +61,6 @@ def test_tail():
         check("reads all from 0", [r["uuid"] for r in recs], ["a", "b"])
         check("consumes whole file", consumed, size)
 
-        # Resuming from the cursor must yield ONLY the new record.
         recs, _ = ft._read_tail(str(p), size)
         check("nothing new at eof", recs, [])
 
@@ -384,7 +383,6 @@ def test_lock():
         check("re-acquires once released", again is not None, True)
         os.close(again)
 
-        # The crash case: a child holds it, then dies. The kernel releases.
         code = ("import fcntl,os,sys;"
                 "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600);"
                 "fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)")
@@ -465,12 +463,11 @@ def test_prefilter():
 
 
 if __name__ == "__main__":
-    # Discovered from globals(), NOT a hand-maintained tuple. The tuple silently
-    # dropped two tests — including the regression lock added in #53, which was
-    # described in that PR as protecting the retraction rule and had in fact
-    # never executed once. A registration list that must be edited in a second
-    # place is a list that will eventually disagree with the file, and the
-    # failure is invisible: the suite still passes, just over less.
+    # Discovered from globals(), NOT a hand-maintained tuple. A hand-maintained
+    # tuple already silently dropped tests before. A registration list that
+    # must be edited in a second place is a list that will eventually disagree
+    # with the file, and the failure is invisible: the suite still passes,
+    # just over less.
     for _name, _fn in sorted(globals().items()):
         if _name.startswith("test_") and callable(_fn):
             _fn()

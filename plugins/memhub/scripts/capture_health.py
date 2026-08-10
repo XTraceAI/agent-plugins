@@ -9,16 +9,7 @@ never disturb a coding session. Correct in isolation, the two rules compose into
 a system that cannot report its own death: every failure path ended in a
 ``print`` nobody could read and an ``exit 0``.
 
-That is not hypothetical. A prod OAuth token cached before the server advertised
-``offline_access`` came back with no refresh token, so it could never be renewed.
-Twenty-four hours later it expired, and every subsequent flush raised
-``NonInteractiveAuthRequired``, logged politely into the void, and exited 0.
-Per-turn capture was dead for a full day across every session in the affected
-repo. The MCP connector kept working the whole time — it holds its own token,
-in Claude Code's store rather than this plugin's — so the product looked alive
-while nothing was being saved. Nothing anywhere said a word.
-
-**The fix.** ``flush_turn.py`` now writes WHY it failed into its per-session
+``flush_turn.py`` writes WHY it failed into its per-session
 state (``last_error``/``last_error_at``). This script runs on ``SessionStart``,
 which is synchronous, so its output is real: it reports through
 ``systemMessage`` — the one hook field Claude Code shows to the USER — and
@@ -203,10 +194,10 @@ def _token_problem(host: str) -> str | None:
     The presence of a refresh token is checked INDEPENDENTLY of expiry, because
     the two facts are known with different confidence. Whether the token has
     lapsed depends on reading an ``exp`` we may not be able to decode; whether
-    it can ever renew itself is simply whether a refresh token is there. An
-    earlier version short-circuited on expiry first, so an unreadable ``exp``
-    returned "healthy" and threw away the second fact entirely — including for
-    a token that provably could never recover.
+    it can ever renew itself is simply whether a refresh token is there. A
+    short-circuit on expiry first would let an unreadable ``exp`` return
+    "healthy" and throw away the second fact entirely — including for a token
+    that provably could never recover.
 
     The states:
 
@@ -222,7 +213,7 @@ def _token_problem(host: str) -> str | None:
       difference between a fix and an outage.
 
     An unreadable ``exp`` alone is never treated as a fault — that would be
-    guessing — but it no longer suppresses the refresh-token fact.
+    guessing — and it does not suppress the refresh-token fact either.
     """
     if os.environ.get("MEMHUB_TOKEN", "").strip():
         return None  # explicit bearer (incl. an mhk_ key) — nothing here applies
@@ -451,17 +442,16 @@ def main() -> int:
 
     # Debounce on WHAT IS WRONG, not on the rendered sentence. The breadcrumb
     # message embeds a "12m ago", so the text changes between every SessionStart
-    # — and SessionStart fires again on resume and /clear. Keying on the message
-    # meant the same unchanged problem produced a new signature each time and
-    # defeated the debounce it was supposed to drive. The cause is what should
-    # be shown once; only a genuinely DIFFERENT problem should interrupt again.
+    # — and SessionStart fires again on resume and /clear. The cause is what
+    # should be shown once; only a genuinely DIFFERENT problem should interrupt
+    # again.
     signature = f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
     if _already_warned(session_id, signature):
         return 0
 
     print(json.dumps({
         # The channel that reaches the USER. Everything else this hook could
-        # emit goes only to the model, which is how the original bug hid.
+        # emit goes only to the model.
         "systemMessage": f"⚠️  {message}",
         # And to the agent, so "is my memory working?" is answerable without
         # re-deriving any of it.

@@ -112,7 +112,6 @@ def test_token_states() -> None:
     check("unrenewable and expiring soon -> no_refresh",
           ch._token_problem(HOST), "no_refresh")
 
-    # A freshly minted unrenewable token is not yet news.
     _write_token(exp=time.time() + ch._NO_REFRESH_WARN_WITHIN_S + 3600,
                  refresh=False)
     check("unrenewable but not due for hours -> silent",
@@ -220,7 +219,6 @@ def test_breadcrumbs() -> None:
                  last_error_at=now - ch._STALE_AFTER_S - 60)
     check("stale failure ignored", ch._recent_failure(), None)
 
-    # A later success in the same session retracts the failure.
     _reset()
     _write_state("s1", last_error="timeout", last_error_at=now - 300,
                  last_ok_at=now - 60)

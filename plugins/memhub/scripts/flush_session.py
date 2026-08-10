@@ -10,18 +10,13 @@ semantic work boundaries, so flushing there makes memory available mid-session
 (parallel sessions see fresh decisions), shapes batch episodes into work-unit
 narratives, and gives the gist's fold-forward an outcome-flavored cadence.
 
-**Also the SessionEnd hook**, which used to be an ``agent``-type hook told in
-prose to read the transcript and re-emit every record inline. Three things say
-it was not capturing anything. A headless run rejects it outright — measured:
-``Agent stop hooks are not yet supported outside REPL``. An agent cannot
-re-emit a 16 MB transcript even where it does run. And the breadcrumb file it
-was instructed to write on BOTH success and failure has never been created on
-any machine, which is what let all of that stay invisible.
-
-Being a script also keeps it in step with the other capture paths rather than
-drifting: the prose version sent no ``org_id`` (every room in a non-default org
-failed with "Agent brain not found"), filtered no slash-command wrappers, and
-derived no title.
+**Also the SessionEnd hook.** It must stay a script rather than an
+``agent``-type hook: headless ``claude -p`` runs reject agent-type Stop
+hooks outright (``Agent stop hooks are not yet supported outside REPL``),
+and an agent cannot reliably re-emit a transcript that can run to tens of
+MB. Being a script also keeps it in step with the other capture paths:
+sending ``org_id``, filtering slash-command wrappers, and deriving a title
+all matter here exactly as much as they do there.
 
 Deliberately INDEPENDENT of the per-turn hook rather than reusing its cursor.
 This is the backstop for exactly the cases where per-turn capture is dormant —
@@ -208,8 +203,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Slash-command bookkeeping never leaves the machine. Applied HERE as well
     # as in the other two upload paths deliberately: the filter's own contract
     # is that a session cannot come out clean or dirty depending on which path
-    # captured it, and this path was the one still shipping `/model` and its
-    # reply as things the user said.
+    # captured it.
     kept = drop_command_wrappers(records)
     if len(kept) != len(records):
         _log(f"dropped {len(records) - len(kept)} slash-command record(s)")
@@ -303,8 +297,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
 
     # Chunked, because this path sends the WHOLE transcript in one
-    # call and real sessions outgrow one payload: of 185 local
-    # transcripts, 74 exceed 1 MB and the largest is 46 MB. Unchunked,
+    # call and real sessions can outgrow a single payload. Unchunked,
     # this works on ordinary sessions and fails on precisely the long
     # ones — and as the backstop for when per-turn capture is dormant,
     # failing on the biggest sessions is failing where it matters most.
