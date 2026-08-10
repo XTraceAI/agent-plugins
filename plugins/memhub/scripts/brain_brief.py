@@ -94,16 +94,41 @@ def _read_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _write_json(path: Path, data: dict) -> None:
-    """Best effort. A cache that cannot be written is a slower session, never a
-    broken one, so every failure here is swallowed."""
+def _write_json(path: Path, data: dict) -> bool:
+    """Best effort; ``True`` when the bytes actually landed.
+
+    A cache that cannot be written is a slower session, never a broken one, so
+    the failure is swallowed — but it is REPORTED, because a refresh that cannot
+    persist its result is worth skipping entirely rather than repeating.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(path)
+        return True
     except Exception:  # noqa: BLE001
-        pass
+        return False
+
+
+def _cache_is_writable() -> bool:
+    """Can we persist a refresh at all?
+
+    ``refresh`` is throttled by the mtime of the file it writes, so a cache
+    directory that cannot be written degrades into "always stale" — and Stop
+    fires every turn, which would turn the 6-hourly digest fetch into a network
+    call on EVERY turn, forever. Since ``brief`` reads only from the cache, a
+    fetch whose result cannot be stored buys nothing at all, so the honest
+    response to an unwritable cache is to not make the call.
+    """
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        probe = CACHE_DIR / ".write-probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _capture_is_off() -> bool:
@@ -257,6 +282,11 @@ def cmd_refresh(payload: dict) -> int:
     brain_id = room["brain_id"]
     path = _cache_path(env, brain_id)
     if _is_fresh(path):
+        return 0
+    # Checked BEFORE the network call, not after: the throttle is the cache's
+    # own mtime, so an unwritable cache is permanently stale and would refetch
+    # every single turn.
+    if not _cache_is_writable():
         return 0
 
     # Imported here, not at module scope: `brief` runs on the synchronous

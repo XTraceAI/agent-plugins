@@ -170,6 +170,28 @@ check("a corrupt cache does not break the brief", "systemMessage" in _brief()
 _stub_room(None)
 check("refresh with no room is a no-op", brain_brief.cmd_refresh({}) == 0)
 
+# An unwritable cache would be permanently stale, and Stop fires every turn —
+# so without this the 6-hourly digest fetch becomes a per-turn network call
+# forever. `brief` reads only from the cache, so a fetch that cannot be stored
+# buys nothing: the honest response is not to make it.
+_stub_room(room)
+_real_dir = brain_brief.CACHE_DIR
+brain_brief.CACHE_DIR = Path("/proc/definitely-not-writable/memhub")
+check("an unwritable cache is detected", not brain_brief._cache_is_writable())
+
+
+def _boom(*a, **k):  # pragma: no cover - must never be reached
+    raise AssertionError("refresh attempted a network call it could not persist")
+
+
+_saved_extract = brain_brief._extract_overview
+brain_brief._extract_overview = _boom
+check("unwritable cache skips the network call entirely",
+      brain_brief.cmd_refresh({"cwd": "/repo"}) == 0)
+brain_brief._extract_overview = _saved_extract
+brain_brief.CACHE_DIR = _real_dir
+check("a writable cache still refreshes", brain_brief._cache_is_writable())
+
 
 # ── the result shape: the envelope is UNWRAPPED, not cached whole ──────────
 class _Block:
