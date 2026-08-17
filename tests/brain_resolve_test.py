@@ -80,7 +80,7 @@ def _orgs(*org_ids):
     ]})
 
 
-NAME = "Repo: XTraceAI/memhub-claude-plugin"
+NAME = "Repo: XTraceAI/agent-plugins"
 BID = "11111111-2222-3333-4444-555555555555"
 
 

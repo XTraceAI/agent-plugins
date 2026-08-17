@@ -16,7 +16,7 @@
 set -u
 cd "$(dirname "$0")/../../.." || exit 1
 export CLAUDE_PLUGIN_ROOT="$PWD/plugins/memhub"
-CMD=$(python3 -c "import json; print(json.load(open('plugins/memhub/hooks/hooks.json'))['hooks']['PostToolUse'][0]['hooks'][0]['command'])")
+CMD=$(python3 -c "import json; print(json.load(open('plugins/memhub/hooks/claude-hooks.json'))['hooks']['PostToolUse'][0]['hooks'][0]['command'])")
 fail=0
 
 run() { printf %s "$1" | bash -c "$CMD" 2>&1; }

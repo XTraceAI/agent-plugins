@@ -81,7 +81,7 @@ check("render valid as hook payload", json.dumps({"additionalContext": block}) !
 # 6. Repo name derivation: this checkout has an origin remote; the name must be
 #    the remote basename, not a worktree dir name.
 repo = dr._repo_name(str(_SCRIPT.parent))
-check("repo from git remote", repo == "memhub-claude-plugin")
+check("repo from git remote", repo == "agent-plugins")
 check("no cwd → empty repo", dr._repo_name("") == "")
 
 # 7. The precision filter is unchanged: the real misfire class (repo-name-only

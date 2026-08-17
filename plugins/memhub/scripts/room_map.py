@@ -26,7 +26,7 @@ deployments with different brain ids for the same repo, so one flat id would
 silently write to the wrong backend's brain on whichever install didn't match:
 
     {"version": 1, "repos": {
-       "Repo: XTraceAI/memhub-claude-plugin": {
+       "Repo: XTraceAI/agent-plugins": {
           "production": {"brain_id": "<uuid>"},
           "staging":    {"brain_id": "<uuid>"}}}}
 
