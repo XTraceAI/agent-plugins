@@ -64,7 +64,15 @@ def replace(tmp: Path, path: Path) -> None:
         try:
             tmp.replace(path)
             return
-        except PermissionError:
+        except OSError as e:
+            # Only the sharing-violation class is transient: ACCESS_DENIED
+            # (5), SHARING_VIOLATION (32), LOCK_VIOLATION (33). Python maps
+            # most of these to PermissionError, but the mapping is not a
+            # contract across versions — filter on the Windows error code
+            # itself. Anything else (bad path, disk full) fails NOW instead
+            # of burning the 10s budget first.
+            if getattr(e, "winerror", None) not in (5, 32, 33):
+                raise
             if time.monotonic() >= deadline:
                 raise
             time.sleep(random.uniform(0.001, 0.004))

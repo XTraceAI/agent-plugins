@@ -37,7 +37,6 @@ pop a browser, so it can only consume a token ``/memhub:login`` already minted.
 from __future__ import annotations
 
 import asyncio
-import portable_lock
 import json
 import os
 import subprocess
@@ -46,6 +45,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import portable_lock  # noqa: E402
 
 # Stdlib-only and side-effect free, so it imports at module scope like the
 # rest of the cursor/tail logic and stays testable under a bare python3.

@@ -8,12 +8,11 @@ callers keep flock semantics.
 
 POSIX: ``fcntl.flock`` exactly as before. Windows: ``msvcrt.locking`` on one
 byte at offset 0 — advisory like flock, released on unlock or when the fd
-closes. One honest semantic difference: a BLOCKING acquire on Windows
-(``LK_LOCK``) retries for ~10 seconds and then raises, where flock waits
-forever. Every blocking use in this codebase guards a sub-second critical
-section, so ten seconds of patience is indistinguishable from forever there —
-documented so nobody builds a long-held blocking lock on top of this without
-reading it.
+closes. Blocking semantics are made to MATCH flock: ``LK_LOCK`` only retries
+for ~10 seconds and then raises, so a blocking acquire loops it until the
+lock is granted — under real contention (a fleet of parallel agents, the
+reason these locks exist) ten seconds is reachable, and a serialization
+primitive that crashes its caller under load is worse than one that waits.
 """
 from __future__ import annotations
 
@@ -41,10 +40,20 @@ except ImportError:  # native Windows
     def lock_exclusive(fd: int, blocking: bool = True) -> None:
         """Take an exclusive lock. Non-blocking raises OSError when held.
 
-        Blocking mode retries ~10s (msvcrt LK_LOCK), then raises — see the
-        module docstring for why that is acceptable here."""
+        Blocking mode waits like flock does: LK_LOCK gives up after ~10s
+        of internal 1/s retries and raises, so loop it — each pass sleeps
+        inside msvcrt, costing nothing extra, and the acquire returns only
+        when the lock is actually held."""
         _at_start(fd)
-        _msvcrt.locking(fd, _msvcrt.LK_LOCK if blocking else _msvcrt.LK_NBLCK, 1)
+        if not blocking:
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+            return
+        while True:
+            try:
+                _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                continue
 
     def unlock(fd: int) -> None:
         _at_start(fd)
