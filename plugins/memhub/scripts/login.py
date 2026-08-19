@@ -338,30 +338,42 @@ def _leaf(exc: BaseException) -> BaseException:
     the first NON-cancellation leaf in depth-first order wins, with any leaf
     as fallback. Cycle-guarded, and never returns a group node while a leaf
     exists."""
-    leaves: list[BaseException] = []
+    leaves: list[tuple[BaseException, bool]] = []   # (leaf, via_context)
     seen: set[int] = set()
-    stack: list[BaseException] = [exc]
+    stack: list[tuple[BaseException, bool]] = [(exc, False)]
     while stack:
-        current = stack.pop()
+        current, via_context = stack.pop()
         if id(current) in seen:
             continue
         seen.add(id(current))
-        children = list(getattr(current, "exceptions", None) or ())
-        # __cause__ AND __context__: anyio and the MCP SDK surface the real
-        # failure through implicit chaining as often as through `raise from`,
-        # and _is_noninteractive below already walks both for that reason.
-        # Cause first — an explicit chain is the better answer when both exist.
-        for chained in (current.__cause__, current.__context__):
-            if chained is not None:
-                children.append(chained)
+        children = [(sub, via_context)
+                    for sub in (getattr(current, "exceptions", None) or ())]
+        # An EXPLICIT cause is authoritative. __context__ is only consulted
+        # when there is none, because it is set implicitly by any raise that
+        # happens while another exception is in flight — teardown inside an
+        # `except` block, an anyio task group's __exit__ — so it routinely
+        # points at something unrelated to the failure being reported.
+        # `raise ... from None` (__suppress_context__) is honored as the
+        # explicit "that context is noise" it is. Context-derived leaves are
+        # also ranked below direct ones in the selection below, so a real
+        # failure still wins over a cleanup bystander.
+        if current.__cause__ is not None:
+            children.append((current.__cause__, via_context))
+        elif (current.__context__ is not None
+                and not current.__suppress_context__):
+            children.append((current.__context__, True))
         if children:
             stack.extend(reversed(children))  # LIFO: first child explored first
         else:
-            leaves.append(current)
-    for leaf in leaves:
-        if not isinstance(leaf, asyncio.CancelledError):
-            return leaf
-    return leaves[0] if leaves else exc
+            leaves.append((current, via_context))
+    # Best answer first: a real failure reached without implicit chaining,
+    # then a real failure behind one, then whatever we have (all-cancellation
+    # groups still report a leaf rather than the useless group node).
+    for want_context in (False, True):
+        for leaf, via in leaves:
+            if via is want_context and not isinstance(leaf, asyncio.CancelledError):
+                return leaf
+    return leaves[0][0] if leaves else exc
 
 
 def _is_noninteractive(exc: BaseException) -> bool:
