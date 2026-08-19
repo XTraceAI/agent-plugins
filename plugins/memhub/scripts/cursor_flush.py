@@ -66,6 +66,27 @@ FLUSH_TIMEOUT_S = 240.0
 
 _MILESTONE_RE = re.compile(r"\bgit\b.*\bcommit\b|\bgh\b.*\bpr\b", re.S)
 
+# Server-side extraction mode per event — mirrors the Claude design, where
+# flush_turn buffers ("auto") and flush_session drains ("now" — the server
+# default) at session end and commit/PR boundaries. Cursor has NO session-end
+# hook, so if every event sent "auto" a small session would NEVER cross the
+# drain threshold: records buffer forever, ack_through stays null, and the
+# session never materializes in the Sessions view. Verified live. Boundaries
+# must drain; only mid-turn edits buffer.
+_FLUSH_MODE = {
+    "beforeShellExecution": "now",   # only fires on milestone commands (gate)
+    "stop": "now",                   # turn boundary
+    "beforeSubmitPrompt": "now",     # previous turn is definitely complete
+    # TEMPORARILY "now", not "auto": staging showed auto-buffered records get
+    # content-registered by dedup WITHOUT persisting — if the buffer never
+    # drains (small session, no later "now"), the records become permanently
+    # unimportable under ANY conversation id (records_new: 0 on a virgin id,
+    # ack_through: null forever). Until that backend bug is fixed, losing
+    # episode batching is the lesser evil than losing records. Revert to
+    # "auto" when the server folds dedup registration into the drain.
+    "afterFileEdit": "now",
+}
+
 
 def _log(msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [cursor-flush] {msg}\n"
@@ -163,7 +184,8 @@ def _namespace_of(cwd: str | None) -> str | None:
     return None
 
 
-async def _flush(uuid: str, store_db: Path, blob_ids: set[str]) -> None:
+async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
+                 flush_mode: str = "now") -> None:
     records, meta = cursor_reader.to_canonical(store_db)
     sendable = redact_records(records)
     if not sendable:
@@ -189,7 +211,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str]) -> None:
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
         "source_platform": "claude",
-        "flush": "auto",
+        "flush": flush_mode,
     }
     if room:
         arguments["agent_brain_id"] = room["brain_id"]
@@ -248,7 +270,8 @@ def main() -> int:
         return 0
 
     try:
-        asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids),
+        mode = _FLUSH_MODE.get(event, "now")
+        asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids, mode),
                                      timeout=FLUSH_TIMEOUT_S))
     except Exception as e:
         _log(f"{event}: flush error: {e}")
