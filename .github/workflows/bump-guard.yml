@@ -1,0 +1,63 @@
+# The release invariant, enforced (see RELEASING.md):
+#
+# The ref/sha pin in .claude-plugin/marketplace.json only guards Claude Code.
+# The Codex catalog (.agents/plugins/marketplace.json) and the Cursor catalog
+# (.cursor-plugin/marketplace.json) have NO pin — installs snapshot whatever
+# `main` holds and cache it under the version string. So shipped plugin code
+# changing on `main` WITHOUT a version bump means two installs of the same
+# version run different bytes, with no error anywhere.
+#
+# Therefore: a PR that touches plugins/memhub/** either bumps the version
+# (that PR is a release for the unpinned channels) or carries the
+# `bump-exempt` label (a deliberate assertion that the change may ship
+# un-versioned — docs or inert packaging only).
+name: bump-guard
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Manifest parity + test registration
+        run: |
+          python3 tests/version_parity_test.py
+          python3 tests/registration_test.py
+      - name: Require a version bump when shipped plugin code changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXEMPT: ${{ contains(github.event.pull_request.labels.*.name, 'bump-exempt') }}
+        run: |
+          set -euo pipefail
+          touched=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'plugins/memhub/**')
+          if [ -z "$touched" ]; then
+            echo "plugins/memhub/ untouched — guard not applicable"
+            exit 0
+          fi
+          echo "shipped plugin files changed:"
+          echo "$touched" | sed 's/^/  /'
+          base_ver=$(git show "$BASE_SHA:plugins/memhub/.claude-plugin/plugin.json" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          head_ver=$(python3 -c 'import json; print(json.load(open("plugins/memhub/.claude-plugin/plugin.json"))["version"])')
+          echo "version: $base_ver -> $head_ver"
+          if [ "$base_ver" != "$head_ver" ]; then
+            echo "ok: version bumped — this PR is the release for the unpinned channels"
+            exit 0
+          fi
+          if [ "$EXEMPT" = "true" ]; then
+            echo "ok: bump-exempt label present — deliberate un-versioned change"
+            exit 0
+          fi
+          echo "FAIL: this PR changes plugins/memhub/** without a version bump." >&2
+          echo "Codex/Cursor installs snapshot main and cache by version — merging" >&2
+          echo "this ships different bytes under the same version number." >&2
+          echo "Either bump every manifest (the release train, see RELEASING.md)" >&2
+          echo "or add the 'bump-exempt' label to assert this change is inert." >&2
+          exit 1

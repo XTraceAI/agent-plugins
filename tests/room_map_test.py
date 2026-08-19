@@ -67,18 +67,18 @@ def test_room_name_from_remote() -> None:
         tmp = Path(td)
         # scp-style and URL-style remotes must reduce to the same room, and a
         # .git suffix must not leak into the name.
-        repo = _repo(tmp, "git@github.com:XTraceAI/memhub-claude-plugin.git")
+        repo = _repo(tmp, "git@github.com:XTraceAI/agent-plugins.git")
         check("scp-style remote", rm.room_name(repo),
-              "Repo: XTraceAI/memhub-claude-plugin")
+              "Repo: XTraceAI/agent-plugins")
         _git(repo, "remote", "set-url", "origin",
-             "https://github.com/XTraceAI/memhub-claude-plugin.git")
+             "https://github.com/XTraceAI/agent-plugins.git")
         check("https remote", rm.room_name(repo),
-              "Repo: XTraceAI/memhub-claude-plugin")
+              "Repo: XTraceAI/agent-plugins")
 
         _git(repo, "remote", "set-url", "origin",
-             "ssh://git@github.com/XTraceAI/memhub-claude-plugin.git")
+             "ssh://git@github.com/XTraceAI/agent-plugins.git")
         check("ssh:// remote", rm.room_name(repo),
-              "Repo: XTraceAI/memhub-claude-plugin")
+              "Repo: XTraceAI/agent-plugins")
         # Self-hosted hosts nest deeper; only the last two segments are the key.
         _git(repo, "remote", "set-url", "origin",
              "https://gitlab.example.com/group/subgroup/repo.git")
@@ -117,14 +117,14 @@ def test_write_then_read_per_backend() -> None:
     print("write/read")
     _fresh_rooms()
     with tempfile.TemporaryDirectory() as td:
-        repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
+        repo = _repo(Path(td), "git@github.com:XTraceAI/agent-plugins.git")
         rm.write_room(PROD, cwd=repo, env="production")
         rm.write_room(STAGING, cwd=repo, env="staging")
 
         check("prod id", (rm.read_room(repo, "production") or {}).get("brain_id"), PROD)
         check("staging id", (rm.read_room(repo, "staging") or {}).get("brain_id"), STAGING)
         check("name reported", (rm.read_room(repo, "production") or {}).get("name"),
-              "Repo: XTraceAI/memhub-claude-plugin")
+              "Repo: XTraceAI/agent-plugins")
 
         # Re-writing one backend must not disturb the other — a repo used from
         # both installs holds both ids.
@@ -142,9 +142,9 @@ def test_write_then_read_per_backend() -> None:
         raw = json.loads(rm.ROOMS_PATH.read_text())
         check("version stamped", raw.get("version"), 1)
         check("keyed by room name", sorted(raw["repos"]),
-              ["Repo: XTraceAI/memhub-claude-plugin", "Repo: XTraceAI/xmem"])
+              ["Repo: XTraceAI/agent-plugins", "Repo: XTraceAI/xmem"])
         check("both backends present",
-              sorted(raw["repos"]["Repo: XTraceAI/memhub-claude-plugin"]),
+              sorted(raw["repos"]["Repo: XTraceAI/agent-plugins"]),
               ["production", "staging"])
 
         # THE constraint: a brain id is account state. Nothing may be written
@@ -157,8 +157,8 @@ def test_reads_never_raise() -> None:
     print("degradation")
     _fresh_rooms()
     with tempfile.TemporaryDirectory() as td:
-        repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
-        key = "Repo: XTraceAI/memhub-claude-plugin"
+        repo = _repo(Path(td), "git@github.com:XTraceAI/agent-plugins.git")
+        key = "Repo: XTraceAI/agent-plugins"
         check("no cache -> None", rm.read_room(repo, "production"), None)
 
         path = rm.ROOMS_PATH
@@ -240,7 +240,7 @@ def test_cli() -> None:
     _fresh_rooms()
     script = SCRIPTS / "room_map.py"
     with tempfile.TemporaryDirectory() as td:
-        repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
+        repo = _repo(Path(td), "git@github.com:XTraceAI/agent-plugins.git")
         # `show` with nothing cached: exit 1 and silence, so callers can test
         # the exit code without parsing an error message.
         out = subprocess.run(
@@ -264,7 +264,7 @@ def test_cli() -> None:
         out = subprocess.run(
             [sys.executable, str(script), "name", "--cwd", str(repo)],
             capture_output=True, text=True)
-        check("name", out.stdout.strip(), "Repo: XTraceAI/memhub-claude-plugin")
+        check("name", out.stdout.strip(), "Repo: XTraceAI/agent-plugins")
 
 
 def test_forget_room() -> None:
@@ -278,7 +278,7 @@ def test_forget_room() -> None:
     print("forget")
     _fresh_rooms()
     with tempfile.TemporaryDirectory() as td:
-        repo = _repo(Path(td), "git@github.com:XTraceAI/memhub-claude-plugin.git")
+        repo = _repo(Path(td), "git@github.com:XTraceAI/agent-plugins.git")
         rm.write_room(PROD, cwd=repo, env="production")
         rm.write_room(STAGING, cwd=repo, env="staging")
 
@@ -297,7 +297,7 @@ def test_forget_room() -> None:
         # the repo room-less here would be inferring absence from an error
         # message rather than from a listing that actually came back empty.
         raw = json.loads(rm.ROOMS_PATH.read_text())
-        entry = raw["repos"]["Repo: XTraceAI/memhub-claude-plugin"]
+        entry = raw["repos"]["Repo: XTraceAI/agent-plugins"]
         check("no negative cache is invented", sorted(entry), ["staging"])
         check("re-resolution is due", rm.resolve_due(repo, "production"), True)
 

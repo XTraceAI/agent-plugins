@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Manual end-to-end test of the plugin's session-import path.
 
-Mirrors what the SessionEnd hook does (plugins/memhub/hooks/hooks.json):
+Mirrors what the SessionEnd hook does (plugins/memhub/hooks/claude-hooks.json):
 read a Claude Code .jsonl transcript, pass the raw records AS-IS to the
 `import_conversation` MCP tool with conversation_id=session_id and
 source_platform="claude". Then polls `search_memory` to confirm the

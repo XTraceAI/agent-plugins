@@ -27,11 +27,17 @@ this pass declines to send is simply carried by the next turn's flush.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sys
 from pathlib import Path
+
+# The locking shim is a sibling module, not a package: pin this script's own
+# directory first so the import holds however this file is loaded (hooks run
+# it as a script, where sys.path[0] already covers it, but tests and embeds
+# do not).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import portable_lock  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -54,7 +60,7 @@ def _lock_is_held(lock_path: Path) -> bool:
     except OSError:
         return False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portable_lock.lock_exclusive(fd, blocking=False)
     except OSError:
         return True  # someone is holding it
     finally:

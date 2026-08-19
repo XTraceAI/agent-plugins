@@ -18,7 +18,7 @@ This repo is a **marketplace** with two installable plugins — `memhub` and
 plugins/memhub/                     # PROD build — install this one
 ├── .claude-plugin/plugin.json      # plugin manifest
 ├── .mcp.json                       # the memhub MCP server → prod (per-user OAuth)
-├── hooks/hooks.json                # Stop/SessionEnd/SessionStart/PreToolUse/PostToolUse
+├── hooks/claude-hooks.json         # Stop/SessionEnd/SessionStart/PreToolUse/PostToolUse
 └── skills/                         # /memhub:* skills (also auto-invoked by Claude)
     ├── handoff-session/            # hand the current session to a teammate
     ├── import-session/             # import a past session, any size
@@ -38,7 +38,7 @@ plugins/memhub-staging/             # INTERNAL staging build — not published h
 └── scripts/ → ../memhub/scripts    # symlinked
 plugins/fleet/
 ├── .claude-plugin/plugin.json      # plugin manifest
-├── hooks/hooks.json                # SessionStart/UserPromptSubmit/PostToolUse/SessionEnd
+├── hooks/hooks.json                # (fleet) SessionStart/UserPromptSubmit/PostToolUse/SessionEnd
 ├── scripts/fleet_board.py          # one script, one subcommand per hook event
 ├── scripts/fleet_start_launch.sh   # session launcher (tmux/iTerm/Terminal/headless)
 ├── skills/start/                   # /fleet:start — decompose, provision, launch
@@ -59,7 +59,7 @@ change).
 ## Install
 
 ```text
-/plugin marketplace add XTraceAI/memhub-claude-plugin
+/plugin marketplace add XTraceAI/agent-plugins
 /plugin install memhub@memhub
 ```
 

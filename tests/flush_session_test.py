@@ -21,9 +21,11 @@ from pathlib import Path
 # breadcrumb directory from Path.home() at import time. Without this the tests
 # write breadcrumbs into the developer's REAL ~/.config/memhub-plugin — which
 # they did, and which would also let a test's fake session id show up in the
-# health check's warnings on a real machine.
+# health check's warnings on a real machine. Both spellings: POSIX expanduser
+# reads HOME; Windows reads USERPROFILE and never consults HOME.
 _TMP_HOME = tempfile.mkdtemp(prefix="flush-session-test-")
 os.environ["HOME"] = _TMP_HOME
+os.environ["USERPROFILE"] = _TMP_HOME
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.
@@ -134,6 +136,11 @@ class FakeSequenceSession:
         # and the retry assertions below would pass vacuously.
         self.sent.append((name, dict(arguments or {})))
         self.timeouts.append(timeout)
+        # Consume real wall clock, so "the retry is bounded by what is LEFT"
+        # stays observable where time.monotonic ticks coarsely (Windows on
+        # Python ≤3.12: GetTickCount64, 15.6ms) — a zero-cost reply would
+        # leave the remaining budget equal to the whole budget there.
+        await asyncio.sleep(0.05)
         return self.results[min(len(self.sent), len(self.results)) - 1]
 
 
@@ -315,8 +322,11 @@ def run_main(raises, deadline="0.5"):
 
     class FakeIn:
         def read(self):
-            return ('{"session_id": "s1", "transcript_path": "%s"}'
-                    % __file__)
+            # json.dumps, NOT %-interpolation: a Windows __file__ carries
+            # backslashes, which spliced raw are invalid JSON escapes — the
+            # payload would read as malformed and never reach the fake.
+            return _json.dumps({"session_id": "s1",
+                                "transcript_path": __file__})
 
     os.environ["MEMHUB_FLUSH_DEADLINE_S"] = deadline
     fs._flush, fs._log, sys.stdin = fake_flush, lines.append, FakeIn()

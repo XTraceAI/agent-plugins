@@ -365,6 +365,44 @@ def test_timeout_override_never_breaks_the_hook():
 
 # ── lock ──────────────────────────────────────────────────────────────
 
+# The concurrent holder locks through portable_lock — the exact primitive the
+# shipped code uses — so this simulation means the same thing on POSIX (flock)
+# and native Windows (msvcrt.locking), where `import fcntl` does not exist.
+# It prints one byte once the lock is HELD; waiting for that byte replaces a
+# fixed sleep that raced slow process spawns.
+_HOLDER = (
+    "import os,sys;"
+    "sys.path.insert(0, sys.argv[2]);"
+    "import portable_lock;"
+    "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600);"
+    "portable_lock.lock_exclusive(fd, blocking=False);"
+    "sys.stdout.write('L');sys.stdout.flush();"
+    "import time;time.sleep(30)"
+)
+
+
+def _hold_lock_in_child(lock_path: Path) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(lock_path), str(SCRIPTS)],
+        stdout=subprocess.PIPE)
+    if proc.stdout.read(1) != b"L":  # blocks until the child holds the lock
+        raise RuntimeError("lock-holder child died before taking the lock")
+    return proc
+
+
+def _acquire_when_released(session_id: str, timeout_s: float = 5.0):
+    """Windows releases a dead holder's byte-range lock a beat after the
+    process object signals (documented: 'depends upon available system
+    resources'); POSIX flock releases synchronously. Poll briefly so the
+    assertion is about WHETHER the kernel releases, not how fast."""
+    deadline = time.time() + timeout_s
+    while True:
+        fd = ft._acquire(session_id)
+        if fd is not None or time.time() >= deadline:
+            return fd
+        time.sleep(0.05)
+
+
 def test_lock():
     """flock, so the kernel owns the lifetime. There is no stale-lock case to
     test because there is no such thing: a crashed flush releases on exit,
@@ -376,34 +414,51 @@ def test_lock():
         first = ft._acquire("s1")
         check("first acquires", first is not None, True)
         check("second is refused while held", ft._acquire("s1"), None)
-        check("a different session is unaffected", ft._acquire("s2") is not None, True)
+        other = ft._acquire("s2")
+        check("a different session is unaffected", other is not None, True)
+        if other is not None:
+            # Windows cannot delete the tempdir while an fd holds a file in it.
+            os.close(other)
 
         os.close(first)
         again = ft._acquire("s1")
         check("re-acquires once released", again is not None, True)
         os.close(again)
 
-        code = ("import fcntl,os,sys;"
-                "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600);"
-                "fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)")
-        held = subprocess.Popen([sys.executable, "-c", code + ";import time;time.sleep(30)",
-                                 str(Path(d) / "s3.lock")])
-        time.sleep(0.4)
+        held = _hold_lock_in_child(Path(d) / "s3.lock")
         check("held by a live process", ft._acquire("s3"), None)
         held.kill(); held.wait()
-        check("released when that process dies", ft._acquire("s3") is not None, True)
+        reclaimed = _acquire_when_released("s3")
+        check("released when that process dies", reclaimed is not None, True)
+        if reclaimed is not None:
+            os.close(reclaimed)
 
 
 # ── prefilter ─────────────────────────────────────────────────────────
 
 def _prefilter(payload, state_dir, **env_extra):
-    env = dict(os.environ, HOME=str(state_dir), **env_extra)
+    # Both spellings, because the prefilter resolves its state dir from
+    # Path.home(): POSIX expanduser reads HOME, Windows reads USERPROFILE
+    # and never consults HOME.
+    env = dict(os.environ, HOME=str(state_dir), USERPROFILE=str(state_dir),
+               **env_extra)
     env.pop("MEMHUB_TURN_FLUSH", None)
     env.update(env_extra)
     return subprocess.run(
         [sys.executable, str(PREFILTER)], input=json.dumps(payload),
         capture_output=True, text=True, env=env,
     ).returncode
+
+
+def _flush_when_released(payload, home, timeout_s: float = 5.0) -> int:
+    """0 as soon as the dead holder's lock is gone — Windows can release it a
+    beat late (see _acquire_when_released), POSIX is immediate."""
+    deadline = time.time() + timeout_s
+    while True:
+        rc = _prefilter(payload, home)
+        if rc == 0 or time.time() >= deadline:
+            return rc
+        time.sleep(0.05)
 
 
 def test_prefilter():
@@ -445,18 +500,12 @@ def test_prefilter():
         # A live flock means a flush is in flight; skipping costs nothing
         # because the cursor has not moved.
         (state / "s1.json").write_text(json.dumps({"offset": 0}))
-        lock = state / "s1.lock"
-        code = ("import fcntl,os,sys;"
-                "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600);"
-                "fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB);"
-                "import time;time.sleep(30)")
-        held = subprocess.Popen([sys.executable, "-c", code, str(lock)])
-        time.sleep(0.4)
+        held = _hold_lock_in_child(state / "s1.lock")
         check("held flock -> skip", _prefilter(base, home), 1)
 
         # The crash case needs no staleness rule: the kernel released it.
         held.kill(); held.wait()
-        check("holder died -> flush", _prefilter(base, home), 0)
+        check("holder died -> flush", _flush_when_released(base, home), 0)
 
         # An unlocked leftover file is not a lock.
         check("leftover lock file -> flush", _prefilter(base, home), 0)

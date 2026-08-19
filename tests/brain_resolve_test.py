@@ -80,7 +80,7 @@ def _orgs(*org_ids):
     ]})
 
 
-NAME = "Repo: XTraceAI/memhub-claude-plugin"
+NAME = "Repo: XTraceAI/agent-plugins"
 BID = "11111111-2222-3333-4444-555555555555"
 
 
@@ -95,7 +95,10 @@ def _isolate(tmp):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run, not get_event_loop().run_until_complete: implicit loop
+    # creation was removed in Python 3.14, where the old spelling raises
+    # "There is no current event loop".
+    return asyncio.run(coro)
 
 
 def test_resolves_and_caches():

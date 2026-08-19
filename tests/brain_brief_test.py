@@ -30,9 +30,12 @@ import time
 from pathlib import Path
 
 # Redirect HOME before importing so the module's import-time CACHE_DIR resolves
-# inside the sandbox and no test can read or write the real ~/.config.
+# inside the sandbox and no test can read or write the real ~/.config. Both
+# spellings: POSIX expanduser reads HOME; Windows reads USERPROFILE and never
+# consults HOME.
 _TMP_HOME = tempfile.mkdtemp(prefix="brain-brief-test-")
 os.environ["HOME"] = _TMP_HOME
+os.environ["USERPROFILE"] = _TMP_HOME
 os.environ.pop("MEMHUB_STATE_DIR", None)
 os.environ.pop("MEMHUB_TURN_FLUSH", None)
 os.environ.pop("MEMHUB_MCP_BASE_URL", None)
@@ -59,7 +62,7 @@ def _run(cmd: str, payload: dict) -> dict:
     proc = subprocess.run(
         [sys.executable, str(SCRIPTS / "brain_brief.py"), cmd],
         input=json.dumps(payload), capture_output=True, text=True,
-        env={**os.environ, "HOME": _TMP_HOME},
+        env={**os.environ, "HOME": _TMP_HOME, "USERPROFILE": _TMP_HOME},
     )
     check(f"{cmd}: exit 0", proc.returncode == 0)
     out = proc.stdout.strip()
@@ -89,7 +92,7 @@ out = brain_brief.cmd_brief({"cwd": "/tmp/nowhere"})
 check("unonboarded repo prints nothing", out == 0)
 
 # ── the brief itself ───────────────────────────────────────────────────────
-room = {"brain_id": BRAIN, "name": "Repo: XTraceAI/memhub-claude-plugin"}
+room = {"brain_id": BRAIN, "name": "Repo: XTraceAI/agent-plugins"}
 _stub_room(room)
 
 import io  # noqa: E402
@@ -106,7 +109,7 @@ def _brief(payload: dict | None = None) -> dict:
 first = _brief()
 check("names the brain in agent context", BRAIN in _ctx(first))
 check("names the room in agent context",
-      "Repo: XTraceAI/memhub-claude-plugin" in _ctx(first))
+      "Repo: XTraceAI/agent-plugins" in _ctx(first))
 check("states it is the default target", "DEFAULT target" in _ctx(first))
 check("first resolution reaches the USER", "systemMessage" in first)
 
@@ -176,7 +179,12 @@ check("refresh with no room is a no-op", brain_brief.cmd_refresh({}) == 0)
 # buys nothing: the honest response is not to make it.
 _stub_room(room)
 _real_dir = brain_brief.CACHE_DIR
-brain_brief.CACHE_DIR = Path("/proc/definitely-not-writable/memhub")
+# A cache dir whose PARENT is a regular file is unwritable on every platform.
+# ("/proc/…" is only guaranteed unwritable on Linux; on Windows that path
+# would simply be created under the drive root.)
+_blocker = Path(_TMP_HOME) / "cache-blocker"
+_blocker.write_text("", encoding="utf-8")
+brain_brief.CACHE_DIR = _blocker / "memhub"
 check("an unwritable cache is detected", not brain_brief._cache_is_writable())
 
 
@@ -237,7 +245,8 @@ probe = subprocess.run(
      "print(json.dumps(sorted(m for m in sys.modules\n"
      "      if m in ('mcp_http', '_memhub_auth', 'urllib.request'))))"
      % str(SCRIPTS)],
-    capture_output=True, text=True, env={**os.environ, "HOME": _TMP_HOME},
+    capture_output=True, text=True,
+    env={**os.environ, "HOME": _TMP_HOME, "USERPROFILE": _TMP_HOME},
 )
 loaded = json.loads(probe.stdout.strip() or "[]") if probe.returncode == 0 else ["?"]
 check("brief imports no transport/auth module", loaded == [])

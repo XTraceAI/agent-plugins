@@ -28,8 +28,11 @@ from pathlib import Path
 # Redirect HOME before importing, so the module's import-time CACHE_DIR /
 # STATE_DIR resolve inside the sandbox and no test can read or write the real
 # ~/.config/memhub-plugin. Exported so the CLI subprocess below inherits it.
+# Both spellings: POSIX expanduser reads HOME; Windows reads USERPROFILE and
+# never consults HOME — without it these tests would RESET the real state dir.
 _TMP_HOME = tempfile.mkdtemp(prefix="capture-health-test-")
 os.environ["HOME"] = _TMP_HOME
+os.environ["USERPROFILE"] = _TMP_HOME
 os.environ.pop("MEMHUB_TOKEN", None)
 os.environ.pop("MEMHUB_TURN_FLUSH", None)
 os.environ.pop("MEMHUB_MCP_BASE_URL", None)
@@ -347,7 +350,8 @@ def test_debounce() -> None:
 
 def _run(payload: dict, env_extra: dict | None = None) -> str:
     """Run the hook as the harness does — a subprocess fed JSON on stdin."""
-    env = dict(os.environ, HOME=_TMP_HOME, CLAUDE_PLUGIN_ROOT=str(_plugin_root()))
+    env = dict(os.environ, HOME=_TMP_HOME, USERPROFILE=_TMP_HOME,
+               CLAUDE_PLUGIN_ROOT=str(_plugin_root()))
     env.pop("MEMHUB_MCP_BASE_URL", None)
     env.update(env_extra or {})
     out = subprocess.run(

@@ -4,6 +4,11 @@ argument-hint: [session-id-or-path]
 allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__refresh_brain_overview, mcp__plugin_memhub_memhub__recall_directives, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__refresh_brain_overview, mcp__plugin_memhub-staging_memhub__recall_directives, mcp__plugin_memhub-staging_memhub__search_brains
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Onboard a new user onto MemHub for the repo they're in. The value of an agent
 brain is a **compiled layer over content** (a self-describing overview + proactive
 code-anchored directives) — so a brand-new empty brain shows nothing. This skill's

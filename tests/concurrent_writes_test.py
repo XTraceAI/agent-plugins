@@ -45,7 +45,9 @@ def check(label: str, got, want) -> None:
 _CHILD = r"""
 import json, os, sys
 sys.path.insert(0, {scripts!r})
+# Both spellings: POSIX expanduser reads HOME, Windows reads USERPROFILE.
 os.environ["HOME"] = {home!r}
+os.environ["USERPROFILE"] = {home!r}
 target, rounds, tag = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
 if target == "state":
@@ -117,8 +119,15 @@ def test_key_cache_survives_concurrent_writers():
             check("padding is intact", len(record.get("padding", "")), 4000)
         except ValueError as exc:
             check(f"published document parses ({exc})", False, True)
-        check("mode is still 0600",
-              oct(published.stat().st_mode)[-3:], "600")
+        if os.name == "nt":
+            # POSIX permission bits do not exist on Windows — st_mode is
+            # synthesized (0666) whatever the writer asked for. The secret is
+            # private there via the profile directory's ACL instead, which a
+            # mode check cannot observe.
+            print("  SKIP mode is still 0600 (POSIX-only: Windows has no mode bits)")
+        else:
+            check("mode is still 0600",
+                  oct(published.stat().st_mode)[-3:], "600")
         leftovers = sorted(p.name for p in home.glob("*.tmp"))
         check("no temp files left", leftovers, [])
 

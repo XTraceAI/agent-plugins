@@ -18,9 +18,17 @@ Exits non-zero if any suite fails, printing that suite's tail.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+# Windows consoles default to a legacy codepage (cp1252) that cannot encode
+# the suites' own output (arrows, em-dashes, replacement chars). Reconfigure
+# OUR stdio rather than requiring every caller to remember PYTHONUTF8=1.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 TESTS = Path(__file__).resolve().parent
 
@@ -33,8 +41,13 @@ def main() -> int:
 
     failed: list[str] = []
     for suite in suites:
+        # PYTHONUTF8 for the CHILD: a suite that prints "→" into a piped
+        # stdout dies on Windows' locale codec inside its own process — no
+        # amount of decode tolerance on OUR side can fix the child crashing.
         result = subprocess.run([sys.executable, str(suite)],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                env={**os.environ, "PYTHONUTF8": "1"})
         ok = result.returncode == 0
         if not ok:
             failed.append(suite.name)

@@ -202,22 +202,83 @@ def _save_handles(session_id: str, keys: list[str]) -> None:
         pass  # the cache is an optimization, never worth failing the hook
 
 
-def _repo_name(cwd: str) -> str:
-    """The repo this session works in: git remote basename (stable across
-    worktrees like ``xmem-directive-golden``), else the cwd basename."""
-    if not cwd:
+_REMOTE_CACHE: dict[str, str] = {}
+
+
+def _git_remote_basename(directory: str) -> str:
+    """Git remote basename for ``directory``, or "" — remote-derived only,
+    per the repo-brain rules: a directory basename is NEVER a scope name
+    (a worktree's would hide directives from the canonical repo, and a
+    parent-of-many-repos cwd would collapse every sibling into one bucket).
+
+    Memoized: one hook run resolves the same directory from both the recall
+    call site and the precision filter, and a subprocess per caller adds up
+    on a hook that fires for every tool use."""
+    if not directory:
         return ""
+    if directory in _REMOTE_CACHE:
+        return _REMOTE_CACHE[directory]
+    name = ""
     try:
         out = subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            ["git", "-C", directory, "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=0.5,
         )
         url = out.stdout.strip()
         if out.returncode == 0 and url:
-            return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+            name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
     except (OSError, subprocess.SubprocessError):
         pass
-    return Path(cwd).name
+    _REMOTE_CACHE[directory] = name
+    return name
+
+
+def _repo_name(cwd: str, args: dict | None = None) -> str:
+    """The repo this CALL works in: the acted-on file's repo first, the cwd's
+    second, else "" (unknown scope — never a directory-basename bucket).
+
+    The acted-on path outranks cwd because of the multi-repo-parent workflow
+    (field report): the agent runs from a folder CONTAINING several repos and
+    edits files inside them — cwd resolves no remote there, and the old
+    basename fallback minted one shared scope bucket named after the parent,
+    collapsing every sibling repo's directives together."""
+    # The session cwd is the trust boundary: git only ever runs inside it.
+    # The acted-on path is payload data — without a cwd to contain it, it
+    # must not steer where git executes (a crafted path could point `git -C`
+    # at a directory whose repo-local config git would honor), nor may a
+    # relative path silently bind to this hook process's own cwd.
+    base: Path | None = None
+    if cwd:
+        try:
+            base = Path(cwd.replace("\\", "/")).resolve()
+        except (OSError, ValueError):
+            base = None
+    if base is not None:
+        for key in ("file_path", "notebook_path"):
+            v = (args or {}).get(key)
+            if not (isinstance(v, str) and v):
+                continue
+            try:
+                d = Path(v.replace("\\", "/")).parent
+                # A relative path is relative to the SESSION's cwd (the
+                # payload field), not this hook process's own cwd.
+                if not d.is_absolute():
+                    d = base / d
+                # Nearest EXISTING ancestor: a Write can name a directory
+                # that does not exist yet, and `git -C <missing>` resolves
+                # nothing.
+                while not d.exists() and d != d.parent:
+                    d = d.parent
+                # Symlinks resolved BEFORE the containment check, so a
+                # link inside cwd can't smuggle git out of it.
+                d = d.resolve()
+                name = (_git_remote_basename(str(d))
+                        if d.is_relative_to(base) else "")
+            except (OSError, ValueError):  # payload strings are untrusted
+                name = ""                  # (NUL bytes raise ValueError)
+            if name:
+                return name
+    return _git_remote_basename(cwd)
 
 
 def _error_output(hook_input: dict) -> str | None:
@@ -279,17 +340,50 @@ _GENERIC_TOKENS = frozenset({
     # matchable, so a directive anchored on it still fires on commands that
     # literally name it — just not on every `git push origin <branch>`.
     "origin", "staging", "master", "branch", "commit",
+    # OS-path filler (field report): on Windows every file_path haystack
+    # contains ``C:/Users/<name>\…``, so path-derived trigger tokens like
+    # "users" matched EVERY call. Same class on POSIX (/home, /Users). These
+    # are blocked as SOLE anchors only — a fuller trigger still matches.
+    "users", "home", "desktop", "documents", "downloads", "appdata",
+    "roaming", "local", "share", "config", "projects", "workspace",
 })
 _MIN_TOKEN_LEN = 4
 
 
-def _repo_tokens(cwd: str) -> set[str]:
-    """Always-on tokens derived from the working dir (the repo name + parts).
+def _user_tokens() -> frozenset[str]:
+    """The machine account's name (+ word parts) as always-blocked tokens —
+    the other half of the Windows-path finding: ``C:/Users/alice`` puts the
+    account name in every haystack, so it can never be a sole anchor.
+    Computed once; Path.home() cannot change mid-process."""
+    global _USER_TOKENS_CACHE
+    if _USER_TOKENS_CACHE is None:
+        try:
+            name = Path.home().name.lower()
+        except (RuntimeError, OSError):  # no resolvable home (service ctx)
+            name = ""
+        toks = {name} if name else set()
+        toks.update(w for w in re.split(r"[^a-z0-9]+", name)
+                    if len(w) >= _MIN_TOKEN_LEN)
+        _USER_TOKENS_CACHE = frozenset(toks)
+    return _USER_TOKENS_CACHE
 
-    A trigger equal to the repo (e.g. ``MemHub-Backend`` → ``memhub`` /
-    ``backend``) matches essentially every call, so it can't stand alone.
-    """
-    base = Path(cwd).name.lower() if cwd else ""
+
+_USER_TOKENS_CACHE: frozenset[str] | None = None
+
+
+def _repo_tokens(repo: str) -> set[str]:
+    """Always-on tokens of the RESOLVED repo name (+ word parts) — pure
+    string work; resolution happens once per hook run (see :func:`_repo_name`)
+    and the name is passed in.
+
+    A trigger equal to the acting repo (e.g. ``MemHub-Backend`` → ``memhub``
+    / ``backend``) matches essentially every call INSIDE that repo, so it
+    can't stand alone there. Resolution replaces the old cwd-basename read:
+    from a multi-repo parent folder, the basename blocked the PARENT's name
+    (useless) while sibling repo names stayed unblocked in their own repos —
+    and, being remote-derived, an unknown scope now blocks nothing instead
+    of minting a bucket."""
+    base = (repo or "").lower()
     if not base:
         return set()
     toks = {base}
@@ -304,7 +398,7 @@ def _trigger_tokens(trigger: str) -> set[str]:
     plus long identifier words. Short fragments are dropped so ``app`` / ``py``
     can't drive a spurious match.
     """
-    t = trigger.strip().lower()
+    t = trigger.strip().lower().replace("\\", "/")
     if not t:
         return set()
     toks = {t}
@@ -317,8 +411,19 @@ def _trigger_tokens(trigger: str) -> set[str]:
     return {w for w in toks if len(w) >= _MIN_TOKEN_LEN}
 
 
+def _hit(tok: str, haystack: str) -> bool:
+    """Boundary-aware containment: ``part`` must not match ``particular``.
+
+    A token counts only when its alphanumeric edges don't continue into more
+    alphanumerics — path separators, dots and spaces all still bound it, so
+    path and dotted-name tokens keep matching exactly as before."""
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", haystack) is not None
+
+
 def _precision_filter(
     items: list[dict], args: dict, cwd: str, extra_haystack: str = "",
+    repo: str | None = None,
 ) -> list[dict]:
     """Keep only directives that concretely match the handle we fired on.
 
@@ -339,10 +444,15 @@ def _precision_filter(
         haystack = " ".join(
             v.lower() for v in list(args.values()) + [extra_haystack]
             if isinstance(v, str) and v
-        )
+        ).replace("\\", "/")
         if not haystack:
             return items
-        blocked = _GENERIC_TOKENS | _repo_tokens(cwd)
+        # main resolves the repo once per run and passes it in; the None
+        # default (self-resolve) keeps the gate correct for callers that
+        # don't — resolution stays out of the per-item loop either way.
+        if repo is None:
+            repo = _repo_name(cwd, args)
+        blocked = _GENERIC_TOKENS | _user_tokens() | _repo_tokens(repo)
         kept: list[dict] = []
         for d in items:
             triggers = d.get("triggers")
@@ -356,7 +466,8 @@ def _precision_filter(
                 if not isinstance(t, str):
                     continue
                 for tok in _trigger_tokens(t):
-                    if tok not in blocked and tok in haystack and len(tok) > len(best_tok):
+                    if (tok not in blocked and len(tok) > len(best_tok)
+                            and _hit(tok, haystack)):
                         best_tok, best_trg = tok, t
             if best_tok:
                 d["_match"] = best_trg
@@ -569,11 +680,12 @@ def main() -> int:
         if handle and handle in handles:
             return 0
         # Only now derive the repo — it spawns a git subprocess, so it must sit
-        # AFTER the cache early-out or every cached hit pays for it.
+        # AFTER the cache early-out or every cached hit pays for it. Resolved
+        # exactly once; the precision filter below reuses this value.
+        repo = _repo_name(cwd, recall_args)
         items = asyncio.run(
             asyncio.wait_for(
-                _recall(tool, recall_args, _repo_name(cwd), fired, output,
-                        session_id),
+                _recall(tool, recall_args, repo, fired, output, session_id),
                 _RECALL_TIMEOUT_S,
             )
         )
@@ -596,7 +708,8 @@ def main() -> int:
         # handle. Containing the failure removes the dilemma: whatever happens
         # in here, we asked the server once and we record that.
         try:
-            items = _precision_filter(items, recall_args, cwd, output or "")
+            items = _precision_filter(items, recall_args, cwd, output or "",
+                                      repo=repo)
             items = _rank(items)[:_MAX_DIRECTIVES]
             if items:
                 _log(f"{len(items)} directive(s) fired for {tool}"

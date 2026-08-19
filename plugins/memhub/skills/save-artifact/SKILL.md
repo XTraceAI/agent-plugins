@@ -4,6 +4,11 @@ argument-hint: <file-path> [artifact name]
 allowed-tools: Bash
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Store an existing file as a MemHub artifact. The file's bytes are uploaded by a
 helper script — **do NOT call the `save_artifact` MCP tool yourself and do NOT
 paste/retype the file contents**; that would regenerate the whole document token
