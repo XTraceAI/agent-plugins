@@ -26,8 +26,13 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CLAUDE_HOOKS = ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json"
-CODEX_HOOKS = ROOT / "plugins" / "memhub" / "hooks" / "codex-hooks.json"
+_HOOKS_DIR = ROOT / "plugins" / "memhub" / "hooks"
+# The Claude file is claude-hooks.json after the multi-host rename (PR #65)
+# and hooks.json before it — same content either way. Resolving both keeps
+# the generator and its parity test working on every branch of the stack.
+CLAUDE_HOOKS = next(p for p in (_HOOKS_DIR / "claude-hooks.json",
+                                _HOOKS_DIR / "hooks.json") if p.exists())
+CODEX_HOOKS = _HOOKS_DIR / "codex-hooks.json"
 
 # Claude matcher → Codex superset matcher (see module docstring).
 MATCHER_MAP = {
