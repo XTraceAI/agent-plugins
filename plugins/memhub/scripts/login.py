@@ -47,8 +47,13 @@ from pak import PakError  # noqa: E402
 # The MCP SDK logs the OAuth flow's exception WITH a traceback before letting it
 # propagate. Under --status a missing token is an expected, reported outcome —
 # not a crash — and a stack trace above a one-line "NOT LOGGED IN" reads like
-# the tool broke. Same silencer the capture hooks use.
-logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
+# the tool broke. Scoped to --status ONLY (checked pre-argparse, so it's set
+# before the SDK import can log): in the INTERACTIVE flow that same silencer
+# hid a real failure completely — a field user saw only "ExceptionGroup:
+# unhandled errors in a TaskGroup" and had to re-enable this logger in a
+# debugger to find the actual broken call underneath.
+if "--status" in sys.argv:
+    logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 from _memhub_auth import (  # noqa: E402
     NonInteractiveAuthRequired,
@@ -272,7 +277,8 @@ async def _run(status_only: bool, force: bool) -> int:
                 print("status      : NOT LOGGED IN (no usable cached token)")
                 print("fix         : run /memhub:login")
                 return 1
-            print(f"status      : FAILED ({type(exc).__name__}: {exc})")
+            leaf = _leaf(exc)
+            print(f"status      : FAILED ({type(leaf).__name__}: {leaf})")
             return 1
 
         # Proven against the server — only now may the stash be discarded.
@@ -320,6 +326,28 @@ async def _run(status_only: bool, force: bool) -> int:
         return 0
     finally:
         _restore()
+
+
+def _leaf(exc: BaseException) -> BaseException:
+    """The deepest single exception under anyio's ExceptionGroup wrapping.
+
+    "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)" names
+    nothing; the leaf ("AttributeError: module 'os' has no attribute
+    'fchmod'") names the bug. Walk group members and causes, preferring the
+    first concrete leaf found depth-first."""
+    seen: set[int] = set()
+    current = exc
+    while id(current) not in seen:
+        seen.add(id(current))
+        subs = getattr(current, "exceptions", None)
+        if subs:
+            current = subs[0]
+            continue
+        if current.__cause__ is not None:
+            current = current.__cause__
+            continue
+        break
+    return current
 
 
 def _is_noninteractive(exc: BaseException) -> bool:

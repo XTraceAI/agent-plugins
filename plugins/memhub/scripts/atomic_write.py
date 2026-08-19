@@ -70,6 +70,26 @@ def replace(tmp: Path, path: Path) -> None:
             time.sleep(random.uniform(0.001, 0.004))
 
 
+def _sweep_stale_tmps(path: Path) -> None:
+    """Best-effort removal of orphaned ``<name>.<pid>.tmp`` siblings.
+
+    Crashed publishes — and, historically, the fchmod bug that broke every
+    Windows write — leave 0-byte temps behind; field machines accumulated
+    dozens. Age-gated a full hour so a LIVE concurrent publish's temp is
+    never yanked mid-write (publishes complete in milliseconds; an hour-old
+    same-name temp has no living writer)."""
+    try:
+        cutoff = time.time() - 3600
+        for stale in path.parent.glob(f"{path.name}.*.tmp"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def publish(path: Path, text: str, mode: int = 0o600) -> None:
     """Write ``text`` to ``path`` atomically, creating it with ``mode``.
 
@@ -79,27 +99,47 @@ def publish(path: Path, text: str, mode: int = 0o600) -> None:
     must not leave debris in the user's config directory.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_tmps(path)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
     try:
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
-        # os.open applies `mode` only when it CREATES the file. A leftover temp
-        # — from a crashed process whose pid has since been reused — keeps
-        # whatever mode it already had, so a secret could be published at 0644
-        # while this code looked like it set 0600. fchmod on the open
-        # descriptor settles it either way, and on the fd rather than the path
-        # so there is no window for a swap in between.
-        # Native Windows has no fchmod (POSIX modes don't map to ACLs; files
-        # under the user profile are private by default there) — chmod on the
-        # path is the closest gesture and the leftover-temp race it reopens
-        # does not exist on Windows, where O_TRUNC already emptied the temp.
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, mode)
-        else:
-            os.chmod(tmp, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # Hand the raw fd to a file object IMMEDIATELY. Any exception between
+        # os.open and os.fdopen leaves the descriptor open, and on Windows a
+        # live descriptor blocks the cleanup unlink below (PermissionError
+        # [WinError 32] — an OSError, silently swallowed). Field report: this
+        # exact window (fchmod raising) littered a machine with dozens of
+        # 0-byte *.tmp orphans across 98 sessions.
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    try:
+        with handle:
+            # os.open applies `mode` only when it CREATES the file. A leftover
+            # temp — from a crashed process whose pid has since been reused —
+            # keeps whatever mode it already had, so a secret could be
+            # published at 0644 while this code looked like it set 0600.
+            # fchmod on the open descriptor settles it either way, and on the
+            # fd rather than the path so there is no window for a swap in
+            # between.
+            # Native Windows has no fchmod (POSIX modes don't map to ACLs;
+            # files under the user profile are private by default there) —
+            # chmod on the path is the closest gesture and the leftover-temp
+            # race it reopens does not exist on Windows, where O_TRUNC already
+            # emptied the temp.
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, mode)
+            else:
+                os.chmod(tmp, mode)
             handle.write(text)
         replace(tmp, path)
     except BaseException:
+        # The handle is closed by its `with` (or was never opened past the
+        # guard above), so the unlink is not fd-blocked on Windows.
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
