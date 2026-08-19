@@ -92,7 +92,7 @@ out = brain_brief.cmd_brief({"cwd": "/tmp/nowhere"})
 check("unonboarded repo prints nothing", out == 0)
 
 # ── the brief itself ───────────────────────────────────────────────────────
-room = {"brain_id": BRAIN, "name": "Repo: XTraceAI/memhub-claude-plugin"}
+room = {"brain_id": BRAIN, "name": "Repo: XTraceAI/agent-plugins"}
 _stub_room(room)
 
 import io  # noqa: E402
@@ -109,7 +109,7 @@ def _brief(payload: dict | None = None) -> dict:
 first = _brief()
 check("names the brain in agent context", BRAIN in _ctx(first))
 check("names the room in agent context",
-      "Repo: XTraceAI/memhub-claude-plugin" in _ctx(first))
+      "Repo: XTraceAI/agent-plugins" in _ctx(first))
 check("states it is the default target", "DEFAULT target" in _ctx(first))
 check("first resolution reaches the USER", "systemMessage" in first)
 

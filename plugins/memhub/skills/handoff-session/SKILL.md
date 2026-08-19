@@ -4,6 +4,11 @@ argument-hint: <teammate> [title...]
 allowed-tools: mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, Bash
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Hand the current session off to a teammate: write a concise handoff brief into
 a shareable agent brain and share it read-only, alongside the repo room where
 per-turn capture has already extracted this session. The teammate's agent picks

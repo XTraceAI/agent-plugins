@@ -4,6 +4,11 @@ argument-hint: <what to look for>
 allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Search MemHub team memory and report what it holds about the user's topic.
 Read-only: this skill never writes or modifies memory.
 

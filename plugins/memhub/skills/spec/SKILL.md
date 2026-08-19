@@ -4,11 +4,16 @@ argument-hint: <init|revise|check|status> [file|topic] [...]
 allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__get_artifact, mcp__plugin_memhub-staging_memhub__get_artifact, mcp__plugin_memhub_memhub__get_artifact_lineage, mcp__plugin_memhub-staging_memhub__get_artifact_lineage, mcp__plugin_memhub_memhub__diff_artifact_versions, mcp__plugin_memhub-staging_memhub__diff_artifact_versions, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, Bash
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Run spec-driven development on top of MemHub. The model:
 
 - **One agent brain per repo** — the repo's shared room, named
   `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
-  stripped — e.g. `Repo: XTraceAI/memhub-claude-plugin`). Resolve it once with
+  stripped — e.g. `Repo: XTraceAI/agent-plugins`). Resolve it once with
   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show`; when that prints
   nothing, match the name EXACTLY in `list_agent_brains` and reuse what you
   find — a teammate may have created it — then cache it with `room_map.py set

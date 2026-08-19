@@ -4,6 +4,11 @@ argument-hint: <session-id-or-path> [title...]
 allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Import a past Claude Code session into MemHub team memory on demand. A helper
 script reads the transcript file and ships it to the `import_conversation` MCP
 tool — **do NOT call the MCP tool yourself and do NOT read or paste transcript

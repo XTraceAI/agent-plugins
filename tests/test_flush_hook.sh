@@ -18,9 +18,11 @@ cd "$(dirname "$0")/.." || exit 1
 export CLAUDE_PLUGIN_ROOT="$PWD/plugins/memhub"
 # PostToolUse holds several Bash-matching blocks (the reactive-prefilter one
 # sits first since 0.9.3), so select the flush block by its unique
-# flush_prefilter.py reference, never by position.
-CMD=$(python3 -c "import json; cmds=[h['command'] for e in json.load(open('plugins/memhub/hooks/hooks.json'))['hooks']['PostToolUse'] for h in e['hooks'] if 'flush_prefilter.py' in h['command']]; assert len(cmds)==1, cmds; print(cmds[0])")
-[ -n "$CMD" ] || { echo "FATAL: no flush hook command extracted from hooks.json" >&2; exit 1; }
+# flush_prefilter.py reference, never by position. The file is
+# claude-hooks.json since the multi-host rename (explicit manifest pointer;
+# no host default-mounts another host's hooks).
+CMD=$(python3 -c "import json; cmds=[h['command'] for e in json.load(open('plugins/memhub/hooks/claude-hooks.json'))['hooks']['PostToolUse'] for h in e['hooks'] if 'flush_prefilter.py' in h['command']]; assert len(cmds)==1, cmds; print(cmds[0])")
+[ -n "$CMD" ] || { echo "FATAL: no flush hook command extracted from claude-hooks.json" >&2; exit 1; }
 fail=0
 
 run() { printf %s "$1" | bash -c "$CMD" 2>&1; }

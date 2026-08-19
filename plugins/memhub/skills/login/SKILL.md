@@ -4,6 +4,11 @@ argument-hint: [--status | --force]
 allowed-tools: Bash
 ---
 
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
+Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
+this plugin's root — the ancestor directory of this skill file that contains
+`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+
 Authenticate this MemHub plugin install and confirm capture can actually run.
 
 **The one thing to understand before answering any question here:** the plugin's

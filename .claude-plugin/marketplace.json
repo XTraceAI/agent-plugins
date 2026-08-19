@@ -10,7 +10,7 @@
       "name": "memhub",
       "source": {
         "source": "git-subdir",
-        "url": "https://github.com/XTraceAI/memhub-claude-plugin.git",
+        "url": "https://github.com/XTraceAI/agent-plugins.git",
         "path": "plugins/memhub",
         "ref": "memhub--v0.26.1",
         "sha": "fa8202965baf9650c68da6267b3975f42e3301e3"
