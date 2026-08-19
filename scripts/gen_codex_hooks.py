@@ -43,8 +43,12 @@ MATCHER_MAP = {
         "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|shell|local_shell|Bash)$",
 }
 
-_FLUSH = ('IN=$(cat); if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then printf %s "$IN" '
-          '| python3 "${CLAUDE_PLUGIN_ROOT}/scripts/codex_flush.py" {event}; fi')
+# Codex sets PLUGIN_ROOT for plugin hooks (per the hooks doc); older builds
+# and Clay's production hooks suggest CLAUDE_PLUGIN_ROOT existed at some
+# point — the fallback chain works on both and costs nothing.
+_ROOT = '${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}'
+_FLUSH = ('IN=$(cat); R="' + _ROOT + '"; if [ -n "$R" ]; then printf %s "$IN" '
+          '| python3 "$R/scripts/codex_flush.py" {event}; fi')
 
 
 def generate(claude_hooks: dict) -> dict:
@@ -58,6 +62,16 @@ def generate(claude_hooks: dict) -> dict:
             e = json.loads(json.dumps(entry))  # deep copy
             if "matcher" in e:
                 e["matcher"] = MATCHER_MAP.get(e["matcher"], e["matcher"])
+            # Claude exports CLAUDE_PLUGIN_ROOT; Codex exports PLUGIN_ROOT.
+            # Rewrite the carried-over commands to the fallback chain so the
+            # directive/artifact hooks locate their scripts on either host —
+            # found live: with CLAUDE_PLUGIN_ROOT unset, every carried hook
+            # fired and silently no-op'd on its own guard.
+            for h in e.get("hooks", []):
+                cmd = h.get("command", "")
+                cmd = cmd.replace("${CLAUDE_PLUGIN_ROOT:-}", _ROOT)
+                cmd = cmd.replace("${CLAUDE_PLUGIN_ROOT}", _ROOT)
+                h["command"] = cmd
             remapped.append(e)
         return remapped
 
