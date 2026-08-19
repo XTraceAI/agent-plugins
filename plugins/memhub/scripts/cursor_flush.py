@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Cursor capture: hook-triggered flush of a cursor-agent session into MemHub.
+
+The Cursor analog of ``flush_turn.py``, reusing its whole downstream —
+``redact``, ``_memhub_auth.resolve_bearer``, ``brain_resolve``, ``room_map``,
+``mcp_http`` — and differing in exactly the two places Cursor differs:
+
+1. **Data source**: Cursor hooks hand a ``transcript_path`` JSONL, but that
+   file is deliberately Claude-shaped-yet-LOSSY (no tool results, no ids, no
+   reasoning — verified live). So the hook is used only for TRIGGER +
+   IDENTITY: the session uuid names the full-fidelity store
+   (``~/.cursor/chats/<hash>/<uuid>/store.db``), read through
+   ``readers.cursor`` into canonical records.
+2. **Watermark**: the store is content-addressed, so "anything new?" is a
+   set comparison on blob ids — which also makes checkpoint restores safe
+   (a new root over mostly-old blobs), where a byte offset would lie.
+
+The full canonical transcript is re-sent each flush under the constant
+``conversation_id cursor-<uuid>``; the SERVER's watermark folds re-sends
+forward (the same property Codex re-imports rely on). The local blob-id set
+only decides WHETHER to flush, so a lost state file costs a redundant send,
+never a lost or duplicated conversation.
+
+Events (from Spike C, cursor-agent 2026.08): ``beforeShellExecution`` and
+``afterFileEdit`` are the ones that fire in ``-p`` mode; ``stop`` and
+``beforeSubmitPrompt`` are wired opportunistically for hosts where they do.
+``beforeShellExecution`` flushes only on milestone commands (git commit /
+gh pr …) so ordinary shell traffic stays quiet; ``afterFileEdit`` is
+debounced. Whatever the trigger set misses, the next flush or an
+import-session sweep heals — idempotence carries correctness, hooks carry
+latency.
+
+Invoked by ``hooks/cursor_capture.sh``, which answers the hook's permission
+contract INSTANTLY and re-runs this script detached — a slow server must
+never hold up the user's shell command.
+
+Runs under bare python3 (stdlib + sibling modules only — no mcp SDK), same
+discipline as flush_turn.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import atomic_write  # noqa: E402
+import mcp_http  # noqa: E402
+from _memhub_auth import resolve_bearer  # noqa: E402
+from brain_resolve import resolve_repo_brain  # noqa: E402
+from readers import cursor as cursor_reader  # noqa: E402
+from redact import redact_records  # noqa: E402
+from room_map import env_for_url  # noqa: E402
+
+STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
+
+# afterFileEdit fires on every edit; flushing each one would hammer the
+# server mid-turn. Milestones and turn boundaries bypass this.
+DEBOUNCE_S = 120.0
+FLUSH_TIMEOUT_S = 240.0
+
+_MILESTONE_RE = re.compile(r"\bgit\b.*\bcommit\b|\bgh\b.*\bpr\b", re.S)
+
+
+def _log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [cursor-flush] {msg}\n"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        log = STATE_DIR / "log"
+        # Cap by rewrite-on-threshold: a background hook's log must never
+        # grow unbounded, and losing old lines is the acceptable direction.
+        if log.exists() and log.stat().st_size > 256_000:
+            tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
+            log.write_text("\n".join(tail) + "\n", encoding="utf-8")
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _state_path(uuid: str) -> Path:
+    return STATE_DIR / f"{uuid}.json"
+
+
+def _read_state(uuid: str) -> dict:
+    try:
+        return json.loads(_state_path(uuid).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(uuid: str, **fields) -> None:
+    state = _read_state(uuid)
+    state.update(fields)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write.publish(_state_path(uuid), json.dumps(state))
+
+
+def session_uuid(payload: dict) -> str | None:
+    """The session identity a hook carries. ``session_id`` when present;
+    else derived from ``transcript_path`` (…/agent-transcripts/<uuid>/…)."""
+    sid = payload.get("session_id") or payload.get("conversation_id")
+    if isinstance(sid, str) and sid.strip():
+        return sid.strip()
+    tp = payload.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        return Path(tp).parent.name or None
+    return None
+
+
+def current_blob_ids(store_db: Path) -> set[str]:
+    import sqlite3
+    con = sqlite3.connect(f"file:{store_db}?mode=ro", uri=True)
+    try:
+        return {row[0] for row in con.execute("SELECT id FROM blobs")}
+    finally:
+        con.close()
+
+
+def should_flush(event: str, payload: dict, state: dict,
+                 blob_ids: set[str], now: float) -> bool:
+    """Pure gate — WHEN a hook invocation becomes a server call.
+
+    New-blobs is a precondition for every event: without new content a flush
+    is a guaranteed no-op round trip. On top of that, each event has its own
+    threshold: milestones always ship (the commit/PR boundary is the whole
+    point of milestone capture), turn boundaries ship, plain edits debounce,
+    and non-milestone shell commands never trigger (too chatty).
+    """
+    if blob_ids <= set(state.get("blob_ids") or []):
+        return False
+    if event == "beforeShellExecution":
+        return bool(_MILESTONE_RE.search(payload.get("command") or ""))
+    if event == "afterFileEdit":
+        return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
+    if event in ("stop", "beforeSubmitPrompt"):
+        return True
+    return False
+
+
+async def _flush(uuid: str, store_db: Path, blob_ids: set[str]) -> None:
+    records, meta = cursor_reader.to_canonical(store_db)
+    sendable = redact_records(records)
+    if not sendable:
+        return
+
+    url, bearer = await asyncio.to_thread(resolve_bearer)
+    if not bearer:
+        _log("no usable credential — skipping (run /memhub:login)")
+        _save_state(uuid, last_error="no_credential")
+        return
+    env = env_for_url(url)
+    session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
+
+    cwd = meta.get("cwd")
+    room = await resolve_repo_brain(session, cwd, env) if cwd else None
+
+    arguments = {
+        "messages": sendable,
+        # Host-namespaced so server-side watermarks never collide across
+        # hosts, matching the codex importer's convention.
+        "conversation_id": f"cursor-{uuid}",
+        # The agentic path detects by STRUCTURE; the records carry a Cursor
+        # provenance banner (see readers/cursor.py).
+        "source_platform": "claude",
+        "flush": "auto",
+    }
+    if room:
+        arguments["agent_brain_id"] = room["brain_id"]
+        if room.get("org_id"):
+            arguments["org_id"] = room["org_id"]
+    if meta.get("title"):
+        arguments["title"] = meta["title"]
+
+    try:
+        await session.call_tool("import_conversation", arguments=arguments)
+    except mcp_http.McpRateLimited as e:
+        _log(f"rate limited: {e} — a later hook retries (state unmoved)")
+        _save_state(uuid, last_error="rate_limited")
+        return
+    except mcp_http.McpError as e:
+        _log(f"import failed: {e}")
+        _save_state(uuid, last_error=str(e)[:200])
+        return
+
+    _save_state(uuid, blob_ids=sorted(blob_ids),
+                last_flush_at=time.time(), last_ok_at=time.time(),
+                last_error=None)
+    _log(f"flushed {len(sendable)} records → cursor-{uuid}"
+         + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
+
+
+def main() -> int:
+    event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+
+    uuid = session_uuid(payload)
+    if not uuid:
+        _log(f"{event}: no session identity in payload — skipping")
+        return 0
+
+    store_db, err = cursor_reader.locate(uuid)
+    if store_db is None:
+        _log(f"{event}: {err}")
+        return 0
+
+    try:
+        blob_ids = current_blob_ids(store_db)
+    except Exception as e:  # locked/corrupt db mid-write — next hook retries
+        _log(f"{event}: store unreadable ({e}) — skipping")
+        return 0
+
+    state = _read_state(uuid)
+    if not should_flush(event, payload, state, blob_ids, time.time()):
+        return 0
+
+    try:
+        asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids),
+                                     timeout=FLUSH_TIMEOUT_S))
+    except Exception as e:
+        _log(f"{event}: flush error: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
