@@ -1,5 +1,11 @@
 # MemHub for OpenAI Codex
 
+> **Moved (multi-host refactor):** the transform now lives at
+> `plugins/memhub/scripts/readers/codex.py`, and the import entry point is
+> `plugins/memhub/scripts/capture.py import --host codex`. The commands below
+> still work — `codex_to_claude.py` and `import_codex_session.py` are thin
+> forwarding shims kept for one release.
+
 Codex isn't a Claude Code plugin, so the marketplace at the repo root doesn't
 apply to it. Instead MemHub reaches Codex two ways, and neither needs a new
 repo or a backend change:

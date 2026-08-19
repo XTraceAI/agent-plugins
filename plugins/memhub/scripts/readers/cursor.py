@@ -1,0 +1,332 @@
+"""Cursor session reader: cursor-agent chat stores → Claude Code records.
+
+Store layout (undocumented; pinned by inspection on cursor-agent 2026.08,
+``meta.json.schemaVersion == 1`` — this reader REFUSES other versions loudly
+rather than misparse):
+
+    ~/.cursor/chats/<md5-of-cwd>/<session-uuid>/store.db   (sqlite)
+    ~/.cursor/chats/<md5-of-cwd>/<session-uuid>/meta.json
+        {schemaVersion, cwd, createdAtMs, updatedAtMs, hasConversation}
+
+``store.db`` is a content-addressed blob store: ``blobs(id TEXT PK, data
+BLOB)`` where ``id`` is the hex hash of the content, plus ``meta(key, value)``
+whose session row carries ``latestRootBlobId``. The conversation is a hash
+tree: the root is a protobuf node whose repeated field 1 holds 32-byte child
+hashes; interior nodes point at more nodes; leaves are PLAIN JSON messages in
+the Vercel AI SDK chat shape:
+
+    {"role": "system"|"user"|"assistant"|"tool", "content": str | [blocks]}
+    assistant blocks: {"type": "reasoning"|"text"|"tool-call", ...}
+      tool-call: {toolCallId, toolName, args}
+    tool blocks: {"type": "tool-result", toolCallId, toolName, result,
+                  experimental_content: [{type: "text", text}]}
+
+Mapping to Claude records mirrors the codex reader: reasoning → thinking
+(signatures dropped — opaque), text → text, tool-call → tool_use,
+tool-result → tool_result; the system prompt and Cursor's context injections
+(``<user_info>``, ``<git_status>``, ``<timestamp>`` …) are noise. The real ask
+arrives inside ``<user_query>…</user_query>`` — extract it when present.
+
+Content-addressing is also the watermark story for live capture later: "the
+set of blob ids already shipped" survives checkpoint restores (a new root
+over mostly-old blobs) where a rowid watermark would lie.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from pathlib import Path
+
+HOST = "cursor"
+
+_CHATS = Path.home() / ".cursor" / "chats"
+_SCHEMA_VERSION = 1
+
+_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S)
+# A user turn that STARTS with a well-formed <tag>…</tag> block is carrying
+# Cursor context injections (<user_info>, <git_status>, <rules>,
+# <agent_transcripts>, …). Tag names churn with Cursor versions, so strip
+# leading blocks GENERICALLY rather than maintaining a name list; mid-text
+# tags are left alone (they're the user's own content).
+_LEADING_TAG_RE = re.compile(r"^<([A-Za-z_][\w-]*)(?:\s[^>]*)?>.*?</\1>\s*", re.S)
+
+
+def _clean_user_text(text: str) -> str | None:
+    """The user's real ask, or None when the turn is pure injected context."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _USER_QUERY_RE.search(t)
+    if m:
+        return m.group(1).strip() or None
+    while True:
+        stripped = _LEADING_TAG_RE.sub("", t, count=1).strip()
+        if stripped == t:
+            break
+        t = stripped
+    return t or None
+
+
+def _text_of(content) -> str:
+    """Join text pieces of a content value (string, or a list of
+    ``{type: "text", text}`` blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+
+
+def _read_meta_json(session_dir: Path) -> dict | None:
+    p = session_dir / "meta.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _session_dirs() -> list[Path]:
+    return [p.parent for p in _CHATS.glob("*/*/store.db")]
+
+
+def list_sessions(limit: int = 20) -> list[dict]:
+    """Most recent cursor sessions, newest first (by meta.json updatedAtMs)."""
+    rows = []
+    for d in _session_dirs():
+        m = _read_meta_json(d) or {}
+        rows.append({"id": d.name, "path": str(d / "store.db"),
+                     "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
+                     "host": HOST, "cwd": m.get("cwd")})
+    rows.sort(key=lambda s: s["mtime"], reverse=True)
+    return rows[:limit]
+
+
+def locate(ref: str) -> tuple[Path | None, str]:
+    """Accept a store.db path, a session dir, ``latest``, or a session uuid."""
+    p = Path(ref).expanduser()
+    if p.is_file():
+        return p, ""
+    if p.is_dir() and (p / "store.db").is_file():
+        return p / "store.db", ""
+    if "/" in ref and ref != "latest":
+        return None, f"cursor store not found: {p}"
+    dirs = _session_dirs()
+    if not dirs:
+        return None, f"no cursor sessions under {_CHATS}"
+    if ref == "latest":
+        newest = max(dirs, key=lambda d: (_read_meta_json(d) or {}).get("updatedAtMs", 0))
+        return newest / "store.db", ""
+    hits = [d for d in dirs if d.name == ref]
+    if not hits:
+        return None, f"no cursor session {ref!r} under {_CHATS}"
+    if len(hits) > 1:
+        # Same uuid under two workspace hashes would change which repo's
+        # brain receives the import — refuse, never guess.
+        return None, f"ambiguous session id {ref!r}: {len(hits)} matches — pass the path"
+    return hits[0] / "store.db", ""
+
+
+def _proto_child_hashes(data: bytes) -> list[str]:
+    """Ordered 32-byte field-1 entries of a protobuf node → hex blob ids.
+
+    Minimal TLV walk (stdlib only — no protobuf dependency): field 1
+    length-delimited (tag 0x0A) with len 32 is a child hash; every other
+    field is skipped by wire type. Malformed input just yields what parsed."""
+    out: list[str] = []
+    i, n = 0, len(data)
+
+    def varint(j: int) -> tuple[int, int]:
+        v, shift = 0, 0
+        while j < n:
+            b = data[j]
+            v |= (b & 0x7F) << shift
+            j += 1
+            if not b & 0x80:
+                break
+            shift += 7
+        return v, j
+
+    while i < n:
+        tag, i = varint(i)
+        wire = tag & 7
+        if wire == 2:                      # length-delimited
+            ln, i = varint(i)
+            if tag >> 3 == 1 and ln == 32 and i + 32 <= n:
+                out.append(data[i:i + 32].hex())
+            i += ln
+        elif wire == 0:                    # varint
+            _, i = varint(i)
+        elif wire == 5:
+            i += 4
+        elif wire == 1:
+            i += 8
+        else:                              # unknown wire type — stop safely
+            break
+    return out
+
+
+def _load_messages(db_path: Path) -> list[dict]:
+    """Walk the hash tree from latestRootBlobId; return ordered JSON leaves."""
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        blobs = {row[0]: row[1] for row in con.execute("SELECT id, data FROM blobs")}
+        root = None
+        for (value,) in con.execute("SELECT value FROM meta"):
+            try:
+                m = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(m, dict) and m.get("latestRootBlobId"):
+                root = m["latestRootBlobId"]
+                break
+    finally:
+        con.close()
+
+    messages: list[dict] = []
+    seen: set[str] = set()
+
+    def walk(blob_id: str) -> None:
+        if blob_id in seen or blob_id not in blobs:
+            return
+        seen.add(blob_id)
+        data = blobs[blob_id]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if data[:1] == b"{":
+            try:
+                msg = json.loads(data.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                return
+            if isinstance(msg, dict) and msg.get("role"):
+                messages.append(msg)
+            return
+        for child in _proto_child_hashes(data):
+            walk(child)
+
+    if root:
+        walk(root)
+    if not messages:
+        # Fallback: no walkable root (interrupted write). Take JSON blobs in
+        # insertion order — degraded but better than losing the session.
+        for data in blobs.values():
+            if isinstance(data, (bytes, bytearray)) and data[:1] == b"{":
+                try:
+                    msg = json.loads(bytes(data).decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and msg.get("role"):
+                    messages.append(msg)
+    return messages
+
+
+def to_canonical(path) -> tuple[list[dict], dict]:
+    """Load a cursor store and transform it to Claude-shaped records."""
+    db_path = Path(path)
+    session_dir = db_path.parent
+    mj = _read_meta_json(session_dir) or {}
+    version = mj.get("schemaVersion")
+    if version != _SCHEMA_VERSION:
+        raise ValueError(
+            f"cursor store {session_dir} has schemaVersion {version!r}; this "
+            f"reader is pinned to {_SCHEMA_VERSION} — refusing to misparse. "
+            "Update readers/cursor.py against the new format.")
+    cwd = mj.get("cwd")
+    session_id = session_dir.name
+
+    def rec(record: dict) -> dict:
+        if cwd:
+            record["cwd"] = cwd
+        return record
+
+    def user(content) -> dict:
+        return rec({"type": "user", "message": {"role": "user", "content": content}})
+
+    def assistant(block) -> dict:
+        return rec({"type": "assistant",
+                    "message": {"role": "assistant", "content": [block]}})
+
+    messages = _load_messages(db_path)
+
+    def _model_of(obj) -> str | None:
+        po = obj.get("providerOptions") if isinstance(obj, dict) else None
+        return (po.get("cursor") or {}).get("modelName") if isinstance(po, dict) else None
+
+    model = None
+    for m in messages:
+        # modelName appears at message level OR on individual content blocks
+        model = _model_of(m) or model
+        if isinstance(m.get("content"), list):
+            for b in m["content"]:
+                model = _model_of(b) or model
+
+    out: list[dict] = []
+    banner = "[Imported from Cursor"
+    if model:
+        banner += f" · model {model}"
+    banner += f" · session {session_id}"
+    if cwd:
+        banner += f" · cwd {cwd}"
+    banner += "]"
+    out.append(user(banner))
+
+    title = None
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "system":
+            continue  # Cursor's harness prompt — noise
+
+        if role == "user":
+            ask = _clean_user_text(_text_of(content))
+            if ask:
+                out.append(user(ask))
+                if title is None:
+                    title = ask.strip().splitlines()[0][:150]
+            continue
+
+        if role == "assistant":
+            blocks = content if isinstance(content, list) else [
+                {"type": "text", "text": content}]
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "reasoning":
+                    text = (b.get("text") or "").strip()
+                    if text:  # signatures are opaque — text only
+                        out.append(assistant({"type": "thinking", "thinking": text}))
+                elif bt == "text":
+                    text = (b.get("text") or "").strip()
+                    if text:
+                        out.append(assistant({"type": "text", "text": text}))
+                elif bt == "tool-call":
+                    args = b.get("args")
+                    out.append(assistant({
+                        "type": "tool_use",
+                        "id": b.get("toolCallId") or f"cursor-call-{len(out)}",
+                        "name": b.get("toolName") or "tool",
+                        "input": args if isinstance(args, dict) else {"input": args},
+                    }))
+            continue
+
+        if role == "tool":
+            blocks = content if isinstance(content, list) else []
+            for b in blocks:
+                if not isinstance(b, dict) or b.get("type") != "tool-result":
+                    continue
+                result = b.get("result")
+                if not isinstance(result, str):
+                    result = _text_of(b.get("experimental_content")) or (
+                        json.dumps(result) if result is not None else "")
+                out.append(user([{
+                    "type": "tool_result",
+                    "tool_use_id": b.get("toolCallId") or f"cursor-out-{len(out)}",
+                    "content": result,
+                }]))
+
+    meta = {"session_id": session_id, "cwd": cwd, "model": model,
+            "title": title, "host": HOST}
+    return out, meta
