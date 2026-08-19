@@ -194,6 +194,17 @@ def _namespace_of(cwd: str | None) -> str | None:
 async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
                  flush_mode: str = "now") -> None:
     records, meta = cursor_reader.to_canonical(store_db)
+    # Close the read span IMMEDIATELY — before redaction and the network call,
+    # which together can run for many seconds. Blobs present at both the gate
+    # and here existed for the whole span the payload was built from, so their
+    # content is in it; that pair is the honest watermark. Taken after the
+    # send instead, this read would span the entire round trip, and a
+    # checkpoint restore in that window could shrink the intersection to
+    # nearly nothing and re-send the same content on every later hook.
+    try:
+        shipped = blob_ids & current_blob_ids(store_db)
+    except Exception:  # store unreadable mid-flush — don't claim more
+        shipped = blob_ids  # than the gate saw; recording nothing re-sends forever
     sendable = redact_records(records)
     if not sendable:
         return
@@ -242,22 +253,8 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         _save_state(uuid, last_error=str(e)[:200])
         return
 
-    # Record only blobs that were present BOTH at the gate read and after the
-    # transcript was read — i.e. those that existed for the whole span the
-    # payload was built from, so their content is in what we just sent.
-    # `blob_ids` alone is a snapshot from BEFORE to_canonical: a checkpoint
-    # restore in between can re-root the store, and marking a blob shipped
-    # whose content never went is the one failure this watermark exists to
-    # prevent. The other direction is harmless and already documented —
-    # blobs added mid-read ship now, aren't recorded, and cost one redundant
-    # re-send that the server folds forward.
-    try:
-        shipped = blob_ids & current_blob_ids(store_db)
-    except Exception:  # store went unreadable mid-flush
-        # Can't verify, so don't claim more than the gate saw. Recording the
-        # pre-read set here matches the old behavior and keeps the session
-        # advancing; the alternative (record nothing) re-sends forever.
-        shipped = blob_ids
+    # `shipped` was fixed at the end of the transcript read (see above), NOT
+    # re-read here: a post-send read would span the whole network round trip.
     _save_state(uuid, blob_ids=sorted(shipped),
                 last_flush_at=time.time(), last_ok_at=time.time(),
                 last_error=None)
