@@ -333,21 +333,30 @@ def _leaf(exc: BaseException) -> BaseException:
 
     "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)" names
     nothing; the leaf ("AttributeError: module 'os' has no attribute
-    'fchmod'") names the bug. Walk group members and causes, preferring the
-    first concrete leaf found depth-first."""
+    'fchmod'") names the bug. Walks EVERY member and cause — a group's first
+    member is often a benign CancelledError sibling of the real failure, so
+    the first NON-cancellation leaf in depth-first order wins, with any leaf
+    as fallback. Cycle-guarded, and never returns a group node while a leaf
+    exists."""
+    leaves: list[BaseException] = []
     seen: set[int] = set()
-    current = exc
-    while id(current) not in seen:
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
         seen.add(id(current))
-        subs = getattr(current, "exceptions", None)
-        if subs:
-            current = subs[0]
-            continue
+        children = list(getattr(current, "exceptions", None) or ())
         if current.__cause__ is not None:
-            current = current.__cause__
-            continue
-        break
-    return current
+            children.append(current.__cause__)
+        if children:
+            stack.extend(reversed(children))  # LIFO: first child explored first
+        else:
+            leaves.append(current)
+    for leaf in leaves:
+        if not isinstance(leaf, asyncio.CancelledError):
+            return leaf
+    return leaves[0] if leaves else exc
 
 
 def _is_noninteractive(exc: BaseException) -> bool:

@@ -30,6 +30,9 @@ try:  # POSIX
         _fcntl.flock(fd, _fcntl.LOCK_UN)
 
 except ImportError:  # native Windows
+    import errno as _errno
+    import time as _time
+
     import msvcrt as _msvcrt
 
     def _at_start(fd: int) -> None:
@@ -40,10 +43,13 @@ except ImportError:  # native Windows
     def lock_exclusive(fd: int, blocking: bool = True) -> None:
         """Take an exclusive lock. Non-blocking raises OSError when held.
 
-        Blocking mode waits like flock does: LK_LOCK gives up after ~10s
-        of internal 1/s retries and raises, so loop it — each pass sleeps
-        inside msvcrt, costing nothing extra, and the acquire returns only
-        when the lock is actually held."""
+        Blocking mode waits like flock does — but only on CONTENTION.
+        LK_LOCK gives up after ~10s of internal 1/s retries and raises
+        EDEADLK (or EACCES); those two errnos mean "still held", so loop
+        them until granted. Any other errno (EBADF, EINVAL — a broken fd,
+        not a held lock) re-raises immediately: retrying a permanent error
+        would spin the caller forever, not serialize it. The tiny sleep is
+        belt-and-braces against a contention raise that returns fast."""
         _at_start(fd)
         if not blocking:
             _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
@@ -52,8 +58,10 @@ except ImportError:  # native Windows
             try:
                 _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
                 return
-            except OSError:
-                continue
+            except OSError as e:
+                if e.errno not in (_errno.EACCES, _errno.EDEADLK):
+                    raise
+                _time.sleep(0.01)
 
     def unlock(fd: int) -> None:
         _at_start(fd)
