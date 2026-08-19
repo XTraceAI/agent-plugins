@@ -43,13 +43,15 @@ except ImportError:  # native Windows
     def lock_exclusive(fd: int, blocking: bool = True) -> None:
         """Take an exclusive lock. Non-blocking raises OSError when held.
 
-        Blocking mode waits like flock does — but only on CONTENTION.
-        LK_LOCK gives up after ~10s of internal 1/s retries and raises
-        EDEADLK (or EACCES); those two errnos mean "still held", so loop
-        them until granted. Any other errno (EBADF, EINVAL — a broken fd,
-        not a held lock) re-raises immediately: retrying a permanent error
-        would spin the caller forever, not serialize it. The tiny sleep is
-        belt-and-braces against a contention raise that returns fast."""
+        Blocking mode waits like flock does — but never retries a BROKEN
+        call. EBADF/EINVAL mean the fd or arguments are wrong and no retry
+        can ever succeed, so they raise. Everything else is treated as
+        contention and waited out: the CRT raises EACCES/EDEADLK for a held
+        lock today, but that mapping is not a contract across CRT versions,
+        and crashing a caller under genuine contention is strictly worse
+        than polling. The sleep bounds the poll at ~100/s even if some
+        environment's contention raise returns immediately instead of after
+        LK_LOCK's internal ~10s of retries."""
         _at_start(fd)
         if not blocking:
             _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
@@ -59,7 +61,7 @@ except ImportError:  # native Windows
                 _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
                 return
             except OSError as e:
-                if e.errno not in (_errno.EACCES, _errno.EDEADLK):
+                if e.errno in (_errno.EBADF, _errno.EINVAL):
                     raise
                 _time.sleep(0.01)
 
