@@ -34,7 +34,8 @@ def main() -> int:
     failed: list[str] = []
     for suite in suites:
         result = subprocess.run([sys.executable, str(suite)],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         ok = result.returncode == 0
         if not ok:
             failed.append(suite.name)
