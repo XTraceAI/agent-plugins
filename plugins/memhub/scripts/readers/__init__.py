@@ -78,6 +78,13 @@ def validate_canonical(records: list[dict]) -> list[str]:
         if r.get("type") not in ("user", "assistant"):
             problems.append(f"record {i}: type={r.get('type')!r}")
             continue
+        # The agentic parser SKIPS records without a uuid (replay-dedup key)
+        # and dates turns from ``timestamp`` — both verified against the
+        # backend: uuid-less records import as NOTHING, silently.
+        if not r.get("uuid"):
+            problems.append(f"record {i}: missing uuid (server skips it)")
+        if not r.get("timestamp"):
+            problems.append(f"record {i}: missing timestamp (event_date null)")
         if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
             problems.append(f"record {i}: missing message/role")
             continue

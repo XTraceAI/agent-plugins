@@ -59,17 +59,24 @@ CODEX_SYNTH = [
     _line("event_msg", {"type": "task_complete", "last_agent_message": "Fixed it"}),
 ]
 
+# Real Claude records carry uuid + timestamp natively — the server's agentic
+# parser SKIPS uuid-less records (replay-dedup key) and dates turns from
+# timestamp, so the identity reader's fixtures must carry both, like reality.
 CLAUDE_SYNTH = [
-    {"type": "user", "cwd": "/repo/proj",
+    {"type": "user", "cwd": "/repo/proj", "uuid": "u-1",
+     "timestamp": "2026-08-18T10:00:00.000Z",
      "message": {"role": "user", "content": "Fix the bug"}},
-    {"type": "assistant", "cwd": "/repo/proj",
+    {"type": "assistant", "cwd": "/repo/proj", "uuid": "u-2",
+     "timestamp": "2026-08-18T10:00:01.000Z",
      "message": {"role": "assistant", "content": [
          {"type": "tool_use", "id": "toolu_1", "name": "Bash",
           "input": {"command": "ls"}}]}},
-    {"type": "user", "cwd": "/repo/proj",
+    {"type": "user", "cwd": "/repo/proj", "uuid": "u-3",
+     "timestamp": "2026-08-18T10:00:02.000Z",
      "message": {"role": "user", "content": [
          {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file.py"}]}},
-    {"type": "assistant", "cwd": "/repo/proj",
+    {"type": "assistant", "cwd": "/repo/proj", "uuid": "u-4",
+     "timestamp": "2026-08-18T10:00:03.000Z",
      "message": {"role": "assistant", "content": [
          {"type": "text", "text": "Done."}]}},
 ]
