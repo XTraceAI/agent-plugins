@@ -323,10 +323,11 @@ def test_cursor_reader_end_to_end():
         for r in recs:
             assert r.get("cwd") == "/repo/proj", r
             assert r.get("uuid") and r.get("timestamp"), r   # server contract
-        # leaves inherit their checkpoint node's clock — a real timeline,
-        # not one instant (first two messages: first checkpoint; rest: second)
+        # A real timeline, not one instant: the banner carries meta.json's
+        # createdAtMs, and leaves inherit their checkpoint node's clock —
+        # first two messages the first checkpoint, the rest the second.
         stamps = {r["timestamp"] for r in recs}
-        assert len(stamps) == 2, stamps
+        assert len(stamps) == 3, stamps
     print("PASS test_cursor_reader_end_to_end")
 
 
