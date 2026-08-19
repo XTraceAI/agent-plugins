@@ -117,8 +117,21 @@ with _tf.TemporaryDirectory() as _td:
           == "memhub-claude-plugin")
     check("non-git cwd, no path → unknown scope, not a bucket",
           dr._repo_name(_td) == "")
-    check("unknown scope blocks no repo tokens",
-          dr._repo_tokens(_td) == set())
+
+    # Containment: git only ever runs inside the session cwd. A payload
+    # path OUTSIDE it must not steer resolution (falls back to the cwd's
+    # own remote), and with no cwd at all a relative path must not bind
+    # to the hook process's cwd.
+    check("acted-on path outside cwd falls back to cwd's remote",
+          dr._repo_name(str(_repo), {"file_path": "/somewhere/else/x.py"})
+          == "memhub-claude-plugin")
+    check("relative path with empty cwd → unknown scope",
+          dr._repo_name("", {"file_path": "src/x.py"}) == "")
+
+check("repo tokens are the name + its parts",
+      dr._repo_tokens("MemHub-Backend") == {"memhub-backend", "memhub",
+                                            "backend"})
+check("unknown scope blocks no repo tokens", dr._repo_tokens("") == set())
 
 # 9. Windows-path noise (field report): OS-path segments and the machine's
 #    own account name can never be a directive's sole anchor, while a

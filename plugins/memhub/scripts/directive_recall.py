@@ -242,21 +242,38 @@ def _repo_name(cwd: str, args: dict | None = None) -> str:
     edits files inside them — cwd resolves no remote there, and the old
     basename fallback minted one shared scope bucket named after the parent,
     collapsing every sibling repo's directives together."""
-    for key in ("file_path", "notebook_path"):
-        v = (args or {}).get(key)
-        if isinstance(v, str) and v:
+    # The session cwd is the trust boundary: git only ever runs inside it.
+    # The acted-on path is payload data — without a cwd to contain it, it
+    # must not steer where git executes (a crafted path could point `git -C`
+    # at a directory whose repo-local config git would honor), nor may a
+    # relative path silently bind to this hook process's own cwd.
+    base: Path | None = None
+    if cwd:
+        try:
+            base = Path(cwd.replace("\\", "/")).resolve()
+        except (OSError, ValueError):
+            base = None
+    if base is not None:
+        for key in ("file_path", "notebook_path"):
+            v = (args or {}).get(key)
+            if not (isinstance(v, str) and v):
+                continue
             try:
                 d = Path(v.replace("\\", "/")).parent
                 # A relative path is relative to the SESSION's cwd (the
-                # payload field), not always this hook process's own cwd.
-                if cwd and not d.is_absolute():
-                    d = Path(cwd.replace("\\", "/")) / d
+                # payload field), not this hook process's own cwd.
+                if not d.is_absolute():
+                    d = base / d
                 # Nearest EXISTING ancestor: a Write can name a directory
                 # that does not exist yet, and `git -C <missing>` resolves
                 # nothing.
                 while not d.exists() and d != d.parent:
                     d = d.parent
-                name = _git_remote_basename(str(d))
+                # Symlinks resolved BEFORE the containment check, so a
+                # link inside cwd can't smuggle git out of it.
+                d = d.resolve()
+                name = (_git_remote_basename(str(d))
+                        if d.is_relative_to(base) else "")
             except (OSError, ValueError):  # payload strings are untrusted
                 name = ""                  # (NUL bytes raise ValueError)
             if name:
@@ -354,9 +371,10 @@ def _user_tokens() -> frozenset[str]:
 _USER_TOKENS_CACHE: frozenset[str] | None = None
 
 
-def _repo_tokens(cwd: str, args: dict | None = None) -> set[str]:
-    """Always-on tokens derived from the RESOLVED repo (remote basename via
-    the acted-on path, then cwd — see :func:`_repo_name`).
+def _repo_tokens(repo: str) -> set[str]:
+    """Always-on tokens of the RESOLVED repo name (+ word parts) — pure
+    string work; resolution happens once per hook run (see :func:`_repo_name`)
+    and the name is passed in.
 
     A trigger equal to the acting repo (e.g. ``MemHub-Backend`` → ``memhub``
     / ``backend``) matches essentially every call INSIDE that repo, so it
@@ -365,7 +383,7 @@ def _repo_tokens(cwd: str, args: dict | None = None) -> set[str]:
     (useless) while sibling repo names stayed unblocked in their own repos —
     and, being remote-derived, an unknown scope now blocks nothing instead
     of minting a bucket."""
-    base = _repo_name(cwd, args).lower()
+    base = (repo or "").lower()
     if not base:
         return set()
     toks = {base}
@@ -405,6 +423,7 @@ def _hit(tok: str, haystack: str) -> bool:
 
 def _precision_filter(
     items: list[dict], args: dict, cwd: str, extra_haystack: str = "",
+    repo: str | None = None,
 ) -> list[dict]:
     """Keep only directives that concretely match the handle we fired on.
 
@@ -428,7 +447,12 @@ def _precision_filter(
         ).replace("\\", "/")
         if not haystack:
             return items
-        blocked = _GENERIC_TOKENS | _user_tokens() | _repo_tokens(cwd, args)
+        # main resolves the repo once per run and passes it in; the None
+        # default (self-resolve) keeps the gate correct for callers that
+        # don't — resolution stays out of the per-item loop either way.
+        if repo is None:
+            repo = _repo_name(cwd, args)
+        blocked = _GENERIC_TOKENS | _user_tokens() | _repo_tokens(repo)
         kept: list[dict] = []
         for d in items:
             triggers = d.get("triggers")
@@ -656,11 +680,12 @@ def main() -> int:
         if handle and handle in handles:
             return 0
         # Only now derive the repo — it spawns a git subprocess, so it must sit
-        # AFTER the cache early-out or every cached hit pays for it.
+        # AFTER the cache early-out or every cached hit pays for it. Resolved
+        # exactly once; the precision filter below reuses this value.
+        repo = _repo_name(cwd, recall_args)
         items = asyncio.run(
             asyncio.wait_for(
-                _recall(tool, recall_args, _repo_name(cwd, recall_args), fired, output,
-                        session_id),
+                _recall(tool, recall_args, repo, fired, output, session_id),
                 _RECALL_TIMEOUT_S,
             )
         )
@@ -683,7 +708,8 @@ def main() -> int:
         # handle. Containing the failure removes the dilemma: whatever happens
         # in here, we asked the server once and we record that.
         try:
-            items = _precision_filter(items, recall_args, cwd, output or "")
+            items = _precision_filter(items, recall_args, cwd, output or "",
+                                      repo=repo)
             items = _rank(items)[:_MAX_DIRECTIVES]
             if items:
                 _log(f"{len(items)} directive(s) fired for {tool}"
