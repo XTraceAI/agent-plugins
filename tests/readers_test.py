@@ -248,15 +248,31 @@ def _make_cursor_store(base: Path, uuid: str = "11111111-2222-3333-4444-55555555
 
     leaves = [blob(json.dumps(m).encode()) for m in CURSOR_MESSAGES]
 
-    def node(children: list[str], extra: bytes = b"") -> tuple[str, bytes]:
-        data = b"".join(b"\x0a\x20" + bytes.fromhex(h) for h in children) + extra
+    def _varint(v: int) -> bytes:
+        out = b""
+        while True:
+            b7 = v & 0x7F
+            v >>= 7
+            out += bytes([b7 | (0x80 if v else 0)])
+            if not v:
+                return out
+
+    def node(children: list[str], ts_ms: int | None = None,
+             extra: bytes = b"") -> tuple[str, bytes]:
+        data = b"".join(b"\x0a\x20" + bytes.fromhex(h) for h in children)
+        if ts_ms is not None:
+            # field 26 varint — the checkpoint wall clock (recognized by
+            # ms-epoch RANGE in the reader, not field number)
+            data += b"\xd0\x01" + _varint(ts_ms)
+        data += extra
         return hashlib.sha256(data).hexdigest(), data
 
-    # interior node holds the first two messages; root = [interior, leaf3,
-    # leaf4] + trailing metadata fields (mimics the real nodes' tail)
-    interior = node([leaves[0][0], leaves[1][0]])
+    # interior node (first checkpoint) holds the first two messages; root
+    # (second checkpoint, 12s later) adds the rest + trailing metadata —
+    # mimics the real store: leaves inherit their nearest ancestor's clock.
+    interior = node([leaves[0][0], leaves[1][0]], ts_ms=1_787_116_704_000)
     root = node([interior[0], leaves[2][0], leaves[3][0]],
-                extra=b"\xb2\x01\x03cli")
+                ts_ms=1_787_116_716_000, extra=b"\xb2\x01\x03cli")
 
     con = sq.connect(d / "store.db")
     con.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
@@ -306,6 +322,11 @@ def test_cursor_reader_end_to_end():
                       "content": "file.py"}, tr
         for r in recs:
             assert r.get("cwd") == "/repo/proj", r
+            assert r.get("uuid") and r.get("timestamp"), r   # server contract
+        # leaves inherit their checkpoint node's clock — a real timeline,
+        # not one instant (first two messages: first checkpoint; rest: second)
+        stamps = {r["timestamp"] for r in recs}
+        assert len(stamps) == 2, stamps
     print("PASS test_cursor_reader_end_to_end")
 
 

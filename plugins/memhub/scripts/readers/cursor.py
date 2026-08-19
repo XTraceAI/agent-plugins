@@ -130,13 +130,23 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0] / "store.db", ""
 
 
-def _proto_child_hashes(data: bytes) -> list[str]:
-    """Ordered 32-byte field-1 entries of a protobuf node → hex blob ids.
+# Plausible ms-epoch window for node clocks (2017..2096). Field numbers churn
+# with cursor versions, so a checkpoint node's timestamp is recognized by
+# RANGE, not by field number — any varint in this window is a wall clock.
+_MS_EPOCH_MIN = 1_500_000_000_000
+_MS_EPOCH_MAX = 4_000_000_000_000
+
+
+def _parse_node(data: bytes) -> tuple[list[str], int | None]:
+    """(ordered child blob ids, node timestamp ms) of a protobuf tree node.
 
     Minimal TLV walk (stdlib only — no protobuf dependency): field 1
-    length-delimited (tag 0x0A) with len 32 is a child hash; every other
-    field is skipped by wire type. Malformed input just yields what parsed."""
+    length-delimited (tag 0x0A) with len 32 is a child hash; a varint in the
+    ms-epoch window is the checkpoint's wall clock (observed as field 26 on
+    cursor-agent 2026.08); everything else is skipped by wire type. Malformed
+    input just yields what parsed."""
     out: list[str] = []
+    ts: int | None = None
     i, n = 0, len(data)
 
     def varint(j: int) -> tuple[int, int]:
@@ -159,18 +169,23 @@ def _proto_child_hashes(data: bytes) -> list[str]:
                 out.append(data[i:i + 32].hex())
             i += ln
         elif wire == 0:                    # varint
-            _, i = varint(i)
+            v, i = varint(i)
+            if ts is None and _MS_EPOCH_MIN <= v <= _MS_EPOCH_MAX:
+                ts = v
         elif wire == 5:
             i += 4
         elif wire == 1:
             i += 8
         else:                              # unknown wire type — stop safely
             break
-    return out
+    return out, ts
 
 
-def _load_messages(db_path: Path) -> list[dict]:
-    """Walk the hash tree from latestRootBlobId; return ordered JSON leaves."""
+def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
+    """Walk the hash tree from latestRootBlobId; return ordered JSON leaves
+    paired with their nearest ancestor node's wall clock (ms epoch, or None).
+    Checkpoint nodes are timestamped; their leaves inherit that clock, which
+    is what turns "the whole session is one instant" into a real timeline."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         blobs = {row[0]: row[1] for row in con.execute("SELECT id, data FROM blobs")}
@@ -186,10 +201,10 @@ def _load_messages(db_path: Path) -> list[dict]:
     finally:
         con.close()
 
-    messages: list[dict] = []
+    messages: list[tuple[dict, int | None]] = []
     seen: set[str] = set()
 
-    def walk(blob_id: str) -> None:
+    def walk(blob_id: str, inherited_ts: int | None) -> None:
         if blob_id in seen or blob_id not in blobs:
             return
         seen.add(blob_id)
@@ -202,13 +217,14 @@ def _load_messages(db_path: Path) -> list[dict]:
             except json.JSONDecodeError:
                 return
             if isinstance(msg, dict) and msg.get("role"):
-                messages.append(msg)
+                messages.append((msg, inherited_ts))
             return
-        for child in _proto_child_hashes(data):
-            walk(child)
+        children, node_ts = _parse_node(data)
+        for child in children:
+            walk(child, node_ts or inherited_ts)
 
     if root:
-        walk(root)
+        walk(root, None)
     if not messages:
         # Fallback: no walkable root (interrupted write). Take JSON blobs in
         # insertion order — degraded but better than losing the session.
@@ -219,7 +235,7 @@ def _load_messages(db_path: Path) -> list[dict]:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(msg, dict) and msg.get("role"):
-                    messages.append(msg)
+                    messages.append((msg, None))
     return messages
 
 
@@ -245,10 +261,12 @@ def to_canonical(path) -> tuple[list[dict], dict]:
         except (TypeError, ValueError, OSError):
             return None
 
-    # The store's messages carry no per-message clock; meta.json's window is
-    # the honest bound. Coarse timestamps beat absent ones: the server lifts
-    # event_date from ``timestamp`` and treats missing as undated.
-    ts = _iso(mj.get("updatedAtMs")) or _iso(mj.get("createdAtMs"))
+    # Per-message clocks come from checkpoint NODES in the hash tree (leaves
+    # carry none); meta.json's window is the fallback when a node had no
+    # readable clock. The server lifts event_date from ``timestamp`` and
+    # treats missing as undated.
+    fallback_ts = _iso(mj.get("updatedAtMs")) or _iso(mj.get("createdAtMs"))
+    ts_holder = {"ts": fallback_ts}
 
     def rec(record: dict) -> dict:
         if cwd:
@@ -258,8 +276,8 @@ def to_canonical(path) -> tuple[list[dict], dict]:
         # Deterministic over (session, output index) so re-flushes fold.
         record["uuid"] = str(_uuid.uuid5(
             _uuid.NAMESPACE_URL, f"memhub:cursor:{session_id}:{len(out)}"))
-        if ts:
-            record["timestamp"] = ts
+        if ts_holder["ts"]:
+            record["timestamp"] = ts_holder["ts"]
         return record
 
     def user(content) -> dict:
@@ -270,14 +288,14 @@ def to_canonical(path) -> tuple[list[dict], dict]:
                     "message": {"role": "assistant", "content": [block]}})
 
     out: list[dict] = []
-    messages = _load_messages(db_path)
+    dated_messages = _load_messages(db_path)
 
     def _model_of(obj) -> str | None:
         po = obj.get("providerOptions") if isinstance(obj, dict) else None
         return (po.get("cursor") or {}).get("modelName") if isinstance(po, dict) else None
 
     model = None
-    for m in messages:
+    for m, _ in dated_messages:
         # modelName appears at message level OR on individual content blocks
         model = _model_of(m) or model
         if isinstance(m.get("content"), list):
@@ -291,10 +309,12 @@ def to_canonical(path) -> tuple[list[dict], dict]:
     if cwd:
         banner += f" · cwd {cwd}"
     banner += "]"
+    ts_holder["ts"] = _iso(mj.get("createdAtMs")) or fallback_ts
     out.append(user(banner))
 
     title = None
-    for msg in messages:
+    for msg, node_ts in dated_messages:
+        ts_holder["ts"] = _iso(node_ts) or fallback_ts
         role = msg.get("role")
         content = msg.get("content")
 
