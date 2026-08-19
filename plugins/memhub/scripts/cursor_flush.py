@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import subprocess
 import sys
@@ -243,7 +242,23 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         _save_state(uuid, last_error=str(e)[:200])
         return
 
-    _save_state(uuid, blob_ids=sorted(blob_ids),
+    # Record only blobs that were present BOTH at the gate read and after the
+    # transcript was read — i.e. those that existed for the whole span the
+    # payload was built from, so their content is in what we just sent.
+    # `blob_ids` alone is a snapshot from BEFORE to_canonical: a checkpoint
+    # restore in between can re-root the store, and marking a blob shipped
+    # whose content never went is the one failure this watermark exists to
+    # prevent. The other direction is harmless and already documented —
+    # blobs added mid-read ship now, aren't recorded, and cost one redundant
+    # re-send that the server folds forward.
+    try:
+        shipped = blob_ids & current_blob_ids(store_db)
+    except Exception:  # store went unreadable mid-flush
+        # Can't verify, so don't claim more than the gate saw. Recording the
+        # pre-read set here matches the old behavior and keeps the session
+        # advancing; the alternative (record nothing) re-sends forever.
+        shipped = blob_ids
+    _save_state(uuid, blob_ids=sorted(shipped),
                 last_flush_at=time.time(), last_ok_at=time.time(),
                 last_error=None)
     _log(f"flushed {len(sendable)} records → cursor-{uuid}"
