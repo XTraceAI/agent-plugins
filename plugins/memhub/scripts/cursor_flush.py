@@ -64,7 +64,15 @@ STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 DEBOUNCE_S = 120.0
 FLUSH_TIMEOUT_S = 240.0
 
-_MILESTONE_RE = re.compile(r"\bgit\b.*\bcommit\b|\bgh\b.*\bpr\b", re.S)
+# The milestone must be in COMMAND POSITION, not merely mentioned: `.*` with
+# DOTALL matched `git log --oneline | grep commit` and even
+# `echo "remember to git commit"`, firing a full flush on ordinary traffic.
+# Command position = start of the text, just after a shell separator, or
+# inside a `bash -lc "..."` wrapper (how agents usually deliver shell calls,
+# so a plain ^ anchor would miss real milestones).
+_MILESTONE_RE = re.compile(
+    r"""(?:^|[;&|]\s*|\b(?:ba)?sh\s+-[a-z]*c\s*['"]?)\s*"""
+    r"""(?:git\s+commit|gh\s+pr)\b""")
 
 # Server-side extraction mode per event — mirrors the Claude design, where
 # flush_turn buffers ("auto") and flush_session drains ("now" — the server
@@ -263,6 +271,14 @@ def main() -> int:
         blob_ids = current_blob_ids(store_db)
     except Exception as e:  # locked/corrupt db mid-write — next hook retries
         _log(f"{event}: store unreadable ({e}) — skipping")
+        return 0
+    if not blob_ids:
+        # NOT the same as "nothing new": the empty set is a subset of every
+        # watermark, so falling through would read as "up to date" and skip
+        # SILENTLY. A readable store with zero blobs is one mid-rebuild (a
+        # checkpoint restore) — say so, and leave the watermark untouched so
+        # the next event re-reads and ships whatever appears.
+        _log(f"{event}: store reports zero blobs (rebuilding?) — skipping")
         return 0
 
     state = _read_state(uuid)

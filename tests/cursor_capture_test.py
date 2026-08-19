@@ -43,6 +43,20 @@ def test_milestone_gates_shell_events():
     # "commit" as a mere substring of another word must not trigger
     assert not should_flush("beforeShellExecution", {"command": "echo recommitted"},
                             STALE, FRESH, NOW)
+    # Command POSITION, not mention: naming a milestone inside an argument
+    # must not fire a whole-transcript send
+    for quiet in ("echo 'remember to git commit later'",
+                  "grep 'git commit' notes.md",
+                  "man git commit",
+                  "git log --oneline | grep commit"):
+        assert not should_flush("beforeShellExecution", {"command": quiet},
+                                STALE, FRESH, NOW), quiet
+    # ...while the wrapper and chained forms agents actually emit still fire
+    for loud in ('bash -lc "git commit -m x"',
+                 "cd repo && git commit -m x",
+                 "sh -c 'gh pr create -f'"):
+        assert should_flush("beforeShellExecution", {"command": loud},
+                            STALE, FRESH, NOW), loud
     print("PASS test_milestone_gates_shell_events")
 
 
