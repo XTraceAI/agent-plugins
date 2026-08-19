@@ -42,6 +42,7 @@ from __future__ import annotations
 import glob
 import json
 import re
+import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
@@ -195,9 +196,22 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         "host": HOST,
     }
 
+    out: list[dict] = []
+    sid_key = sm.get("id") or "unknown"
+    ts_holder = {"ts": None}
+
     def rec(record: dict) -> dict:
         if cwd:
             record["cwd"] = cwd
+        # The server's agentic parser SKIPS records without a ``uuid`` (it is
+        # the per-record replay-dedup key) and lifts ``event_date`` from
+        # ``timestamp`` — records missing them import as nothing, silently.
+        # Deterministic uuid5 over (session, output index) so a re-import of
+        # the same rollout folds forward instead of duplicating.
+        record["uuid"] = str(_uuid.uuid5(
+            _uuid.NAMESPACE_URL, f"memhub:codex:{sid_key}:{len(out)}"))
+        if ts_holder["ts"]:
+            record["timestamp"] = ts_holder["ts"]
         return record
 
     def user(content) -> dict:
@@ -206,8 +220,6 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     def assistant(block) -> dict:
         return rec({"type": "assistant",
                     "message": {"role": "assistant", "content": [block]}})
-
-    out: list[dict] = []
 
     # Provenance banner: origin is otherwise lost (source_platform forced to
     # "claude" on the agentic path). Kept terse and bracketed as metadata.
@@ -219,11 +231,15 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     if cwd:
         banner += f" · cwd {cwd}"
     banner += "]"
+    ts_holder["ts"] = next((r.get("timestamp") for r in rollout
+                            if isinstance(r.get("timestamp"), str)), None)
     out.append(user(banner))
 
     for idx, r in enumerate(rollout):
         if r.get("type") != "response_item":
             continue
+        if isinstance(r.get("timestamp"), str):
+            ts_holder["ts"] = r["timestamp"]
         pl = r.get("payload")
         if not isinstance(pl, dict):
             continue
