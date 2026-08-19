@@ -33,9 +33,11 @@ over mostly-old blobs) where a rowid watermark would lie.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import sqlite3
+import uuid as _uuid
 from pathlib import Path
 
 HOST = "cursor"
@@ -235,9 +237,29 @@ def to_canonical(path) -> tuple[list[dict], dict]:
     cwd = mj.get("cwd")
     session_id = session_dir.name
 
+    def _iso(ms) -> str | None:
+        try:
+            return datetime.datetime.fromtimestamp(
+                ms / 1000.0, tz=datetime.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        except (TypeError, ValueError, OSError):
+            return None
+
+    # The store's messages carry no per-message clock; meta.json's window is
+    # the honest bound. Coarse timestamps beat absent ones: the server lifts
+    # event_date from ``timestamp`` and treats missing as undated.
+    ts = _iso(mj.get("updatedAtMs")) or _iso(mj.get("createdAtMs"))
+
     def rec(record: dict) -> dict:
         if cwd:
             record["cwd"] = cwd
+        # uuid is the server's per-record replay-dedup key — records without
+        # one are SKIPPED by the agentic parser (imported as nothing).
+        # Deterministic over (session, output index) so re-flushes fold.
+        record["uuid"] = str(_uuid.uuid5(
+            _uuid.NAMESPACE_URL, f"memhub:cursor:{session_id}:{len(out)}"))
+        if ts:
+            record["timestamp"] = ts
         return record
 
     def user(content) -> dict:
@@ -247,6 +269,7 @@ def to_canonical(path) -> tuple[list[dict], dict]:
         return rec({"type": "assistant",
                     "message": {"role": "assistant", "content": [block]}})
 
+    out: list[dict] = []
     messages = _load_messages(db_path)
 
     def _model_of(obj) -> str | None:
@@ -261,7 +284,6 @@ def to_canonical(path) -> tuple[list[dict], dict]:
             for b in m["content"]:
                 model = _model_of(b) or model
 
-    out: list[dict] = []
     banner = "[Imported from Cursor"
     if model:
         banner += f" · model {model}"
