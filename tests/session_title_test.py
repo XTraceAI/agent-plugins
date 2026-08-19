@@ -156,11 +156,31 @@ check("an exactly-80-char prompt is untouched",
 
 # ── against every real transcript on this machine ─────────────────────
 
+def _carries_title_record(records) -> bool:
+    """A raw shape scan, independent of the parsers under test: does any
+    record LOOK like a usable title? Gating on this rather than on the
+    machine keeps the check meaningful everywhere — a host used only
+    headlessly (CI, e2e boxes) legitimately has no titled session at all."""
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        if r.get("type") == "ai-title":
+            value = r.get("aiTitle")
+        elif r.get("type") == "custom-title":
+            value = r.get("customTitle")
+        else:
+            continue
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
 root = Path.home() / ".claude" / "projects"
 real = sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime,
               reverse=True)[:200] if root.is_dir() else []
 if real:
     titled = untitled = named_by_prompt = 0
+    any_title_records = False
     for path in real:
         records = []
         for line in open(path, "rb"):
@@ -168,6 +188,7 @@ if real:
                 records.append(json.loads(line))
             except Exception:  # noqa: BLE001
                 continue
+        any_title_records = any_title_records or _carries_title_record(records)
         explicit = custom_title(records) or generated_title(records)
         if explicit:
             titled += 1
@@ -181,7 +202,12 @@ if real:
     # The fallback exists for sessions the client never titles. If it fires
     # for none of them it is not doing its job; if it fires for all of THEM
     # while explicit titles vanish, precedence broke.
-    check("real sessions carry explicit titles", titled > 0)
+    if any_title_records:
+        check("real sessions carry explicit titles", titled > 0)
+    else:
+        print("real transcripts: none carries a title record on this machine "
+              "(headless-only host) — extraction is pinned by the synthetic "
+              "checks above")
     check("the fallback names sessions that have no title record",
           untitled == 0 or named_by_prompt > 0)
 else:
