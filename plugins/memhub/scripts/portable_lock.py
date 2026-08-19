@@ -8,11 +8,14 @@ callers keep flock semantics.
 
 POSIX: ``fcntl.flock`` exactly as before. Windows: ``msvcrt.locking`` on one
 byte at offset 0 — advisory like flock, released on unlock or when the fd
-closes. Blocking semantics are made to MATCH flock: ``LK_LOCK`` only retries
-for ~10 seconds and then raises, so a blocking acquire loops it until the
-lock is granted — under real contention (a fleet of parallel agents, the
+closes. Blocking semantics approximate flock under a 60-second budget:
+``LK_LOCK`` only retries for ~10 seconds and then raises, so a blocking
+acquire loops it — under real contention (a fleet of parallel agents, the
 reason these locks exist) ten seconds is reachable, and a serialization
 primitive that crashes its caller under load is worse than one that waits.
+The budget is the other side of that coin: a lock still refused after a
+full minute is wedged or un-grantable, and raising then beats hanging the
+calling hook forever. See ``lock_exclusive`` for the errno classification.
 """
 from __future__ import annotations
 
@@ -43,25 +46,33 @@ except ImportError:  # native Windows
     def lock_exclusive(fd: int, blocking: bool = True) -> None:
         """Take an exclusive lock. Non-blocking raises OSError when held.
 
-        Blocking mode waits like flock does — but never retries a BROKEN
-        call. EBADF/EINVAL mean the fd or arguments are wrong and no retry
-        can ever succeed, so they raise. Everything else is treated as
-        contention and waited out: the CRT raises EACCES/EDEADLK for a held
-        lock today, but that mapping is not a contract across CRT versions,
-        and crashing a caller under genuine contention is strictly worse
-        than polling. The sleep bounds the poll at ~100/s even if some
-        environment's contention raise returns immediately instead of after
-        LK_LOCK's internal ~10s of retries."""
+        Blocking mode waits out contention like flock — under a 60s wall
+        budget. Three regimes, one per failure class:
+        * EBADF/EINVAL raise immediately: the CALL is broken (bad fd or
+          arguments) and no retry can ever succeed.
+        * Any other errno is treated as contention, because the CRT's
+          mapping for a held lock (EACCES/EDEADLK today) is not a contract
+          across CRT versions — crashing a caller under genuine contention
+          would be worse than waiting.
+        * The deadline converts "waits like flock" into "waits, bounded":
+          measured fleet contention resolves in well under a second and
+          LK_LOCK itself sleeps ~10s per attempt, so a full minute of
+          refusal means a wedged holder or an un-grantable lock (ACLs) —
+          raising then beats hanging a capture hook (or pegging a core at
+          the 10ms poll) forever."""
         _at_start(fd)
         if not blocking:
             _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
             return
+        deadline = _time.monotonic() + 60.0
         while True:
             try:
                 _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
                 return
             except OSError as e:
                 if e.errno in (_errno.EBADF, _errno.EINVAL):
+                    raise
+                if _time.monotonic() >= deadline:
                     raise
                 _time.sleep(0.01)
 
