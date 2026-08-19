@@ -81,19 +81,62 @@ check("render valid as hook payload", json.dumps({"additionalContext": block}) !
 # 6. Repo name derivation: this checkout has an origin remote; the name must be
 #    the remote basename, not a worktree dir name.
 repo = dr._repo_name(str(_SCRIPT.parent))
-check("repo from git remote", repo == "memhub-claude-plugin")
+check("repo from git remote", repo == "agent-plugins")
 check("no cwd → empty repo", dr._repo_name("") == "")
 
-# 7. The precision filter is unchanged: the real misfire class (repo-name-only
-#    trigger) still drops; a concrete file-path trigger still passes.
-repo_only = {"id": "r", "content": "x", "triggers": ["memhub-claude-plugin"]}
-concrete = {"id": "c", "content": "y", "triggers": ["directive_recall.py"]}
-kept = dr._precision_filter(
-    [repo_only, concrete],
-    {"command": "python plugins/memhub/scripts/directive_recall.py"},
-    "/Users/x/memhub-claude-plugin",
-)
-check("repo-only trigger dropped", [d["id"] for d in kept] == ["c"])
+# 7. The precision filter: the real misfire class (repo-name-only trigger)
+#    still drops — now via the RESOLVED repo (remote basename), exercised on
+#    a real throwaway git checkout since a bare directory name no longer
+#    mints a scope bucket. Concrete file-path triggers still pass.
+import subprocess as _sp
+import tempfile as _tf
+
+with _tf.TemporaryDirectory() as _td:
+    _repo = Path(_td) / "some-checkout-dir"       # basename ≠ remote name
+    _repo.mkdir()
+    for _cmd in (["git", "init", "-q"],
+                 ["git", "remote", "add", "origin",
+                  "https://github.com/XTraceAI/memhub-claude-plugin.git"]):
+        _sp.run(_cmd, cwd=_repo, capture_output=True, check=True)
+
+    repo_only = {"id": "r", "content": "x", "triggers": ["memhub-claude-plugin"]}
+    concrete = {"id": "c", "content": "y", "triggers": ["directive_recall.py"]}
+    kept = dr._precision_filter(
+        [repo_only, concrete],
+        {"command": "python plugins/memhub/scripts/directive_recall.py"},
+        str(_repo),
+    )
+    check("repo-only trigger dropped (resolved via remote)",
+          [d["id"] for d in kept] == ["c"])
+
+    # 8. Multi-repo parent workflow (field report): cwd is a NON-git parent;
+    #    the acted-on file lives in a child repo. Scope resolves from the
+    #    file's repo — never from the parent directory's basename.
+    check("repo from acted-on path under non-git parent",
+          dr._repo_name(_td, {"file_path": str(_repo / "app" / "x.py")})
+          == "memhub-claude-plugin")
+    check("non-git cwd, no path → unknown scope, not a bucket",
+          dr._repo_name(_td) == "")
+    check("unknown scope blocks no repo tokens",
+          dr._repo_tokens(_td) == set())
+
+# 9. Windows-path noise (field report): OS-path segments and the machine's
+#    own account name can never be a directive's sole anchor, while a
+#    concrete file trigger still matches a backslashed Windows payload.
+_account = Path.home().name.lower()
+win_payload = {"file_path": "C:\\Users\\" + _account + "\\proj\\foo_helper.py"}
+noisy = {"id": "n", "content": "x", "triggers": ["Users"]}
+selfname = {"id": "s", "content": "x", "triggers": [_account]}
+concrete_win = {"id": "w", "content": "x", "triggers": ["foo_helper.py"]}
+kept = dr._precision_filter([noisy, selfname, concrete_win], win_payload, "")
+check("path filler + account name dropped; windows path still matches",
+      [d["id"] for d in kept] == ["w"])
+
+# 10. Boundary-aware matching: a token must not match inside a longer word.
+inside = {"id": "i", "content": "x", "triggers": ["part"]}
+kept = dr._precision_filter([inside], {"command": "grep particular file"}, "")
+check("token never matches inside a longer word",
+      [d["id"] for d in kept] == [])
 
 print()
 if FAILURES:
