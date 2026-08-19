@@ -25,9 +25,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import claude, codex
+from . import claude, codex, cursor
 
-READERS = {m.HOST: m for m in (claude, codex)}
+READERS = {m.HOST: m for m in (claude, codex, cursor)}
 
 
 def reader_for(host: str):
@@ -49,6 +49,8 @@ def sniff(ref: str) -> str | None:
     if name.startswith("rollout-") and name.endswith(".jsonl"):
         return codex.HOST
     parts = p.parts
+    if name == "store.db" or ".cursor" in parts:
+        return cursor.HOST
     if ".codex" in parts:
         return codex.HOST
     if ".claude" in parts:
