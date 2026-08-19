@@ -32,7 +32,42 @@ Run the self-test:  python3 tests/concurrent_writes_test.py
 from __future__ import annotations
 
 import os
+import random
+import time
 from pathlib import Path
+
+
+def replace(tmp: Path, path: Path) -> None:
+    """``os.replace`` that survives Windows sharing violations.
+
+    POSIX rename is atomic and never refuses because another process is
+    mid-rename or mid-read on the same target. Windows' MoveFileEx does:
+    anything holding the destination (or the fresh temp) open without
+    FILE_SHARE_DELETE — a reader between open and close, another writer's
+    landing replace, an antivirus sweep — surfaces as ``PermissionError``.
+
+    Measured on a real Windows 11 host under the concurrency self-test
+    (12 processes in a read-modify-write storm on one file), a single
+    publish can stay refused for ~0.7s — as thousands of sub-millisecond
+    collisions, not one long hold. That shape dictates the strategy: flat
+    millisecond retries with jitter, under a time budget far above anything
+    measured. A geometric backoff loses exactly here — it samples the gaps
+    a handful of times and spends the rest of its budget asleep. A
+    persistent denial (an ACL, a file something genuinely holds) still
+    raises once the budget runs out.
+    """
+    if os.name != "nt":
+        tmp.replace(path)
+        return
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(random.uniform(0.001, 0.004))
 
 
 def publish(path: Path, text: str, mode: int = 0o600) -> None:
@@ -63,7 +98,7 @@ def publish(path: Path, text: str, mode: int = 0o600) -> None:
             os.chmod(tmp, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
-        tmp.replace(path)
+        replace(tmp, path)
     except BaseException:
         try:
             tmp.unlink(missing_ok=True)

@@ -55,6 +55,8 @@ import time
 import sys
 from pathlib import Path
 
+import atomic_write
+
 #: Shared with _memhub_auth's token cache — this is already the plugin's
 #: per-user state dir, and the room id belongs there for the same reason the
 #: OAuth token does: it is account state, not project state.
@@ -220,7 +222,10 @@ def _write_atomic(data: dict) -> None:
     try:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
                        encoding="utf-8")
-        os.replace(tmp, ROOMS_PATH)
+        # atomic_write.replace, not bare os.replace: hooks READ rooms.json on
+        # every turn without taking this writer's lock, and on Windows a read
+        # in flight makes a plain replace raise a sharing violation.
+        atomic_write.replace(tmp, ROOMS_PATH)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise

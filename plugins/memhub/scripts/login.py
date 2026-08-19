@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import atomic_write  # noqa: E402 — stdlib-only, sits beside this file
 import pak  # noqa: E402 — stdlib-only, sits beside this file
 from pak import PakError  # noqa: E402
 
@@ -180,7 +181,10 @@ async def _run(status_only: bool, force: bool) -> int:
     stash: Path | None = None
     if force and cache.exists():
         stash = cache.with_suffix(".json.prelogin")
-        cache.replace(stash)
+        # atomic_write.replace, not bare Path.replace: hooks read this cache
+        # concurrently, and on Windows a read in flight makes a plain replace
+        # raise a sharing violation.
+        atomic_write.replace(cache, stash)
         print(f"set aside the cached {env} token (restored if login fails)")
 
     # The stored key has to go too, and it is the more important half now: a
@@ -222,8 +226,10 @@ async def _run(status_only: bool, force: bool) -> int:
             stash.unlink()  # superseded by a login we actually proved works
         else:
             # Atomic rename, so it also overwrites any unverified remnant the
-            # failed flow left at `cache`.
-            stash.replace(cache)
+            # failed flow left at `cache`. Patient on Windows (see above) —
+            # a restore that crashes on a sharing violation would strand the
+            # user's working token in the .prelogin stash.
+            atomic_write.replace(stash, cache)
             print(f"login did not complete — restored the previous {env} token")
 
     print(f"environment : {env} ({url})")
