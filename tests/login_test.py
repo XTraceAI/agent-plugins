@@ -25,7 +25,11 @@ import time
 from pathlib import Path
 
 _TMP_HOME = tempfile.mkdtemp(prefix="login-test-")
+# Both spellings: POSIX expanduser reads HOME; Windows reads USERPROFILE and
+# never consults HOME — without it these tests would delete the developer's
+# real token caches.
 os.environ["HOME"] = _TMP_HOME
+os.environ["USERPROFILE"] = _TMP_HOME
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.
@@ -220,7 +224,8 @@ def test_flag_conflict() -> None:
     print("\nflag conflict")
     out = subprocess.run(
         [sys.executable, str(SCRIPTS / "login.py"), "--status", "--force"],
-        capture_output=True, text=True, env=dict(os.environ, HOME=_TMP_HOME))
+        capture_output=True, text=True,
+        env=dict(os.environ, HOME=_TMP_HOME, USERPROFILE=_TMP_HOME))
     check("--status --force is refused", out.returncode != 0, True)
     check("explains why", "contradictory" in out.stderr, True)
 

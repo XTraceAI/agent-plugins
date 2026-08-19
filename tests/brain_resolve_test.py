@@ -95,7 +95,10 @@ def _isolate(tmp):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run, not get_event_loop().run_until_complete: implicit loop
+    # creation was removed in Python 3.14, where the old spelling raises
+    # "There is no current event loop".
+    return asyncio.run(coro)
 
 
 def test_resolves_and_caches():

@@ -26,7 +26,7 @@ deployments with different brain ids for the same repo, so one flat id would
 silently write to the wrong backend's brain on whichever install didn't match:
 
     {"version": 1, "repos": {
-       "Repo: XTraceAI/memhub-claude-plugin": {
+       "Repo: XTraceAI/agent-plugins": {
           "production": {"brain_id": "<uuid>"},
           "staging":    {"brain_id": "<uuid>"}}}}
 
@@ -54,6 +54,8 @@ import subprocess
 import time
 import sys
 from pathlib import Path
+
+import atomic_write
 
 #: Shared with _memhub_auth's token cache — this is already the plugin's
 #: per-user state dir, and the room id belongs there for the same reason the
@@ -183,17 +185,17 @@ def _locked():
     """
     ROOMS_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import fcntl
+        import portable_lock
     except ImportError:  # native Windows — unsupported platform, degrade
         yield
         return
     with open(ROOMS_PATH.with_name(ROOMS_PATH.name + ".lock"), "w",
               encoding="utf-8") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            portable_lock.unlock(portable_lock.fileno_of(fh))
 
 
 def _load() -> dict:
@@ -220,7 +222,10 @@ def _write_atomic(data: dict) -> None:
     try:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
                        encoding="utf-8")
-        os.replace(tmp, ROOMS_PATH)
+        # atomic_write.replace, not bare os.replace: hooks READ rooms.json on
+        # every turn without taking this writer's lock, and on Windows a read
+        # in flight makes a plain replace raise a sharing violation.
+        atomic_write.replace(tmp, ROOMS_PATH)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise

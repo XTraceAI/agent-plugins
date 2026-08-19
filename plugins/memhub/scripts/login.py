@@ -40,14 +40,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import atomic_write  # noqa: E402 — stdlib-only, sits beside this file
 import pak  # noqa: E402 — stdlib-only, sits beside this file
 from pak import PakError  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception WITH a traceback before letting it
 # propagate. Under --status a missing token is an expected, reported outcome —
 # not a crash — and a stack trace above a one-line "NOT LOGGED IN" reads like
-# the tool broke. Same silencer the capture hooks use.
-logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
+# the tool broke. Scoped to --status ONLY (checked pre-argparse, so it's set
+# before the SDK import can log): in the INTERACTIVE flow that same silencer
+# hid a real failure completely — a field user saw only "ExceptionGroup:
+# unhandled errors in a TaskGroup" and had to re-enable this logger in a
+# debugger to find the actual broken call underneath.
+if "--status" in sys.argv:
+    logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
 
 from _memhub_auth import (  # noqa: E402
     NonInteractiveAuthRequired,
@@ -180,7 +186,10 @@ async def _run(status_only: bool, force: bool) -> int:
     stash: Path | None = None
     if force and cache.exists():
         stash = cache.with_suffix(".json.prelogin")
-        cache.replace(stash)
+        # atomic_write.replace, not bare Path.replace: hooks read this cache
+        # concurrently, and on Windows a read in flight makes a plain replace
+        # raise a sharing violation.
+        atomic_write.replace(cache, stash)
         print(f"set aside the cached {env} token (restored if login fails)")
 
     # The stored key has to go too, and it is the more important half now: a
@@ -222,8 +231,10 @@ async def _run(status_only: bool, force: bool) -> int:
             stash.unlink()  # superseded by a login we actually proved works
         else:
             # Atomic rename, so it also overwrites any unverified remnant the
-            # failed flow left at `cache`.
-            stash.replace(cache)
+            # failed flow left at `cache`. Patient on Windows (see above) —
+            # a restore that crashes on a sharing violation would strand the
+            # user's working token in the .prelogin stash.
+            atomic_write.replace(stash, cache)
             print(f"login did not complete — restored the previous {env} token")
 
     print(f"environment : {env} ({url})")
@@ -266,7 +277,8 @@ async def _run(status_only: bool, force: bool) -> int:
                 print("status      : NOT LOGGED IN (no usable cached token)")
                 print("fix         : run /memhub:login")
                 return 1
-            print(f"status      : FAILED ({type(exc).__name__}: {exc})")
+            leaf = _leaf(exc)
+            print(f"status      : FAILED ({type(leaf).__name__}: {leaf})")
             return 1
 
         # Proven against the server — only now may the stash be discarded.
@@ -314,6 +326,37 @@ async def _run(status_only: bool, force: bool) -> int:
         return 0
     finally:
         _restore()
+
+
+def _leaf(exc: BaseException) -> BaseException:
+    """The deepest single exception under anyio's ExceptionGroup wrapping.
+
+    "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)" names
+    nothing; the leaf ("AttributeError: module 'os' has no attribute
+    'fchmod'") names the bug. Walks EVERY member and cause — a group's first
+    member is often a benign CancelledError sibling of the real failure, so
+    the first NON-cancellation leaf in depth-first order wins, with any leaf
+    as fallback. Cycle-guarded, and never returns a group node while a leaf
+    exists."""
+    leaves: list[BaseException] = []
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        children = list(getattr(current, "exceptions", None) or ())
+        if current.__cause__ is not None:
+            children.append(current.__cause__)
+        if children:
+            stack.extend(reversed(children))  # LIFO: first child explored first
+        else:
+            leaves.append(current)
+    for leaf in leaves:
+        if not isinstance(leaf, asyncio.CancelledError):
+            return leaf
+    return leaves[0] if leaves else exc
 
 
 def _is_noninteractive(exc: BaseException) -> bool:

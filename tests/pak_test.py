@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 _TMP_HOME = tempfile.mkdtemp(prefix="pak-test-")
+# Both spellings: POSIX expanduser reads HOME; Windows (ntpath) reads
+# USERPROFILE and never consults HOME, so setting HOME alone would leave
+# CACHE_DIR pointing at the developer's real ~/.config there.
 os.environ["HOME"] = _TMP_HOME
+os.environ["USERPROFILE"] = _TMP_HOME
 os.environ["MEMHUB_PAK_LABEL"] = "test-machine"
 
 # The tests live outside the plugin so they are not shipped to users;
@@ -124,7 +129,13 @@ def test_store_roundtrip():
     check("missing reads as None", pak.load(MCP), None)
     pak.save(MCP, {"secret": "mhk_abc", "label": "test-machine"})
     check("round-trips", pak.load(MCP)["secret"], "mhk_abc")
-    check("mode is 0600", oct(pak.key_path(MCP).stat().st_mode)[-3:], "600")
+    if os.name == "nt":
+        # POSIX permission bits do not exist on Windows — st_mode is
+        # synthesized (0666) whatever the writer asked for; the secret is
+        # private there via the profile directory's ACL instead.
+        print("  SKIP mode is 0600 (POSIX-only: Windows has no mode bits)")
+    else:
+        check("mode is 0600", oct(pak.key_path(MCP).stat().st_mode)[-3:], "600")
 
     # A record with no secret is not a credential, however well-formed.
     pak.save(MCP, {"label": "test-machine"})
@@ -154,30 +165,34 @@ def test_expiry_is_utc_regardless_of_local_zone():
     measured at exactly -3600s for a summer expiry under America/Los_Angeles
     and 0 for a winter one. Correct half the year is the worst shape a bug can
     have, so this pins both halves in a DST zone.
+
+    The zone is shifted in a CHILD process, because that is the one portable
+    way to do it: ``time.tzset`` does not exist on Windows, but every
+    platform's C runtime reads ``TZ`` at process start — and ``PST8PDT`` is
+    the spelling both POSIX and the Microsoft CRT accept (IANA names are
+    POSIX-only). Same offsets and DST rules as America/Los_Angeles.
     """
     print("\nexpiry is UTC")
-    import calendar
-    import importlib
-    import os as _os
-
-    previous = _os.environ.get("TZ")
-    try:
-        _os.environ["TZ"] = "America/Los_Angeles"
-        time.tzset()
-        importlib.reload(pak)
-        for label, raw in [("summer (DST)", "2026-07-15T12:00:00Z"),
-                           ("winter (no DST)", "2026-12-15T12:00:00Z")]:
-            true_epoch = calendar.timegm(
-                time.strptime(raw.replace("Z", ""), "%Y-%m-%dT%H:%M:%S"))
-            got = pak.expires_in_s({"expires_at": raw}) + time.time()
-            check(f"{label} has no skew", round(got - true_epoch), 0)
-    finally:
-        if previous is None:
-            _os.environ.pop("TZ", None)
-        else:
-            _os.environ["TZ"] = previous
-        time.tzset()
-        importlib.reload(pak)
+    code = (
+        "import calendar, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import pak\n"
+        "for raw in ('2026-07-15T12:00:00Z', '2026-12-15T12:00:00Z'):\n"
+        "    true = calendar.timegm("
+        "time.strptime(raw[:-1], '%Y-%m-%dT%H:%M:%S'))\n"
+        "    got = pak.expires_in_s({'expires_at': raw}) + time.time()\n"
+        "    print(round(got - true))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(SCRIPTS)],
+        capture_output=True, text=True,
+        env={**os.environ, "TZ": "PST8PDT"})
+    check("the zone-shifted child ran", proc.returncode, 0)
+    if proc.returncode != 0:
+        print(f"  child stderr: {proc.stderr.strip()[-300:]}")
+    skews = proc.stdout.split() or ["missing", "missing"]
+    for label, skew in zip(("summer (DST)", "winter (no DST)"), skews):
+        check(f"{label} has no skew", skew, "0")
 
 
 def test_every_timestamp_shape_the_server_might_send():
