@@ -9,5 +9,8 @@
   "homepage": "https://memhub.xtrace.ai",
   "repository": "https://github.com/XTraceAI/agent-plugins",
   "category": "developer-tools",
-  "skills": ["./skills"]
+  "skills": [
+    "./skills"
+  ],
+  "hooks": "./hooks/cursor-hooks.json"
 }
