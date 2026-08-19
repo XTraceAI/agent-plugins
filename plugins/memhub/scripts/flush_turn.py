@@ -37,7 +37,7 @@ pop a browser, so it can only consume a token ``/memhub:login`` already minted.
 from __future__ import annotations
 
 import asyncio
-import fcntl
+import portable_lock
 import json
 import os
 import subprocess
@@ -225,7 +225,7 @@ def _acquire(session_id: str) -> int | None:
     fd = os.open(STATE_DIR / f"{session_id}.lock",
                  os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portable_lock.lock_exclusive(fd, blocking=False)
     except OSError:
         os.close(fd)
         return None  # another flush holds it; ours is redundant anyway

@@ -26,7 +26,7 @@ deployments with different brain ids for the same repo, so one flat id would
 silently write to the wrong backend's brain on whichever install didn't match:
 
     {"version": 1, "repos": {
-       "Repo: XTraceAI/memhub-claude-plugin": {
+       "Repo: XTraceAI/agent-plugins": {
           "production": {"brain_id": "<uuid>"},
           "staging":    {"brain_id": "<uuid>"}}}}
 
@@ -183,17 +183,17 @@ def _locked():
     """
     ROOMS_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import fcntl
+        import portable_lock
     except ImportError:  # native Windows — unsupported platform, degrade
         yield
         return
     with open(ROOMS_PATH.with_name(ROOMS_PATH.name + ".lock"), "w",
               encoding="utf-8") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            portable_lock.unlock(portable_lock.fileno_of(fh))
 
 
 def _load() -> dict:

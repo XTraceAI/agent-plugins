@@ -53,7 +53,14 @@ def publish(path: Path, text: str, mode: int = 0o600) -> None:
         # while this code looked like it set 0600. fchmod on the open
         # descriptor settles it either way, and on the fd rather than the path
         # so there is no window for a swap in between.
-        os.fchmod(fd, mode)
+        # Native Windows has no fchmod (POSIX modes don't map to ACLs; files
+        # under the user profile are private by default there) — chmod on the
+        # path is the closest gesture and the leftover-temp race it reopens
+        # does not exist on Windows, where O_TRUNC already emptied the temp.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        else:
+            os.chmod(tmp, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
         tmp.replace(path)

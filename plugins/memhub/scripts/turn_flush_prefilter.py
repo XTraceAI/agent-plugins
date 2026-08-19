@@ -27,7 +27,7 @@ this pass declines to send is simply carried by the next turn's flush.
 """
 from __future__ import annotations
 
-import fcntl
+import portable_lock
 import json
 import os
 import sys
@@ -54,7 +54,7 @@ def _lock_is_held(lock_path: Path) -> bool:
     except OSError:
         return False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portable_lock.lock_exclusive(fd, blocking=False)
     except OSError:
         return True  # someone is holding it
     finally:
