@@ -22,6 +22,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows consoles default to a legacy codepage (cp1252) that cannot encode
+# the suites' own output (arrows, em-dashes, replacement chars). Reconfigure
+# OUR stdio rather than requiring every caller to remember PYTHONUTF8=1.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 TESTS = Path(__file__).resolve().parent
 
 
