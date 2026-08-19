@@ -1,9 +1,9 @@
 {
   "version": 1,
   "hooks": {
-    "stop": [{ "command": "./hooks/cursor_probe.sh stop" }],
-    "beforeShellExecution": [{ "command": "./hooks/cursor_probe.sh beforeShellExecution" }],
-    "afterFileEdit": [{ "command": "./hooks/cursor_probe.sh afterFileEdit" }],
-    "beforeSubmitPrompt": [{ "command": "./hooks/cursor_probe.sh beforeSubmitPrompt" }]
+    "beforeShellExecution": [{ "command": "./hooks/cursor_capture.sh beforeShellExecution" }],
+    "afterFileEdit": [{ "command": "./hooks/cursor_capture.sh afterFileEdit" }],
+    "stop": [{ "command": "./hooks/cursor_capture.sh stop" }],
+    "beforeSubmitPrompt": [{ "command": "./hooks/cursor_capture.sh beforeSubmitPrompt" }]
   }
 }
