@@ -43,6 +43,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -142,6 +143,26 @@ def should_flush(event: str, payload: dict, state: dict,
     return False
 
 
+def _namespace_of(cwd: str | None) -> str | None:
+    """Git-remote basename for the session's cwd — the working-context scope
+    stamp, resolved client-side exactly like flush_turn._namespace (a
+    worktree directory's basename would HIDE directives from the canonical
+    repo's recalls)."""
+    if not cwd:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2,
+        )
+        url = out.stdout.strip()
+        if out.returncode == 0 and url:
+            return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 async def _flush(uuid: str, store_db: Path, blob_ids: set[str]) -> None:
     records, meta = cursor_reader.to_canonical(store_db)
     sendable = redact_records(records)
@@ -158,6 +179,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str]) -> None:
 
     cwd = meta.get("cwd")
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    namespace = _namespace_of(cwd)
 
     arguments = {
         "messages": sendable,
@@ -173,6 +195,10 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str]) -> None:
         arguments["agent_brain_id"] = room["brain_id"]
         if room.get("org_id"):
             arguments["org_id"] = room["org_id"]
+    if namespace:
+        # Same scope stamp flush_turn sends: directives extracted from this
+        # session must recall in this repo's context, not everywhere.
+        arguments["namespace"] = namespace
     if meta.get("title"):
         arguments["title"] = meta["title"]
 
