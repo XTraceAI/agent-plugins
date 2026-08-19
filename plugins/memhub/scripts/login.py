@@ -347,8 +347,13 @@ def _leaf(exc: BaseException) -> BaseException:
             continue
         seen.add(id(current))
         children = list(getattr(current, "exceptions", None) or ())
-        if current.__cause__ is not None:
-            children.append(current.__cause__)
+        # __cause__ AND __context__: anyio and the MCP SDK surface the real
+        # failure through implicit chaining as often as through `raise from`,
+        # and _is_noninteractive below already walks both for that reason.
+        # Cause first — an explicit chain is the better answer when both exist.
+        for chained in (current.__cause__, current.__context__):
+            if chained is not None:
+                children.append(chained)
         if children:
             stack.extend(reversed(children))  # LIFO: first child explored first
         else:
