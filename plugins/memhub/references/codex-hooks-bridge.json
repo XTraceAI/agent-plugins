@@ -1,0 +1,24 @@
+{
+ "hooks": {
+  "Stop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\"); cat > \"$T\"; R=$(ls -d $HOME/.codex/plugins/cache/*/memhub/*/ 2>/dev/null | sort | tail -1); if [ -n \"$R\" ]; then nohup sh -c 'python3 \"$1scripts/codex_flush.py\" Stop < \"$2\"; rm -f \"$2\"' -- \"$R\" \"$T\" >/dev/null 2>&1 & fi"
+     }
+    ]
+   }
+  ],
+  "PostToolUse": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\"); cat > \"$T\"; R=$(ls -d $HOME/.codex/plugins/cache/*/memhub/*/ 2>/dev/null | sort | tail -1); if [ -n \"$R\" ]; then nohup sh -c 'python3 \"$1scripts/codex_flush.py\" PostToolUse < \"$2\"; rm -f \"$2\"' -- \"$R\" \"$T\" >/dev/null 2>&1 & fi"
+     }
+    ]
+   }
+  ]
+ }
+}
