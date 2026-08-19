@@ -18,6 +18,7 @@ Exits non-zero if any suite fails, printing that suite's tail.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,9 +41,13 @@ def main() -> int:
 
     failed: list[str] = []
     for suite in suites:
+        # PYTHONUTF8 for the CHILD: a suite that prints "→" into a piped
+        # stdout dies on Windows' locale codec inside its own process — no
+        # amount of decode tolerance on OUR side can fix the child crashing.
         result = subprocess.run([sys.executable, str(suite)],
                                 capture_output=True, text=True,
-                                encoding="utf-8", errors="replace")
+                                encoding="utf-8", errors="replace",
+                                env={**os.environ, "PYTHONUTF8": "1"})
         ok = result.returncode == 0
         if not ok:
             failed.append(suite.name)
