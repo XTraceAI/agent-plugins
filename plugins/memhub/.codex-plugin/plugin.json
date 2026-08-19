@@ -12,6 +12,10 @@
   "interface": {
     "displayName": "MemHub",
     "shortDescription": "Team memory for Codex",
-    "capabilities": ["Read", "Write"]
-  }
+    "capabilities": [
+      "Read",
+      "Write"
+    ]
+  },
+  "hooks": "./hooks/codex-hooks.json"
 }
