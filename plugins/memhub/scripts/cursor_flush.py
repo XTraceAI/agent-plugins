@@ -78,8 +78,12 @@ _MILESTONE_RE = re.compile(
     r"""(?:(?:sudo|env|command|time|nice)\s+(?:[A-Za-z_]\w*=\S*\s+)*)*"""
     # Options BETWEEN the tool and the subcommand: `git -C <dir> commit` is a
     # routine agent form, and requiring adjacency silently skipped it.
-    r"""(?:git|gh)(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+[^\s-]\S*)?)*"""
-    r"""\s+(?:commit|pr)\b""")
+    # `gh pr` alone also matched read-only listings (`gh pr list`, `gh pr
+    # view`), each buying a whole-transcript send; only PR ACTIONS are
+    # milestones.
+    r"""(?:git(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+[^\s-]\S*)?)*\s+commit\b"""
+    r"""|gh(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+[^\s-]\S*)?)*"""
+    r"""\s+pr\s+(?:create|merge|ready|edit|close|reopen|comment)\b)""")
 
 # Server-side extraction mode per event — mirrors the Claude design, where
 # flush_turn buffers ("auto") and flush_session drains ("now" — the server
@@ -119,8 +123,18 @@ def _log(msg: str) -> None:
         pass
 
 
+def _safe_uuid(uuid: str) -> str:
+    """A uuid safe as a filename component. Identity comes from the hook
+    payload (session_id / transcript_path's parent), so separators and ``..``
+    are flattened — otherwise the state and .lock files could be published
+    outside STATE_DIR. Real Cursor session ids are plain uuids and pass
+    through unchanged."""
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9._-]", "_", uuid)[:80]
+
+
 def _state_path(uuid: str) -> Path:
-    return STATE_DIR / f"{uuid}.json"
+    return STATE_DIR / f"{_safe_uuid(uuid)}.json"
 
 
 def _read_state(uuid: str) -> dict:
@@ -268,12 +282,17 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # get-url` subprocess with a 2s budget (off the loop, like resolve_bearer
     # above). Awaiting them in series spent the flush deadline twice over for
     # no ordering reason.
-    if cwd:
+    # ONE guard for both consumers: cwd is store content, and
+    # resolve_repo_brain resolves it as a path too — validating only inside
+    # _namespace_of would have left that half open.
+    if _cwd_ok(cwd):
         room, namespace = await asyncio.gather(
             resolve_repo_brain(session, cwd, env),
             asyncio.to_thread(_namespace_of, cwd),
         )
     else:
+        if cwd:
+            _log(f"ignoring unusable cwd from store: {str(cwd)[:60]!r}")
         room, namespace = None, None
 
     arguments = {

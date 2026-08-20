@@ -51,7 +51,14 @@ def test_milestone_gates_shell_events():
                   "git log --oneline | grep commit",
                   "echo 'sudo git commit'",
                   "cat prcommit.txt",
-                  "git status", "git push", "gh repo view"):
+                  "git status", "git push", "gh repo view",
+                  # the reviewer's edge cases: refs/branches named after the
+                  # milestone words must not fire
+                  "git push origin commit-branch", "git branch pr-123",
+                  "git checkout commit", "git log --oneline commit",
+                  "git checkout -b pr-fix", "git diff --stat commit",
+                  # read-only gh pr subcommands are not milestones
+                  "gh pr list", "gh pr view 12", "gh pr checks", "gh pr diff"):
         assert not should_flush("beforeShellExecution", {"command": quiet},
                                 STALE, FRESH, NOW), quiet
     # ...while the wrapper and chained forms agents actually emit still fire
@@ -65,7 +72,8 @@ def test_milestone_gates_shell_events():
                  "gh --repo o/r pr create",
                  # leading wrappers
                  "sudo git commit", "env FOO=1 git commit",
-                 "time git commit -m z"):
+                 "time git commit -m z",
+                 "git -c user.name=x commit", "gh pr merge 12 --squash"):
         assert should_flush("beforeShellExecution", {"command": loud},
                             STALE, FRESH, NOW), loud
     print("PASS test_milestone_gates_shell_events")
