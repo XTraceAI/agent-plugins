@@ -76,7 +76,68 @@ agentic path always tags the platform `claude`.
 
 Run the tests: `python3 codex/test_codex_to_claude.py`.
 
-## 3. Auto-capture (optional, verify on your Codex version)
+## 3. Automatic capture and directive recall — the hooks bridge
+
+After installing the plugin, ask Codex to `set up MemHub` or invoke the
+`memhub:setup` skill. The same operation is available directly:
+
+```bash
+python3 plugins/memhub/scripts/setup_codex_hooks.py install
+```
+
+The installer preserves unrelated hooks, backs up a changed existing file, and
+survives plugin upgrades. Then approve the six MemHub handlers with `/hooks` in
+the Codex TUI once (trust is per hook hash). The bridge provides `PreToolUse`
+directive recall, reactive failure recall, artifact reminders, milestone
+capture, and per-turn capture.
+
+**Why user-level and not the plugin's own `hooks/codex-hooks.json`.** Verified
+live on codex-cli 0.148 and 0.149: plugin-bundled hooks are **not mounted**, via
+either a manifest pointer or the default `hooks/hooks.json` path. User-level
+`~/.codex/hooks.json` hooks do fire, and 0.149 delivers
+`PreToolUse.hookSpecificOutput.additionalContext` to the model. The plugin keeps
+its native hook declaration ready for the Codex release that mounts it; the
+bridge is the working compatibility path today.
+
+The installed trampoline resolves the highest naturally ordered plugin version
+at run time instead of naming one. Natural ordering matters: lexical ordering
+puts `0.9.0` above `0.10.0`, while mtime can be changed by merely touching a
+directory. The version directory is the installer's actual upgrade boundary.
+
+The marketplace namespace is **pinned** (`cache/xtrace-plugins/memhub/*/`),
+only the version segment is a wildcard. The cache is shared by every
+marketplace you have installed — `openai-bundled`, `openai-curated-remote`,
+and so on all live beside ours — so a namespace wildcard would let any other
+marketplace shipping a plugin named `memhub` supply the code this hook runs.
+Pinning removes that without giving up upgrade-safety.
+
+**Trust assumption.** The bridge runs scripts from the highest-versioned directory
+under `~/.codex/plugins/cache/xtrace-plugins/memhub/`,
+without verifying a signature or hash. That directory is inside your own home:
+writing a higher-versioned sibling there requires the ability to write your home
+directory, and anything with that ability can already rewrite `~/.codex/hooks.json`
+(which *defines* this hook), edit the installed plugin in place, or alter your
+shell startup — so the bridge is not a distinct escalation path, and a hash
+stored in that same writable tree would verify nothing an attacker couldn't also
+change. The assumption, stated plainly, is that `~/.codex/plugins/cache/` is
+written only by the Codex plugin installer and by you. Pinning an exact version
+instead would trade this for a concrete regression: capture silently stops on
+every plugin upgrade until the pin is bumped.
+
+Three implementation facts matter if you edit the bridge:
+
+* every handler drains stdin;
+* `"async": true` hooks are killed with `codex exec`, so capture detaches from
+  the synchronous trampoline itself;
+* Codex ignores plain text from `PreToolUse` and `PostToolUse`; model-visible
+  bridge output uses `hookSpecificOutput.additionalContext`.
+
+## 4. Auto-capture via `notify` (legacy, verify on your Codex version)
+
+Predates the bridge and is strictly worse — it imports whole rollouts on a
+debounce rather than flushing incrementally, and Codex allows only ONE `notify`
+program, so this conflicts with anything else already using that slot (the
+ChatGPT desktop client claims it). Prefer the bridge above.
 
 Codex's `notify` config runs a program on session events. Point it at a wrapper
 that imports the newest rollout when a session ends:
