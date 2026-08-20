@@ -336,32 +336,20 @@ def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
     out = getattr(res, "structuredContent", None)
 
     def _add(d):
-        # A FastMCP wrapper may carry conversation_id at the TOP level while
-        # the confirming ack_through lives in `result`, which need not echo
-        # the id. Consider the nested result so its ack is not missed — but
-        # only INHERIT the parent's id when we can prove the wrapper is ours:
-        # either there is no id filter (expected is None), or the parent's id
-        # already equals the expected one. Blindly copying it would let a
-        # BATCHED wrapper (top-level id for another conversation) smuggle a
-        # foreign ack past the expected-id filter and wrongly confirm this
-        # session — advancing the watermark on someone else's ack. A result
-        # left id-less is simply excluded by the filter (the conservative,
-        # unconfirmed direction).
+        # A FastMCP `result` wrapper is unwrapped so a nested ack is still
+        # considered — but the id is NEVER synthesized onto it. An ack must
+        # carry its OWN conversation_id to be matched: proving the ENVELOPE
+        # is ours does not prove the ENVELOPE'S nested result is (a batched
+        # wrapper could echo our id on the envelope while its result acks a
+        # different conversation). So an id-less inner result is excluded by
+        # the expected-id filter — the conservative, unconfirmed direction.
+        # This backend returns conversation_id and ack_through together in
+        # the same object, so a real confirming ack always carries its id;
+        # the id-less-inner shape is hypothetical, and its worst case is a
+        # harmless re-send (the server dedups).
         candidates.append(d)
         inner = d.get("result")
         if isinstance(inner, dict):
-            parent_id = d.get("conversation_id")
-            # Inherit ONLY when we can prove the wrapper is ours: an expected
-            # id is set AND the parent carries it. With no expected id there
-            # is no downstream cross-conversation filter, so copying a
-            # foreign top-level id onto the ack would confirm the wrong
-            # session with nothing to catch it — leave the inner result
-            # id-less (excluded from acks) in that case, the conservative
-            # direction. The only capture caller always passes an expected id.
-            if ("conversation_id" not in inner
-                    and expected_conversation_id is not None
-                    and parent_id == expected_conversation_id):
-                inner = {"conversation_id": parent_id, **inner}
             candidates.append(inner)
 
     if isinstance(out, dict):
