@@ -334,18 +334,29 @@ def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
     """
     candidates: list[dict] = []
     out = getattr(res, "structuredContent", None)
+
     def _add(d):
         # A FastMCP wrapper may carry conversation_id at the TOP level while
         # the confirming ack_through lives in `result`, which need not echo
-        # the id. The nested result belongs to its parent's conversation, so
-        # it INHERITS the id when it lacks one — otherwise the expected-id
-        # filter below would drop the real ack and report a healthy import as
-        # unconfirmed, looping full re-uploads.
+        # the id. Consider the nested result so its ack is not missed — but
+        # only INHERIT the parent's id when we can prove the wrapper is ours:
+        # either there is no id filter (expected is None), or the parent's id
+        # already equals the expected one. Blindly copying it would let a
+        # BATCHED wrapper (top-level id for another conversation) smuggle a
+        # foreign ack past the expected-id filter and wrongly confirm this
+        # session — advancing the watermark on someone else's ack. A result
+        # left id-less is simply excluded by the filter (the conservative,
+        # unconfirmed direction).
         candidates.append(d)
         inner = d.get("result")
         if isinstance(inner, dict):
-            if "conversation_id" not in inner and "conversation_id" in d:
-                inner = {"conversation_id": d["conversation_id"], **inner}
+            parent_id = d.get("conversation_id")
+            safe_to_inherit = (
+                "conversation_id" not in inner and parent_id is not None
+                and (expected_conversation_id is None
+                     or parent_id == expected_conversation_id))
+            if safe_to_inherit:
+                inner = {"conversation_id": parent_id, **inner}
             candidates.append(inner)
 
     if isinstance(out, dict):
