@@ -96,11 +96,18 @@ def test_turn_boundaries_flush_on_new_content():
 
 
 def test_session_uuid_sources():
+    # a payload id is the identity verbatim (the server namespaces it)
     assert session_uuid({"session_id": "u-1"}) == "u-1"
     assert session_uuid({"conversation_id": "c-2"}) == "c-2"
-    # falls back to the transcript_path's session directory
-    tp = "/x/.cursor/projects/slug/agent-transcripts/u-3/u-3.jsonl"
-    assert session_uuid({"transcript_path": tp}) == "u-3"
+    # the transcript_path fallback must yield a real session UUID, from the
+    # session directory or the file stem...
+    u = "019c6e48-b66c-7881-9301-99c87fc66cf6"
+    assert session_uuid(
+        {"transcript_path": f"/x/agent-transcripts/{u}/{u}.jsonl"}) == u
+    assert session_uuid({"transcript_path": f"/x/agent-transcripts/{u}.jsonl"}) == u
+    # ...never a layout constant: a host that drops the per-session dir would
+    # otherwise mis-key every session onto "agent-transcripts"
+    assert session_uuid({"transcript_path": "/x/agent-transcripts/sess.jsonl"}) is None
     assert session_uuid({"session_id": "  "}) is None   # blank → no identity
     assert session_uuid({}) is None
     print("PASS test_session_uuid_sources")

@@ -78,6 +78,34 @@ DORMANT_RETRY_S = 1800.0
 # re-probes on the same timer, so a fixed server still heals.
 MAX_UNCONFIRMED = 5
 
+
+def _note_failure(uuid: str, reason: str) -> None:
+    """Record a non-ok flush outcome, escalating to dormancy after
+    MAX_UNCONFIRMED CONSECUTIVE failures of ANY kind — rate-limit, McpError,
+    timeout, or an unconfirmed import. Counting only the "unconfirmed verdict"
+    left a hard-down backend (always rate-limited / erroring) hammering the
+    server on every event forever, since dormancy never triggered.
+
+    The streak resets to 0 the moment the session goes dormant, so each
+    re-probe after DORMANT_RETRY_S gets a FRESH budget of attempts — a
+    flaky server that recovers on the 2nd or 3rd try still gets those tries.
+    A confirmed import clears everything (see _flush's success path).
+    """
+    streak = int(_read_state(uuid).get("fail_streak") or 0) + 1
+    now = time.time()
+    if streak >= MAX_UNCONFIRMED:
+        _log(f"{streak} consecutive failed imports ({reason}) — per-event "
+             f"flush is dormant for this session; run /memhub:import-session "
+             f"to capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
+        _save_state(uuid, last_flush_at=now, last_error=reason,
+                    unsupported=True, unsupported_at=now, fail_streak=0)
+    else:
+        # Sub-threshold: back off via the debounce (last_flush_at), stay in
+        # normal mode (unsupported cleared) so the next event keeps counting.
+        _save_state(uuid, last_flush_at=now, last_error=reason,
+                    unsupported=False, fail_streak=streak)
+
+
 # The milestone must be in COMMAND POSITION, not merely mentioned: `.*` with
 # DOTALL matched `git log --oneline | grep commit` and even
 # `echo "remember to git commit"`, firing a full flush on ordinary traffic.
@@ -224,15 +252,31 @@ def _acquire(uuid: str) -> int | None:
     return fd
 
 
+# A cursor session id is a uuid; the transcript_path fallback must look like
+# one, not a layout constant. `…/agent-transcripts/<uuid>/<uuid>.jsonl` puts
+# the uuid at BOTH the parent dir and the file stem — but a host that drops
+# the per-session dir (`…/agent-transcripts/<uuid>.jsonl`) would otherwise
+# yield the constant "agent-transcripts", collapsing every session onto one
+# state key. Accept the parent, then the stem, then give up.
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                      r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
 def session_uuid(payload: dict) -> str | None:
-    """The session identity a hook carries. ``session_id`` when present;
-    else derived from ``transcript_path`` (…/agent-transcripts/<uuid>/…)."""
+    """The session identity a hook carries. ``session_id`` when present; else
+    a uuid derived from ``transcript_path`` — never a directory-name constant.
+    """
     sid = payload.get("session_id") or payload.get("conversation_id")
     if isinstance(sid, str) and sid.strip():
         return sid.strip()
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:
-        return Path(tp).parent.name or None
+        p = Path(tp)
+        for cand in (p.parent.name, p.stem):
+            if _UUID_RE.fullmatch(cand):
+                return cand
+        _log(f"transcript_path yields no session uuid ({tp!r}) — skipping "
+             f"rather than mis-key state on a layout constant")
     return None
 
 
@@ -357,7 +401,6 @@ def _namespace_of(cwd: str | None) -> str | None:
 
 async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
                  flush_mode: str = "now") -> None:
-    state_before = _read_state(uuid)
     records, meta = cursor_reader.to_canonical(store_db)
     # Close the read span IMMEDIATELY — before redaction and the network call,
     # which together can run for many seconds. Blobs present at both the gate
@@ -458,12 +501,12 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         res = await session.call_tool("import_conversation",
                                       arguments=arguments)
     except mcp_http.McpRateLimited as e:
-        _log(f"rate limited: {e} — a later hook retries (state unmoved)")
-        _save_state(uuid, last_error="rate_limited")
+        _log(f"rate limited: {e}")
+        _note_failure(uuid, "rate_limited")
         return
     except mcp_http.McpError as e:
         _log(f"import failed: {e}")
-        _save_state(uuid, last_error=str(e)[:200])
+        _note_failure(uuid, f"mcp_error: {str(e)[:80]}")
         return
 
     # A returned call is NOT a persisted call. MCP signals tool failure with
@@ -485,20 +528,10 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
              "dormant for this session; run /memhub:import-session to "
              "capture it, or upgrade the server")
         _save_state(uuid, last_flush_at=time.time(), unsupported=True,
-                    unsupported_at=time.time())
+                    unsupported_at=time.time(), fail_streak=0)
         return
     if verdict != "ok":
-        streak = int(state_before.get("unconfirmed_streak") or 0) + 1
-        if streak >= MAX_UNCONFIRMED:
-            _log(f"{streak} consecutive unconfirmed imports — per-event flush "
-                 f"is dormant for this session; run /memhub:import-session to "
-                 f"capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
-            _save_state(uuid, last_flush_at=time.time(), unsupported=True,
-                        unsupported_at=time.time(), unconfirmed_streak=streak)
-        else:
-            _save_state(uuid, last_flush_at=time.time(),
-                        last_error="unconfirmed_import",
-                        unconfirmed_streak=streak)
+        _note_failure(uuid, "unconfirmed_import")
         return
 
     # `shipped` was fixed at the end of the transcript read (see above), NOT
@@ -510,7 +543,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
               # The re-probe worked: this server confirms after all, so the
               # session re-arms instead of staying dormant on old evidence.
               "unsupported": False, "unsupported_at": 0,
-              "unconfirmed_streak": 0}
+              "fail_streak": 0}
     if shipped is not None:
         fields["blob_ids"] = sorted(shipped)
     else:
@@ -568,7 +601,13 @@ def main() -> int:
             asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids, mode),
                                          timeout=FLUSH_TIMEOUT_S))
         except Exception as e:
+            # A timeout or any raise past _flush's own handlers (the broad
+            # case, including asyncio.wait_for firing) counts toward dormancy
+            # too — otherwise a hard-down backend re-parses and re-uploads the
+            # whole store on every event forever, and Stop is cooldown-exempt
+            # so nothing else bounds it.
             _log(f"{event}: flush error: {e}")
+            _note_failure(uuid, f"flush_error: {type(e).__name__}")
     finally:
         os.close(lock_fd)  # releases the flock
     return 0
