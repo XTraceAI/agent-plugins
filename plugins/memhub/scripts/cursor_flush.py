@@ -70,6 +70,9 @@ FLUSH_TIMEOUT_S = 240.0
 # that an unfixed server costs one wasted upload an hour, short enough that a
 # fix takes effect inside a working session.
 DORMANT_RETRY_S = 1800.0
+# Cap on how long a last-chance boundary waits for a concurrent flush before
+# giving up (see _acquire) — bounds blocked-process lifetime.
+LOCK_WAIT_S = 60.0
 # "Unconfirmed" is retried because it is usually transient. A server that
 # returns it FOREVER (always records_dropped>0, say) would otherwise re-parse,
 # re-redact and re-upload the whole transcript on every event for the life of
@@ -256,12 +259,31 @@ def _acquire(uuid: str, blocking: bool = False) -> int | None:
     # constant is Unix-only and the capture scripts run on native Windows.
     fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.flush.lock",
                  os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
-    try:
-        portable_lock.lock_exclusive(fd, blocking=blocking)
-    except OSError:
-        os.close(fd)
-        return None
-    return fd
+    if not blocking:
+        try:
+            portable_lock.lock_exclusive(fd, blocking=False)
+            return fd
+        except OSError:
+            os.close(fd)
+            return None
+    # BOUNDED wait, never an unbounded flock(LOCK_EX): a live peer stuck
+    # OUTSIDE its asyncio.wait_for (a huge synchronous parse, a wedged
+    # subprocess) holds the lock past the network deadline, and an unbounded
+    # wait would pile up one blocked detached process per boundary event. So
+    # poll the non-blocking lock up to LOCK_WAIT_S — long enough to wait out a
+    # normal concurrent flush, short enough to cap a stuck one — then give up
+    # (the import-session sweep is the backstop). A dead peer releases the
+    # flock via the kernel, so this returns the instant that happens.
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            portable_lock.lock_exclusive(fd, blocking=False)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
 
 
 # A cursor session id is a uuid; the transcript_path fallback must look like
@@ -483,10 +505,22 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # resolve_repo_brain resolves it as a path too — validating only inside
     # _namespace_of would have left that half open.
     if _cwd_ok(cwd):
-        room, namespace = await asyncio.gather(
-            resolve_repo_brain(session, cwd, env),
-            asyncio.to_thread(_namespace_of, cwd),
-        )
+        try:
+            room, namespace = await asyncio.gather(
+                resolve_repo_brain(session, cwd, env),
+                asyncio.to_thread(_namespace_of, cwd),
+            )
+        except Exception as e:  # noqa: BLE001
+            # resolve_repo_brain is documented never to raise (its body is a
+            # broad except returning None), so this is belt-and-braces — but
+            # if it ever did, ABORT and retry rather than either of the wrong
+            # answers: degrading room to None would route the FIRST receive to
+            # personal LTM and set the conversation's partition there stickily,
+            # and letting it propagate would count a routing hiccup as an
+            # import failure toward dormancy. A clean return does neither.
+            _log(f"room/namespace resolve failed transiently ({e!r}) — "
+                 f"retrying next event")
+            return
     else:
         if cwd:
             _log(f"ignoring unusable cwd from store: {str(cwd)[:60]!r}")
