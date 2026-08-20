@@ -171,17 +171,16 @@ def test_import_verdicts_and_dormancy():
     assert _verdict(_res({"conversation_id": "cursor-other", "ack_through": "u"}),
                     "cursor-mine") == "unconfirmed"
 
-    # A dormant session stops flushing on every event, not just some...
+    # A dormant session stops flushing on EVERY event within the window,
+    # turn boundaries included: re-probing once per DORMANT_RETRY_S is what
+    # keeps a down server from being hammered per-turn. The final tail that
+    # falls in a dormant window is caught by the import-session sweep, and a
+    # transient blip ships before the streak ever reaches dormancy.
     dormant = {"unsupported": True, "unsupported_at": 1_000.0}
-    # Mid-turn events stay gated while dormant...
-    for event in ("afterFileEdit", "beforeShellExecution"):
+    for event in ("afterFileEdit", "beforeShellExecution",
+                  "stop", "beforeSubmitPrompt"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 dormant, {"new-blob"}, 1_000.0), event
-    # ...but turn boundaries are last-chance and attempt anyway (ship if the
-    # server recovered, fail harmlessly if not).
-    for event in ("stop", "beforeSubmitPrompt"):
-        assert should_flush(event, {"command": "git commit -m x"},
-                            dormant, {"new-blob"}, 1_000.0), event
     # ...but dormancy is NOT a one-way door: going dormant means never
     # flushing again, so nothing could otherwise observe that the server was
     # upgraded. After the re-probe window one flush is allowed through, and a

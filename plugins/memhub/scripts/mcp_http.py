@@ -334,19 +334,29 @@ def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
     """
     candidates: list[dict] = []
     out = getattr(res, "structuredContent", None)
+    def _add(d):
+        # A FastMCP wrapper may carry conversation_id at the TOP level while
+        # the confirming ack_through lives in `result`, which need not echo
+        # the id. The nested result belongs to its parent's conversation, so
+        # it INHERITS the id when it lacks one — otherwise the expected-id
+        # filter below would drop the real ack and report a healthy import as
+        # unconfirmed, looping full re-uploads.
+        candidates.append(d)
+        inner = d.get("result")
+        if isinstance(inner, dict):
+            if "conversation_id" not in inner and "conversation_id" in d:
+                inner = {"conversation_id": d["conversation_id"], **inner}
+            candidates.append(inner)
+
     if isinstance(out, dict):
-        candidates.append(out)
-        if isinstance(out.get("result"), dict):
-            candidates.append(out["result"])
+        _add(out)
     for text in texts_of(res):
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(parsed, dict):
-            candidates.append(parsed)
-            if isinstance(parsed.get("result"), dict):
-                candidates.append(parsed["result"])
+            _add(parsed)
     # Among the shapes that look like an ack, prefer one that actually
     # CONFIRMS persistence. Order alone is not enough: a wrapper can carry
     # conversation_id at the top level with a null ack while the real,

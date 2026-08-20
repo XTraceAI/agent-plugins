@@ -106,8 +106,17 @@ def _note_failure(uuid: str, reason: str) -> None:
     flaky server that recovers on the 2nd or 3rd try still gets those tries.
     A confirmed import clears everything (see _flush's success path).
     """
-    streak = int(_read_state(uuid).get("fail_streak") or 0) + 1
     now = time.time()
+    st = _read_state(uuid)
+    if st.get("unsupported"):
+        # A re-probe of a dormant session FAILED: stay dormant, reset the
+        # timer — a persistently-down server is attempted exactly once per
+        # DORMANT_RETRY_S, not given a fresh MAX_UNCONFIRMED budget each
+        # window that would let it hammer between windows.
+        _save_state(uuid, last_flush_at=now, last_error=reason,
+                    unsupported=True, unsupported_at=now, fail_streak=0)
+        return
+    streak = int(st.get("fail_streak") or 0) + 1
     if streak >= MAX_UNCONFIRMED:
         _log(f"{streak} consecutive failed imports ({reason}) — per-event "
              f"flush is dormant for this session; run /memhub:import-session "
@@ -340,18 +349,15 @@ def should_flush(event: str, payload: dict, state: dict,
     point of milestone capture), turn boundaries ship, plain edits debounce,
     and non-milestone shell commands never trigger (too chatty).
     """
-    # Turn boundaries (stop / beforeSubmitPrompt) are last-chance events — a
-    # session may have no later flush — so they attempt even when dormant:
-    # they ship if the server recovered, fail harmlessly if not (the
-    # import-session sweep backstops). Mid-turn events (edits, milestone
-    # shell) stay dormant-gated, which is where the frequent hammering is.
-    boundary = event in ("stop", "beforeSubmitPrompt")
-    if state.get("unsupported") and not boundary:
-        # Dormant, but not forever: after DORMANT_RETRY_S fall through and
-        # let one flush re-probe. A successful ack clears the flag, so an
-        # upgraded server re-arms a session already in progress.
-        if now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S:
-            return False
+    # Dormancy gates EVERY event including the turn boundaries: a
+    # persistently-down server is re-probed once per DORMANT_RETRY_S, never
+    # hammered per-turn (boundaries can fire many times a minute). A boundary
+    # whose tail falls inside a dormant window is captured by the
+    # import-session sweep, not by attempting a full flush every turn against
+    # an already-struggling backend. A successful re-probe clears the flag.
+    if state.get("unsupported") and (
+            now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
+        return False
     if blob_ids <= set(state.get("blob_ids") or []):
         return False
     if event == "beforeShellExecution":
@@ -543,8 +549,14 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
             # personal LTM and set the conversation's partition there stickily,
             # and letting it propagate would count a routing hiccup as an
             # import failure toward dormancy. A clean return does neither.
+            # Not _note_failure: a routing hiccup is local, not a
+            # server-import failure, so it must not count toward dormancy or
+            # degrade room to None (which would mis-home the partition). The
+            # afterFileEdit debounce already rate-limits the frequent event;
+            # boundaries retry next turn.
             _log(f"room/namespace resolve failed transiently ({e!r}) — "
                  f"retrying next event")
+            _save_state(uuid, last_error="resolve_error")
             return
     else:
         if cwd:
