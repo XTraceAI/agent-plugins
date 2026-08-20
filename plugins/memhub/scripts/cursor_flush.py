@@ -56,7 +56,8 @@ from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from redact import redact_records  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly  # noqa: E402
+from room_map import (  # noqa: E402
+    env_for_url, git_env, git_readonly, is_staging_backend)
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 
@@ -80,13 +81,6 @@ LOCK_WAIT_S = 60.0
 # unconfirmed replies the session goes dormant like an unsupported one — and
 # re-probes on the same timer, so a fixed server still heals.
 MAX_UNCONFIRMED = 5
-
-
-def _is_staging(env: str) -> bool:
-    """The one place the staging platform-gate is decided — case-folded
-    so a relabel of env_for_url can't silently break it, and defaulting
-    NON-staging so an unknown label ships the always-accepted "claude"."""
-    return (env or "").strip().lower() == "staging"
 
 
 def _note_failure(uuid: str, reason: str) -> None:
@@ -593,7 +587,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         # gate goes away and it is unconditional. A session first flushed
         # as "claude" self-heals to "cursor" on its next real-platform
         # receive (server-side monotonic platform heal).
-        "source_platform": "cursor" if _is_staging(env) else "claude",
+        "source_platform": "cursor" if is_staging_backend(url) else "claude",
         "flush": flush_mode,
     }
     if room:

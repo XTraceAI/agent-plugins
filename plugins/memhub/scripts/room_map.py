@@ -72,6 +72,21 @@ ROOMS_PATH = Path(
 DEFAULT_ENV = "production"
 
 
+def is_staging_backend(url: str) -> bool:
+    """True only when ``url``'s HOST has a ``staging`` label — stricter than
+    ``env_for_url``'s substring match, which is fine for cache-keying (a wrong
+    bucket is harmless) but NOT for the ENG-886 platform gate, where a false
+    positive sends "cursor"/"codex" to prod and fails the whole import. A
+    host like ``staging-corp.com`` or a ``/staging`` path no longer matches;
+    ``api.staging.memhub.xtrace.ai`` does."""
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return "staging" in host.split(".")
+
+
 def env_for_url(url: str) -> str:
     """Map an MCP endpoint to a cache key. Substring, not host equality, so a
     `MEMHUB_MCP_BASE_URL` override pointing at any staging host still keys to
@@ -113,17 +128,14 @@ def git_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k.upper() in _GIT_KEEP}
     env.update({
         "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
-        # Ignore GLOBAL config too (~/.gitconfig). Capture callers point git
-        # at a cwd taken from session content, so git must read ONLY the
-        # target repo's LOCAL config — the remote URL we actually want, whose
-        # execution primitives git_readonly disarms with -c. Nulling global
-        # removes an entire class of "config vector we didn't think to
-        # denylist" (a global alias, insteadOf, or a future exec hook). The
-        # one thing global carries that matters here is safe.directory, and
-        # dropping it FAILS CLOSED: git refuses a foreign-owned repo (no URL →
-        # no namespace → default room), which is the right answer for a
-        # hostile cwd. The user's own repos need no safe.directory.
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        # NB: global config (~/.gitconfig) is deliberately KEPT. It carries
+        # safe.directory — needed for the user's own repo when the git
+        # process runs as a different uid (CI, containers, multi-user), where
+        # dropping it makes rev-parse/remote fail "dubious ownership" and the
+        # session mis-routes to personal memory — and url.insteadOf rewrites
+        # that define the canonical remote (and thus the room name). The
+        # untrusted-cwd hardening is the git_readonly -c disarms plus this
+        # secret-free env, not nulling the user's own config.
         "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
         "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
         "GIT_ASKPASS": "",
