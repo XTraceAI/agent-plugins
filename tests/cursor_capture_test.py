@@ -77,6 +77,14 @@ def test_milestone_gates_shell_events():
                  "git -c user.name=x commit", "gh pr merge 12 --squash"):
         assert should_flush("beforeShellExecution", {"command": loud},
                             STALE, FRESH, NOW), loud
+    # A milestone verb behind a long wrapper prefix (a real `bash -lc "cd
+    # <deep path> && … && git commit"`) must still fire: the scan bound is far
+    # larger than the old 512 bytes, which truncated exactly this shape.
+    long_commit = ('bash -lc "cd /' + "very/long/path/" * 60
+                   + " && git commit -m done\"")
+    assert len(long_commit) > 512
+    assert should_flush("beforeShellExecution", {"command": long_commit},
+                        STALE, FRESH, NOW), "milestone past old 512 cap"
     print("PASS test_milestone_gates_shell_events")
 
 

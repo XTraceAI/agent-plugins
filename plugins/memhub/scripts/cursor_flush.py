@@ -145,6 +145,14 @@ _MILESTONE_RE = re.compile(
     r"""|gh(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+[^\s-]\S*)?)*"""
     r"""\s+pr\s+(?:create|merge|ready|edit|close|reopen|comment)\b)""")
 
+# Bound on how much of a command we scan for a milestone. The regex above is
+# linear (bounded quantifiers, no nested repetition — a 200 KB input scans in
+# ~2 ms), so this is NOT backtracking protection; it is only a sanity limit on
+# a pathological multi-megabyte argument. 16 KiB clears any realistic agent
+# command — including a long `bash -lc "cd <deep/path> && … && git commit"`
+# whose verb lands well past the old 512-byte cap — by a wide margin.
+_MILESTONE_SCAN_LIMIT = 16384
+
 # Server-side extraction mode per event — mirrors the Claude design, where
 # flush_turn buffers ("auto") and flush_session drains ("now" — the server
 # default) at session end and commit/PR boundaries. Cursor has NO session-end
@@ -368,11 +376,11 @@ def should_flush(event: str, payload: dict, state: dict,
         cmd = payload.get("command")
         if not isinstance(cmd, str):
             return False
-        # Cap the match input: a milestone lives at command position, so the
-        # prefix suffices, and bounding the length is cheap insurance against
-        # a pathological command should a future regex edit reintroduce
-        # backtracking.
-        return bool(_MILESTONE_RE.search(cmd[:512]))
+        # Bound the match input (see _MILESTONE_SCAN_LIMIT): the regex is
+        # linear, so this only guards against a pathological megabyte-long
+        # argument — it is large enough that a real `git commit`/`gh pr` verb,
+        # even behind a long wrapper prefix, is never truncated away.
+        return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
     if event in ("stop", "beforeSubmitPrompt"):

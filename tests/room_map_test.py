@@ -235,6 +235,29 @@ def test_env_keying() -> None:
           rm.env_for_url("https://API.STAGING.memhub.xtrace.ai/mcp"), "staging")
 
 
+def test_is_staging_backend() -> None:
+    print("is_staging_backend")
+    T, F = True, False
+    cases = [
+        ("staging host", "https://api.staging.memhub.xtrace.ai/mcp", T),
+        # a port must not defeat the host-label check — .hostname excludes it
+        ("staging host + port", "https://api.staging.memhub.xtrace.ai:8443/mcp", T),
+        # scheme-less config parses as all-path (hostname None); we normalize to
+        # https so the label is still seen — else a real staging backend reads
+        # as prod and mis-tags the platform "claude"
+        ("scheme-less staging", "api.staging.memhub.xtrace.ai/mcp", T),
+        ("scheme-less staging + port", "api.staging.memhub.xtrace.ai:8443/mcp", T),
+        # the strictness env_for_url's substring match deliberately lacks
+        ("prod host", "https://api.memhub.xtrace.ai/mcp", F),
+        ("staging as infix, not a label", "https://staging-corp.example.com", F),
+        ("staging only in the path", "https://api.memhub.xtrace.ai/staging", F),
+        ("substring of another label", "https://notstaging.example.com", F),
+        ("empty", "", F),
+    ]
+    for name, url, want in cases:
+        check(name, rm.is_staging_backend(url), want)
+
+
 def test_cli() -> None:
     print("cli")
     _fresh_rooms()
@@ -332,7 +355,8 @@ if __name__ == "__main__":
     for test in (test_room_name_from_remote, test_write_then_read_per_backend,
                  test_forget_room, test_forget_outside_a_repo_is_safe,
                  test_reads_never_raise, test_concurrent_writers_dont_lose_entries,
-                 test_non_string_brain_id_is_rejected, test_env_keying, test_cli):
+                 test_non_string_brain_id_is_rejected, test_env_keying,
+                 test_is_staging_backend, test_cli):
         test()
     if failures:
         print("\nFAILED:")

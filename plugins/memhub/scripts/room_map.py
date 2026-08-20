@@ -81,7 +81,15 @@ def is_staging_backend(url: str) -> bool:
     ``api.staging.memhub.xtrace.ai`` does."""
     from urllib.parse import urlparse
     try:
-        host = (urlparse(url).hostname or "").lower()
+        # A scheme-less config ("host/path") parses as all-path with hostname
+        # None, which would read a real staging backend as prod and send
+        # "claude". Assume https when no scheme is present so the host label is
+        # always seen. (A port — host:8443 — already works: .hostname excludes
+        # it.) This also realigns the gate with env_for_url, which substring-
+        # matches the raw URL and so already treats a scheme-less staging URL
+        # as staging.
+        normalized = url if "://" in url else "https://" + url
+        host = (urlparse(normalized).hostname or "").lower()
     except ValueError:
         return False
     return "staging" in host.split(".")
