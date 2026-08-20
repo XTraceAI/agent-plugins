@@ -95,11 +95,47 @@ def current_env() -> str:
         return DEFAULT_ENV
 
 
+# Every git call here targets a directory the CALLER supplied, and capture
+# callers get theirs from session content (a cursor store's meta.json, a codex
+# rollout) — semi-trusted by construction. Git reads the local config of
+# whatever directory it is pointed at, and that config can carry execution
+# primitives: core.fsmonitor IS a command git runs, credential helpers run on
+# network access, hooksPath redirects hooks. So every invocation in this
+# module goes through these two helpers, which disarm those and hand git only
+# the environment it needs to run — never this process's, which holds the
+# MemHub bearer.
+_GIT_KEEP = {"PATH", "HOME", "SYSTEMROOT", "SYSTEMDRIVE", "USERPROFILE",
+             "PATHEXT", "COMSPEC", "TEMP", "TMP", "TMPDIR"}
+
+
+def git_env() -> dict[str, str]:
+    """The minimal environment for a read-only git probe."""
+    env = {k: v for k, v in os.environ.items() if k.upper() in _GIT_KEEP}
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
+        "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
+        "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+    })
+    return env
+
+
+def git_readonly(cwd) -> list[str]:
+    """``git -C <cwd>`` with the config-driven execution primitives disarmed."""
+    return ["git", "-C", str(cwd),
+            "-c", "core.fsmonitor=",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "credential.helper=",
+            "-c", "protocol.ext.allow=never"]
+
+
 def repo_root(cwd: str | Path | None = None) -> Path | None:
     """The git toplevel for `cwd`, or None outside a repo."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(cwd or Path.cwd()), "rev-parse", "--show-toplevel"],
+            git_readonly(cwd or Path.cwd()) + ["rev-parse", "--show-toplevel"],
+            env=git_env(),
             capture_output=True,
             text=True,
             timeout=2,
@@ -119,8 +155,10 @@ def _no_remote_name(root: Path, cwd: str | Path | None) -> str:
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(cwd or root), "rev-parse",
-             "--path-format=absolute", "--git-common-dir"],
+            git_readonly(cwd or root) + ["rev-parse",
+                                         "--path-format=absolute",
+                                         "--git-common-dir"],
+            env=git_env(),
             capture_output=True,
             text=True,
             timeout=2,
@@ -150,10 +188,11 @@ def room_name(cwd: str | Path | None = None) -> str | None:
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            git_readonly(root) + ["remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             timeout=2,
+            env=git_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return _no_remote_name(root, cwd)

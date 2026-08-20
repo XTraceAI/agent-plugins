@@ -56,7 +56,7 @@ from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from redact import redact_records  # noqa: E402
-from room_map import env_for_url  # noqa: E402
+from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 
@@ -260,48 +260,22 @@ def should_flush(event: str, payload: dict, state: dict,
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today. Verified: a repo whose
 # core.fsmonitor is a command runs it under plain git and does not here.
-# Only what git needs to RUN — never the flush process's own environment,
-# which holds the MemHub bearer and whatever else the user exports. Spreading
-# os.environ would hand all of it to a subprocess we are deliberately pointing
-# at a semi-trusted repo. HOME stays because dropping it loses legitimate
-# global config (safe.directory in particular, without which git refuses
-# repos it considers foreign); the Windows names are what CreateProcess needs
-# to work at all. Matched case-insensitively: os.environ upper-cases on
-# Windows.
-_GIT_KEEP = {"PATH", "HOME", "SYSTEMROOT", "SYSTEMDRIVE", "USERPROFILE",
-             "PATHEXT", "COMSPEC", "TEMP", "TMP", "TMPDIR"}
-
-
-def _git_env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k.upper() in _GIT_KEEP}
-    env.update({
-        "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
-        "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
-        "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
-        "GIT_ASKPASS": "",
-        "SSH_ASKPASS": "",
-    })
-    return env
-
-
-def _git_readonly(cwd: str) -> list[str]:
-    return ["git", "-C", cwd,
-            "-c", "core.fsmonitor=",
-            "-c", "core.hooksPath=/dev/null",
-            "-c", "credential.helper=",
-            "-c", "protocol.ext.allow=never"]
+def _texts(res) -> list[str]:
+    return [t for t in (getattr(b, "text", None)
+                        for b in getattr(res, "content", []) or []) if t]
 
 
 def _persisted(res) -> bool:
     """True only when the server CONFIRMS it stored the records.
 
-    Accepts the ack shapes this backend returns — structuredContent, a
-    FastMCP ``result`` wrapper, or a JSON text block — and requires a
-    conversation_id plus a non-null ``ack_through``. An older server that
-    does not report ack_through cannot be distinguished from one that
-    dropped everything, so it is treated as unconfirmed: re-sending is
-    free (the server folds re-sends forward by conversation_id), losing a
-    session is not.
+    MCP reports tool failure through isError, not an exception, and this
+    backend has shipped a mode where records are dedup-registered WITHOUT
+    being persisted (records_dropped>0, ack_through null) — the failure that
+    hid Cursor sessions for months. Requires a recognizable ack
+    (structuredContent, a FastMCP ``result`` wrapper, or a JSON text block)
+    carrying conversation_id and a non-null ack_through. A server predating
+    ack_through cannot be distinguished from one that dropped everything, so
+    it counts as unconfirmed: re-sending is free, losing a session is not.
     """
     if getattr(res, "isError", False):
         _log(f"server rejected the import: {_texts(res)[:1]}")
@@ -328,11 +302,6 @@ def _persisted(res) -> bool:
     return True
 
 
-def _texts(res) -> list[str]:
-    return [t for t in (getattr(b, "text", None)
-                        for b in getattr(res, "content", []) or []) if t]
-
-
 def _cwd_ok(cwd: str | None) -> bool:
     """``cwd`` is read out of the cursor STORE, so it is session content, not
     a trusted path. Anything handed to `git -C` must be an absolute existing
@@ -354,8 +323,8 @@ def _namespace_of(cwd: str | None) -> str | None:
         return None
     try:
         out = subprocess.run(
-            _git_readonly(cwd) + ["remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2, env=_git_env(),
+            git_readonly(cwd) + ["remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2, env=git_env(),
         )
         url = out.stdout.strip()
         if out.returncode == 0 and url:
@@ -406,13 +375,13 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         shipped = None
     sendable = redact_records(records)
     if not sendable:
-        # Nothing to send, but this content HAS been examined: record it so
-        # afterFileEdit doesn't re-parse and re-redact the same transcript on
-        # every edit. Watermark only when the read could be verified.
-        fields = {"last_flush_at": time.time()}
-        if shipped is not None:
-            fields["blob_ids"] = sorted(shipped)
-        _save_state(uuid, **fields)
+        # Examined is not shipped. Advance the DEBOUNCE only — recording
+        # blob_ids here would mark content shipped that the server never saw,
+        # so if redaction emptied it wrongly (an over-broad rule, a transient
+        # bug) it could never be re-sent once the rule was fixed. Leaving the
+        # watermark costs a re-parse on the next event, which the debounce
+        # already bounds.
+        _save_state(uuid, last_flush_at=time.time())
         return
 
     url, bearer = await asyncio.to_thread(resolve_bearer)
