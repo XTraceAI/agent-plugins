@@ -242,6 +242,8 @@ def should_flush(event: str, payload: dict, state: dict,
     point of milestone capture), turn boundaries ship, plain edits debounce,
     and non-milestone shell commands never trigger (too chatty).
     """
+    if state.get("unsupported"):
+        return False        # this server cannot confirm; see _verdict
     if blob_ids <= set(state.get("blob_ids") or []):
         return False
     if event == "beforeShellExecution":
@@ -260,43 +262,43 @@ def should_flush(event: str, payload: dict, state: dict,
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today. Verified: a repo whose
 # core.fsmonitor is a command runs it under plain git and does not here.
-def _persisted(res) -> bool:
-    """True only when the server CONFIRMS it stored the records.
+def _verdict(res) -> str:
+    """``"ok"`` | ``"unconfirmed"`` | ``"unsupported"`` for an import reply.
 
     MCP reports tool failure through isError, not an exception, and this
     backend has shipped a mode where records are dedup-registered WITHOUT
     being persisted (records_dropped>0, ack_through null) — the failure that
-    hid Cursor sessions for months. A server predating ack_through cannot be
-    told apart from one that dropped everything, so it counts as unconfirmed:
-    re-sending is free, losing a session is not.
+    hid Cursor sessions for months. So a returned call is not a stored call.
+
+    The three-way split exists because a server that OMITS ack_through poses
+    a dilemma neither binary answer settles: treat it as confirmed and a
+    server that silently dropped everything costs the session (a session's
+    last flush has no later event to retry); treat it as unconfirmed and the
+    watermark never advances, so every event re-uploads the whole transcript
+    forever. flush_turn already answered this on the Claude path — go
+    DORMANT: hold the watermark, stop flushing this session, and let the
+    idempotent import-session sweep carry it. No loss, no loop.
     """
     if getattr(res, "isError", False):
         _log(f"server rejected the import: {mcp_http.texts_of(res)[:1]}")
-        return False
+        return "unconfirmed"
     ack = mcp_http.ack_of(res)
     if ack is None:
         _log("import response unrecognized — holding the watermark")
-        return False
+        return "unconfirmed"
+    if ack.get("records_dropped"):
+        _log(f"server dropped {ack['records_dropped']} record(s) — "
+             f"holding the watermark")
+        return "unconfirmed"
     if "ack_through" not in ack:
-        # ABSENT, not null: a server predating the field. Those did persist —
-        # they simply cannot say so — and treating them as unconfirmed would
-        # re-upload the entire transcript on every event forever.
-        if ack.get("records_dropped"):
-            _log(f"server dropped {ack['records_dropped']} record(s) — "
-                 f"holding the watermark")
-            return False
-        _log("server does not report ack_through (older build) — accepting "
-             "the import; upgrade it for durable per-event confirmation")
-        return True
+        return "unsupported"
     if not ack["ack_through"]:
-        # Present and null is the DIFFERENT case: a server that knows the
-        # field telling us it stored nothing — the failure that hid Cursor
-        # sessions for months.
-        _log(f"import NOT confirmed (ack_through null, dropped="
-             f"{ack.get('records_dropped')}) — holding the watermark so the "
-             f"next event re-sends")
-        return False
-    return True
+        # Present and null: a server that KNOWS the field telling us it
+        # stored nothing. Retrying is right — this is transient.
+        _log("import NOT confirmed (ack_through null) — holding the "
+             "watermark so the next event re-sends")
+        return "unconfirmed"
+    return "ok"
 
 
 def _cwd_ok(cwd: str | None) -> bool:
@@ -455,7 +457,18 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # event to re-send it, that is a silently lost conversation. So: confirm
     # the ack, or hold the watermark and let the next event re-send. Mirrors
     # flush_turn's discipline on the Claude path.
-    if not _persisted(res):
+    verdict = _verdict(res)
+    if verdict == "unsupported":
+        # Dormant for this session rather than looping: the watermark stays
+        # put (nothing is claimed shipped) and no further flush runs, so an
+        # unconfirmable server costs redundant work exactly once instead of
+        # on every event. /memhub:import-session still captures the session.
+        _log("server does not report ack_through — per-event flush is "
+             "dormant for this session; run /memhub:import-session to "
+             "capture it, or upgrade the server")
+        _save_state(uuid, last_flush_at=time.time(), unsupported=True)
+        return
+    if verdict != "ok":
         _save_state(uuid, last_flush_at=time.time(),
                     last_error="unconfirmed_import")
         return

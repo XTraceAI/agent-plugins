@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
-from cursor_flush import _persisted, session_uuid, should_flush  # noqa: E402
+from cursor_flush import _verdict, session_uuid, should_flush  # noqa: E402
 
 NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
@@ -105,13 +105,16 @@ def test_session_uuid_sources():
     print("PASS test_session_uuid_sources")
 
 
-def test_import_must_be_confirmed_before_advancing():
-    """A returned call is not a persisted call.
+def test_import_verdicts_and_dormancy():
+    """A returned call is not a stored call — and an unconfirmable server
+    must cost neither the session nor an upload loop.
 
-    This backend has shipped a 200-with-nothing-stored mode (records
-    dedup-registered without persisting: ack_through null), which is what hid
-    Cursor sessions for months. Advancing the watermark on such a reply loses
-    the conversation outright when it is a session's LAST flush.
+    The backend has shipped a 200-with-nothing-stored mode (records
+    dedup-registered without persisting), which is what hid Cursor sessions
+    for months. A server that OMITS ack_through is the harder case: trusting
+    it risks losing a session's last flush, distrusting it re-uploads the
+    whole transcript on every event forever. Answer (flush_turn's, on the
+    Claude path): go dormant — hold the watermark AND stop flushing.
     """
     import json as _json
     import types
@@ -121,37 +124,37 @@ def test_import_must_be_confirmed_before_advancing():
             structuredContent=structured, isError=is_error,
             content=[types.SimpleNamespace(text=t) for t in texts])
 
-    confirmed = [
+    ok = [
         _res({"conversation_id": "cursor-x", "ack_through": "u1"}),
         _res({"result": {"conversation_id": "c", "ack_through": "u"}}),
         _res(None, [_json.dumps({"conversation_id": "c", "ack_through": "u"})]),
+        # a diagnostic block ahead of the ack must not be mistaken for it
+        _res(None, [_json.dumps({"level": "info"}),
+                    _json.dumps({"conversation_id": "c", "ack_through": "u"})]),
+        # nor may a null-ack wrapper outrank the real ack inside its result
+        _res({"conversation_id": "c", "ack_through": None,
+              "result": {"conversation_id": "c", "ack_through": "u9"}}),
     ]
-    # a diagnostic JSON block AHEAD of the ack must not be mistaken for it —
-    # that read a healthy server as failing and re-uploaded every event
-    confirmed.append(_res(None, [
-        _json.dumps({"level": "info", "msg": "queued"}),
-        _json.dumps({"conversation_id": "c", "ack_through": "u"})]))
-    # a wrapper carrying conversation_id with a NULL ack must not outrank the
-    # real acknowledged payload inside its `result`
-    confirmed.append(_res({"conversation_id": "c", "ack_through": None,
-                           "result": {"conversation_id": "c",
-                                      "ack_through": "u9"}}))
-    confirmed.append(_res(None, ["saved!", _json.dumps(
-        {"conversation_id": "c", "ack_through": "u"})]))
     unconfirmed = [
+        _res({"conversation_id": "c", "ack_through": None}),
         _res({"conversation_id": "c", "ack_through": None, "records_dropped": 6}),
+        _res({"conversation_id": "c", "records_dropped": 3}),
         _res({"conversation_id": "c", "ack_through": "u"}, is_error=True),
         _res(None, ["not json"]),
-        _res({"conversation_id": "c", "records_dropped": 3}),  # old, but dropped
     ]
-    # ABSENT ack_through = an older server that persisted without being able
-    # to confirm; holding for those re-sends the transcript forever
-    confirmed.append(_res({"conversation_id": "c"}))
-    for r in confirmed:
-        assert _persisted(r), r
+    for r in ok:
+        assert _verdict(r) == "ok", r
     for r in unconfirmed:
-        assert not _persisted(r), r
-    print("PASS test_import_must_be_confirmed_before_advancing")
+        assert _verdict(r) == "unconfirmed", r
+    # the field ABSENT (not null) is the dormancy case
+    assert _verdict(_res({"conversation_id": "c"})) == "unsupported"
+
+    # and a dormant session stops flushing on every event, not just some
+    for event in ("stop", "beforeSubmitPrompt", "afterFileEdit",
+                  "beforeShellExecution"):
+        assert not should_flush(event, {"command": "git commit -m x"},
+                                {"unsupported": True}, {"new-blob"}, 1e9), event
+    print("PASS test_import_verdicts_and_dormancy")
 
 
 if __name__ == "__main__":
