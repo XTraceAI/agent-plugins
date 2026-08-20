@@ -219,6 +219,7 @@ def _git_remote_basename(directory: str) -> str:
     if directory in _REMOTE_CACHE:
         return _REMOTE_CACHE[directory]
     name = ""
+    definitive = True
     try:
         out = subprocess.run(
             ["git", "-C", directory, "remote", "get-url", "origin"],
@@ -227,9 +228,16 @@ def _git_remote_basename(directory: str) -> str:
         url = out.stdout.strip()
         if out.returncode == 0 and url:
             name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    except subprocess.TimeoutExpired:
+        # A 0.5s budget on a loaded machine says nothing about the directory —
+        # caching this "" would mark the repo unknown for the WHOLE hook run
+        # (both the call site and the precision filter resolve it), silently
+        # dropping repo-scoped token blocking. Let the next lookup retry.
+        definitive = False
     except (OSError, subprocess.SubprocessError):
-        pass
-    _REMOTE_CACHE[directory] = name
+        pass  # git missing or unrunnable — stable for this process, cache it
+    if definitive:
+        _REMOTE_CACHE[directory] = name
     return name
 
 
