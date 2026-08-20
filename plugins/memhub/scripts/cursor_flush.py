@@ -82,6 +82,13 @@ LOCK_WAIT_S = 60.0
 MAX_UNCONFIRMED = 5
 
 
+def _is_staging(env: str) -> bool:
+    """The one place the staging platform-gate is decided — case-folded
+    so a relabel of env_for_url can't silently break it, and defaulting
+    NON-staging so an unknown label ships the always-accepted "claude"."""
+    return (env or "").strip().lower() == "staging"
+
+
 def _note_failure(uuid: str, reason: str) -> None:
     """Record a SERVER-CONTACTED failure, escalating to dormancy after
     MAX_UNCONFIRMED consecutive ones — rate-limit, McpError, timeout, or an
@@ -333,7 +340,13 @@ def should_flush(event: str, payload: dict, state: dict,
     point of milestone capture), turn boundaries ship, plain edits debounce,
     and non-milestone shell commands never trigger (too chatty).
     """
-    if state.get("unsupported"):
+    # Turn boundaries (stop / beforeSubmitPrompt) are last-chance events — a
+    # session may have no later flush — so they attempt even when dormant:
+    # they ship if the server recovered, fail harmlessly if not (the
+    # import-session sweep backstops). Mid-turn events (edits, milestone
+    # shell) stay dormant-gated, which is where the frequent hammering is.
+    boundary = event in ("stop", "beforeSubmitPrompt")
+    if state.get("unsupported") and not boundary:
         # Dormant, but not forever: after DORMANT_RETRY_S fall through and
         # let one flush re-probe. A successful ack clears the flag, so an
         # upgraded server re-arms a session already in progress.
@@ -474,6 +487,9 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         shipped = None
     sendable = redact_records(records)
     if not sendable:
+        if records:
+            _log(f"all {len(records)} record(s) redacted away — nothing to "
+                 f"send (check redact rules if this recurs on real content)")
         # Examined is not shipped. Advance the DEBOUNCE only — recording
         # blob_ids here would mark content shipped that the server never saw,
         # so if redaction emptied it wrongly (an over-broad rule, a transient
@@ -549,7 +565,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         # gate goes away and it is unconditional. A session first flushed
         # as "claude" self-heals to "cursor" on its next real-platform
         # receive (server-side monotonic platform heal).
-        "source_platform": "cursor" if env == "staging" else "claude",
+        "source_platform": "cursor" if _is_staging(env) else "claude",
         "flush": flush_mode,
     }
     if room:
