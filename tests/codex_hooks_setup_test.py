@@ -2,7 +2,9 @@
 """Setup and trampoline tests for the Codex user-hooks bridge (stdlib only)."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -186,6 +188,29 @@ def test_runner_copy_failure_does_not_publish_hooks():
         assert not list(home.glob("hooks.json.memhub-backup-*"))
         assert not (home / "memhub_hook_bridge.py").exists()
     print("PASS test_runner_copy_failure_does_not_publish_hooks")
+
+
+def test_cli_reports_filesystem_failure_without_traceback():
+    real_install = setup.install
+    real_argv = sys.argv
+
+    def fail_install(_home):
+        raise OSError("simulated filesystem failure")
+
+    setup.install = fail_install
+    sys.argv = ["setup_codex_hooks.py", "install", "--codex-home", "/unused"]
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            assert setup.main() == 2
+    finally:
+        setup.install = real_install
+        sys.argv = real_argv
+
+    assert output.getvalue().strip() == (
+        "MemHub Codex hooks: ERROR: simulated filesystem failure"
+    )
+    print("PASS test_cli_reports_filesystem_failure_without_traceback")
 
 
 def test_runner_selects_latest_known_install():

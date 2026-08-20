@@ -261,7 +261,7 @@ def main() -> int:
         healthy, actual, expected = status(home)
         print(f"MemHub Codex hooks: {'OK' if healthy else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
         return 0 if healthy else 1
-    except SetupError as exc:
+    except (SetupError, OSError) as exc:
         print(f"MemHub Codex hooks: ERROR: {exc}")
         return 2
 
