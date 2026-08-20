@@ -257,6 +257,9 @@ def test_is_staging_backend() -> None:
         # extracts the host without validating the port, so no ValueError
         ("scp-style git remote", "git@github.com:XTraceAI/repo.git", F),
         ("empty", "", F),
+        # a non-str url (None from resolve_bearer) must fail safe, not raise
+        # TypeError from the `"://" in url` normalization into the platform gate
+        ("non-str url", None, F),
     ]
     for name, url, want in cases:
         check(name, rm.is_staging_backend(url), want)

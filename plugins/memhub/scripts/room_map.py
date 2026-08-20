@@ -79,6 +79,9 @@ def is_staging_backend(url: str) -> bool:
     positive sends "cursor"/"codex" to prod and fails the whole import. A
     host like ``staging-corp.com`` or a ``/staging`` path no longer matches;
     ``api.staging.memhub.xtrace.ai`` does."""
+    if not isinstance(url, str):
+        return False  # a None/non-str url (e.g. from resolve_bearer) must not
+        #               raise into the platform gate — fail safe to "claude".
     from urllib.parse import urlparse
     try:
         # A scheme-less config ("host/path") parses as all-path with hostname
