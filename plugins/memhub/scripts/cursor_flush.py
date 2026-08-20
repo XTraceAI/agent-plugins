@@ -612,8 +612,12 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         # Same scope stamp flush_turn sends: directives extracted from this
         # session must recall in this repo's context, not everywhere.
         arguments["namespace"] = namespace
-    if meta.get("title"):
-        arguments["title"] = meta["title"]
+    title = meta.get("title")
+    if isinstance(title, str) and title.strip():
+        # Bound a semi-trusted session title (store content, like cwd): a
+        # non-str from a corrupt meta is dropped rather than sent as-is, and a
+        # runaway length is capped so it can't bloat every re-send.
+        arguments["title"] = title.strip()[:200]
 
     try:
         res = await session.call_tool("import_conversation",

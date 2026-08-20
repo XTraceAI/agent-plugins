@@ -252,6 +252,10 @@ def test_is_staging_backend() -> None:
         ("staging as infix, not a label", "https://staging-corp.example.com", F),
         ("staging only in the path", "https://api.memhub.xtrace.ai/staging", F),
         ("substring of another label", "https://notstaging.example.com", F),
+        # an scp-style git remote is never fed here (the input is the MCP base
+        # URL), but must not crash or false-positive if one ever is: .hostname
+        # extracts the host without validating the port, so no ValueError
+        ("scp-style git remote", "git@github.com:XTraceAI/repo.git", F),
         ("empty", "", F),
     ]
     for name, url, want in cases:
