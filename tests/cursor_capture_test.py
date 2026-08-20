@@ -131,6 +131,11 @@ def test_import_must_be_confirmed_before_advancing():
     confirmed.append(_res(None, [
         _json.dumps({"level": "info", "msg": "queued"}),
         _json.dumps({"conversation_id": "c", "ack_through": "u"})]))
+    # a wrapper carrying conversation_id with a NULL ack must not outrank the
+    # real acknowledged payload inside its `result`
+    confirmed.append(_res({"conversation_id": "c", "ack_through": None,
+                           "result": {"conversation_id": "c",
+                                      "ack_through": "u9"}}))
     confirmed.append(_res(None, ["saved!", _json.dumps(
         {"conversation_id": "c", "ack_through": "u"})]))
     unconfirmed = [

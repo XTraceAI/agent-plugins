@@ -347,10 +347,17 @@ def ack_of(res) -> dict | None:
             candidates.append(parsed)
             if isinstance(parsed.get("result"), dict):
                 candidates.append(parsed["result"])
-    for c in candidates:
-        if "conversation_id" in c:
+    # Among the shapes that look like an ack, prefer one that actually
+    # CONFIRMS persistence. Order alone is not enough: a wrapper can carry
+    # conversation_id at the top level with a null ack while the real,
+    # acknowledged payload sits in its ``result`` — picking by position would
+    # then report a healthy import as unconfirmed and re-upload the whole
+    # transcript on every later event.
+    acks = [c for c in candidates if "conversation_id" in c]
+    for c in acks:
+        if c.get("ack_through"):
             return c
-    return None
+    return acks[0] if acks else None
 
 
 class Session:
