@@ -223,8 +223,15 @@ def _save_state(uuid: str, **fields) -> None:
             fh.close()
 
 
-def _acquire(uuid: str) -> int | None:
-    """Non-blocking per-session flock, or None when a flush is already running.
+def _acquire(uuid: str, blocking: bool = False) -> int | None:
+    """Per-session flock. Non-blocking returns None when held; blocking WAITS.
+
+    Turn-boundary events (stop / beforeSubmitPrompt) pass blocking=True: a
+    boundary that lost this lock to a concurrent flush might be the session's
+    last event and never retry. The peer's flush is bounded by
+    asyncio.wait_for, and the boundary runs detached, so waiting is cheap;
+    should_flush re-checks after acquiring so nothing is re-sent.
+
 
     Both a milestone shell event and a turn boundary can fire within the same
     second, and cursor_capture.sh detaches each into its own process — so two
@@ -250,7 +257,7 @@ def _acquire(uuid: str) -> int | None:
     fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.flush.lock",
                  os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
     try:
-        portable_lock.lock_exclusive(fd, blocking=False)
+        portable_lock.lock_exclusive(fd, blocking=blocking)
     except OSError:
         os.close(fd)
         return None
@@ -597,7 +604,13 @@ def main() -> int:
     # Serialize the whole check-then-act: reading the watermark, sending, and
     # writing it back must not interleave with a concurrent flush for this
     # session, or both upload the same transcript and race the watermark.
-    lock_fd = _acquire(uuid)
+    # Turn boundaries (stop / beforeSubmitPrompt) are last-chance events — a
+    # session may have no later flush — so they WAIT for a concurrent flush
+    # rather than skip and never run again. Mid-turn events (edits, milestone
+    # shell) skip when busy: another will follow. Once acquired, should_flush
+    # re-checks new-blobs, so a waited boundary ships only the delta or no-ops.
+    lock_fd = _acquire(uuid,
+                       blocking=(event in ("stop", "beforeSubmitPrompt")))
     if lock_fd is None:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
