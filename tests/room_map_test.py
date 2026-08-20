@@ -113,6 +113,65 @@ def test_room_name_from_remote() -> None:
         check("outside a repo -> None", rm.room_name(Path(td)), None)
 
 
+def test_git_local_config_execution_is_disarmed() -> None:
+    """Capture supplies cwd, so every git probe must neutralize repo config."""
+    print("git hardening")
+    cmd = rm.git_readonly("/tmp/untrusted-repo")
+    check("git command keeps cwd out of option position",
+          cmd[:3], ["git", "-C", "/tmp/untrusted-repo"])
+    check("fsmonitor command disabled",
+          ["-c", "core.fsmonitor="] in [cmd[i:i + 2]
+                                        for i in range(len(cmd) - 1)], True)
+    check("hooks redirected",
+          ["-c", "core.hooksPath=/dev/null"] in [cmd[i:i + 2]
+                                                   for i in range(len(cmd) - 1)],
+          True)
+    check("credential helpers disabled",
+          ["-c", "credential.helper="] in [cmd[i:i + 2]
+                                            for i in range(len(cmd) - 1)], True)
+    check("ext transports disabled",
+          ["-c", "protocol.ext.allow=never"] in [cmd[i:i + 2]
+                                                  for i in range(len(cmd) - 1)],
+          True)
+
+    env = rm.git_env()
+    check("system config disabled", env.get("GIT_CONFIG_NOSYSTEM"), "1")
+    check("terminal prompts disabled", env.get("GIT_TERMINAL_PROMPT"), "0")
+    check("askpass disabled", env.get("GIT_ASKPASS"), "")
+    check("ssh askpass disabled", env.get("SSH_ASKPASS"), "")
+    check("bearer-bearing process env is not inherited",
+          "MEMHUB_ACCESS_TOKEN" in env, False)
+
+    # Prove the highest-risk primitive, not just the argv shape. Git executes a
+    # repo-local core.fsmonitor command under an ordinary status probe; the
+    # shared helper must suppress the same command. Git for Windows has
+    # different shebang dispatch, so its portable contract is pinned above.
+    if os.name != "nt":
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            repo = _repo(tmp, None)
+            marker = tmp / "PWNED"
+            hook = tmp / "fsmonitor"
+            hook.write_text(
+                f"#!{sys.executable}\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed')\n"
+            )
+            hook.chmod(0o700)
+            _git(repo, "config", "--local", "core.fsmonitor", str(hook))
+
+            subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
+                           check=True, capture_output=True, text=True)
+            check("poisoned repo executes under plain git", marker.exists(), True)
+
+            marker.unlink(missing_ok=True)
+            subprocess.run(rm.git_readonly(repo) + ["status", "--porcelain"],
+                           env=rm.git_env(), check=True, capture_output=True,
+                           text=True)
+            check("hardened probe suppresses poisoned config",
+                  marker.exists(), False)
+
+
 def test_write_then_read_per_backend() -> None:
     print("write/read")
     _fresh_rooms()
@@ -359,7 +418,9 @@ def test_forget_outside_a_repo_is_safe() -> None:
 
 
 if __name__ == "__main__":
-    for test in (test_room_name_from_remote, test_write_then_read_per_backend,
+    for test in (test_room_name_from_remote,
+                 test_git_local_config_execution_is_disarmed,
+                 test_write_then_read_per_backend,
                  test_forget_room, test_forget_outside_a_repo_is_safe,
                  test_reads_never_raise, test_concurrent_writers_dont_lose_entries,
                  test_non_string_brain_id_is_rejected, test_env_keying,
