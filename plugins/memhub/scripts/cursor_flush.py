@@ -70,6 +70,13 @@ FLUSH_TIMEOUT_S = 240.0
 # that an unfixed server costs one wasted upload an hour, short enough that a
 # fix takes effect inside a working session.
 DORMANT_RETRY_S = 1800.0
+# "Unconfirmed" is retried because it is usually transient. A server that
+# returns it FOREVER (always records_dropped>0, say) would otherwise re-parse,
+# re-redact and re-upload the whole transcript on every event for the life of
+# the session, bounded only by the debounce. After this many consecutive
+# unconfirmed replies the session goes dormant like an unsupported one — and
+# re-probes on the same timer, so a fixed server still heals.
+MAX_UNCONFIRMED = 5
 
 # The milestone must be in COMMAND POSITION, not merely mentioned: `.*` with
 # DOTALL matched `git log --oneline | grep commit` and even
@@ -350,6 +357,7 @@ def _namespace_of(cwd: str | None) -> str | None:
 
 async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
                  flush_mode: str = "now") -> None:
+    state_before = _read_state(uuid)
     records, meta = cursor_reader.to_canonical(store_db)
     # Close the read span IMMEDIATELY — before redaction and the network call,
     # which together can run for many seconds. Blobs present at both the gate
@@ -480,8 +488,17 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
                     unsupported_at=time.time())
         return
     if verdict != "ok":
-        _save_state(uuid, last_flush_at=time.time(),
-                    last_error="unconfirmed_import")
+        streak = int(state_before.get("unconfirmed_streak") or 0) + 1
+        if streak >= MAX_UNCONFIRMED:
+            _log(f"{streak} consecutive unconfirmed imports — per-event flush "
+                 f"is dormant for this session; run /memhub:import-session to "
+                 f"capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
+            _save_state(uuid, last_flush_at=time.time(), unsupported=True,
+                        unsupported_at=time.time(), unconfirmed_streak=streak)
+        else:
+            _save_state(uuid, last_flush_at=time.time(),
+                        last_error="unconfirmed_import",
+                        unconfirmed_streak=streak)
         return
 
     # `shipped` was fixed at the end of the transcript read (see above), NOT
@@ -492,7 +509,8 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
               "last_error": None,
               # The re-probe worked: this server confirms after all, so the
               # session re-arms instead of staying dormant on old evidence.
-              "unsupported": False, "unsupported_at": 0}
+              "unsupported": False, "unsupported_at": 0,
+              "unconfirmed_streak": 0}
     if shipped is not None:
         fields["blob_ids"] = sorted(shipped)
     else:
