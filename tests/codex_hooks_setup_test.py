@@ -152,6 +152,42 @@ def test_malformed_existing_file_is_never_overwritten():
     print("PASS test_malformed_existing_file_is_never_overwritten")
 
 
+def test_runner_copy_failure_does_not_publish_hooks():
+    with tempfile.TemporaryDirectory() as raw:
+        home = Path(raw)
+        hooks_path = home / "hooks.json"
+        hooks_path.write_text(
+            json.dumps({
+                "description": "keep exactly",
+                "hooks": {"Stop": [{"hooks": [{
+                    "type": "command", "command": "echo existing",
+                }]}]},
+            }),
+            encoding="utf-8",
+        )
+        original = hooks_path.read_bytes()
+        real_copy = setup._copy_runner
+
+        def fail_copy(_path):
+            raise OSError("simulated runner copy failure")
+
+        setup._copy_runner = fail_copy
+        try:
+            try:
+                setup.install(home)
+            except OSError as exc:
+                assert "simulated runner copy failure" in str(exc)
+            else:
+                raise AssertionError("runner copy failure should abort setup")
+        finally:
+            setup._copy_runner = real_copy
+
+        assert hooks_path.read_bytes() == original
+        assert not list(home.glob("hooks.json.memhub-backup-*"))
+        assert not (home / "memhub_hook_bridge.py").exists()
+    print("PASS test_runner_copy_failure_does_not_publish_hooks")
+
+
 def test_runner_selects_latest_known_install():
     with tempfile.TemporaryDirectory() as raw:
         home = Path(raw)
