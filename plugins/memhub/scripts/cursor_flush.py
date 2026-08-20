@@ -253,6 +253,31 @@ def should_flush(event: str, payload: dict, state: dict,
     return False
 
 
+# Reading a remote URL means reading the TARGET repo's own config — that is
+# the data we want — but a repo's local config can also carry execution
+# primitives (core.fsmonitor runs a command, credential helpers run on
+# network access, hooksPath redirects hooks). The store's cwd is
+# semi-trusted, so those are disarmed explicitly rather than relying on
+# `remote get-url` not happening to reach them today. Verified: a repo whose
+# core.fsmonitor is a command runs it under plain git and does not here.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
+    "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
+    "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
+    "GIT_ASKPASS": "",
+    "SSH_ASKPASS": "",
+}
+
+
+def _git_readonly(cwd: str) -> list[str]:
+    return ["git", "-C", cwd,
+            "-c", "core.fsmonitor=",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "credential.helper=",
+            "-c", "protocol.ext.allow=never"]
+
+
 def _cwd_ok(cwd: str | None) -> bool:
     """``cwd`` is read out of the cursor STORE, so it is session content, not
     a trusted path. Anything handed to `git -C` must be an absolute existing
@@ -274,8 +299,8 @@ def _namespace_of(cwd: str | None) -> str | None:
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2,
+            _git_readonly(cwd) + ["remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2, env=_GIT_ENV,
         )
         url = out.stdout.strip()
         if out.returncode == 0 and url:
