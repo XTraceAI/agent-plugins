@@ -43,7 +43,6 @@ import asyncio
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import time
@@ -298,16 +297,24 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # nearly nothing and re-send the same content on every later hook.
     try:
         shipped = blob_ids & current_blob_ids(store_db)
-    except (sqlite3.Error, OSError) as e:
+    except Exception as e:  # noqa: BLE001 — see below
         # Unreadable mid-flush: we cannot say which blobs survived the read,
         # so the watermark is left ALONE rather than advanced to the gate set
         # — claiming the full set would mark blobs shipped that a checkpoint
         # restore may have removed before the payload was built. Cost is one
         # redundant re-send on the next event, the documented safe direction.
-        # Narrow on purpose: a locked/mid-write store is transient and this is
-        # right, but a PERSISTENT failure (a schema change renaming `blobs`)
-        # would re-send the whole transcript on every hook forever, so it is
-        # logged loudly rather than hidden behind a bare except.
+        # BROAD on purpose. This read exists only to decide what to record
+        # in the watermark — a local optimization. Letting any failure out of
+        # here would unwind past redact/send and drop an upload we already
+        # have the records for, trading a redundant re-send (cheap, the
+        # server folds it forward) for a lost one (only healed by a later
+        # hook). Narrowing to sqlite3.Error/OSError left TypeError,
+        # MemoryError and driver-specific classes escaping into exactly that.
+        # The visibility this catch would otherwise cost is bought back by
+        # the log below rather than by a narrower clause: a transient
+        # locked/mid-write store is the expected case, while a PERSISTENT
+        # failure (a schema change renaming `blobs`) re-sends the whole
+        # transcript on every hook forever and has to be findable.
         _log(f"blob read failed after the transcript read ({e!r}) — watermark "
              f"held; if this repeats every flush, the store schema has moved "
              f"and readers/cursor.py needs updating")
