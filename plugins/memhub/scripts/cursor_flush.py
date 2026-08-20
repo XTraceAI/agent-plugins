@@ -332,8 +332,14 @@ def session_uuid(payload: dict) -> str | None:
 
 def current_blob_ids(store_db: Path) -> set[str]:
     import sqlite3
-    con = sqlite3.connect(f"file:{store_db}?mode=ro", uri=True)
+    # 3s busy_timeout: Cursor is often mid-write (a checkpoint restore, an
+    # active turn), and without it sqlite raises "database is locked"
+    # instantly. On the _flush read path that holds the watermark, so a
+    # consistently-busy store would re-send the whole transcript on every
+    # event; a short wait turns a transient lock into a brief pause instead.
+    con = sqlite3.connect(f"file:{store_db}?mode=ro", uri=True, timeout=3.0)
     try:
+        con.execute("PRAGMA busy_timeout=3000")
         return {row[0] for row in con.execute("SELECT id FROM blobs")}
     finally:
         con.close()
