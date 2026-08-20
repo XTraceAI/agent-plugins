@@ -193,10 +193,16 @@ def install(home: Path) -> tuple[bool, int, Path | None]:
     current = _load_json(hooks_path)
     bridge = _bridge_for_home(_load_json(BRIDGE_SOURCE), home)
     merged = merge_hooks(current, bridge)
-    changed = merged != current or not runner_path.exists() or (
+    runner_changed = not runner_path.exists() or (
         runner_path.read_bytes() != RUNNER_SOURCE.read_bytes()
     )
+    changed = merged != current or runner_changed
     backup = None
+    # Publish the runner before any hook can reference it. If this copy fails,
+    # hooks.json remains byte-for-byte unchanged instead of pointing at a
+    # missing or stale bridge.
+    if runner_changed:
+        _copy_runner(runner_path)
     if changed and hooks_path.exists() and merged != current:
         fd, backup_name = tempfile.mkstemp(
             prefix=f"hooks.json.memhub-backup-{time.strftime('%Y%m%d-%H%M%S')}-",
@@ -208,8 +214,6 @@ def install(home: Path) -> tuple[bool, int, Path | None]:
     if merged != current:
         old_mode = stat.S_IMODE(hooks_path.stat().st_mode) if hooks_path.exists() else 0o600
         _write_atomic(hooks_path, merged, old_mode)
-    if not runner_path.exists() or runner_path.read_bytes() != RUNNER_SOURCE.read_bytes():
-        _copy_runner(runner_path)
     return changed, _handler_count(bridge), backup
 
 
@@ -257,7 +261,7 @@ def main() -> int:
         healthy, actual, expected = status(home)
         print(f"MemHub Codex hooks: {'OK' if healthy else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
         return 0 if healthy else 1
-    except SetupError as exc:
+    except (SetupError, OSError) as exc:
         print(f"MemHub Codex hooks: ERROR: {exc}")
         return 2
 
