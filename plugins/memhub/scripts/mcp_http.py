@@ -318,7 +318,7 @@ def texts_of(res) -> list[str]:
                         for b in getattr(res, "content", []) or []) if t]
 
 
-def ack_of(res) -> dict | None:
+def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
     """The import ack carried by a tool result, or None if it carries none.
 
     A server may answer with structuredContent, a FastMCP ``result`` wrapper,
@@ -354,6 +354,16 @@ def ack_of(res) -> dict | None:
     # then report a healthy import as unconfirmed and re-upload the whole
     # transcript on every later event.
     acks = [c for c in candidates if "conversation_id" in c]
+    if expected_conversation_id is not None:
+        # An ack only confirms OUR import. The server echoes back the
+        # client-supplied conversation_id (MemHub-Backend mcp_server.py: the
+        # ack's `conversation_id` is the request's `conv`), so an ack naming
+        # a different id — a batched or diagnostic echo for another
+        # conversation — must not advance THIS session's watermark. A
+        # mismatch drops to no-ack, i.e. "unconfirmed": hold and retry, the
+        # safe direction.
+        acks = [c for c in acks
+                if c.get("conversation_id") == expected_conversation_id]
     for c in acks:
         if c.get("ack_through"):
             return c

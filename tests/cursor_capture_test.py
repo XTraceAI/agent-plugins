@@ -156,6 +156,14 @@ def test_import_verdicts_and_dormancy():
                           "result": {"conversation_id": "c",
                                      "ack_through": None}})) == "unconfirmed"
 
+    # An ack must confirm OUR conversation, not merely SOME conversation: the
+    # server echoes the client-supplied id, so an ack naming a different one
+    # (a batched/diagnostic echo) must not advance this session's watermark.
+    assert _verdict(_res({"conversation_id": "cursor-mine", "ack_through": "u"}),
+                    "cursor-mine") == "ok"
+    assert _verdict(_res({"conversation_id": "cursor-other", "ack_through": "u"}),
+                    "cursor-mine") == "unconfirmed"
+
     # A dormant session stops flushing on every event, not just some...
     dormant = {"unsupported": True, "unsupported_at": 1_000.0}
     for event in ("stop", "beforeSubmitPrompt", "afterFileEdit",

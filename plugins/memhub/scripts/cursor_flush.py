@@ -279,7 +279,7 @@ def should_flush(event: str, payload: dict, state: dict,
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today. Verified: a repo whose
 # core.fsmonitor is a command runs it under plain git and does not here.
-def _verdict(res) -> str:
+def _verdict(res, expected_conversation_id: str | None = None) -> str:
     """``"ok"`` | ``"unconfirmed"`` | ``"unsupported"`` for an import reply.
 
     MCP reports tool failure through isError, not an exception, and this
@@ -299,7 +299,7 @@ def _verdict(res) -> str:
     if getattr(res, "isError", False):
         _log(f"server rejected the import: {mcp_http.texts_of(res)[:1]}")
         return "unconfirmed"
-    ack = mcp_http.ack_of(res)
+    ack = mcp_http.ack_of(res, expected_conversation_id)
     if ack is None:
         _log("import response unrecognized — holding the watermark")
         return "unconfirmed"
@@ -475,7 +475,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # event to re-send it, that is a silently lost conversation. So: confirm
     # the ack, or hold the watermark and let the next event re-send. Mirrors
     # flush_turn's discipline on the Claude path.
-    verdict = _verdict(res)
+    verdict = _verdict(res, f"cursor-{uuid}")
     if verdict == "unsupported":
         # Dormant for this session rather than looping: the watermark stays
         # put (nothing is claimed shipped) and no further flush runs, so an
