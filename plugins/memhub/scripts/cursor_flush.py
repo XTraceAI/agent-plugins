@@ -295,6 +295,11 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # send instead, this read would span the entire round trip, and a
     # checkpoint restore in that window could shrink the intersection to
     # nearly nothing and re-send the same content on every later hook.
+    # Bound BEFORE the try so its definedness never depends on how broad the
+    # clause below happens to be — that breadth has already changed twice
+    # under review, and the reader below must not be one edit away from an
+    # UnboundLocalError.
+    shipped: set[str] | None = None
     try:
         shipped = blob_ids & current_blob_ids(store_db)
     except Exception as e:  # noqa: BLE001 — see below
