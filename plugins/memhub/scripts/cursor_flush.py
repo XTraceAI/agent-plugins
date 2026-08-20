@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -176,6 +177,35 @@ def _save_state(uuid: str, **fields) -> None:
             fh.close()
 
 
+def _acquire(uuid: str) -> int | None:
+    """Non-blocking per-session flock, or None when a flush is already running.
+
+    Both a milestone shell event and a turn boundary can fire within the same
+    second, and cursor_capture.sh detaches each into its own process — so two
+    flushes would read the same watermark, both re-read and re-redact the whole
+    transcript, both upload it, and then race to write the watermark back. The
+    loser of this lock is redundant by construction: the holder is sending the
+    same (or newer) content.
+
+    flock rather than a lockfile because the kernel owns the lifetime — it
+    releases on process exit however that happens, so there is no such thing as
+    a stale one to reclaim. The caller must keep the fd OPEN; closing releases.
+
+    A DISTINCT file from _save_state's .lock: flock is per open-file-
+    description, so taking both on one path would deadlock this process
+    against itself.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.flush.lock",
+                 os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        portable_lock.lock_exclusive(fd, blocking=False)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def session_uuid(payload: dict) -> str | None:
     """The session identity a hook carries. ``session_id`` when present;
     else derived from ``transcript_path`` (…/agent-transcripts/<uuid>/…)."""
@@ -271,6 +301,13 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         shipped = None
     sendable = redact_records(records)
     if not sendable:
+        # Nothing to send, but this content HAS been examined: record it so
+        # afterFileEdit doesn't re-parse and re-redact the same transcript on
+        # every edit. Watermark only when the read could be verified.
+        fields = {"last_flush_at": time.time()}
+        if shipped is not None:
+            fields["blob_ids"] = sorted(shipped)
+        _save_state(uuid, **fields)
         return
 
     url, bearer = await asyncio.to_thread(resolve_bearer)
@@ -379,16 +416,25 @@ def main() -> int:
         _log(f"{event}: store reports zero blobs (rebuilding?) — skipping")
         return 0
 
-    state = _read_state(uuid)
-    if not should_flush(event, payload, state, blob_ids, time.time()):
+    # Serialize the whole check-then-act: reading the watermark, sending, and
+    # writing it back must not interleave with a concurrent flush for this
+    # session, or both upload the same transcript and race the watermark.
+    lock_fd = _acquire(uuid)
+    if lock_fd is None:
+        _log(f"{event}: another flush is running for this session — skipping")
         return 0
-
     try:
-        mode = _FLUSH_MODE.get(event, "now")
-        asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids, mode),
-                                     timeout=FLUSH_TIMEOUT_S))
-    except Exception as e:
-        _log(f"{event}: flush error: {e}")
+        state = _read_state(uuid)
+        if not should_flush(event, payload, state, blob_ids, time.time()):
+            return 0
+        try:
+            mode = _FLUSH_MODE.get(event, "now")
+            asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids, mode),
+                                         timeout=FLUSH_TIMEOUT_S))
+        except Exception as e:
+            _log(f"{event}: flush error: {e}")
+    finally:
+        os.close(lock_fd)  # releases the flock
     return 0
 
 
