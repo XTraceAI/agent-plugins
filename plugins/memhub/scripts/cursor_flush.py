@@ -578,9 +578,13 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
             # Advance the debounce (like the empty-redaction / no-credential
             # paths): a persistent resolve failure — a wedged git subprocess,
             # a repeatedly-failing brain resolve — would otherwise re-run the
-            # full parse + redact + 2s git probe on every afterFileEdit.
+            # full parse + redact + 2s git probe on every afterFileEdit. And
+            # like those paths, CLEAR fail_streak: the server was never
+            # contacted, so this neutral no-op must not preserve a prior run
+            # of contacted failures that a later single failure tips into
+            # dormancy (see _note_failure's documented contract).
             _save_state(uuid, last_error="resolve_error",
-                        last_flush_at=time.time())
+                        last_flush_at=time.time(), fail_streak=0)
             return
     else:
         if cwd:
