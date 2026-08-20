@@ -312,6 +312,47 @@ def list_tools(url: str, bearer: str,
             or [])
 
 
+def texts_of(res) -> list[str]:
+    """The text blocks of a tool result, in order."""
+    return [t for t in (getattr(b, "text", None)
+                        for b in getattr(res, "content", []) or []) if t]
+
+
+def ack_of(res) -> dict | None:
+    """The import ack carried by a tool result, or None if it carries none.
+
+    A server may answer with structuredContent, a FastMCP ``result`` wrapper,
+    one or more JSON text blocks, or a mix — and the ack is not necessarily
+    the FIRST parseable one: a diagnostic object ahead of it would otherwise
+    be mistaken for the answer and read as "unrecognized", making a healthy
+    server look like a failing one and re-uploading the transcript on every
+    event. So every candidate is collected and the one that actually looks
+    like an ack (carries ``conversation_id``) wins.
+
+    Lives here rather than in each capture script because both flushers need
+    exactly this and a bug in it is a bug in both.
+    """
+    candidates: list[dict] = []
+    out = getattr(res, "structuredContent", None)
+    if isinstance(out, dict):
+        candidates.append(out)
+        if isinstance(out.get("result"), dict):
+            candidates.append(out["result"])
+    for text in texts_of(res):
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            candidates.append(parsed)
+            if isinstance(parsed.get("result"), dict):
+                candidates.append(parsed["result"])
+    for c in candidates:
+        if "conversation_id" in c:
+            return c
+    return None
+
+
 class Session:
     """An SDK-compatible ``call_tool`` over this transport.
 

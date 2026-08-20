@@ -126,6 +126,13 @@ def test_import_must_be_confirmed_before_advancing():
         _res({"result": {"conversation_id": "c", "ack_through": "u"}}),
         _res(None, [_json.dumps({"conversation_id": "c", "ack_through": "u"})]),
     ]
+    # a diagnostic JSON block AHEAD of the ack must not be mistaken for it —
+    # that read a healthy server as failing and re-uploaded every event
+    confirmed.append(_res(None, [
+        _json.dumps({"level": "info", "msg": "queued"}),
+        _json.dumps({"conversation_id": "c", "ack_through": "u"})]))
+    confirmed.append(_res(None, ["saved!", _json.dumps(
+        {"conversation_id": "c", "ack_through": "u"})]))
     unconfirmed = [
         _res({"conversation_id": "c", "ack_through": None, "records_dropped": 6}),
         _res({"conversation_id": "c", "ack_through": "u"}, is_error=True),

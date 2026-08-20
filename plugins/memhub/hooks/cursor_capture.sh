@@ -10,7 +10,14 @@
 # observed pointing at a DIFFERENT plugin's cache (Spike C) — never trust it.
 EVENT="${1:-unknown}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
-TMP="$(mktemp "${TMPDIR:-/tmp}/memhub-cursor-hook.XXXXXX")" || exit 0
+# The verdict is the ONLY thing the agent is blocked on, so every exit path
+# prints it — including this one. Exiting quiet when /tmp is full would hang
+# or default-deny the user's command, which is precisely the gating this
+# shim exists to prevent.
+TMP="$(mktemp "${TMPDIR:-/tmp}/memhub-cursor-hook.XXXXXX")" || {
+  printf '{"permission":"allow"}\n'
+  exit 0
+}
 cat > "$TMP"
 # nohup + its own stdin/stdout: `( … ) &` alone leaves the child in the
 # hook's process group, so it can take SIGHUP when Cursor reaps the hook and

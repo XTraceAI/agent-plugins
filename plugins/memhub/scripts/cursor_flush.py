@@ -260,43 +260,26 @@ def should_flush(event: str, payload: dict, state: dict,
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today. Verified: a repo whose
 # core.fsmonitor is a command runs it under plain git and does not here.
-def _texts(res) -> list[str]:
-    return [t for t in (getattr(b, "text", None)
-                        for b in getattr(res, "content", []) or []) if t]
-
-
 def _persisted(res) -> bool:
     """True only when the server CONFIRMS it stored the records.
 
     MCP reports tool failure through isError, not an exception, and this
     backend has shipped a mode where records are dedup-registered WITHOUT
     being persisted (records_dropped>0, ack_through null) — the failure that
-    hid Cursor sessions for months. Requires a recognizable ack
-    (structuredContent, a FastMCP ``result`` wrapper, or a JSON text block)
-    carrying conversation_id and a non-null ack_through. A server predating
-    ack_through cannot be distinguished from one that dropped everything, so
-    it counts as unconfirmed: re-sending is free, losing a session is not.
+    hid Cursor sessions for months. A server predating ack_through cannot be
+    told apart from one that dropped everything, so it counts as unconfirmed:
+    re-sending is free, losing a session is not.
     """
     if getattr(res, "isError", False):
-        _log(f"server rejected the import: {_texts(res)[:1]}")
+        _log(f"server rejected the import: {mcp_http.texts_of(res)[:1]}")
         return False
-    out = getattr(res, "structuredContent", None)
-    if isinstance(out, dict) and "conversation_id" not in out \
-            and isinstance(out.get("result"), dict):
-        out = out["result"]           # FastMCP wraps some returns
-    if not isinstance(out, dict):
-        for text in _texts(res):
-            try:
-                out = json.loads(text)
-                break
-            except json.JSONDecodeError:
-                continue
-    if not isinstance(out, dict) or "conversation_id" not in out:
+    ack = mcp_http.ack_of(res)
+    if ack is None:
         _log("import response unrecognized — holding the watermark")
         return False
-    if not out.get("ack_through"):
+    if not ack.get("ack_through"):
         _log(f"import NOT confirmed (ack_through null, dropped="
-             f"{out.get('records_dropped')}) — holding the watermark so the "
+             f"{ack.get('records_dropped')}) — holding the watermark so the "
              f"next event re-sends")
         return False
     return True
@@ -307,9 +290,14 @@ def _cwd_ok(cwd: str | None) -> bool:
     a trusted path. Anything handed to `git -C` must be an absolute existing
     directory that cannot be read as an option — git honors the local config
     of whatever repository it is pointed at."""
+    # isinstance FIRST: the store is content, not a contract — a corrupt or
+    # hostile meta.json can carry a list or a number here, and .startswith
+    # would raise AttributeError, which the clause below does not catch and
+    # which would cost the whole flush.
+    if not isinstance(cwd, str) or not cwd or cwd.startswith("-"):
+        return False
     try:
-        return bool(cwd) and not cwd.startswith("-") and \
-            Path(cwd).is_absolute() and Path(cwd).is_dir()
+        return Path(cwd).is_absolute() and Path(cwd).is_dir()
     except (OSError, ValueError):
         return False
 
