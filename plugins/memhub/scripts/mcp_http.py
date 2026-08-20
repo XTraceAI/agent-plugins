@@ -312,6 +312,87 @@ def list_tools(url: str, bearer: str,
             or [])
 
 
+def texts_of(res) -> list[str]:
+    """The text blocks of a tool result, in order."""
+    return [t for t in (getattr(b, "text", None)
+                        for b in getattr(res, "content", []) or []) if t]
+
+
+def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
+    """The import ack carried by a tool result, or None if it carries none.
+
+    A server may answer with structuredContent, a FastMCP ``result`` wrapper,
+    one or more JSON text blocks, or a mix — and the ack is not necessarily
+    the FIRST parseable one: a diagnostic object ahead of it would otherwise
+    be mistaken for the answer and read as "unrecognized", making a healthy
+    server look like a failing one and re-uploading the transcript on every
+    event. So every candidate is collected and the one that actually looks
+    like an ack (carries ``conversation_id``) wins.
+
+    Lives here rather than in each capture script because both flushers need
+    exactly this and a bug in it is a bug in both.
+    """
+    candidates: list[dict] = []
+    out = getattr(res, "structuredContent", None)
+
+    def _add(d):
+        # A FastMCP `result` wrapper is unwrapped so a nested ack is still
+        # considered — but the id is NEVER synthesized onto it. An ack must
+        # carry its OWN conversation_id to be matched: proving the ENVELOPE
+        # is ours does not prove the ENVELOPE'S nested result is (a batched
+        # wrapper could echo our id on the envelope while its result acks a
+        # different conversation). So an id-less inner result is excluded by
+        # the expected-id filter — the conservative, unconfirmed direction.
+        # This backend returns conversation_id and ack_through together in
+        # the same object, so a real confirming ack always carries its id;
+        # the id-less-inner shape is hypothetical, and its worst case is a
+        # harmless re-send (the server dedups).
+        candidates.append(d)
+        inner = d.get("result")
+        if isinstance(inner, dict):
+            candidates.append(inner)
+
+    if isinstance(out, dict):
+        _add(out)
+    for text in texts_of(res):
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            _add(parsed)
+    # Among the shapes that look like an ack, prefer one that actually
+    # CONFIRMS persistence. Order alone is not enough: a wrapper can carry
+    # conversation_id at the top level with a null ack while the real,
+    # acknowledged payload sits in its ``result`` — picking by position would
+    # then report a healthy import as unconfirmed and re-upload the whole
+    # transcript on every later event.
+    acks = [c for c in candidates if "conversation_id" in c]
+    if expected_conversation_id is not None:
+        # An ack only confirms OUR import. The server echoes back the
+        # client-supplied conversation_id (MemHub-Backend mcp_server.py: the
+        # ack's `conversation_id` is the request's `conv`), so an ack naming
+        # a different id — a batched or diagnostic echo for another
+        # conversation — must not advance THIS session's watermark. A
+        # mismatch drops to no-ack, i.e. "unconfirmed": hold and retry, the
+        # safe direction.
+        acks = [c for c in acks
+                if c.get("conversation_id") == expected_conversation_id]
+    for c in acks:
+        if c.get("ack_through"):
+            return c
+    # Nothing confirms. Prefer a candidate that at least CARRIES the
+    # ack_through key over one that omits it: "present but null" means a
+    # server that knows the field and stored nothing (transient — retry),
+    # while "absent" means a server that cannot report at all (structural).
+    # Callers act very differently on those, so an ack-less wrapper must not
+    # shadow a null-ack payload sitting beside it.
+    for c in acks:
+        if "ack_through" in c:
+            return c
+    return acks[0] if acks else None
+
+
 class Session:
     """An SDK-compatible ``call_tool`` over this transport.
 

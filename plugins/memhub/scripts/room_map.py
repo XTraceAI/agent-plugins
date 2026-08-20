@@ -72,6 +72,32 @@ ROOMS_PATH = Path(
 DEFAULT_ENV = "production"
 
 
+def is_staging_backend(url: str) -> bool:
+    """True only when ``url``'s HOST has a ``staging`` label — stricter than
+    ``env_for_url``'s substring match, which is fine for cache-keying (a wrong
+    bucket is harmless) but NOT for the ENG-886 platform gate, where a false
+    positive sends "cursor"/"codex" to prod and fails the whole import. A
+    host like ``staging-corp.com`` or a ``/staging`` path no longer matches;
+    ``api.staging.memhub.xtrace.ai`` does."""
+    if not isinstance(url, str):
+        return False  # a None/non-str url (e.g. from resolve_bearer) must not
+        #               raise into the platform gate — fail safe to "claude".
+    from urllib.parse import urlparse
+    try:
+        # A scheme-less config ("host/path") parses as all-path with hostname
+        # None, which would read a real staging backend as prod and send
+        # "claude". Assume https when no scheme is present so the host label is
+        # always seen. (A port — host:8443 — already works: .hostname excludes
+        # it.) This also realigns the gate with env_for_url, which substring-
+        # matches the raw URL and so already treats a scheme-less staging URL
+        # as staging.
+        normalized = url if "://" in url else "https://" + url
+        host = (urlparse(normalized).hostname or "").lower()
+    except ValueError:
+        return False
+    return "staging" in host.split(".")
+
+
 def env_for_url(url: str) -> str:
     """Map an MCP endpoint to a cache key. Substring, not host equality, so a
     `MEMHUB_MCP_BASE_URL` override pointing at any staging host still keys to
@@ -95,11 +121,55 @@ def current_env() -> str:
         return DEFAULT_ENV
 
 
+# Every git call here targets a directory the CALLER supplied, and capture
+# callers get theirs from session content (a cursor store's meta.json, a codex
+# rollout) — semi-trusted by construction. Git reads the local config of
+# whatever directory it is pointed at, and that config can carry execution
+# primitives: core.fsmonitor IS a command git runs, credential helpers run on
+# network access, hooksPath redirects hooks. So every invocation in this
+# module goes through these two helpers, which disarm those and hand git only
+# the environment it needs to run — never this process's, which holds the
+# MemHub bearer.
+_GIT_KEEP = {"PATH", "HOME", "SYSTEMROOT", "SYSTEMDRIVE", "USERPROFILE",
+             "PATHEXT", "COMSPEC", "TEMP", "TMP", "TMPDIR"}
+
+
+def git_env() -> dict[str, str]:
+    """The minimal environment for a read-only git probe."""
+    env = {k: v for k, v in os.environ.items() if k.upper() in _GIT_KEEP}
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
+        # NB: global config (~/.gitconfig) is deliberately KEPT. It carries
+        # safe.directory — needed for the user's own repo when the git
+        # process runs as a different uid (CI, containers, multi-user), where
+        # dropping it makes rev-parse/remote fail "dubious ownership" and the
+        # session mis-routes to personal memory — and url.insteadOf rewrites
+        # that define the canonical remote (and thus the room name). The
+        # untrusted-cwd hardening is the git_readonly -c disarms plus this
+        # secret-free env, not nulling the user's own config.
+        "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
+        "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+    })
+    return env
+
+
+def git_readonly(cwd) -> list[str]:
+    """``git -C <cwd>`` with the config-driven execution primitives disarmed."""
+    return ["git", "-C", str(cwd),
+            "-c", "core.fsmonitor=",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "credential.helper=",
+            "-c", "protocol.ext.allow=never"]
+
+
 def repo_root(cwd: str | Path | None = None) -> Path | None:
     """The git toplevel for `cwd`, or None outside a repo."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(cwd or Path.cwd()), "rev-parse", "--show-toplevel"],
+            git_readonly(cwd or Path.cwd()) + ["rev-parse", "--show-toplevel"],
+            env=git_env(),
             capture_output=True,
             text=True,
             timeout=2,
@@ -119,8 +189,10 @@ def _no_remote_name(root: Path, cwd: str | Path | None) -> str:
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(cwd or root), "rev-parse",
-             "--path-format=absolute", "--git-common-dir"],
+            git_readonly(cwd or root) + ["rev-parse",
+                                         "--path-format=absolute",
+                                         "--git-common-dir"],
+            env=git_env(),
             capture_output=True,
             text=True,
             timeout=2,
@@ -150,10 +222,11 @@ def room_name(cwd: str | Path | None = None) -> str | None:
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            git_readonly(root) + ["remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             timeout=2,
+            env=git_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return _no_remote_name(root, cwd)

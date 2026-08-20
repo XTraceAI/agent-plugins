@@ -2,12 +2,13 @@
   "name": "memhub",
   "displayName": "MemHub",
   "version": "0.26.1",
-  "description": "XTrace MemHub team memory in Cursor: search_memory / save_artifact / import_conversation tools plus skills for artifact upload, session import, recall, handoff, and spec-driven development. Session auto-capture for Cursor arrives in a later release.",
+  "description": "XTrace MemHub team memory in Cursor: search_memory / save_artifact / import_conversation tools plus skills for artifact upload, session import, recall, handoff, and spec-driven development. Sessions are captured automatically.",
   "author": {
     "name": "XTrace"
   },
   "homepage": "https://memhub.xtrace.ai",
   "repository": "https://github.com/XTraceAI/agent-plugins",
   "category": "developer-tools",
-  "skills": ["./skills"]
+  "skills": ["./skills"],
+  "hooks": "./hooks/cursor-hooks.json"
 }
