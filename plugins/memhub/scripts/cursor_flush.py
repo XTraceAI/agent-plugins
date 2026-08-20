@@ -562,7 +562,12 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
             # boundaries retry next turn.
             _log(f"room/namespace resolve failed transiently ({e!r}) — "
                  f"retrying next event")
-            _save_state(uuid, last_error="resolve_error")
+            # Advance the debounce (like the empty-redaction / no-credential
+            # paths): a persistent resolve failure — a wedged git subprocess,
+            # a repeatedly-failing brain resolve — would otherwise re-run the
+            # full parse + redact + 2s git probe on every afterFileEdit.
+            _save_state(uuid, last_error="resolve_error",
+                        last_flush_at=time.time())
             return
     else:
         if cwd:
@@ -644,11 +649,19 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
               # session re-arms instead of staying dormant on old evidence.
               "unsupported": False, "unsupported_at": 0,
               "fail_streak": 0}
-    if shipped is not None:
-        fields["blob_ids"] = sorted(shipped)
-    else:
-        _log("store unreadable after the transcript read — watermark held, "
-             "next event re-sends")
+    # On a CONFIRMED import, advance the watermark even when the post-read
+    # failed (shipped is None): the server acked the payload, which was built
+    # from the store at GATE time, so the gate set `blob_ids` is a valid
+    # watermark. The intersection is the tighter value when we have it, but
+    # withholding entirely on a confirmed send looped a full re-upload on
+    # every (undebounced) turn boundary while the store stayed busy. A blob
+    # the gate saw but a restore then removed is gone from the store anyway,
+    # so marking it shipped loses nothing; a restore's NEW blobs have fresh
+    # ids the next flush picks up.
+    fields["blob_ids"] = sorted(shipped if shipped is not None else blob_ids)
+    if shipped is None:
+        _log("store unreadable after the transcript read — watermark advanced "
+             "to the gate set on this confirmed import")
     _save_state(uuid, **fields)
     _log(f"flushed {len(sendable)} records → cursor-{uuid}"
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
