@@ -43,6 +43,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -292,12 +293,19 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # nearly nothing and re-send the same content on every later hook.
     try:
         shipped = blob_ids & current_blob_ids(store_db)
-    except Exception:
+    except (sqlite3.Error, OSError) as e:
         # Unreadable mid-flush: we cannot say which blobs survived the read,
         # so the watermark is left ALONE rather than advanced to the gate set
         # — claiming the full set would mark blobs shipped that a checkpoint
         # restore may have removed before the payload was built. Cost is one
         # redundant re-send on the next event, the documented safe direction.
+        # Narrow on purpose: a locked/mid-write store is transient and this is
+        # right, but a PERSISTENT failure (a schema change renaming `blobs`)
+        # would re-send the whole transcript on every hook forever, so it is
+        # logged loudly rather than hidden behind a bare except.
+        _log(f"blob read failed after the transcript read ({e!r}) — watermark "
+             f"held; if this repeats every flush, the store schema has moved "
+             f"and readers/cursor.py needs updating")
         shipped = None
     sendable = redact_records(records)
     if not sendable:

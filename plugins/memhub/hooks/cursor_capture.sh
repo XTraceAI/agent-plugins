@@ -12,5 +12,15 @@ EVENT="${1:-unknown}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp "${TMPDIR:-/tmp}/memhub-cursor-hook.XXXXXX")" || exit 0
 cat > "$TMP"
-( python3 "$DIR/../scripts/cursor_flush.py" "$EVENT" < "$TMP"; rm -f "$TMP" ) >/dev/null 2>&1 &
+# nohup + its own stdin/stdout: `( … ) &` alone leaves the child in the
+# hook's process group, so it can take SIGHUP when Cursor reaps the hook and
+# lose the upload mid-flight. setsid when available adds a new session (also
+# detaching the controlling terminal); nohup is the portable floor.
+if command -v setsid >/dev/null 2>&1; then
+  setsid nohup sh -c 'python3 "$1" "$2" < "$3"; rm -f "$3"' -- \
+    "$DIR/../scripts/cursor_flush.py" "$EVENT" "$TMP" </dev/null >/dev/null 2>&1 &
+else
+  nohup sh -c 'python3 "$1" "$2" < "$3"; rm -f "$3"' -- \
+    "$DIR/../scripts/cursor_flush.py" "$EVENT" "$TMP" </dev/null >/dev/null 2>&1 &
+fi
 printf '{"permission":"allow"}\n'
