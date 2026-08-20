@@ -80,11 +80,16 @@ MAX_UNCONFIRMED = 5
 
 
 def _note_failure(uuid: str, reason: str) -> None:
-    """Record a non-ok flush outcome, escalating to dormancy after
-    MAX_UNCONFIRMED CONSECUTIVE failures of ANY kind — rate-limit, McpError,
-    timeout, or an unconfirmed import. Counting only the "unconfirmed verdict"
-    left a hard-down backend (always rate-limited / erroring) hammering the
-    server on every event forever, since dormancy never triggered.
+    """Record a SERVER-CONTACTED failure, escalating to dormancy after
+    MAX_UNCONFIRMED consecutive ones — rate-limit, McpError, timeout, or an
+    unconfirmed import. Counting only the "unconfirmed verdict" left a
+    hard-down backend (always rate-limited / erroring) hammering the server on
+    every event forever, since dormancy never triggered.
+
+    "Consecutive" means consecutive CONTACTED attempts since the last success:
+    a confirmed import clears the streak, and so does any outcome that never
+    reached the server (an empty redaction, a missing credential), so those
+    neutral no-ops cannot slowly accumulate a healthy session into dormancy.
 
     The streak resets to 0 the moment the session goes dormant, so each
     re-probe after DORMANT_RETRY_S gets a FRESH budget of attempts — a
@@ -445,14 +450,18 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         # so if redaction emptied it wrongly (an over-broad rule, a transient
         # bug) it could never be re-sent once the rule was fixed. Leaving the
         # watermark costs a re-parse on the next event, which the debounce
-        # already bounds.
-        _save_state(uuid, last_flush_at=time.time())
+        # already bounds. fail_streak clears: the server was never contacted,
+        # so this breaks any run of contacted failures (see _note_failure).
+        _save_state(uuid, last_flush_at=time.time(), fail_streak=0)
         return
 
     url, bearer = await asyncio.to_thread(resolve_bearer)
     if not bearer:
         _log("no usable credential — skipping (run /memhub:login)")
-        _save_state(uuid, last_error="no_credential")
+        # A local auth gap, not a server failure — never contacted it, so
+        # clear any failure run rather than let a login blip tip a session
+        # toward dormancy.
+        _save_state(uuid, last_error="no_credential", fail_streak=0)
         return
     env = env_for_url(url)
     session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
