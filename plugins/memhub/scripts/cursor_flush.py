@@ -262,8 +262,13 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # nearly nothing and re-send the same content on every later hook.
     try:
         shipped = blob_ids & current_blob_ids(store_db)
-    except Exception:  # store unreadable mid-flush — don't claim more
-        shipped = blob_ids  # than the gate saw; recording nothing re-sends forever
+    except Exception:
+        # Unreadable mid-flush: we cannot say which blobs survived the read,
+        # so the watermark is left ALONE rather than advanced to the gate set
+        # — claiming the full set would mark blobs shipped that a checkpoint
+        # restore may have removed before the payload was built. Cost is one
+        # redundant re-send on the next event, the documented safe direction.
+        shipped = None
     sendable = redact_records(records)
     if not sendable:
         return
@@ -329,9 +334,16 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
 
     # `shipped` was fixed at the end of the transcript read (see above), NOT
     # re-read here: a post-send read would span the whole network round trip.
-    _save_state(uuid, blob_ids=sorted(shipped),
-                last_flush_at=time.time(), last_ok_at=time.time(),
-                last_error=None)
+    # The timestamps land either way — the debounce must still hold after a
+    # successful send — but blob_ids only when we could actually verify it.
+    fields = {"last_flush_at": time.time(), "last_ok_at": time.time(),
+              "last_error": None}
+    if shipped is not None:
+        fields["blob_ids"] = sorted(shipped)
+    else:
+        _log("store unreadable after the transcript read — watermark held, "
+             "next event re-sends")
+    _save_state(uuid, **fields)
     _log(f"flushed {len(sendable)} records → cursor-{uuid}"
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
