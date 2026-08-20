@@ -49,6 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
+import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
@@ -70,8 +71,15 @@ FLUSH_TIMEOUT_S = 240.0
 # inside a `bash -lc "..."` wrapper (how agents usually deliver shell calls,
 # so a plain ^ anchor would miss real milestones).
 _MILESTONE_RE = re.compile(
+    # Position: start of text, after a shell separator, or inside a
+    # `bash -lc "..."` wrapper (how agents deliver shell calls).
     r"""(?:^|[;&|]\s*|\b(?:ba)?sh\s+-[a-z]*c\s*['"]?)\s*"""
-    r"""(?:git\s+commit|gh\s+pr)\b""")
+    # Leading wrappers an agent may prepend.
+    r"""(?:(?:sudo|env|command|time|nice)\s+(?:[A-Za-z_]\w*=\S*\s+)*)*"""
+    # Options BETWEEN the tool and the subcommand: `git -C <dir> commit` is a
+    # routine agent form, and requiring adjacency silently skipped it.
+    r"""(?:git|gh)(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+[^\s-]\S*)?)*"""
+    r"""\s+(?:commit|pr)\b""")
 
 # Server-side extraction mode per event — mirrors the Claude design, where
 # flush_turn buffers ("auto") and flush_session drains ("now" — the server
@@ -123,10 +131,35 @@ def _read_state(uuid: str) -> dict:
 
 
 def _save_state(uuid: str, **fields) -> None:
-    state = _read_state(uuid)
-    state.update(fields)
+    """Merge ``fields`` into this session's state under a per-uuid lock.
+
+    atomic_write makes each PUBLISH atomic, but the read-modify-write around
+    it is not: cursor_capture.sh runs every flush DETACHED, so an
+    afterFileEdit and a stop firing close together can both read the old
+    state and the later writer silently drops the other's blob_ids or
+    last_flush_at — regressing the watermark into redundant re-sends. The
+    lock is a separate .lock file, never the state file itself: locking a
+    file that is about to be replaced releases the lock with the old inode.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write.publish(_state_path(uuid), json.dumps(state))
+    lock_path = _state_path(uuid).with_suffix(".lock")
+    try:
+        fh = open(lock_path, "w", encoding="utf-8")
+    except OSError:  # unwritable state dir — publish unserialized rather
+        fh = None    # than lose the write entirely
+    try:
+        if fh is not None:
+            portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
+        state = _read_state(uuid)
+        state.update(fields)
+        atomic_write.publish(_state_path(uuid), json.dumps(state))
+    finally:
+        if fh is not None:
+            try:
+                portable_lock.unlock(portable_lock.fileno_of(fh))
+            except OSError:
+                pass
+            fh.close()
 
 
 def session_uuid(payload: dict) -> str | None:
@@ -171,12 +204,24 @@ def should_flush(event: str, payload: dict, state: dict,
     return False
 
 
+def _cwd_ok(cwd: str | None) -> bool:
+    """``cwd`` is read out of the cursor STORE, so it is session content, not
+    a trusted path. Anything handed to `git -C` must be an absolute existing
+    directory that cannot be read as an option — git honors the local config
+    of whatever repository it is pointed at."""
+    try:
+        return bool(cwd) and not cwd.startswith("-") and \
+            Path(cwd).is_absolute() and Path(cwd).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
 def _namespace_of(cwd: str | None) -> str | None:
     """Git-remote basename for the session's cwd — the working-context scope
     stamp, resolved client-side exactly like flush_turn._namespace (a
     worktree directory's basename would HIDE directives from the canonical
     repo's recalls)."""
-    if not cwd:
+    if not _cwd_ok(cwd):
         return None
     try:
         out = subprocess.run(

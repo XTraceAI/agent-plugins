@@ -48,13 +48,24 @@ def test_milestone_gates_shell_events():
     for quiet in ("echo 'remember to git commit later'",
                   "grep 'git commit' notes.md",
                   "man git commit",
-                  "git log --oneline | grep commit"):
+                  "git log --oneline | grep commit",
+                  "echo 'sudo git commit'",
+                  "cat prcommit.txt",
+                  "git status", "git push", "gh repo view"):
         assert not should_flush("beforeShellExecution", {"command": quiet},
                                 STALE, FRESH, NOW), quiet
     # ...while the wrapper and chained forms agents actually emit still fire
     for loud in ('bash -lc "git commit -m x"',
                  "cd repo && git commit -m x",
-                 "sh -c 'gh pr create -f'"):
+                 "sh -c 'gh pr create -f'",
+                 # options BETWEEN tool and subcommand: `git -C <dir> commit`
+                 # is a routine agent form that adjacency silently skipped
+                 "git -C /tmp/x commit -m y",
+                 "git --no-pager commit",
+                 "gh --repo o/r pr create",
+                 # leading wrappers
+                 "sudo git commit", "env FOO=1 git commit",
+                 "time git commit -m z"):
         assert should_flush("beforeShellExecution", {"command": loud},
                             STALE, FRESH, NOW), loud
     print("PASS test_milestone_gates_shell_events")
