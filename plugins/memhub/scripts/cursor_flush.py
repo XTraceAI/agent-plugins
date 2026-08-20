@@ -197,8 +197,13 @@ def _acquire(uuid: str) -> int | None:
     against itself.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # O_CLOEXEC is belt-and-braces: CPython has made os.open fds
+    # non-inheritable by default since PEP 446 (3.4), so a subprocess cannot
+    # already pin this lock past our exit — the flag states the invariant in
+    # code so a future refactor cannot quietly drop it. getattr because the
+    # constant is Unix-only and the capture scripts run on native Windows.
     fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.flush.lock",
-                 os.O_CREAT | os.O_RDWR, 0o600)
+                 os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
     try:
         portable_lock.lock_exclusive(fd, blocking=False)
     except OSError:
