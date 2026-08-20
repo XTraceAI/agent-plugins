@@ -367,7 +367,12 @@ def should_flush(event: str, payload: dict, state: dict,
     if blob_ids <= set(state.get("blob_ids") or []):
         return False
     if event == "beforeShellExecution":
-        return bool(_MILESTONE_RE.search(payload.get("command") or ""))
+        # Cap the match input: a milestone lives at command position (the
+        # first ~200 bytes cover any real `git commit` / `gh pr` prefix), and
+        # bounding the length is cheap insurance against a pathological
+        # command pegging a core, should a future regex edit reintroduce
+        # backtracking. The command itself is untrusted user text.
+        return bool(_MILESTONE_RE.search((payload.get("command") or "")[:512]))
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
     if event in ("stop", "beforeSubmitPrompt"):

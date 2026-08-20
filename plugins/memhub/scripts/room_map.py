@@ -113,6 +113,17 @@ def git_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k.upper() in _GIT_KEEP}
     env.update({
         "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
+        # Ignore GLOBAL config too (~/.gitconfig). Capture callers point git
+        # at a cwd taken from session content, so git must read ONLY the
+        # target repo's LOCAL config — the remote URL we actually want, whose
+        # execution primitives git_readonly disarms with -c. Nulling global
+        # removes an entire class of "config vector we didn't think to
+        # denylist" (a global alias, insteadOf, or a future exec hook). The
+        # one thing global carries that matters here is safe.directory, and
+        # dropping it FAILS CLOSED: git refuses a foreign-owned repo (no URL →
+        # no namespace → default room), which is the right answer for a
+        # hostile cwd. The user's own repos need no safe.directory.
+        "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
         "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
         "GIT_ASKPASS": "",
