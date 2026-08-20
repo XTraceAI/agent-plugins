@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
-from cursor_flush import session_uuid, should_flush  # noqa: E402
+from cursor_flush import _persisted, session_uuid, should_flush  # noqa: E402
 
 NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
@@ -103,6 +103,40 @@ def test_session_uuid_sources():
     assert session_uuid({"session_id": "  "}) is None   # blank → no identity
     assert session_uuid({}) is None
     print("PASS test_session_uuid_sources")
+
+
+def test_import_must_be_confirmed_before_advancing():
+    """A returned call is not a persisted call.
+
+    This backend has shipped a 200-with-nothing-stored mode (records
+    dedup-registered without persisting: ack_through null), which is what hid
+    Cursor sessions for months. Advancing the watermark on such a reply loses
+    the conversation outright when it is a session's LAST flush.
+    """
+    import json as _json
+    import types
+
+    def _res(structured=None, texts=(), is_error=False):
+        return types.SimpleNamespace(
+            structuredContent=structured, isError=is_error,
+            content=[types.SimpleNamespace(text=t) for t in texts])
+
+    confirmed = [
+        _res({"conversation_id": "cursor-x", "ack_through": "u1"}),
+        _res({"result": {"conversation_id": "c", "ack_through": "u"}}),
+        _res(None, [_json.dumps({"conversation_id": "c", "ack_through": "u"})]),
+    ]
+    unconfirmed = [
+        _res({"conversation_id": "c", "ack_through": None, "records_dropped": 6}),
+        _res({"conversation_id": "c", "ack_through": "u"}, is_error=True),
+        _res(None, ["not json"]),
+        _res({"conversation_id": "c"}),          # server predating ack_through
+    ]
+    for r in confirmed:
+        assert _persisted(r), r
+    for r in unconfirmed:
+        assert not _persisted(r), r
+    print("PASS test_import_must_be_confirmed_before_advancing")
 
 
 if __name__ == "__main__":

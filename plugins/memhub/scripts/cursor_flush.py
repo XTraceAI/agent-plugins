@@ -278,6 +278,47 @@ def _git_readonly(cwd: str) -> list[str]:
             "-c", "protocol.ext.allow=never"]
 
 
+def _persisted(res) -> bool:
+    """True only when the server CONFIRMS it stored the records.
+
+    Accepts the ack shapes this backend returns — structuredContent, a
+    FastMCP ``result`` wrapper, or a JSON text block — and requires a
+    conversation_id plus a non-null ``ack_through``. An older server that
+    does not report ack_through cannot be distinguished from one that
+    dropped everything, so it is treated as unconfirmed: re-sending is
+    free (the server folds re-sends forward by conversation_id), losing a
+    session is not.
+    """
+    if getattr(res, "isError", False):
+        _log(f"server rejected the import: {_texts(res)[:1]}")
+        return False
+    out = getattr(res, "structuredContent", None)
+    if isinstance(out, dict) and "conversation_id" not in out \
+            and isinstance(out.get("result"), dict):
+        out = out["result"]           # FastMCP wraps some returns
+    if not isinstance(out, dict):
+        for text in _texts(res):
+            try:
+                out = json.loads(text)
+                break
+            except json.JSONDecodeError:
+                continue
+    if not isinstance(out, dict) or "conversation_id" not in out:
+        _log("import response unrecognized — holding the watermark")
+        return False
+    if not out.get("ack_through"):
+        _log(f"import NOT confirmed (ack_through null, dropped="
+             f"{out.get('records_dropped')}) — holding the watermark so the "
+             f"next event re-sends")
+        return False
+    return True
+
+
+def _texts(res) -> list[str]:
+    return [t for t in (getattr(b, "text", None)
+                        for b in getattr(res, "content", []) or []) if t]
+
+
 def _cwd_ok(cwd: str | None) -> bool:
     """``cwd`` is read out of the cursor STORE, so it is session content, not
     a trusted path. Anything handed to `git -C` must be an absolute existing
@@ -409,7 +450,8 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         arguments["title"] = meta["title"]
 
     try:
-        await session.call_tool("import_conversation", arguments=arguments)
+        res = await session.call_tool("import_conversation",
+                                      arguments=arguments)
     except mcp_http.McpRateLimited as e:
         _log(f"rate limited: {e} — a later hook retries (state unmoved)")
         _save_state(uuid, last_error="rate_limited")
@@ -417,6 +459,20 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     except mcp_http.McpError as e:
         _log(f"import failed: {e}")
         _save_state(uuid, last_error=str(e)[:200])
+        return
+
+    # A returned call is NOT a persisted call. MCP signals tool failure with
+    # isError rather than an exception, and this backend has shipped a
+    # 200-with-nothing-stored mode before (records dedup-registered without
+    # persisting: records_dropped>0, ack_through null — the same failure that
+    # hid Cursor sessions for months). Advancing the watermark on such a reply
+    # marks the blobs shipped, and since a session's LAST flush has no later
+    # event to re-send it, that is a silently lost conversation. So: confirm
+    # the ack, or hold the watermark and let the next event re-send. Mirrors
+    # flush_turn's discipline on the Claude path.
+    if not _persisted(res):
+        _save_state(uuid, last_flush_at=time.time(),
+                    last_error="unconfirmed_import")
         return
 
     # `shipped` was fixed at the end of the transcript read (see above), NOT
