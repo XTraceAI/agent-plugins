@@ -1,25 +1,81 @@
 {
- "hooks": {
-  "Stop": [
-   {
-    "hooks": [
-     {
-      "type": "command",
-      "command": "IN=$(cat); R=$(ls -d \"$HOME\"/.codex/plugins/cache/xtrace-plugins/memhub/*/ 2>/dev/null | sort -V | while IFS= read -r d; do [ -f \"$d/scripts/codex_flush.py\" ] && printf '%s\\n' \"$d\"; done | tail -1); P=$(command -v python3 || command -v python); if [ -z \"$P\" ]; then mkdir -p \"$HOME/.config/memhub-plugin/codexflush\" 2>/dev/null && printf \"%s [codex-flush] no python3/python on PATH - capture skipped\\n\" \"$(date +%Y-%m-%dT%H:%M:%S)\" >> \"$HOME/.config/memhub-plugin/codexflush/log\"; elif [ -n \"$R\" ]; then T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\") || exit 0; printf %s \"$IN\" > \"$T\"; nohup sh -c '\"$3\" \"${1%/}/scripts/codex_flush.py\" Stop < \"$2\"; rm -f \"$2\"' -- \"$R\" \"$T\" \"$P\" >/dev/null 2>&1 & fi"
-     }
+  "description": "MemHub compatibility hooks for Codex releases without plugin-bundled hook loading.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking for relevant directives",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" directive-pre",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" directive-pre"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|shell|local_shell",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking for relevant directives",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" directive-pre",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" directive-pre"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|shell|local_shell|Bash)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking directives for this failure",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" directive-post",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" directive-post"
+          }
+        ]
+      },
+      {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "statusMessage": "MemHub: checking artifact links",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" artifact-sync",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" artifact-sync"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|shell|local_shell",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "statusMessage": "MemHub: flushing session memory",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" flush PostToolUse",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" flush PostToolUse"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" flush Stop",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" flush Stop"
+          }
+        ]
+      }
     ]
-   }
-  ],
-  "PostToolUse": [
-   {
-    "matcher": "Bash|shell|local_shell",
-    "hooks": [
-     {
-      "type": "command",
-      "command": "IN=$(cat); R=$(ls -d \"$HOME\"/.codex/plugins/cache/xtrace-plugins/memhub/*/ 2>/dev/null | sort -V | while IFS= read -r d; do [ -f \"$d/scripts/codex_flush.py\" ] && printf '%s\\n' \"$d\"; done | tail -1); P=$(command -v python3 || command -v python); if [ -z \"$P\" ]; then mkdir -p \"$HOME/.config/memhub-plugin/codexflush\" 2>/dev/null && printf \"%s [codex-flush] no python3/python on PATH - capture skipped\\n\" \"$(date +%Y-%m-%dT%H:%M:%S)\" >> \"$HOME/.config/memhub-plugin/codexflush/log\"; elif [ -n \"$R\" ]; then T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\") || exit 0; printf %s \"$IN\" > \"$T\"; nohup sh -c '\"$3\" \"${1%/}/scripts/codex_flush.py\" PostToolUse < \"$2\"; rm -f \"$2\"' -- \"$R\" \"$T\" \"$P\" >/dev/null 2>&1 & fi"
-     }
-    ]
-   }
-  ]
- }
+  }
 }

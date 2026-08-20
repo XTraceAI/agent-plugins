@@ -14,6 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+BRIDGE_HOOKS = (ROOT / "plugins" / "memhub" / "references" /
+                "codex-hooks-bridge.json")
 
 from gen_codex_hooks import (  # noqa: E402
     CLAUDE_HOOKS, CLAUDE_ONLY_CAPTURE, CODEX_HOOKS, generate)
@@ -37,6 +39,17 @@ def test_no_claude_only_capture_leaked():
         assert forbidden not in text, forbidden
     assert "codex_flush.py" in text
     print("PASS test_no_claude_only_capture_leaked")
+
+
+def test_user_bridge_covers_live_codex_capabilities():
+    bridge = json.loads(BRIDGE_HOOKS.read_text(encoding="utf-8"))["hooks"]
+    assert set(bridge) == {"PreToolUse", "PostToolUse", "Stop"}
+    text = json.dumps(bridge)
+    for action in ("directive-pre", "directive-post", "artifact-sync",
+                   "flush PostToolUse", "flush Stop"):
+        assert action in text, action
+    assert text.count("memhub_hook_bridge.py") == 12  # Unix + Windows, 6 handlers
+    print("PASS test_user_bridge_covers_live_codex_capabilities")
 
 
 if __name__ == "__main__":

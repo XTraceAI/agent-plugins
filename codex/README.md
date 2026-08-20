@@ -76,39 +76,33 @@ agentic path always tags the platform `claude`.
 
 Run the tests: `python3 codex/test_codex_to_claude.py`.
 
-## 3. Auto-capture — the hooks bridge (recommended)
+## 3. Automatic capture and directive recall — the hooks bridge
 
-Install this once and every Codex session flushes itself; nothing else in this
-file is needed for day-to-day use.
+After installing the plugin, ask Codex to `set up MemHub` or invoke the
+`memhub:setup` skill. The same operation is available directly:
 
 ```bash
-# from a checkout of this repo
-python3 -c "import json,pathlib,sys; \
-src=pathlib.Path('plugins/memhub/references/codex-hooks-bridge.json'); \
-dst=pathlib.Path.home()/'.codex'/'hooks.json'; \
-dst.parent.mkdir(parents=True, exist_ok=True); \
-cur=json.loads(dst.read_text()) if dst.exists() else {}; \
-new=json.loads(src.read_text()); \
-cur.setdefault('hooks', {}).update(new['hooks']); \
-dst.write_text(json.dumps(cur, indent=1)); \
-print('wrote', dst)"
+python3 plugins/memhub/scripts/setup_codex_hooks.py install
 ```
 
-Then approve the hooks: run `/hooks` in the Codex TUI once (trust is per hook
-hash), or pass `--dangerously-bypass-hook-trust` for automation.
+The installer preserves unrelated hooks, backs up a changed existing file, and
+survives plugin upgrades. Then approve the six MemHub handlers with `/hooks` in
+the Codex TUI once (trust is per hook hash). The bridge provides `PreToolUse`
+directive recall, reactive failure recall, artifact reminders, milestone
+capture, and per-turn capture.
 
 **Why user-level and not the plugin's own `hooks/codex-hooks.json`.** Verified
-live on codex-cli 0.148: plugin-bundled hooks are **not mounted**, at any path
-or trust state — only `~/.codex/hooks.json` (user) and the project-level file
-are. The plugin ships `codex-hooks.json` and a manifest pointer for the version
-that starts honoring them; until then the bridge above is what actually fires.
-It is written to survive plugin upgrades: the command resolves the versioned
-cache path at run time rather than naming a version, picking the highest
-version present (`ls -d … | sort -V | tail -1`). `sort -V` rather than a plain
-sort because a lexical sort puts `0.9.0` above `0.10.0`, so a name-sorted
-bridge would silently start running an older `codex_flush.py` after enough
-releases; and rather than mtime (`ls -dt`) because an mtime is settable by
-anything that touches the directory, while a version segment has to be named.
+live on codex-cli 0.148 and 0.149: plugin-bundled hooks are **not mounted**, via
+either a manifest pointer or the default `hooks/hooks.json` path. User-level
+`~/.codex/hooks.json` hooks do fire, and 0.149 delivers
+`PreToolUse.hookSpecificOutput.additionalContext` to the model. The plugin keeps
+its native hook declaration ready for the Codex release that mounts it; the
+bridge is the working compatibility path today.
+
+The installed trampoline resolves the highest naturally ordered plugin version
+at run time instead of naming one. Natural ordering matters: lexical ordering
+puts `0.9.0` above `0.10.0`, while mtime can be changed by merely touching a
+directory. The version directory is the installer's actual upgrade boundary.
 
 The marketplace namespace is **pinned** (`cache/xtrace-plugins/memhub/*/`),
 only the version segment is a wildcard. The cache is shared by every
@@ -117,8 +111,8 @@ and so on all live beside ours — so a namespace wildcard would let any other
 marketplace shipping a plugin named `memhub` supply the code this hook runs.
 Pinning removes that without giving up upgrade-safety.
 
-**Trust assumption.** The bridge runs whichever `codex_flush.py` sits in the
-highest-versioned directory under `~/.codex/plugins/cache/xtrace-plugins/memhub/`,
+**Trust assumption.** The bridge runs scripts from the highest-versioned directory
+under `~/.codex/plugins/cache/xtrace-plugins/memhub/`,
 without verifying a signature or hash. That directory is inside your own home:
 writing a higher-versioned sibling there requires the ability to write your home
 directory, and anything with that ability can already rewrite `~/.codex/hooks.json`
@@ -130,13 +124,13 @@ written only by the Codex plugin installer and by you. Pinning an exact version
 instead would trade this for a concrete regression: capture silently stops on
 every plugin upgrade until the pin is bumped.
 
-Three more facts that cost a day each to find, if you ever edit the bridge:
+Three implementation facts matter if you edit the bridge:
 
-* a hook that does **not** read stdin deadlocks Codex — every command here
-  starts by draining it into a temp file;
-* `"async": true` hooks are killed with `codex exec`, so the bridge is
-  synchronous and detaches the real work with `nohup`;
-* hooks receive `PLUGIN_ROOT`, not `CLAUDE_PLUGIN_ROOT`.
+* every handler drains stdin;
+* `"async": true` hooks are killed with `codex exec`, so capture detaches from
+  the synchronous trampoline itself;
+* Codex ignores plain text from `PreToolUse` and `PostToolUse`; model-visible
+  bridge output uses `hookSpecificOutput.additionalContext`.
 
 ## 4. Auto-capture via `notify` (legacy, verify on your Codex version)
 
