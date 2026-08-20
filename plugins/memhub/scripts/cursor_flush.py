@@ -64,6 +64,12 @@ STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 # server mid-turn. Milestones and turn boundaries bypass this.
 DEBOUNCE_S = 120.0
 FLUSH_TIMEOUT_S = 240.0
+# Dormancy (an unconfirmable server — see _verdict) must not be a one-way
+# door: going dormant means never flushing again, so nothing can ever observe
+# that the server was upgraded. Re-probe occasionally instead. Long enough
+# that an unfixed server costs one wasted upload an hour, short enough that a
+# fix takes effect inside a working session.
+DORMANT_RETRY_S = 1800.0
 
 # The milestone must be in COMMAND POSITION, not merely mentioned: `.*` with
 # DOTALL matched `git log --oneline | grep commit` and even
@@ -243,7 +249,11 @@ def should_flush(event: str, payload: dict, state: dict,
     and non-milestone shell commands never trigger (too chatty).
     """
     if state.get("unsupported"):
-        return False        # this server cannot confirm; see _verdict
+        # Dormant, but not forever: after DORMANT_RETRY_S fall through and
+        # let one flush re-probe. A successful ack clears the flag, so an
+        # upgraded server re-arms a session already in progress.
+        if now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S:
+            return False
     if blob_ids <= set(state.get("blob_ids") or []):
         return False
     if event == "beforeShellExecution":
@@ -466,7 +476,8 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         _log("server does not report ack_through — per-event flush is "
              "dormant for this session; run /memhub:import-session to "
              "capture it, or upgrade the server")
-        _save_state(uuid, last_flush_at=time.time(), unsupported=True)
+        _save_state(uuid, last_flush_at=time.time(), unsupported=True,
+                    unsupported_at=time.time())
         return
     if verdict != "ok":
         _save_state(uuid, last_flush_at=time.time(),
@@ -478,7 +489,10 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # The timestamps land either way — the debounce must still hold after a
     # successful send — but blob_ids only when we could actually verify it.
     fields = {"last_flush_at": time.time(), "last_ok_at": time.time(),
-              "last_error": None}
+              "last_error": None,
+              # The re-probe worked: this server confirms after all, so the
+              # session re-arms instead of staying dormant on old evidence.
+              "unsupported": False, "unsupported_at": 0}
     if shipped is not None:
         fields["blob_ids"] = sorted(shipped)
     else:

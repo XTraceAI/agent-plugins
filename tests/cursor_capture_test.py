@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
-from cursor_flush import _verdict, session_uuid, should_flush  # noqa: E402
+from cursor_flush import (  # noqa: E402
+    DORMANT_RETRY_S, _verdict, session_uuid, should_flush)
 
 NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
@@ -148,12 +149,26 @@ def test_import_verdicts_and_dormancy():
         assert _verdict(r) == "unconfirmed", r
     # the field ABSENT (not null) is the dormancy case
     assert _verdict(_res({"conversation_id": "c"})) == "unsupported"
+    # ...but an ack-less WRAPPER must not shadow a null-ack payload beside
+    # it: that misread a transient failure as a structural one and went
+    # dormant on a live server.
+    assert _verdict(_res({"conversation_id": "c",
+                          "result": {"conversation_id": "c",
+                                     "ack_through": None}})) == "unconfirmed"
 
-    # and a dormant session stops flushing on every event, not just some
+    # A dormant session stops flushing on every event, not just some...
+    dormant = {"unsupported": True, "unsupported_at": 1_000.0}
     for event in ("stop", "beforeSubmitPrompt", "afterFileEdit",
                   "beforeShellExecution"):
         assert not should_flush(event, {"command": "git commit -m x"},
-                                {"unsupported": True}, {"new-blob"}, 1e9), event
+                                dormant, {"new-blob"}, 1_000.0), event
+    # ...but dormancy is NOT a one-way door: going dormant means never
+    # flushing again, so nothing could otherwise observe that the server was
+    # upgraded. After the re-probe window one flush is allowed through, and a
+    # confirmed import clears the flag.
+    assert should_flush("stop", {}, dormant, {"new-blob"},
+                        1_000.0 + DORMANT_RETRY_S + 1)
+    assert should_flush("stop", {}, {"unsupported": False}, {"new-blob"}, 5_000.0)
     print("PASS test_import_verdicts_and_dormancy")
 
 

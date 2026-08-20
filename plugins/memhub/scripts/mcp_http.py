@@ -357,6 +357,15 @@ def ack_of(res) -> dict | None:
     for c in acks:
         if c.get("ack_through"):
             return c
+    # Nothing confirms. Prefer a candidate that at least CARRIES the
+    # ack_through key over one that omits it: "present but null" means a
+    # server that knows the field and stored nothing (transient — retry),
+    # while "absent" means a server that cannot report at all (structural).
+    # Callers act very differently on those, so an ack-less wrapper must not
+    # shadow a null-ack payload sitting beside it.
+    for c in acks:
+        if "ack_through" in c:
+            return c
     return acks[0] if acks else None
 
 
