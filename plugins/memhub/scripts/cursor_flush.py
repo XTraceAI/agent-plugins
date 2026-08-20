@@ -218,11 +218,18 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
 
     cwd = meta.get("cwd")
-    room = await resolve_repo_brain(session, cwd, env) if cwd else None
-    # to_thread like resolve_bearer above: `git remote get-url` is a blocking
-    # subprocess with a 2s budget, and running it inline would pin the loop
-    # and spend the flush deadline on it.
-    namespace = await asyncio.to_thread(_namespace_of, cwd)
+    # Both derive from cwd alone and neither feeds the other, so they run
+    # CONCURRENTLY: one is a network round trip, the other a `git remote
+    # get-url` subprocess with a 2s budget (off the loop, like resolve_bearer
+    # above). Awaiting them in series spent the flush deadline twice over for
+    # no ordering reason.
+    if cwd:
+        room, namespace = await asyncio.gather(
+            resolve_repo_brain(session, cwd, env),
+            asyncio.to_thread(_namespace_of, cwd),
+        )
+    else:
+        room, namespace = None, None
 
     arguments = {
         "messages": sendable,
