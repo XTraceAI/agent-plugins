@@ -50,6 +50,12 @@ HOST = "codex"
 
 _SESSIONS = Path.home() / ".codex" / "sessions"
 
+
+def sessions_root() -> Path:
+    """The rollout store this reader will ever touch — capture callers use
+    it as a containment boundary for payload-supplied paths."""
+    return _SESSIONS
+
 # The user's real ask is wrapped by the Codex VSCode extension under this
 # heading, after an "# Context from my IDE setup:" preamble.
 _IDE_REQUEST_RE = re.compile(r"##\s*My request(?: for Codex)?:\s*\n", re.I)

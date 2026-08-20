@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking for relevant directives",
+            "command": "IN=$(cat); if [ -n \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\" ]; then printf %s \"$IN\" | python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/directive_recall.py\"; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|shell|local_shell",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking for relevant directives",
+            "command": "IN=$(cat); if [ -n \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\" ] && printf %s \"$IN\" | python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/directive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/directive_recall.py\"; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|shell|local_shell|Bash)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking directives for this failure",
+            "command": "IN=$(cat); if [ -n \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\" ] && printf %s \"$IN\" | python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/reactive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/directive_recall.py\"; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "statusMessage": "MemHub: checking artifact links",
+            "command": "if [ -n \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\" ]; then python3 \"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}/scripts/artifact_sync_reminder.py\"; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|shell|local_shell",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "statusMessage": "MemHub: flushing session memory",
+            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_flush.py\" ]; then T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\") || exit 0; printf %s \"$IN\" > \"$T\"; nohup sh -c '\"$3\" \"$1\" PostToolUse < \"$2\"; rm -f \"$2\"' -- \"$R/scripts/codex_flush.py\" \"$T\" \"$P\" </dev/null >/dev/null 2>&1 & fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_flush.py\" ]; then T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\") || exit 0; printf %s \"$IN\" > \"$T\"; nohup sh -c '\"$3\" \"$1\" Stop < \"$2\"; rm -f \"$2\"' -- \"$R/scripts/codex_flush.py\" \"$T\" \"$P\" </dev/null >/dev/null 2>&1 & fi"
+          }
+        ]
+      }
+    ]
+  }
+}

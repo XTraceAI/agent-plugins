@@ -1,0 +1,25 @@
+{
+ "hooks": {
+  "Stop": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "IN=$(cat); R=$(ls -d \"$HOME\"/.codex/plugins/cache/xtrace-plugins/memhub/*/ 2>/dev/null | sort -V | while IFS= read -r d; do [ -f \"$d/scripts/codex_flush.py\" ] && printf '%s\\n' \"$d\"; done | tail -1); P=$(command -v python3 || command -v python); if [ -z \"$P\" ]; then mkdir -p \"$HOME/.config/memhub-plugin/codexflush\" 2>/dev/null && printf \"%s [codex-flush] no python3/python on PATH - capture skipped\\n\" \"$(date +%Y-%m-%dT%H:%M:%S)\" >> \"$HOME/.config/memhub-plugin/codexflush/log\"; elif [ -n \"$R\" ]; then T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\") || exit 0; printf %s \"$IN\" > \"$T\"; nohup sh -c '\"$3\" \"${1%/}/scripts/codex_flush.py\" Stop < \"$2\"; rm -f \"$2\"' -- \"$R\" \"$T\" \"$P\" >/dev/null 2>&1 & fi"
+     }
+    ]
+   }
+  ],
+  "PostToolUse": [
+   {
+    "matcher": "Bash|shell|local_shell",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "IN=$(cat); R=$(ls -d \"$HOME\"/.codex/plugins/cache/xtrace-plugins/memhub/*/ 2>/dev/null | sort -V | while IFS= read -r d; do [ -f \"$d/scripts/codex_flush.py\" ] && printf '%s\\n' \"$d\"; done | tail -1); P=$(command -v python3 || command -v python); if [ -z \"$P\" ]; then mkdir -p \"$HOME/.config/memhub-plugin/codexflush\" 2>/dev/null && printf \"%s [codex-flush] no python3/python on PATH - capture skipped\\n\" \"$(date +%Y-%m-%dT%H:%M:%S)\" >> \"$HOME/.config/memhub-plugin/codexflush/log\"; elif [ -n \"$R\" ]; then T=$(mktemp \"${TMPDIR:-/tmp}/memhub-codex-hook.XXXXXX\") || exit 0; printf %s \"$IN\" > \"$T\"; nohup sh -c '\"$3\" \"${1%/}/scripts/codex_flush.py\" PostToolUse < \"$2\"; rm -f \"$2\"' -- \"$R\" \"$T\" \"$P\" >/dev/null 2>&1 & fi"
+     }
+    ]
+   }
+  ]
+ }
+}
