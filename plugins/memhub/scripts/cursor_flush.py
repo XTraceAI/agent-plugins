@@ -484,7 +484,16 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         _save_state(uuid, last_flush_at=time.time(), fail_streak=0)
         return
 
-    url, bearer = await asyncio.to_thread(resolve_bearer)
+    try:
+        url, bearer = await asyncio.to_thread(resolve_bearer)
+    except Exception as e:  # noqa: BLE001
+        # Auth resolution is LOCAL (token cache, refresh) — a failure here is
+        # the no_credential case, not a contacted-server failure, so it must
+        # not count toward dormancy. Clear the streak and skip, exactly like
+        # the no-bearer path below.
+        _log(f"credential resolve failed ({e!r}) — skipping (run /memhub:login)")
+        _save_state(uuid, last_error="no_credential", fail_streak=0)
+        return
     if not bearer:
         _log("no usable credential — skipping (run /memhub:login)")
         # A local auth gap, not a server failure — never contacted it, so
@@ -621,6 +630,15 @@ def main() -> int:
     uuid = session_uuid(payload)
     if not uuid:
         _log(f"{event}: no session identity in payload — skipping")
+        return 0
+    if not _UUID_RE.fullmatch(uuid):
+        # session_uuid returns session_id/conversation_id verbatim, and
+        # cursor_reader.locate treats a resolvable value as a PATH — so a
+        # non-uuid id (a path, "..") could otherwise open an arbitrary
+        # sqlite file and upload its blobs. The store lookup requires a real
+        # session uuid; the transcript_path fallback is already uuid-checked.
+        _log(f"{event}: session id {uuid!r} is not a uuid — refusing the "
+             f"store lookup")
         return 0
 
     store_db, err = cursor_reader.locate(uuid)
