@@ -533,7 +533,14 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         "conversation_id": f"cursor-{uuid}",
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
-        "source_platform": "claude",
+        # ENG-886: send the REAL platform where the backend can store it.
+        # Staging has the widened CHECK constraint (#1041/#1047 deployed);
+        # prod does NOT yet, and would fail the whole import on "cursor",
+        # so its install stays "claude" until prod deploys — then this
+        # gate goes away and it is unconditional. A session first flushed
+        # as "claude" self-heals to "cursor" on its next real-platform
+        # receive (server-side monotonic platform heal).
+        "source_platform": "cursor" if env == "staging" else "claude",
         "flush": flush_mode,
     }
     if room:
