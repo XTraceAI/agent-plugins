@@ -277,7 +277,21 @@ def _persisted(res) -> bool:
     if ack is None:
         _log("import response unrecognized — holding the watermark")
         return False
-    if not ack.get("ack_through"):
+    if "ack_through" not in ack:
+        # ABSENT, not null: a server predating the field. Those did persist —
+        # they simply cannot say so — and treating them as unconfirmed would
+        # re-upload the entire transcript on every event forever.
+        if ack.get("records_dropped"):
+            _log(f"server dropped {ack['records_dropped']} record(s) — "
+                 f"holding the watermark")
+            return False
+        _log("server does not report ack_through (older build) — accepting "
+             "the import; upgrade it for durable per-event confirmation")
+        return True
+    if not ack["ack_through"]:
+        # Present and null is the DIFFERENT case: a server that knows the
+        # field telling us it stored nothing — the failure that hid Cursor
+        # sessions for months.
         _log(f"import NOT confirmed (ack_through null, dropped="
              f"{ack.get('records_dropped')}) — holding the watermark so the "
              f"next event re-sends")

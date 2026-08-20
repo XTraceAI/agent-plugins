@@ -142,8 +142,11 @@ def test_import_must_be_confirmed_before_advancing():
         _res({"conversation_id": "c", "ack_through": None, "records_dropped": 6}),
         _res({"conversation_id": "c", "ack_through": "u"}, is_error=True),
         _res(None, ["not json"]),
-        _res({"conversation_id": "c"}),          # server predating ack_through
+        _res({"conversation_id": "c", "records_dropped": 3}),  # old, but dropped
     ]
+    # ABSENT ack_through = an older server that persisted without being able
+    # to confirm; holding for those re-sends the transcript forever
+    confirmed.append(_res({"conversation_id": "c"}))
     for r in confirmed:
         assert _persisted(r), r
     for r in unconfirmed:
