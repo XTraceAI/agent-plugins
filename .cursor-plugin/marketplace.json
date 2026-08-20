@@ -1,0 +1,12 @@
+{
+  "name": "xtrace-plugins",
+  "owner": { "name": "XTrace" },
+  "metadata": { "description": "XTrace MemHub team-memory plugins" },
+  "plugins": [
+    {
+      "name": "memhub",
+      "source": "./plugins/memhub",
+      "description": "Team memory for Cursor — recall, artifacts, session import."
+    }
+  ]
+}
