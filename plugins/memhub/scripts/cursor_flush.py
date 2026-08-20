@@ -260,14 +260,28 @@ def should_flush(event: str, payload: dict, state: dict,
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today. Verified: a repo whose
 # core.fsmonitor is a command runs it under plain git and does not here.
-_GIT_ENV = {
-    **os.environ,
-    "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
-    "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
-    "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
-    "GIT_ASKPASS": "",
-    "SSH_ASKPASS": "",
-}
+# Only what git needs to RUN — never the flush process's own environment,
+# which holds the MemHub bearer and whatever else the user exports. Spreading
+# os.environ would hand all of it to a subprocess we are deliberately pointing
+# at a semi-trusted repo. HOME stays because dropping it loses legitimate
+# global config (safe.directory in particular, without which git refuses
+# repos it considers foreign); the Windows names are what CreateProcess needs
+# to work at all. Matched case-insensitively: os.environ upper-cases on
+# Windows.
+_GIT_KEEP = {"PATH", "HOME", "SYSTEMROOT", "SYSTEMDRIVE", "USERPROFILE",
+             "PATHEXT", "COMSPEC", "TEMP", "TMP", "TMPDIR"}
+
+
+def _git_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k.upper() in _GIT_KEEP}
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",     # ignore /etc/gitconfig
+        "GIT_TERMINAL_PROMPT": "0",     # never block on a prompt
+        "GIT_OPTIONAL_LOCKS": "0",      # read-only: touch no locks
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+    })
+    return env
 
 
 def _git_readonly(cwd: str) -> list[str]:
@@ -341,7 +355,7 @@ def _namespace_of(cwd: str | None) -> str | None:
     try:
         out = subprocess.run(
             _git_readonly(cwd) + ["remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2, env=_GIT_ENV,
+            capture_output=True, text=True, timeout=2, env=_git_env(),
         )
         url = out.stdout.strip()
         if out.returncode == 0 and url:
