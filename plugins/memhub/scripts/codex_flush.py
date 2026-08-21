@@ -43,8 +43,7 @@ from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
 from redact import redact_records  # noqa: E402
-from room_map import (  # noqa: E402
-    env_for_url, git_env, git_readonly, is_staging_backend)
+from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
 FLUSH_TIMEOUT_S = 240.0
@@ -510,14 +509,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     arguments = {
         "messages": sendable,
         "conversation_id": f"codex-{sid}",
-        # ENG-886: send the REAL platform where the backend can store it.
-        # Staging has the widened CHECK constraint (#1041/#1047 deployed);
-        # prod does NOT yet, and would fail the whole import on "codex", so
-        # its install stays "claude" until prod deploys — then this gate goes
-        # away and it is unconditional. A session first flushed as "claude"
-        # self-heals to "codex" on its next real-platform receive (server-side
-        # monotonic platform heal).
-        "source_platform": "codex" if is_staging_backend(url) else "claude",
+        "source_platform": codex_reader.HOST,
         "flush": "now",
     }
     if room:

@@ -11,8 +11,10 @@ Run: python3 codex_capture_test.py
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -232,20 +234,54 @@ def test_import_verdicts_and_dormancy():
     print("PASS test_import_verdicts_and_dormancy")
 
 
-def test_platform_gate_symbol_is_imported():
-    """_flush builds ``source_platform`` via ``is_staging_backend(url)``. That
-    symbol lives in room_map and MUST be imported into this module, or every
-    non-empty flush raises NameError at the arguments construction — caught by
-    _flush's broad except and logged as a flush_error, so after MAX_UNCONFIRMED
-    the session goes dormant: silent, total capture failure. No test that stops
-    at should_flush/locate_rollout exercises _flush, which is how it shipped
-    latent; this pins the import (and the cursor_flush twin already had it)."""
-    assert callable(codex_flush.is_staging_backend)
-    assert codex_flush.is_staging_backend(
-        "https://api.staging.memhub.xtrace.ai/mcp") is True
-    assert codex_flush.is_staging_backend(
-        "https://api.memhub.xtrace.ai/mcp") is False
-    print("PASS test_platform_gate_symbol_is_imported")
+def test_real_platform_is_unconditional():
+    seen: list[dict] = []
+    originals = {
+        "to_canonical": codex_flush.codex_reader.to_canonical,
+        "redact_records": codex_flush.redact_records,
+        "resolve_bearer": codex_flush.resolve_bearer,
+        "session": codex_flush.mcp_http.Session,
+        "save_state": codex_flush._save_state,
+        "log": codex_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": arguments["conversation_id"],
+                    "ack_through": "record-1",
+                },
+                content=[], isError=False)
+
+    try:
+        codex_flush.codex_reader.to_canonical = lambda _path: ([{
+            "type": "user", "uuid": "record-1",
+            "message": {"role": "user", "content": "hello"},
+        }], {"cwd": None, "title": None})
+        codex_flush.redact_records = lambda records: records
+        codex_flush.mcp_http.Session = Session
+        codex_flush._save_state = lambda *_args, **_kwargs: None
+        codex_flush._log = lambda *_args, **_kwargs: None
+        for url in ("https://api.memhub.xtrace.ai/mcp-server/mcp",
+                    "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"):
+            codex_flush.resolve_bearer = lambda u=url: (u, "token")
+            asyncio.run(codex_flush._flush(
+                "session-1", Path("/tmp/rollout.jsonl"), 100))
+    finally:
+        codex_flush.codex_reader.to_canonical = originals["to_canonical"]
+        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.resolve_bearer = originals["resolve_bearer"]
+        codex_flush.mcp_http.Session = originals["session"]
+        codex_flush._save_state = originals["save_state"]
+        codex_flush._log = originals["log"]
+
+    assert [args["source_platform"] for args in seen] == ["codex", "codex"]
+    print("PASS test_real_platform_is_unconditional")
 
 
 if __name__ == "__main__":

@@ -10,9 +10,9 @@ session gist).
 
 Why re-shape instead of adding a Codex detector server-side: the agentic path
 keys off *structure* ("records with a nested ``message`` and tool-call /
-tool-result blocks"), not the ``source_platform`` tag (which the schema says is
-ignored on that path). So a faithful client-side transform gets the full
-agentic extraction with **no backend change**.
+tool-result blocks"), while ``source_platform`` records provenance. A faithful
+client-side transform gets the full agentic extraction and the import still
+stores the real ``codex`` platform.
 
 Codex rollout envelope (one JSON object per line)::
 
@@ -182,8 +182,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
     ``claude_records`` are Claude-Code-shaped and carry ``cwd`` (so
     ``import_session._namespace_from_records`` can resolve the repo) plus a
-    leading provenance banner (the agentic path always tags ``claude``, so
-    origin would otherwise be lost)."""
+    leading provenance banner for in-transcript traceability and compatibility
+    with conversations imported before the real platform tag shipped."""
     sm = _session_meta(rollout)
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
@@ -227,8 +227,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         return rec({"type": "assistant",
                     "message": {"role": "assistant", "content": [block]}})
 
-    # Provenance banner: origin is otherwise lost (source_platform forced to
-    # "claude" on the agentic path). Kept terse and bracketed as metadata.
+    # Keep a terse provenance banner inside the transcript as well as the
+    # structured platform tag so older and exported captures stay identifiable.
     banner = "[Imported from OpenAI Codex"
     if model:
         banner += f" · model {model}"
