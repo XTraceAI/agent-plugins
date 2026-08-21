@@ -45,6 +45,11 @@ from room_map import env_for_url, read_room, repo_root  # noqa: E402
 TAG = "auto-captured"
 MAX_PER_TURN = 5          # a turn that rewrote 40 .md files is a migration, not deliverables
 TIMEOUT_S = 20.0
+# Retries are bounded per path, not unbounded: a path that keeps failing —
+# a persistent server rejection, a file that never decodes — leaves the list
+# after this many failed passes with a log line, instead of re-reading and
+# re-sending it on every Stop for the rest of the session. Reset on success.
+MAX_ATTEMPTS = 3
 
 
 def _log(msg: str) -> None:
@@ -133,6 +138,7 @@ async def flush(session_id: str) -> None:
     if not dirty:
         return
     saved = dict(state.get("saved") or {})   # path -> content digest
+    attempts = dict(state.get("attempts") or {})   # path -> consecutive failures
     # `processed` is built from OUTCOMES, not from the input list: a path leaves
     # `dirty` only when it was saved, judged a non-candidate, or is unchanged
     # since its last save. Capped-out candidates and failed saves stay in
@@ -156,8 +162,10 @@ async def flush(session_id: str) -> None:
             continue
         try:
             text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            processed.add(raw)
+        except (OSError, UnicodeDecodeError) as e:
+            # The Stop hook is async: this read can land mid-write. Retry on
+            # the next Stop rather than drop — bounded by MAX_ATTEMPTS.
+            _bump(attempts, raw, processed, f"unreadable ({type(e).__name__})")
             continue
         ok, why = is_candidate(p, size=len(text.encode("utf-8")), text=text)
         if not ok:
@@ -174,7 +182,7 @@ async def flush(session_id: str) -> None:
              f"the rest retry next Stop")
         todo = sorted(todo, key=lambda t: -len(t[2]))[:MAX_PER_TURN]
     if not todo:
-        _persist(session_id, processed, saved)
+        _persist(session_id, processed, saved, attempts)
         return
 
     try:
@@ -208,12 +216,13 @@ async def flush(session_id: str) -> None:
                             call_args["agent_brain_id"] = room["brain_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
                     except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
-                        _log(f"save failed for {p.name}: {type(e).__name__}: {str(e)[:120]}")
+                        _bump(attempts, raw, processed, f"{type(e).__name__}: {str(e)[:120]}")
                         continue
                     # Keyed on `raw` — the exact string in `dirty` — so the
                     # dedup lookup and the `_persist` removal both match it.
                     saved[raw] = d
                     processed.add(raw)
+                    attempts.pop(raw, None)
                     _log(f"saved '{name}' ({len(body):,} chars) → "
                          f"{room['name'] if room else 'personal memory'} "
                          f"id={out.get('artifact_id') or out.get('id')}")
@@ -221,10 +230,23 @@ async def flush(session_id: str) -> None:
         # Persist whatever was decided even if the connection itself failed:
         # non-candidates drop out, successes record their digest, everything
         # else remains dirty for the next Stop.
-        _persist(session_id, processed, saved)
+        _persist(session_id, processed, saved, attempts)
 
 
-def _persist(session_id: str, processed: set, saved: dict) -> None:
+def _bump(attempts: dict, raw: str, processed: set, why: str) -> None:
+    """Count a failed pass for `raw`; give up (mark processed) at the cap."""
+    n = attempts.get(raw, 0) + 1
+    attempts[raw] = n
+    name = Path(raw).name
+    if n >= MAX_ATTEMPTS:
+        _log(f"giving up on {name} after {n} failed passes: {why}")
+        processed.add(raw)
+        attempts.pop(raw, None)
+    else:
+        _log(f"will retry {name} next Stop ({n}/{MAX_ATTEMPTS}): {why}")
+
+
+def _persist(session_id: str, processed: set, saved: dict, attempts: dict | None = None) -> None:
     """Write back by MERGING into a fresh read, never from the snapshot taken
     before the network window. The Stop hook is async, so the collector keeps
     appending to the same file while a save is in flight; persisting the
@@ -233,6 +255,8 @@ def _persist(session_id: str, processed: set, saved: dict) -> None:
     fresh = load_state(session_id)
     fresh["dirty"] = [d for d in fresh.get("dirty") or [] if d not in processed]
     fresh.setdefault("saved", {}).update(saved)
+    if attempts is not None:
+        fresh["attempts"] = attempts
     save_state(session_id, fresh)
 
 

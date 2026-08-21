@@ -211,6 +211,32 @@ with tempfile.TemporaryDirectory() as td:
         check(len(st["dirty"]) == 3, f"capped-out + failed-save + failed-derivation all remain dirty: {len(st['dirty'])}")
         check(all(k in paths for k in st["saved"]), "saved keys are the exact dirty strings (raw), not re-stringified Paths")
         check(paths[0] in st["dirty"], "the capped-out (smallest) candidate stayed dirty")
+
+        # bounded retries: a path that keeps failing leaves the list at MAX_ATTEMPTS,
+        # and a non-UTF-8 read retries (async Stop can land mid-write) instead of dropping.
+        sid4 = "sess-md-flush-bounded"
+        bad = root / "always-fails.md"; bad.write_text("# F\n" + "y" * 7000, encoding="utf-8")
+        undec = root / "mid-write.md"; undec.write_bytes(b"# U\n" + b"\xff" * 7000)
+        mc.save_state(sid4, {"dirty": [str(bad), str(undec)], "saved": {}, "attempts": {}})
+        async def always_fail(session, call_args):
+            raise f.SaveRejected("quota")
+        f._save = always_fail
+        f.repo_root = lambda *a, **k: None
+        for i in range(1, f.MAX_ATTEMPTS + 1):
+            asyncio.run(f.flush(sid4))
+            st = mc.load_state(sid4)
+            if i < f.MAX_ATTEMPTS:
+                check(set(st["dirty"]) == {str(bad), str(undec)}, f"pass {i}: both still dirty ({st.get('attempts')})")
+            else:
+                check(st["dirty"] == [] and st.get("attempts") == {}, f"pass {i}: both given up at the cap, counters cleared")
+        # a decode error that CLEARS (write completed) is saved on the next pass, counter reset
+        undec.write_text("# U\n" + "z" * 7000, encoding="utf-8")
+        mc.save_state(sid4, {"dirty": [str(undec)], "saved": {}, "attempts": {str(undec): 1}})
+        f._save = fake_save
+        asyncio.run(f.flush(sid4))
+        st = mc.load_state(sid4)
+        check(str(undec) in st["saved"] and st.get("attempts") == {}, "recovered file saved; attempt counter reset")
+
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
 
 
