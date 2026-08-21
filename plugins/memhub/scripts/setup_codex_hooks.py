@@ -253,13 +253,22 @@ def main() -> int:
             print(f"hooks: {home / 'hooks.json'}")
             if backup:
                 print(f"backup: {backup}")
-            print("next: open /hooks in Codex and trust the MemHub hooks")
+            print("activation: installed; trust is controlled separately by Codex")
+            print(f"review source: User config - {home / 'hooks.json'}")
+            print(f"review command: {home / _RUNNER_NAME}")
+            print(
+                "next: restart Codex, open /hooks, and trust only the 3 "
+                f"handlers whose command contains {_RUNNER_NAME}"
+            )
+            print("note: do not use 'Trust all' while unrelated hooks also need review")
             return 0
         if args.action == "remove":
             print("MemHub Codex hooks: " + ("removed" if uninstall(home) else "not installed"))
             return 0
         healthy, actual, expected = status(home)
         print(f"MemHub Codex hooks: {'OK' if healthy else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
+        if healthy:
+            print("trust: Codex-controlled; verify the 3 MemHub handlers in /hooks")
         return 0 if healthy else 1
     except (SetupError, OSError) as exc:
         print(f"MemHub Codex hooks: ERROR: {exc}")

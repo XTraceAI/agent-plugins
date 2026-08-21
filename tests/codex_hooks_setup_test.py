@@ -45,7 +45,7 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         }
         (home / "hooks.json").write_text(json.dumps(original), encoding="utf-8")
         changed, expected, backup = setup.install(home)
-        assert changed and expected == 6 and backup and backup.exists()
+        assert changed and expected == 3 and backup and backup.exists()
         installed = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
         assert installed["description"] == "mine"
         assert installed["hooks"]["SessionStart"] == original["hooks"]["SessionStart"]
@@ -54,10 +54,10 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         installed_text = json.dumps(installed)
         assert str(home) in installed_text
         assert "${CODEX_HOME" not in installed_text
-        assert setup.status(home) == (True, 6, 6)
+        assert setup.status(home) == (True, 3, 3)
 
         again, count, second_backup = setup.install(home)
-        assert not again and count == 6 and second_backup is None
+        assert not again and count == 3 and second_backup is None
         assert json.loads((home / "hooks.json").read_text(encoding="utf-8")) == installed
     print("PASS test_install_preserves_other_hooks_and_is_idempotent")
 
@@ -110,7 +110,7 @@ def test_install_replaces_legacy_bridge_without_duplicates():
         assert "plugins/cache/xtrace-plugins" not in text
         assert "0.26/scripts/codex_flush.py" not in text
         assert "echo user" in text
-        assert setup.status(home) == (True, 6, 6)
+        assert setup.status(home) == (True, 3, 3)
     print("PASS test_install_replaces_legacy_bridge_without_duplicates")
 
 
@@ -275,6 +275,81 @@ def test_runner_relays_directive_and_artifact_context():
     print("PASS test_runner_relays_directive_and_artifact_context")
 
 
+def test_dispatch_combines_post_tool_contexts():
+    with tempfile.TemporaryDirectory() as raw:
+        plugin = Path(raw)
+        scripts = plugin / "scripts"
+        scripts.mkdir()
+        (scripts / "codex_flush.py").write_text("", encoding="utf-8")
+        (scripts / "reactive_prefilter.py").write_text(
+            "import sys; sys.stdin.read(); raise SystemExit(0)\n", encoding="utf-8"
+        )
+        (scripts / "directive_recall.py").write_text(
+            "import json,sys; json.load(sys.stdin); "
+            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse',"
+            "'additionalContext':'reactive proof'}}))\n",
+            encoding="utf-8",
+        )
+        (scripts / "artifact_sync_reminder.py").write_text(
+            "import json,sys; json.load(sys.stdin); "
+            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse',"
+            "'additionalContext':'version the artifact'}}))\n",
+            encoding="utf-8",
+        )
+        env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
+        payload = json.dumps({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"patch": "*** Begin Patch"},
+            "tool_response": "error: patch failed",
+        }).encode()
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"),
+             "dispatch", "PostToolUse"],
+            input=payload, capture_output=True, env=env, check=True,
+        )
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        assert output == {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "reactive proof\n\nversion the artifact",
+        }
+    print("PASS test_dispatch_combines_post_tool_contexts")
+
+
+def test_dispatch_keeps_artifact_context_when_recall_fails():
+    original_directive = bridge._directive_result
+    original_artifact = bridge._artifact_sync_result
+    original_stdout = sys.stdout
+
+    def fail_directive(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("directive_recall.py", 7)
+
+    artifact = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": "artifact survived",
+            }
+        }).encode(), stderr=b"",
+    )
+    bridge._directive_result = fail_directive
+    bridge._artifact_sync_result = lambda *_args, **_kwargs: artifact
+    output = io.StringIO()
+    sys.stdout = output
+    try:
+        bridge._dispatch_post(
+            Path("/unused"), b"{}", {"tool_name": "apply_patch"}
+        )
+    finally:
+        sys.stdout = original_stdout
+        bridge._directive_result = original_directive
+        bridge._artifact_sync_result = original_artifact
+
+    result = json.loads(output.getvalue())["hookSpecificOutput"]
+    assert result["additionalContext"] == "artifact survived"
+    print("PASS test_dispatch_keeps_artifact_context_when_recall_fails")
+
+
 def test_status_checks_materialized_windows_commands():
     with tempfile.TemporaryDirectory() as raw:
         home = Path(raw)
@@ -283,8 +358,28 @@ def test_status_checks_materialized_windows_commands():
         doc["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] = "py -3 broken.py"
         (home / "hooks.json").write_text(json.dumps(doc), encoding="utf-8")
         healthy, actual, expected = setup.status(home)
-        assert not healthy and actual == expected == 6
+        assert not healthy and actual == expected == 3
     print("PASS test_status_checks_materialized_windows_commands")
+
+
+def test_cli_names_only_the_memhub_handlers_for_review():
+    with tempfile.TemporaryDirectory() as raw:
+        real_argv = sys.argv
+        sys.argv = ["setup_codex_hooks.py", "install", "--codex-home", raw]
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                assert setup.main() == 0
+        finally:
+            sys.argv = real_argv
+
+        text = output.getvalue()
+        assert "installed (3 handlers)" in text
+        assert f"User config - {raw}/hooks.json" in text
+        assert f"review command: {raw}/memhub_hook_bridge.py" in text
+        assert "trust only the 3 handlers" in text
+        assert "do not use 'Trust all'" in text
+    print("PASS test_cli_names_only_the_memhub_handlers_for_review")
 
 
 def test_every_shell_alias_uses_the_directive_prefilter():

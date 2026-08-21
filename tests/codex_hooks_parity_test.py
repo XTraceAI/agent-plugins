@@ -37,19 +37,31 @@ def test_no_claude_only_capture_leaked():
     # cannot disagree about which scripts are Claude-only.
     for forbidden in CLAUDE_ONLY_CAPTURE:
         assert forbidden not in text, forbidden
-    assert "codex_flush.py" in text
+    assert "codex_hook_bridge.py" in text
     print("PASS test_no_claude_only_capture_leaked")
 
 
 def test_user_bridge_covers_live_codex_capabilities():
     bridge = json.loads(BRIDGE_HOOKS.read_text(encoding="utf-8"))["hooks"]
     assert set(bridge) == {"PreToolUse", "PostToolUse", "Stop"}
+    assert all(len(groups) == 1 for groups in bridge.values())
     text = json.dumps(bridge)
-    for action in ("directive-pre", "directive-post", "artifact-sync",
-                   "flush PostToolUse", "flush Stop"):
+    for action in ("dispatch PreToolUse", "dispatch PostToolUse",
+                   "dispatch Stop"):
         assert action in text, action
-    assert text.count("memhub_hook_bridge.py") == 12  # Unix + Windows, 6 handlers
+    assert text.count("memhub_hook_bridge.py") == 6  # Unix + Windows, 3 handlers
     print("PASS test_user_bridge_covers_live_codex_capabilities")
+
+
+def test_bundled_hooks_require_only_three_approvals():
+    hooks = json.loads(CODEX_HOOKS.read_text(encoding="utf-8"))["hooks"]
+    assert set(hooks) == {"PreToolUse", "PostToolUse", "Stop"}
+    handlers = [handler for groups in hooks.values() for group in groups
+                for handler in group["hooks"]]
+    assert len(handlers) == 3
+    assert all("codex_hook_bridge.py" in handler["command"]
+               for handler in handlers)
+    print("PASS test_bundled_hooks_require_only_three_approvals")
 
 
 if __name__ == "__main__":
