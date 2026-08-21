@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,15 @@ CODEX_SYNTH = [
     _line("response_item", {"type": "message", "role": "user",
                             "content": [{"type": "input_text",
                                          "text": "# AGENTS.md instructions for /repo\n..."}]}),
+    _line("response_item", {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": (
+                                "<recommended_plugins>\nplugin list\n"
+                                "</recommended_plugins>\n"
+                                "# AGENTS.md instructions\n\n"
+                                "<INSTRUCTIONS>\nrepo rule\n</INSTRUCTIONS>\n"
+                                "<environment_context>\nrepo metadata\n"
+                                "</environment_context>"
+                            )}]}),
     _line("turn_context", {"model": "gpt-5.3-codex"}),
     _line("event_msg", {"type": "user_message", "message": "duplicate UI text — ignored"}),
     _line("response_item", {"type": "message", "role": "user",
@@ -106,25 +116,29 @@ def test_codex_transform():
     assert meta["model"] == "gpt-5.3-codex", meta
     assert meta["title"] == "Fix the bug", meta   # user's opening ask wins
     assert meta["host"] == "codex", meta
-    # banner + user + thinking + text + tool_use + tool_result
-    # (developer msg + AGENTS.md msg + event_msg dupes all dropped)
+    # user + thinking + text + tool_use + tool_result
+    # (developer msg + AGENTS.md/app context + event_msg dupes all dropped)
     kinds = []
     for r in recs:
         c = r["message"]["content"]
         kinds.append(f"{r['message']['role']}:" +
                      ("text" if isinstance(c, str) else c[0]["type"]))
-    assert kinds == ["user:text", "user:text", "assistant:thinking",
-                     "assistant:text", "assistant:tool_use", "user:tool_result"], kinds
+    assert kinds == ["user:text", "assistant:thinking", "assistant:text",
+                     "assistant:tool_use", "user:tool_result"], kinds
     for r in recs:  # every record carries cwd for namespace resolution
         assert r.get("cwd") == "/repo/proj", r
-    assert recs[0]["message"]["content"].startswith("[Imported from OpenAI Codex"), recs[0]
-    assert recs[4]["message"]["model"] == "gpt-5.3-codex", recs[4]
-    assert recs[4]["message"]["usage"] == {
+    assert recs[0]["message"]["content"] == "Fix the bug", recs[0]
+    # 0.27.4 used index 0 for its banner and index 1 for the app context.
+    # The real ask keeps legacy index 2 so incremental re-import is deduplicated.
+    assert recs[0]["uuid"] == str(uuid.uuid5(
+        uuid.NAMESPACE_URL, "memhub:codex:sess-abc:2")), recs[0]
+    assert recs[3]["message"]["model"] == "gpt-5.3-codex", recs[3]
+    assert recs[3]["message"]["usage"] == {
         "input_tokens": 30,
         "output_tokens": 20,
         "cache_read_input_tokens": 60,
         "cache_creation_input_tokens": 10,
-    }, recs[4]
+    }, recs[3]
     print("PASS test_codex_transform")
 
 
@@ -170,6 +184,50 @@ def test_codex_usage_uses_cumulative_deltas():
         "cache_creation_input_tokens": 10,
     }, assistants[1]
     print("PASS test_codex_usage_uses_cumulative_deltas")
+
+
+def test_codex_recovers_wrapped_ask_without_shifting_legacy_ids():
+    wrapped = (
+        "# AGENTS.md instructions\n\n"
+        "<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>\n"
+        "<environment_context>\nrepo\n</environment_context>\n"
+        "Fix the wrapped bug"
+    )
+    roll = [
+        _line("session_meta", {"id": "recovered", "cwd": "/x"}),
+        _line("response_item", {"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": wrapped}]}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}]}),
+    ]
+    recs, meta = codex.rollout_to_claude_records(roll)
+    assert meta["title"] == "Fix the wrapped bug", meta
+    assert [r["message"]["role"] for r in recs] == ["user", "assistant"], recs
+    assert recs[0]["message"]["content"] == "Fix the wrapped bug", recs[0]
+    assert recs[0]["uuid"] == str(uuid.uuid5(
+        uuid.NAMESPACE_URL, "memhub:codex:recovered:recovered-user:1")), recs[0]
+    # 0.27.4 dropped the wrapped ask, then assigned legacy index 1 to this
+    # assistant. Recovering the ask must not move that acknowledged identity.
+    assert recs[1]["uuid"] == str(uuid.uuid5(
+        uuid.NAMESPACE_URL, "memhub:codex:recovered:1")), recs[1]
+    print("PASS test_codex_recovers_wrapped_ask_without_shifting_legacy_ids")
+
+
+def test_codex_simple_cli_records_keep_pre_banner_removal_ids():
+    roll = [
+        _line("session_meta", {"id": "simple", "cwd": "/x"}),
+        _line("response_item", {"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": "go"}]}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}]}),
+    ]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    assert len(recs) == 2, recs
+    assert [r["uuid"] for r in recs] == [
+        str(uuid.uuid5(uuid.NAMESPACE_URL, "memhub:codex:simple:1")),
+        str(uuid.uuid5(uuid.NAMESPACE_URL, "memhub:codex:simple:2")),
+    ], recs
+    print("PASS test_codex_simple_cli_records_keep_pre_banner_removal_ids")
 
 
 def test_codex_usage_without_assistant_gets_stable_record():
@@ -259,9 +317,9 @@ def test_codex_missing_call_id_orphans_uniquely():
         _line("response_item", {"type": "function_call_output", "output": "b"}),
     ]
     recs, _ = codex.rollout_to_claude_records(roll)
-    ids = [recs[1]["message"]["content"][0]["id"],
-           recs[2]["message"]["content"][0]["tool_use_id"],
-           recs[3]["message"]["content"][0]["tool_use_id"]]
+    ids = [recs[0]["message"]["content"][0]["id"],
+           recs[1]["message"]["content"][0]["tool_use_id"],
+           recs[2]["message"]["content"][0]["tool_use_id"]]
     assert all(ids) and len(set(ids)) == 3, ids   # never None, never mispaired
     print("PASS test_codex_missing_call_id_orphans_uniquely")
 
@@ -269,6 +327,14 @@ def test_codex_missing_call_id_orphans_uniquely():
 def test_clean_user_text():
     assert codex.clean_user_text("# AGENTS.md instructions for /x\n...") is None
     assert codex.clean_user_text("<environment_context>\n</environment_context>") is None
+    app_context = (
+        "<recommended_plugins>\nplugins\n</recommended_plugins>\n"
+        "# AGENTS.md instructions\n\n"
+        "<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>\n"
+        "<environment_context>\nrepo\n</environment_context>"
+    )
+    assert codex.clean_user_text(app_context) is None
+    assert codex.clean_user_text(app_context + "\nFix the real bug") == "Fix the real bug"
     ide = ("# Context from my IDE setup:\n\n## Open tabs:\n- a.py\n\n"
            "## My request for Codex:\nFix the flaky test\n\n")
     assert codex.clean_user_text(ide) == "Fix the flaky test"
