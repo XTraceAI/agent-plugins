@@ -73,16 +73,26 @@ _CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 def _plugin_root() -> Path:
     """The installed plugin dir — prod ``memhub`` or ``memhub-staging``.
 
-    Prefer ``$CLAUDE_PLUGIN_ROOT`` (set by Claude Code, authoritative). When it
-    is unset (a standalone script run) fall back to this file's location — but
-    UNRESOLVED: ``scripts/`` is symlinked into the memhub-staging plugin, so
-    ``Path(__file__).resolve()`` would collapse the symlink to the prod
-    ``memhub`` dir and read the wrong ``.mcp.json`` (a staging install would
-    then auth against and talk to prod). The unresolved path keeps the real
-    plugin identity.
+    Claude sets ``$CLAUDE_PLUGIN_ROOT``, but Cursor's compatibility loader can
+    set it to a different installed plugin. Trust the variable only when its
+    auth module is this running file. This also preserves the staging layout:
+    ``scripts/`` is symlinked into the prod plugin in the source tree, so
+    ``samefile`` recognizes the shared module while returning the staging root
+    and its staging ``.mcp.json``.
+
+    When no trustworthy root is present (a standalone script or Cursor), use
+    this file's unresolved location. Resolving it would collapse the staging
+    symlink to the prod plugin and select the wrong backend.
     """
     root = os.environ.get("CLAUDE_PLUGIN_ROOT")
-    return Path(root) if root else Path(__file__).parent.parent
+    if root:
+        candidate = Path(root)
+        try:
+            if (candidate / "scripts" / Path(__file__).name).samefile(__file__):
+                return candidate
+        except OSError:
+            pass
+    return Path(__file__).parent.parent
 
 
 def _plugin_mcp_config() -> dict:
