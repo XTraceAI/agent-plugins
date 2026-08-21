@@ -611,12 +611,9 @@ def resolve_bearer(url: str | None = None,
     if token:
         return url, token
 
-    record = _stored_pak(url)
-    # isinstance, not just truthy: the secret is formatted straight into an
-    # Authorization header, so a non-string would be rendered by f-string into
-    # a nonsense credential and fail as a puzzling 401 rather than as "no key".
-    if record and isinstance(record.get("secret"), str):
-        return url, record["secret"]
+    secret = _stored_pak_secret(url)
+    if secret is not None:
+        return url, secret
 
     # Renew before reading: the cached access token is short-lived, and this
     # shim is the only thing that ever renews it from a cold process.
@@ -664,6 +661,17 @@ def _stored_pak(url: str) -> dict | None:
         return None
 
 
+def _stored_pak_secret(url: str) -> str | None:
+    """Return only a secret that is safe to put in a bearer header."""
+    record = _stored_pak(url)
+    if not record:
+        return None
+    # isinstance, not just truthy: f-string would turn a malformed value into
+    # a nonsense credential and fail as a puzzling 401 rather than as "no key".
+    secret = record.get("secret")
+    return secret if isinstance(secret, str) else None
+
+
 def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     """Return (url, headers, auth) for streamablehttp_client.
 
@@ -692,9 +700,9 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     # the OAuth cache is the older credential and may still work, and a
     # degraded-but-working capture beats a confident dead end. The health check
     # reports the lapsed key either way.
-    record = _stored_pak(url)
-    if record:
-        return url, {"Authorization": f"Bearer {record['secret']}"}, None
+    secret = _stored_pak_secret(url)
+    if secret is not None:
+        return url, {"Authorization": f"Bearer {secret}"}, None
 
     _refresh_cached_token_if_stale(url)
     return url, None, build_oauth(url, interactive=interactive)
