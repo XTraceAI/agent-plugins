@@ -213,6 +213,43 @@ def test_codex_usage_without_assistant_gets_stable_record():
     print("PASS test_codex_usage_without_assistant_gets_stable_record")
 
 
+def test_codex_second_usage_without_output_does_not_hit_prior_assistant():
+    first = {
+        "input_tokens": 10, "cached_input_tokens": 4,
+        "cache_write_input_tokens": 0, "output_tokens": 2,
+        "reasoning_output_tokens": 0, "total_tokens": 12,
+    }
+    second = {
+        "input_tokens": 18, "cached_input_tokens": 7,
+        "cache_write_input_tokens": 0, "output_tokens": 3,
+        "reasoning_output_tokens": 0, "total_tokens": 21,
+    }
+    roll = [
+        _line("session_meta", {"id": "hidden-usage", "cwd": "/x"}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "one"}]}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": first, "last_token_usage": first}}),
+        # A hidden model request advances usage without an assistant item.
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": second, "last_token_usage": second}}),
+    ]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    assistants = [r for r in recs if r["type"] == "assistant"]
+    assert assistants[0]["message"]["usage"] == {
+        "input_tokens": 6, "output_tokens": 2,
+        "cache_read_input_tokens": 4,
+        "cache_creation_input_tokens": 0,
+    }, assistants[0]
+    assert assistants[1]["message"]["content"] == [{"type": "text", "text": ""}]
+    assert assistants[1]["message"]["usage"] == {
+        "input_tokens": 5, "output_tokens": 1,
+        "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 0,
+    }, assistants[1]
+    print("PASS test_codex_second_usage_without_output_does_not_hit_prior_assistant")
+
+
 def test_codex_missing_call_id_orphans_uniquely():
     roll = [
         _line("session_meta", {"id": "s", "cwd": "/x"}),

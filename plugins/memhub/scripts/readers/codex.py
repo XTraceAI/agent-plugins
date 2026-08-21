@@ -356,6 +356,12 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                 if usage:
                     if last_assistant is not None:
                         _merge_usage(last_assistant, usage)
+                        # One cumulative delta belongs to one model request.
+                        # Until another response item is emitted, a later
+                        # advancing snapshot has no assistant output to own it
+                        # and must become a usage-only record rather than pile
+                        # onto this now-complete request.
+                        last_assistant = None
                     else:
                         append_usage_only(usage, idx)
             continue
