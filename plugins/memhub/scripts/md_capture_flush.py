@@ -55,15 +55,23 @@ def _fm_field(fm: str, key: str) -> str | None:
     return m.group(1).strip().strip("\"'") if m else None
 
 
-def derive_name(path: Path, text: str) -> str:
+def derive_name(path: Path, text: str, root: Path | None = None) -> str:
+    """Artifact name = the version key. A frontmatter title is author-chosen
+    and used verbatim. An H1 or filename is INFERRED and gets the repo-relative
+    path appended: ``save_artifact`` versions by name within a brain, so two
+    docs that both open with ``# Overview`` would otherwise chain into one
+    lineage and the wrong one would become "latest"."""
     fm = frontmatter(text)
     t = _fm_field(fm, "title")
     if t:
         return t[:150]
     m = re.search(r"^#\s+(.+?)\s*$", text, re.M)
-    if m:
-        return m.group(1).strip()[:150]
-    return path.stem.replace("_", " ").replace("-", " ")[:150]
+    base = m.group(1).strip() if m else path.stem.replace("_", " ").replace("-", " ")
+    try:
+        rel = str(path.relative_to(root)) if root else path.name
+    except ValueError:
+        rel = path.name
+    return f"{base} ({rel})"[:150]
 
 
 def derive_type(path: Path, text: str, name: str) -> str:
@@ -86,7 +94,6 @@ def _digest(text: str) -> str:
 
 
 async def _save(session, call_args: dict) -> dict:
-    from mcp.client.session import ClientSession  # noqa: F401  (type only)
     res = await session.call_tool("save_artifact", arguments=call_args)
     texts = [c.text for c in getattr(res, "content", []) if getattr(c, "type", "") == "text"]
     try:
@@ -118,14 +125,14 @@ async def flush(session_id: str) -> None:
         if saved.get(raw) == d:
             continue                         # unchanged since last successful save
         todo.append((p, text, d))
-    # Whatever happens below, this turn's dirty list is consumed; unsaved
-    # entries come back only if the file is edited again (collector re-adds).
-    state["dirty"] = []
+    # Paths judged this pass (saved, skipped, or capped out) leave `dirty`;
+    # they come back only if the file is edited again (collector re-adds).
+    processed = set(dirty)
     if len(todo) > MAX_PER_TURN:
         _log(f"{len(todo)} candidates > cap {MAX_PER_TURN}; saving the {MAX_PER_TURN} largest")
         todo = sorted(todo, key=lambda t: -len(t[1]))[:MAX_PER_TURN]
     if not todo:
-        save_state(session_id, state)
+        _persist(session_id, processed, saved)
         return
 
     from mcp.client.session import ClientSession
@@ -136,7 +143,8 @@ async def flush(session_id: str) -> None:
         async with ClientSession(r, w) as s:
             await s.initialize()
             for p, text, d in todo:
-                name = derive_name(p, text)
+                root = repo_root(p.parent)
+                name = derive_name(p, text, root)
                 body = redact_text(text)
                 call_args: dict = {
                     "name": name,
@@ -146,7 +154,7 @@ async def flush(session_id: str) -> None:
                     "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
                                  f"re-save with save_artifact.py to publish",
                 }
-                room = read_room(p.parent, env) if repo_root(p.parent) is not None else None
+                room = read_room(p.parent, env) if root is not None else None
                 if room:
                     call_args["agent_brain_id"] = room["brain_id"]
                 try:
@@ -157,7 +165,19 @@ async def flush(session_id: str) -> None:
                          + (f" id={out.get('artifact_id') or out.get('id')}" if isinstance(out, dict) else ""))
                 except Exception as e:  # noqa: BLE001
                     _log(f"save failed for {p.name}: {type(e).__name__}: {str(e)[:120]}")
-    save_state(session_id, state)
+    _persist(session_id, processed, saved)
+
+
+def _persist(session_id: str, processed: set, saved: dict) -> None:
+    """Write back by MERGING into a fresh read, never from the snapshot taken
+    before the network window. The Stop hook is async, so the collector keeps
+    appending to the same file while a save is in flight; persisting the
+    stale snapshot would drop those paths (flush_turn solves the same race
+    with flock — this is the lock-free equivalent for a list-and-dict)."""
+    fresh = load_state(session_id)
+    fresh["dirty"] = [d for d in fresh.get("dirty") or [] if d not in processed]
+    fresh.setdefault("saved", {}).update(saved)
+    save_state(session_id, fresh)
 
 
 def main() -> int:

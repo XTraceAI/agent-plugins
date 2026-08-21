@@ -34,6 +34,13 @@ def check(cond: bool, msg: str) -> None:
         print(f"  FAIL {msg}")
 
 
+try:
+    import md_capture_flush as f
+    have_flush = True
+except ModuleNotFoundError:
+    have_flush = False
+    print("note: mcp SDK not installed — flush-side checks skipped (run via uv run --with 'mcp<2')")
+
 BIG = 9_000   # the smallest real spec in the backtest was 9,156 bytes
 SMALL = 5_800 # the largest PR-body draft was 5,760 bytes
 
@@ -96,19 +103,26 @@ with tempfile.TemporaryDirectory() as td:
     state = mc.load_state(sid)
     check(state["dirty"] == [spec], f"state holds the spec exactly once: {state['dirty']}")
 
+    if have_flush:
+        # race: a path added to `dirty` while a flush is in flight must survive the write-back
+        sid2 = "sess-md-flush-race"
+        os.environ["TMPDIR"] = td
+        mc.save_state(sid2, {"dirty": ["/Users/me/repo/a.md"], "saved": {}})
+        mc.save_state(sid2, {"dirty": ["/Users/me/repo/a.md", "/Users/me/repo/b.md"], "saved": {}})  # collector appended b mid-flight
+        f._persist(sid2, processed={"/Users/me/repo/a.md"}, saved={"/Users/me/repo/a.md": "abc"})
+        st = mc.load_state(sid2)
+        check(st["dirty"] == ["/Users/me/repo/b.md"] and st["saved"] == {"/Users/me/repo/a.md": "abc"},
+              f"flush write-back merges, does not clobber: {st}")
+
 # ---- flush-side derivations (no network) ----------------------------------
 print("flush derivations")
-try:
-    import md_capture_flush as f
-    have_flush = True
-except ModuleNotFoundError:
-    have_flush = False
-    print("  skip flush derivations (mcp SDK not installed; run via uv run --with 'mcp<2')")
 if have_flush:
     p = Path("/r/docs/rulebook-detector-spec.md")
     check(f.derive_name(p, "---\ntitle: Rulebook detectors\n---\n# Other") == "Rulebook detectors", "name: frontmatter title wins")
-    check(f.derive_name(p, "# Rulebook v2 — detectors\n") == "Rulebook v2 — detectors", "name: H1 next")
-    check(f.derive_name(p, "no heading") == "rulebook detector spec", "name: filename stem last")
+    check(f.derive_name(p, "# Rulebook v2 — detectors\n", Path("/r")) == "Rulebook v2 — detectors (docs/rulebook-detector-spec.md)", "name: H1 + relpath (inferred names are qualified)")
+    check(f.derive_name(p, "no heading", Path("/r")) == "rulebook detector spec (docs/rulebook-detector-spec.md)", "name: stem + relpath")
+    check(f.derive_name(Path("/elsewhere/x.md"), "# T", Path("/r")) == "T (x.md)", "name: outside root → basename only")
+
     check(f.derive_type(p, "", "Rulebook detectors") == "spec", "type: 'spec' in path → spec")
     check(f.derive_type(Path("/r/notes.md"), "---\ntype: runbook\n---", "x") == "runbook", "type: frontmatter wins")
     check(f.derive_type(Path("/r/retry-design.md"), "", "Retry") == "design_doc", "type: design → design_doc")
