@@ -61,6 +61,20 @@ def sessions_root() -> Path:
 # heading, after an "# Context from my IDE setup:" preamble.
 _IDE_REQUEST_RE = re.compile(r"##\s*My request(?: for Codex)?:\s*\n", re.I)
 
+# Codex Desktop can prepend these app-owned blocks as a Responses-API ``user``
+# item before the person's prompt. Strip a leading sequence rather than dropping
+# the whole item so a future host version can append the real ask to the same
+# item without losing it.
+_APP_CONTEXT_BLOCK_RE = re.compile(
+    r"\A\s*<(recommended_plugins|environment_context)>.*?</\1>\s*",
+    re.S,
+)
+_AGENTS_XML_BLOCK_RE = re.compile(
+    r"\A\s*# AGENTS\.md instructions[^\n]*\n+\s*"
+    r"<INSTRUCTIONS>.*?</INSTRUCTIONS>\s*",
+    re.S,
+)
+
 # Codex rollout files are named rollout-<ISO-timestamp>-<uuid>.jsonl.
 _ROLLOUT_UUID_RE = re.compile(
     r"-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -72,14 +86,28 @@ def clean_user_text(text: str) -> str | None:
     when the message is pure injected context.
 
     Codex prepends several non-user "user" turns: the ``# AGENTS.md
-    instructions`` block, an ``<environment_context>`` metadata blob, and (VSCode
-    extension) an ``# Context from my IDE setup:`` preamble that wraps the real
-    request under a ``## My request for Codex:`` heading. Plain CLI turns pass
-    through untouched."""
+    instructions`` block, app-owned ``<recommended_plugins>`` and
+    ``<environment_context>`` metadata blobs, and (VSCode extension) an
+    ``# Context from my IDE setup:`` preamble that wraps the real request under
+    a ``## My request for Codex:`` heading. Plain CLI turns pass through
+    untouched."""
     t = (text or "").strip()
     if not t:
         return None
-    if t.startswith("# AGENTS.md instructions") or t.startswith("<environment_context>"):
+    while True:
+        for pattern in (_APP_CONTEXT_BLOCK_RE, _AGENTS_XML_BLOCK_RE):
+            match = pattern.match(t)
+            if match:
+                t = t[match.end():].strip()
+                break
+        else:
+            break
+    if not t:
+        return None
+    # Older CLI rollouts can carry an unstructured AGENTS.md blob with no
+    # closing delimiter. There is no safe boundary at which a user ask could be
+    # recovered, so preserve the established behavior and drop that item.
+    if t.startswith("# AGENTS.md instructions"):
         return None
     if t.startswith("# Context from my IDE setup:"):
         m = _IDE_REQUEST_RE.search(t)
@@ -250,10 +278,10 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
-    ``claude_records`` are Claude-Code-shaped and carry ``cwd`` (so
-    ``import_session._namespace_from_records`` can resolve the repo) plus a
-    leading provenance banner for in-transcript traceability and compatibility
-    with conversations imported before the real platform tag shipped."""
+    ``claude_records`` are Claude-Code-shaped and carry ``cwd`` so
+    ``import_session._namespace_from_records`` can resolve the repo. Platform,
+    model, session, and cwd provenance live in structured metadata instead of a
+    synthetic user turn, keeping titles and turn counts faithful."""
     sm = _session_meta(rollout)
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
@@ -275,23 +303,53 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     out: list[dict] = []
     sid_key = sm.get("id") or "unknown"
     ts_holder = {"ts": None}
+    # Reader versions through 0.27.4 emitted a provenance banner at identity
+    # index 0. Keep a virtual slot for it so every real record retains its UUID
+    # on incremental re-import even though the banner is no longer emitted.
+    identity_index = 1
 
     def rec(record: dict) -> dict:
+        nonlocal identity_index
         if cwd:
             record["cwd"] = cwd
         # The server's agentic parser SKIPS records without a ``uuid`` (it is
         # the per-record replay-dedup key) and lifts ``event_date`` from
         # ``timestamp`` — records missing them import as nothing, silently.
-        # Deterministic uuid5 over (session, output index) so a re-import of
-        # the same rollout folds forward instead of duplicating.
+        # Deterministic uuid5 over (session, legacy output index) so a re-import
+        # folds forward instead of duplicating. ``identity_index`` can reserve
+        # slots for synthetic rows removed by newer readers.
         record["uuid"] = str(_uuid.uuid5(
-            _uuid.NAMESPACE_URL, f"memhub:codex:{sid_key}:{len(out)}"))
+            _uuid.NAMESPACE_URL, f"memhub:codex:{sid_key}:{identity_index}"))
+        identity_index += 1
         if ts_holder["ts"]:
             record["timestamp"] = ts_holder["ts"]
         return record
 
+    def reserve_legacy_identity() -> None:
+        nonlocal identity_index
+        identity_index += 1
+
     def user(content) -> dict:
         return rec({"type": "user", "message": {"role": "user", "content": content}})
+
+    def recovered_user(content: str, source_index: int) -> dict:
+        """A real ask recovered from a wrapper 0.27.4 dropped wholesale.
+
+        It must not consume a legacy output index: doing so would shift every
+        later record onto a new UUID during incremental re-import. A separate
+        source-indexed namespace adds the missing ask while preserving all
+        previously acknowledged identities.
+        """
+        record = {"type": "user", "message": {"role": "user", "content": content}}
+        if cwd:
+            record["cwd"] = cwd
+        record["uuid"] = str(_uuid.uuid5(
+            _uuid.NAMESPACE_URL,
+            f"memhub:codex:{sid_key}:recovered-user:{source_index}",
+        ))
+        if ts_holder["ts"]:
+            record["timestamp"] = ts_holder["ts"]
+        return record
 
     def assistant(block) -> dict:
         message = {"role": "assistant", "content": [block]}
@@ -299,19 +357,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
             message["model"] = model
         return rec({"type": "assistant", "message": message})
 
-    # Keep a terse provenance banner inside the transcript as well as the
-    # structured platform tag so older and exported captures stay identifiable.
-    banner = "[Imported from OpenAI Codex"
-    if model:
-        banner += f" · model {model}"
-    if sm.get("id"):
-        banner += f" · session {sm['id']}"
-    if cwd:
-        banner += f" · cwd {cwd}"
-    banner += "]"
     ts_holder["ts"] = next((r.get("timestamp") for r in rollout
                             if isinstance(r.get("timestamp"), str)), None)
-    out.append(user(banner))
 
     last_assistant: dict | None = None
     previous_usage_total: dict[str, int] | None = None
@@ -383,7 +430,21 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
             if role == "user":
                 ask = clean_user_text(text)
                 if ask:  # drop AGENTS.md / environment_context / IDE-context noise
-                    out.append(user(ask))
+                    raw = text.lstrip()
+                    if (raw.startswith("# AGENTS.md instructions")
+                            or raw.startswith("<environment_context>")):
+                        out.append(recovered_user(ask, idx))
+                    else:
+                        # A recommended_plugins-led item was already emitted by
+                        # 0.27.4, so its cleaned ask must consume that SAME
+                        # legacy slot. Moving it to recovered_user would add a
+                        # duplicate ask beside the acknowledged wrapper row.
+                        out.append(user(ask))
+                elif text.lstrip().startswith("<recommended_plugins>"):
+                    # 0.27.4 treated this app-owned preamble as a real user
+                    # record. Reserve its former index so later real records
+                    # keep the UUIDs already acknowledged by MemHub.
+                    reserve_legacy_identity()
             elif role == "assistant":
                 append_assistant({"type": "text", "text": text})
 
