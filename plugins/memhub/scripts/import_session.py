@@ -39,7 +39,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from room_map import env_for_url, read_room  # noqa: E402
+from room_map import env_for_url, git_env, git_readonly, read_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -224,6 +224,16 @@ def _cwd_from_records(records: list[dict]) -> str | None:
                  and r.get("cwd")), None)
 
 
+def _cwd_ok(cwd: str | None) -> bool:
+    """Whether a transcript-provided cwd is safe to pass as ``git -C``."""
+    if not isinstance(cwd, str) or not cwd or cwd.startswith("-"):
+        return False
+    try:
+        return Path(cwd).is_absolute() and Path(cwd).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
 def _namespace_from_records(records: list[dict]) -> str | None:
     """The session's working context: git remote basename resolved from the
     transcript's ``cwd`` (client-side — the server never derives this, since a
@@ -231,12 +241,12 @@ def _namespace_from_records(records: list[dict]) -> str | None:
     canonical repo's scoped recalls). None when it can't be resolved
     confidently — unscoped stores serve everywhere, a wrong scope doesn't."""
     cwd = _cwd_from_records(records)
-    if not cwd:
+    if not _cwd_ok(cwd):
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2,
+            git_readonly(cwd) + ["remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2, env=git_env(),
         )
         url = out.stdout.strip()
         if out.returncode == 0 and url:

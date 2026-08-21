@@ -2,7 +2,9 @@
 """Real host provenance reaches every automatic and manual import path."""
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -91,7 +93,44 @@ def test_capture_passes_reader_host_to_import_session() -> None:
     print("PASS test_capture_passes_reader_host_to_import_session")
 
 
+def test_import_namespace_probe_hardens_transcript_cwd() -> None:
+    captured: dict = {}
+    original_run = import_session.subprocess.run
+    secret_key = "MEMHUB_TEST_BEARER"
+    original_secret = os.environ.get(secret_key)
+
+    def fake_run(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="git@github.com:XTraceAI/agent-plugins.git\n",
+        )
+
+    try:
+        os.environ[secret_key] = "must-not-reach-git"
+        import_session.subprocess.run = fake_run
+        with tempfile.TemporaryDirectory() as cwd:
+            assert import_session._namespace_from_records(
+                [{"cwd": cwd}]) == "agent-plugins"
+            assert captured["command"] == import_session.git_readonly(cwd) + [
+                "remote", "get-url", "origin"]
+        assert captured["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert secret_key not in captured["env"]
+        captured.clear()
+        assert import_session._namespace_from_records(
+            [{"cwd": "relative/repo"}]) is None
+        assert not captured
+    finally:
+        import_session.subprocess.run = original_run
+        if original_secret is None:
+            os.environ.pop(secret_key, None)
+        else:
+            os.environ[secret_key] = original_secret
+    print("PASS test_import_namespace_probe_hardens_transcript_cwd")
+
+
 if __name__ == "__main__":
     test_import_request_uses_requested_platform()
     test_capture_passes_reader_host_to_import_session()
+    test_import_namespace_probe_hardens_transcript_cwd()
     print("ALL PASS")
