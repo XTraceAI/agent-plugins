@@ -435,6 +435,10 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                             or raw.startswith("<environment_context>")):
                         out.append(recovered_user(ask, idx))
                     else:
+                        # A recommended_plugins-led item was already emitted by
+                        # 0.27.4, so its cleaned ask must consume that SAME
+                        # legacy slot. Moving it to recovered_user would add a
+                        # duplicate ask beside the acknowledged wrapper row.
                         out.append(user(ask))
                 elif text.lstrip().startswith("<recommended_plugins>"):
                     # 0.27.4 treated this app-owned preamble as a real user

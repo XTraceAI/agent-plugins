@@ -230,6 +230,30 @@ def test_codex_simple_cli_records_keep_pre_banner_removal_ids():
     print("PASS test_codex_simple_cli_records_keep_pre_banner_removal_ids")
 
 
+def test_codex_recommended_plugins_with_ask_keeps_emitted_legacy_slot():
+    roll = [
+        _line("session_meta", {"id": "recommended-ask", "cwd": "/x"}),
+        _line("response_item", {"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": (
+                                    "<recommended_plugins>\nplugins\n"
+                                    "</recommended_plugins>\nFix the real bug"
+                                )}]}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}]}),
+    ]
+    recs, meta = codex.rollout_to_claude_records(roll)
+    assert meta["title"] == "Fix the real bug", meta
+    assert recs[0]["message"]["content"] == "Fix the real bug", recs[0]
+    # Unlike AGENTS/environment-led items, 0.27.4 emitted this whole wrapper
+    # as legacy index 1. Reuse that UUID; a recovered-user UUID would duplicate
+    # the ask on an incremental re-import and shift the assistant off index 2.
+    assert [r["uuid"] for r in recs] == [
+        str(uuid.uuid5(uuid.NAMESPACE_URL, "memhub:codex:recommended-ask:1")),
+        str(uuid.uuid5(uuid.NAMESPACE_URL, "memhub:codex:recommended-ask:2")),
+    ], recs
+    print("PASS test_codex_recommended_plugins_with_ask_keeps_emitted_legacy_slot")
+
+
 def test_codex_usage_without_assistant_gets_stable_record():
     total = {
         "input_tokens": 12, "cached_input_tokens": 8,
