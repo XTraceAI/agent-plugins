@@ -23,6 +23,9 @@ _KNOWN_INSTALLS = (
 _VERSION_PART = re.compile(r"\d+|[A-Za-z]+")
 _EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
 _SHELL_TOOLS = {"Bash", "shell", "local_shell"}
+_GATE_TIMEOUT_S = 1
+_RECALL_TIMEOUT_S = 6
+_ARTIFACT_TIMEOUT_S = 7
 
 
 def _version_key(path: Path) -> tuple:
@@ -53,13 +56,19 @@ def resolve_plugin_root() -> Path | None:
     return None
 
 
-def _run(root: Path, script: str, payload: bytes, *args: str) -> subprocess.CompletedProcess:
+def _run(
+    root: Path,
+    script: str,
+    payload: bytes,
+    *args: str,
+    timeout: float = 7,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(root / "scripts" / script), *args],
         input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=7,
+        timeout=timeout,
         check=False,
     )
 
@@ -80,15 +89,21 @@ def _directive_result(
         return
 
     if reactive:
-        gate = _run(root, "reactive_prefilter.py", payload)
+        gate = _run(
+            root, "reactive_prefilter.py", payload, timeout=_GATE_TIMEOUT_S
+        )
         if gate.returncode != 0:
             return
     elif hook.get("tool_name") in _SHELL_TOOLS:
-        gate = _run(root, "directive_prefilter.py", payload)
+        gate = _run(
+            root, "directive_prefilter.py", payload, timeout=_GATE_TIMEOUT_S
+        )
         if gate.returncode != 0:
             return
 
-    return _run(root, "directive_recall.py", payload)
+    return _run(
+        root, "directive_recall.py", payload, timeout=_RECALL_TIMEOUT_S
+    )
 
 
 def _directive(root: Path, payload: bytes, reactive: bool) -> None:
@@ -98,7 +113,12 @@ def _directive(root: Path, payload: bytes, reactive: bool) -> None:
 
 
 def _artifact_sync_result(root: Path, payload: bytes) -> subprocess.CompletedProcess:
-    return _run(root, "artifact_sync_reminder.py", payload)
+    return _run(
+        root,
+        "artifact_sync_reminder.py",
+        payload,
+        timeout=_ARTIFACT_TIMEOUT_S,
+    )
 
 
 def _artifact_sync(root: Path, payload: bytes) -> None:

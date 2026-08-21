@@ -322,7 +322,9 @@ def test_dispatch_keeps_artifact_context_when_recall_fails():
     original_stdout = sys.stdout
 
     def fail_directive(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired("directive_recall.py", 7)
+        raise subprocess.TimeoutExpired(
+            "directive_recall.py", bridge._RECALL_TIMEOUT_S
+        )
 
     artifact = subprocess.CompletedProcess(
         args=[], returncode=0, stdout=json.dumps({
@@ -348,6 +350,15 @@ def test_dispatch_keeps_artifact_context_when_recall_fails():
     result = json.loads(output.getvalue())["hookSpecificOutput"]
     assert result["additionalContext"] == "artifact survived"
     print("PASS test_dispatch_keeps_artifact_context_when_recall_fails")
+
+
+def test_dispatch_subprocess_budgets_fit_hook_timeouts():
+    assert bridge._GATE_TIMEOUT_S + bridge._RECALL_TIMEOUT_S < 8
+    assert max(
+        bridge._GATE_TIMEOUT_S + bridge._RECALL_TIMEOUT_S,
+        bridge._ARTIFACT_TIMEOUT_S,
+    ) < 16
+    print("PASS test_dispatch_subprocess_budgets_fit_hook_timeouts")
 
 
 def test_status_checks_materialized_windows_commands():
