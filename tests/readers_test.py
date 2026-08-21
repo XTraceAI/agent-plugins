@@ -172,6 +172,36 @@ def test_codex_usage_uses_cumulative_deltas():
     print("PASS test_codex_usage_uses_cumulative_deltas")
 
 
+def test_codex_usage_without_assistant_gets_stable_record():
+    total = {
+        "input_tokens": 12, "cached_input_tokens": 8,
+        "cache_write_input_tokens": 0, "output_tokens": 2,
+        "reasoning_output_tokens": 0, "total_tokens": 14,
+    }
+    roll = [
+        _line("session_meta", {"id": "usage-only", "cwd": "/x"}),
+        _line("turn_context", {"model": "gpt-test"}),
+        _line("response_item", {"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": "go"}]}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": total, "last_token_usage": total}}),
+    ]
+    first, _ = codex.rollout_to_claude_records(roll)
+    second, _ = codex.rollout_to_claude_records(roll)
+    assert not readers.validate_canonical(first), readers.validate_canonical(first)
+    usage_record = first[-1]
+    assert usage_record["type"] == "assistant", usage_record
+    assert usage_record["message"]["content"] == [{"type": "text", "text": ""}]
+    assert usage_record["message"]["model"] == "gpt-test"
+    assert usage_record["message"]["usage"] == {
+        "input_tokens": 4, "output_tokens": 2,
+        "cache_read_input_tokens": 8,
+        "cache_creation_input_tokens": 0,
+    }, usage_record
+    assert usage_record["uuid"] == second[-1]["uuid"]
+    print("PASS test_codex_usage_without_assistant_gets_stable_record")
+
+
 def test_codex_missing_call_id_orphans_uniquely():
     roll = [
         _line("session_meta", {"id": "s", "cwd": "/x"}),

@@ -404,6 +404,20 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                 "content": output,
             }]))
 
+    if pending_usage:
+        # A model request can consume tokens without yielding an emit-worthy
+        # response item (empty assistant text, compaction, failed generation).
+        # Preserve those measured counters on an empty assistant turn instead
+        # of fabricating prose. Give it its own identity namespace: if a later
+        # append adds a real assistant item after this token event, that normal
+        # item must not reuse the already-imported usage-only row's uuid.
+        usage_record = assistant({"type": "text", "text": ""})
+        usage_record["uuid"] = str(_uuid.uuid5(
+            _uuid.NAMESPACE_URL, f"memhub:codex:{sid_key}:usage-only"
+        ))
+        _merge_usage(usage_record, pending_usage)
+        out.append(usage_record)
+
     return out, meta
 
 
