@@ -29,7 +29,8 @@ def test_stored_pak_secret_validation():
         auth.build_oauth = lambda _url, interactive=True: oauth
         os.environ.pop("MEMHUB_TOKEN", None)
 
-        for record in ({}, {"secret": None}, {"secret": ["not", "a", "key"]}):
+        for record in ({}, {"secret": ""}, {"secret": None},
+                       {"secret": ["not", "a", "key"]}):
             auth._stored_pak = lambda _url, value=record: value
             assert auth.resolve_bearer(URL) == (URL, "oauth-token")
             assert auth.resolve_url_and_auth(URL) == (URL, None, oauth)
@@ -44,7 +45,7 @@ def test_stored_pak_secret_validation():
         auth._cached_access_token = originals["cached"]
         auth.build_oauth = originals["oauth"]
 
-    assert refreshed == [URL] * 6
+    assert refreshed == [URL] * 8
     print("PASS test_stored_pak_secret_validation")
 
 

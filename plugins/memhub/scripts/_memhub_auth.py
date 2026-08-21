@@ -669,7 +669,7 @@ def _stored_pak_secret(url: str) -> str | None:
     # isinstance, not just truthy: f-string would turn a malformed value into
     # a nonsense credential and fail as a puzzling 401 rather than as "no key".
     secret = record.get("secret")
-    return secret if isinstance(secret, str) else None
+    return secret if isinstance(secret, str) and secret else None
 
 
 def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
