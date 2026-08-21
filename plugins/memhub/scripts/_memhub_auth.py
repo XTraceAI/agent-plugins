@@ -92,6 +92,8 @@ def _plugin_root() -> Path:
                 return candidate
         except OSError:
             pass
+    # A copied staging install passes samefile above because __file__ is in that
+    # copy; reaching here means the advertised root does not own this module.
     return Path(__file__).parent.parent
 
 
