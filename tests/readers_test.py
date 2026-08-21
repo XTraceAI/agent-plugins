@@ -56,6 +56,18 @@ CODEX_SYNTH = [
                             "arguments": '{"cmd":"ls"}', "call_id": "call_1"}),
     _line("response_item", {"type": "function_call_output", "call_id": "call_1",
                             "output": "file.py"}),
+    _line("event_msg", {"type": "token_count", "info": {
+        "total_token_usage": {
+            "input_tokens": 100, "cached_input_tokens": 60,
+            "cache_write_input_tokens": 10, "output_tokens": 20,
+            "reasoning_output_tokens": 5, "total_tokens": 120,
+        },
+        "last_token_usage": {
+            "input_tokens": 100, "cached_input_tokens": 60,
+            "cache_write_input_tokens": 10, "output_tokens": 20,
+            "reasoning_output_tokens": 5, "total_tokens": 120,
+        },
+    }}),
     _line("event_msg", {"type": "task_complete", "last_agent_message": "Fixed it"}),
 ]
 
@@ -106,7 +118,136 @@ def test_codex_transform():
     for r in recs:  # every record carries cwd for namespace resolution
         assert r.get("cwd") == "/repo/proj", r
     assert recs[0]["message"]["content"].startswith("[Imported from OpenAI Codex"), recs[0]
+    assert recs[4]["message"]["model"] == "gpt-5.3-codex", recs[4]
+    assert recs[4]["message"]["usage"] == {
+        "input_tokens": 30,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 60,
+        "cache_creation_input_tokens": 10,
+    }, recs[4]
     print("PASS test_codex_transform")
+
+
+def test_codex_usage_uses_cumulative_deltas():
+    """Repeated last-usage broadcasts do not double count; a later cumulative
+    advance attaches only its delta and cache tokens are not counted as fresh.
+    """
+    first = {
+        "input_tokens": 100, "cached_input_tokens": 60,
+        "cache_write_input_tokens": 10, "output_tokens": 20,
+        "reasoning_output_tokens": 5, "total_tokens": 120,
+    }
+    second = {
+        "input_tokens": 180, "cached_input_tokens": 100,
+        "cache_write_input_tokens": 20, "output_tokens": 35,
+        "reasoning_output_tokens": 8, "total_tokens": 215,
+    }
+    roll = [
+        _line("session_meta", {"id": "usage", "cwd": "/x"}),
+        _line("turn_context", {"model": "gpt-test"}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "one"}]}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": first, "last_token_usage": first}}),
+        # Codex can rebroadcast unchanged last_token_usage on rate-limit updates.
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": first, "last_token_usage": first}}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "two"}]}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": second, "last_token_usage": second}}),
+    ]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    assistants = [r for r in recs if r["type"] == "assistant"]
+    assert assistants[0]["message"]["usage"] == {
+        "input_tokens": 30, "output_tokens": 20,
+        "cache_read_input_tokens": 60,
+        "cache_creation_input_tokens": 10,
+    }, assistants[0]
+    assert assistants[1]["message"]["usage"] == {
+        "input_tokens": 30, "output_tokens": 15,
+        "cache_read_input_tokens": 40,
+        "cache_creation_input_tokens": 10,
+    }, assistants[1]
+    print("PASS test_codex_usage_uses_cumulative_deltas")
+
+
+def test_codex_usage_without_assistant_gets_stable_record():
+    total = {
+        "input_tokens": 12, "cached_input_tokens": 8,
+        "cache_write_input_tokens": 0, "output_tokens": 2,
+        "reasoning_output_tokens": 0, "total_tokens": 14,
+    }
+    roll = [
+        _line("session_meta", {"id": "usage-only", "cwd": "/x"}),
+        _line("turn_context", {"model": "gpt-test"}),
+        _line("response_item", {"type": "message", "role": "user",
+                                "content": [{"type": "input_text", "text": "go"}]}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": total, "last_token_usage": total}}),
+    ]
+    first, _ = codex.rollout_to_claude_records(roll)
+    second, _ = codex.rollout_to_claude_records(roll)
+    assert not readers.validate_canonical(first), readers.validate_canonical(first)
+    usage_record = first[-1]
+    assert usage_record["type"] == "assistant", usage_record
+    assert usage_record["message"]["content"] == [{"type": "text", "text": ""}]
+    assert usage_record["message"]["model"] == "gpt-test"
+    assert usage_record["message"]["usage"] == {
+        "input_tokens": 4, "output_tokens": 2,
+        "cache_read_input_tokens": 8,
+        "cache_creation_input_tokens": 0,
+    }, usage_record
+    assert usage_record["uuid"] == second[-1]["uuid"]
+
+    # If a later rollout append adds real assistant output, the already-sent
+    # usage row remains with the same uuid and the new row does not inherit its
+    # counters (which would double-count after incremental import).
+    grown = roll + [
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}]})
+    ]
+    later, _ = codex.rollout_to_claude_records(grown)
+    assert later[-2]["uuid"] == usage_record["uuid"]
+    assert "usage" not in later[-1]["message"], later[-1]
+    print("PASS test_codex_usage_without_assistant_gets_stable_record")
+
+
+def test_codex_second_usage_without_output_does_not_hit_prior_assistant():
+    first = {
+        "input_tokens": 10, "cached_input_tokens": 4,
+        "cache_write_input_tokens": 0, "output_tokens": 2,
+        "reasoning_output_tokens": 0, "total_tokens": 12,
+    }
+    second = {
+        "input_tokens": 18, "cached_input_tokens": 7,
+        "cache_write_input_tokens": 0, "output_tokens": 3,
+        "reasoning_output_tokens": 0, "total_tokens": 21,
+    }
+    roll = [
+        _line("session_meta", {"id": "hidden-usage", "cwd": "/x"}),
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "one"}]}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": first, "last_token_usage": first}}),
+        # A hidden model request advances usage without an assistant item.
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": second, "last_token_usage": second}}),
+    ]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    assistants = [r for r in recs if r["type"] == "assistant"]
+    assert assistants[0]["message"]["usage"] == {
+        "input_tokens": 6, "output_tokens": 2,
+        "cache_read_input_tokens": 4,
+        "cache_creation_input_tokens": 0,
+    }, assistants[0]
+    assert assistants[1]["message"]["content"] == [{"type": "text", "text": ""}]
+    assert assistants[1]["message"]["usage"] == {
+        "input_tokens": 5, "output_tokens": 1,
+        "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 0,
+    }, assistants[1]
+    print("PASS test_codex_second_usage_without_output_does_not_hit_prior_assistant")
 
 
 def test_codex_missing_call_id_orphans_uniquely():
@@ -222,6 +363,8 @@ CURSOR_MESSAGES = [
         {"type": "text", "text": "On it."},
         {"type": "tool-call", "toolCallId": "call-1\nfc_0", "toolName": "Shell",
          "args": {"command": "ls"}}],
+     "usage": {"inputTokens": 50, "outputTokens": 12,
+               "cacheReadTokens": 20, "cacheWriteTokens": 3},
      "providerOptions": {"cursor": {"modelName": "cursor-test-model"}}},
     {"role": "tool", "content": [
         {"type": "tool-result", "toolCallId": "call-1\nfc_0", "toolName": "Shell",
@@ -317,6 +460,12 @@ def test_cursor_reader_end_to_end():
         tu = recs[3]["message"]["content"][0]
         assert tu == {"type": "tool_use", "id": "call-1\nfc_0", "name": "Shell",
                       "input": {"command": "ls"}}, tu
+        assert recs[3]["message"]["model"] == "cursor-test-model", recs[3]
+        assert recs[3]["message"]["usage"] == {
+            "input_tokens": 50, "output_tokens": 12,
+            "cache_read_input_tokens": 20,
+            "cache_creation_input_tokens": 3,
+        }, recs[3]
         tr = recs[4]["message"]["content"][0]
         assert tr == {"type": "tool_result", "tool_use_id": "call-1\nfc_0",
                       "content": "file.py"}, tr

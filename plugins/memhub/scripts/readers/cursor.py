@@ -81,6 +81,47 @@ def _text_of(content) -> str:
     return ""
 
 
+def _usage_of(message: dict) -> dict[str, int] | None:
+    """Map persisted Cursor usage, when the host provides it.
+
+    Cursor 2026.08's v1 chat store does not persist the CLI result's usage
+    object, so real sessions currently return ``None``. Accept both the CLI's
+    camelCase names and Claude-shaped snake_case names so usage begins flowing
+    without another reader migration if Cursor adds it to message leaves.
+    Never estimate from text: proprietary model tokenizers make that look
+    precise while being wrong.
+    """
+    raw = message.get("usage")
+    if not isinstance(raw, dict):
+        raw = message.get("tokenCount")
+    if not isinstance(raw, dict):
+        return None
+
+    aliases = {
+        "input_tokens": ("inputTokens", "input_tokens"),
+        "output_tokens": ("outputTokens", "output_tokens"),
+        "cache_read_input_tokens": (
+            "cacheReadTokens", "cache_read_tokens", "cache_read_input_tokens"
+        ),
+        "cache_creation_input_tokens": (
+            "cacheWriteTokens", "cache_write_tokens",
+            "cache_creation_input_tokens",
+        ),
+    }
+    out: dict[str, int] = {}
+    measured = False
+    for target, names in aliases.items():
+        value = next((raw[name] for name in names if name in raw), None)
+        if value is None:
+            out[target] = 0
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        out[target] = value
+        measured = True
+    return out if measured else None
+
+
 def _read_meta_json(session_dir: Path) -> dict | None:
     p = session_dir / "meta.json"
     try:
@@ -283,9 +324,11 @@ def to_canonical(path) -> tuple[list[dict], dict]:
     def user(content) -> dict:
         return rec({"type": "user", "message": {"role": "user", "content": content}})
 
-    def assistant(block) -> dict:
-        return rec({"type": "assistant",
-                    "message": {"role": "assistant", "content": [block]}})
+    def assistant(block, block_model: str | None = None) -> dict:
+        message = {"role": "assistant", "content": [block]}
+        if block_model or model:
+            message["model"] = block_model or model
+        return rec({"type": "assistant", "message": message})
 
     out: list[dict] = []
     dated_messages = _load_messages(db_path)
@@ -332,26 +375,39 @@ def to_canonical(path) -> tuple[list[dict], dict]:
         if role == "assistant":
             blocks = content if isinstance(content, list) else [
                 {"type": "text", "text": content}]
+            emitted: list[dict] = []
             for b in blocks:
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
+                block_model = _model_of(b) or _model_of(msg)
                 if bt == "reasoning":
                     text = (b.get("text") or "").strip()
                     if text:  # signatures are opaque — text only
-                        out.append(assistant({"type": "thinking", "thinking": text}))
+                        record = assistant(
+                            {"type": "thinking", "thinking": text}, block_model
+                        )
+                        out.append(record)
+                        emitted.append(record)
                 elif bt == "text":
                     text = (b.get("text") or "").strip()
                     if text:
-                        out.append(assistant({"type": "text", "text": text}))
+                        record = assistant({"type": "text", "text": text}, block_model)
+                        out.append(record)
+                        emitted.append(record)
                 elif bt == "tool-call":
                     args = b.get("args")
-                    out.append(assistant({
+                    record = assistant({
                         "type": "tool_use",
                         "id": b.get("toolCallId") or f"cursor-call-{len(out)}",
                         "name": b.get("toolName") or "tool",
                         "input": args if isinstance(args, dict) else {"input": args},
-                    }))
+                    }, block_model)
+                    out.append(record)
+                    emitted.append(record)
+            usage = _usage_of(msg)
+            if emitted and usage:
+                emitted[-1]["message"]["usage"] = usage
             continue
 
         if role == "tool":
