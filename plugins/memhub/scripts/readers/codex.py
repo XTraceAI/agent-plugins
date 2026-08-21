@@ -20,9 +20,9 @@ Codex rollout envelope (one JSON object per line)::
 
 The conversation lives in the ``response_item`` stream (the OpenAI Responses
 API items actually exchanged with the model — this is what carries tool I/O in
-order). The parallel ``event_msg`` stream is UI telemetry and is intentionally
-ignored: it duplicates the text without the tool-call structure the agentic
-detector needs, and mixing the two would double every user/assistant turn.
+order). The parallel ``event_msg`` stream is ignored for CONTENT because it
+duplicates text without tool-call structure, but its cumulative ``token_count``
+snapshots are the rollout's authoritative usage source.
 
 Mapping (order preserved — gpt-5.x emits a ``reasoning`` item *before* its
 ``function_call`` and the loop must keep that order)::
@@ -35,6 +35,7 @@ Mapping (order preserved — gpt-5.x emits a ``reasoning`` item *before* its
     response_item custom_tool_call    -> assistant tool_use block (apply_patch …)
     response_item function_call_output-> user tool_result block
     response_item custom_tool_call_output -> user tool_result block
+    event_msg token_count              -> usage on the latest assistant record
     (role=developer / system prompt injections are skipped as noise)
 """
 from __future__ import annotations
@@ -150,6 +151,75 @@ def _session_meta(rollout: list[dict]) -> dict:
     return {}
 
 
+_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+)
+
+
+def _usage_total(value: Any) -> dict[str, int] | None:
+    """A validated Codex cumulative-usage snapshot, or ``None``.
+
+    Booleans are ints in Python but not token counts. Missing cache fields are
+    zero for older rollouts; missing input/output fields make the snapshot
+    unusable rather than turning an incomplete event into measured zeroes.
+    """
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, int] = {}
+    for key in _USAGE_KEYS:
+        raw = value.get(key, 0 if "cache" in key else None)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            return None
+        out[key] = raw
+    return out
+
+
+def _usage_delta(current: dict[str, int], previous: dict[str, int] | None
+                 ) -> dict[str, int] | None:
+    """Map a cumulative Codex snapshot to one Claude-shaped usage delta.
+
+    Codex may re-emit an unchanged ``last_token_usage`` on a rate-limit-only
+    update, so the cumulative counters — not ``last_token_usage`` — are the
+    dedup boundary. Codex ``input_tokens`` includes cache reads and writes;
+    MemHub stores those separately, therefore ``input_tokens`` below is only
+    the fresh remainder. This makes MemHub's four-field sum equal Codex's raw
+    input + output total instead of double-counting the prompt cache.
+    """
+    before = previous or {key: 0 for key in _USAGE_KEYS}
+    if any(current[key] < before[key] for key in _USAGE_KEYS):
+        return None
+    delta = {key: current[key] - before[key] for key in _USAGE_KEYS}
+    if not any(delta.values()):
+        return None
+    fresh = max(
+        0,
+        delta["input_tokens"]
+        - delta["cached_input_tokens"]
+        - delta["cache_write_input_tokens"],
+    )
+    return {
+        "input_tokens": fresh,
+        "output_tokens": delta["output_tokens"],
+        "cache_read_input_tokens": delta["cached_input_tokens"],
+        "cache_creation_input_tokens": delta["cache_write_input_tokens"],
+    }
+
+
+def _merge_usage(record: dict, usage: dict[str, int]) -> None:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return
+    target = message.setdefault("usage", {})
+    if not isinstance(target, dict):
+        target = {}
+        message["usage"] = target
+    for key, value in usage.items():
+        target[key] = target.get(key, 0) + value
+
+
 def _title(rollout: list[dict]) -> str | None:
     """Best-effort title: the final ``task_complete`` summary, else the first
     real user message's first line."""
@@ -224,8 +294,10 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         return rec({"type": "user", "message": {"role": "user", "content": content}})
 
     def assistant(block) -> dict:
-        return rec({"type": "assistant",
-                    "message": {"role": "assistant", "content": [block]}})
+        message = {"role": "assistant", "content": [block]}
+        if model:
+            message["model"] = model
+        return rec({"type": "assistant", "message": message})
 
     # Keep a terse provenance banner inside the transcript as well as the
     # structured platform tag so older and exported captures stay identifiable.
@@ -241,12 +313,47 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                             if isinstance(r.get("timestamp"), str)), None)
     out.append(user(banner))
 
+    last_assistant: dict | None = None
+    previous_usage_total: dict[str, int] | None = None
+    pending_usage: dict[str, int] = {}
+
+    def append_assistant(block: dict) -> None:
+        nonlocal last_assistant, pending_usage
+        last_assistant = assistant(block)
+        out.append(last_assistant)
+        if pending_usage:
+            _merge_usage(last_assistant, pending_usage)
+            pending_usage = {}
+
     for idx, r in enumerate(rollout):
+        pl = r.get("payload")
+        if (r.get("type") == "event_msg" and isinstance(pl, dict)
+                and pl.get("type") == "token_count"):
+            if isinstance(r.get("timestamp"), str):
+                ts_holder["ts"] = r["timestamp"]
+            info = pl.get("info")
+            total = _usage_total(
+                info.get("total_token_usage") if isinstance(info, dict) else None
+            )
+            if total is not None:
+                usage = _usage_delta(total, previous_usage_total)
+                # A regressing/malformed cumulative snapshot is ignored and
+                # does not poison the baseline for later valid snapshots.
+                if (previous_usage_total is None
+                        or all(total[k] >= previous_usage_total[k]
+                               for k in _USAGE_KEYS)):
+                    previous_usage_total = total
+                if usage:
+                    if last_assistant is not None:
+                        _merge_usage(last_assistant, usage)
+                    else:
+                        for key, value in usage.items():
+                            pending_usage[key] = pending_usage.get(key, 0) + value
+            continue
         if r.get("type") != "response_item":
             continue
         if isinstance(r.get("timestamp"), str):
             ts_holder["ts"] = r["timestamp"]
-        pl = r.get("payload")
         if not isinstance(pl, dict):
             continue
         pt = pl.get("type")
@@ -263,24 +370,24 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                 if ask:  # drop AGENTS.md / environment_context / IDE-context noise
                     out.append(user(ask))
             elif role == "assistant":
-                out.append(assistant({"type": "text", "text": text}))
+                append_assistant({"type": "text", "text": text})
 
         elif pt == "reasoning":
             summary = _text_of(pl.get("summary")).strip()
             if summary:
-                out.append(assistant({"type": "thinking", "thinking": summary}))
+                append_assistant({"type": "thinking", "thinking": summary})
 
         elif pt in ("function_call", "custom_tool_call"):
             # Real Codex tool calls always carry call_id; synthesize a unique,
             # non-None id if a malformed record omits it (the matching output
             # carries the same call_id, so pairing still holds).
             call_id = pl.get("call_id") or pl.get("id") or f"codex-call-{idx}"
-            out.append(assistant({
+            append_assistant({
                 "type": "tool_use",
                 "id": call_id,
                 "name": pl.get("name") or "tool",
                 "input": _tool_input(pl),
-            }))
+            })
 
         elif pt in ("function_call_output", "custom_tool_call_output"):
             # An id-less output is inherently unpairable (its call_id is the only
