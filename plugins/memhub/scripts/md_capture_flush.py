@@ -117,7 +117,10 @@ async def _save(session, call_args: dict) -> dict:
         raise SaveRejected(f"non-JSON reply: {body[:160]}")
     if not isinstance(out, dict):
         raise SaveRejected(f"unexpected reply shape: {type(out).__name__}")
-    if any(k in out for k in ("error", "detail", "_raw")) and not (out.get("artifact_id") or out.get("id")):
+    # The server's success payload is exactly {id, name, action, tags,
+    # tag_report, scope}; failures raise (→ isError). An error field is
+    # therefore never part of a success, and wins over any id beside it.
+    if any(k in out for k in ("error", "detail", "_raw")):
         raise SaveRejected(f"rejected: {json.dumps(out)[:160]}")
     if not (out.get("artifact_id") or out.get("id")):
         raise SaveRejected(f"no artifact id in reply: {json.dumps(out)[:160]}")

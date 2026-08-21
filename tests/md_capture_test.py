@@ -172,6 +172,8 @@ with tempfile.TemporaryDirectory() as td:
         check(_rejects(_R("<html>502</html>")), "_save: non-JSON body → SaveRejected")
         check(_rejects(_R('{"ok":true}')), "_save: no artifact id → SaveRejected")
         check(not _rejects(_R('{"artifact_id":"a1","name":"x"}')), "_save: real success → returns")
+        check(_rejects(_R('{"id":"a1","error":"quota: saved partial"}')), "_save: error field beside an id → still rejected")
+        check(not _rejects(_R('{"id":"a1","name":"x","action":"created","tags":[],"tag_report":{},"scope":{}}')), "_save: the server's exact success shape → returns")
         class _S:
             async def initialize(self): pass
         class _Ctx:
