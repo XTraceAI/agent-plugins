@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Mapping
@@ -105,7 +106,6 @@ def _log(message: str) -> None:
 def _spawn_cursor_flush(raw: bytes, event: str) -> None:
     script = Path(__file__).resolve().with_name("cursor_flush.py")
     kwargs: dict[str, object] = {
-        "stdin": subprocess.PIPE,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
@@ -119,15 +119,17 @@ def _spawn_cursor_flush(raw: bytes, event: str) -> None:
         kwargs["start_new_session"] = True
 
     try:
-        process = subprocess.Popen(
-            [sys.executable, str(script), event], **kwargs)
-        if process.stdin is not None:
-            try:
-                process.stdin.write(raw)
-            except BrokenPipeError:
-                pass
-            finally:
-                process.stdin.close()
+        # Do not feed an unbounded hook payload through PIPE from this guard:
+        # a payload larger than the kernel pipe buffer would hold the hook
+        # process until cursor_flush finishes importing and reads stdin. The
+        # child inherits its own handle to this seeked temporary file, so the
+        # parent can close immediately after Popen on both POSIX and Windows.
+        with tempfile.TemporaryFile() as payload_file:
+            payload_file.write(raw)
+            payload_file.seek(0)
+            subprocess.Popen(
+                [sys.executable, str(script), event],
+                stdin=payload_file, **kwargs)
     except OSError as exc:
         _log(f"could not launch cursor_flush.py ({exc!r})")
 
