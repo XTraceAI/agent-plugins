@@ -43,6 +43,12 @@ UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 # gates INFERRED captures.
 MIN_BYTES = 6_000
 
+# Upper bound. A generated markdown dump (a 200 MB log rendered as a table)
+# is not a deliverable, and reading + hashing + redacting + shipping it on
+# every Stop is a memory and timeout cliff on the async hook path. Judged a
+# non-candidate so it leaves the retry list rather than recurring.
+MAX_BYTES = 2_000_000
+
 # Veto locations — by meaning, not by customer layout. Claude's own state under
 # ~/.claude (auto-memory was half of all .md writes), the harness scratchpad,
 # and OS temp dirs. Matched on the resolved absolute path.
@@ -123,6 +129,8 @@ def is_candidate(path: Path, size: int | None = None, text: str | None = None) -
         return False, "size unknown"
     if size < MIN_BYTES:
         return False, f"below size floor ({size} < {MIN_BYTES})"
+    if size > MAX_BYTES:
+        return False, f"above size cap ({size} > {MAX_BYTES})"
     return True, f"markdown >= {MIN_BYTES} bytes"
 
 
@@ -142,7 +150,14 @@ def main() -> int:
     ok, _ = is_candidate(path, size=MIN_BYTES)  # size floor deferred → treat as passing
     if not ok:
         return 0
-    key = str(path.resolve()) if path.exists() else str(path)
+    # resolve() is non-strict: it canonicalises the existing prefix (symlinks,
+    # `..`) whether or not the leaf exists yet, so the first Write (file absent)
+    # and later Edits (file present) map to ONE key. A create-then-edit used to
+    # store two keys and save the file twice under two names.
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = os.path.abspath(str(path))
     state = load_state(session_id)
     if key not in state["dirty"]:
         state["dirty"].append(key)

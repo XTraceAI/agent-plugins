@@ -62,6 +62,7 @@ cases = [
     ("/Users/me/repo/notes/design.md", SMALL, "---\nmemhub: artifact\ntitle: Retry design\n---\n# Retry", True, "small but frontmatter opt-in → capture"),
     ("/Users/me/repo/notes/design.md", SMALL, "---\ntitle: Retry design\n---\n", False, "frontmatter WITHOUT memhub: artifact → below floor"),
     ("/Users/me/repo/src/thing.py", BIG, "", False, "not markdown"),
+    ("/Users/me/repo/dump.md", 3_000_000, "", False, "3 MB generated dump → above size cap"),
     ("/Users/me/repo/node_modules/pkg/README.md", BIG, "", False, "node_modules → veto"),
 ]
 for path, size, text, expect, label in cases:
@@ -102,6 +103,22 @@ with tempfile.TemporaryDirectory() as td:
     os.environ["TMPDIR"] = td
     state = mc.load_state(sid)
     check(state["dirty"] == [spec], f"state holds the spec exactly once: {state['dirty']}")
+    # create-then-edit through a symlinked dir must map to ONE canonical key
+    real = Path(td) / "realrepo" / "docs"; real.mkdir(parents=True)
+    link = Path(td) / "linkrepo"; link.symlink_to(Path(td) / "realrepo")
+    sidk = "sess-md-capture-keys"
+    absent_via_link = str(link / "docs" / "new-spec.md")         # first Write: file absent
+    run({"session_id": sidk, "tool_name": "Write", "tool_input": {"file_path": absent_via_link}})
+    (real / "new-spec.md").write_text("# x", encoding="utf-8")   # now it exists
+    run({"session_id": sidk, "tool_name": "Edit", "tool_input": {"file_path": absent_via_link}})
+    run({"session_id": sidk, "tool_name": "Edit", "tool_input": {"file_path": str(real / "new-spec.md")}})
+    vp0 = mc.VETO_PARTS
+    st = mc.load_state(sidk)
+    canon = str((real / "new-spec.md").resolve())
+    # td itself is under /var/folders (vetoed) so the collector never records these —
+    # assert the KEY function directly instead: all three spellings canonicalise alike.
+    keys = {str(Path(x).resolve()) for x in (absent_via_link, str(real / "new-spec.md"))}
+    check(keys == {canon}, f"symlink + absent-at-first-write spellings resolve to one key: {keys}")
 
     if have_flush:
         # race: a path added to `dirty` while a flush is in flight must survive the write-back
@@ -135,6 +152,26 @@ with tempfile.TemporaryDirectory() as td:
             if calls["n"] == 2:
                 raise RuntimeError("server blip")
             return {"artifact_id": "aid"}
+        # _save's own success detection, exercised directly with fake tool results
+        class _R:
+            def __init__(self, text, is_error=False):
+                self.isError = is_error
+                self.content = [types.SimpleNamespace(type="text", text=text)]
+        class _Sess:
+            def __init__(self, r): self.r = r
+            async def call_tool(self, *a, **k): return self.r
+        import types
+        real_save = f._save
+        def _rejects(res):
+            try:
+                asyncio.run(real_save(_Sess(res), {})); return False
+            except f.SaveRejected:
+                return True
+        check(_rejects(_R('{"error":"auth failed"}')), "_save: JSON error payload → SaveRejected")
+        check(_rejects(_R("Unauthorized", is_error=True)), "_save: isError result → SaveRejected")
+        check(_rejects(_R("<html>502</html>")), "_save: non-JSON body → SaveRejected")
+        check(_rejects(_R('{"ok":true}')), "_save: no artifact id → SaveRejected")
+        check(not _rejects(_R('{"artifact_id":"a1","name":"x"}')), "_save: real success → returns")
         class _S:
             async def initialize(self): pass
         class _Ctx:

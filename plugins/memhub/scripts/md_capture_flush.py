@@ -38,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from md_capture import frontmatter, is_candidate, load_state, save_state  # noqa: E402
+from md_capture import MAX_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
 from room_map import env_for_url, read_room, repo_root  # noqa: E402
 
@@ -94,13 +94,34 @@ def _digest(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
+class SaveRejected(RuntimeError):
+    """The server answered, but not with a saved artifact."""
+
+
 async def _save(session, call_args: dict) -> dict:
+    """Call save_artifact and return its parsed payload, or raise.
+
+    Only a confirmed success returns: an ``isError`` result, a non-JSON body,
+    or a JSON body carrying an error field all raise ``SaveRejected`` so the
+    caller leaves the path dirty. Treating any dict as success recorded the
+    digest on an auth/quota rejection and silently lost the capture.
+    """
     res = await session.call_tool("save_artifact", arguments=call_args)
     texts = [c.text for c in getattr(res, "content", []) if getattr(c, "type", "") == "text"]
+    body = texts[0] if texts else ""
+    if getattr(res, "isError", False):
+        raise SaveRejected(f"tool error: {body[:160]}")
     try:
-        return json.loads(texts[0]) if texts else {}
+        out = json.loads(body) if body else {}
     except ValueError:
-        return {"_raw": texts[0][:200] if texts else ""}
+        raise SaveRejected(f"non-JSON reply: {body[:160]}")
+    if not isinstance(out, dict):
+        raise SaveRejected(f"unexpected reply shape: {type(out).__name__}")
+    if any(k in out for k in ("error", "detail", "_raw")) and not (out.get("artifact_id") or out.get("id")):
+        raise SaveRejected(f"rejected: {json.dumps(out)[:160]}")
+    if not (out.get("artifact_id") or out.get("id")):
+        raise SaveRejected(f"no artifact id in reply: {json.dumps(out)[:160]}")
+    return out
 
 
 async def flush(session_id: str) -> None:
@@ -119,6 +140,16 @@ async def flush(session_id: str) -> None:
         p = Path(raw)
         if not p.is_file():
             processed.add(raw)                   # deleted/moved: nothing to retry
+            continue
+        try:
+            nbytes = p.stat().st_size
+        except OSError:
+            processed.add(raw)
+            continue
+        if nbytes > MAX_BYTES:
+            # stat-gated BEFORE read_text: the cap must not cost a full read
+            _log(f"skip {p.name}: above size cap ({nbytes} > {MAX_BYTES})")
+            processed.add(raw)
             continue
         try:
             text = p.read_text(encoding="utf-8")
@@ -181,8 +212,8 @@ async def flush(session_id: str) -> None:
                     saved[raw] = d
                     processed.add(raw)
                     _log(f"saved '{name}' ({len(body):,} chars) → "
-                         f"{room['name'] if room else 'personal memory'}"
-                         + (f" id={out.get('artifact_id') or out.get('id')}" if isinstance(out, dict) else ""))
+                         f"{room['name'] if room else 'personal memory'} "
+                         f"id={out.get('artifact_id') or out.get('id')}")
     finally:
         # Persist whatever was decided even if the connection itself failed:
         # non-candidates drop out, successes record their digest, everything
