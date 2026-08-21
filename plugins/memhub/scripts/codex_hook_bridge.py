@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _KNOWN_INSTALLS = (
@@ -20,6 +21,11 @@ _KNOWN_INSTALLS = (
     ("memhub-internal", "memhub-staging"),
 )
 _VERSION_PART = re.compile(r"\d+|[A-Za-z]+")
+_EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
+_SHELL_TOOLS = {"Bash", "shell", "local_shell"}
+_GATE_TIMEOUT_S = 1
+_RECALL_TIMEOUT_S = 6
+_ARTIFACT_TIMEOUT_S = 7
 
 
 def _version_key(path: Path) -> tuple:
@@ -31,11 +37,12 @@ def _version_key(path: Path) -> tuple:
 
 
 def resolve_plugin_root() -> Path | None:
-    override = os.environ.get("MEMHUB_PLUGIN_ROOT")
-    if override:
-        root = Path(override).expanduser()
-        if (root / "scripts" / "codex_flush.py").is_file():
-            return root
+    for variable in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+        override = os.environ.get(variable)
+        if override:
+            root = Path(override).expanduser()
+            if (root / "scripts" / "codex_flush.py").is_file():
+                return root
 
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     cache = codex_home / "plugins" / "cache"
@@ -49,13 +56,19 @@ def resolve_plugin_root() -> Path | None:
     return None
 
 
-def _run(root: Path, script: str, payload: bytes, *args: str) -> subprocess.CompletedProcess:
+def _run(
+    root: Path,
+    script: str,
+    payload: bytes,
+    *args: str,
+    timeout: float = 7,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(root / "scripts" / script), *args],
         input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=7,
+        timeout=timeout,
         check=False,
     )
 
@@ -67,29 +80,122 @@ def _relay(result: subprocess.CompletedProcess) -> None:
         sys.stdout.buffer.write(result.stdout)
 
 
-def _directive(root: Path, payload: bytes, reactive: bool) -> None:
+def _directive_result(
+    root: Path, payload: bytes, reactive: bool
+) -> subprocess.CompletedProcess | None:
     try:
         hook = json.loads(payload or b"{}")
     except (TypeError, ValueError):
         return
 
     if reactive:
-        gate = _run(root, "reactive_prefilter.py", payload)
+        gate = _run(
+            root, "reactive_prefilter.py", payload, timeout=_GATE_TIMEOUT_S
+        )
         if gate.returncode != 0:
             return
-    elif hook.get("tool_name") in {"Bash", "shell", "local_shell"}:
-        gate = _run(root, "directive_prefilter.py", payload)
+    elif hook.get("tool_name") in _SHELL_TOOLS:
+        gate = _run(
+            root, "directive_prefilter.py", payload, timeout=_GATE_TIMEOUT_S
+        )
         if gate.returncode != 0:
             return
 
-    _relay(_run(root, "directive_recall.py", payload))
+    return _run(
+        root, "directive_recall.py", payload, timeout=_RECALL_TIMEOUT_S
+    )
+
+
+def _directive(root: Path, payload: bytes, reactive: bool) -> None:
+    result = _directive_result(root, payload, reactive)
+    if result is not None:
+        _relay(result)
+
+
+def _artifact_sync_result(root: Path, payload: bytes) -> subprocess.CompletedProcess:
+    return _run(
+        root,
+        "artifact_sync_reminder.py",
+        payload,
+        timeout=_ARTIFACT_TIMEOUT_S,
+    )
 
 
 def _artifact_sync(root: Path, payload: bytes) -> None:
     # artifact_sync_reminder already emits Codex/Claude-compatible
     # hookSpecificOutput JSON. Relay it byte-for-byte; wrapping it again would
     # turn the JSON document itself into the model-visible reminder text.
-    _relay(_run(root, "artifact_sync_reminder.py", payload))
+    _relay(_artifact_sync_result(root, payload))
+
+
+def _additional_context(result: subprocess.CompletedProcess | None) -> str | None:
+    if result is None:
+        return None
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+    if not result.stdout:
+        return None
+    try:
+        output = json.loads(result.stdout)
+        context = output["hookSpecificOutput"]["additionalContext"]
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"[memhub-codex-bridge] invalid hook output: {exc}", file=sys.stderr)
+        return None
+    return context if isinstance(context, str) and context else None
+
+
+def _fail_open_job(job):
+    try:
+        return job()
+    except BaseException as exc:
+        print(
+            f"[memhub-codex-bridge] {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _dispatch_post(root: Path, payload: bytes, hook: dict) -> None:
+    tool = hook.get("tool_name")
+    jobs = [lambda: _directive_result(root, payload, reactive=True)]
+    if tool in _EDIT_TOOLS:
+        jobs.append(lambda: _artifact_sync_result(root, payload))
+    if tool in _SHELL_TOOLS:
+        _fail_open_job(lambda: _detach_flush(root, payload, "PostToolUse"))
+
+    if len(jobs) == 1:
+        results = [_fail_open_job(jobs[0])]
+    else:
+        # The old layout ran these as separate handlers. Preserve that latency
+        # profile while folding their output into one valid JSON document.
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = [executor.submit(_fail_open_job, job) for job in jobs]
+            results = [future.result() for future in futures]
+
+    contexts = [context for result in results
+                if (context := _additional_context(result))]
+    if contexts:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": "\n\n".join(contexts),
+            }
+        }))
+
+
+def _dispatch(root: Path, payload: bytes, event: str) -> None:
+    try:
+        hook = json.loads(payload or b"{}")
+    except (TypeError, ValueError):
+        return
+    if not isinstance(hook, dict):
+        return
+    if event == "PreToolUse":
+        _directive(root, payload, reactive=False)
+    elif event == "PostToolUse":
+        _dispatch_post(root, payload, hook)
+    elif event == "Stop":
+        _detach_flush(root, payload, "Stop")
 
 
 def _detach_flush(root: Path, payload: bytes, event: str) -> None:
@@ -140,7 +246,9 @@ def main() -> int:
         root = resolve_plugin_root()
         if root is None:
             return 0
-        if action == "directive-pre":
+        if action == "dispatch" and len(sys.argv) > 2:
+            _dispatch(root, payload, sys.argv[2])
+        elif action == "directive-pre":
             _directive(root, payload, reactive=False)
         elif action == "directive-post":
             _directive(root, payload, reactive=True)

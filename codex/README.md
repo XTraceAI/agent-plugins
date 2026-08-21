@@ -78,18 +78,32 @@ Run the tests: `python3 codex/test_codex_to_claude.py`.
 
 ## 3. Automatic capture and directive recall — the hooks bridge
 
-After installing the plugin, ask Codex to `set up MemHub` or invoke the
-`memhub:setup` skill. The same operation is available directly:
+After installing the plugin, ask Codex to `set up MemHub`. In the Codex CLI,
+skills are model-invoked; `/memhub:setup` is not a slash command. The same
+operation is available directly:
 
 ```bash
 python3 plugins/memhub/scripts/setup_codex_hooks.py install
 ```
 
 The installer preserves unrelated hooks, backs up a changed existing file, and
-survives plugin upgrades. Then approve the six MemHub handlers with `/hooks` in
-the Codex TUI once (trust is per hook hash). The bridge provides `PreToolUse`
-directive recall, reactive failure recall, artifact reminders, milestone
-capture, and per-turn capture.
+survives plugin upgrades. It folds all behavior into three handlers: one each
+for `PreToolUse`, `PostToolUse`, and `Stop`. The bridge still provides directive
+recall, reactive failure recall, artifact reminders, milestone capture, and
+per-turn capture.
+
+Codex requires an explicit review because trust is per command hash. MemHub
+cannot approve its own hooks. Restart Codex, choose **Review hooks** at startup
+or open `/hooks`, and trust only the three handlers with both of these traits:
+
+- source: `User config - ~/.codex/hooks.json`
+- command contains: `memhub_hook_bridge.py`
+
+If more than three handlers need review, the others are unrelated to MemHub's
+installer. Do not choose **Trust all** unless you have separately reviewed
+those too. Re-run `setup_codex_hooks.py status` to verify installation; Codex
+does not expose trust approval to this setup script, so the script reports that
+state separately instead of pretending the handlers are active.
 
 **Why user-level and not the plugin's own `hooks/codex-hooks.json`.** Verified
 live on codex-cli 0.148 and 0.149: plugin-bundled hooks are **not mounted**, via
@@ -124,9 +138,10 @@ written only by the Codex plugin installer and by you. Pinning an exact version
 instead would trade this for a concrete regression: capture silently stops on
 every plugin upgrade until the pin is bumped.
 
-Three implementation facts matter if you edit the bridge:
+Four implementation facts matter if you edit the bridge:
 
 * every handler drains stdin;
+* one dispatcher per event keeps the review surface to three command hashes;
 * `"async": true` hooks are killed with `codex exec`, so capture detaches from
   the synchronous trampoline itself;
 * Codex ignores plain text from `PreToolUse` and `PostToolUse`; model-visible

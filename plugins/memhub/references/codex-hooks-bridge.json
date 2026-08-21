@@ -3,26 +3,14 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$",
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell)$",
         "hooks": [
           {
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking for relevant directives",
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" directive-pre",
-            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" directive-pre"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash|shell|local_shell",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 8,
-            "statusMessage": "MemHub: checking for relevant directives",
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" directive-pre",
-            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" directive-pre"
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch PreToolUse",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch PreToolUse"
           }
         ]
       }
@@ -33,34 +21,10 @@
         "hooks": [
           {
             "type": "command",
-            "timeout": 8,
-            "statusMessage": "MemHub: checking directives for this failure",
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" directive-post",
-            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" directive-post"
-          }
-        ]
-      },
-      {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 10,
-            "statusMessage": "MemHub: checking artifact links",
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" artifact-sync",
-            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" artifact-sync"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash|shell|local_shell",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 30,
-            "statusMessage": "MemHub: flushing session memory",
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" flush PostToolUse",
-            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" flush PostToolUse"
+            "timeout": 16,
+            "statusMessage": "MemHub: checking memory context",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch PostToolUse",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch PostToolUse"
           }
         ]
       }
@@ -71,8 +35,8 @@
           {
             "type": "command",
             "timeout": 30,
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" flush Stop",
-            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" flush Stop"
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch Stop",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch Stop"
           }
         ]
       }

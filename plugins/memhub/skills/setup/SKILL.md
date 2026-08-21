@@ -23,7 +23,7 @@ an installed plugin. Install MemHub's compatibility bridge:
 python3 "$ROOT/scripts/setup_codex_hooks.py" install
 ```
 
-The installer is idempotent. It merges MemHub's handlers into
+The installer is idempotent. It merges three MemHub handlers into
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`), preserves unrelated
 events and handlers, backs up a changed existing file, and installs a stable
 trampoline that follows plugin version upgrades. It enables:
@@ -32,9 +32,22 @@ trampoline that follows plugin version upgrades. It enables:
 - `PostToolUse`: reactive recall on failures and artifact-link reminders;
 - `PostToolUse` + `Stop`: incremental session capture.
 
-After installation, tell the user to open `/hooks` once and trust the MemHub
-handlers. Codex deliberately does not auto-trust plugin or user command hooks.
-Do not claim capture or directive recall is active until that review is done.
+After installation, report installation and trust as separate states. Codex
+deliberately does not let a plugin approve command hooks, and the setup script
+cannot inspect or change that approval. Do not claim capture or directive
+recall is active until the user confirms the review is done.
+
+Give these precise review instructions:
+
+1. Restart Codex, then choose **Review hooks** at startup or open `/hooks`.
+2. Review the single MemHub handler under each of `PreToolUse`, `PostToolUse`,
+   and `Stop`.
+3. Trust only handlers whose source is `User config - ~/.codex/hooks.json` and
+   whose command contains `memhub_hook_bridge.py`.
+
+If Codex reports more than three handlers awaiting review, the extras are not
+from this installer. Warn the user not to choose **Trust all** in that case.
+Never describe this manual approval as automatable by MemHub.
 
 For `$ARGUMENTS == --status`, run this and make no changes:
 
@@ -68,8 +81,8 @@ CLAUDE_PLUGIN_ROOT="$ROOT" python3 "$ROOT/scripts/capture_health.py"
 
 No output is healthy. Relay any warning exactly enough that the user knows the
 remedy. Finish with a compact status: hook bridge installed/current, hook trust
-pending or reviewed, plugin credential healthy or missing, and whether the
-current repo still needs `/memhub:onboard`.
+unverified or user-confirmed, plugin credential healthy or missing, and whether
+the current repo still needs MemHub onboarding.
 
 ## Other hosts
 
