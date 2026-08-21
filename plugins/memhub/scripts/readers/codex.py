@@ -315,15 +315,25 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
 
     last_assistant: dict | None = None
     previous_usage_total: dict[str, int] | None = None
-    pending_usage: dict[str, int] = {}
 
     def append_assistant(block: dict) -> None:
-        nonlocal last_assistant, pending_usage
+        nonlocal last_assistant
         last_assistant = assistant(block)
         out.append(last_assistant)
-        if pending_usage:
-            _merge_usage(last_assistant, pending_usage)
-            pending_usage = {}
+
+    def append_usage_only(usage: dict[str, int], event_idx: int) -> None:
+        # A model request can consume tokens without yielding an emit-worthy
+        # response item (empty assistant text, compaction, failed generation).
+        # Preserve those counters immediately on an empty assistant turn. The
+        # event index keeps its identity stable across incremental re-imports
+        # and distinct from normal output rows and other usage-only events.
+        record = assistant({"type": "text", "text": ""})
+        record["uuid"] = str(_uuid.uuid5(
+            _uuid.NAMESPACE_URL,
+            f"memhub:codex:{sid_key}:usage-only:{event_idx}",
+        ))
+        _merge_usage(record, usage)
+        out.append(record)
 
     for idx, r in enumerate(rollout):
         pl = r.get("payload")
@@ -347,8 +357,7 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                     if last_assistant is not None:
                         _merge_usage(last_assistant, usage)
                     else:
-                        for key, value in usage.items():
-                            pending_usage[key] = pending_usage.get(key, 0) + value
+                        append_usage_only(usage, idx)
             continue
         if r.get("type") != "response_item":
             continue
@@ -403,20 +412,6 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                 "tool_use_id": call_id,
                 "content": output,
             }]))
-
-    if pending_usage:
-        # A model request can consume tokens without yielding an emit-worthy
-        # response item (empty assistant text, compaction, failed generation).
-        # Preserve those measured counters on an empty assistant turn instead
-        # of fabricating prose. Give it its own identity namespace: if a later
-        # append adds a real assistant item after this token event, that normal
-        # item must not reuse the already-imported usage-only row's uuid.
-        usage_record = assistant({"type": "text", "text": ""})
-        usage_record["uuid"] = str(_uuid.uuid5(
-            _uuid.NAMESPACE_URL, f"memhub:codex:{sid_key}:usage-only"
-        ))
-        _merge_usage(usage_record, pending_usage)
-        out.append(usage_record)
 
     return out, meta
 

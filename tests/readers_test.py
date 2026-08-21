@@ -199,6 +199,17 @@ def test_codex_usage_without_assistant_gets_stable_record():
         "cache_creation_input_tokens": 0,
     }, usage_record
     assert usage_record["uuid"] == second[-1]["uuid"]
+
+    # If a later rollout append adds real assistant output, the already-sent
+    # usage row remains with the same uuid and the new row does not inherit its
+    # counters (which would double-count after incremental import).
+    grown = roll + [
+        _line("response_item", {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "done"}]})
+    ]
+    later, _ = codex.rollout_to_claude_records(grown)
+    assert later[-2]["uuid"] == usage_record["uuid"]
+    assert "usage" not in later[-1]["message"], later[-1]
     print("PASS test_codex_usage_without_assistant_gets_stable_record")
 
 
