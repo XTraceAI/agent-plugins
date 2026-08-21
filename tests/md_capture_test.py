@@ -149,8 +149,15 @@ with tempfile.TemporaryDirectory() as td:
         f._save = fake_save
         f.resolve_url_and_auth = lambda *a, **k: ("http://x", {}, None)
         f.env_for_url = lambda u: "test"
+        def flaky_root(parent):
+            # the 3rd item's repo lookup blows up (derivation, not save): must
+            # skip ONLY that item, never abort the rest of the turn
+            calls["root"] = calls.get("root", 0) + 1
+            if calls["root"] == 3:
+                raise PermissionError("git rev-parse denied")
+            return None
         f.read_room = lambda *a, **k: None
-        f.repo_root = lambda *a, **k: None
+        f.repo_root = flaky_root
         mcp_mod = types.ModuleType("mcp"); cli = types.ModuleType("mcp.client")
         sess = types.ModuleType("mcp.client.session"); sess.ClientSession = _CS
         sh = types.ModuleType("mcp.client.streamable_http"); sh.streamablehttp_client = _Ctx
@@ -159,8 +166,11 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid3)
         # 6 candidates, cap 5 → the smallest (spec0) is capped out; of the 5 attempted,
         # the 2nd save raised. Expect: 4 saved+digested, 2 still dirty.
-        check(len(st["saved"]) == 4, f"4 of 5 attempted saves recorded a digest: {len(st['saved'])}")
-        check(len(st["dirty"]) == 2, f"capped-out + failed both remain dirty for retry: {st['dirty']}")
+        # 6 candidates, cap 5 → spec0 capped out; of 5 attempted: the 3rd room
+        # lookup raises (skips one) and the 2nd save raises (skips one) → 3 saved.
+        check(len(st["saved"]) == 3, f"3 of 5 attempted saves recorded a digest: {len(st['saved'])}")
+        check(len(st["dirty"]) == 3, f"capped-out + failed-save + failed-derivation all remain dirty: {len(st['dirty'])}")
+        check(all(k in paths for k in st["saved"]), "saved keys are the exact dirty strings (raw), not re-stringified Paths")
         check(paths[0] in st["dirty"], "the capped-out (smallest) candidate stayed dirty")
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
 

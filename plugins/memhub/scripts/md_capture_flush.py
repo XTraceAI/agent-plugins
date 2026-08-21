@@ -114,7 +114,7 @@ async def flush(session_id: str) -> None:
     # since its last save. Capped-out candidates and failed saves stay in
     # `dirty` so the next Stop retries them without needing another edit.
     processed: set[str] = set()
-    todo: list[tuple[Path, str, str]] = []
+    todo: list[tuple[str, Path, str, str]] = []   # (raw key, path, text, digest)
     for raw in dirty:
         p = Path(raw)
         if not p.is_file():
@@ -134,45 +134,52 @@ async def flush(session_id: str) -> None:
         if saved.get(raw) == d:
             processed.add(raw)                   # unchanged since last successful save
             continue
-        todo.append((p, text, d))
+        todo.append((raw, p, text, d))
     if len(todo) > MAX_PER_TURN:
         _log(f"{len(todo)} candidates > cap {MAX_PER_TURN}; saving the {MAX_PER_TURN} largest, "
              f"the rest retry next Stop")
-        todo = sorted(todo, key=lambda t: -len(t[1]))[:MAX_PER_TURN]
+        todo = sorted(todo, key=lambda t: -len(t[2]))[:MAX_PER_TURN]
     if not todo:
         _persist(session_id, processed, saved)
         return
 
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
     try:
+        # Lazy SDK imports INSIDE the guard: if they fail, `finally` still
+        # persists the non-candidate / unchanged decisions made above.
+        from mcp.client.session import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
         url, headers, auth = resolve_url_and_auth(None, interactive=False)
         env = env_for_url(url)
         async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
             async with ClientSession(r, w) as s:
                 await s.initialize()
-                for p, text, d in todo:
-                    root = repo_root(p.parent)
-                    name = derive_name(p, text, root)
-                    body = redact_text(text)
-                    call_args: dict = {
-                        "name": name,
-                        "content": body,
-                        "artifact_type": derive_type(p, text, name),
-                        "tags": [TAG],
-                        "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
-                                     f"re-save with save_artifact.py to publish",
-                    }
-                    room = read_room(p.parent, env) if root is not None else None
-                    if room:
-                        call_args["agent_brain_id"] = room["brain_id"]
+                for raw, p, text, d in todo:
+                    # The whole per-item body is guarded, not just the save:
+                    # a malformed room file or odd content must skip ONE item
+                    # (which stays dirty), never the rest of the turn.
                     try:
+                        root = repo_root(p.parent)
+                        name = derive_name(p, text, root)
+                        body = redact_text(text)
+                        call_args: dict = {
+                            "name": name,
+                            "content": body,
+                            "artifact_type": derive_type(p, text, name),
+                            "tags": [TAG],
+                            "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
+                                         f"re-save with save_artifact.py to publish",
+                        }
+                        room = read_room(p.parent, env) if root is not None else None
+                        if room:
+                            call_args["agent_brain_id"] = room["brain_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
                     except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
                         _log(f"save failed for {p.name}: {type(e).__name__}: {str(e)[:120]}")
                         continue
-                    saved[str(p)] = d
-                    processed.add(str(p))
+                    # Keyed on `raw` — the exact string in `dirty` — so the
+                    # dedup lookup and the `_persist` removal both match it.
+                    saved[raw] = d
+                    processed.add(raw)
                     _log(f"saved '{name}' ({len(body):,} chars) → "
                          f"{room['name'] if room else 'personal memory'}"
                          + (f" id={out.get('artifact_id') or out.get('id')}" if isinstance(out, dict) else ""))
