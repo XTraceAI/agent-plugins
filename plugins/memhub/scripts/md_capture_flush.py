@@ -21,9 +21,10 @@ path says so > ``document``.
 
 Runs via ``uv run --with 'mcp<2'`` (needs the SDK), fire-and-forget from the
 Stop hook. NEVER FAILS LOUDLY: any error exits 0 quietly — memory capture must
-not disturb the session. Each path is retried on the next Stop only if the
-file changed (content hash in state), so a server blip costs one turn, and a
-flaky server never re-saves an unchanged file.
+not disturb the session. A path leaves the retry list only when it was saved
+(content hash recorded), judged a non-candidate, or is unchanged since its
+last save — so a server blip or the per-turn cap costs one turn, and a flaky
+server never re-saves an unchanged file.
 """
 from __future__ import annotations
 
@@ -107,29 +108,36 @@ async def flush(session_id: str) -> None:
     dirty = list(state.get("dirty") or [])
     if not dirty:
         return
-    saved = state.setdefault("saved", {})   # path -> content digest
+    saved = dict(state.get("saved") or {})   # path -> content digest
+    # `processed` is built from OUTCOMES, not from the input list: a path leaves
+    # `dirty` only when it was saved, judged a non-candidate, or is unchanged
+    # since its last save. Capped-out candidates and failed saves stay in
+    # `dirty` so the next Stop retries them without needing another edit.
+    processed: set[str] = set()
     todo: list[tuple[Path, str, str]] = []
     for raw in dirty:
         p = Path(raw)
         if not p.is_file():
+            processed.add(raw)                   # deleted/moved: nothing to retry
             continue
         try:
             text = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            processed.add(raw)
             continue
         ok, why = is_candidate(p, size=len(text.encode("utf-8")), text=text)
         if not ok:
             _log(f"skip {p.name}: {why}")
+            processed.add(raw)
             continue
         d = _digest(text)
         if saved.get(raw) == d:
-            continue                         # unchanged since last successful save
+            processed.add(raw)                   # unchanged since last successful save
+            continue
         todo.append((p, text, d))
-    # Paths judged this pass (saved, skipped, or capped out) leave `dirty`;
-    # they come back only if the file is edited again (collector re-adds).
-    processed = set(dirty)
     if len(todo) > MAX_PER_TURN:
-        _log(f"{len(todo)} candidates > cap {MAX_PER_TURN}; saving the {MAX_PER_TURN} largest")
+        _log(f"{len(todo)} candidates > cap {MAX_PER_TURN}; saving the {MAX_PER_TURN} largest, "
+             f"the rest retry next Stop")
         todo = sorted(todo, key=lambda t: -len(t[1]))[:MAX_PER_TURN]
     if not todo:
         _persist(session_id, processed, saved)
@@ -137,35 +145,42 @@ async def flush(session_id: str) -> None:
 
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
-    url, headers, auth = resolve_url_and_auth(None, interactive=False)
-    env = env_for_url(url)
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            for p, text, d in todo:
-                root = repo_root(p.parent)
-                name = derive_name(p, text, root)
-                body = redact_text(text)
-                call_args: dict = {
-                    "name": name,
-                    "content": body,
-                    "artifact_type": derive_type(p, text, name),
-                    "tags": [TAG],
-                    "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
-                                 f"re-save with save_artifact.py to publish",
-                }
-                room = read_room(p.parent, env) if root is not None else None
-                if room:
-                    call_args["agent_brain_id"] = room["brain_id"]
-                try:
-                    out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
+    try:
+        url, headers, auth = resolve_url_and_auth(None, interactive=False)
+        env = env_for_url(url)
+        async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                for p, text, d in todo:
+                    root = repo_root(p.parent)
+                    name = derive_name(p, text, root)
+                    body = redact_text(text)
+                    call_args: dict = {
+                        "name": name,
+                        "content": body,
+                        "artifact_type": derive_type(p, text, name),
+                        "tags": [TAG],
+                        "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
+                                     f"re-save with save_artifact.py to publish",
+                    }
+                    room = read_room(p.parent, env) if root is not None else None
+                    if room:
+                        call_args["agent_brain_id"] = room["brain_id"]
+                    try:
+                        out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
+                    except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
+                        _log(f"save failed for {p.name}: {type(e).__name__}: {str(e)[:120]}")
+                        continue
                     saved[str(p)] = d
+                    processed.add(str(p))
                     _log(f"saved '{name}' ({len(body):,} chars) → "
                          f"{room['name'] if room else 'personal memory'}"
                          + (f" id={out.get('artifact_id') or out.get('id')}" if isinstance(out, dict) else ""))
-                except Exception as e:  # noqa: BLE001
-                    _log(f"save failed for {p.name}: {type(e).__name__}: {str(e)[:120]}")
-    _persist(session_id, processed, saved)
+    finally:
+        # Persist whatever was decided even if the connection itself failed:
+        # non-candidates drop out, successes record their digest, everything
+        # else remains dirty for the next Stop.
+        _persist(session_id, processed, saved)
 
 
 def _persist(session_id: str, processed: set, saved: dict) -> None:

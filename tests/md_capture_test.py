@@ -114,6 +114,57 @@ with tempfile.TemporaryDirectory() as td:
         check(st["dirty"] == ["/Users/me/repo/b.md"] and st["saved"] == {"/Users/me/repo/a.md": "abc"},
               f"flush write-back merges, does not clobber: {st}")
 
+        # retry semantics (bot review on #88): a failed save and a capped-out
+        # candidate must both STAY dirty so the next Stop retries them.
+        import asyncio
+        sid3 = "sess-md-flush-retry"
+        root = Path(td) / "r"; root.mkdir()
+        # six real candidates, each above the floor; none under a veto path
+        # (td is /var/folders → vetoed, so build them under a non-temp-looking
+        # symlink-free dir: patch VETO_PARTS for this block only)
+        vp = mc.VETO_PARTS
+        mc.VETO_PARTS = tuple(v for v in vp if v not in ("/tmp/", "/private/tmp/", "/var/folders/"))
+        f.VETO_PARTS = mc.VETO_PARTS
+        paths = []
+        for i in range(6):
+            q = root / f"spec{i}.md"; q.write_text("# S" + str(i) + "\n" + "x" * (7000 + i), encoding="utf-8"); paths.append(str(q))
+        mc.save_state(sid3, {"dirty": paths, "saved": {}})
+        calls = {"n": 0}
+        async def fake_save(session, call_args):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("server blip")
+            return {"artifact_id": "aid"}
+        class _S:
+            async def initialize(self): pass
+        class _Ctx:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return (None, None, None)
+            async def __aexit__(self, *a): return False
+        class _CS:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return _S()
+            async def __aexit__(self, *a): return False
+        import types, sys as _sys
+        f._save = fake_save
+        f.resolve_url_and_auth = lambda *a, **k: ("http://x", {}, None)
+        f.env_for_url = lambda u: "test"
+        f.read_room = lambda *a, **k: None
+        f.repo_root = lambda *a, **k: None
+        mcp_mod = types.ModuleType("mcp"); cli = types.ModuleType("mcp.client")
+        sess = types.ModuleType("mcp.client.session"); sess.ClientSession = _CS
+        sh = types.ModuleType("mcp.client.streamable_http"); sh.streamablehttp_client = _Ctx
+        _sys.modules.update({"mcp": mcp_mod, "mcp.client": cli, "mcp.client.session": sess, "mcp.client.streamable_http": sh})
+        asyncio.run(f.flush(sid3))
+        st = mc.load_state(sid3)
+        # 6 candidates, cap 5 → the smallest (spec0) is capped out; of the 5 attempted,
+        # the 2nd save raised. Expect: 4 saved+digested, 2 still dirty.
+        check(len(st["saved"]) == 4, f"4 of 5 attempted saves recorded a digest: {len(st['saved'])}")
+        check(len(st["dirty"]) == 2, f"capped-out + failed both remain dirty for retry: {st['dirty']}")
+        check(paths[0] in st["dirty"], "the capped-out (smallest) candidate stayed dirty")
+        mc.VETO_PARTS = vp; f.VETO_PARTS = vp
+
+
 # ---- flush-side derivations (no network) ----------------------------------
 print("flush derivations")
 if have_flush:
