@@ -2,10 +2,10 @@
 """Unified session entry point across hosts — list and import any host's
 sessions through one command, using the per-host readers.
 
-    python3 capture.py list [--host all|claude|codex] [--limit N]
+    python3 capture.py list [--host all|claude|codex|cursor] [--limit N]
 
     uv run --with 'mcp<2' python capture.py import --session <ref> \
-        [--host auto|claude|codex] [--conversation-id <id>] [--title "..."] \
+        [--host auto|claude|codex|cursor] [--conversation-id <id>] [--title "..."] \
         [--agent-brain-id <id>] [--namespace <ns>] [--url <mcp-url>] [--dry-run]
 
 ``--session`` accepts a transcript/rollout path, a bare session id, or
@@ -22,11 +22,10 @@ namespaced ``<host>-<session-id>`` so server-side watermarks stay per-host.
 
 The mcp SDK pin (``uv run --with 'mcp<2'``) matches every other invocation
 site: mcp 2.x renamed streamablehttp_client, breaking import_session.py's
-transport. ``list`` is stdlib-only and runs under bare python3.
-
-Hook-event dispatch (``capture.py <host> <event>``) intentionally does NOT
-live here yet — it lands with the first non-Claude hooks file, so no dead
-dispatch table ships in between.
+transport. ``list`` is stdlib-only and runs under bare python3. Automatic
+capture deliberately keeps per-host flush entry points because each host has
+different trigger and watermark semantics; this command unifies listing and
+manual import, where the behavior is genuinely shared.
 """
 from __future__ import annotations
 
@@ -73,7 +72,8 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
         if host is None:
             return None, None, (
                 f"cannot infer the host from {args.session!r} — a bare id or "
-                "'latest' is ambiguous across hosts; pass --host claude|codex")
+                "'latest' is ambiguous across hosts; pass "
+                "--host claude|codex|cursor")
     r = readers.reader_for(host)
     if r is None:
         return None, None, f"unknown host {host!r} (known: {', '.join(readers.READERS)})"
@@ -101,7 +101,8 @@ def cmd_import(args) -> int:
 
     def run_import(transcript: Path, conv_id: str | None) -> int:
         cmd = ["uv", "run", "--with", "mcp<2", "python", str(_IMPORT_SESSION),
-               "--session", str(transcript)]
+               "--session", str(transcript),
+               "--source-platform", r.HOST]
         if conv_id:
             cmd += ["--conversation-id", conv_id]
         return subprocess.run(cmd + passthrough).returncode

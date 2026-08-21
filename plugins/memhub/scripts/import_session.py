@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import a specific Claude Code session into MemHub — a terminal operation.
+"""Import a specific coding-agent session into MemHub — a terminal operation.
 
 The transcript is read off disk and shipped straight to the
 `import_conversation` MCP tool: the model never re-emits the content, so a
@@ -19,7 +19,8 @@ else a one-time browser approval. No memhub-cli required.
 
 Usage (mcp SDK pulled ephemerally by uv):
     uv run --with 'mcp<2' python import_session.py --session <session-id-or-path>
-        [--conversation-id <id>] [--title "..."] [--url <mcp-url>]
+        [--conversation-id <id>] [--source-platform claude|codex|cursor]
+        [--title "..."] [--url <mcp-url>]
 
 `--session` accepts either a path to a .jsonl transcript or a bare session id,
 which is resolved by searching ~/.claude/projects/*/<id>.jsonl.
@@ -38,7 +39,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from room_map import env_for_url, read_room  # noqa: E402
+from room_map import env_for_url, git_env, git_readonly, read_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -50,6 +51,21 @@ from transcript_chunks import (  # noqa: E402
 )
 from redact import redact_records  # noqa: E402
 from transcript_filter import drop_command_wrappers  # noqa: E402
+
+
+SOURCE_PLATFORMS = ("claude", "codex", "cursor")
+
+
+def import_call_args(messages: list[dict], conversation_id: str,
+                     source_platform: str) -> dict:
+    """Build the provenance-bearing core of an import request."""
+    if source_platform not in SOURCE_PLATFORMS:
+        raise ValueError(f"unsupported source platform: {source_platform}")
+    return {
+        "messages": messages,
+        "conversation_id": conversation_id,
+        "source_platform": source_platform,
+    }
 
 
 def load_transcript(path: Path) -> tuple[list[dict], int]:
@@ -208,6 +224,16 @@ def _cwd_from_records(records: list[dict]) -> str | None:
                  and r.get("cwd")), None)
 
 
+def _cwd_ok(cwd: str | None) -> bool:
+    """Whether a transcript-provided cwd is safe to pass as ``git -C``."""
+    if not isinstance(cwd, str) or not cwd or cwd.startswith("-"):
+        return False
+    try:
+        return Path(cwd).is_absolute() and Path(cwd).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
 def _namespace_from_records(records: list[dict]) -> str | None:
     """The session's working context: git remote basename resolved from the
     transcript's ``cwd`` (client-side — the server never derives this, since a
@@ -215,12 +241,12 @@ def _namespace_from_records(records: list[dict]) -> str | None:
     canonical repo's scoped recalls). None when it can't be resolved
     confidently — unscoped stores serve everywhere, a wrong scope doesn't."""
     cwd = _cwd_from_records(records)
-    if not cwd:
+    if not _cwd_ok(cwd):
         return None
     try:
         out = subprocess.run(
-            ["git", "-C", cwd, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=2,
+            git_readonly(cwd) + ["remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2, env=git_env(),
         )
         url = out.stdout.strip()
         if out.returncode == 0 and url:
@@ -231,7 +257,7 @@ def _namespace_from_records(records: list[dict]) -> str | None:
 
 
 async def main() -> int:
-    ap = argparse.ArgumentParser(description="Import a Claude Code session into MemHub.")
+    ap = argparse.ArgumentParser(description="Import a coding-agent session into MemHub.")
     ap.add_argument("--session", required=True,
                     help="path to a .jsonl transcript, or a bare session id")
     ap.add_argument("--conversation-id", default=None,
@@ -243,6 +269,9 @@ async def main() -> int:
                          "across two conversations; only pass one for a "
                          "transcript that has no session id of its own (e.g. a "
                          "synthesized Codex rollout)")
+    ap.add_argument("--source-platform", choices=SOURCE_PLATFORMS,
+                    default="claude",
+                    help="originating host recorded on the imported session")
     ap.add_argument("--title", default=None)
     ap.add_argument("--agent-brain-id", default=None,
                     help="route the extracted facts/episodes into an agent brain "
@@ -356,6 +385,7 @@ async def main() -> int:
     print(f"records         : {len(records)}   ({size:,} bytes ≈ {size // 4:,} tokens)"
           f"{filtered}")
     print(f"conversation_id : {conv_id}")
+    print(f"source platform : {args.source_platform}")
     if title:
         src = "explicit" if args.title else "from transcript"
         print(f'title           : "{title}"   ({src})')
@@ -379,11 +409,8 @@ async def main() -> int:
             prev_gist_hash = await _gist_hash(
                 s, args.agent_brain_id, args.org_id)
             for i, sl in enumerate(slices, 1):
-                call_args: dict = {
-                    "messages": sl,
-                    "conversation_id": conv_id,
-                    "source_platform": "claude",
-                }
+                call_args = import_call_args(
+                    sl, conv_id, args.source_platform)
                 if args.org_id:
                     # Brains are looked up inside ONE org. Without this, an
                     # --agent-brain-id belonging to a non-default org fails

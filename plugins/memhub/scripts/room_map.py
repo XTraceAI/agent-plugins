@@ -72,32 +72,6 @@ ROOMS_PATH = Path(
 DEFAULT_ENV = "production"
 
 
-def is_staging_backend(url: str) -> bool:
-    """True only when ``url``'s HOST has a ``staging`` label — stricter than
-    ``env_for_url``'s substring match, which is fine for cache-keying (a wrong
-    bucket is harmless) but NOT for the ENG-886 platform gate, where a false
-    positive sends "cursor"/"codex" to prod and fails the whole import. A
-    host like ``staging-corp.com`` or a ``/staging`` path no longer matches;
-    ``api.staging.memhub.xtrace.ai`` does."""
-    if not isinstance(url, str):
-        return False  # a None/non-str url (e.g. from resolve_bearer) must not
-        #               raise into the platform gate — fail safe to "claude".
-    from urllib.parse import urlparse
-    try:
-        # A scheme-less config ("host/path") parses as all-path with hostname
-        # None, which would read a real staging backend as prod and send
-        # "claude". Assume https when no scheme is present so the host label is
-        # always seen. (A port — host:8443 — already works: .hostname excludes
-        # it.) This also realigns the gate with env_for_url, which substring-
-        # matches the raw URL and so already treats a scheme-less staging URL
-        # as staging.
-        normalized = url if "://" in url else "https://" + url
-        host = (urlparse(normalized).hostname or "").lower()
-    except ValueError:
-        return False
-    return "staging" in host.split(".")
-
-
 def env_for_url(url: str) -> str:
     """Map an MCP endpoint to a cache key. Substring, not host equality, so a
     `MEMHUB_MCP_BASE_URL` override pointing at any staging host still keys to

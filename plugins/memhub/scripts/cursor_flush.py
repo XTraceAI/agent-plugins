@@ -56,8 +56,7 @@ from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from redact import redact_records  # noqa: E402
-from room_map import (  # noqa: E402
-    env_for_url, git_env, git_readonly, is_staging_backend)
+from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 
@@ -598,14 +597,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
         "conversation_id": f"cursor-{uuid}",
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
-        # ENG-886: send the REAL platform where the backend can store it.
-        # Staging has the widened CHECK constraint (#1041/#1047 deployed);
-        # prod does NOT yet, and would fail the whole import on "cursor",
-        # so its install stays "claude" until prod deploys — then this
-        # gate goes away and it is unconditional. A session first flushed
-        # as "claude" self-heals to "cursor" on its next real-platform
-        # receive (server-side monotonic platform heal).
-        "source_platform": "cursor" if is_staging_backend(url) else "claude",
+        "source_platform": cursor_reader.HOST,
         "flush": flush_mode,
     }
     if room:

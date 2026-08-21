@@ -11,12 +11,15 @@ Run: python3 cursor_capture_test.py
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
+import cursor_flush  # noqa: E402
 from cursor_flush import (  # noqa: E402
     DORMANT_RETRY_S, _verdict, session_uuid, should_flush)
 
@@ -24,6 +27,59 @@ NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
 SHIPPED = {"blob_ids": ["a", "b"], "last_flush_at": NOW - 300}
 STALE = {"blob_ids": ["a"], "last_flush_at": NOW - 300}   # "b" is new
+
+
+def test_real_platform_is_unconditional():
+    seen: list[dict] = []
+    originals = {
+        "to_canonical": cursor_flush.cursor_reader.to_canonical,
+        "current_blob_ids": cursor_flush.current_blob_ids,
+        "redact_records": cursor_flush.redact_records,
+        "resolve_bearer": cursor_flush.resolve_bearer,
+        "session": cursor_flush.mcp_http.Session,
+        "save_state": cursor_flush._save_state,
+        "log": cursor_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": arguments["conversation_id"],
+                    "ack_through": "record-1",
+                },
+                content=[], isError=False)
+
+    try:
+        cursor_flush.cursor_reader.to_canonical = lambda _path: ([{
+            "type": "user", "uuid": "record-1",
+            "message": {"role": "user", "content": "hello"},
+        }], {"cwd": None, "title": None})
+        cursor_flush.current_blob_ids = lambda _path: {"blob-1"}
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.mcp_http.Session = Session
+        cursor_flush._save_state = lambda *_args, **_kwargs: None
+        cursor_flush._log = lambda *_args, **_kwargs: None
+        for url in ("https://api.memhub.xtrace.ai/mcp-server/mcp",
+                    "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"):
+            cursor_flush.resolve_bearer = lambda u=url: (u, "token")
+            asyncio.run(cursor_flush._flush(
+                "session-1", Path("/tmp/store.db"), {"blob-1"}))
+    finally:
+        cursor_flush.cursor_reader.to_canonical = originals["to_canonical"]
+        cursor_flush.current_blob_ids = originals["current_blob_ids"]
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert [args["source_platform"] for args in seen] == ["cursor", "cursor"]
+    print("PASS test_real_platform_is_unconditional")
 
 
 def test_no_new_blobs_never_flushes():
