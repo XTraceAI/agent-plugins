@@ -12,8 +12,8 @@
         "source": "git-subdir",
         "url": "https://github.com/XTraceAI/agent-plugins.git",
         "path": "plugins/memhub",
-        "ref": "memhub--v0.27.6",
-        "sha": "0ee3b7089c4156d41a676f06fd6cf3cb01bd5e7c"
+        "ref": "memhub--v0.27.7",
+        "sha": "bfe1954b5c63a36de5f8c3e8d66a3dad904933c0"
       },
       "description": "Auto-capture Claude Code sessions into MemHub team memory at session end. Points at the production backend."
     },
