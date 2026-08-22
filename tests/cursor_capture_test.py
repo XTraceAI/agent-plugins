@@ -14,10 +14,13 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import tempfile
+import os
+import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
@@ -70,16 +73,23 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
         command = handlers[0]["command"]
-        expected = ("~/.config/memhub-plugin/cursor_capture.cmd"
-                    if event == "stop" else "./hooks/cursor_capture.cmd")
         assert command.startswith('tee "$HOME/.memhub-cursor-hook-'), command
-        assert f'; {expected} {event} ' in command, command
-        assert command.count(".memhub-cursor-hook-$PID-$$.json") == 2, command
+        if event == "stop":
+            assert "; ./hooks/cursor_capture.cmd stop " in command
+            assert "; ~/.config/memhub-plugin/cursor_capture.cmd stop " in command
+            assert command.index("./hooks/cursor_capture.cmd stop") < command.index(
+                "~/.config/memhub-plugin/cursor_capture.cmd stop")
+            expected_json_uses = 3
+        else:
+            assert f'; ./hooks/cursor_capture.cmd {event} ' in command
+            expected_json_uses = 2
+        assert command.count(".memhub-cursor-hook-$PID-$$.json") == expected_json_uses
         assert command.count(".memhub-cursor-hook-$PID-$$.out") == 1, command
         assert command.endswith("; echo '{\"permission\":\"allow\"}'"), command
     launcher = (ROOT / "plugins" / "memhub" / "hooks" /
                 "cursor_capture.cmd").read_text(encoding="utf-8")
     assert launcher.startswith(":; ")
+    assert '[ -f "$ROOT/scripts/cursor_capture.py" ] && cmp -s' in launcher
     assert "goto stable_root" in launcher
     assert '<nul >"%STATE%\\cursor-root" set /p "=%ROOT%"' in launcher
     assert ":stable_root\nset \"ROOT=\"" in launcher
@@ -87,6 +97,68 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     assert launcher.count('"%~1" "%~2"') == 2
     assert launcher.count("if errorlevel 1 goto allow") == 3
     print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
+
+
+def test_staged_invocation_never_reads_stdin_or_spawns_when_missing():
+    class BlockingStdin:
+        @property
+        def buffer(self):
+            raise AssertionError("staged invocation must not inspect stdin")
+
+    seen: list[tuple[bytes, str]] = []
+    original_spawn = cursor_capture.spawn_cursor_flush
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    original_argv = sys.argv
+    try:
+        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
+            (raw, event))
+        sys.stdin = BlockingStdin()
+        sys.stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as raw_home:
+            missing = Path(raw_home) / ".memhub-cursor-hook-1-.json"
+            output = missing.with_suffix(".out")
+            output.write_text("orphaned tee output", encoding="utf-8")
+            sys.argv = ["cursor_capture.py", "stop", str(missing)]
+            with mock.patch.object(cursor_capture.Path, "home",
+                                   return_value=Path(raw_home)):
+                assert cursor_capture.main() == 0
+            assert not output.exists()
+    finally:
+        cursor_capture.spawn_cursor_flush = original_spawn
+        sys.stdin = original_stdin
+        sys.stdout = original_stdout
+        sys.argv = original_argv
+
+    assert seen == []
+    print("PASS test_staged_invocation_never_reads_stdin_or_spawns_when_missing")
+
+
+def test_posix_stable_launcher_rejects_root_without_capture_script():
+    if os.name == "nt":
+        print("SKIP test_posix_stable_launcher_rejects_root_without_capture_script")
+        return
+    launcher = ROOT / "plugins" / "memhub" / "hooks" / "cursor_capture.cmd"
+    with tempfile.TemporaryDirectory() as temp:
+        home = Path(temp) / "home"
+        state = home / ".config" / "memhub-plugin"
+        stale_root = Path(temp) / "stale-plugin"
+        state.mkdir(parents=True)
+        (stale_root / "hooks").mkdir(parents=True)
+        stable = state / "cursor_capture.cmd"
+        stable.write_bytes(launcher.read_bytes())
+        (stale_root / "hooks" / "cursor_capture.cmd").write_bytes(
+            launcher.read_bytes())
+        (state / "cursor-root").write_text(str(stale_root), encoding="utf-8")
+
+        result = subprocess.run(
+            ["sh", str(stable), "stop", str(home / "missing.json")],
+            env={**os.environ, "HOME": str(home)}, capture_output=True,
+            text=True, timeout=5, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"permission": "allow"}
+    print("PASS test_posix_stable_launcher_rejects_root_without_capture_script")
 
 
 def test_staged_payload_is_home_scoped_decoded_and_deleted():

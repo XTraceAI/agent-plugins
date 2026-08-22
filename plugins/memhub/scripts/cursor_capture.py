@@ -80,13 +80,17 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
     home = (home or Path.home()).resolve()
     should_unlink = False
     try:
+        # Validate the lexical home-scoped name before requiring the JSON to
+        # exist so a tee failure can still clean its sibling .out file.
+        parent = path.parent.resolve(strict=True)
+        if (os.path.normcase(str(parent)) != os.path.normcase(str(home)) or
+                not _STAGED_NAME_RE.fullmatch(path.name) or path.is_symlink()):
+            return None
+        should_unlink = True
         resolved = path.resolve(strict=True)
         if (os.path.normcase(str(resolved.parent)) !=
                 os.path.normcase(str(home))):
             return None
-        if not _STAGED_NAME_RE.fullmatch(resolved.name) or path.is_symlink():
-            return None
-        should_unlink = True
         # POSIX tee honors the user's umask and may create 0644. Tighten both
         # short-lived copies before reading; Windows keeps its profile ACLs.
         for staged_path in (path, path.with_suffix(".out")):
@@ -129,10 +133,12 @@ def main() -> int:
     try:
         # Direct invocations carry JSON on stdin; manifest invocations have
         # already consumed it through tee and provide the completed file.
-        piped = sys.stdin.buffer.read()
-        staged = (_read_staged_payload(sys.argv[2])
-                  if len(sys.argv) > 2 else None)
-        spawn_cursor_flush(staged if staged is not None else piped, event)
+        if len(sys.argv) > 2:
+            staged = _read_staged_payload(sys.argv[2])
+            if staged is not None:
+                spawn_cursor_flush(staged, event)
+        else:
+            spawn_cursor_flush(sys.stdin.buffer.read(), event)
     except Exception as exc:
         # Capture observes; it must never gate the user's prompt or command.
         _log(f"could not stage hook payload ({exc!r})")
