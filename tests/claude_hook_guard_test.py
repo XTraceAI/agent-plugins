@@ -2,6 +2,7 @@
 """Regression tests for Cursor importing MemHub's Claude hooks."""
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import subprocess
@@ -100,6 +101,22 @@ def test_large_fallback_payload_uses_file_backed_stdin():
         capture.subprocess.Popen = original
     assert seen == [raw]
     print("PASS test_large_fallback_payload_uses_file_backed_stdin")
+
+
+def test_missing_cursor_launcher_never_disables_claude_hooks():
+    original_import = builtins.__import__
+
+    def fail_cursor_capture(name, *args, **kwargs):
+        if name == "cursor_capture":
+            raise ImportError("partial install")
+        return original_import(name, *args, **kwargs)
+
+    builtins.__import__ = fail_cursor_capture
+    try:
+        assert not guard.route("capture", "Stop", FIXTURE, b"{}", {})
+    finally:
+        builtins.__import__ = original_import
+    print("PASS test_missing_cursor_launcher_never_disables_claude_hooks")
 
 
 def test_exact_imported_stop_hook_never_runs_claude_flusher():

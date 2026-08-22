@@ -21,9 +21,6 @@ import os
 import sys
 from typing import Mapping
 
-from cursor_capture import spawn_cursor_flush as _spawn_cursor_flush
-
-
 _CURSOR_ENV_MARKERS = (
     "CURSOR_PLUGIN_ROOT",
     "CURSOR_VERSION",
@@ -85,6 +82,15 @@ def _cursor_event(source_event: str) -> str | None:
     if source_event.lower() in {"stop", "sessionend"}:
         return "stop"
     return None
+
+
+def _spawn_cursor_flush(raw: bytes, event: str) -> None:
+    """Keep a partial Cursor install from disabling unrelated Claude hooks."""
+    try:
+        from cursor_capture import spawn_cursor_flush
+    except Exception:
+        return
+    spawn_cursor_flush(raw, event)
 
 
 def route(action: str, source_event: str, payload: object, raw: bytes,

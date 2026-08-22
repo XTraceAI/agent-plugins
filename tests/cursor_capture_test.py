@@ -84,6 +84,8 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     assert '<nul >"%STATE%\\cursor-root" set /p "=%ROOT%"' in launcher
     assert ":stable_root\nset \"ROOT=\"" in launcher
     assert ":launch\nwhere py" in launcher
+    assert launcher.count('"%~1" "%~2"') == 2
+    assert launcher.count("if errorlevel 1 goto allow") == 3
     print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
 
 
