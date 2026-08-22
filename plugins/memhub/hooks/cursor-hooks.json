@@ -3,22 +3,22 @@
   "hooks": {
     "beforeShellExecution": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" beforeShellExecution'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd beforeShellExecution \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "afterFileEdit": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" afterFileEdit'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd afterFileEdit \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "stop": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" stop'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ~/.config/memhub-plugin/cursor_capture.cmd stop \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" beforeSubmitPrompt'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd beforeSubmitPrompt \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
       }
     ]
   }

@@ -14,6 +14,7 @@ PLUGIN = ROOT / "plugins" / "memhub"
 sys.path.insert(0, str(PLUGIN / "scripts"))
 
 import claude_hook_guard as guard  # noqa: E402
+import cursor_capture as capture  # noqa: E402
 
 FIXTURE = json.loads(
     (ROOT / "tests" / "fixtures" / "cursor_hook_payload.json")
@@ -86,17 +87,17 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
 
 def test_large_fallback_payload_uses_file_backed_stdin():
     seen: list[bytes] = []
-    original = guard.subprocess.Popen
+    original = capture.subprocess.Popen
 
     def fake_popen(_args, *, stdin, **_kwargs):
         seen.append(stdin.read())
 
-    guard.subprocess.Popen = fake_popen
+    capture.subprocess.Popen = fake_popen
     raw = b"x" * 1_000_000
     try:
         guard._spawn_cursor_flush(raw, "stop")
     finally:
-        guard.subprocess.Popen = original
+        capture.subprocess.Popen = original
     assert seen == [raw]
     print("PASS test_large_fallback_payload_uses_file_backed_stdin")
 

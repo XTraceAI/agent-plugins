@@ -689,7 +689,9 @@ def main() -> int:
 
     uuid = session_uuid(payload)
     if not uuid:
-        _log(f"{event}: no session identity in payload — skipping")
+        keys = sorted(str(key) for key in payload)
+        _log(f"{event}: no session identity in payload (keys={keys!r}) — "
+             "skipping")
         return 0
     if not _UUID_RE.fullmatch(uuid):
         # session_uuid returns session_id/conversation_id verbatim, and

@@ -18,12 +18,10 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
-import tempfile
-import time
-from pathlib import Path
 from typing import Mapping
+
+from cursor_capture import spawn_cursor_flush as _spawn_cursor_flush
 
 
 _CURSOR_ENV_MARKERS = (
@@ -87,51 +85,6 @@ def _cursor_event(source_event: str) -> str | None:
     if source_event.lower() in {"stop", "sessionend"}:
         return "stop"
     return None
-
-
-def _log(message: str) -> None:
-    try:
-        path = (Path.home() / ".config" / "memhub-plugin" /
-                "cursorflush" / "log")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"[cursor-flush] compatibility fallback: {message}\n"
-            )
-    except OSError:
-        pass
-
-
-def _spawn_cursor_flush(raw: bytes, event: str) -> None:
-    script = Path(__file__).resolve().with_name("cursor_flush.py")
-    kwargs: dict[str, object] = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-        )
-    else:
-        kwargs["start_new_session"] = True
-
-    try:
-        # Do not feed an unbounded hook payload through PIPE from this guard:
-        # a payload larger than the kernel pipe buffer would hold the hook
-        # process until cursor_flush finishes importing and reads stdin. The
-        # child inherits its own handle to this seeked temporary file, so the
-        # parent can close immediately after Popen on both POSIX and Windows.
-        with tempfile.TemporaryFile() as payload_file:
-            payload_file.write(raw)
-            payload_file.seek(0)
-            subprocess.Popen(
-                [sys.executable, str(script), event],
-                stdin=payload_file, **kwargs)
-    except OSError as exc:
-        _log(f"could not launch cursor_flush.py ({exc!r})")
 
 
 def route(action: str, source_event: str, payload: object, raw: bytes,

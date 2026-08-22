@@ -12,6 +12,9 @@ Run: python3 cursor_capture_test.py
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+import tempfile
 import sys
 import types
 from pathlib import Path
@@ -20,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
 import cursor_flush  # noqa: E402
+import cursor_capture  # noqa: E402
 from cursor_flush import (  # noqa: E402
     DORMANT_RETRY_S, _verdict, session_uuid, should_flush)
 
@@ -27,6 +31,80 @@ NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
 SHIPPED = {"blob_ids": ["a", "b"], "last_flush_at": NOW - 300}
 STALE = {"blob_ids": ["a"], "last_flush_at": NOW - 300}   # "b" is new
+
+
+def test_cross_platform_launcher_acknowledges_and_detaches():
+    seen: list[tuple[bytes, str]] = []
+    original_spawn = cursor_capture.spawn_cursor_flush
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    try:
+        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
+            (raw, event))
+        sys.stdin = io.TextIOWrapper(io.BytesIO(b'{"session_id":"s"}'))
+        sys.stdout = io.StringIO()
+        original_argv = sys.argv
+        sys.argv = ["cursor_capture.py", "stop"]
+        try:
+            assert cursor_capture.main() == 0
+        finally:
+            sys.argv = original_argv
+        output = sys.stdout.getvalue()
+    finally:
+        cursor_capture.spawn_cursor_flush = original_spawn
+        sys.stdin = original_stdin
+        sys.stdout = original_stdout
+
+    assert seen == [(b'{"session_id":"s"}', "stop")]
+    assert json.loads(output) == {"permission": "allow"}
+    print("PASS test_cross_platform_launcher_acknowledges_and_detaches")
+
+
+def test_cursor_manifest_uses_one_portable_launcher_per_event():
+    document = json.loads(
+        (ROOT / "plugins" / "memhub" / "hooks" / "cursor-hooks.json")
+        .read_text(encoding="utf-8"))
+    assert set(document["hooks"]) == {
+        "beforeShellExecution", "afterFileEdit", "stop", "beforeSubmitPrompt"
+    }
+    for event, handlers in document["hooks"].items():
+        assert len(handlers) == 1, event
+        command = handlers[0]["command"]
+        expected = ("~/.config/memhub-plugin/cursor_capture.cmd"
+                    if event == "stop" else "./hooks/cursor_capture.cmd")
+        assert command.startswith('tee "$HOME/.memhub-cursor-hook-'), command
+        assert f'; {expected} {event} ' in command, command
+        assert command.count(".memhub-cursor-hook-$PID-$$.json") == 2, command
+        assert command.count(".memhub-cursor-hook-$PID-$$.out") == 1, command
+        assert command.endswith("; echo '{\"permission\":\"allow\"}'"), command
+    launcher = (ROOT / "plugins" / "memhub" / "hooks" /
+                "cursor_capture.cmd").read_text(encoding="utf-8")
+    assert launcher.startswith(":; ")
+    assert "goto stable_root" in launcher
+    assert '<nul >"%STATE%\\cursor-root" set /p "=%ROOT%"' in launcher
+    assert ":stable_root\nset \"ROOT=\"" in launcher
+    assert ":launch\nwhere py" in launcher
+    print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
+
+
+def test_staged_payload_is_home_scoped_decoded_and_deleted():
+    with tempfile.TemporaryDirectory() as raw_home:
+        home = Path(raw_home)
+        path = home / ".memhub-cursor-hook-123-.json"
+        output = path.with_suffix(".out")
+        expected = b'{"session_id":"s"}'
+        path.write_bytes(b"\xff\xfe" + expected.decode().encode("utf-16le"))
+        output.write_text("discarded tee output", encoding="utf-8")
+        assert cursor_capture._read_staged_payload(str(path), home) == expected
+        assert not path.exists()
+        assert not output.exists()
+
+        outside = home.parent / ".memhub-cursor-hook-456-.json"
+        outside.write_bytes(expected)
+        assert cursor_capture._read_staged_payload(str(outside), home) is None
+        assert outside.exists()
+        outside.unlink()
+    print("PASS test_staged_payload_is_home_scoped_decoded_and_deleted")
 
 
 def test_real_platform_is_unconditional():
