@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from pathlib import Path
 from typing import Mapping
 
 _CURSOR_ENV_MARKERS = (
@@ -88,7 +90,18 @@ def _spawn_cursor_flush(raw: bytes, event: str) -> None:
     """Keep a partial Cursor install from disabling unrelated Claude hooks."""
     try:
         from cursor_capture import spawn_cursor_flush
-    except Exception:
+    except Exception as exc:
+        try:
+            path = (Path.home() / ".config" / "memhub-plugin" /
+                    "cursorflush" / "log")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"[cursor-flush] guard import failed ({exc!r})\n"
+                )
+        except OSError:
+            pass
         return
     spawn_cursor_flush(raw, event)
 

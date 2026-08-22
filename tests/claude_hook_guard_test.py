@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "memhub"
@@ -112,10 +113,16 @@ def test_missing_cursor_launcher_never_disables_claude_hooks():
         return original_import(name, *args, **kwargs)
 
     builtins.__import__ = fail_cursor_capture
-    try:
-        assert not guard.route("capture", "Stop", FIXTURE, b"{}", {})
-    finally:
-        builtins.__import__ = original_import
+    with tempfile.TemporaryDirectory() as temp:
+        try:
+            with mock.patch.object(guard.Path, "home",
+                                   return_value=Path(temp)):
+                assert not guard.route("capture", "Stop", FIXTURE, b"{}", {})
+        finally:
+            builtins.__import__ = original_import
+        log = (Path(temp) / ".config" / "memhub-plugin" /
+               "cursorflush" / "log").read_text(encoding="utf-8")
+        assert "guard import failed (ImportError('partial install'))" in log
     print("PASS test_missing_cursor_launcher_never_disables_claude_hooks")
 
 
