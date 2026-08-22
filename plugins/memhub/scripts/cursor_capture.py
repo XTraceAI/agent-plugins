@@ -91,19 +91,18 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
         if (os.path.normcase(str(resolved.parent)) !=
                 os.path.normcase(str(home))):
             return None
-        # POSIX tee honors the user's umask and may create 0644. Tighten both
-        # short-lived copies before reading; Windows keeps its profile ACLs.
-        for staged_path in (path, path.with_suffix(".out")):
-            try:
-                os.chmod(staged_path, 0o600)
-            except OSError:
-                pass
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 return None
+            # POSIX tee may create 0644. Tighten the opened JSON by fd so a
+            # sibling symlink can never redirect chmod; Windows uses ACLs.
+            try:
+                os.fchmod(handle.fileno(), 0o600)
+            except (AttributeError, OSError):
+                pass
             raw = handle.read(_MAX_PAYLOAD_BYTES + 1)
         if len(raw) > _MAX_PAYLOAD_BYTES:
             _log("staged hook payload exceeds 4 MiB — capture skipped")

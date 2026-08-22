@@ -13,7 +13,7 @@
     ],
     "stop": [
       {
-        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd stop \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; ~/.config/memhub-plugin/cursor_capture.cmd stop \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd stop \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "beforeSubmitPrompt": [
