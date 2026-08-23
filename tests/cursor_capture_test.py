@@ -117,7 +117,8 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         (ROOT / "plugins" / "memhub" / "hooks" / "cursor-hooks.json")
         .read_text(encoding="utf-8"))
     assert set(document["hooks"]) == {
-        "beforeShellExecution", "afterFileEdit", "stop", "beforeSubmitPrompt"
+        "beforeShellExecution", "afterFileEdit", "afterAgentResponse",
+        "stop", "beforeSubmitPrompt", "sessionEnd"
     }
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
@@ -212,7 +213,8 @@ def test_real_platform_is_unconditional():
 
 
 def test_no_new_blobs_never_flushes():
-    for event in ("stop", "afterFileEdit", "beforeShellExecution", "beforeSubmitPrompt"):
+    for event in ("afterAgentResponse", "stop", "afterFileEdit",
+                  "beforeShellExecution", "beforeSubmitPrompt", "sessionEnd"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 SHIPPED, FRESH, NOW), event
     print("PASS test_no_new_blobs_never_flushes")
@@ -282,8 +284,10 @@ def test_edit_debounce():
 
 
 def test_turn_boundaries_flush_on_new_content():
+    assert should_flush("afterAgentResponse", {}, STALE, FRESH, NOW)
     assert should_flush("stop", {}, STALE, FRESH, NOW)
     assert should_flush("beforeSubmitPrompt", {}, STALE, FRESH, NOW)
+    assert should_flush("sessionEnd", {}, STALE, FRESH, NOW)
     assert not should_flush("unknownEvent", {}, STALE, FRESH, NOW)
     print("PASS test_turn_boundaries_flush_on_new_content")
 
@@ -371,7 +375,8 @@ def test_import_verdicts_and_dormancy():
     # transient blip ships before the streak ever reaches dormancy.
     dormant = {"unsupported": True, "unsupported_at": 1_000.0}
     for event in ("afterFileEdit", "beforeShellExecution",
-                  "stop", "beforeSubmitPrompt"):
+                  "afterAgentResponse", "stop", "beforeSubmitPrompt",
+                  "sessionEnd"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 dormant, {"new-blob"}, 1_000.0), event
     # ...but dormancy is NOT a one-way door: going dormant means never

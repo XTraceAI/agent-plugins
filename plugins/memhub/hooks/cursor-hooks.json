@@ -11,6 +11,11 @@
         "command": "./hooks/cursor_capture.cmd afterFileEdit"
       }
     ],
+    "afterAgentResponse": [
+      {
+        "command": "./hooks/cursor_capture.cmd afterAgentResponse"
+      }
+    ],
     "stop": [
       {
         "command": "./hooks/cursor_capture.cmd stop"
@@ -19,6 +24,11 @@
     "beforeSubmitPrompt": [
       {
         "command": "./hooks/cursor_capture.cmd beforeSubmitPrompt"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "./hooks/cursor_capture.cmd sessionEnd"
       }
     ]
   }
