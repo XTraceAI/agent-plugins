@@ -20,6 +20,8 @@ from pathlib import Path
 
 _STAGED_NAME_RE = re.compile(r"\.memhub-cursor-hook-[A-Za-z0-9_-]*\.json")
 _MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+_READ_ATTEMPTS = 3
+_READ_RETRY_SECONDS = 0.02
 
 
 def _log(message: str) -> None:
@@ -87,23 +89,31 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
                 not _STAGED_NAME_RE.fullmatch(path.name) or path.is_symlink()):
             return None
         should_unlink = True
-        resolved = path.resolve(strict=True)
-        if (os.path.normcase(str(resolved.parent)) !=
-                os.path.normcase(str(home))):
-            return None
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        with os.fdopen(fd, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None
-            # POSIX tee may create 0644. Tighten the opened JSON by fd so a
-            # sibling symlink can never redirect chmod; Windows uses ACLs.
+        for attempt in range(_READ_ATTEMPTS):
             try:
-                os.fchmod(handle.fileno(), 0o600)
-            except (AttributeError, OSError):
-                pass
-            raw = handle.read(_MAX_PAYLOAD_BYTES + 1)
+                # Re-check immediately before each open for Windows, where
+                # O_NOFOLLOW is unavailable. POSIX also enforces it atomically.
+                if path.is_symlink():
+                    return None
+                fd = os.open(path, flags)
+                with os.fdopen(fd, "rb") as handle:
+                    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                        return None
+                    # POSIX tee may create 0644. Tighten the opened JSON by fd
+                    # so a sibling symlink can never redirect chmod.
+                    try:
+                        os.fchmod(handle.fileno(), 0o600)
+                    except (AttributeError, OSError):
+                        pass
+                    raw = handle.read(_MAX_PAYLOAD_BYTES + 1)
+                break
+            except OSError as exc:
+                if attempt + 1 == _READ_ATTEMPTS:
+                    _log(f"could not read staged hook payload ({exc!r})")
+                    return None
+                time.sleep(_READ_RETRY_SECONDS)
         if len(raw) > _MAX_PAYLOAD_BYTES:
             _log("staged hook payload exceeds 4 MiB — capture skipped")
             return None
@@ -112,6 +122,9 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
         return None
     finally:
         if should_unlink:
+            # tee consumed stdin, so transient recovery happens through the
+            # bounded retries above. Never leave session payloads in HOME for
+            # an unrelated future hook to discover or reuse.
             for staged_path in (path, path.with_suffix(".out")):
                 try:
                     staged_path.unlink()
@@ -121,6 +134,18 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
     try:
         if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
             return raw.decode("utf-16").encode("utf-8")
+
+        # Windows PowerShell can produce BOM-less UTF-16. JSON's ASCII
+        # punctuation makes that encoding unambiguous through its aligned NULs.
+        if len(raw) >= 4 and len(raw) % 2 == 0:
+            even = raw[0::2]
+            odd = raw[1::2]
+            if (odd.count(0) * 4 >= len(odd) * 3 and
+                    even.count(0) * 4 <= len(even)):
+                return raw.decode("utf-16le").encode("utf-8")
+            if (even.count(0) * 4 >= len(even) * 3 and
+                    odd.count(0) * 4 <= len(odd)):
+                return raw.decode("utf-16be").encode("utf-8")
         return raw.decode("utf-8-sig").encode("utf-8")
     except UnicodeError:
         _log("staged hook payload is not UTF-8/UTF-16 — capture skipped")

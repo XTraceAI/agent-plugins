@@ -15,6 +15,7 @@ import asyncio
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -72,6 +73,8 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
         command = handlers[0]["command"]
+        # Cursor's current plugin-hook contract resolves relative commands
+        # from the plugin root. One launcher avoids cross-process double flush.
         assert command.startswith('tee "$HOME/.memhub-cursor-hook-'), command
         assert f'; ./hooks/cursor_capture.cmd {event} ' in command
         assert command.count(".memhub-cursor-hook-$PID-$$.json") == 2
@@ -82,10 +85,46 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     assert launcher.startswith(":; ")
     assert "cursor-root" not in launcher
     assert "stable_root" not in launcher
+    assert "cleanup_stage" in launcher
     assert ":launch\nwhere py" in launcher
     assert launcher.count('"%~1" "%~2"') == 2
     assert launcher.count("if errorlevel 1 goto allow") == 2
     print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
+
+
+def test_posix_launcher_cleans_staging_when_runtime_is_missing():
+    if os.name == "nt":
+        print("SKIP test_posix_launcher_cleans_staging_when_runtime_is_missing")
+        return
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        home = base / "home"
+        hooks = base / "plugin" / "hooks"
+        workspace = base / "workspace"
+        home.mkdir()
+        hooks.mkdir(parents=True)
+        workspace.mkdir()
+        source = (ROOT / "plugins" / "memhub" / "hooks" /
+                  "cursor_capture.cmd")
+        launcher = hooks / "cursor_capture.cmd"
+        launcher.write_bytes(source.read_bytes())
+        staged = home / ".memhub-cursor-hook-123-456.json"
+        output = staged.with_suffix(".out")
+        staged.write_text('{"session_id":"s"}', encoding="utf-8")
+        output.write_text("duplicate", encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+
+        completed = subprocess.run(
+            ["/bin/sh", str(launcher), "stop", str(staged)],
+            cwd=workspace, env=env, capture_output=True, text=True,
+            check=False)
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == {"permission": "allow"}
+        assert not staged.exists()
+        assert not output.exists()
+    print("PASS test_posix_launcher_cleans_staging_when_runtime_is_missing")
 
 
 def test_staged_invocation_never_reads_stdin_or_spawns_when_missing():
@@ -135,12 +174,45 @@ def test_staged_payload_is_home_scoped_decoded_and_deleted():
         assert not path.exists()
         assert not output.exists()
 
+        for marker, encoding in (("le", "utf-16le"), ("be", "utf-16be")):
+            bomless = home / f".memhub-cursor-hook-{marker}-.json"
+            bomless.write_bytes(expected.decode().encode(encoding))
+            assert cursor_capture._read_staged_payload(
+                str(bomless), home) == expected
+            assert not bomless.exists()
+
         outside = home.parent / ".memhub-cursor-hook-456-.json"
         outside.write_bytes(expected)
         assert cursor_capture._read_staged_payload(str(outside), home) is None
         assert outside.exists()
         outside.unlink()
     print("PASS test_staged_payload_is_home_scoped_decoded_and_deleted")
+
+
+def test_staged_payload_retries_transient_read_failure():
+    with tempfile.TemporaryDirectory() as raw_home:
+        home = Path(raw_home)
+        path = home / ".memhub-cursor-hook-retry-.json"
+        expected = b'{"session_id":"s"}'
+        path.write_bytes(expected)
+        real_open = cursor_capture.os.open
+        attempts = 0
+
+        def flaky_open(path_arg, flags):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("transient test failure")
+            return real_open(path_arg, flags)
+
+        with mock.patch.object(cursor_capture.os, "open", flaky_open), \
+                mock.patch.object(cursor_capture.time, "sleep"):
+            assert cursor_capture._read_staged_payload(
+                str(path), home) == expected
+
+        assert attempts == 2
+        assert not path.exists()
+    print("PASS test_staged_payload_retries_transient_read_failure")
 
 
 def test_staged_output_symlink_target_is_never_modified():
