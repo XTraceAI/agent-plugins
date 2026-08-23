@@ -15,6 +15,8 @@ import asyncio
 import io
 import json
 import sys
+import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -57,6 +59,57 @@ def test_cross_platform_launcher_acknowledges_and_detaches():
     assert seen == [(b'{"session_id":"s"}', "stop")]
     assert json.loads(output) == {"permission": "allow"}
     print("PASS test_cross_platform_launcher_acknowledges_and_detaches")
+
+
+def test_detached_temporary_stdin_survives_parent_close():
+    """The detached child must retain stdin after the launcher returns.
+
+    A delayed reader makes every parent ``TemporaryFile`` close before the
+    child consumes it. Repeating the real spawn path catches Windows handle
+    inheritance regressions that a mocked ``Popen`` cannot expose.
+    """
+    attempts = 24
+    original_file = cursor_capture.__file__
+    with tempfile.TemporaryDirectory(prefix="memhub-cursor-stdin-") as td:
+        root = Path(td)
+        results = root / "detached results"
+        results.mkdir()
+        helper = root / "cursor_flush.py"
+        helper.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import time\n"
+            "time.sleep(0.1)\n"
+            "Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())\n",
+            encoding="utf-8",
+        )
+
+        expected: dict[Path, bytes] = {}
+        cursor_capture.__file__ = str(root / "cursor_capture.py")
+        try:
+            for attempt in range(attempts):
+                output = results / f"payload-{attempt:02d}.bin"
+                payload = (f"attempt-{attempt:02d}\n".encode("ascii")
+                           + bytes(range(256)) * 384)
+                expected[output] = payload
+                cursor_capture.spawn_cursor_flush(payload, str(output))
+        finally:
+            cursor_capture.__file__ = original_file
+
+        deadline = time.monotonic() + 20
+        pending = list(expected)
+        while pending and time.monotonic() < deadline:
+            pending = [path for path, payload in expected.items()
+                       if not path.exists()
+                       or path.stat().st_size != len(payload)]
+            if pending:
+                time.sleep(0.02)
+
+        assert not pending, f"detached children did not finish: {pending}"
+        for path, payload in expected.items():
+            assert path.read_bytes() == payload, path
+
+    print("PASS test_detached_temporary_stdin_survives_parent_close")
 
 
 def test_cursor_manifest_uses_one_portable_launcher_per_event():
