@@ -12,13 +12,13 @@ if not exist "%ROOT%\scripts\cursor_capture.py" goto allow
 :launch
 where py >nul 2>&1
 if %errorlevel% equ 0 (
-  py -3 "%ROOT%\scripts\cursor_capture.py" "%~1" "%~2"
+  py -3 "%ROOT%\scripts\cursor_capture.py" "%~1" "%~2" "%~3"
   if errorlevel 1 goto allow
   exit /b 0
 )
 where python >nul 2>&1
 if %errorlevel% equ 0 (
-  python "%ROOT%\scripts\cursor_capture.py" "%~1" "%~2"
+  python "%ROOT%\scripts\cursor_capture.py" "%~1" "%~2" "%~3"
   if errorlevel 1 goto allow
   exit /b 0
 )

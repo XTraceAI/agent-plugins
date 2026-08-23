@@ -88,7 +88,7 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     assert "stable_root" not in launcher
     assert "cleanup_stage" in launcher
     assert ":launch\nwhere py" in launcher
-    assert launcher.count('"%~1" "%~2"') == 2
+    assert launcher.count('"%~1" "%~2" "%~3"') == 2
     assert launcher.count("if errorlevel 1 goto allow") == 2
     assert 'call :cleanup_stage "%~2" "%~3"' in launcher
     print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
