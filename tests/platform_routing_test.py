@@ -173,6 +173,11 @@ def test_capture_auto_reports_missing_bare_id() -> None:
         reader, path, err = capture._resolve(args)
         assert reader is None and path is None
         assert "cannot find session 'missing-session'" in err
+
+        args.host = "cursor"
+        reader, path, err = capture._resolve(args)
+        assert reader is None and path is None
+        assert err == "cannot find session 'missing-session' for host 'cursor'"
     finally:
         capture.readers.READERS = original_readers
     print("PASS test_capture_auto_reports_missing_bare_id")

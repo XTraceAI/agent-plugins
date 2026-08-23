@@ -82,7 +82,8 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
                 candidate_path, candidate_err = candidate.locate(args.session)
                 if candidate_path is not None:
                     matches.append((candidate, candidate_path))
-                elif candidate_err and "ambiguous" in candidate_err.lower():
+                elif (isinstance(candidate_err, str) and
+                      "ambiguous" in candidate_err.lower()):
                     ambiguities.append(f"{candidate.HOST}: {candidate_err}")
             if ambiguities:
                 return None, None, (
@@ -103,6 +104,8 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
         return None, None, f"unknown host {host!r} (known: {', '.join(readers.READERS)})"
     path, err = r.locate(args.session)
     if path is None:
+        if not isinstance(err, str) or not err:
+            err = f"cannot find session {args.session!r} for host {host!r}"
         return None, None, err
     return r, path, ""
 
