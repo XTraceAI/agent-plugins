@@ -78,6 +78,9 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
                     "--host claude|codex|cursor")
             matches: list[tuple[object, Path]] = []
             ambiguities: list[str] = []
+            # Every reader matches the complete native session UUID, never a
+            # prefix. Accept one exact installed-session match; any duplicate
+            # within or across hosts remains an error below.
             for candidate in readers.READERS.values():
                 candidate_path, candidate_err = candidate.locate(args.session)
                 if candidate_path is not None:
