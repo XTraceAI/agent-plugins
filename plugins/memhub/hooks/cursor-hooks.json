@@ -3,32 +3,32 @@
   "hooks": {
     "beforeShellExecution": [
       {
-        "command": "./hooks/cursor_capture.cmd beforeShellExecution"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeShellExecution"
       }
     ],
     "afterFileEdit": [
       {
-        "command": "./hooks/cursor_capture.cmd afterFileEdit"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" afterFileEdit"
       }
     ],
     "afterAgentResponse": [
       {
-        "command": "./hooks/cursor_capture.cmd afterAgentResponse"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" afterAgentResponse"
       }
     ],
     "stop": [
       {
-        "command": "./hooks/cursor_capture.cmd stop"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" stop"
       }
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "./hooks/cursor_capture.cmd beforeSubmitPrompt"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeSubmitPrompt"
       }
     ],
     "sessionEnd": [
       {
-        "command": "./hooks/cursor_capture.cmd sessionEnd"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" sessionEnd"
       }
     ]
   }
