@@ -123,9 +123,11 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
         command = handlers[0]["command"]
-        # Cursor's current plugin-hook contract resolves relative commands
-        # from the plugin root. One launcher avoids cross-process double flush.
-        assert command == f"./hooks/cursor_capture.cmd {event}"
+        # Cursor runs stop from the workspace even for plugin hooks. Keep every
+        # event explicit so no event-specific cwd can strand the launcher.
+        expected = f'"${{CURSOR_PLUGIN_ROOT}}/hooks/cursor_capture.cmd" {event}'
+        assert command == expected
+        assert not command.startswith("./hooks/")
         assert "tee" not in command
     launcher = (ROOT / "plugins" / "memhub" / "hooks" /
                 "cursor_capture.cmd").read_text(encoding="utf-8")
