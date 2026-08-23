@@ -435,6 +435,8 @@ def test_sniff():
     assert readers.sniff("rollout-2026-01-01T00-00-00-abc.jsonl") == "codex"
     assert readers.sniff(str(Path.home() / ".claude/projects/-x/s.jsonl")) == "claude"
     assert readers.sniff("/x/.cursor/chats/h/u/store.db") == "cursor"
+    assert readers.sniff(
+        "/x/.cursor/projects/p/agent-transcripts/u/u.jsonl") == "cursor"
     assert readers.sniff("/anywhere/store.db") == "cursor"
     assert readers.sniff("latest") is None       # ambiguous → caller must pick
     assert readers.sniff("0199-bare-id") is None
@@ -460,6 +462,31 @@ CURSOR_MESSAGES = [
         {"type": "tool-result", "toolCallId": "call-1\nfc_0", "toolName": "Shell",
          "result": "file.py"}]},
 ]
+
+CURSOR_TRANSCRIPT = [
+    {"role": "user", "message": {"content": [{"type": "text", "text":
+        "<timestamp>Sunday, Aug 23, 2026, 11:16 AM (UTC-7)</timestamp>\n"
+        "<user_query>\nReply once\n</user_query>"}]}},
+    {"role": "assistant", "message": {"content": [
+        {"type": "text", "text": "FIRST"}]}},
+    {"type": "turn_ended", "status": "success"},
+    {"role": "user", "message": {"content": [{"type": "text", "text":
+        "<timestamp>Sunday, Aug 23, 2026, 11:18 AM (UTC-7)</timestamp>\n"
+        "<user_query>\nEdit it\n</user_query>"}]}},
+    {"role": "assistant", "message": {"content": [
+        {"type": "text", "text": "Working."},
+        {"type": "tool_use", "name": "Write",
+         "input": {"path": "/repo/proj/out.txt", "contents": "ok\n"}}]}},
+    {"role": "assistant", "message": {"content": [
+        {"type": "text", "text": "DONE"}]}},
+    {"type": "turn_ended", "status": "success"},
+]
+
+
+def _make_cursor_transcript(base: Path,
+                            uuid: str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee") -> Path:
+    path = base / "project" / "agent-transcripts" / uuid / f"{uuid}.jsonl"
+    return _write_jsonl(path, CURSOR_TRANSCRIPT)
 
 
 def _make_cursor_store(base: Path, uuid: str = "11111111-2222-3333-4444-555555555555",
@@ -570,23 +597,110 @@ def test_cursor_reader_end_to_end():
     print("PASS test_cursor_reader_end_to_end")
 
 
+def test_cursor_transcript_reader_end_to_end():
+    with tempfile.TemporaryDirectory() as td:
+        path = _make_cursor_transcript(Path(td))
+        recs, meta = cursor.to_canonical(
+            path, cwd="/repo/proj", model="cursor-test-hook-model")
+        assert meta == {
+            "session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "cwd": "/repo/proj", "model": "cursor-test-hook-model",
+            "title": "Reply once", "host": "cursor",
+        }, meta
+        kinds = []
+        for record in recs:
+            content = record["message"]["content"]
+            kinds.append(
+                f"{record['message']['role']}:" +
+                ("text" if isinstance(content, str) else content[0]["type"]))
+        assert kinds == [
+            "user:text", "user:text", "assistant:text", "user:text",
+            "assistant:text", "assistant:tool_use", "assistant:text",
+        ], kinds
+        assert recs[1]["message"]["content"] == "Reply once"
+        assert recs[3]["message"]["content"] == "Edit it"
+        tool = recs[5]["message"]["content"][0]
+        assert tool == {
+            "type": "tool_use", "id": "cursor-call-5", "name": "Write",
+            "input": {"path": "/repo/proj/out.txt", "contents": "ok\n"},
+        }, tool
+        assert recs[6]["message"]["content"][0]["text"] == "DONE"
+        assert recs[6]["message"]["model"] == "cursor-test-hook-model"
+        assert "usage" not in recs[6]["message"]
+        assert {record["timestamp"] for record in recs} == {
+            "2026-08-23T18:16:00.000Z", "2026-08-23T18:18:00.000Z"}
+        again, _ = cursor.to_canonical(
+            path, cwd="/repo/proj", model="cursor-test-hook-model")
+        assert [record["uuid"] for record in again] == [
+            record["uuid"] for record in recs]
+        assert not readers.validate_canonical(recs)
+    print("PASS test_cursor_transcript_reader_end_to_end")
+
+
+def test_cursor_transcript_defers_partial_tail_and_rejects_bad_lines():
+    with tempfile.TemporaryDirectory() as td:
+        path = _make_cursor_transcript(Path(td))
+        path.write_bytes(path.read_bytes().rstrip(b"\n"))
+        recs, _ = cursor.to_canonical(path)
+        assert recs[-1]["message"]["content"][0]["text"] == "DONE"
+        with path.open("ab") as handle:
+            handle.write(b'\n{"role":"assistant","message":')
+        recs, _ = cursor.to_canonical(path)
+        assert recs[-1]["message"]["content"][0]["text"] == "DONE"
+        path.write_bytes(path.read_bytes() + b"\nnot-json\n")
+        try:
+            cursor.to_canonical(path)
+        except ValueError as exc:
+            assert "invalid JSON" in str(exc)
+        else:
+            raise AssertionError("terminated invalid transcript line must fail")
+    print("PASS test_cursor_transcript_defers_partial_tail_and_rejects_bad_lines")
+
+
+def test_cursor_usage_normalization_is_exact():
+    assert cursor.normalize_usage({
+        "input_tokens": 100, "output_tokens": 7,
+        "cache_read_tokens": 40, "cache_write_tokens": 3,
+    }) == {
+        "input_tokens": 100, "output_tokens": 7,
+        "cache_read_input_tokens": 40,
+        "cache_creation_input_tokens": 3,
+    }
+    assert cursor.normalize_usage({"inputTokens": 5}) == {
+        "input_tokens": 5, "output_tokens": 0,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    }
+    for invalid in ({}, {"input_tokens": -1}, {"output_tokens": True},
+                    {"cache_read_tokens": "4"}):
+        assert cursor.normalize_usage(invalid) is None, invalid
+    print("PASS test_cursor_usage_normalization_is_exact")
+
+
 def test_cursor_locate_and_list():
     with tempfile.TemporaryDirectory() as td:
-        db = _make_cursor_store(Path(td))
-        old = cursor._CHATS
-        cursor._CHATS = Path(td)
+        root = Path(td)
+        db = _make_cursor_store(root / "chats")
+        transcript = _make_cursor_transcript(root / "projects")
+        old_chats, old_projects = cursor._CHATS, cursor._PROJECTS
+        cursor._CHATS = root / "chats"
+        cursor._PROJECTS = root / "projects"
         try:
             hit, err = cursor.locate("11111111-2222-3333-4444-555555555555")
             assert hit == db and not err, err
             hit, err = cursor.locate("latest")
-            assert hit == db
+            assert hit == transcript
+            hit, err = cursor.locate("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+            assert hit == transcript and not err
             hit, err = cursor.locate("nope")
             assert hit is None and "no cursor session" in err
             sessions = cursor.list_sessions()
-            assert [s["id"] for s in sessions] == ["11111111-2222-3333-4444-555555555555"]
-            assert sessions[0]["cwd"] == "/repo/proj"
+            assert [s["id"] for s in sessions] == [
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "11111111-2222-3333-4444-555555555555",
+            ]
+            assert sessions[1]["cwd"] == "/repo/proj"
         finally:
-            cursor._CHATS = old
+            cursor._CHATS, cursor._PROJECTS = old_chats, old_projects
     print("PASS test_cursor_locate_and_list")
 
 

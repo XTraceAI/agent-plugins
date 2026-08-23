@@ -1,4 +1,4 @@
-"""Cursor session reader: cursor-agent chat stores → Claude Code records.
+"""Cursor session reader: native stores/transcripts -> Claude Code records.
 
 Store layout (undocumented; pinned by inspection on cursor-agent 2026.08,
 ``meta.json.schemaVersion == 1`` — this reader REFUSES other versions loudly
@@ -30,6 +30,12 @@ arrives inside ``<user_query>…</user_query>`` — extract it when present.
 Content-addressing is also the watermark story for live capture later: "the
 set of blob ids already shipped" survives checkpoint restores (a new root
 over mostly-old blobs) where a rowid watermark would lie.
+
+Cursor IDE 3.17 also writes hook transcripts at
+``~/.cursor/projects/<project>/agent-transcripts/<uuid>/<uuid>.jsonl``. Those
+JSONL records preserve user/assistant text and tool calls but omit tool
+results, model, cwd, and usage. Hook payload metadata fills the latter fields
+during live capture; manual imports remain valid with nullable metadata.
 """
 from __future__ import annotations
 
@@ -43,6 +49,7 @@ from pathlib import Path
 HOST = "cursor"
 
 _CHATS = Path.home() / ".cursor" / "chats"
+_PROJECTS = Path.home() / ".cursor" / "projects"
 _SCHEMA_VERSION = 1
 
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S)
@@ -52,6 +59,9 @@ _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S)
 # leading blocks GENERICALLY rather than maintaining a name list; mid-text
 # tags are left alone (they're the user's own content).
 _LEADING_TAG_RE = re.compile(r"^<([A-Za-z_][\w-]*)(?:\s[^>]*)?>.*?</\1>\s*", re.S)
+_TIMESTAMP_RE = re.compile(
+    r"<timestamp>([A-Za-z]+, [A-Za-z]+ \d{1,2}, \d{4}, "
+    r"\d{1,2}:\d{2} [AP]M) \(UTC([+-]\d{1,2})(?::(\d{2}))?\)</timestamp>")
 
 
 def _clean_user_text(text: str) -> str | None:
@@ -81,19 +91,14 @@ def _text_of(content) -> str:
     return ""
 
 
-def _usage_of(message: dict) -> dict[str, int] | None:
-    """Map persisted Cursor usage, when the host provides it.
+def normalize_usage(raw) -> dict[str, int] | None:
+    """Normalize exact native counters, or return ``None`` when unmeasured.
 
-    Cursor 2026.08's v1 chat store does not persist the CLI result's usage
-    object, so real sessions currently return ``None``. Accept both the CLI's
-    camelCase names and Claude-shaped snake_case names so usage begins flowing
-    without another reader migration if Cursor adds it to message leaves.
-    Never estimate from text: proprietary model tokenizers make that look
-    precise while being wrong.
+    Accept store/CLI camelCase, hook snake_case, and canonical names. Missing
+    buckets become measured zero only when at least one exact counter exists.
+    A malformed present value invalidates the whole sample; partially trusting
+    one bucket would make the aggregate look more complete than it is.
     """
-    raw = message.get("usage")
-    if not isinstance(raw, dict):
-        raw = message.get("tokenCount")
     if not isinstance(raw, dict):
         return None
 
@@ -122,6 +127,14 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return out if measured else None
 
 
+def _usage_of(message: dict) -> dict[str, int] | None:
+    """Map persisted Cursor usage, when the host provides it."""
+    raw = message.get("usage")
+    if not isinstance(raw, dict):
+        raw = message.get("tokenCount")
+    return normalize_usage(raw)
+
+
 def _read_meta_json(session_dir: Path) -> dict | None:
     p = session_dir / "meta.json"
     try:
@@ -134,41 +147,73 @@ def _session_dirs() -> list[Path]:
     return [p.parent for p in _CHATS.glob("*/*/store.db")]
 
 
+def _transcript_paths() -> list[Path]:
+    return list(_PROJECTS.glob("*/agent-transcripts/*/*.jsonl"))
+
+
 def list_sessions(limit: int = 20) -> list[dict]:
-    """Most recent cursor sessions, newest first (by meta.json updatedAtMs)."""
-    rows = []
+    """Most recent Cursor sessions, preferring the richer store per UUID."""
+    rows: list[dict] = []
+    store_ids: set[str] = set()
     for d in _session_dirs():
         m = _read_meta_json(d) or {}
+        store_ids.add(d.name)
         rows.append({"id": d.name, "path": str(d / "store.db"),
                      "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
                      "host": HOST, "cwd": m.get("cwd")})
+    for p in _transcript_paths():
+        if p.stem in store_ids:
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        rows.append({"id": p.stem, "path": str(p), "mtime": mtime,
+                     "host": HOST, "cwd": None})
     rows.sort(key=lambda s: s["mtime"], reverse=True)
     return rows[:limit]
 
 
 def locate(ref: str) -> tuple[Path | None, str]:
-    """Accept a store.db path, a session dir, ``latest``, or a session uuid."""
+    """Accept a native path, session directory, ``latest``, or session UUID."""
     p = Path(ref).expanduser()
     if p.is_file():
         return p, ""
     if p.is_dir() and (p / "store.db").is_file():
         return p / "store.db", ""
+    if p.is_dir() and (p / f"{p.name}.jsonl").is_file():
+        return p / f"{p.name}.jsonl", ""
     if "/" in ref and ref != "latest":
-        return None, f"cursor store not found: {p}"
+        return None, f"cursor session not found: {p}"
     dirs = _session_dirs()
-    if not dirs:
-        return None, f"no cursor sessions under {_CHATS}"
+    transcripts = _transcript_paths()
+    if not dirs and not transcripts:
+        return None, f"no cursor sessions under {_CHATS} or {_PROJECTS}"
     if ref == "latest":
-        newest = max(dirs, key=lambda d: (_read_meta_json(d) or {}).get("updatedAtMs", 0))
-        return newest / "store.db", ""
+        candidates = [
+            ((m.get("updatedAtMs") or 0) / 1000.0, d / "store.db")
+            for d in dirs for m in [(_read_meta_json(d) or {})]
+        ]
+        for transcript in transcripts:
+            try:
+                candidates.append((transcript.stat().st_mtime, transcript))
+            except OSError:
+                continue
+        return max(candidates, key=lambda item: item[0])[1], ""
     hits = [d for d in dirs if d.name == ref]
-    if not hits:
-        return None, f"no cursor session {ref!r} under {_CHATS}"
     if len(hits) > 1:
         # Same uuid under two workspace hashes would change which repo's
         # brain receives the import — refuse, never guess.
         return None, f"ambiguous session id {ref!r}: {len(hits)} matches — pass the path"
-    return hits[0] / "store.db", ""
+    if hits:
+        return hits[0] / "store.db", ""
+    transcript_hits = [path for path in transcripts if path.stem == ref]
+    if len(transcript_hits) > 1:
+        return None, (f"ambiguous session id {ref!r}: "
+                      f"{len(transcript_hits)} transcripts — pass the path")
+    if transcript_hits:
+        return transcript_hits[0], ""
+    return None, f"no cursor session {ref!r} under {_CHATS} or {_PROJECTS}"
 
 
 # Plausible ms-epoch window for node clocks (2017..2096). Field numbers churn
@@ -280,34 +325,54 @@ def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
     return messages
 
 
-def to_canonical(path) -> tuple[list[dict], dict]:
-    """Load a cursor store and transform it to Claude-shaped records."""
-    db_path = Path(path)
-    session_dir = db_path.parent
-    mj = _read_meta_json(session_dir) or {}
-    version = mj.get("schemaVersion")
-    if version != _SCHEMA_VERSION:
-        raise ValueError(
-            f"cursor store {session_dir} has schemaVersion {version!r}; this "
-            f"reader is pinned to {_SCHEMA_VERSION} — refusing to misparse. "
-            "Update readers/cursor.py against the new format.")
-    cwd = mj.get("cwd")
-    session_id = session_dir.name
+def _iso_ms(ms) -> str | None:
+    try:
+        return datetime.datetime.fromtimestamp(
+            ms / 1000.0, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    except (TypeError, ValueError, OSError):
+        return None
 
-    def _iso(ms) -> str | None:
-        try:
-            return datetime.datetime.fromtimestamp(
-                ms / 1000.0, tz=datetime.timezone.utc
-            ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        except (TypeError, ValueError, OSError):
-            return None
 
-    # Per-message clocks come from checkpoint NODES in the hash tree (leaves
-    # carry none); meta.json's window is the fallback when a node had no
-    # readable clock. The server lifts event_date from ``timestamp`` and
-    # treats missing as undated.
-    fallback_ts = _iso(mj.get("updatedAtMs")) or _iso(mj.get("createdAtMs"))
+def _iso_seconds(seconds) -> str | None:
+    try:
+        return datetime.datetime.fromtimestamp(
+            seconds, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _embedded_timestamp(text: str) -> str | None:
+    match = _TIMESTAMP_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        local = datetime.datetime.strptime(match.group(1),
+                                           "%A, %b %d, %Y, %I:%M %p")
+        hours = int(match.group(2))
+        minutes = int(match.group(3) or 0)
+        sign = -1 if hours < 0 else 1
+        offset = datetime.timedelta(hours=hours, minutes=sign * minutes)
+        aware = local.replace(tzinfo=datetime.timezone(offset))
+        return aware.astimezone(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z")
+    except (TypeError, ValueError):
+        return None
+
+
+def _model_of(obj) -> str | None:
+    po = obj.get("providerOptions") if isinstance(obj, dict) else None
+    return (po.get("cursor") or {}).get("modelName") if isinstance(po, dict) else None
+
+
+def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
+                  session_id: str, cwd: str | None, model_hint: str | None,
+                  created_ts: str | None, fallback_ts: str | None
+                  ) -> tuple[list[dict], dict]:
+    """Transform either native source after it has yielded ordered messages."""
     ts_holder = {"ts": fallback_ts}
+    out: list[dict] = []
 
     def rec(record: dict) -> dict:
         if cwd:
@@ -330,14 +395,7 @@ def to_canonical(path) -> tuple[list[dict], dict]:
             message["model"] = block_model or model
         return rec({"type": "assistant", "message": message})
 
-    out: list[dict] = []
-    dated_messages = _load_messages(db_path)
-
-    def _model_of(obj) -> str | None:
-        po = obj.get("providerOptions") if isinstance(obj, dict) else None
-        return (po.get("cursor") or {}).get("modelName") if isinstance(po, dict) else None
-
-    model = None
+    model = model_hint
     for m, _ in dated_messages:
         # modelName appears at message level OR on individual content blocks
         model = _model_of(m) or model
@@ -352,12 +410,12 @@ def to_canonical(path) -> tuple[list[dict], dict]:
     if cwd:
         banner += f" · cwd {cwd}"
     banner += "]"
-    ts_holder["ts"] = _iso(mj.get("createdAtMs")) or fallback_ts
+    ts_holder["ts"] = created_ts or fallback_ts
     out.append(user(banner))
 
     title = None
-    for msg, node_ts in dated_messages:
-        ts_holder["ts"] = _iso(node_ts) or fallback_ts
+    for msg, message_ts in dated_messages:
+        ts_holder["ts"] = message_ts or fallback_ts
         role = msg.get("role")
         content = msg.get("content")
 
@@ -395,12 +453,13 @@ def to_canonical(path) -> tuple[list[dict], dict]:
                         record = assistant({"type": "text", "text": text}, block_model)
                         out.append(record)
                         emitted.append(record)
-                elif bt == "tool-call":
-                    args = b.get("args")
+                elif bt in ("tool-call", "tool_use"):
+                    args = b.get("args") if bt == "tool-call" else b.get("input")
                     record = assistant({
                         "type": "tool_use",
-                        "id": b.get("toolCallId") or f"cursor-call-{len(out)}",
-                        "name": b.get("toolName") or "tool",
+                        "id": (b.get("toolCallId") or b.get("id") or
+                               f"cursor-call-{len(out)}"),
+                        "name": b.get("toolName") or b.get("name") or "tool",
                         "input": args if isinstance(args, dict) else {"input": args},
                     }, block_model)
                     out.append(record)
@@ -428,3 +487,83 @@ def to_canonical(path) -> tuple[list[dict], dict]:
     meta = {"session_id": session_id, "cwd": cwd, "model": model,
             "title": title, "host": HOST}
     return out, meta
+
+
+_MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
+
+
+def _load_transcript(path: Path) -> tuple[list[tuple[dict, str | None]], str | None]:
+    """Read Cursor hook JSONL, ignoring only an unfinished final line."""
+    try:
+        fallback_ts = _iso_seconds(path.stat().st_ctime)
+    except OSError:
+        fallback_ts = None
+    current_ts = fallback_ts
+    messages: list[tuple[dict, str | None]] = []
+    with path.open("rb") as handle:
+        line_no = 0
+        while True:
+            raw = handle.readline(_MAX_TRANSCRIPT_LINE_BYTES + 1)
+            if not raw:
+                break
+            line_no += 1
+            if len(raw) > _MAX_TRANSCRIPT_LINE_BYTES:
+                raise ValueError(
+                    f"cursor transcript {path} line {line_no} exceeds 8 MiB")
+            terminated = raw.endswith((b"\n", b"\r"))
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if not terminated:
+                    # Cursor appends records. A hook can race the writer, so a
+                    # genuinely unfinished tail is deferred to the next event.
+                    # A complete final JSON object needs no trailing newline
+                    # and is accepted by the same parse above.
+                    break
+                raise ValueError(
+                    f"cursor transcript {path} line {line_no} is invalid JSON") from exc
+            if not isinstance(entry, dict) or entry.get("role") not in (
+                    "system", "user", "assistant", "tool"):
+                continue
+            body = entry.get("message")
+            if not isinstance(body, dict):
+                continue
+            message = dict(body)
+            message["role"] = entry["role"]
+            if entry["role"] == "user":
+                current_ts = (_embedded_timestamp(_text_of(message.get("content")))
+                              or current_ts)
+            messages.append((message, current_ts))
+    return messages, fallback_ts
+
+
+def to_canonical(path, *, session_id: str | None = None,
+                 cwd: str | None = None, model: str | None = None
+                 ) -> tuple[list[dict], dict]:
+    """Load either a legacy ``store.db`` or current hook transcript."""
+    source = Path(path)
+    if source.name != "store.db":
+        sid = session_id or source.stem
+        messages, fallback_ts = _load_transcript(source)
+        created_ts = messages[0][1] if messages else fallback_ts
+        return _canonicalize(
+            messages, session_id=sid, cwd=cwd, model_hint=model,
+            created_ts=created_ts, fallback_ts=fallback_ts)
+
+    session_dir = source.parent
+    mj = _read_meta_json(session_dir) or {}
+    version = mj.get("schemaVersion")
+    if version != _SCHEMA_VERSION:
+        raise ValueError(
+            f"cursor store {session_dir} has schemaVersion {version!r}; this "
+            f"reader is pinned to {_SCHEMA_VERSION} — refusing to misparse. "
+            "Update readers/cursor.py against the new format.")
+    store_cwd = mj.get("cwd")
+    fallback_ts = (_iso_ms(mj.get("updatedAtMs")) or
+                   _iso_ms(mj.get("createdAtMs")))
+    messages = [(message, _iso_ms(node_ts) or fallback_ts)
+                for message, node_ts in _load_messages(source)]
+    return _canonicalize(
+        messages, session_id=session_dir.name, cwd=store_cwd,
+        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")),
+        fallback_ts=fallback_ts)

@@ -5,15 +5,15 @@ The Cursor analog of ``flush_turn.py``, reusing its whole downstream —
 ``redact``, ``_memhub_auth.resolve_bearer``, ``brain_resolve``, ``room_map``,
 ``mcp_http`` — and differing in exactly the two places Cursor differs:
 
-1. **Data source**: Cursor hooks hand a ``transcript_path`` JSONL, but that
-   file is deliberately Claude-shaped-yet-LOSSY (no tool results, no ids, no
-   reasoning — verified live). So the hook is used only for TRIGGER +
-   IDENTITY: the session uuid names the full-fidelity store
-   (``~/.cursor/chats/<hash>/<uuid>/store.db``), read through
-   ``readers.cursor`` into canonical records.
-2. **Watermark**: the store is content-addressed, so "anything new?" is a
-   set comparison on blob ids — which also makes checkpoint restores safe
-   (a new root over mostly-old blobs), where a byte offset would lie.
+1. **Data source**: legacy Cursor/CLI sessions use the full-fidelity v1
+   ``store.db``; current Cursor IDE sessions use the hook-provided JSONL under
+   ``~/.cursor/projects``. Source choice is sticky per session so record UUIDs
+   never shift if a second representation appears later.
+2. **Watermark**: stores compare content-addressed blob ids; transcripts use a
+   canonical-content digest. Exact completed-turn hook usage is persisted by
+   generation id before the network call and folded into the final assistant
+   record, so retries retain telemetry and duplicate ``afterAgentResponse`` /
+   ``stop`` delivery never double-counts it.
 
 The full canonical transcript is re-sent each flush under the constant
 ``conversation_id cursor-<uuid>``; the SERVER's watermark folds re-sends
@@ -21,9 +21,10 @@ forward (the same property Codex re-imports rely on). The local blob-id set
 only decides WHETHER to flush, so a lost state file costs a redundant send,
 never a lost or duplicated conversation.
 
-Events (from Spike C, cursor-agent 2026.08): ``beforeShellExecution`` and
-``afterFileEdit`` are the ones that fire in ``-p`` mode; ``stop`` and
-``beforeSubmitPrompt`` are wired opportunistically for hosts where they do.
+Cursor IDE 3.17 emits ``afterAgentResponse`` and ``stop`` with exact usage;
+Cursor Agent CLI 2026.08 emits only ``sessionStart`` / ``sessionEnd`` hooks and
+keeps usage solely in caller-owned stream output. ``sessionEnd`` therefore
+captures CLI content with nullable usage rather than estimating it.
 ``beforeShellExecution`` flushes only on milestone commands (git commit /
 gh pr …) so ordinary shell traffic stays quiet; ``afterFileEdit`` is
 debounced. Whatever the trigger set misses, the next flush or an
@@ -40,6 +41,7 @@ discipline as flush_turn.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -59,6 +61,7 @@ from redact import redact_records  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
+_CURSOR_PROJECTS = Path.home() / ".cursor" / "projects"
 
 # afterFileEdit fires on every edit; flushing each one would hammer the
 # server mid-turn. Milestones and turn boundaries bypass this.
@@ -154,15 +157,17 @@ _MILESTONE_SCAN_LIMIT = 16384
 
 # Server-side extraction mode per event — mirrors the Claude design, where
 # flush_turn buffers ("auto") and flush_session drains ("now" — the server
-# default) at session end and commit/PR boundaries. Cursor has NO session-end
-# hook, so if every event sent "auto" a small session would NEVER cross the
-# drain threshold: records buffer forever, ack_through stays null, and the
-# session never materializes in the Sessions view. Verified live. Boundaries
-# must drain; only mid-turn edits buffer.
+# default) at turn/session end and commit/PR boundaries. If every event sent
+# "auto", a small IDE session that stays open would never cross the drain
+# threshold: records buffer forever, ack_through stays null, and the session
+# never materializes in the Sessions view. Verified live. Boundaries must
+# drain; only mid-turn edits are debounce candidates.
 _FLUSH_MODE = {
     "beforeShellExecution": "now",   # only fires on milestone commands (gate)
+    "afterAgentResponse": "now",     # completed turn + exact usage
     "stop": "now",                   # turn boundary
     "beforeSubmitPrompt": "now",     # previous turn is definitely complete
+    "sessionEnd": "now",             # CLI/content backstop
     # TEMPORARILY "now", not "auto": staging showed auto-buffered records get
     # content-registered by dedup WITHOUT persisting — if the buffer never
     # drains (small session, no later "now"), the records become permanently
@@ -331,6 +336,164 @@ def session_uuid(payload: dict) -> str | None:
     return None
 
 
+def _valid_transcript_path(raw, uuid: str) -> tuple[Path | None, str]:
+    """Resolve a hook transcript without granting arbitrary-file upload.
+
+    A project can invoke the launcher itself and controls hook JSON. Requiring
+    Cursor's native root plus the UUID in both directory and filename keeps a
+    forged payload from turning this capture path into a local file reader.
+    ``resolve`` on both sides makes a symlink escape compare outside the root.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None, "hook payload has no transcript_path"
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        return None, "transcript_path is not absolute"
+    if candidate.parent.name != uuid or candidate.name != f"{uuid}.jsonl":
+        return None, "transcript_path does not match the session UUID"
+    try:
+        resolved = candidate.resolve(strict=True)
+        root = _CURSOR_PROJECTS.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None, "transcript_path does not resolve under ~/.cursor/projects"
+    if not resolved.is_file():
+        return None, "transcript_path is not a regular file"
+    return resolved, ""
+
+
+def _source_for(uuid: str, payload: dict, state: dict
+                ) -> tuple[str | None, Path | None, str]:
+    """Choose one native representation and keep that choice sticky."""
+    sticky = state.get("source_kind")
+    if sticky == "store":
+        path, err = cursor_reader.locate(uuid)
+        if path is not None and path.name == "store.db":
+            return "store", path, ""
+        return None, None, err or "sticky Cursor store is unavailable"
+    if sticky == "transcript":
+        raw = state.get("transcript_path") or payload.get("transcript_path")
+        path, err = _valid_transcript_path(raw, uuid)
+        return ("transcript", path, "") if path is not None else (None, None, err)
+
+    # Prefer the richer store when both exist (current CLI; older IDE). A
+    # current IDE session has no store, so the validated hook transcript wins.
+    store, store_err = cursor_reader.locate(uuid)
+    if store is not None and store.name == "store.db":
+        return "store", store, ""
+    transcript, transcript_err = _valid_transcript_path(
+        payload.get("transcript_path"), uuid)
+    if transcript is not None:
+        return "transcript", transcript, ""
+    return None, None, transcript_err or store_err
+
+
+def _payload_meta(payload: dict, state: dict) -> dict:
+    prior = state.get("cursor_meta")
+    meta = dict(prior) if isinstance(prior, dict) else {}
+    model = payload.get("model")
+    if isinstance(model, str) and model.strip():
+        meta["model"] = model.strip()[:200]
+    roots = payload.get("workspace_roots")
+    if isinstance(roots, list):
+        cwd = next((root for root in roots
+                    if isinstance(root, str) and root), None)
+        if cwd:
+            meta["cwd"] = cwd[:4096]
+    return meta
+
+
+_HOOK_USAGE_KEYS = {
+    "inputTokens", "input_tokens", "outputTokens", "output_tokens",
+    "cacheReadTokens", "cache_read_tokens", "cache_read_input_tokens",
+    "cacheWriteTokens", "cache_write_tokens", "cache_creation_input_tokens",
+}
+
+
+def _hook_usage(event: str, payload: dict
+                ) -> tuple[str, dict[str, int]] | None:
+    if event not in ("afterAgentResponse", "stop"):
+        return None
+    if not any(key in payload for key in _HOOK_USAGE_KEYS):
+        return None
+    generation = payload.get("generation_id")
+    usage = cursor_reader.normalize_usage(payload)
+    if (not isinstance(generation, str) or
+            not _UUID_RE.fullmatch(generation) or usage is None):
+        return None
+    return generation, usage
+
+
+def _assistant_text(record: dict) -> str:
+    content = (record.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(block.get("text", "") for block in content
+                     if isinstance(block, dict) and block.get("type") == "text")
+
+
+def _last_assistant_uuid(records: list[dict], expected_text=None) -> str | None:
+    for record in reversed(records):
+        if record.get("type") != "assistant" or not isinstance(
+                record.get("uuid"), str):
+            continue
+        if isinstance(expected_text, str) and _assistant_text(record) != expected_text:
+            continue
+        return record["uuid"]
+    return None
+
+
+def _usage_events_with(state: dict, generation: str, target_uuid: str,
+                       usage: dict[str, int]) -> dict:
+    raw = state.get("usage_events")
+    events = dict(raw) if isinstance(raw, dict) else {}
+    prior = events.get(generation)
+    if (isinstance(prior, dict) and
+            isinstance(prior.get("target_uuid"), str)):
+        # afterAgentResponse and stop repeat one generation. The detached stop
+        # process can wait behind another flush while a new turn begins, so its
+        # then-current "last assistant" is not authoritative. Once observed,
+        # a generation stays bound to its original deterministic record UUID.
+        target_uuid = prior["target_uuid"]
+    # If Cursor regenerates a visible turn onto the same deterministic record,
+    # retain the latest exact sample rather than summing unlike attempts.
+    events = {key: value for key, value in events.items()
+              if key == generation or not (
+                  isinstance(value, dict) and
+                  value.get("target_uuid") == target_uuid)}
+    events[generation] = {"target_uuid": target_uuid, "usage": usage}
+    # Long-running chats must not grow hook state without bound. Removing old
+    # entries cannot corrupt server totals: confirmed UUIDs are immutable and
+    # a later re-send is folded by server dedup.
+    while len(events) > 512:
+        events.pop(next(iter(events)))
+    return events
+
+
+def _apply_usage(records: list[dict], usage_events) -> set[str]:
+    by_uuid = {record.get("uuid"): record for record in records}
+    applied: set[str] = set()
+    if not isinstance(usage_events, dict):
+        return applied
+    for generation, event in usage_events.items():
+        if not isinstance(event, dict):
+            continue
+        record = by_uuid.get(event.get("target_uuid"))
+        usage = event.get("usage")
+        if (not isinstance(record, dict) or record.get("type") != "assistant" or
+                cursor_reader.normalize_usage(usage) is None):
+            continue
+        record["message"]["usage"] = usage
+        applied.add(generation)
+    return applied
+
+
+def _records_revision(records: list[dict]) -> str:
+    encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":"),
+                         sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def current_blob_ids(store_db: Path) -> set[str]:
     import sqlite3
     # 3s busy_timeout: Cursor is often mid-write (a checkpoint restore, an
@@ -347,7 +510,10 @@ def current_blob_ids(store_db: Path) -> set[str]:
 
 
 def should_flush(event: str, payload: dict, state: dict,
-                 blob_ids: set[str], now: float) -> bool:
+                 blob_ids: set[str], now: float, *,
+                 source_kind: str = "store",
+                 source_revision: str | None = None,
+                 usage_pending: bool = False) -> bool:
     """Pure gate — WHEN a hook invocation becomes a server call.
 
     New-blobs is a precondition for every event: without new content a flush
@@ -365,8 +531,13 @@ def should_flush(event: str, payload: dict, state: dict,
     if state.get("unsupported") and (
             now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
         return False
-    if blob_ids <= set(state.get("blob_ids") or []):
-        return False
+    if not usage_pending:
+        if source_kind == "transcript":
+            if not source_revision or source_revision == state.get(
+                    "transcript_revision"):
+                return False
+        elif blob_ids <= set(state.get("blob_ids") or []):
+            return False
     if event == "beforeShellExecution":
         # The command is untrusted payload and need not be a str — a host
         # version could send argv as a list or a dict, and `(list or "")[:512]`
@@ -382,7 +553,8 @@ def should_flush(event: str, payload: dict, state: dict,
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
-    if event in ("stop", "beforeSubmitPrompt"):
+    if event in ("afterAgentResponse", "stop", "beforeSubmitPrompt",
+                 "sessionEnd"):
         return True
     return False
 
@@ -470,9 +642,13 @@ def _namespace_of(cwd: str | None) -> str | None:
     return None
 
 
-async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
-                 flush_mode: str = "now") -> None:
-    records, meta = cursor_reader.to_canonical(store_db)
+async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
+                 flush_mode: str = "now", *, source_kind: str = "store",
+                 source_revision: str | None = None,
+                 records: list[dict] | None = None, meta: dict | None = None,
+                 applied_usage: set[str] | None = None) -> None:
+    if records is None or meta is None:
+        records, meta = cursor_reader.to_canonical(source_path)
     # Close the read span IMMEDIATELY — before redaction and the network call,
     # which together can run for many seconds. Blobs present at both the gate
     # and here existed for the whole span the payload was built from, so their
@@ -486,7 +662,8 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
     # UnboundLocalError.
     shipped: set[str] | None = None
     try:
-        shipped = blob_ids & current_blob_ids(store_db)
+        if source_kind == "store":
+            shipped = blob_ids & current_blob_ids(source_path)
     except Exception as e:  # noqa: BLE001 — see below
         # Unreadable mid-flush: we cannot say which blobs survived the read,
         # so the watermark is left ALONE rather than advanced to the gate set
@@ -587,7 +764,7 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
             return
     else:
         if cwd:
-            _log(f"ignoring unusable cwd from store: {str(cwd)[:60]!r}")
+            _log(f"ignoring unusable cwd from Cursor source: {str(cwd)[:60]!r}")
         room, namespace = None, None
 
     arguments = {
@@ -662,19 +839,20 @@ async def _flush(uuid: str, store_db: Path, blob_ids: set[str],
               # session re-arms instead of staying dormant on old evidence.
               "unsupported": False, "unsupported_at": 0,
               "fail_streak": 0}
-    # On a CONFIRMED import, advance the watermark even when the post-read
-    # failed (shipped is None): the server acked the payload, which was built
-    # from the store at GATE time, so the gate set `blob_ids` is a valid
-    # watermark. The intersection is the tighter value when we have it, but
-    # withholding entirely on a confirmed send looped a full re-upload on
-    # every (undebounced) turn boundary while the store stayed busy. A blob
-    # the gate saw but a restore then removed is gone from the store anyway,
-    # so marking it shipped loses nothing; a restore's NEW blobs have fresh
-    # ids the next flush picks up.
-    fields["blob_ids"] = sorted(shipped if shipped is not None else blob_ids)
-    if shipped is None:
-        _log("store unreadable after the transcript read — watermark advanced "
-             "to the gate set on this confirmed import")
+    if source_kind == "store":
+        # On a CONFIRMED import, advance the watermark even when the post-read
+        # failed (shipped is None): the server acked the payload built from the
+        # gate set. A checkpoint restore's newly-added blobs still differ next
+        # time, while removed blobs cannot be recovered by withholding state.
+        fields["blob_ids"] = sorted(
+            shipped if shipped is not None else blob_ids)
+        if shipped is None:
+            _log("store unreadable after the transcript read — watermark "
+                 "advanced to the gate set on this confirmed import")
+    elif source_revision:
+        fields["transcript_revision"] = source_revision
+    if applied_usage is not None:
+        fields["sent_usage_generations"] = sorted(applied_usage)
     _save_state(uuid, **fields)
     _log(f"flushed {len(sendable)} records → cursor-{uuid}"
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
@@ -703,25 +881,6 @@ def main() -> int:
              f"store lookup")
         return 0
 
-    store_db, err = cursor_reader.locate(uuid)
-    if store_db is None:
-        _log(f"{event}: {err}")
-        return 0
-
-    try:
-        blob_ids = current_blob_ids(store_db)
-    except Exception as e:  # locked/corrupt db mid-write — next hook retries
-        _log(f"{event}: store unreadable ({e}) — skipping")
-        return 0
-    if not blob_ids:
-        # NOT the same as "nothing new": the empty set is a subset of every
-        # watermark, so falling through would read as "up to date" and skip
-        # SILENTLY. A readable store with zero blobs is one mid-rebuild (a
-        # checkpoint restore) — say so, and leave the watermark untouched so
-        # the next event re-reads and ships whatever appears.
-        _log(f"{event}: store reports zero blobs (rebuilding?) — skipping")
-        return 0
-
     # Serialize the whole check-then-act: reading the watermark, sending, and
     # writing it back must not interleave with a concurrent flush for this
     # session, or both upload the same transcript and race the watermark.
@@ -730,19 +889,86 @@ def main() -> int:
     # rather than skip and never run again. Mid-turn events (edits, milestone
     # shell) skip when busy: another will follow. Once acquired, should_flush
     # re-checks new-blobs, so a waited boundary ships only the delta or no-ops.
-    lock_fd = _acquire(uuid,
-                       blocking=(event in ("stop", "beforeSubmitPrompt")))
+    lock_fd = _acquire(
+        uuid, blocking=(event in ("afterAgentResponse", "stop",
+                                  "beforeSubmitPrompt", "sessionEnd")))
     if lock_fd is None:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
         state = _read_state(uuid)
-        if not should_flush(event, payload, state, blob_ids, time.time()):
+        source_kind, source_path, err = _source_for(uuid, payload, state)
+        if source_kind is None or source_path is None:
+            _log(f"{event}: {err or 'no readable Cursor source'}")
+            return 0
+
+        cursor_meta = _payload_meta(payload, state)
+        blob_ids: set[str] = set()
+        source_revision: str | None = None
+        try:
+            if source_kind == "store":
+                blob_ids = current_blob_ids(source_path)
+                if not blob_ids:
+                    # A readable empty store is mid-rebuild. Leave every
+                    # watermark untouched so the next hook retries it.
+                    _log(f"{event}: store reports zero blobs (rebuilding?) — "
+                         "skipping")
+                    return 0
+                records, meta = cursor_reader.to_canonical(source_path)
+            else:
+                records, meta = cursor_reader.to_canonical(
+                    source_path, session_id=uuid,
+                    cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
+                source_revision = _records_revision(records)
+        except Exception as e:  # locked/partial/corrupt source — next hook retries
+            _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
+            return 0
+
+        # Persist source identity and exact usage BEFORE any network work.
+        # afterAgentResponse and stop duplicate the same generation; replacing
+        # that dictionary key makes delivery idempotent, while a later hook can
+        # retry an auth/server failure without needing Cursor to repeat usage.
+        fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
+        if source_kind == "transcript":
+            fields["transcript_path"] = str(source_path)
+        usage_events = state.get("usage_events")
+        usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
+        sample = _hook_usage(event, payload)
+        if sample is not None:
+            generation, usage = sample
+            expected_text = payload.get("text") if event == "afterAgentResponse" else None
+            target = _last_assistant_uuid(records, expected_text)
+            if target is None:
+                _log(f"{event}: exact usage has no matching final assistant "
+                     "record — leaving this turn unmeasured")
+            else:
+                usage_events = _usage_events_with(
+                    state, generation, target, usage)
+                fields["usage_events"] = usage_events
+        elif (event in ("afterAgentResponse", "stop") and
+              any(key in payload for key in _HOOK_USAGE_KEYS)):
+            _log(f"{event}: malformed token counters or generation_id — "
+                 "leaving this turn unmeasured")
+
+        _save_state(uuid, **fields)
+        state.update(fields)
+        applied_usage = _apply_usage(records, usage_events)
+        sent_usage = set(state.get("sent_usage_generations") or [])
+        usage_pending = bool(applied_usage - sent_usage)
+
+        if not should_flush(
+                event, payload, state, blob_ids, time.time(),
+                source_kind=source_kind, source_revision=source_revision,
+                usage_pending=usage_pending):
             return 0
         try:
             mode = _FLUSH_MODE.get(event, "now")
-            asyncio.run(asyncio.wait_for(_flush(uuid, store_db, blob_ids, mode),
-                                         timeout=FLUSH_TIMEOUT_S))
+            asyncio.run(asyncio.wait_for(
+                _flush(
+                    uuid, source_path, blob_ids, mode,
+                    source_kind=source_kind, source_revision=source_revision,
+                    records=records, meta=meta, applied_usage=applied_usage),
+                timeout=FLUSH_TIMEOUT_S))
         except Exception as e:
             # A timeout or any raise past _flush's own handlers (the broad
             # case, including asyncio.wait_for firing) counts toward dormancy
