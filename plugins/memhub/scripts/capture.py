@@ -141,6 +141,22 @@ def cmd_import(args) -> int:
 
     if r.HOST == claude_reader.HOST:
         # Already canonical — import_session.py reads the transcript in place.
+        if args.dry_run:
+            records, meta = r.to_canonical(path)
+            if not records:
+                print(f"ERROR: nothing to import from {path}", file=sys.stderr)
+                return 2
+            sid = meta.get("session_id") or path.stem
+            conv_id = args.conversation_id or sid
+            print(f"source          : {path}")
+            print(f"claude session  : {sid}")
+            print(f"records         : {len(records)}")
+            print(f"cwd             : {meta.get('cwd')}")
+            print(f"conversation_id : {conv_id}")
+            print("-" * 56)
+            print("[dry-run] Claude transcript is already canonical; "
+                  "skipping import_conversation")
+            return 0
         return run_import(path, args.conversation_id)
 
     records, meta = r.to_canonical(path)

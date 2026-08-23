@@ -95,6 +95,41 @@ def test_capture_passes_reader_host_to_import_session() -> None:
     print("PASS test_capture_passes_reader_host_to_import_session")
 
 
+def test_capture_claude_dry_run_never_imports() -> None:
+    original_resolve = capture._resolve
+    original_run = capture.subprocess.run
+
+    class Reader:
+        HOST = "claude"
+
+        @staticmethod
+        def to_canonical(_path):
+            return ([{
+                "type": "user",
+                "uuid": "record-1",
+                "timestamp": "2026-08-23T00:00:00Z",
+                "cwd": "/repo",
+                "message": {"role": "user", "content": "hello"},
+            }], {"session_id": "session-1", "cwd": "/repo"})
+
+    def fail_run(_command):
+        raise AssertionError("Claude dry-run launched the importer")
+
+    args = types.SimpleNamespace(
+        host="auto", session="session-1", title=None, agent_brain_id=None,
+        no_room=False, namespace=None, url=None, conversation_id=None,
+        dry_run=True)
+    try:
+        capture._resolve = lambda _args: (
+            Reader(), Path("/sessions/session-1.jsonl"), "")
+        capture.subprocess.run = fail_run
+        assert capture.cmd_import(args) == 0
+    finally:
+        capture._resolve = original_resolve
+        capture.subprocess.run = original_run
+    print("PASS test_capture_claude_dry_run_never_imports")
+
+
 def test_capture_auto_resolves_one_host_for_bare_id() -> None:
     original_readers = capture.readers.READERS
 
@@ -260,6 +295,7 @@ def test_import_namespace_probe_hardens_transcript_cwd() -> None:
 if __name__ == "__main__":
     test_import_request_uses_requested_platform()
     test_capture_passes_reader_host_to_import_session()
+    test_capture_claude_dry_run_never_imports()
     test_capture_auto_resolves_one_host_for_bare_id()
     test_capture_auto_refuses_cross_host_id_and_latest()
     test_capture_auto_reports_missing_bare_id()
