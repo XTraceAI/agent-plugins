@@ -1,6 +1,6 @@
 {
   "name": "memhub",
-  "version": "0.27.7",
+  "version": "0.27.8",
   "description": "XTrace MemHub team memory in Codex: automatic session capture, situated directive recall, artifact sync, search, import, handoff, and spec-driven development. Run the memhub:setup skill once to install the compatibility hooks bridge on Codex 0.148-0.149.",
   "author": {
     "name": "XTrace",

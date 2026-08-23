@@ -12,6 +12,8 @@ Run: python3 cursor_capture_test.py
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import sys
 import types
 from pathlib import Path
@@ -20,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
 import cursor_flush  # noqa: E402
+import cursor_capture  # noqa: E402
 from cursor_flush import (  # noqa: E402
     DORMANT_RETRY_S, _verdict, session_uuid, should_flush)
 
@@ -27,6 +30,79 @@ NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
 SHIPPED = {"blob_ids": ["a", "b"], "last_flush_at": NOW - 300}
 STALE = {"blob_ids": ["a"], "last_flush_at": NOW - 300}   # "b" is new
+
+
+def test_cross_platform_launcher_acknowledges_and_detaches():
+    seen: list[tuple[bytes, str]] = []
+    original_spawn = cursor_capture.spawn_cursor_flush
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    try:
+        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
+            (raw, event))
+        sys.stdin = io.TextIOWrapper(io.BytesIO(b'{"session_id":"s"}'))
+        sys.stdout = io.StringIO()
+        original_argv = sys.argv
+        sys.argv = ["cursor_capture.py", "stop"]
+        try:
+            assert cursor_capture.main() == 0
+        finally:
+            sys.argv = original_argv
+        output = sys.stdout.getvalue()
+    finally:
+        cursor_capture.spawn_cursor_flush = original_spawn
+        sys.stdin = original_stdin
+        sys.stdout = original_stdout
+
+    assert seen == [(b'{"session_id":"s"}', "stop")]
+    assert json.loads(output) == {"permission": "allow"}
+    print("PASS test_cross_platform_launcher_acknowledges_and_detaches")
+
+
+def test_cursor_manifest_uses_one_portable_launcher_per_event():
+    document = json.loads(
+        (ROOT / "plugins" / "memhub" / "hooks" / "cursor-hooks.json")
+        .read_text(encoding="utf-8"))
+    assert set(document["hooks"]) == {
+        "beforeShellExecution", "afterFileEdit", "stop", "beforeSubmitPrompt"
+    }
+    for event, handlers in document["hooks"].items():
+        assert len(handlers) == 1, event
+        command = handlers[0]["command"]
+        # Cursor's current plugin-hook contract resolves relative commands
+        # from the plugin root. One launcher avoids cross-process double flush.
+        assert command == f"./hooks/cursor_capture.cmd {event}"
+        assert "tee" not in command
+    launcher = (ROOT / "plugins" / "memhub" / "hooks" /
+                "cursor_capture.cmd").read_text(encoding="utf-8")
+    assert not (ROOT / "plugins" / "memhub" / "hooks" /
+                "cursor_capture.sh").exists()
+    assert launcher.startswith(":; ")
+    assert "cursor-root" not in launcher
+    assert "stable_root" not in launcher
+    assert "cleanup_stage" not in launcher
+    assert ".memhub-cursor-hook-" not in launcher
+    assert ":launch\nwhere py" in launcher
+    assert launcher.count('"%ROOT%\\scripts\\cursor_capture.py" %*') == 2
+    assert launcher.count("if errorlevel 1 goto allow") == 2
+    print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
+
+
+def test_direct_payload_normalizes_encodings_and_rejects_invalid():
+    expected = b'{"session_id":"s"}'
+    assert cursor_capture._normalize_payload(expected) == expected
+    assert cursor_capture._normalize_payload(
+        b"\xff\xfe" + expected.decode().encode("utf-16le")) == expected
+    assert cursor_capture._normalize_payload(
+        expected.decode().encode("utf-16le")) == expected
+    assert cursor_capture._normalize_payload(
+        expected.decode().encode("utf-16be")) == expected
+    escaped_nul = b'{"value":"\\u0000"}'
+    assert cursor_capture._normalize_payload(escaped_nul) == escaped_nul
+    assert cursor_capture._normalize_payload(b"a\x00b\x00") is None
+    oversized = b"{" + b" " * cursor_capture._MAX_PAYLOAD_BYTES + b"}"
+    assert cursor_capture._normalize_payload(oversized) is None
+    print("PASS test_direct_payload_normalizes_encodings_and_rejects_invalid")
 
 
 def test_real_platform_is_unconditional():

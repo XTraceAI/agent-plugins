@@ -52,7 +52,15 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         assert installed["hooks"]["PreToolUse"][0] == original["hooks"]["PreToolUse"][0]
         assert (home / "memhub_hook_bridge.py").is_file()
         installed_text = json.dumps(installed)
-        assert str(home) in installed_text
+        commands = [
+            handler[key]
+            for groups in installed["hooks"].values()
+            for group in groups
+            for handler in group.get("hooks", [])
+            for key in ("command", "commandWindows")
+            if isinstance(handler.get(key), str)
+        ]
+        assert any(str(home) in command for command in commands)
         assert "${CODEX_HOME" not in installed_text
         assert setup.status(home) == (True, 3, 3)
 
@@ -386,8 +394,8 @@ def test_cli_names_only_the_memhub_handlers_for_review():
 
         text = output.getvalue()
         assert "installed (3 handlers)" in text
-        assert f"User config - {raw}/hooks.json" in text
-        assert f"review command: {raw}/memhub_hook_bridge.py" in text
+        assert f"User config - {Path(raw) / 'hooks.json'}" in text
+        assert f"review command: {Path(raw) / 'memhub_hook_bridge.py'}" in text
         assert "trust only the 3 handlers" in text
         assert "do not use 'Trust all'" in text
     print("PASS test_cli_names_only_the_memhub_handlers_for_review")

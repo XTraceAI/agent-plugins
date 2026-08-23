@@ -30,8 +30,8 @@ debounced. Whatever the trigger set misses, the next flush or an
 import-session sweep heals — idempotence carries correctness, hooks carry
 latency.
 
-Invoked by ``hooks/cursor_capture.sh``, which answers the hook's permission
-contract INSTANTLY and re-runs this script detached — a slow server must
+Invoked by the portable Cursor launcher, which answers the hook's permission
+contract immediately and re-runs this script detached - a slow server must
 never hold up the user's shell command.
 
 Runs under bare python3 (stdlib + sibling modules only — no mcp SDK), same
@@ -215,7 +215,7 @@ def _save_state(uuid: str, **fields) -> None:
     """Merge ``fields`` into this session's state under a per-uuid lock.
 
     atomic_write makes each PUBLISH atomic, but the read-modify-write around
-    it is not: cursor_capture.sh runs every flush DETACHED, so an
+    it is not: the Cursor launcher runs every flush DETACHED, so an
     afterFileEdit and a stop firing close together can both read the old
     state and the later writer silently drops the other's blob_ids or
     last_flush_at — regressing the watermark into redundant re-sends. The
@@ -254,7 +254,7 @@ def _acquire(uuid: str, blocking: bool = False) -> int | None:
 
 
     Both a milestone shell event and a turn boundary can fire within the same
-    second, and cursor_capture.sh detaches each into its own process — so two
+    second, and the launcher detaches each into its own process - so two
     flushes would read the same watermark, both re-read and re-redact the whole
     transcript, both upload it, and then race to write the watermark back. The
     loser of this lock is redundant by construction: the holder is sending the
@@ -689,7 +689,9 @@ def main() -> int:
 
     uuid = session_uuid(payload)
     if not uuid:
-        _log(f"{event}: no session identity in payload — skipping")
+        keys = sorted(str(key) for key in payload)
+        _log(f"{event}: no session identity in payload (keys={keys!r}) — "
+             "skipping")
         return 0
     if not _UUID_RE.fullmatch(uuid):
         # session_uuid returns session_id/conversation_id verbatim, and
