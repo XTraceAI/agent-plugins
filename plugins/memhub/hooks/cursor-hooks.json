@@ -3,22 +3,22 @@
   "hooks": {
     "beforeShellExecution": [
       {
-        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd beforeShellExecution \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd beforeShellExecution \"$HOME/.memhub-cursor-hook-$PID-$$.json\" \"$HOME\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "afterFileEdit": [
       {
-        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd afterFileEdit \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd afterFileEdit \"$HOME/.memhub-cursor-hook-$PID-$$.json\" \"$HOME\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "stop": [
       {
-        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd stop \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd stop \"$HOME/.memhub-cursor-hook-$PID-$$.json\" \"$HOME\"; echo '{\"permission\":\"allow\"}'"
       }
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd beforeSubmitPrompt \"$HOME/.memhub-cursor-hook-$PID-$$.json\"; echo '{\"permission\":\"allow\"}'"
+        "command": "tee \"$HOME/.memhub-cursor-hook-$PID-$$.json\" > \"$HOME/.memhub-cursor-hook-$PID-$$.out\"; ./hooks/cursor_capture.cmd beforeSubmitPrompt \"$HOME/.memhub-cursor-hook-$PID-$$.json\" \"$HOME\"; echo '{\"permission\":\"allow\"}'"
       }
     ]
   }

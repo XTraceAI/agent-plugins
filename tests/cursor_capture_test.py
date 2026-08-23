@@ -79,6 +79,7 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         assert f'; ./hooks/cursor_capture.cmd {event} ' in command
         assert command.count(".memhub-cursor-hook-$PID-$$.json") == 2
         assert command.count(".memhub-cursor-hook-$PID-$$.out") == 1, command
+        assert command.count(' "$HOME";') == 1, command
         assert command.endswith("; echo '{\"permission\":\"allow\"}'"), command
     launcher = (ROOT / "plugins" / "memhub" / "hooks" /
                 "cursor_capture.cmd").read_text(encoding="utf-8")
@@ -89,6 +90,7 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
     assert ":launch\nwhere py" in launcher
     assert launcher.count('"%~1" "%~2"') == 2
     assert launcher.count("if errorlevel 1 goto allow") == 2
+    assert 'call :cleanup_stage "%~2" "%~3"' in launcher
     print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
 
 
@@ -116,7 +118,7 @@ def test_posix_launcher_cleans_staging_when_runtime_is_missing():
         env["HOME"] = str(home)
 
         completed = subprocess.run(
-            ["/bin/sh", str(launcher), "stop", str(staged)],
+            ["/bin/sh", str(launcher), "stop", str(staged), str(home)],
             cwd=workspace, env=env, capture_output=True, text=True,
             check=False)
 
@@ -162,6 +164,46 @@ def test_staged_invocation_never_reads_stdin_or_spawns_when_missing():
     print("PASS test_staged_invocation_never_reads_stdin_or_spawns_when_missing")
 
 
+def test_staged_invocation_uses_manifest_home_not_process_home():
+    class BlockingStdin:
+        @property
+        def buffer(self):
+            raise AssertionError("staged invocation must not inspect stdin")
+
+    seen: list[tuple[bytes, str]] = []
+    original_spawn = cursor_capture.spawn_cursor_flush
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    original_argv = sys.argv
+    try:
+        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
+            (raw, event))
+        sys.stdin = BlockingStdin()
+        sys.stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            stage_home = base / "stage-home"
+            process_home = base / "different-process-home"
+            stage_home.mkdir()
+            process_home.mkdir()
+            path = stage_home / ".memhub-cursor-hook-explicit-home-.json"
+            path.write_bytes(b'{"session_id":"s"}')
+            sys.argv = ["cursor_capture.py", "stop", str(path),
+                        str(stage_home)]
+            with mock.patch.object(cursor_capture.Path, "home",
+                                   return_value=process_home):
+                assert cursor_capture.main() == 0
+            assert not path.exists()
+    finally:
+        cursor_capture.spawn_cursor_flush = original_spawn
+        sys.stdin = original_stdin
+        sys.stdout = original_stdout
+        sys.argv = original_argv
+
+    assert seen == [(b'{"session_id":"s"}', "stop")]
+    print("PASS test_staged_invocation_uses_manifest_home_not_process_home")
+
+
 def test_staged_payload_is_home_scoped_decoded_and_deleted():
     with tempfile.TemporaryDirectory() as raw_home:
         home = Path(raw_home)
@@ -180,6 +222,18 @@ def test_staged_payload_is_home_scoped_decoded_and_deleted():
             assert cursor_capture._read_staged_payload(
                 str(bomless), home) == expected
             assert not bomless.exists()
+
+        escaped_nul = home / ".memhub-cursor-hook-escaped-nul-.json"
+        escaped_nul_payload = b'{"value":"\\u0000"}'
+        escaped_nul.write_bytes(escaped_nul_payload)
+        assert cursor_capture._read_staged_payload(
+            str(escaped_nul), home) == escaped_nul_payload
+
+        invalid_utf16 = home / ".memhub-cursor-hook-invalid-utf16-.json"
+        invalid_utf16.write_bytes(b"a\x00b\x00")
+        assert cursor_capture._read_staged_payload(
+            str(invalid_utf16), home) is None
+        assert not invalid_utf16.exists()
 
         outside = home.parent / ".memhub-cursor-hook-456-.json"
         outside.write_bytes(expected)

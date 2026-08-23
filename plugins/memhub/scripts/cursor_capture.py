@@ -131,25 +131,43 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
                 except OSError:
                     pass
 
-    try:
-        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-            return raw.decode("utf-16").encode("utf-8")
+    def valid_json(encoding: str) -> bytes | None:
+        try:
+            text = raw.decode(encoding)
+            json.loads(text)
+            return text.encode("utf-8")
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        decoded = valid_json("utf-16")
+        if decoded is not None:
+            return decoded
+    else:
+        # Prefer valid UTF-8 before consulting a byte-pattern heuristic.
+        decoded = valid_json("utf-8-sig")
+        if decoded is not None:
+            return decoded
 
         # Windows PowerShell can produce BOM-less UTF-16. JSON's ASCII
-        # punctuation makes that encoding unambiguous through its aligned NULs.
+        # punctuation makes that encoding visible through its aligned NULs;
+        # valid_json prevents coincidental byte patterns from being accepted.
         if len(raw) >= 4 and len(raw) % 2 == 0:
             even = raw[0::2]
             odd = raw[1::2]
             if (odd.count(0) * 4 >= len(odd) * 3 and
                     even.count(0) * 4 <= len(even)):
-                return raw.decode("utf-16le").encode("utf-8")
+                decoded = valid_json("utf-16le")
+                if decoded is not None:
+                    return decoded
             if (even.count(0) * 4 >= len(even) * 3 and
                     odd.count(0) * 4 <= len(odd)):
-                return raw.decode("utf-16be").encode("utf-8")
-        return raw.decode("utf-8-sig").encode("utf-8")
-    except UnicodeError:
-        _log("staged hook payload is not UTF-8/UTF-16 — capture skipped")
-        return None
+                decoded = valid_json("utf-16be")
+                if decoded is not None:
+                    return decoded
+
+    _log("staged hook payload is not valid UTF-8/UTF-16 JSON — capture skipped")
+    return None
 
 
 def main() -> int:
@@ -158,7 +176,8 @@ def main() -> int:
         # Direct invocations carry JSON on stdin; manifest invocations have
         # already consumed it through tee and provide the completed file.
         if len(sys.argv) > 2:
-            staged = _read_staged_payload(sys.argv[2])
+            stage_home = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+            staged = _read_staged_payload(sys.argv[2], stage_home)
             if staged is not None:
                 spawn_cursor_flush(staged, event)
         else:
