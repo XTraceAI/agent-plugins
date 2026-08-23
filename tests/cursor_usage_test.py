@@ -132,7 +132,51 @@ def test_hook_usage_is_exact_and_aborts_remain_unmeasured():
     assert records[0]["message"]["usage"] == usage
     assert cursor_flush._last_assistant_uuid(records, "USAGE_OK") == "final-record"
     assert cursor_flush._last_assistant_uuid(records, "other") is None
+
+    multi_block = [
+        {"type": "user", "uuid": "prompt",
+         "message": {"role": "user", "content": "Do work"}},
+        {"type": "assistant", "uuid": "working",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "Working."}]}},
+        {"type": "assistant", "uuid": "tool",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Write", "input": {}}]}},
+        {"type": "assistant", "uuid": "done",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "DONE"}]}},
+    ]
+    assert cursor_flush._last_assistant_uuid(
+        multi_block, "  DONE\n") == "done"
+    assert cursor_flush._last_assistant_uuid(
+        multi_block, "Working.\nDONE") == "done"
+    assert cursor_flush._last_assistant_uuid(
+        multi_block, "prior turn") is None
     print("PASS test_hook_usage_is_exact_and_aborts_remain_unmeasured")
+
+
+def test_usage_state_refresh_survives_bounded_eviction_and_bad_records():
+    usage = {
+        "input_tokens": 1, "output_tokens": 2,
+        "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4,
+    }
+    oversized = {
+        GENERATION: {"target_uuid": "active", "usage": usage},
+        **{f"stale-{index}": {"target_uuid": f"record-{index}",
+                              "usage": usage}
+           for index in range(512)},
+    }
+    refreshed = cursor_flush._usage_events_with(
+        {"usage_events": oversized}, GENERATION, "wrong-late-target", usage)
+    assert len(refreshed) == 512
+    assert list(refreshed)[-1] == GENERATION
+    assert refreshed[GENERATION]["target_uuid"] == "active"
+
+    malformed = [{"type": "assistant", "uuid": "missing-message"}]
+    assert cursor_flush._apply_usage(malformed, {
+        GENERATION: {"target_uuid": "missing-message", "usage": usage},
+    }) == set()
+    print("PASS test_usage_state_refresh_survives_bounded_eviction_and_bad_records")
 
 
 def test_transcript_gate_deduplicates_revision_and_usage_generation():

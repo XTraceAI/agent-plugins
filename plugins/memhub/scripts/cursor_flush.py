@@ -425,22 +425,44 @@ def _hook_usage(event: str, payload: dict
 
 
 def _assistant_text(record: dict) -> str:
-    content = (record.get("message") or {}).get("content")
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
     if not isinstance(content, list):
         return ""
     return "\n".join(block.get("text", "") for block in content
                      if isinstance(block, dict) and block.get("type") == "text")
 
 
+def _normalized_assistant_text(value) -> str:
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
 def _last_assistant_uuid(records: list[dict], expected_text=None) -> str | None:
+    last_uuid: str | None = None
+    turn_text: list[str] = []
     for record in reversed(records):
-        if record.get("type") != "assistant" or not isinstance(
-                record.get("uuid"), str):
+        message = record.get("message")
+        if (record.get("type") == "user" and isinstance(message, dict) and
+                isinstance(message.get("content"), str)):
+            break
+        if (record.get("type") != "assistant" or
+                not isinstance(record.get("uuid"), str)):
             continue
-        if isinstance(expected_text, str) and _assistant_text(record) != expected_text:
-            continue
-        return record["uuid"]
-    return None
+        if last_uuid is None:
+            last_uuid = record["uuid"]
+        text = _assistant_text(record)
+        if text:
+            turn_text.append(text)
+    if last_uuid is None or not isinstance(expected_text, str):
+        return last_uuid
+    expected = _normalized_assistant_text(expected_text)
+    if not expected:
+        return last_uuid
+    individual = {_normalized_assistant_text(text) for text in turn_text}
+    combined = _normalized_assistant_text("\n".join(reversed(turn_text)))
+    return last_uuid if expected == combined or expected in individual else None
 
 
 def _usage_events_with(state: dict, generation: str, target_uuid: str,
@@ -455,12 +477,15 @@ def _usage_events_with(state: dict, generation: str, target_uuid: str,
         # then-current "last assistant" is not authoritative. Once observed,
         # a generation stays bound to its original deterministic record UUID.
         target_uuid = prior["target_uuid"]
+    # Updating an existing dict key preserves its old insertion position.
+    # Pop first so even an oversized recovered state cannot evict the sample
+    # being refreshed when the bounded map drops its oldest entries below.
+    events.pop(generation, None)
     # If Cursor regenerates a visible turn onto the same deterministic record,
     # retain the latest exact sample rather than summing unlike attempts.
     events = {key: value for key, value in events.items()
-              if key == generation or not (
-                  isinstance(value, dict) and
-                  value.get("target_uuid") == target_uuid)}
+              if not (isinstance(value, dict) and
+                      value.get("target_uuid") == target_uuid)}
     events[generation] = {"target_uuid": target_uuid, "usage": usage}
     # Long-running chats must not grow hook state without bound. Removing old
     # entries cannot corrupt server totals: confirmed UUIDs are immutable and
@@ -480,10 +505,12 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
             continue
         record = by_uuid.get(event.get("target_uuid"))
         usage = event.get("usage")
+        message = record.get("message") if isinstance(record, dict) else None
         if (not isinstance(record, dict) or record.get("type") != "assistant" or
+                not isinstance(message, dict) or
                 cursor_reader.normalize_usage(usage) is None):
             continue
-        record["message"]["usage"] = usage
+        message["usage"] = usage
         applied.add(generation)
     return applied
 
