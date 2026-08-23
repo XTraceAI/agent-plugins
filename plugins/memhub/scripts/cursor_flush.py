@@ -444,6 +444,9 @@ def _last_assistant_uuid(records: list[dict], expected_text=None) -> str | None:
     turn_text: list[str] = []
     for record in reversed(records):
         message = record.get("message")
+        # Canonical prompt/banner records have string content, while tool
+        # results are user records with list content and remain inside a turn.
+        # Raw Cursor list-form prompts are normalized to strings by the reader.
         if (record.get("type") == "user" and isinstance(message, dict) and
                 isinstance(message.get("content"), str)):
             break
@@ -451,6 +454,10 @@ def _last_assistant_uuid(records: list[dict], expected_text=None) -> str | None:
                 not isinstance(record.get("uuid"), str)):
             continue
         if last_uuid is None:
+            # Usage is turn-level and belongs on the final assistant record,
+            # including a tool_use-only turn. This matches _canonicalize(),
+            # which puts persisted native usage on emitted[-1]. Text below is
+            # an association guard, not the destination-record selector.
             last_uuid = record["uuid"]
         text = _assistant_text(record)
         if text:

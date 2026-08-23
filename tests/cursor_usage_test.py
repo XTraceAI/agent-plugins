@@ -134,6 +134,11 @@ def test_hook_usage_is_exact_and_aborts_remain_unmeasured():
     assert cursor_flush._last_assistant_uuid(records, "other") is None
 
     multi_block = [
+        {"type": "user", "uuid": "prior-prompt",
+         "message": {"role": "user", "content": "Prior turn"}},
+        {"type": "assistant", "uuid": "prior-answer",
+         "message": {"role": "assistant", "content": [
+             {"type": "text", "text": "prior turn"}]}},
         {"type": "user", "uuid": "prompt",
          "message": {"role": "user", "content": "Do work"}},
         {"type": "assistant", "uuid": "working",
@@ -142,6 +147,10 @@ def test_hook_usage_is_exact_and_aborts_remain_unmeasured():
         {"type": "assistant", "uuid": "tool",
          "message": {"role": "assistant", "content": [
              {"type": "tool_use", "name": "Write", "input": {}}]}},
+        {"type": "user", "uuid": "tool-result",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "tool",
+              "content": "ok"}]}},
         {"type": "assistant", "uuid": "done",
          "message": {"role": "assistant", "content": [
              {"type": "text", "text": "DONE"}]}},
@@ -152,6 +161,19 @@ def test_hook_usage_is_exact_and_aborts_remain_unmeasured():
         multi_block, "Working.\nDONE") == "done"
     assert cursor_flush._last_assistant_uuid(
         multi_block, "prior turn") is None
+
+    tool_only = [
+        {"type": "user", "uuid": "tool-prompt",
+         "message": {"role": "user", "content": "Run it"}},
+        {"type": "assistant", "uuid": "final-tool",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Shell", "input": {}}]}},
+    ]
+    assert cursor_flush._last_assistant_uuid(tool_only) == "final-tool"
+    tool_event = cursor_flush._usage_events_with(
+        {}, GENERATION, "final-tool", usage)
+    assert cursor_flush._apply_usage(tool_only, tool_event) == {GENERATION}
+    assert tool_only[-1]["message"]["usage"] == usage
     print("PASS test_hook_usage_is_exact_and_aborts_remain_unmeasured")
 
 
