@@ -122,9 +122,11 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
         return None
     finally:
         if should_unlink:
-            # tee consumed stdin, so transient recovery happens through the
-            # bounded retries above. Never leave session payloads in HOME for
-            # an unrelated future hook to discover or reuse.
+            # The manifest runs `tee ...; launcher` sequentially, so tee has
+            # closed this file before the first read. The bounded retries cover
+            # external interference such as a transient scanner lock. After
+            # exhaustion, delete it: no recovery sweep owns staged files, and
+            # retaining session JSON in HOME creates disclosure/replay risk.
             for staged_path in (path, path.with_suffix(".out")):
                 try:
                     staged_path.unlink()
