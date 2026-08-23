@@ -82,7 +82,7 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
                 candidate_path, candidate_err = candidate.locate(args.session)
                 if candidate_path is not None:
                     matches.append((candidate, candidate_path))
-                elif "ambiguous" in candidate_err.lower():
+                elif candidate_err and "ambiguous" in candidate_err.lower():
                     ambiguities.append(f"{candidate.HOST}: {candidate_err}")
             if ambiguities:
                 return None, None, (

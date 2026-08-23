@@ -168,6 +168,7 @@ def test_capture_auto_reports_missing_bare_id() -> None:
         capture.readers.READERS = {
             host: Reader(host) for host in ("claude", "codex", "cursor")
         }
+        capture.readers.READERS["cursor"].locate = lambda _ref: (None, None)
         args = types.SimpleNamespace(host="auto", session="missing-session")
         reader, path, err = capture._resolve(args)
         assert reader is None and path is None
