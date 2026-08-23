@@ -309,11 +309,11 @@ def _acquire(uuid: str, blocking: bool = False) -> int | None:
 
 
 # A cursor session id is a uuid; the transcript_path fallback must look like
-# one, not a layout constant. `…/agent-transcripts/<uuid>/<uuid>.jsonl` puts
-# the uuid at BOTH the parent dir and the file stem — but a host that drops
-# the per-session dir (`…/agent-transcripts/<uuid>.jsonl`) would otherwise
-# yield the constant "agent-transcripts", collapsing every session onto one
-# state key. Accept the parent, then the stem, then give up.
+# one, not a layout constant. Identity extraction is deliberately looser than
+# transcript-file authorization below: a dir-less filename can still identify
+# a legacy store, but is not permission to read an unrecognized file layout.
+# `…/agent-transcripts/<uuid>/<uuid>.jsonl` puts the uuid at BOTH the parent dir
+# and the file stem. Accept the parent, then the stem, then give up.
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
                       r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
@@ -321,6 +321,9 @@ _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
 def session_uuid(payload: dict) -> str | None:
     """The session identity a hook carries. ``session_id`` when present; else
     a uuid derived from ``transcript_path`` — never a directory-name constant.
+
+    This parses identity only. ``_valid_transcript_path`` separately enforces
+    the one native layout authorized for transcript reads.
     """
     sid = payload.get("session_id") or payload.get("conversation_id")
     if isinstance(sid, str) and sid.strip():
@@ -340,8 +343,11 @@ def _valid_transcript_path(raw, uuid: str) -> tuple[Path | None, str]:
     """Resolve a hook transcript without granting arbitrary-file upload.
 
     A project can invoke the launcher itself and controls hook JSON. Requiring
-    Cursor's native root plus the UUID in both directory and filename keeps a
-    forged payload from turning this capture path into a local file reader.
+    Cursor's observed native root plus the UUID in both directory and filename
+    keeps a forged payload from turning this capture path into a local file
+    reader. A UUID-looking filename directly under ``agent-transcripts`` may
+    identify a session, but that unobserved layout is intentionally not enough
+    to authorize reading it.
     ``resolve`` on both sides makes a symlink escape compare outside the root.
     """
     if not isinstance(raw, str) or not raw:
@@ -565,6 +571,10 @@ def should_flush(event: str, payload: dict, state: dict,
     if state.get("unsupported") and (
             now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
         return False
+    # Pending usage deliberately retries an unchanged transcript, but never
+    # bypasses the global dormancy gate above or the event-specific debounce
+    # below. Failed delivery is therefore bounded by MAX_UNCONFIRMED and then
+    # by DORMANT_RETRY_S instead of becoming a per-hook upload loop.
     if not usage_pending:
         if source_kind == "transcript":
             if not source_revision or source_revision == state.get(
@@ -725,14 +735,16 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         if records:
             _log(f"all {len(records)} record(s) redacted away — nothing to "
                  f"send (check redact rules if this recurs on real content)")
-        # Examined is not shipped. Advance the DEBOUNCE only — recording
-        # blob_ids here would mark content shipped that the server never saw,
-        # so if redaction emptied it wrongly (an over-broad rule, a transient
-        # bug) it could never be re-sent once the rule was fixed. Leaving the
-        # watermark costs a re-parse on the next event, which the debounce
-        # already bounds. fail_streak clears: the server was never contacted,
-        # so this breaks any run of contacted failures (see _note_failure).
-        _save_state(uuid, last_flush_at=time.time(), fail_streak=0)
+        # Redaction is structure-preserving today, so a non-empty input cannot
+        # become empty. Keep the watermark held for that defensive future case:
+        # advancing it would make content unrecoverable after an over-broad
+        # redaction rule is fixed. A genuinely empty transcript has no content
+        # to lose, so mark its revision examined and avoid parsing it again at
+        # every turn boundary until Cursor writes something new.
+        fields = {"last_flush_at": time.time(), "fail_streak": 0}
+        if (source_kind == "transcript" and source_revision and not records):
+            fields["transcript_revision"] = source_revision
+        _save_state(uuid, **fields)
         return
 
     try:

@@ -2,6 +2,7 @@
 """Current Cursor transcript + exact hook-usage capture regressions."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sys
@@ -79,6 +80,15 @@ def test_transcript_path_is_uuid_bound_and_contained():
             assert hit == path.resolve() and not err
             hit, err = cursor_flush._valid_transcript_path(
                 str(path.with_name("other.jsonl")), SESSION)
+            assert hit is None and "session UUID" in err
+
+            # Identity parsing accepts this shape so a UUID can still locate a
+            # legacy store, but it is not an authorized transcript layout.
+            flat = path.parent.parent / f"{SESSION}.jsonl"
+            flat.write_text("{}\n", encoding="utf-8")
+            assert cursor_flush.session_uuid(
+                {"transcript_path": str(flat)}) == SESSION
+            hit, err = cursor_flush._valid_transcript_path(str(flat), SESSION)
             assert hit is None and "session UUID" in err
 
             outside = root / "outside" / SESSION / f"{SESSION}.jsonl"
@@ -219,6 +229,52 @@ def test_transcript_gate_deduplicates_revision_and_usage_generation():
         "unknown", {}, state, set(), now,
         source_kind="transcript", source_revision="new")
     print("PASS test_transcript_gate_deduplicates_revision_and_usage_generation")
+
+
+def test_pending_usage_retry_obeys_debounce_and_dormancy():
+    now = 1_787_000_000.0
+    recent = {"transcript_revision": "same", "last_flush_at": now - 5}
+    assert not cursor_flush.should_flush(
+        "afterFileEdit", {}, recent, set(), now,
+        source_kind="transcript", source_revision="same", usage_pending=True)
+    dormant = {
+        "transcript_revision": "same", "unsupported": True,
+        "unsupported_at": now - 5,
+    }
+    assert not cursor_flush.should_flush(
+        "stop", {}, dormant, set(), now,
+        source_kind="transcript", source_revision="same", usage_pending=True)
+    print("PASS test_pending_usage_retry_obeys_debounce_and_dormancy")
+
+
+def test_empty_transcript_revision_is_marked_examined():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        old_state = cursor_flush.STATE_DIR
+        old_redact = cursor_flush.redact_records
+        cursor_flush.STATE_DIR = root / "state"
+        cursor_flush.redact_records = lambda records: records
+        try:
+            asyncio.run(cursor_flush._flush(
+                SESSION, root / f"{SESSION}.jsonl", set(),
+                source_kind="transcript", source_revision="empty-revision",
+                records=[], meta={}))
+            state = cursor_flush._read_state(SESSION)
+            assert state["transcript_revision"] == "empty-revision"
+
+            # A defensive future redactor that drops non-empty content must not
+            # mark that content examined; a later corrected rule can resend it.
+            cursor_flush.redact_records = lambda _records: []
+            asyncio.run(cursor_flush._flush(
+                SESSION, root / f"{SESSION}.jsonl", set(),
+                source_kind="transcript", source_revision="held-revision",
+                records=[{"type": "user"}], meta={}))
+            assert cursor_flush._read_state(SESSION)["transcript_revision"] == (
+                "empty-revision")
+        finally:
+            cursor_flush.STATE_DIR = old_state
+            cursor_flush.redact_records = old_redact
+    print("PASS test_empty_transcript_revision_is_marked_examined")
 
 
 def _main_delivery_case(*, first_send_succeeds: bool) -> tuple[list[dict], dict]:
