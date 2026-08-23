@@ -1,40 +1,25 @@
-:; STAGED=${2:-}; STAGE_HOME=${3:-$HOME}; cleanup_stage() { P=${1:-}; E=${2:-}; [ -n "$P" ] && [ -n "$E" ] || return; D=$(CDPATH= cd -- "$(dirname -- "$P")" 2>/dev/null && pwd -P) || return; H=$(CDPATH= cd -- "$E" 2>/dev/null && pwd -P) || return; [ "$D" = "$H" ] || return; B=${P##*/}; case "$B" in .memhub-cursor-hook-*.json) M=${B#.memhub-cursor-hook-}; M=${M%.json}; case "$M" in *[!A-Za-z0-9_-]*) return;; esac;; *) return;; esac; rm -f -- "$P" "${P%.json}.out"; }; allow() { cleanup_stage "$STAGED" "$STAGE_HOME"; printf '{"permission":"allow"}\n'; exit 0; }; SELF=$0; DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd) || allow; ROOT=$(CDPATH= cd -- "$DIR/.." && pwd); [ -f "$ROOT/scripts/cursor_capture.py" ] || allow; PY=$(command -v python3 || command -v python); [ -n "$PY" ] || allow; exec "$PY" "$ROOT/scripts/cursor_capture.py" "$@"
+:; allow() { printf '{"permission":"allow"}\n'; exit 0; }; SELF=$0; DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd) || allow; ROOT=$(CDPATH= cd -- "$DIR/.." && pwd); [ -f "$ROOT/scripts/cursor_capture.py" ] || allow; PY=$(command -v python3 || command -v python); [ -n "$PY" ] || allow; exec "$PY" "$ROOT/scripts/cursor_capture.py" "$@"
 @echo off
 rem Batch below; POSIX shells execute only the polyglot first line above.
-rem cursor-hooks.json deliberately stays in the POSIX/PowerShell overlap:
-rem tee, semicolons, $HOME/$PID, redirects, and ./paths work in both. Cursor's
-rem native Windows runner reaches this batch half after staging the payload.
 rem Cursor resolves ./hooks from the plugin root; this shim then derives every
-rem executable path from its own installed location.
+rem executable path from its own installed location. Hook JSON stays on stdin;
+rem no named transcript or command payload file is created.
 setlocal
 for %%I in ("%~dp0..") do set "ROOT=%%~fI"
 if not exist "%ROOT%\scripts\cursor_capture.py" goto allow
 :launch
 where py >nul 2>&1
 if %errorlevel% equ 0 (
-  py -3 "%ROOT%\scripts\cursor_capture.py" "%~1" "%~2" "%~3"
+  py -3 "%ROOT%\scripts\cursor_capture.py" %*
   if errorlevel 1 goto allow
   exit /b 0
 )
 where python >nul 2>&1
 if %errorlevel% equ 0 (
-  python "%ROOT%\scripts\cursor_capture.py" "%~1" "%~2" "%~3"
+  python "%ROOT%\scripts\cursor_capture.py" %*
   if errorlevel 1 goto allow
   exit /b 0
 )
 :allow
-call :cleanup_stage "%~2" "%~3"
 echo {"permission":"allow"}
-exit /b 0
-:cleanup_stage
-if "%~1"=="" exit /b 0
-set "EXPECTED_HOME=%~2"
-if not defined EXPECTED_HOME set "EXPECTED_HOME=%USERPROFILE%"
-for %%H in ("%EXPECTED_HOME%") do set "HOME_DIR=%%~fH\"
-if /i not "%~dp1"=="%HOME_DIR%" exit /b 0
-if /i not "%~x1"==".json" exit /b 0
-set "STEM=%~n1"
-if /i not "%STEM:~0,20%"==".memhub-cursor-hook-" exit /b 0
-del /f /q "%~f1" 2>nul
-for %%F in ("%~f1") do del /f /q "%%~dpnF.out" 2>nul
 exit /b 0

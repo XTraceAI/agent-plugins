@@ -3,14 +3,12 @@
 
 Cursor runs plugin hooks through the host shell: POSIX shells on macOS/Linux
 and PowerShell on native Windows. A polyglot shell/batch shim selects a bare
-Python interpreter; this module owns the staged payload and detached flusher.
+Python interpreter; this module normalizes hook stdin and detaches the flusher.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -18,10 +16,7 @@ import time
 from pathlib import Path
 
 
-_STAGED_NAME_RE = re.compile(r"\.memhub-cursor-hook-[A-Za-z0-9_-]*\.json")
 _MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
-_READ_ATTEMPTS = 3
-_READ_RETRY_SECONDS = 0.02
 
 
 def _log(message: str) -> None:
@@ -76,62 +71,11 @@ def spawn_cursor_flush(raw: bytes, event: str) -> None:
         _log(f"could not launch cursor_flush.py ({exc!r})")
 
 
-def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | None:
-    """Read one manifest-staged payload without following an arbitrary path."""
-    path = Path(path_arg)
-    home = (home or Path.home()).resolve()
-    should_unlink = False
-    try:
-        # Validate the lexical home-scoped name before requiring the JSON to
-        # exist so a tee failure can still clean its sibling .out file.
-        parent = path.parent.resolve(strict=True)
-        if (os.path.normcase(str(parent)) != os.path.normcase(str(home)) or
-                not _STAGED_NAME_RE.fullmatch(path.name) or path.is_symlink()):
-            return None
-        should_unlink = True
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        for attempt in range(_READ_ATTEMPTS):
-            try:
-                # Re-check immediately before each open for Windows, where
-                # O_NOFOLLOW is unavailable. POSIX also enforces it atomically.
-                if path.is_symlink():
-                    return None
-                fd = os.open(path, flags)
-                with os.fdopen(fd, "rb") as handle:
-                    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                        return None
-                    # POSIX tee may create 0644. Tighten the opened JSON by fd
-                    # so a sibling symlink can never redirect chmod.
-                    try:
-                        os.fchmod(handle.fileno(), 0o600)
-                    except (AttributeError, OSError):
-                        pass
-                    raw = handle.read(_MAX_PAYLOAD_BYTES + 1)
-                break
-            except OSError as exc:
-                if attempt + 1 == _READ_ATTEMPTS:
-                    _log(f"could not read staged hook payload ({exc!r})")
-                    return None
-                time.sleep(_READ_RETRY_SECONDS)
-        if len(raw) > _MAX_PAYLOAD_BYTES:
-            _log("staged hook payload exceeds 4 MiB — capture skipped")
-            return None
-    except OSError as exc:
-        _log(f"could not read staged hook payload ({exc!r})")
+def _normalize_payload(raw: bytes) -> bytes | None:
+    """Return canonical UTF-8 JSON for the detached child's secure stdin."""
+    if len(raw) > _MAX_PAYLOAD_BYTES:
+        _log("hook payload exceeds 4 MiB - capture skipped")
         return None
-    finally:
-        if should_unlink:
-            # The manifest runs `tee ...; launcher` sequentially, so tee has
-            # closed this file before the first read. The bounded retries cover
-            # external interference such as a transient scanner lock. After
-            # exhaustion, delete it: no recovery sweep owns staged files, and
-            # retaining session JSON in HOME creates disclosure/replay risk.
-            for staged_path in (path, path.with_suffix(".out")):
-                try:
-                    staged_path.unlink()
-                except OSError:
-                    pass
 
     def valid_json(encoding: str) -> bytes | None:
         try:
@@ -168,25 +112,20 @@ def _read_staged_payload(path_arg: str, home: Path | None = None) -> bytes | Non
                 if decoded is not None:
                     return decoded
 
-    _log("staged hook payload is not valid UTF-8/UTF-16 JSON — capture skipped")
+    _log("hook payload is not valid UTF-8/UTF-16 JSON - capture skipped")
     return None
 
 
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
-        # Direct invocations carry JSON on stdin; manifest invocations have
-        # already consumed it through tee and provide the completed file.
-        if len(sys.argv) > 2:
-            stage_home = Path(sys.argv[3]) if len(sys.argv) > 3 else None
-            staged = _read_staged_payload(sys.argv[2], stage_home)
-            if staged is not None:
-                spawn_cursor_flush(staged, event)
-        else:
-            spawn_cursor_flush(sys.stdin.buffer.read(), event)
+        raw = sys.stdin.buffer.read(_MAX_PAYLOAD_BYTES + 1)
+        payload = _normalize_payload(raw)
+        if payload is not None:
+            spawn_cursor_flush(payload, event)
     except Exception as exc:
         # Capture observes; it must never gate the user's prompt or command.
-        _log(f"could not stage hook payload ({exc!r})")
+        _log(f"could not launch hook capture ({exc!r})")
     print(json.dumps({"permission": "allow"}), flush=True)
     return 0
 

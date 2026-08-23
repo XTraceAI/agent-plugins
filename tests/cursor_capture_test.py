@@ -14,13 +14,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import os
-import subprocess
 import sys
-import tempfile
 import types
 from pathlib import Path
-from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
@@ -75,221 +71,38 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         command = handlers[0]["command"]
         # Cursor's current plugin-hook contract resolves relative commands
         # from the plugin root. One launcher avoids cross-process double flush.
-        assert command.startswith('tee "$HOME/.memhub-cursor-hook-'), command
-        assert f'; ./hooks/cursor_capture.cmd {event} ' in command
-        assert command.count(".memhub-cursor-hook-$PID-$$.json") == 2
-        assert command.count(".memhub-cursor-hook-$PID-$$.out") == 1, command
-        assert command.count(' "$HOME";') == 1, command
-        assert command.endswith("; echo '{\"permission\":\"allow\"}'"), command
+        assert command == f"./hooks/cursor_capture.cmd {event}"
+        assert "tee" not in command
     launcher = (ROOT / "plugins" / "memhub" / "hooks" /
                 "cursor_capture.cmd").read_text(encoding="utf-8")
+    assert not (ROOT / "plugins" / "memhub" / "hooks" /
+                "cursor_capture.sh").exists()
     assert launcher.startswith(":; ")
     assert "cursor-root" not in launcher
     assert "stable_root" not in launcher
-    assert "cleanup_stage" in launcher
+    assert "cleanup_stage" not in launcher
+    assert ".memhub-cursor-hook-" not in launcher
     assert ":launch\nwhere py" in launcher
-    assert launcher.count('"%~1" "%~2" "%~3"') == 2
+    assert launcher.count('"%ROOT%\\scripts\\cursor_capture.py" %*') == 2
     assert launcher.count("if errorlevel 1 goto allow") == 2
-    assert 'call :cleanup_stage "%~2" "%~3"' in launcher
     print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
 
 
-def test_posix_launcher_cleans_staging_when_runtime_is_missing():
-    if os.name == "nt":
-        print("SKIP test_posix_launcher_cleans_staging_when_runtime_is_missing")
-        return
-    with tempfile.TemporaryDirectory() as raw:
-        base = Path(raw)
-        home = base / "home"
-        hooks = base / "plugin" / "hooks"
-        workspace = base / "workspace"
-        home.mkdir()
-        hooks.mkdir(parents=True)
-        workspace.mkdir()
-        source = (ROOT / "plugins" / "memhub" / "hooks" /
-                  "cursor_capture.cmd")
-        launcher = hooks / "cursor_capture.cmd"
-        launcher.write_bytes(source.read_bytes())
-        staged = home / ".memhub-cursor-hook-123-456.json"
-        output = staged.with_suffix(".out")
-        staged.write_text('{"session_id":"s"}', encoding="utf-8")
-        output.write_text("duplicate", encoding="utf-8")
-        env = os.environ.copy()
-        env["HOME"] = str(home)
-
-        completed = subprocess.run(
-            ["/bin/sh", str(launcher), "stop", str(staged), str(home)],
-            cwd=workspace, env=env, capture_output=True, text=True,
-            check=False)
-
-        assert completed.returncode == 0, completed.stderr
-        assert json.loads(completed.stdout) == {"permission": "allow"}
-        assert not staged.exists()
-        assert not output.exists()
-    print("PASS test_posix_launcher_cleans_staging_when_runtime_is_missing")
-
-
-def test_staged_invocation_never_reads_stdin_or_spawns_when_missing():
-    class BlockingStdin:
-        @property
-        def buffer(self):
-            raise AssertionError("staged invocation must not inspect stdin")
-
-    seen: list[tuple[bytes, str]] = []
-    original_spawn = cursor_capture.spawn_cursor_flush
-    original_stdin = sys.stdin
-    original_stdout = sys.stdout
-    original_argv = sys.argv
-    try:
-        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
-            (raw, event))
-        sys.stdin = BlockingStdin()
-        sys.stdout = io.StringIO()
-        with tempfile.TemporaryDirectory() as raw_home:
-            missing = Path(raw_home) / ".memhub-cursor-hook-1-.json"
-            output = missing.with_suffix(".out")
-            output.write_text("orphaned tee output", encoding="utf-8")
-            sys.argv = ["cursor_capture.py", "stop", str(missing)]
-            with mock.patch.object(cursor_capture.Path, "home",
-                                   return_value=Path(raw_home)):
-                assert cursor_capture.main() == 0
-            assert not output.exists()
-    finally:
-        cursor_capture.spawn_cursor_flush = original_spawn
-        sys.stdin = original_stdin
-        sys.stdout = original_stdout
-        sys.argv = original_argv
-
-    assert seen == []
-    print("PASS test_staged_invocation_never_reads_stdin_or_spawns_when_missing")
-
-
-def test_staged_invocation_uses_manifest_home_not_process_home():
-    class BlockingStdin:
-        @property
-        def buffer(self):
-            raise AssertionError("staged invocation must not inspect stdin")
-
-    seen: list[tuple[bytes, str]] = []
-    original_spawn = cursor_capture.spawn_cursor_flush
-    original_stdin = sys.stdin
-    original_stdout = sys.stdout
-    original_argv = sys.argv
-    try:
-        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
-            (raw, event))
-        sys.stdin = BlockingStdin()
-        sys.stdout = io.StringIO()
-        with tempfile.TemporaryDirectory() as raw:
-            base = Path(raw)
-            stage_home = base / "stage-home"
-            process_home = base / "different-process-home"
-            stage_home.mkdir()
-            process_home.mkdir()
-            path = stage_home / ".memhub-cursor-hook-explicit-home-.json"
-            path.write_bytes(b'{"session_id":"s"}')
-            sys.argv = ["cursor_capture.py", "stop", str(path),
-                        str(stage_home)]
-            with mock.patch.object(cursor_capture.Path, "home",
-                                   return_value=process_home):
-                assert cursor_capture.main() == 0
-            assert not path.exists()
-    finally:
-        cursor_capture.spawn_cursor_flush = original_spawn
-        sys.stdin = original_stdin
-        sys.stdout = original_stdout
-        sys.argv = original_argv
-
-    assert seen == [(b'{"session_id":"s"}', "stop")]
-    print("PASS test_staged_invocation_uses_manifest_home_not_process_home")
-
-
-def test_staged_payload_is_home_scoped_decoded_and_deleted():
-    with tempfile.TemporaryDirectory() as raw_home:
-        home = Path(raw_home)
-        path = home / ".memhub-cursor-hook-123-.json"
-        output = path.with_suffix(".out")
-        expected = b'{"session_id":"s"}'
-        path.write_bytes(b"\xff\xfe" + expected.decode().encode("utf-16le"))
-        output.write_text("discarded tee output", encoding="utf-8")
-        assert cursor_capture._read_staged_payload(str(path), home) == expected
-        assert not path.exists()
-        assert not output.exists()
-
-        for marker, encoding in (("le", "utf-16le"), ("be", "utf-16be")):
-            bomless = home / f".memhub-cursor-hook-{marker}-.json"
-            bomless.write_bytes(expected.decode().encode(encoding))
-            assert cursor_capture._read_staged_payload(
-                str(bomless), home) == expected
-            assert not bomless.exists()
-
-        escaped_nul = home / ".memhub-cursor-hook-escaped-nul-.json"
-        escaped_nul_payload = b'{"value":"\\u0000"}'
-        escaped_nul.write_bytes(escaped_nul_payload)
-        assert cursor_capture._read_staged_payload(
-            str(escaped_nul), home) == escaped_nul_payload
-
-        invalid_utf16 = home / ".memhub-cursor-hook-invalid-utf16-.json"
-        invalid_utf16.write_bytes(b"a\x00b\x00")
-        assert cursor_capture._read_staged_payload(
-            str(invalid_utf16), home) is None
-        assert not invalid_utf16.exists()
-
-        outside = home.parent / ".memhub-cursor-hook-456-.json"
-        outside.write_bytes(expected)
-        assert cursor_capture._read_staged_payload(str(outside), home) is None
-        assert outside.exists()
-        outside.unlink()
-    print("PASS test_staged_payload_is_home_scoped_decoded_and_deleted")
-
-
-def test_staged_payload_retries_transient_read_failure():
-    with tempfile.TemporaryDirectory() as raw_home:
-        home = Path(raw_home)
-        path = home / ".memhub-cursor-hook-retry-.json"
-        expected = b'{"session_id":"s"}'
-        path.write_bytes(expected)
-        real_open = cursor_capture.os.open
-        attempts = 0
-
-        def flaky_open(path_arg, flags):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise PermissionError("transient test failure")
-            return real_open(path_arg, flags)
-
-        with mock.patch.object(cursor_capture.os, "open", flaky_open), \
-                mock.patch.object(cursor_capture.time, "sleep"):
-            assert cursor_capture._read_staged_payload(
-                str(path), home) == expected
-
-        assert attempts == 2
-        assert not path.exists()
-    print("PASS test_staged_payload_retries_transient_read_failure")
-
-
-def test_staged_output_symlink_target_is_never_modified():
-    if os.name == "nt":
-        print("SKIP test_staged_output_symlink_target_is_never_modified")
-        return
-    with tempfile.TemporaryDirectory() as raw_home:
-        home = Path(raw_home)
-        path = home / ".memhub-cursor-hook-789-.json"
-        output = path.with_suffix(".out")
-        target = home / "unrelated.txt"
-        path.write_bytes(b'{}')
-        target.write_text("keep", encoding="utf-8")
-        target.chmod(0o644)
-        output.symlink_to(target)
-
-        assert cursor_capture._read_staged_payload(str(path), home) == b'{}'
-
-        assert target.read_text(encoding="utf-8") == "keep"
-        assert target.stat().st_mode & 0o777 == 0o644
-        assert target.exists()
-        assert not output.exists()
-    print("PASS test_staged_output_symlink_target_is_never_modified")
+def test_direct_payload_normalizes_encodings_and_rejects_invalid():
+    expected = b'{"session_id":"s"}'
+    assert cursor_capture._normalize_payload(expected) == expected
+    assert cursor_capture._normalize_payload(
+        b"\xff\xfe" + expected.decode().encode("utf-16le")) == expected
+    assert cursor_capture._normalize_payload(
+        expected.decode().encode("utf-16le")) == expected
+    assert cursor_capture._normalize_payload(
+        expected.decode().encode("utf-16be")) == expected
+    escaped_nul = b'{"value":"\\u0000"}'
+    assert cursor_capture._normalize_payload(escaped_nul) == escaped_nul
+    assert cursor_capture._normalize_payload(b"a\x00b\x00") is None
+    oversized = b"{" + b" " * cursor_capture._MAX_PAYLOAD_BYTES + b"}"
+    assert cursor_capture._normalize_payload(oversized) is None
+    print("PASS test_direct_payload_normalizes_encodings_and_rejects_invalid")
 
 
 def test_real_platform_is_unconditional():
