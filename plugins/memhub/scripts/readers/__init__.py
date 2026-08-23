@@ -38,9 +38,10 @@ def reader_for(host: str):
 def sniff(ref: str) -> str | None:
     """Best-effort host detection from how a session is addressed.
 
-    Path shapes are unambiguous (rollout filename / .claude location). A bare
-    id or ``latest`` is NOT guessable — return None and let the caller demand
-    an explicit ``--host`` rather than import the wrong host's session.
+    Path shapes are unambiguous (rollout filename / .claude location). Bare ids
+    and ``latest`` have no shape, so return None; capture.py may safely probe a
+    bare id across readers, but requires an explicit host for ``latest`` or a
+    cross-host collision.
     """
     if not ref or ref == "latest":
         return None

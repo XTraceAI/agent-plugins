@@ -74,7 +74,8 @@ def test_capture_passes_reader_host_to_import_session() -> None:
 
     args = types.SimpleNamespace(
         host=None, session="session-1", title=None, agent_brain_id=None,
-        namespace=None, url=None, conversation_id=None, dry_run=False)
+        no_room=True, namespace=None, url=None, conversation_id=None,
+        dry_run=False)
     try:
         capture.subprocess.run = fake_run
         for host in ("claude", "codex", "cursor"):
@@ -90,7 +91,128 @@ def test_capture_passes_reader_host_to_import_session() -> None:
     for host, command in zip(("claude", "codex", "cursor"), captured):
         index = command.index("--source-platform")
         assert command[index + 1] == host, command
+        assert command.count("--no-room") == 1, command
     print("PASS test_capture_passes_reader_host_to_import_session")
+
+
+def test_capture_auto_resolves_one_host_for_bare_id() -> None:
+    original_readers = capture.readers.READERS
+
+    class Reader:
+        def __init__(self, host: str, path: Path | None):
+            self.HOST = host
+            self.path = path
+
+        def locate(self, _ref):
+            return ((self.path, "") if self.path else
+                    (None, f"no {self.HOST} match"))
+
+    expected = Path("/sessions/codex.jsonl")
+    try:
+        capture.readers.READERS = {
+            "claude": Reader("claude", None),
+            "codex": Reader("codex", expected),
+            "cursor": Reader("cursor", None),
+        }
+        args = types.SimpleNamespace(host="auto", session="session-1")
+        reader, path, err = capture._resolve(args)
+        assert reader is capture.readers.READERS["codex"]
+        assert path == expected
+        assert err == ""
+    finally:
+        capture.readers.READERS = original_readers
+    print("PASS test_capture_auto_resolves_one_host_for_bare_id")
+
+
+def test_capture_auto_refuses_cross_host_id_and_latest() -> None:
+    original_readers = capture.readers.READERS
+
+    class Reader:
+        def __init__(self, host: str):
+            self.HOST = host
+
+        def locate(self, _ref):
+            return Path(f"/sessions/{self.HOST}.jsonl"), ""
+
+    try:
+        capture.readers.READERS = {
+            "claude": Reader("claude"),
+            "codex": Reader("codex"),
+            "cursor": Reader("cursor"),
+        }
+        args = types.SimpleNamespace(host="auto", session="session-1")
+        reader, path, err = capture._resolve(args)
+        assert reader is None and path is None
+        assert "multiple hosts (claude, codex, cursor)" in err
+
+        args.session = "latest"
+        reader, path, err = capture._resolve(args)
+        assert reader is None and path is None
+        assert "'latest' is ambiguous across hosts" in err
+    finally:
+        capture.readers.READERS = original_readers
+    print("PASS test_capture_auto_refuses_cross_host_id_and_latest")
+
+
+def test_capture_auto_reports_missing_bare_id() -> None:
+    original_readers = capture.readers.READERS
+
+    class Reader:
+        def __init__(self, host: str):
+            self.HOST = host
+
+        def locate(self, _ref):
+            return None, f"no {self.HOST} match"
+
+    try:
+        capture.readers.READERS = {
+            host: Reader(host) for host in ("claude", "codex", "cursor")
+        }
+        args = types.SimpleNamespace(host="auto", session="missing-session")
+        reader, path, err = capture._resolve(args)
+        assert reader is None and path is None
+        assert "cannot find session 'missing-session'" in err
+    finally:
+        capture.readers.READERS = original_readers
+    print("PASS test_capture_auto_reports_missing_bare_id")
+
+
+def test_capture_auto_preserves_within_host_ambiguity() -> None:
+    original_readers = capture.readers.READERS
+
+    class Reader:
+        def __init__(self, host: str, result):
+            self.HOST = host
+            self.result = result
+
+        def locate(self, _ref):
+            return self.result
+
+    try:
+        capture.readers.READERS = {
+            "claude": Reader("claude", (
+                None, "ambiguous session id 'shared': 2 matches — pass the path")),
+            "codex": Reader("codex", (Path("/sessions/codex.jsonl"), "")),
+            "cursor": Reader("cursor", (None, "no cursor match")),
+        }
+        args = types.SimpleNamespace(host="auto", session="shared")
+        reader, path, err = capture._resolve(args)
+        assert reader is None and path is None
+        assert "claude: ambiguous session id" in err
+        assert "pass the session path" in err
+    finally:
+        capture.readers.READERS = original_readers
+    print("PASS test_capture_auto_preserves_within_host_ambiguity")
+
+
+def test_packaged_import_skill_uses_unified_capture() -> None:
+    skill = (ROOT / "plugins" / "memhub" / "skills" / "import-session" /
+             "SKILL.md").read_text(encoding="utf-8")
+    assert "scripts/capture.py" in skill
+    assert "--host auto" in skill
+    assert "scripts/import_session.py" not in skill
+    assert "Claude Code, Codex, or Cursor" in skill
+    print("PASS test_packaged_import_skill_uses_unified_capture")
 
 
 def test_import_namespace_probe_hardens_transcript_cwd() -> None:
@@ -132,5 +254,10 @@ def test_import_namespace_probe_hardens_transcript_cwd() -> None:
 if __name__ == "__main__":
     test_import_request_uses_requested_platform()
     test_capture_passes_reader_host_to_import_session()
+    test_capture_auto_resolves_one_host_for_bare_id()
+    test_capture_auto_refuses_cross_host_id_and_latest()
+    test_capture_auto_reports_missing_bare_id()
+    test_capture_auto_preserves_within_host_ambiguity()
+    test_packaged_import_skill_uses_unified_capture()
     test_import_namespace_probe_hardens_transcript_cwd()
     print("ALL PASS")
