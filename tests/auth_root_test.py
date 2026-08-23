@@ -11,7 +11,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "memhub"
-STAGING = ROOT / "plugins" / "memhub-staging"
 sys.path.insert(0, str(PLUGIN / "scripts"))
 
 import _memhub_auth as auth  # noqa: E402
@@ -40,6 +39,27 @@ def roots(claude: str | None, cursor: str | None = None):
                 os.environ[name] = value
 
 
+@contextmanager
+def staging_root():
+    """Build staging identity without depending on Git symlink checkout."""
+    with tempfile.TemporaryDirectory() as td:
+        staging = Path(td) / "memhub-staging"
+        staging.mkdir()
+        scripts = staging / "scripts"
+        try:
+            scripts.symlink_to(PLUGIN / "scripts", target_is_directory=True)
+        except OSError:
+            # Windows can disable directory symlinks per machine/repository.
+            # A hard link exercises the same Path.samefile identity contract.
+            scripts.mkdir()
+            os.link(Path(auth.__file__), scripts / Path(auth.__file__).name)
+        (staging / ".mcp.json").write_text(json.dumps({
+            "mcpServers": {"memhub-staging": {"url": STAGING_URL}}
+        }), encoding="utf-8")
+        assert (scripts / Path(auth.__file__).name).samefile(auth.__file__)
+        yield staging
+
+
 def test_matching_claude_root_is_preserved():
     with roots(str(PLUGIN)):
         assert auth._plugin_root() == PLUGIN
@@ -47,11 +67,12 @@ def test_matching_claude_root_is_preserved():
     print("PASS test_matching_claude_root_is_preserved")
 
 
-def test_staging_symlink_keeps_staging_identity():
-    with roots(str(STAGING)):
-        assert auth._plugin_root() == STAGING
-        assert auth.default_url() == STAGING_URL
-    print("PASS test_staging_symlink_keeps_staging_identity")
+def test_staging_file_identity_keeps_staging_backend():
+    with staging_root() as staging:
+        with roots(str(staging)):
+            assert auth._plugin_root() == staging
+            assert auth.default_url() == STAGING_URL
+    print("PASS test_staging_file_identity_keeps_staging_backend")
 
 
 def test_cursor_unrelated_root_is_rejected():
