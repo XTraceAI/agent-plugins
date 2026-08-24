@@ -41,6 +41,7 @@ MANIFESTS = {
 AP_SCHEMA_PREFIX = "https://agent-plugins.org/schemas/"
 MCP_AP = MEMHUB / "mcp.json"          # Agent Plugins format (Codex, Cursor, …)
 MCP_CLAUDE = MEMHUB / ".mcp.json"     # Claude Code format (carries oauth)
+MCP_STAGING = ROOT / "plugins" / "memhub-staging" / ".mcp.json"
 
 
 def _load(path: Path) -> dict | None:
@@ -71,7 +72,9 @@ def main() -> int:
     ap_root = _load(MEMHUB / "plugin.json")
     ap_mcp = _load(MCP_AP)
     claude_mcp = _load(MCP_CLAUDE)
-    if ap_root is None or ap_mcp is None or claude_mcp is None:
+    staging_mcp = _load(MCP_STAGING)
+    if (ap_root is None or ap_mcp is None or claude_mcp is None
+            or staging_mcp is None):
         return 1
 
     failures = 0
@@ -82,6 +85,19 @@ def main() -> int:
             failures += 1
     if not failures:
         print("ok  AP manifests carry the agent-plugins.org $schema")
+
+    for label, config in (("production", claude_mcp),
+                          ("staging", staging_mcp)):
+        server = config.get("mcpServers", {}).get("memhub", {})
+        cursor_client = server.get("auth", {}).get("CLIENT_ID")
+        capture_client = server.get("oauth", {}).get("clientId")
+        if not cursor_client or cursor_client != capture_client:
+            print(f"FAIL {label} MCP OAuth clients disagree: "
+                  f"auth.CLIENT_ID={cursor_client!r}, "
+                  f"oauth.clientId={capture_client!r}")
+            failures += 1
+        else:
+            print(f"ok  {label} keeps Cursor auth and capture OAuth aligned")
 
     def server_url(cfg: dict) -> str | None:
         server = cfg.get("mcpServers", {}).get("memhub", {})
