@@ -7,10 +7,19 @@ allowed-tools: Bash, Read, AskUserQuestion
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. If unset, export it
 first — it is the ancestor directory of this skill file containing `.claude-plugin/`.
 
-You are creating a **Rulebook rule**: a deterministic matcher that fires inside
-teammates' agent sessions at the moment a rule is about to be violated. Rules are
-data, not prose in a doc — and a rule that was never backtested is a false-fire
-generator (the pilot measured ~60% organic false-fire from unhardened matchers).
+You are creating a **Rulebook rule**: a **human-authored lesson** stored in
+MemHub's directive substrate, so it is immediately shareable, portable, and
+served by the same `recall_directives` pipeline that serves auto-learned
+lessons — same triggers, same brains, same lanes, but human provenance and
+human trust. Rules are data, not prose in a doc — and a rule that was never
+backtested is a false-fire generator (the pilot measured ~60% organic
+false-fire from unhardened matchers).
+
+The precision model differs from a regex engine: the **trigger is the
+tripwire** (broad is OK — it decides what reaches the gate) and the **LLM
+applicability gate** downstream provides precision. The backtest measures
+tripwire volume; the content carries the nuance the gate applies (e.g. "the
+with-lease form on your own branch is sanctioned").
 
 Arguments: `$ARGUMENTS`
 - `--brain "<name>"` (optional) → the destination brain. Until server authoring
@@ -70,6 +79,16 @@ Plus on every rule: `id` (kebab), `text` (≤160 chars, the advisory line),
 
 ### 4. Backtest — the arming gate
 
+Directive rules: backtest the **triggers** (offline approximation: substring
+replay over past commands, paths, and edited content):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_backtest.py" \
+  --triggers "git push,--force" --days 30 --exclude-session "<current session id>"
+```
+
+Compiled-tier rules (deterministic matchers): backtest the matcher itself:
+
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_backtest.py" \
   --rule '<the candidate JSON>' --days 30 --exclude-session "<current session id>"
@@ -85,28 +104,45 @@ the borderline excerpts. Iterate the matcher until the excerpts are clean:
   (consumer-contract edits, force-push), but state "zero-fire in the window"
   out loud so the user decides with that fact.
 
-### 5. Confirm, then file
+### 5. Confirm, then file — as a human-authored lesson
 
-Show the user: the final rule JSON, the backtest verdict (`N sessions hit /
-M scanned, X judged TP, Y FP`), and where it will fire. On approval:
+Show the user: the rule sentence, the triggers, and the backtest verdict
+(`N sessions hit / M scanned, judged TP/FP`). On approval, the **primary write
+is the MemHub directive** — call the `add_directive` MCP tool:
+
+- `content`: prefix with `RULE (human-authored, team convention):`, then the
+  full sentence including the nuance the LLM gate needs (sanctioned forms,
+  exemptions — they live in prose here, not in `not_rx`).
+- `triggers`: the concrete identifiers, **including flag-shaped and
+  phrase-shaped ones** (`--force`, `git push`) — these are what the backtest
+  validated.
+- `fact_type`: `"lesson"` (or `"procedure"` with `steps` for a recipe).
+- `scope`: the repo (from `--brain`, e.g. `Repo: XTraceAI/xmem` → `xmem`).
+
+Known limits, say them out loud: authoring is **personal-partition only** for
+now (shared-brain authoring needs the backend's review gate — the rule reaches
+teammates once that lands, or via brain-level import); and serve-side entity
+extraction currently misses flag/phrase-shaped triggers from raw commands, so
+the fire is reliable via explicit `entities` until the plugin's recall payload
+carries them.
+
+**Optional compiled tier**: only for a rule whose ledger later proves it and
+whose shape is exactly checkable, ALSO compile it to a deterministic matcher in
+the local rulebook (the enforcement ladder's gate-candidate cache):
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_add.py" --rule '<final JSON>'
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_add.py" --rule '<compiled JSON>'
 ```
 
-Include provenance fields on the rule: `brain` (from `--brain`), `source_ref`
-(e.g. `xmem/CLAUDE.md § <section>` or `user correction, session <id>`), and
-`backtest` (`{"days": 30, "sessions_scanned": N, "session_hits": M,
-"judged_tp": X, "judged_fp": Y}`).
-
-The add script refuses duplicates, validates every regex, backs up the
-rulebook, and writes atomically. **New rules always land advisory** — the hook
-never blocks; promotion to a gating tier is a separate, admin-only,
-evidence-gated decision that this skill never makes.
+Include provenance either way: `source_ref` (e.g. `xmem/CLAUDE.md § <section>`
+or `user correction, session <id>`) and the backtest verdict. **New rules
+always land advisory** — promotion to any gating tier is a separate,
+admin-only, evidence-gated decision this skill never makes.
 
 ### 6. Report
 
-Tell the user: the rule is live immediately (the hook re-reads the rulebook on
-every tool call), which sessions it would have fired in, and that its real
-fires will accrue in `~/.claude/scripts/rulebook/ledger/fires.jsonl` — the
-evidence that later decides promote / demote / retire.
+Tell the user: the rule is live immediately (`recall_directives` serves it on
+the next matching action; a compiled copy fires via the local hook with zero
+latency), which sessions it would have fired in, and where its evidence will
+accrue (the serving ledger server-side; `ledger/fires.jsonl` for compiled
+rules) — the evidence that later decides promote / demote / retire.

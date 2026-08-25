@@ -79,13 +79,25 @@ def main():
     g.add_argument("--rule")
     g.add_argument("--rule-file")
     g.add_argument("--id")
+    g.add_argument("--triggers", help="comma-separated trigger identifiers "
+                   "(directive mode): replayed as case-insensitive substring "
+                   "matches over commands, paths, and edited content — the "
+                   "honest offline approximation of entity-trigger firing")
     ap.add_argument("--projects", default=os.path.expanduser("~/.claude/projects"))
     ap.add_argument("--days", type=float, default=30)
     ap.add_argument("--max-excerpts", type=int, default=15)
     ap.add_argument("--exclude-session", default="")
     args = ap.parse_args()
 
-    rule = load_rule(args)
+    if args.triggers:
+        trigs = [t.strip() for t in args.triggers.split(",") if t.strip()]
+        rule = {"id": "directive-triggers", "on": "bash",
+                "rx": "|".join(re.escape(t) for t in trigs),
+                "match_heredoc_body": False,
+                "fire_scope": "session", "repo_scope": "any",
+                "_directive_mode": True}
+    else:
+        rule = load_rule(args)
     on = rule.get("on")
     if on not in ("bash", "edit"):
         sys.exit(f"backtest supports on=bash|edit for now (got {on!r}); "
@@ -146,6 +158,12 @@ def main():
                         scanned_calls += 1
                         hit = match_bash(rule, cmd)
                         excerpt = cmd
+                    elif rule.get("_directive_mode") and tool in ("Edit", "Write", "MultiEdit"):
+                        fp = str(inp.get("file_path", ""))
+                        body = str(inp.get("new_string", "")) + str(inp.get("content", ""))
+                        scanned_calls += 1
+                        hit = bool(re.search(rule["rx"], fp + "\n" + body, re.I))
+                        excerpt = fp
                     elif on == "edit" and tool in ("Edit", "Write", "MultiEdit"):
                         fp = str(inp.get("file_path", ""))
                         body = str(inp.get("new_string", "")) + str(inp.get("content", ""))
