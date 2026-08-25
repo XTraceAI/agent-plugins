@@ -28,6 +28,7 @@ REQUIRED_BY_ON = {
     "bash": ["rx"],
     "edit": ["path_rx"],
     "result": ["rx"],
+    "session": [],   # posture rule: served at SessionStart, no matcher
 }
 OPTIONAL_RX = ["not_rx", "path_rx", "path_not_rx", "content_rx", "cmd_rx", "exclude_rx", "rx"]
 KNOWN_SCOPES = ("call", "session", "branch")
@@ -47,7 +48,7 @@ def validate(rule, existing):
         fail(f"id '{rule['id']}' already exists in the rulebook")
     on = rule["on"]
     if on not in REQUIRED_BY_ON:
-        fail(f"on='{on}' — the hook evaluates bash | edit | result "
+        fail(f"on='{on}' — the hook evaluates bash | edit | result | session "
              "(write_stdlib is bespoke; edit it by hand)")
     for field in REQUIRED_BY_ON[on]:
         if not rule.get(field):

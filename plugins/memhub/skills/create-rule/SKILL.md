@@ -45,6 +45,7 @@ The hook (`~/.claude/scripts/rulebook/rulebook_hook.py`) evaluates these shapes:
 | `bash` | a Bash command matches `rx` | `rx` | `not_rx`, `match_heredoc_body` |
 | `edit` | an Edit/Write path matches `path_rx` | `path_rx` | `path_not_rx`, `content_rx` (against the new content) |
 | `result` | a tool RESULT matches `rx` (PostToolUse) | `rx` | `cmd_rx`, `exclude_rx` |
+| `session` | SessionStart — a POSTURE rule: worldview served as context, no matcher, never enforced | — | — |
 
 Plus on every rule: `id` (kebab), `text` (≤160 chars, the advisory line),
 `why` (one sentence, shown in parentheses), `fire_scope`
@@ -61,6 +62,11 @@ Plus on every rule: `id` (kebab), `text` (≤160 chars, the advisory line),
   `call` is for rules where each occurrence matters (e.g. force-push).
 - `result` rules cannot be backtested from transcripts (results aren't replayed)
   — they arm from live advisory data instead; say so.
+- `session` (posture) rules skip the backtest — there is nothing to match. They
+  ride the context window every session, so hold a hard budget: at most 3 per
+  repo scope, and only for worldview a matcher cannot express. Session start is
+  the weakest attention slot (measured 4% vs 88% in-flight) — anything with a
+  checkable shape belongs in a `bash`/`edit`/`result` rule instead.
 
 ### 4. Backtest — the arming gate
 
