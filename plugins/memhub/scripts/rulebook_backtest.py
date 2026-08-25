@@ -33,12 +33,12 @@ RULEBOOK = os.path.expanduser("~/.claude/scripts/rulebook/rulebook.json")
 
 def load_rule(args):
     if args.id:
-        with open(RULEBOOK) as f:
+        with open(RULEBOOK, encoding="utf-8") as f:
             for r in json.load(f)["rules"]:
                 if r["id"] == args.id:
                     return r
         sys.exit(f"no rule '{args.id}' in {RULEBOOK}")
-    raw = args.rule or open(args.rule_file).read()
+    raw = args.rule or open(args.rule_file, encoding="utf-8").read()
     return json.loads(raw)
 
 

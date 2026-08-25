@@ -82,7 +82,7 @@ def main():
     except ValueError as e:
         fail(f"rule is not valid JSON: {e}")
 
-    with open(args.rulebook) as f:
+    with open(args.rulebook, encoding="utf-8") as f:
         book = json.load(f)
     validate(rule, book["rules"])
     rule.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -95,7 +95,7 @@ def main():
     shutil.copy2(args.rulebook, backup)
     book["rules"].append(rule)
     tmp = args.rulebook + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(book, f, indent=1)
         f.write("\n")
     os.replace(tmp, args.rulebook)
