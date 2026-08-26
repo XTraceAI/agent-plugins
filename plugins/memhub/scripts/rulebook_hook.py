@@ -332,6 +332,26 @@ _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 
 
+_RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
+            "content_rx", "content_not_rx", "exclude_rx", "converted_rx")
+_RX_MAX = 400
+_RX_NESTED = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*{]|\(\.\*\)|(\.\*){2,}")   # (a+)+, (.*), .*.*
+
+
+def rx_ok(pat):
+    """Load-time lint for a pattern that came off the wire (§5.1 fallback):
+    must compile, stay short, and avoid the nested-quantifier shapes that
+    backtrack catastrophically. A rejected pattern drops the RULE, never the
+    hook — a server book can advise, it cannot stall a tool call."""
+    if not isinstance(pat, str) or len(pat) > _RX_MAX or _RX_NESTED.search(pat):
+        return False
+    try:
+        re.compile(pat)
+    except re.error:
+        return False
+    return True
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. Never raises
@@ -349,13 +369,16 @@ def to_hook_rule(row):
              "mode": row.get("mode", "advise"), "_version": row.get("version")}
         if not r["id"]:
             return None
-        scopes = row.get("scope_repos") or []
-        r["repo_scope"] = scopes[0] if len(scopes) == 1 else "any"
-        if len(scopes) > 1:
-            r["_scope_repos"] = list(scopes)
+        scopes = [str(x) for x in (row.get("scope_repos") or []) if x]
+        r["repo_scope"] = "any"
+        if scopes:
+            r["_scope_repos"] = scopes
         if isinstance(row.get("ordering"), dict):
+            o = row["ordering"]
+            if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
+                return None
             r["on"] = "ordering"
-            r["ordering"] = row["ordering"]
+            r["ordering"] = o
             return r
         m = row.get("matcher")
         if not isinstance(m, dict):
@@ -367,6 +390,8 @@ def to_hook_rule(row):
                 continue
             r[keys.get(k, k)] = v
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
+        if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
+            return None
         return r
     except Exception:
         return None
@@ -412,8 +437,9 @@ def effective_mode(rule, fetched_at, now=None):
 
 def scope_ok(rule, repo, gitdir):
     scope = rule.get("repo_scope", "any")
-    if rule.get("_scope_repos"):
-        return any(s in repo or (gitdir and f"/{s}/" in gitdir) for s in rule["_scope_repos"])
+    if rule.get("_scope_repos"):        # server list: exact basename / path segment, never substring
+        segs = set(gitdir.split("/")) if gitdir else set()
+        return any(s == repo or s in segs for s in rule["_scope_repos"])
     if scope == "any":
         return True
     return scope in repo or (gitdir and f"/{scope}/" in gitdir)
@@ -474,9 +500,10 @@ def wire_row(row):
     return {k: row.get(k) for k in WIRE_KEYS}
 
 
-def _read_rows(path, start=0):
+def _read_rows(path, start=0, offsets=None):
     """Complete JSON lines from byte `start`; returns (rows, end_offset) where
-    end_offset stops before any partial trailing line."""
+    end_offset stops before any partial trailing line. `offsets`, if given,
+    receives each row's end offset so a caller can watermark per row."""
     rows, end = [], start
     try:
         if start > os.path.getsize(path):    # ledger rewritten/rotated: restart, never strand
@@ -491,6 +518,8 @@ def _read_rows(path, start=0):
                     rows.append(json.loads(line.decode("utf-8")))
                 except Exception:
                     continue
+                if offsets is not None:
+                    offsets.append(end)
     except FileNotFoundError:
         pass
     return rows, end
@@ -515,13 +544,16 @@ def pending_batches(sent):
     """Rows to POST = fires past the watermark ∪ fires named by conversions past
     THEIR watermark (each re-sent with converted/converted_at merged — the
     ingest is an upsert on fire_id, so a re-send is an update, never a dup).
-    Returns (batches, new_sent). The same fire_id is reused on every retry:
-    rows come from the ledger, nothing is minted here. Reads past the
-    watermark first (a seek, cheap on every Stop) and only indexes the whole
-    ledger when there is something to send."""
+    Returns (batches, new_sent): each batch is (rows, sent_after_it) so a
+    multi-batch flush advances the watermark per accepted batch and a poison
+    batch never makes earlier ones re-send forever. The same fire_id is
+    reused on every retry: rows come from the ledger, nothing is minted here.
+    Reads past the watermark first (a seek, cheap on every Stop) and only
+    indexes the whole ledger when there is something to send."""
     ldir = _ledger_dir()
     fpath, cpath = os.path.join(ldir, "fires.jsonl"), os.path.join(ldir, "conversions.jsonl")
-    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0))
+    f_offsets = []
+    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets)
     new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0))
     new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
     if not new_fires and not new_convs:
@@ -533,15 +565,27 @@ def pending_batches(sent):
         if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
             by_id[c["fire_id"]]["converted"] = True
             by_id[c["fire_id"]]["converted_at"] = c.get("converted_at")
-    ids = [r["fire_id"] for r in new_fires if isinstance(r, dict) and r.get("fire_id")]
-    seen = set(ids)
+    # (row, fires_offset once this row is accepted); conversion re-sends carry
+    # no fires progress of their own, so they inherit the last fire's offset.
+    items, seen = [], set()
+    for r, off in zip(new_fires, f_offsets):
+        if isinstance(r, dict) and r.get("fire_id") and r["fire_id"] not in seen:
+            items.append((wire_row(by_id.get(r["fire_id"], r)), off))
+            seen.add(r["fire_id"])
     for c in new_convs:
         fid = c.get("fire_id") if isinstance(c, dict) else None
         if fid in by_id and fid not in seen:
-            ids.append(fid)
+            items.append((wire_row(by_id[fid]), None))
             seen.add(fid)
-    rows = [wire_row(by_id[i]) for i in ids if i in by_id]
-    batches = [rows[i:i + FLUSH_BATCH] for i in range(0, len(rows), FLUSH_BATCH)]
+    batches = []
+    fo = sent.get("fires_offset", 0) if f_offsets or new_fires else f_end
+    for i in range(0, len(items), FLUSH_BATCH):
+        chunk = items[i:i + FLUSH_BATCH]
+        fo = max([fo] + [o for _, o in chunk if o is not None])
+        last = i + FLUSH_BATCH >= len(items)
+        batches.append(([r for r, _ in chunk],
+                        dict(sent, fires_offset=f_end if last else fo,
+                             conversions_offset=c_end if last else sent.get("conversions_offset", 0))))
     return batches, new_sent
 
 
@@ -571,7 +615,7 @@ def flush_fires(final=False):
     try:
         sent = load_sent()
         batches, new_sent = pending_batches(sent)
-        n = sum(len(b) for b in batches)
+        n = sum(len(b) for b, _ in batches)
         if not n:
             return
         if not final:
@@ -587,19 +631,19 @@ def flush_fires(final=False):
             return
         base, bearer, http = api
         accepted = 0
-        for batch in batches:
+        for batch, after in batches:
             reply = http.rest(f"{base}{API_PATH}/fires", bearer, "POST",
                               body={"fires": batch}, timeout=FLUSH_TIMEOUT_S)
             if reply.status not in (200, 201, 202):
-                return                    # watermark untouched → retried next flush
+                return                    # watermark stays at the last accepted batch
             data = reply.data if isinstance(reply.data, dict) else {}
             if not isinstance(data.get("accepted"), int):
                 return                    # not the §4.3 reply → do not trust it as a receipt
             accepted += data["accepted"]
             _log_rejected(data.get("rejected"))
-        new_sent["last_flush_at"] = _now()
-        new_sent["last_accepted"] = accepted
-        _atomic_json(_sent_path(), new_sent)
+            after["last_flush_at"] = _now()
+            after["last_accepted"] = accepted
+            _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()

@@ -331,8 +331,10 @@ def main():
         check("flush: throttle releases after FLUSH_EVERY_S", len(fake.posts()) == n_posts + 1)
 
         # ── gate freshness (§5.3) ───────────────────────────────────────
-        sys.path.insert(0, os.path.dirname(HOOK))
+        os.environ.update(env)          # BEFORE import: BASE is read at module load —
+        sys.path.insert(0, os.path.dirname(HOOK))   # never point H at the real ledger
         import rulebook_hook as H  # noqa: E402
+        check("in-process hook is relocated to the temp dir (never the real ledger)", H.BASE == td)
         now = datetime.now(timezone.utc)
         gate = {"mode": "gate"}
         rr = H.to_hook_rule({"rule_id": "x", "statement": "s", "matcher": {"event": "result", "command_rx": "pytest",
@@ -346,6 +348,36 @@ def main():
         check("load_sent: non-dict .sent falls back to a fresh watermark", H.load_sent()["fires_offset"] == 0)
         with open(sent_p, "w", encoding="utf-8") as f:
             json.dump(st, f)
+        bad_rx = H.to_hook_rule({"rule_id": "evil", "statement": "s", "matcher": {"event": "bash", "command_rx": "(a+)+$"}})
+        bad_ord = H.to_hook_rule({"rule_id": "evil2", "statement": "s", "ordering": {"required_command_rx": "(", "gated_command_rx": "x"}})
+        good = H.to_hook_rule({"rule_id": "fine", "statement": "s", "matcher": {"event": "bash", "command_rx": r"git\s+push"}})
+        check("to_hook_rule: a wire regex that nests quantifiers or fails to compile drops the rule, not the hook",
+              bad_rx is None and bad_ord is None and good is not None)
+        scoped = H.to_hook_rule({"rule_id": "sc", "statement": "s", "scope_repos": ["app"], "matcher": {"event": "bash", "command_rx": "x"}})
+        check("scope_ok: server scope_repos match the repo exactly, never by substring",
+              H.scope_ok(scoped, "app", "/w/app/.git") and not H.scope_ok(scoped, "apple", "/w/apple/.git")
+              and H.scope_ok(scoped, "wt", "/w/app/.git/worktrees/wt"))
+        # per-batch watermark: batch 1 accepted, batch 2 fails → batch 1 is not re-sent
+        H.FLUSH_BATCH = 2
+        with open(ledger, "a", encoding="utf-8") as f:
+            for i in range(5):
+                f.write(json.dumps({"fire_id": f"pb-{i}", "rule_id": "srv-bash", "fired_at": "t"}) + "\n")
+        calls = {"n": 0}
+        class _R:
+            def __init__(self, ok): self.status = 202 if ok else 500; self.data = {"accepted": 2, "rejected": 0} if ok else None
+        class _Http:
+            @staticmethod
+            def rest(url, bearer, method, body=None, headers=None, timeout=None):
+                calls["n"] += 1
+                return _R(calls["n"] != 2)
+        H._api = lambda: ("http://x", "t", _Http)
+        H.flush_fires(final=True)
+        after1 = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
+        H.flush_fires(final=True)
+        after2 = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
+        check("flush: per-batch watermark — an accepted batch is never re-sent after a later batch fails",
+              after1 < after2 == os.path.getsize(ledger) and calls["n"] == 4, f"{after1} {after2} {calls}")
+        H.FLUSH_BATCH = 200
         check("effective_mode: fresh cache honours gate",
               H.effective_mode(gate, (now - timedelta(hours=1)).isoformat(), now) == "gate")
         check("effective_mode: >24h cache degrades gate to advise",
