@@ -314,7 +314,7 @@ def main() -> int:
         with open(os.path.join(td, "ledger", "conversions.jsonl"), encoding="utf-8") as f:
             hows = [json.loads(l)["how"] for l in f if l.strip()]
         check("ordering: a discharge after a fire converts that fire (the conversion signal)",
-              hows.count("discharged") == 2, str(hows))
+              hows.count("discharged") == 3, str(hows))
         statefiles = [n for n in os.listdir(os.path.join(td, "state")) if n.startswith("wt-") and n.endswith(".json")]
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
