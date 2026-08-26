@@ -359,6 +359,18 @@ def rx_ok(pat):
 
 
 _TEXT_MAX = 400
+STALL_QUARANTINE_AFTER = 3   # identical short-counted batch this many times → quarantine it
+
+
+def _version_of(v):
+    """A rule version is an int or a short string; anything else is unknown."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and 0 < len(v) <= 40:
+        return v
+    return None
 
 
 def _clean_text(v):
@@ -383,7 +395,7 @@ def to_hook_rule(row):
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
-             "mode": row.get("mode", "advise"), "_version": row.get("version")}
+             "mode": row.get("mode", "advise"), "_version": _version_of(row.get("version"))}
         if not r["id"]:
             return None
         scopes = [str(x) for x in (row.get("scope_repos") or []) if x]
@@ -576,11 +588,29 @@ def pending_batches(sent):
     new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
     if not new_fires and not new_convs:
         return [], new_sent
-    # New fires carry their own rows; only a NEW conversion can name a fire
-    # behind the watermark, so the full ledger is indexed only in that case.
-    all_rows = _read_rows(fpath, 0)[0] if new_convs else new_fires
+    # New fires carry their own rows. A NEW conversion may name a fire behind
+    # the watermark; only THOSE ids are looked up, streaming the ledger without
+    # holding it (bounded by the number of new conversions, not by history).
+    by_id = {r["fire_id"]: r for r in new_fires if isinstance(r, dict) and r.get("fire_id")}
+    wanted = {c.get("fire_id") for c in new_convs if isinstance(c, dict)} - set(by_id)
+    if wanted:
+        try:
+            with open(fpath, "rb") as f:
+                for line in f:
+                    if not line.endswith(b"\n"):
+                        break
+                    try:
+                        r = json.loads(line.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(r, dict) and r.get("fire_id") in wanted:
+                        by_id[r["fire_id"]] = r
+                        wanted.discard(r["fire_id"])
+                        if not wanted:
+                            break
+        except FileNotFoundError:
+            pass
     convs, _ = _read_rows(cpath, 0)
-    by_id = {r["fire_id"]: r for r in all_rows if isinstance(r, dict) and r.get("fire_id")}
     for c in convs:                     # merge EVERY conversion, sent or not
         if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
             by_id[c["fire_id"]]["converted"] = True
@@ -671,9 +701,25 @@ def flush_fires(final=False):
             rej = data.get("rejected")
             n_rej = len(rej) if isinstance(rej, list) else (rej if isinstance(rej, int) else 0)
             if data["accepted"] + n_rej < len(batch):
-                return                    # server accounted for fewer rows than sent → retry
+                # Short-counted: retry — but not forever. The same batch (same
+                # first fire_id) short-counting STALL_QUARANTINE_AFTER times in
+                # a row is a poison batch: log it as rejected and move past it,
+                # so one bad row can never strand every fire behind it.
+                key = batch[0].get("fire_id")
+                stall = sent.get("stall") or {}
+                n = (stall.get("n", 0) + 1) if stall.get("key") == key else 1
+                if n < STALL_QUARANTINE_AFTER:
+                    cur = load_sent()
+                    cur["stall"] = {"key": key, "n": n}
+                    _atomic_json(_sent_path(), cur)
+                    return
+                _log_rejected([{"fire_id": r.get("fire_id"), "reason": "quarantined: short-counted "
+                                f"{n}x (accepted {data['accepted']}, rejected {n_rej} of {len(batch)})"}
+                               for r in batch], batch)
+            else:
+                _log_rejected(rej, batch)
             accepted += data["accepted"]
-            _log_rejected(rej, batch)
+            after.pop("stall", None)
             after["last_flush_at"] = _now()
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress

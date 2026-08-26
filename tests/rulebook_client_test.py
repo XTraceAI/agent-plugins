@@ -371,6 +371,23 @@ def main():
         rej = jl(os.path.join(td, "ledger", "rejected.jsonl"))
         check("flush: a bare rejected COUNT is logged with the batch's fire_ids",
               rej[-1].get("rejected_count") == 1 and len(rej[-1].get("batch_fire_ids", [])) >= 2, str(rej[-1:]))
+        check("to_hook_rule: server version must be an int or short string",
+              H._version_of(3) == 3 and H._version_of("pilot-5") == "pilot-5"
+              and H._version_of({"a": 1}) is None and H._version_of("x" * 41) is None and H._version_of(True) is None)
+        # poison batch: short-counted 3x in a row → quarantined into rejected.jsonl, watermark moves on
+        fake.post_reply = {"accepted": 0, "rejected": 0}
+        run("pre", dict(base, session_id="f8", tool_input={"command": "server-only-cmd"}), env)
+        before_off = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
+        for i in range(2):
+            run("flush", {"session_id": "f8"}, env, ("final",))
+        mid = json.load(open(sent_p, encoding="utf-8"))
+        run("flush", {"session_id": "f8"}, env, ("final",))
+        fin = json.load(open(sent_p, encoding="utf-8"))
+        fake.post_reply = {"accepted": None, "rejected": 0}
+        q = [r for r in jl(os.path.join(td, "ledger", "rejected.jsonl")) if "quarantined" in str(r.get("rejected", {}).get("reason", ""))]
+        check("flush: a poison batch is retried twice, then quarantined and the watermark advances",
+              mid["fires_offset"] == before_off and mid.get("stall", {}).get("n") == 2
+              and fin["fires_offset"] == os.path.getsize(ledger) and "stall" not in fin and q, str((mid, fin)))
         check("book_path: repos that sanitise alike get distinct books",
               H.book_path("my repo") != H.book_path("my_repo"))
         scoped = H.to_hook_rule({"rule_id": "sc", "statement": "s", "scope_repos": ["app"], "matcher": {"event": "bash", "command_rx": "x"}})
