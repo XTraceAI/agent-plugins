@@ -211,6 +211,7 @@ def main() -> int:
         check("shell_only: shell AFTER a heredoc terminator is kept (the 44% FN class)",
               "git push -u origin fm" in so(chained) and "fix: forbidden" not in so(chained))
         check("shell_only: unquoted and <<- delimiters", "secret" not in so("cat <<-EOF\nsecret\nEOF\nls"))
+        check("shell_only: a numeric bit-shift is not a heredoc", so("x=$((1 << 2))\ngit push") == "x=$((1 << 2))\ngit push")
         push = {"on": "bash", "rx": r"git\s+push"}
         check("evaluate: push after heredoc fires",
               H.evaluate(push, hook_phase="pre", tool="Bash", cmd=chained))
@@ -302,7 +303,13 @@ def main() -> int:
         with open(os.path.join(wt, ".git", "HEAD"), "w", encoding="utf-8") as f:
             f.write("ref: refs/heads/other\n")
         rc, out = run("pre", pushev, oenv)
-        check("ordering: state does not leak across branches", out.strip() == "")
+        check("ordering: obligation survives `git checkout -b` (keyed by worktree, not branch)",
+              "[audit-before-push]" in ctx(out))
+        run("post", dict(suite, tool_input={"command": "uv run pytest tests/architecture -q &"},
+                         tool_response={"stdout": "", "exit_code": 0}), oenv)
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: a BACKGROUNDED receipt does not discharge", "[audit-before-push]" in ctx(out))
+        run("post", dict(suite, tool_response={"stdout": "3 passed", "exit_code": 0}), oenv)
         oledger = os.path.join(td, "ledger", "fires.jsonl")
         with open(os.path.join(td, "ledger", "conversions.jsonl"), encoding="utf-8") as f:
             hows = [json.loads(l)["how"] for l in f if l.strip()]

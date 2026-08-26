@@ -56,7 +56,7 @@ LOCAL_PKGS = {"xmem", "evaluation", "tests", "app", "scripts"}
 
 
 # ── shell-only segment ──────────────────────────────────────────────────────
-_HD_OPEN = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+_HD_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")   # delimiter must be a word, so `x << 2` is a shift
 
 
 def shell_only(cmd):
@@ -132,7 +132,11 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
 
 # ── ordering engine: obligation state machine ───────────────────────────────
 class OrderingEngine:
-    """State file per worktree root; inside it {branch: {rule_id: {count, last_edit}}}.
+    """State file per worktree root; inside it {"*": {rule_id: {count, last_edit}}}.
+    Keyed by WORKTREE, not branch: a working tree carries uncommitted edits
+    across `git checkout -b`, so a branch-keyed obligation would vanish on a
+    branch switch before the push. Sibling branches share it (over-gates
+    slightly — the safe direction).
     Every read-modify-write holds an exclusive flock on a sidecar lock (bounded
     LOCK_WAIT_S; past that the hook fails open) and replaces the file atomically.
     An arm and a discharge from two sessions must never overwrite each other —
@@ -142,7 +146,7 @@ class OrderingEngine:
         os.makedirs(os.path.join(BASE, "state"), exist_ok=True)
         key = hashlib.sha1(worktree_root.encode("utf-8")).hexdigest()[:16]
         self.path = os.path.join(BASE, "state", f"wt-{key}.json")
-        self.branch = branch or "detached"
+        self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
         lock = open(self.path + ".lock", "a+", encoding="utf-8")
@@ -200,9 +204,10 @@ class OrderingEngine:
         # only when the receipt is the final segment and not piped (`pytest |
         # tail` returns tail's status). Earlier segments / pipelines never
         # discharge — under-counting is the safe direction.
+        last = last_segment(seg) if seg else ""
         is_receipt = hook_phase == "post" and tool == "Bash" and seg and \
-            re.search(spec["required_command_rx"], last_segment(seg)) and \
-            "|" not in last_segment(seg)
+            re.search(spec["required_command_rx"], last) and \
+            "|" not in last and not last.rstrip().endswith("&")   # piped / backgrounded: status isn't the suite's
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             re.search(spec["gated_command_rx"], seg)
         if not (is_edit or is_receipt or is_gate):
