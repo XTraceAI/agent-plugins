@@ -83,8 +83,14 @@ def main():
     except ValueError as e:
         fail(f"rule is not valid JSON: {e}")
 
-    with open(args.rulebook, encoding="utf-8") as f:
-        book = json.load(f)
+    try:
+        with open(args.rulebook, encoding="utf-8") as f:
+            book = json.load(f)
+        book["rules"]
+    except FileNotFoundError:
+        fail(f"no rulebook at {args.rulebook} — create it as {{\"version\": 1, \"rules\": []}} first")
+    except (ValueError, KeyError, TypeError) as e:
+        fail(f"rulebook at {args.rulebook} is not valid ({e}); fix it before adding rules")
     validate(rule, book["rules"])
     rule.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
 

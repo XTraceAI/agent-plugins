@@ -76,6 +76,8 @@ def main():
 
     if args.triggers:
         trigs = [t.strip() for t in args.triggers.split(",") if t.strip()]
+        if not trigs:
+            sys.exit("--triggers is empty: an empty alternation would match every command")
         rule = {"id": "directive-triggers", "on": "bash",
                 "rx": "|".join(re.escape(t) for t in trigs),
                 "match_heredoc_body": False,
@@ -110,7 +112,9 @@ def main():
 
     for p in sorted(files):
         session = os.path.basename(p)[:-6]
-        if args.exclude_session and session.startswith(args.exclude_session[:8]):
+        # match on the prefix the caller GAVE (a full uuid excludes exactly one
+        # session; a short one is the caller's choice) — never truncate to 8
+        if args.exclude_session and session.startswith(args.exclude_session):
             continue
         try:
             fh = open(p, encoding="utf-8", errors="replace")
