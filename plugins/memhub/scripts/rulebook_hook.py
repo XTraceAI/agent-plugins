@@ -259,7 +259,9 @@ def bash_ok(resp, *, strict=False):
     txt = result_text(resp)
     # text proxy, anchored to pytest/traceback vocabulary — a green run whose
     # output merely mentions "error:" must not be mistaken for red
-    return not re.search(r"(^|\n)(FAILED|ERROR) |\b\d+ failed\b|\nTraceback \(most recent call last\)", txt)
+    return not re.search(
+        r"(^|\n)(FAILED|ERROR)\b|\b\d+ (failed|errors?)\b|\nTraceback \(most recent call last\)"
+        r"|(^|\n)npm ERR!|(^|\n)error(\[E\d+\])?:", txt)
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -474,11 +476,13 @@ def main():
                 and re.search(crx, shell_only(cmd), re.I | re.M):
             log_conversion(fid, "converted_rx")
             del st["open"][rid]
+            st.get("open_file", {}).pop(rid, None)
         elif mode == "pre" and r.get("on") == "edit" and "content_rx" in r \
                 and tool in EDIT_TOOLS and fp == st.get("open_file", {}).get(rid) \
                 and not evaluate(r, hook_phase="pre", tool=tool, file_path=fp, body=body):
             log_conversion(fid, "re-edit-clears")
             del st["open"][rid]
+            st.get("open_file", {}).pop(rid, None)
 
     for r in rules:
         if r.get("on") == "session" or not scope_ok(r, repo, gitdir) \

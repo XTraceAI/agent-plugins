@@ -233,7 +233,10 @@ def main() -> int:
         check("bash_ok: exit_code wins; None is never ok; 'error:' in green output is ok",
               H.bash_ok({"exit_code": 0, "stdout": "3 failed earlier but fixed"}) and not H.bash_ok({"exit_code": 1})
               and not H.bash_ok(None) and H.bash_ok({"stdout": "warning: error: handled gracefully\n5 passed"})
-              and not H.bash_ok({"stdout": "== 2 failed, 3 passed =="}))
+              and not H.bash_ok({"stdout": "== 2 failed, 3 passed =="})
+              and not H.bash_ok({"stdout": "collected 0 items / 1 error"})
+              and not H.bash_ok({"stdout": "npm ERR! code ELIFECYCLE"})
+              and not H.bash_ok({"stdout": "error[E0308]: mismatched types"}))
         check("bash_ok strict: a gate-mode receipt needs an explicit exit_code (text cannot forge green)",
               not H.bash_ok({"stdout": "5 passed"}, strict=True) and H.bash_ok({"stdout": "5 passed", "exit_code": 0}, strict=True))
         check("last_segment: receipt only counts as the final unpiped segment",
