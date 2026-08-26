@@ -352,10 +352,11 @@ def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
         raise McpError(f"{method} {url}: reply was not JSON: {raw[:200]!r}") from exc
     # The REST API wraps in {"code": 0, "msg": "ok", "data": …}; a non-zero
     # code is a failure the transport reported as 2xx and must not read as one.
-    if isinstance(payload, dict) and "code" in payload and "data" in payload:
-        if payload.get("code") not in (0, None):
+    if isinstance(payload, dict) and "code" in payload:
+        if payload.get("code") not in (0, None):     # error envelope, with or without data
             raise McpError(f"{method} {url}: {payload.get('msg') or payload}", status)
-        payload = payload["data"]
+        if "data" in payload:
+            payload = payload["data"]
     return RestReply(status, etag, payload)
 
 

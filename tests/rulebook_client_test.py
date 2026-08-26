@@ -95,7 +95,7 @@ class Fake:
                     return self._send(500, {"detail": "boom"})
                 n = len(json.loads(body or "{}").get("fires", []))
                 rep = dict(fake.post_reply)
-                if rep.get("accepted") is None:
+                if "accepted" in rep and rep["accepted"] is None:
                     rep["accepted"] = n
                 self._send(202, rep)
 
@@ -306,6 +306,18 @@ def main():
         rej = jl(os.path.join(td, "ledger", "rejected.jsonl"))
         check("flush: rejected rows logged locally and not retried",
               len(rej) == 1 and rej[0]["rejected"]["fire_id"] == rej_id and len(fake.posts()) == n_posts)
+
+        # a 2xx that is not the §4.3 receipt (error envelope, no accepted) is not a success
+        run("pre", dict(base, session_id="f6", tool_input={"command": "server-only-cmd"}), env)
+        before_off = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
+        for bad in ({"code": 5, "msg": "forbidden"}, {"ok": True}):
+            fake.post_reply = dict(bad)
+            run("flush", {"session_id": "f6"}, env, ("final",))
+            check(f"flush: 2xx with {bad} leaves the watermark",
+                  json.load(open(sent_p, encoding="utf-8"))["fires_offset"] == before_off)
+        fake.post_reply = {"accepted": None, "rejected": 0}
+        run("flush", {"session_id": "f6"}, env, ("final",))
+        n_posts = len(fake.posts())
 
         # throttle: a non-final flush with few rows and a recent flush waits
         run("pre", dict(base, session_id="f5", tool_input={"command": "server-only-cmd"}), env)

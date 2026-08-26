@@ -593,7 +593,9 @@ def flush_fires(final=False):
             if reply.status not in (200, 201, 202):
                 return                    # watermark untouched → retried next flush
             data = reply.data if isinstance(reply.data, dict) else {}
-            accepted += int(data.get("accepted") or 0)
+            if not isinstance(data.get("accepted"), int):
+                return                    # not the §4.3 reply → do not trust it as a receipt
+            accepted += data["accepted"]
             _log_rejected(data.get("rejected"))
         new_sent["last_flush_at"] = _now()
         new_sent["last_accepted"] = accepted
