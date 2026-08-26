@@ -302,8 +302,11 @@ def load_local_rules():
 
 
 def book_path(repo):
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo)[:80] or "norepo"
-    return os.path.join(BOOK_DIR, f"{safe}.json")
+    """Readable name + a hash of the RAW name, so two repos that sanitise to
+    the same string ('my repo' / 'my_repo') never share a book."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo)[:60] or "norepo"
+    h = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(BOOK_DIR, f"{safe}-{h}.json")
 
 
 def load_book(repo):
@@ -335,7 +338,10 @@ _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
             "content_rx", "content_not_rx", "exclude_rx", "converted_rx")
 _RX_MAX = 400
-_RX_NESTED = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*{]|\(\.\*\)|(\.\*){2,}")   # (a+)+, (.*), .*.*
+# (a+)+, (\d+)+$, (a|a)+, (.*), .*.* — the classic backtracking shapes. A
+# denylist, not a proof: stdlib `re` has no timeout, and a bounded matcher
+# (worker + wall clock) is the Phase 2 answer named in §5.1.
+_RX_NESTED = re.compile(r"\([^()]*[+*|][^()]*\)\s*[+*{]|\(\.\*\)|(\.\*){2,}")
 
 
 def rx_ok(pat):
@@ -558,7 +564,9 @@ def pending_batches(sent):
     new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
     if not new_fires and not new_convs:
         return [], new_sent
-    all_rows, _ = _read_rows(fpath, 0)
+    # New fires carry their own rows; only a NEW conversion can name a fire
+    # behind the watermark, so the full ledger is indexed only in that case.
+    all_rows = _read_rows(fpath, 0)[0] if new_convs else new_fires
     convs, _ = _read_rows(cpath, 0)
     by_id = {r["fire_id"]: r for r in all_rows if isinstance(r, dict) and r.get("fire_id")}
     for c in convs:                     # merge EVERY conversion, sent or not
@@ -639,6 +647,10 @@ def flush_fires(final=False):
             data = reply.data if isinstance(reply.data, dict) else {}
             if not isinstance(data.get("accepted"), int):
                 return                    # not the §4.3 reply → do not trust it as a receipt
+            rej = data.get("rejected")
+            n_rej = len(rej) if isinstance(rej, list) else (rej if isinstance(rej, int) else 0)
+            if data["accepted"] + n_rej < len(batch):
+                return                    # server accounted for fewer rows than sent → retry
             accepted += data["accepted"]
             _log_rejected(data.get("rejected"))
             after["last_flush_at"] = _now()

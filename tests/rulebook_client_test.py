@@ -50,7 +50,7 @@ class Fake:
         self.mode = "ok"
         self.etag = '"v1"'
         self.rules = []
-        self.post_reply = {"accepted": 0, "rejected": 0}
+        self.post_reply = {"accepted": None, "rejected": 0}   # None → filled with the batch size
         self.requests = []
         fake = self
 
@@ -154,7 +154,8 @@ def main():
         env = {"MEMHUB_RULEBOOK": book, "MEMHUB_TOKEN": "tok-123",
                "MEMHUB_MCP_BASE_URL": f"http://127.0.0.1:{fake.port}",
                "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_TIMEOUT_S": "1"}
-        cache = os.path.join(td, "book", "xmem.json")
+        import hashlib
+        cache = os.path.join(td, "book", f"xmem-{hashlib.sha1(b'xmem').hexdigest()[:8]}.json")
         base = {"cwd": repo, "session_id": "s1", "tool_name": "Bash"}
 
         # ── fetch ───────────────────────────────────────────────────────
@@ -310,7 +311,7 @@ def main():
         # a 2xx that is not the §4.3 receipt (error envelope, no accepted) is not a success
         run("pre", dict(base, session_id="f6", tool_input={"command": "server-only-cmd"}), env)
         before_off = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
-        for bad in ({"code": 5, "msg": "forbidden"}, {"ok": True}):
+        for bad in ({"code": 5, "msg": "forbidden"}, {"ok": True}, {"accepted": 0, "rejected": 0}):
             fake.post_reply = dict(bad)
             run("flush", {"session_id": "f6"}, env, ("final",))
             check(f"flush: 2xx with {bad} leaves the watermark",
@@ -351,8 +352,11 @@ def main():
         bad_rx = H.to_hook_rule({"rule_id": "evil", "statement": "s", "matcher": {"event": "bash", "command_rx": "(a+)+$"}})
         bad_ord = H.to_hook_rule({"rule_id": "evil2", "statement": "s", "ordering": {"required_command_rx": "(", "gated_command_rx": "x"}})
         good = H.to_hook_rule({"rule_id": "fine", "statement": "s", "matcher": {"event": "bash", "command_rx": r"git\s+push"}})
+        alt = H.to_hook_rule({"rule_id": "evil3", "statement": "s", "matcher": {"event": "bash", "command_rx": "(a|aa)+$"}})
         check("to_hook_rule: a wire regex that nests quantifiers or fails to compile drops the rule, not the hook",
-              bad_rx is None and bad_ord is None and good is not None)
+              bad_rx is None and bad_ord is None and alt is None and good is not None)
+        check("book_path: repos that sanitise alike get distinct books",
+              H.book_path("my repo") != H.book_path("my_repo"))
         scoped = H.to_hook_rule({"rule_id": "sc", "statement": "s", "scope_repos": ["app"], "matcher": {"event": "bash", "command_rx": "x"}})
         check("scope_ok: server scope_repos match the repo exactly, never by substring",
               H.scope_ok(scoped, "app", "/w/app/.git") and not H.scope_ok(scoped, "apple", "/w/apple/.git")
