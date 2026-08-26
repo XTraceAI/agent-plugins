@@ -10,6 +10,18 @@ Lanes (the mode argument):
            "edit", "write_stdlib") and the ordering-rule GATE (on="ordering").
   post     PostToolUse: reactive advisories on failing/erroring results
            (on="result"); ordering-rule ARM (edit-family) and RECEIPT (bash).
+  fetch    Refresh the server book for one repo (GET /rules?view=hook with
+           If-None-Match) into <BASE>/book/<repo>.json. The session lane spawns
+           it DETACHED so SessionStart never waits on the network.
+  flush    Stop / SessionEnd: POST unsent ledger rows to /fires in batches,
+           behind a sent-watermark (ledger/.sent). `flush final` ignores the
+           every-N-fires / every-M-minutes throttle.
+
+Book = server book (cached, ETag) merged with the local rulebook.json; local
+wins on id collision during the pilot. Offline → cached book; no cache → local
+only. A `mode: gate` rule is honoured only from a book fetched within 24 h —
+older caches run it as `advise` (spec §5.3). Wire rows carry identifiers, never
+payloads: `excerpt` is stripped before POST.
 
 Usage (wired in hooks.json): printf %s "$IN" | python3 rulebook_hook.py {session|pre|post}
 
@@ -33,6 +45,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
@@ -43,6 +56,25 @@ MAX_ADVISE = 2          # per tool call — habituation guard
 MAX_POSTURE = 3         # full-text rules at session start — context guard
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2); v1 = per-tool-call rows
+BOOK_DIR = os.path.join(BASE, "book")
+BOOK_MAX_AGE_S = 24 * 3600   # §5.3: a gate from an older cache degrades to advise
+API_PATH = "/v1/team/rulebook"
+
+
+def _timeout(default):
+    """Network timeouts, overridable for tests; a bad value is the default."""
+    try:
+        v = float(os.environ.get("MEMHUB_RULEBOOK_TIMEOUT_S", ""))
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+FETCH_TIMEOUT_S = _timeout(5.0)    # detached child; bounds how long a dead server is probed
+FLUSH_TIMEOUT_S = _timeout(20.0)   # per batch, inside an async 60 s hook
+FLUSH_EVERY_FIRES = 10       # Stop-hook throttle: flush when this many rows wait…
+FLUSH_EVERY_S = 300          # …or this long has passed since the last flush
+FLUSH_BATCH = 200
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 STDLIB = set(getattr(sys, "stdlib_module_names", ())) or {
     "abc", "argparse", "ast", "asyncio", "base64", "collections", "contextlib",
@@ -260,10 +292,307 @@ def bash_ok(resp):
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
-def load_rules():
+def load_local_rules():
+    """The local pilot book. Missing → no rules; corrupt → raises (caller is silent)."""
+    if not os.path.isfile(RULEBOOK):
+        return [], ""
     with open(RULEBOOK, encoding="utf-8") as f:
         book = json.load(f)
     return book["rules"], str(book.get("version", ""))
+
+
+def book_path(repo):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo)[:80] or "norepo"
+    return os.path.join(BOOK_DIR, f"{safe}.json")
+
+
+def load_book(repo):
+    """The cached server book {etag, fetched_at, rules} or None. Pure file read."""
+    try:
+        with open(book_path(repo), encoding="utf-8") as f:
+            b = json.load(f)
+        return b if isinstance(b, dict) and isinstance(b.get("rules"), list) else None
+    except Exception:
+        return None
+
+
+def _atomic_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+_MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot keys
+    "command_rx": "rx", "command_not_rx": "not_rx", "content_not_rx": "content_not_rx",
+    "warn_once_per": "fire_scope", "result_rx": "rx",
+}
+
+
+def to_hook_rule(row):
+    """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
+    Rows already in the pilot shape (an `on` key) pass through. Never raises
+    on a malformed row: returns None and the row is skipped."""
+    try:
+        if not isinstance(row, dict):
+            return None
+        if "on" in row:
+            r = dict(row)
+            r.setdefault("id", row.get("rule_id"))
+            return r if r.get("id") else None
+        r = {"id": row.get("rule_id") or row.get("id"),
+             "text": row.get("statement") or row.get("title") or "",
+             "why": row.get("why") or "", "status": row.get("status", "active"),
+             "mode": row.get("mode", "advise"), "_version": row.get("version")}
+        if not r["id"]:
+            return None
+        scopes = row.get("scope_repos") or []
+        r["repo_scope"] = scopes[0] if len(scopes) == 1 else "any"
+        if len(scopes) > 1:
+            r["_scope_repos"] = list(scopes)
+        if isinstance(row.get("ordering"), dict):
+            r["on"] = "ordering"
+            r["ordering"] = row["ordering"]
+            return r
+        m = row.get("matcher")
+        if not isinstance(m, dict):
+            return None
+        r["on"] = m.get("event") or "bash"
+        for k, v in m.items():
+            if k == "event":
+                continue
+            r[_MATCHER_KEYS.get(k, k)] = v
+        r.setdefault("fire_scope", "session")
+        return r
+    except Exception:
+        return None
+
+
+def load_rules(repo):
+    """Local book ∪ cached server book. Local wins on id collision (pilot).
+    Returns (rules, local_version, fetched_at, sources) where sources maps
+    rule id → "local" | "server"."""
+    try:
+        local, version = load_local_rules()
+    except Exception:       # a corrupt local book must not also lose the server book
+        local, version = [], ""
+    book = load_book(repo)
+    merged, sources = [], {}
+    for r in local:
+        if r.get("id"):
+            merged.append(r)
+            sources[r["id"]] = "local"
+    for row in (book or {}).get("rules", []):
+        r = to_hook_rule(row)
+        if r and r["id"] not in sources:
+            merged.append(r)
+            sources[r["id"]] = "server"
+    return merged, version, (book or {}).get("fetched_at"), sources
+
+
+def effective_mode(rule, fetched_at, now=None):
+    """`gate` is honoured only from a book fetched (200 or 304) within the last
+    24 h (§5.3); anything else is `advise`. Local-book rules never gate."""
+    mode = rule.get("mode", "advise")
+    if mode != "gate":
+        return "advise"
+    try:
+        ts = datetime.fromisoformat(str(fetched_at))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return "gate" if (now - ts).total_seconds() <= BOOK_MAX_AGE_S else "advise"
+    except Exception:
+        return "advise"
+
+
+def scope_ok(rule, repo, gitdir):
+    scope = rule.get("repo_scope", "any")
+    if rule.get("_scope_repos"):
+        return any(s in repo or (gitdir and f"/{s}/" in gitdir) for s in rule["_scope_repos"])
+    if scope == "any":
+        return True
+    return scope in repo or (gitdir and f"/{scope}/" in gitdir)
+
+
+# ── server: fetch + flush (lazy imports — the pre/post lanes never pay for them) ──
+def _api():
+    """(rest_base, bearer, mcp_http) or None. Non-interactive: a hook can only
+    spend a credential /memhub:login already minted."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import mcp_http
+    import pak
+    from _memhub_auth import resolve_bearer
+    url, bearer = resolve_bearer(refresh=False)
+    if not bearer:
+        return None
+    return pak.api_base(url), bearer, mcp_http
+
+
+def fetch_book(repo):
+    """GET /rules?status=active&repo=<repo>&view=hook with If-None-Match.
+    200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
+    current, which is what §5.3 gate freshness measures); anything else →
+    the cache is left exactly as it was."""
+    api = _api()
+    if not api:
+        return
+    base, bearer, http = api
+    old = load_book(repo) or {}
+    hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
+    q = "status=active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
+                      timeout=FETCH_TIMEOUT_S)
+    if reply.status == 304 and old:
+        _atomic_json(book_path(repo), dict(old, fetched_at=_now()))
+    elif reply.status == 200 and isinstance(reply.data, dict) \
+            and isinstance(reply.data.get("rules"), list):
+        _atomic_json(book_path(repo), {"etag": reply.etag, "fetched_at": _now(),
+                                       "rules": reply.data["rules"]})
+
+
+def spawn_fetch(repo):
+    """Refresh the book in a DETACHED child so SessionStart returns at once."""
+    import subprocess
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "fetch", repo],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+
+
+WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "repo",
+             "branch", "tool", "hook_phase", "mode", "dedup_key",
+             "raw_matches_before_fire", "fired_at", "converted", "converted_at")
+
+
+def wire_row(row):
+    """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
+    opt-in for excerpts is a server setting the hook does not consult)."""
+    return {k: row.get(k) for k in WIRE_KEYS}
+
+
+def _read_rows(path, start=0):
+    """Complete JSON lines from byte `start`; returns (rows, end_offset) where
+    end_offset stops before any partial trailing line."""
+    rows, end = [], start
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            for line in f:
+                if not line.endswith(b"\n"):
+                    break
+                end += len(line)
+                try:
+                    rows.append(json.loads(line.decode("utf-8")))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return rows, end
+
+
+def _sent_path():
+    return os.path.join(_ledger_dir(), ".sent")
+
+
+def load_sent():
+    try:
+        with open(_sent_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"fires_offset": 0, "conversions_offset": 0, "last_flush_at": None}
+
+
+def pending_batches(sent):
+    """Rows to POST = fires past the watermark ∪ fires named by conversions past
+    THEIR watermark (each re-sent with converted/converted_at merged — the
+    ingest is an upsert on fire_id, so a re-send is an update, never a dup).
+    Returns (batches, new_sent). The same fire_id is reused on every retry:
+    rows come from the ledger, nothing is minted here. Reads past the
+    watermark first (a seek, cheap on every Stop) and only indexes the whole
+    ledger when there is something to send."""
+    ldir = _ledger_dir()
+    fpath, cpath = os.path.join(ldir, "fires.jsonl"), os.path.join(ldir, "conversions.jsonl")
+    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0))
+    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0))
+    new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
+    if not new_fires and not new_convs:
+        return [], new_sent
+    all_rows, _ = _read_rows(fpath, 0)
+    convs, _ = _read_rows(cpath, 0)
+    by_id = {r["fire_id"]: r for r in all_rows if isinstance(r, dict) and r.get("fire_id")}
+    for c in convs:                     # merge EVERY conversion, sent or not
+        if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
+            by_id[c["fire_id"]]["converted"] = True
+            by_id[c["fire_id"]]["converted_at"] = c.get("converted_at")
+    ids = [r["fire_id"] for r in new_fires if isinstance(r, dict) and r.get("fire_id")]
+    seen = set(ids)
+    for c in new_convs:
+        fid = c.get("fire_id") if isinstance(c, dict) else None
+        if fid in by_id and fid not in seen:
+            ids.append(fid)
+            seen.add(fid)
+    rows = [wire_row(by_id[i]) for i in ids if i in by_id]
+    batches = [rows[i:i + FLUSH_BATCH] for i in range(0, len(rows), FLUSH_BATCH)]
+    return batches, new_sent
+
+
+def _log_rejected(rejected):
+    try:
+        items = rejected if isinstance(rejected, list) else []
+        if items:
+            with open(os.path.join(_ledger_dir(), "rejected.jsonl"), "a", encoding="utf-8") as f:
+                for it in items:
+                    f.write(json.dumps({"at": _now(), "rejected": it}) + "\n")
+    except Exception:
+        pass
+
+
+def flush_fires(final=False):
+    """POST unsent rows in batches. The watermark advances ONLY on a 2xx, so
+    a failed batch is retried, verbatim, on the next flush; `rejected` rows
+    are logged locally and never retried (they sit behind the watermark).
+    One flusher at a time via flock; a second caller simply leaves."""
+    ldir = _ledger_dir()
+    lock = open(os.path.join(ldir, ".flush.lock"), "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return
+    try:
+        sent = load_sent()
+        batches, new_sent = pending_batches(sent)
+        n = sum(len(b) for b in batches)
+        if not n:
+            return
+        if not final:
+            last = sent.get("last_flush_at")
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
+            except Exception:
+                age = float("inf")
+            if n < FLUSH_EVERY_FIRES and age < FLUSH_EVERY_S:
+                return
+        api = _api()
+        if not api:
+            return
+        base, bearer, http = api
+        accepted = 0
+        for batch in batches:
+            reply = http.rest(f"{base}{API_PATH}/fires", bearer, "POST",
+                              body={"fires": batch}, timeout=FLUSH_TIMEOUT_S)
+            if reply.status not in (200, 201, 202):
+                return                    # watermark untouched → retried next flush
+            data = reply.data if isinstance(reply.data, dict) else {}
+            accepted += int(data.get("accepted") or 0)
+            _log_rejected(data.get("rejected"))
+        new_sent["last_flush_at"] = _now()
+        new_sent["last_accepted"] = accepted
+        _atomic_json(_sent_path(), new_sent)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 def repo_info(cwd):
@@ -289,13 +618,6 @@ def _branch(head_path):
         return h.rsplit("/", 1)[-1] if h.startswith("ref:") else "detached"
     except Exception:
         return ""
-
-
-def scope_ok(rule, repo, gitdir):
-    scope = rule.get("repo_scope", "any")
-    if scope == "any":
-        return True
-    return scope in repo or (gitdir and f"/{scope}/" in gitdir)
 
 
 def state_path(session_id):
@@ -376,7 +698,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                 ids[r["id"]] = fid
                 f.write(json.dumps({
                     "fire_id": fid, "rule_id": r["id"],
-                    "rule_version": ctx["rule_version"],
+                    "rule_version": r.get("_version", ctx["rule_version"]),
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
                     "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
@@ -425,6 +747,16 @@ def session_digest(rules, repo, gitdir, ctx):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
+    if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
+        fetch_book(sys.argv[2])
+        return 0
+    if mode == "flush":                # needs nothing from the event payload
+        try:
+            sys.stdin.read()
+        except Exception:
+            pass
+        flush_fires(final="final" in sys.argv[2:])
+        return 0
     try:
         data = json.loads(sys.stdin.read() or "{}")
     except Exception:
@@ -434,13 +766,25 @@ def main():
     repo, root, gitdir, branch = repo_info(cwd)
     if not repo:            # not in a git repo → no rules apply
         return 0
-    rules, rule_version = load_rules()
+    if mode == "fetch":
+        fetch_book(repo)
+        return 0
+    rules, rule_version, fetched_at, sources = load_rules(repo)
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version}
 
     if mode == "session":
+        try:        # which source each rule came from — the pilot's merge audit
+            _atomic_json(book_path(repo) + ".sources", {"at": _now(), "sources": sources})
+        except Exception:
+            pass
         session_digest(rules, repo, gitdir, ctx)
+        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
+            try:
+                spawn_fetch(repo)
+            except Exception:
+                pass
         return 0
 
     inp = data.get("tool_input") or {}
@@ -527,6 +871,13 @@ def main():
     for r in shown:
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
         lines.append(f"- **[{r['id']}]** {r['text']}{detail}  _(why: {r['why']})_")
+    # §5.3: a gate from a stale book runs as advise and says so once per session.
+    degraded = [r["id"] for r in shown if r.get("mode") == "gate"
+                and effective_mode(r, fetched_at) == "advise"]
+    if degraded and not st.get("degrade_noted"):
+        st["degrade_noted"] = True
+        lines.append("- _(team rulebook last refreshed >24 h ago — gate rules "
+                     "run as advisories until the next successful fetch)_")
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines))
     except Exception:
@@ -551,6 +902,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        rc = main()
     except BaseException:
-        sys.exit(0)
+        if os.environ.get("MEMHUB_RULEBOOK_DEBUG"):      # stderr only; stdout stays silent
+            import traceback
+            traceback.print_exc()
+        rc = 0
+    sys.exit(rc or 0)
