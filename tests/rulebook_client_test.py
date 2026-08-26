@@ -319,6 +319,8 @@ def main():
             run("flush", {"session_id": "f6"}, env, ("final",))
             check(f"flush: 2xx with {bad} leaves the watermark",
                   json.load(open(sent_p, encoding="utf-8"))["fires_offset"] == before_off)
+        check("flush: an envelope error leaves a breadcrumb in ledger/.last_error",
+              "forbidden" in json.load(open(os.path.join(td, "ledger", ".last_error"), encoding="utf-8"))["error"])
         fake.post_reply = {"accepted": None, "rejected": 0}
         run("flush", {"session_id": "f6"}, env, ("final",))
         n_posts = len(fake.posts())

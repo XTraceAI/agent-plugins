@@ -555,6 +555,15 @@ def _read_rows(path, start=0, offsets=None):
     return rows, end
 
 
+def _breadcrumb(what, exc):
+    """ledger/.last_error — the one place a silent backstop failure is visible."""
+    try:
+        _atomic_json(os.path.join(_ledger_dir(), ".last_error"),
+                     {"at": _now(), "what": what, "error": str(exc)[:300]})
+    except Exception:
+        pass
+
+
 def _sent_path():
     return os.path.join(_ledger_dir(), ".sent")
 
@@ -692,8 +701,12 @@ def flush_fires(final=False):
         base, bearer, http = api
         accepted = 0
         for batch, after in batches:
-            reply = http.rest(f"{base}{API_PATH}/fires", bearer, "POST",
-                              body={"fires": batch}, timeout=FLUSH_TIMEOUT_S)
+            try:
+                reply = http.rest(f"{base}{API_PATH}/fires", bearer, "POST",
+                                  body={"fires": batch}, timeout=FLUSH_TIMEOUT_S)
+            except Exception as exc:      # transport/envelope error: retry next flush,
+                _breadcrumb("flush", exc)  # but say so where an operator can look
+                return
             if reply.status not in (200, 201, 202):
                 return                    # watermark stays at the last accepted batch
             data = reply.data if isinstance(reply.data, dict) else {}
