@@ -230,6 +230,13 @@ def main() -> int:
         check("evaluate: write_stdlib honours path_not_rx",
               H.evaluate(ws, hook_phase="pre", tool="Write", file_path="/r/pkg/m.py", body="import os\nimport re\nx=1")
               and not H.evaluate(ws, hook_phase="pre", tool="Write", file_path="/r/tests/t.py", body="import os\nimport re\nx=1"))
+        check("bash_ok: exit_code wins; None is never ok; 'error:' in green output is ok",
+              H.bash_ok({"exit_code": 0, "stdout": "3 failed earlier but fixed"}) and not H.bash_ok({"exit_code": 1})
+              and not H.bash_ok(None) and H.bash_ok({"stdout": "warning: error: handled gracefully\n5 passed"})
+              and not H.bash_ok({"stdout": "== 2 failed, 3 passed =="}))
+        check("last_segment: receipt only counts as the final unpiped segment",
+              H.last_segment("cd x && uv run pytest tests/architecture -q") == "uv run pytest tests/architecture -q"
+              and H.last_segment("pytest tests/architecture; git push") == "git push")
         check("evaluate: broken regex is False, never raises",
               H.evaluate({"on": "bash", "rx": "("}, hook_phase="pre", tool="Bash", cmd="x") is False)
 
@@ -264,6 +271,16 @@ def main() -> int:
         run("post", dict(suite, tool_response={"stdout": "1 failed", "exit_code": 1}), oenv)
         rc, out = run("pre", pushev, oenv)
         check("ordering: RED suite run is not a receipt", "[audit-before-push]" in ctx(out))
+        run("post", dict(suite, tool_input={"command": "uv run pytest tests/architecture -q; echo done"},
+                         tool_response={"stdout": "3 passed\ndone", "exit_code": 0}), oenv)
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: a receipt that is NOT the last segment does not discharge (exit status isn't its own)",
+              "[audit-before-push]" in ctx(out))
+        run("post", dict(suite, tool_input={"command": "uv run pytest tests/architecture -q | tail -3"},
+                         tool_response={"stdout": "3 passed", "exit_code": 0}), oenv)
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: a PIPED receipt does not discharge (pipe masks the status)",
+              "[audit-before-push]" in ctx(out))
         run("post", dict(suite, tool_response={"stdout": "3 passed", "exit_code": 0}), oenv)
         rc, out = run("pre", pushev, oenv)
         check("ordering: green run discharges → push allowed", out.strip() == "")

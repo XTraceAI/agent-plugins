@@ -79,6 +79,12 @@ def shell_only(cmd):
     return "\n".join(out)
 
 
+def last_segment(shell):
+    """The final command segment of a shell string (split on ;, &&, ||, newline)."""
+    parts = [x.strip() for x in re.split(r"&&|\|\||;|\n", shell) if x.strip()]
+    return parts[-1] if parts else ""
+
+
 # ── matcher engine: pure ────────────────────────────────────────────────────
 def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text=""):
     """True if `rule` fires on this event. No I/O, no dedup — the backtest
@@ -190,8 +196,13 @@ class OrderingEngine:
         if is_edit and spec.get("path_rx") and not re.search(spec["path_rx"], file_path):
             return None
         seg = shell_only(cmd) if cmd else ""
+        # A Bash call reports ONE exit status. It is the receipt's own status
+        # only when the receipt is the final segment and not piped (`pytest |
+        # tail` returns tail's status). Earlier segments / pipelines never
+        # discharge — under-counting is the safe direction.
         is_receipt = hook_phase == "post" and tool == "Bash" and seg and \
-            re.search(spec["required_command_rx"], seg)
+            re.search(spec["required_command_rx"], last_segment(seg)) and \
+            "|" not in last_segment(seg)
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             re.search(spec["gated_command_rx"], seg)
         if not (is_edit or is_receipt or is_gate):
@@ -235,13 +246,17 @@ def bash_ok(resp):
     """Did the Bash call succeed? Uses exit_code when the harness supplies it;
     otherwise the same proxy the transcript replayer uses (error flag, then
     pytest/traceback vocabulary in the head of the output)."""
+    if resp is None:                      # no result at all is never a receipt
+        return False
     if isinstance(resp, dict):
         if isinstance(resp.get("exit_code"), int):
             return resp["exit_code"] == 0
         if resp.get("is_error") or resp.get("isError"):
             return False
-    txt = result_text(resp)[:400]
-    return not re.search(r"\b(\d+ )?(failed|error(s)?:)|Traceback", txt)
+    txt = result_text(resp)
+    # text proxy, anchored to pytest/traceback vocabulary — a green run whose
+    # output merely mentions "error:" must not be mistaken for red
+    return not re.search(r"(^|\n)(FAILED|ERROR) |\b\d+ failed\b|\nTraceback \(most recent call last\)", txt)
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -286,7 +301,8 @@ def scope_ok(rule, repo, gitdir):
 def state_path(session_id):
     sdir = os.path.join(BASE, "state")
     os.makedirs(sdir, exist_ok=True)
-    return os.path.join(sdir, f"{session_id or 'nosession'}.json")
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(session_id or ""))[:80] or "nosession"
+    return os.path.join(sdir, f"{safe}.json")
 
 
 def load_state(p):
@@ -434,7 +450,8 @@ def main():
 
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
     fp = str(inp.get("file_path", ""))
-    body = str(inp.get("new_string", "")) + str(inp.get("content", ""))
+    body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
+        "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     ok = bash_ok(data.get("tool_response")) if (mode == "post" and tool == "Bash") else None
     ordering = None
@@ -490,7 +507,10 @@ def main():
             continue
         st["raw"][rid] = st["raw"].get(rid, 0) + 1
         if scope.startswith("counter"):
-            threshold = int(scope.split(":")[1])
+            try:
+                threshold = int(scope.split(":", 1)[1])
+            except (IndexError, ValueError):
+                threshold = 1               # a malformed scope must not silence the whole call
             st["counts"][rid] = st["counts"].get(rid, 0) + 1
             if st["counts"][rid] != threshold:   # fire exactly once, at the Nth hit
                 continue

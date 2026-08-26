@@ -22,11 +22,15 @@ def migrate(ledger_dir):
         with open(sv, "w", encoding="utf-8") as f:
             f.write("2\n")
         return "no v1 ledger; stamped v2"
-    rows = []
+    rows, bad = [], 0
     with open(src, encoding="utf-8") as f:
         for line in f:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 rows.append(json.loads(line))
+            except ValueError:
+                bad += 1                     # one corrupt line must not abort the migration
     out = []
     for r in rows:
         if "fire_id" in r:                       # already v2-shaped
@@ -44,13 +48,18 @@ def migrate(ledger_dir):
                 "excerpt": r.get("excerpt", ""),
                 "migrated_from": "v1",
             })
-    os.replace(src, os.path.join(ledger_dir, "fires.v1.jsonl"))
-    with open(src, "w", encoding="utf-8") as f:
+    # crash-safe order: the v2 file is fully written to a temp name BEFORE the
+    # v1 file moves aside; an interruption anywhere leaves either the intact
+    # v1 file or both files, never neither.
+    tmp = src + ".v2.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         for r in out:
             f.write(json.dumps(r) + "\n")
+    os.replace(src, os.path.join(ledger_dir, "fires.v1.jsonl"))
+    os.replace(tmp, src)
     with open(sv, "w", encoding="utf-8") as f:
         f.write("2\n")
-    return f"migrated {len(rows)} v1 rows -> {len(out)} v2 rows"
+    return f"migrated {len(rows)} v1 rows -> {len(out)} v2 rows" + (f" ({bad} unparseable line(s) skipped)" if bad else "")
 
 
 def main():
