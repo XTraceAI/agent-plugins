@@ -328,6 +328,8 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
     "command_rx": "rx", "command_not_rx": "not_rx", "content_not_rx": "content_not_rx",
     "warn_once_per": "fire_scope", "result_rx": "rx",
 }
+_RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx")
+_SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 
 
 def to_hook_rule(row):
@@ -359,11 +361,12 @@ def to_hook_rule(row):
         if not isinstance(m, dict):
             return None
         r["on"] = m.get("event") or "bash"
+        keys = _RESULT_KEYS if r["on"] == "result" else _MATCHER_KEYS
         for k, v in m.items():
             if k == "event":
                 continue
-            r[_MATCHER_KEYS.get(k, k)] = v
-        r.setdefault("fire_scope", "session")
+            r[keys.get(k, k)] = v
+        r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         return r
     except Exception:
         return None
@@ -476,8 +479,10 @@ def _read_rows(path, start=0):
     end_offset stops before any partial trailing line."""
     rows, end = [], start
     try:
+        if start > os.path.getsize(path):    # ledger rewritten/rotated: restart, never strand
+            rows, end = [], 0
         with open(path, "rb") as f:
-            f.seek(start)
+            f.seek(end)
             for line in f:
                 if not line.endswith(b"\n"):
                     break
@@ -498,7 +503,10 @@ def _sent_path():
 def load_sent():
     try:
         with open(_sent_path(), encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError("not a dict")
+        return d
     except Exception:
         return {"fires_offset": 0, "conversions_offset": 0, "last_flush_at": None}
 

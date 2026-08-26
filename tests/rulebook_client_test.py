@@ -323,6 +323,17 @@ def main():
         import rulebook_hook as H  # noqa: E402
         now = datetime.now(timezone.utc)
         gate = {"mode": "gate"}
+        rr = H.to_hook_rule({"rule_id": "x", "statement": "s", "matcher": {"event": "result", "command_rx": "pytest",
+                             "result_rx": "FAIL", "warn_once_per": "turn"}})
+        check("to_hook_rule: result event maps command_rx→cmd_rx, result_rx→rx, turn→call",
+              rr["cmd_rx"] == "pytest" and rr["rx"] == "FAIL" and rr["fire_scope"] == "call", str(rr))
+        rows_, end_ = H._read_rows(ledger, os.path.getsize(ledger) + 10_000)
+        check("_read_rows: a watermark past EOF (rotated ledger) restarts from 0", end_ == os.path.getsize(ledger) and rows_)
+        with open(sent_p, "w", encoding="utf-8") as f:
+            f.write("[]")
+        check("load_sent: non-dict .sent falls back to a fresh watermark", H.load_sent()["fires_offset"] == 0)
+        with open(sent_p, "w", encoding="utf-8") as f:
+            json.dump(st, f)
         check("effective_mode: fresh cache honours gate",
               H.effective_mode(gate, (now - timedelta(hours=1)).isoformat(), now) == "gate")
         check("effective_mode: >24h cache degrades gate to advise",
