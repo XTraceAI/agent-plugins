@@ -358,6 +358,17 @@ def rx_ok(pat):
     return True
 
 
+_TEXT_MAX = 400
+
+
+def _clean_text(v):
+    """Server rule prose is display data, not instructions: one line, no
+    control characters, length-capped before it enters the model context."""
+    t = re.sub(r"[\x00-\x1f\x7f]+", " ", str(v or ""))
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:_TEXT_MAX]
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. Never raises
@@ -370,8 +381,8 @@ def to_hook_rule(row):
             r.setdefault("id", row.get("rule_id"))
             return r if r.get("id") else None
         r = {"id": row.get("rule_id") or row.get("id"),
-             "text": row.get("statement") or row.get("title") or "",
-             "why": row.get("why") or "", "status": row.get("status", "active"),
+             "text": _clean_text(row.get("statement") or row.get("title")),
+             "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
              "mode": row.get("mode", "advise"), "_version": row.get("version")}
         if not r["id"]:
             return None
@@ -597,13 +608,22 @@ def pending_batches(sent):
     return batches, new_sent
 
 
-def _log_rejected(rejected):
+def _log_rejected(rejected, batch):
+    """Per-row rejections are logged as given; a bare count (the §4.3 example
+    shape) is logged with the batch's fire_ids so the loss is visible even
+    though the server did not say which rows."""
     try:
-        items = rejected if isinstance(rejected, list) else []
+        if isinstance(rejected, list):
+            items = [{"rejected": it} for it in rejected]
+        elif isinstance(rejected, int) and rejected > 0:
+            items = [{"rejected_count": rejected,
+                      "batch_fire_ids": [r.get("fire_id") for r in batch]}]
+        else:
+            items = []
         if items:
             with open(os.path.join(_ledger_dir(), "rejected.jsonl"), "a", encoding="utf-8") as f:
                 for it in items:
-                    f.write(json.dumps({"at": _now(), "rejected": it}) + "\n")
+                    f.write(json.dumps(dict(it, at=_now())) + "\n")
     except Exception:
         pass
 
@@ -652,7 +672,7 @@ def flush_fires(final=False):
             if data["accepted"] + n_rej < len(batch):
                 return                    # server accounted for fewer rows than sent → retry
             accepted += data["accepted"]
-            _log_rejected(data.get("rejected"))
+            _log_rejected(rej, batch)
             after["last_flush_at"] = _now()
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
