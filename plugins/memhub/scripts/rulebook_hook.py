@@ -33,6 +33,8 @@ import re
 import sys
 import tempfile
 import time
+import uuid
+from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.environ.get("MEMHUB_RULEBOOK", "")) or \
     os.path.expanduser("~/.claude/scripts/rulebook")
@@ -40,6 +42,7 @@ RULEBOOK = os.environ.get("MEMHUB_RULEBOOK") or os.path.join(BASE, "rulebook.jso
 MAX_ADVISE = 2          # per tool call — habituation guard
 MAX_POSTURE = 3         # full-text rules at session start — context guard
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
+LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2); v1 = per-tool-call rows
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 STDLIB = set(getattr(sys, "stdlib_module_names", ())) or {
     "abc", "argparse", "ast", "asyncio", "base64", "collections", "contextlib",
@@ -148,6 +151,21 @@ class OrderingEngine:
             json.dump(st, f)
         os.replace(tmp, self.path)
 
+    def mark_fired(self, rule_id, fire_id):
+        """Remember the open fire in WORKTREE state so a later discharge from
+        any session in this checkout converts it."""
+        lock = self._locked()
+        if lock is None:
+            return
+        try:
+            st = self._read()
+            st.setdefault(self.branch, {}).setdefault(
+                rule_id, {"count": 0, "last_edit": None})["open_fire"] = fire_id
+            self._write(st)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+
     def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None):
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
         under lock; None on lock timeout (fail open)."""
@@ -181,6 +199,9 @@ class OrderingEngine:
             if is_receipt:                                # handler 2: green receipt
                 if ok is True:                            # a red run never discharges
                     s["count"] = 0
+                    # conversion is (worktree, branch)-scoped: a subagent's or
+                    # sibling session's receipt converts whichever fire is open
+                    rule["_converted_fire"] = s.pop("open_fire", None)
                     self._write(st)
                     return "discharged"
                 return None
@@ -213,7 +234,8 @@ def bash_ok(resp):
 # ── plumbing ────────────────────────────────────────────────────────────────
 def load_rules():
     with open(RULEBOOK, encoding="utf-8") as f:
-        return json.load(f)["rules"]
+        book = json.load(f)
+    return book["rules"], str(book.get("version", ""))
 
 
 def repo_info(cwd):
@@ -255,11 +277,13 @@ def state_path(session_id):
 
 
 def load_state(p):
+    st = {"fired": [], "counts": {}, "raw": {}, "open": {}}
     try:
         with open(p, encoding="utf-8") as f:
-            return json.load(f)
+            st.update(json.load(f))
     except Exception:
-        return {"fired": [], "counts": {}}
+        pass
+    return st
 
 
 def save_state(p, st):
@@ -287,22 +311,70 @@ def emit(event_name, text):
         "hookEventName": event_name, "additionalContext": text}}))
 
 
-def log_fire(session, repo, mode, tool, rules, excerpt, outcome="fired"):
+def _ledger_dir():
+    d = os.path.join(BASE, "ledger")
+    os.makedirs(d, exist_ok=True)
+    sv = os.path.join(d, "schema_version")
+    if not os.path.exists(sv):
+        with open(sv, "w", encoding="utf-8") as f:
+            f.write(f"{LEDGER_SCHEMA}\n")
+    return d
+
+
+def _now():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def agent_id_of(data):
+    """Subagent transcripts live at <session>/subagents/agent-<id>.jsonl;
+    the main agent's do not. NULL = main agent."""
+    tp = str(data.get("transcript_path") or "")
+    if "/subagents/" in tp:
+        return os.path.basename(tp).rsplit(".", 1)[0]
+    return None
+
+
+def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None):
+    """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
+    `excerpt` stays in this LOCAL file and never crosses the wire without
+    org opt-in. Returns {rule_id: fire_id} so conversions can point back."""
+    ids = {}
     try:
-        os.makedirs(os.path.join(BASE, "ledger"), exist_ok=True)
-        with open(os.path.join(BASE, "ledger", "fires.jsonl"), "a",
+        path = os.path.join(_ledger_dir(), "fires.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            for r in rules:
+                fid = str(uuid.uuid4())
+                ids[r["id"]] = fid
+                f.write(json.dumps({
+                    "fire_id": fid, "rule_id": r["id"],
+                    "rule_version": ctx["rule_version"],
+                    "session_id": ctx["session"], "agent_id": ctx["agent_id"],
+                    "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
+                    "hook_phase": hook_phase, "mode": mode,
+                    "dedup_key": (dedup_keys or {}).get(r["id"]),
+                    "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
+                    "fired_at": _now(),
+                    "converted": None, "converted_at": None,
+                    "excerpt": excerpt[:160],
+                }) + "\n")
+    except Exception:
+        pass
+    return ids
+
+
+def log_conversion(fire_id, how):
+    """Append-only sidecar (the fires file is shared across sessions, so it
+    is never rewritten in place). A reader merges by fire_id."""
+    try:
+        with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
                   encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                "session": session[:8], "repo": repo,
-                                "mode": mode, "tool": tool,
-                                "rules": [r["id"] for r in rules],
-                                "outcome": outcome,
-                                "excerpt": excerpt[:160]}) + "\n")
+            f.write(json.dumps({"fire_id": fire_id, "converted": True,
+                                "converted_at": _now(), "how": how}) + "\n")
     except Exception:
         pass
 
 
-def session_digest(rules, repo, gitdir, session):
+def session_digest(rules, repo, gitdir, ctx):
     in_scope = [r for r in rules if scope_ok(r, repo, gitdir)]
     if not in_scope:
         return
@@ -319,7 +391,7 @@ def session_digest(rules, repo, gitdir, session):
             f"not boilerplate.")
     emit("SessionStart", "\n".join(lines))
     if posture:
-        log_fire(session, repo, "session", "SessionStart", posture, "")
+        log_fires(ctx, posture, hook_phase="session", mode="advise", excerpt="")
 
 
 def main():
@@ -333,13 +405,15 @@ def main():
     repo, root, gitdir, branch = repo_info(cwd)
     if not repo:            # not in a git repo → no rules apply
         return 0
-    rules = load_rules()
+    rules, rule_version = load_rules()
+    tool = data.get("tool_name", "")
+    ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
+           "branch": branch, "tool": tool, "rule_version": rule_version}
 
     if mode == "session":
-        session_digest(rules, repo, gitdir, session)
+        session_digest(rules, repo, gitdir, ctx)
         return 0
 
-    tool = data.get("tool_name", "")
     inp = data.get("tool_input") or {}
     sp = state_path(session)
     st = load_state(sp)
@@ -351,6 +425,25 @@ def main():
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     ok = bash_ok(data.get("tool_response")) if (mode == "post" and tool == "Bash") else None
     ordering = None
+    dedup_keys = {}
+    by_id = {r["id"]: r for r in rules}
+
+    # Conversions: did this call perform the action an earlier fire asked for?
+    # Deterministic, under-counts, never over-counts (spec §5.1).
+    for rid, fid in list(st["open"].items()):
+        r = by_id.get(rid)
+        if not r:
+            continue
+        crx = r.get("converted_rx")
+        if mode == "post" and tool == "Bash" and crx and cmd \
+                and re.search(crx, shell_only(cmd), re.I | re.M):
+            log_conversion(fid, "converted_rx")
+            del st["open"][rid]
+        elif mode == "pre" and r.get("on") == "edit" and "content_rx" in r \
+                and tool in EDIT_TOOLS and fp == st.get("open_file", {}).get(rid) \
+                and not evaluate(r, hook_phase="pre", tool=tool, file_path=fp, body=body):
+            log_conversion(fid, "re-edit-clears")
+            del st["open"][rid]
 
     for r in rules:
         if r.get("on") == "session" or not scope_ok(r, repo, gitdir):
@@ -364,42 +457,61 @@ def main():
                                         file_path=fp, ok=ok)
             except Exception:
                 outcome = None
-            if outcome == "discharged":
-                log_fire(session, repo, mode, tool, [r], cmd, outcome="discharged")
+            if outcome == "discharged" and r.get("_converted_fire"):
+                log_conversion(r["_converted_fire"], "discharged")
             elif outcome == "fired":
+                dedup_keys[rid] = f"{rid}@{root}:{branch}"
                 fired_now.append(r)
             continue
 
         scope = r.get("fire_scope", "session")
         key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
         if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
+            if evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
+                        body=body, result_text=rtext):
+                st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
             continue
         if not evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
                         body=body, result_text=rtext):
             continue
+        st["raw"][rid] = st["raw"].get(rid, 0) + 1
         if scope.startswith("counter"):
             threshold = int(scope.split(":")[1])
             st["counts"][rid] = st["counts"].get(rid, 0) + 1
             if st["counts"][rid] != threshold:   # fire exactly once, at the Nth hit
                 continue
         st["fired"].append(key)
+        dedup_keys[rid] = key
         fired_now.append(r)
 
     if not fired_now:
         save_state(sp, st)
         return 0
 
-    fired_now = fired_now[:MAX_ADVISE]
+    shown, cut = fired_now[:MAX_ADVISE], fired_now[MAX_ADVISE:]
     lines = ["## 📏 Rulebook (team rules — advisory, not blocking)"]
-    for r in fired_now:
+    for r in shown:
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
         lines.append(f"- **[{r['id']}]** {r['text']}{detail}  _(why: {r['why']})_")
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines))
     except Exception:
         pass
+    raw = {r["id"]: st["raw"].get(r["id"]) for r in fired_now}
+    ids = log_fires(ctx, shown, hook_phase=mode, mode="advise", excerpt=cmd or fp or "",
+                    raw_counts=raw, dedup_keys=dedup_keys)
+    if cut:   # the per-call cap has a cost; make it visible, never silent
+        log_fires(ctx, cut, hook_phase=mode, mode="suppressed", excerpt=cmd or fp or "",
+                  raw_counts=raw, dedup_keys=dedup_keys)
+    for r in shown:
+        st["raw"][r["id"]] = 0
+        if r.get("on") == "ordering" and ordering and ids.get(r["id"]):
+            ordering.mark_fired(r["id"], ids[r["id"]])
+        elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
+            st["open"][r["id"]] = ids.get(r["id"])
+            if r.get("on") == "edit":
+                st.setdefault("open_file", {})[r["id"]] = fp
     save_state(sp, st)
-    log_fire(session, repo, mode, tool, fired_now, cmd or fp or "")
     return 0
 
 

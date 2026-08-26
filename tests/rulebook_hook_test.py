@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -152,10 +153,49 @@ def main() -> int:
         check("ledger written beside the relocated rulebook", os.path.isfile(ledger))
         if os.path.isfile(ledger):
             with open(ledger, encoding="utf-8") as f:
-                fired = [json.loads(l)["rules"] for l in f if l.strip()]
-            check("ledger rows carry rule ids",
-                  any("bash-rule" in r for r in fired) and
-                  any("post-rule" in r for r in fired))
+                rows = [json.loads(l) for l in f if l.strip()]
+            ids = [r["rule_id"] for r in rows]
+            check("ledger v2: one row per rule, rule_id column",
+                  "bash-rule" in ids and "post-rule" in ids and all("rules" not in r for r in rows))
+            check("ledger v2: client-minted fire_id, unique",
+                  len({r["fire_id"] for r in rows}) == len(rows) and all(len(r["fire_id"]) == 36 for r in rows))
+            check("ledger v2: hook_phase and mode are separate columns",
+                  {r["hook_phase"] for r in rows} >= {"pre", "post", "session"} and
+                  all(r["mode"] == "advise" for r in rows))
+            check("ledger v2: full session_id, rule_version, tz-aware fired_at",
+                  all(r["session_id"] in ("s1", "s2", "s6") for r in rows) and
+                  all(r["rule_version"] == "1" for r in rows) and
+                  all(re.search(r"([+-]\d\d:\d\d|Z)$", r["fired_at"]) for r in rows))
+            check("ledger v2: schema_version file stamped",
+                  open(os.path.join(td, "ledger", "schema_version"), encoding="utf-8").read().strip() == "2")
+
+        # --- cap → suppressed rows; converted_rx → conversions sidecar --------
+        cbook = os.path.join(td, "cap.json")
+        with open(cbook, "w", encoding="utf-8") as f:
+            json.dump({"version": "t", "rules": [
+                {"id": f"cap-{i}", "on": "bash", "rx": r"capcmd", "fire_scope": "session",
+                 "repo_scope": "any", "text": f"cap {i}", "why": "w",
+                 **({"converted_rx": r"do-the-thing"} if i == 0 else {})}
+                for i in range(3)]}, f)
+        cenv = {"MEMHUB_RULEBOOK": cbook}
+        cb = {"cwd": repo, "session_id": "c1", "tool_name": "Bash"}
+        rc, out = run("pre", dict(cb, tool_input={"command": "capcmd"}), cenv)
+        check("cap: at most MAX_ADVISE rules shown", ctx(out).count("[cap-") == 2)
+        run("pre", dict(cb, tool_input={"command": "capcmd again"}), cenv)   # deduped → raw count
+        run("post", dict(cb, tool_input={"command": "now do-the-thing"},
+                         tool_response={"stdout": "ok"}), cenv)
+        with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip() and '"cap-' in l]
+        modes = {r["rule_id"]: r["mode"] for r in rows}
+        check("cap: the cut rule is logged mode=suppressed, never silently dropped",
+              modes == {"cap-0": "advise", "cap-1": "advise", "cap-2": "suppressed"}, str(modes))
+        check("cap: raw_matches_before_fire recorded", all(r["raw_matches_before_fire"] == 1 for r in rows))
+        conv = os.path.join(td, "ledger", "conversions.jsonl")
+        with open(conv, encoding="utf-8") as f:
+            convs = [json.loads(l) for l in f if l.strip()]
+        fid0 = next(r["fire_id"] for r in rows if r["rule_id"] == "cap-0")
+        check("converted_rx: follow-up command writes a conversion for that fire_id",
+              [c["fire_id"] for c in convs] == [fid0] and convs[0]["how"] == "converted_rx", str(convs))
 
         # --- shell_only + evaluate(): the pure engine the backtest imports ---
         sys.path.insert(0, os.path.dirname(HOOK))
@@ -229,10 +269,10 @@ def main() -> int:
         rc, out = run("pre", pushev, oenv)
         check("ordering: state does not leak across branches", out.strip() == "")
         oledger = os.path.join(td, "ledger", "fires.jsonl")
-        with open(oledger, encoding="utf-8") as f:
-            outcomes = [json.loads(l).get("outcome") for l in f if l.strip()]
-        check("ordering: discharges are logged (the conversion signal)",
-              outcomes.count("discharged") == 2, str(outcomes))
+        with open(os.path.join(td, "ledger", "conversions.jsonl"), encoding="utf-8") as f:
+            hows = [json.loads(l)["how"] for l in f if l.strip()]
+        check("ordering: a discharge after a fire converts that fire (the conversion signal)",
+              hows.count("discharged") == 2, str(hows))
         statefiles = [n for n in os.listdir(os.path.join(td, "state")) if n.startswith("wt-") and n.endswith(".json")]
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
