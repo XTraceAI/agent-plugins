@@ -610,8 +610,9 @@ def pending_batches(sent):
                             break
         except FileNotFoundError:
             pass
-    convs, _ = _read_rows(cpath, 0)
-    for c in convs:                     # merge EVERY conversion, sent or not
+    # Only conversions past THEIR watermark need merging: the two offsets
+    # advance together, so an older conversion was shipped with its fire.
+    for c in new_convs:
         if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
             by_id[c["fire_id"]]["converted"] = True
             by_id[c["fire_id"]]["converted_at"] = c.get("converted_at")
@@ -831,7 +832,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                 ids[r["id"]] = fid
                 f.write(json.dumps({
                     "fire_id": fid, "rule_id": r["id"],
-                    "rule_version": r.get("_version", ctx["rule_version"]),
+                    "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
                     "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
