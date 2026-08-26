@@ -14,6 +14,7 @@ import uuid
 
 
 def migrate(ledger_dir):
+    os.makedirs(ledger_dir, exist_ok=True)      # first run: no ledger dir yet
     sv = os.path.join(ledger_dir, "schema_version")
     src = os.path.join(ledger_dir, "fires.jsonl")
     if os.path.exists(sv) and open(sv, encoding="utf-8").read().strip() == "2":
