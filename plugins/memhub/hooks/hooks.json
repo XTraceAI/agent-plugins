@@ -2,6 +2,17 @@
   "hooks": {
     "PreToolUse": [
       {
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "statusMessage": "MemHub: checking team rules",
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" pre; fi"
+          }
+        ]
+      },
+      {
         "matcher": "^(Edit|MultiEdit|Write|NotebookEdit)$",
         "hooks": [
           {
@@ -25,6 +36,17 @@
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "statusMessage": "MemHub: checking team rules",
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" post; fi"
+          }
+        ]
+      },
       {
         "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|Bash)$",
         "hooks": [
@@ -72,6 +94,16 @@
       }
     ],
     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "statusMessage": "MemHub: loading team rules",
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" session; fi"
+          }
+        ]
+      },
       {
         "hooks": [
           {
