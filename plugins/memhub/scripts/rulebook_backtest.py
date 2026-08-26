@@ -84,10 +84,9 @@ def main():
     else:
         rule = load_rule(args)
     on = rule.get("on")
-    if on not in ("bash", "edit"):
-        sys.exit(f"backtest supports on=bash|edit for now (got {on!r}); "
-                 "result/write_stdlib rules need paired tool results — arm those "
-                 "from live advisory data instead.")
+    if on not in ("bash", "edit", "write_stdlib", "result"):
+        sys.exit(f"backtest supports on=bash|edit|write_stdlib|result (got {on!r}); "
+                 "session-lane posture rules are not matchers and have no backtest.")
     # Fail fast on a broken regex before scanning anything.
     for k in ("rx", "not_rx", "path_rx", "path_not_rx", "content_rx"):
         if rule.get(k):
@@ -117,6 +116,24 @@ def main():
             fh = open(p, encoding="utf-8", errors="replace")
         except OSError:
             continue
+        # `result` rules need the paired tool_result: index every result by
+        # tool_use_id first (parallel calls interleave — never pair by adjacency).
+        results = {}
+        if on == "result":
+            with open(p, encoding="utf-8", errors="replace") as rf:
+                for line in rf:
+                    if '"tool_result"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    for c in (d.get("message") or {}).get("content") or []:
+                        if isinstance(c, dict) and c.get("type") == "tool_result":
+                            txt = c.get("content")
+                            if isinstance(txt, list):
+                                txt = "\n".join(x.get("text", "") for x in txt if isinstance(x, dict))
+                            results[c.get("tool_use_id")] = str(txt or "")
         with fh:
             for line in fh:
                 if '"tool_use"' not in line:
@@ -157,6 +174,20 @@ def main():
                         scanned_calls += 1
                         hit = evaluate(rule, hook_phase="pre", tool=tool, file_path=fp, body=body)
                         excerpt = fp
+                    elif on == "write_stdlib" and tool == "Write":
+                        fp = str(inp.get("file_path", ""))
+                        body = str(inp.get("content", ""))
+                        scanned_calls += 1
+                        hit = evaluate(rule, hook_phase="pre", tool=tool, file_path=fp, body=body)
+                        excerpt = fp
+                    elif on == "result" and tool == "Bash":
+                        cmd = str(inp.get("command", ""))
+                        rtext = results.get(c.get("id"), "")
+                        if not rtext:
+                            continue
+                        scanned_calls += 1
+                        hit = evaluate(rule, hook_phase="post", tool=tool, cmd=cmd, result_text=rtext)
+                        excerpt = cmd
                     if hit:
                         raw_hits += 1
                         first = p not in session_hits

@@ -77,6 +77,8 @@ def main() -> int:
             {"id": "post-rule", "on": "result", "rx": r"BOOM-ERROR",
              "cmd_rx": r"pytest", "fire_scope": "session", "repo_scope": "any",
              "text": "Post advisory", "why": "w"},
+            {"id": "draft-rule", "on": "bash", "rx": r"forbidden-cmd", "status": "draft",
+             "fire_scope": "session", "repo_scope": "any", "text": "DRAFT TEXT", "why": "w"},
         ]}
         with open(book, "w", encoding="utf-8") as f:
             json.dump(rules, f)
@@ -121,6 +123,7 @@ def main() -> int:
         base = {"cwd": repo, "session_id": "s2", "tool_name": "Bash"}
         rc, out = run("pre", dict(base, tool_input={"command": "run forbidden-cmd now"}), env)
         check("pre: bash rule fires", "[bash-rule]" in ctx(out))
+        check("pre: a status=draft rule never fires (unbacktested = unarmed)", "[draft-rule]" not in ctx(out))
 
         rc, out = run("pre", dict(base, tool_input={"command": "run forbidden-cmd now"}), env)
         check("pre: fire_scope=session dedupes the second call", out.strip() == "")
@@ -217,6 +220,16 @@ def main() -> int:
         check("evaluate: match_heredoc_body opts in",
               H.evaluate(dict(push, match_heredoc_body=True), hook_phase="pre",
                          tool="Bash", cmd="cat > n.md <<'EOF'\nrun git push\nEOF"))
+        hd = {"on": "bash", "rx": r"python3?\s+-?\s*<<", "match_heredoc_body": True, "body_rx": r"results\.json"}
+        check("evaluate: body_rx rule — rx on the shell line, body_rx on the payload",
+              H.evaluate(hd, hook_phase="pre", tool="Bash", cmd="python3 - <<'PY'\nload('results.json')\nPY")
+              and not H.evaluate(hd, hook_phase="pre", tool="Bash", cmd="python3 - <<'PY'\nprint(1)\nPY")
+              and not H.evaluate(hd, hook_phase="pre", tool="Bash",
+                                 cmd="cat > spec.md <<'MD'\nuse python3 - << for results.json\nMD"))
+        ws = {"on": "write_stdlib", "min_chars": 10, "path_not_rx": r"/tests?/"}
+        check("evaluate: write_stdlib honours path_not_rx",
+              H.evaluate(ws, hook_phase="pre", tool="Write", file_path="/r/pkg/m.py", body="import os\nimport re\nx=1")
+              and not H.evaluate(ws, hook_phase="pre", tool="Write", file_path="/r/tests/t.py", body="import os\nimport re\nx=1"))
         check("evaluate: broken regex is False, never raises",
               H.evaluate({"on": "bash", "rx": "("}, hook_phase="pre", tool="Bash", cmd="x") is False)
 

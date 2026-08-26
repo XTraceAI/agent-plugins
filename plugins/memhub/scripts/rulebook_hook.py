@@ -87,9 +87,21 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
     on = rule.get("on")
     try:
         if hook_phase == "pre" and on == "bash" and tool == "Bash" and cmd:
-            target = cmd if rule.get("match_heredoc_body") else shell_only(cmd)
-            return bool(re.search(rule["rx"], target, re.I | re.M)) and not (
-                rule.get("not_rx") and re.search(rule["not_rx"], target, re.I))
+            # Rules ABOUT payloads (`body_rx`): rx still names the shell shape
+            # (`python - <<`), body_rx says what the payload must be about — so
+            # a spec file that merely *contains* "python3 - <<" never fires.
+            # Legacy `match_heredoc_body` without body_rx matches the whole string.
+            shell = shell_only(cmd)
+            target = cmd if (rule.get("match_heredoc_body") and not rule.get("body_rx")) else shell
+            if not re.search(rule["rx"], target, re.I | re.M):
+                return False
+            if rule.get("not_rx") and re.search(rule["not_rx"], target, re.I):
+                return False
+            if rule.get("body_rx"):
+                kept = set(shell.split("\n"))
+                body_only = "\n".join(l for l in cmd.split("\n") if l not in kept)
+                return bool(re.search(rule["body_rx"], body_only, re.I | re.M))
+            return True
         if hook_phase == "pre" and on == "edit" and tool in EDIT_TOOLS:
             if re.search(rule["path_rx"], file_path) and not (
                     rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)):
@@ -97,6 +109,7 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
             return False
         if hook_phase == "pre" and on == "write_stdlib" and tool == "Write" \
                 and file_path.endswith(".py") and "scratchpad" not in file_path \
+                and not (rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)) \
                 and len(body) >= rule.get("min_chars", 800):
             mods = set(re.findall(r"^(?:import|from)\s+([A-Za-z_]\w*)", body, re.M))
             return bool(mods) and not {m for m in mods if m not in STDLIB and m not in LOCAL_PKGS}
@@ -375,7 +388,7 @@ def log_conversion(fire_id, how):
 
 
 def session_digest(rules, repo, gitdir, ctx):
-    in_scope = [r for r in rules if scope_ok(r, repo, gitdir)]
+    in_scope = [r for r in rules if scope_ok(r, repo, gitdir) and r.get("status", "active") == "active"]
     if not in_scope:
         return
     posture = [r for r in in_scope if r.get("on") == "session"][:MAX_POSTURE]
@@ -446,7 +459,8 @@ def main():
             del st["open"][rid]
 
     for r in rules:
-        if r.get("on") == "session" or not scope_ok(r, repo, gitdir):
+        if r.get("on") == "session" or not scope_ok(r, repo, gitdir) \
+                or r.get("status", "active") != "active":   # draft = not armed (§6)
             continue
         rid = r["id"]
 
