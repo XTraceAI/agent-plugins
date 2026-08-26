@@ -454,9 +454,10 @@ def effective_mode(rule, fetched_at, now=None):
 
 def scope_ok(rule, repo, gitdir):
     scope = rule.get("repo_scope", "any")
-    if rule.get("_scope_repos"):        # server list: exact basename / path segment, never substring
-        segs = set(gitdir.split("/")) if gitdir else set()
-        return any(s == repo or s in segs for s in rule["_scope_repos"])
+    if rule.get("_scope_repos"):        # server list: this checkout's name or its main
+        parts = gitdir.split("/") if gitdir else []   # checkout's (…/<main>/.git/worktrees/x)
+        main = parts[parts.index(".git") - 1] if ".git" in parts and parts.index(".git") > 0 else ""
+        return any(s == repo or (main and s == main) for s in rule["_scope_repos"])
     if scope == "any":
         return True
     return scope in repo or (gitdir and f"/{scope}/" in gitdir)

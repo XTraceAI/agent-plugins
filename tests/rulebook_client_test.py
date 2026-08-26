@@ -376,7 +376,8 @@ def main():
         scoped = H.to_hook_rule({"rule_id": "sc", "statement": "s", "scope_repos": ["app"], "matcher": {"event": "bash", "command_rx": "x"}})
         check("scope_ok: server scope_repos match the repo exactly, never by substring",
               H.scope_ok(scoped, "app", "/w/app/.git") and not H.scope_ok(scoped, "apple", "/w/apple/.git")
-              and H.scope_ok(scoped, "wt", "/w/app/.git/worktrees/wt"))
+              and H.scope_ok(scoped, "wt", "/w/app/.git/worktrees/wt")
+              and not H.scope_ok(scoped, "other", "/home/app/projects/other/.git"))
         # per-batch watermark: batch 1 accepted, batch 2 fails → batch 1 is not re-sent
         H.FLUSH_BATCH = 2
         with open(ledger, "a", encoding="utf-8") as f:
