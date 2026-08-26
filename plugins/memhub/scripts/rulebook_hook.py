@@ -242,10 +242,11 @@ class OrderingEngine:
             lock.close()
 
 
-def bash_ok(resp):
-    """Did the Bash call succeed? Uses exit_code when the harness supplies it;
-    otherwise the same proxy the transcript replayer uses (error flag, then
-    pytest/traceback vocabulary in the head of the output)."""
+def bash_ok(resp, *, strict=False):
+    """Did the Bash call succeed? Uses exit_code when the harness supplies it.
+    Without one, the text proxy (same as the transcript replayer) is a guess a
+    command's own output could forge — so `strict=True` (used for GATE-mode
+    receipts) returns False unless an explicit exit_code says 0."""
     if resp is None:                      # no result at all is never a receipt
         return False
     if isinstance(resp, dict):
@@ -253,6 +254,8 @@ def bash_ok(resp):
             return resp["exit_code"] == 0
         if resp.get("is_error") or resp.get("isError"):
             return False
+    if strict:
+        return False
     txt = result_text(resp)
     # text proxy, anchored to pytest/traceback vocabulary — a green run whose
     # output merely mentions "error:" must not be mistaken for red
@@ -344,7 +347,9 @@ def _ledger_dir():
     d = os.path.join(BASE, "ledger")
     os.makedirs(d, exist_ok=True)
     sv = os.path.join(d, "schema_version")
-    if not os.path.exists(sv):
+    # stamp v2 only on a FRESH ledger; an unstamped ledger with rows is v1 and
+    # must go through rulebook_ledger_migrate.py — never silently relabel it
+    if not os.path.exists(sv) and not os.path.exists(os.path.join(d, "fires.jsonl")):
         with open(sv, "w", encoding="utf-8") as f:
             f.write(f"{LEDGER_SCHEMA}\n")
     return d
@@ -453,7 +458,7 @@ def main():
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
-    ok = bash_ok(data.get("tool_response")) if (mode == "post" and tool == "Bash") else None
+    resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
     ordering = None
     dedup_keys = {}
     by_id = {r["id"]: r for r in rules}
@@ -484,6 +489,7 @@ def main():
         if r.get("on") == "ordering":
             try:
                 ordering = ordering or OrderingEngine(root, branch)
+                ok = bash_ok(resp, strict=r.get("mode") == "gate") if resp is not None else None
                 outcome = ordering.feed(r, hook_phase=mode, tool=tool, cmd=cmd,
                                         file_path=fp, ok=ok)
             except Exception:

@@ -234,6 +234,8 @@ def main() -> int:
               H.bash_ok({"exit_code": 0, "stdout": "3 failed earlier but fixed"}) and not H.bash_ok({"exit_code": 1})
               and not H.bash_ok(None) and H.bash_ok({"stdout": "warning: error: handled gracefully\n5 passed"})
               and not H.bash_ok({"stdout": "== 2 failed, 3 passed =="}))
+        check("bash_ok strict: a gate-mode receipt needs an explicit exit_code (text cannot forge green)",
+              not H.bash_ok({"stdout": "5 passed"}, strict=True) and H.bash_ok({"stdout": "5 passed", "exit_code": 0}, strict=True))
         check("last_segment: receipt only counts as the final unpiped segment",
               H.last_segment("cd x && uv run pytest tests/architecture -q") == "uv run pytest tests/architecture -q"
               and H.last_segment("pytest tests/architecture; git push") == "git push")
