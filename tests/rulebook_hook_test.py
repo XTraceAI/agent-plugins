@@ -7,8 +7,14 @@ Covers the properties that make this safe to ship in everyone's harness:
   non-git cwd);
 * the session lane serves posture rules in full and everything else as one
   index line — never the whole book;
-* the pre lane matches the pre-heredoc segment only, honors not_rx, and
-  dedupes per fire_scope=session (the habituation guard);
+* the pre lane matches the shell-only segment (heredoc bodies stripped,
+  shell after terminators kept), honors not_rx, and dedupes per
+  fire_scope=session (the habituation guard);
+* `shell_only` + `evaluate()` are pure and importable — the backtest replays
+  them, so what is tested is what runs;
+* ordering rules arm on edits, discharge on a GREEN receipt only, gate the
+  push, and keep state per (worktree, branch) — shared by sibling sessions and
+  subagents, never leaking across branches;
 * the post lane fires on failing result text, gated by cmd_rx;
 * repo_scope filters rules to the repo the session is in;
 * MEMHUB_RULEBOOK relocates the book AND its state/ledger together, so tests
@@ -150,6 +156,86 @@ def main() -> int:
             check("ledger rows carry rule ids",
                   any("bash-rule" in r for r in fired) and
                   any("post-rule" in r for r in fired))
+
+        # --- shell_only + evaluate(): the pure engine the backtest imports ---
+        sys.path.insert(0, os.path.dirname(HOOK))
+        import rulebook_hook as H  # noqa: E402
+        so = H.shell_only
+        check("shell_only: plain command unchanged", so("git push origin main") == "git push origin main")
+        check("shell_only: heredoc body dropped",
+              "forbidden" not in so("cat > f <<'EOF'\nforbidden\nEOF"))
+        chained = "git commit -F - <<'MSG'\nfix: forbidden\nMSG\ngit push -u origin fm"
+        check("shell_only: shell AFTER a heredoc terminator is kept (the 44% FN class)",
+              "git push -u origin fm" in so(chained) and "fix: forbidden" not in so(chained))
+        check("shell_only: unquoted and <<- delimiters", "secret" not in so("cat <<-EOF\nsecret\nEOF\nls"))
+        push = {"on": "bash", "rx": r"git\s+push"}
+        check("evaluate: push after heredoc fires",
+              H.evaluate(push, hook_phase="pre", tool="Bash", cmd=chained))
+        check("evaluate: push only inside a body does not fire",
+              not H.evaluate(push, hook_phase="pre", tool="Bash",
+                             cmd="cat > n.md <<'EOF'\nrun git push\nEOF"))
+        check("evaluate: match_heredoc_body opts in",
+              H.evaluate(dict(push, match_heredoc_body=True), hook_phase="pre",
+                         tool="Bash", cmd="cat > n.md <<'EOF'\nrun git push\nEOF"))
+        check("evaluate: broken regex is False, never raises",
+              H.evaluate({"on": "bash", "rx": "("}, hook_phase="pre", tool="Bash", cmd="x") is False)
+
+        # --- ordering engine: arm / receipt / gate, keyed by worktree ---------
+        obook = os.path.join(td, "ordering.json")
+        with open(obook, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "rules": [
+                {"id": "audit-before-push", "on": "ordering", "repo_scope": "any",
+                 "ordering": {"required_command_rx": r"pytest\s+\S*tests/architecture",
+                              "gated_command_rx": r"git\s+push",
+                              "armed_by_events": ["edit", "write"],
+                              "min_edits": 1, "display_name": "the architecture suite"},
+                 "text": "Run the architecture suite before pushing", "why": "w"}]}, f)
+        oenv = {"MEMHUB_RULEBOOK": obook}
+        wt = os.path.join(td, "wtrepo")
+        os.makedirs(os.path.join(wt, ".git"))
+        with open(os.path.join(wt, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/feat\n")
+        edit_ev = {"cwd": wt, "session_id": "o1", "tool_name": "Edit",
+                   "tool_input": {"file_path": os.path.join(wt, "pkg", "gate.py")}}
+        suite = {"cwd": wt, "session_id": "o1", "tool_name": "Bash",
+                 "tool_input": {"command": "uv run pytest tests/architecture -q"}}
+        pushev = {"cwd": wt, "session_id": "o1", "tool_name": "Bash",
+                  "tool_input": {"command": "git push -u origin feat"}}
+
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: push with nothing armed → silent", out.strip() == "")
+        run("post", edit_ev, oenv)                                   # arm
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: push while armed → fires and names the file",
+              "[audit-before-push]" in ctx(out) and "gate.py" in ctx(out), ctx(out))
+        run("post", dict(suite, tool_response={"stdout": "1 failed", "exit_code": 1}), oenv)
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: RED suite run is not a receipt", "[audit-before-push]" in ctx(out))
+        run("post", dict(suite, tool_response={"stdout": "3 passed", "exit_code": 0}), oenv)
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: green run discharges → push allowed", out.strip() == "")
+        run("post", edit_ev, oenv)                                   # re-arm
+        rc, out = run("pre", dict(pushev, session_id="o2-sibling"), oenv)
+        check("ordering: state is per worktree, not per session (sibling sees the arm)",
+              "[audit-before-push]" in ctx(out))
+        run("post", dict(suite, session_id="subagent-9",
+                         tool_response={"stdout": "ok", "exit_code": 0}), oenv)
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: a SUBAGENT's green receipt discharges the parent's obligation",
+              out.strip() == "")
+        run("post", edit_ev, oenv)
+        with open(os.path.join(wt, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/other\n")
+        rc, out = run("pre", pushev, oenv)
+        check("ordering: state does not leak across branches", out.strip() == "")
+        oledger = os.path.join(td, "ledger", "fires.jsonl")
+        with open(oledger, encoding="utf-8") as f:
+            outcomes = [json.loads(l).get("outcome") for l in f if l.strip()]
+        check("ordering: discharges are logged (the conversion signal)",
+              outcomes.count("discharged") == 2, str(outcomes))
+        statefiles = [n for n in os.listdir(os.path.join(td, "state")) if n.startswith("wt-") and n.endswith(".json")]
+        check("ordering: one state file per worktree, atomic (no temp leftovers)",
+              len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
 
     print()
     if FAILURES:

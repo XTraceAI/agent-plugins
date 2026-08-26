@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Backtest a candidate rulebook rule against past Claude Code session transcripts.
 
-Replays the rule's matcher over every Bash/Edit/Write tool call recorded in
-~/.claude/projects/**/*.jsonl, with the SAME semantics as the live hook
-(~/.claude/scripts/rulebook/rulebook_hook.py): pre-heredoc segment for bash
-rules unless match_heredoc_body, rx/not_rx with re.I|re.M, path_rx /
-path_not_rx / content_rx for edit rules, repo_scope filtering, and
-fire_scope=session dedup (one fire per session).
+Replays the rule over every Bash/Edit/Write tool call recorded in
+~/.claude/projects/**/*.jsonl through the live hook's own `evaluate()`
+(imported from rulebook_hook.py beside this file) — never a re-implementation,
+so the backtest exercises exactly the code that will run. Adds repo_scope
+filtering and fire_scope=session dedup (one fire per session).
 
 This is the arming gate: a rule is added only after a human reads the
 excerpts this prints and judges them. Stdlib only; read-only.
@@ -27,6 +26,9 @@ import json
 import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rulebook_hook import evaluate  # noqa: E402 — the ONE matcher implementation
 
 RULEBOOK = os.path.expanduser("~/.claude/scripts/rulebook/rulebook.json")
 
@@ -54,23 +56,6 @@ def repo_of(cwd):
     return parts[-1] if parts else ""
 
 
-def match_bash(rule, cmd):
-    target = cmd if rule.get("match_heredoc_body") else cmd.split("<<", 1)[0]
-    if not re.search(rule["rx"], target, re.I | re.M):
-        return False
-    if rule.get("not_rx") and re.search(rule["not_rx"], target, re.I):
-        return False
-    return True
-
-
-def match_edit(rule, fp, body):
-    if not re.search(rule["path_rx"], fp):
-        return False
-    if rule.get("path_not_rx") and re.search(rule["path_not_rx"], fp):
-        return False
-    if "content_rx" in rule and not re.search(rule["content_rx"], body, re.M):
-        return False
-    return True
 
 
 def main():
@@ -156,7 +141,7 @@ def main():
                         if not cmd:
                             continue
                         scanned_calls += 1
-                        hit = match_bash(rule, cmd)
+                        hit = evaluate(rule, hook_phase="pre", tool="Bash", cmd=cmd)
                         excerpt = cmd
                     elif rule.get("_directive_mode") and tool in ("Edit", "Write", "MultiEdit"):
                         fp = str(inp.get("file_path", ""))
@@ -170,7 +155,7 @@ def main():
                         if not fp:
                             continue
                         scanned_calls += 1
-                        hit = match_edit(rule, fp, body)
+                        hit = evaluate(rule, hook_phase="pre", tool=tool, file_path=fp, body=body)
                         excerpt = fp
                     if hit:
                         raw_hits += 1
