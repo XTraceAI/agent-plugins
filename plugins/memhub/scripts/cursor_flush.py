@@ -13,7 +13,11 @@ The Cursor analog of ``flush_turn.py``, reusing its whole downstream —
    canonical-content digest. Exact completed-turn hook usage is persisted by
    generation id before the network call and folded into the final assistant
    record, so retries retain telemetry and duplicate ``afterAgentResponse`` /
-   ``stop`` delivery never double-counts it.
+   ``stop`` delivery never double-counts it. Per-record timestamps follow the
+   same discipline: Cursor's artifacts carry real clocks for only some
+   records, so each record is dated the moment a hook FIRST OBSERVES it and
+   that pin is persisted before the network call (``_stamp_records``) — a
+   re-send ships the original dates, never the re-send's wall clock.
 
 The full canonical transcript is re-sent each flush under the constant
 ``conversation_id cursor-<uuid>``; the SERVER's watermark folds re-sends
@@ -528,6 +532,98 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
     return applied
 
 
+# Per-record timestamp pins persisted in session state. Bounds a pathological
+# session's state file; FIFO eviction drops the OLDEST records, whose rows the
+# server has long since persisted with their original stamps (re-sends of
+# known uuids are folded by the server watermark), so eviction costs revision
+# churn on a giant session, never a wrong stored date.
+_RECORD_TS_CAP = 8192
+
+
+def _now_iso() -> str:
+    now = time.time()
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+            + f".{int(now * 1000) % 1000:03d}Z")
+
+
+def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
+                   first_observation: bool,
+                   boundary_uuids: frozenset | set = frozenset()) -> dict:
+    """Date every record with a REAL clock, pinned across re-sends.
+
+    The server persists ``timestamp`` as the row's ``event_date`` — "the
+    turn's clock at its source, NULL when unmeasured" (claude_parts,
+    ENG-675b). Cursor's artifacts only carry clocks for SOME records (user
+    turns' embedded tags, store checkpoint nodes), so this fills the gap with
+    the one other real clock available: the moment THIS hook first observed
+    the record. Boundary hooks (afterAgentResponse / stop /
+    beforeSubmitPrompt) fire when a turn actually completes, so first-seen is
+    the turn's own wall clock to within one hook interval — never the
+    import/flush clock of a whole-session re-send, which is the degeneracy
+    this replaces (a 44-turn production session dated at a single instant).
+
+    Pinning: the first stamp a record ever gets — artifact-carried or
+    first-seen — is stored in the session state and re-applied verbatim on
+    every later re-send, so a record's date never drifts with the re-flush
+    schedule. ``None`` pins mean "observed, no clock": records already present
+    at the session's FIRST observation (a mid-session install, a backfill)
+    predate any hook by an unknowable margin, so they stay unmeasured rather
+    than inheriting "now" — except a ``boundary_uuids`` record, which the
+    current hook explicitly dates (its generation just ended). A ``None`` pin
+    upgrades if the artifact later supplies a real clock for that record.
+
+    With ``now_iso=None`` this only APPLIES existing pins (read-only replay
+    for out-of-band senders); no new stamps are minted. Mutates ``records``
+    in place; returns the updated pin map for persisting.
+    """
+    stamps: dict = dict(prior) if isinstance(prior, dict) else {}
+    for record in records:
+        rid = record.get("uuid")
+        if not isinstance(rid, str) or not rid:
+            continue
+        reader_ts = record.get("timestamp")
+        reader_ts = reader_ts if isinstance(reader_ts, str) and reader_ts else None
+        if rid in stamps:
+            pinned = stamps[rid]
+            if not isinstance(pinned, str) or not pinned:
+                pinned = None
+            if pinned is None and reader_ts:
+                stamps[rid] = pinned = reader_ts
+            elif pinned is None and now_iso and rid in boundary_uuids:
+                stamps[rid] = pinned = now_iso
+        else:
+            if reader_ts:
+                pinned = reader_ts
+            elif now_iso and (not first_observation or rid in boundary_uuids):
+                pinned = now_iso
+            else:
+                pinned = None
+            stamps[rid] = pinned
+        if pinned:
+            record["timestamp"] = pinned
+        else:
+            record.pop("timestamp", None)
+    while len(stamps) > _RECORD_TS_CAP:
+        stamps.pop(next(iter(stamps)))
+    return stamps
+
+
+def apply_session_state(records: list[dict], uuid: str) -> None:
+    """Restore live-observed fidelity onto an out-of-band re-read.
+
+    capture.py (the manual import / sweep backstop for sessions whose
+    per-event flush went dormant) re-reads the artifact from scratch, which
+    carries neither the first-seen timestamp pins nor the exact hook usage
+    this machine observed live. Re-apply both from the session's flush state,
+    read-only — nothing here writes state, so a sweep can never perturb the
+    live capture's watermarks.
+    """
+    state = _read_state(uuid)
+    _stamp_records(records, state.get("record_ts"), None,
+                   first_observation=True)
+    _apply_usage(records, state.get("usage_events"))
+
+
 def _records_revision(records: list[dict]) -> str:
     encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":"),
                          sort_keys=True).encode("utf-8")
@@ -693,6 +789,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  applied_usage: set[str] | None = None) -> None:
     if records is None or meta is None:
         records, meta = cursor_reader.to_canonical(source_path)
+        # main() stamps before calling; this self-read path must not ship
+        # unpinned records (their dates would vary with the re-read).
+        apply_session_state(records, uuid)
     # Close the read span IMMEDIATELY — before redaction and the network call,
     # which together can run for many seconds. Blobs present at both the gate
     # and here existed for the whole span the payload was built from, so their
@@ -965,20 +1064,23 @@ def main() -> int:
                 records, meta = cursor_reader.to_canonical(
                     source_path, session_id=uuid,
                     cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
-                source_revision = _records_revision(records)
         except Exception as e:  # locked/partial/corrupt source — next hook retries
             _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
             return 0
 
-        # Persist source identity and exact usage BEFORE any network work.
-        # afterAgentResponse and stop duplicate the same generation; replacing
-        # that dictionary key makes delivery idempotent, while a later hook can
-        # retry an auth/server failure without needing Cursor to repeat usage.
+        # Persist source identity, exact usage, and timestamp pins BEFORE any
+        # network work. afterAgentResponse and stop duplicate the same
+        # generation; replacing that dictionary key makes delivery idempotent,
+        # while a later hook can retry an auth/server failure without needing
+        # Cursor to repeat usage. Timestamp pins likewise: a record's date is
+        # fixed the moment it is first OBSERVED, so a failed send retries with
+        # the same stamps instead of re-dating the records at retry time.
         fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
         if source_kind == "transcript":
             fields["transcript_path"] = str(source_path)
         usage_events = state.get("usage_events")
         usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
+        boundary_uuids: set[str] = set()
         sample = _hook_usage(event, payload)
         if sample is not None:
             generation, usage = sample
@@ -991,10 +1093,24 @@ def main() -> int:
                 usage_events = _usage_events_with(
                     state, generation, target, usage)
                 fields["usage_events"] = usage_events
+                # This hook explicitly dates that record: its generation ended
+                # NOW, so it gets a real clock even in a first-observation
+                # backlog (where everything else stays unmeasured).
+                boundary_uuids = {target}
         elif (event in ("afterAgentResponse", "stop") and
               any(key in payload for key in _HOOK_USAGE_KEYS)):
             _log(f"{event}: malformed token counters or generation_id — "
                  "leaving this turn unmeasured")
+
+        fields["record_ts"] = _stamp_records(
+            records, state.get("record_ts"), _now_iso(),
+            first_observation="record_ts" not in state,
+            boundary_uuids=boundary_uuids)
+        if source_kind == "transcript":
+            # AFTER stamping: the revision must hash the shape that ships.
+            # Pins make it stable across invocations — it moves only when a
+            # new record (uuid) appears, which is precisely "new content".
+            source_revision = _records_revision(records)
 
         _save_state(uuid, **fields)
         state.update(fields)

@@ -163,6 +163,15 @@ def cmd_import(args) -> int:
     if not records:
         print(f"ERROR: nothing to import from {path}", file=sys.stderr)
         return 2
+    if r.HOST == "cursor":
+        # Cursor artifacts carry clocks/usage for only some records; the live
+        # flush observed the rest and pinned them in its session state. This
+        # import is the documented backstop for sessions whose per-event flush
+        # went dormant — re-apply those pins (read-only) so the backstop
+        # preserves the same per-turn fidelity the live path ships.
+        import cursor_flush
+        cursor_flush.apply_session_state(
+            records, meta.get("session_id") or path.stem)
     problems = readers.validate_canonical(records)
     if problems:
         print(f"ERROR: transform produced non-canonical records: {problems[:3]}",

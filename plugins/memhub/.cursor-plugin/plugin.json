@@ -1,7 +1,7 @@
 {
   "name": "memhub",
   "displayName": "MemHub",
-  "version": "0.27.14",
+  "version": "0.27.15",
   "description": "XTrace MemHub team memory in Cursor: search_memory / save_artifact / import_conversation tools plus skills for artifact upload, session import, recall, handoff, and spec-driven development. Sessions are captured automatically.",
   "author": {
     "name": "XTrace"

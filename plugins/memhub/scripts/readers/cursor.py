@@ -36,6 +36,19 @@ Cursor IDE 3.17 also writes hook transcripts at
 JSONL records preserve user/assistant text and tool calls but omit tool
 results, model, cwd, and usage. Hook payload metadata fills the latter fields
 during live capture; manual imports remain valid with nullable metadata.
+
+**Timestamps are real or absent — never synthesized.** The server persists
+``timestamp`` as the row's ``event_date``, whose contract (MemHub's
+claude_parts, ENG-675b) is "the turn's clock at its source; NULL means
+unmeasured". A record therefore gets a ``timestamp`` only from a clock the
+artifact actually carries for it: a user turn's embedded ``<timestamp>`` tag,
+a store leaf's ancestor checkpoint clock, or meta.json's ``createdAtMs`` on
+the synthetic banner. Session-level fallbacks (``updatedAtMs``, file ctime)
+used to be stamped on every otherwise-undated record; those are flush-adjacent
+wall clocks, so a whole session collapsed onto one or two ``event_date``
+values — measured on production as 44 turns sharing a single instant. Live
+capture fills the gaps with per-record first-seen clocks instead
+(``cursor_flush._stamp_records``); backfills honestly leave them NULL.
 """
 from __future__ import annotations
 
@@ -334,15 +347,6 @@ def _iso_ms(ms) -> str | None:
         return None
 
 
-def _iso_seconds(seconds) -> str | None:
-    try:
-        return datetime.datetime.fromtimestamp(
-            seconds, tz=datetime.timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    except (TypeError, ValueError, OSError):
-        return None
-
-
 def _embedded_timestamp(text: str) -> str | None:
     match = _TIMESTAMP_RE.search(text or "")
     if not match:
@@ -368,10 +372,13 @@ def _model_of(obj) -> str | None:
 
 def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                   session_id: str, cwd: str | None, model_hint: str | None,
-                  created_ts: str | None, fallback_ts: str | None
-                  ) -> tuple[list[dict], dict]:
-    """Transform either native source after it has yielded ordered messages."""
-    ts_holder = {"ts": fallback_ts}
+                  created_ts: str | None) -> tuple[list[dict], dict]:
+    """Transform either native source after it has yielded ordered messages.
+
+    Each message's ``ts`` is a clock the artifact carries FOR IT (or None —
+    see the module docstring); no session-level value fills the gaps here.
+    """
+    ts_holder: dict = {"ts": None}
     out: list[dict] = []
 
     def rec(record: dict) -> dict:
@@ -410,12 +417,12 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
     if cwd:
         banner += f" · cwd {cwd}"
     banner += "]"
-    ts_holder["ts"] = created_ts or fallback_ts
+    ts_holder["ts"] = created_ts
     out.append(user(banner))
 
     title = None
     for msg, message_ts in dated_messages:
-        ts_holder["ts"] = message_ts or fallback_ts
+        ts_holder["ts"] = message_ts
         role = msg.get("role")
         content = msg.get("content")
 
@@ -492,13 +499,17 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 _MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
 
 
-def _load_transcript(path: Path) -> tuple[list[tuple[dict, str | None]], str | None]:
-    """Read Cursor hook JSONL, ignoring only an unfinished final line."""
-    try:
-        fallback_ts = _iso_seconds(path.stat().st_ctime)
-    except OSError:
-        fallback_ts = None
-    current_ts = fallback_ts
+def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
+    """Read Cursor hook JSONL, ignoring only an unfinished final line.
+
+    A message's clock is its OWN embedded ``<timestamp>`` tag (user turns
+    carry one inside Cursor's context injection) or None. It is deliberately
+    NOT carried forward to the following assistant/tool messages and not
+    defaulted from file times: both collapse a whole span of turns onto one
+    repeated value, which is exactly the degenerate ``event_date`` shape this
+    reader must never produce. Live capture dates the undated records by
+    first-seen hook clock instead; backfills leave them unmeasured.
+    """
     messages: list[tuple[dict, str | None]] = []
     with path.open("rb") as handle:
         line_no = 0
@@ -530,11 +541,10 @@ def _load_transcript(path: Path) -> tuple[list[tuple[dict, str | None]], str | N
                 continue
             message = dict(body)
             message["role"] = entry["role"]
-            if entry["role"] == "user":
-                current_ts = (_embedded_timestamp(_text_of(message.get("content")))
-                              or current_ts)
-            messages.append((message, current_ts))
-    return messages, fallback_ts
+            own_ts = (_embedded_timestamp(_text_of(message.get("content")))
+                      if entry["role"] == "user" else None)
+            messages.append((message, own_ts))
+    return messages
 
 
 def to_canonical(path, *, session_id: str | None = None,
@@ -544,11 +554,14 @@ def to_canonical(path, *, session_id: str | None = None,
     source = Path(path)
     if source.name != "store.db":
         sid = session_id or source.stem
-        messages, fallback_ts = _load_transcript(source)
-        created_ts = messages[0][1] if messages else fallback_ts
+        messages = _load_transcript(source)
+        # The banner's clock: the first embedded user-turn tag — the earliest
+        # source-carried instant the transcript offers (None when it offers
+        # none; the flush's first-seen stamp covers live sessions).
+        created_ts = next((ts for _, ts in messages if ts), None)
         return _canonicalize(
             messages, session_id=sid, cwd=cwd, model_hint=model,
-            created_ts=created_ts, fallback_ts=fallback_ts)
+            created_ts=created_ts)
 
     session_dir = source.parent
     mj = _read_meta_json(session_dir) or {}
@@ -559,11 +572,12 @@ def to_canonical(path, *, session_id: str | None = None,
             f"reader is pinned to {_SCHEMA_VERSION} — refusing to misparse. "
             "Update readers/cursor.py against the new format.")
     store_cwd = mj.get("cwd")
-    fallback_ts = (_iso_ms(mj.get("updatedAtMs")) or
-                   _iso_ms(mj.get("createdAtMs")))
-    messages = [(message, _iso_ms(node_ts) or fallback_ts)
+    # A leaf's clock is its nearest ancestor checkpoint node's — per-checkpoint
+    # real time, or None where no ancestor carried one. meta.json's
+    # ``updatedAtMs`` is NOT a substitute: it moves with every write, so using
+    # it dates the whole undated remainder at flush-adjacent time.
+    messages = [(message, _iso_ms(node_ts))
                 for message, node_ts in _load_messages(source)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")),
-        fallback_ts=fallback_ts)
+        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))
