@@ -291,6 +291,20 @@ def test_main_flow_pins_persist_and_ship():
     print("PASS test_main_flow_pins_persist_and_ship")
 
 
+def test_capture_session_sid_falls_back_to_real_uuid():
+    """The capture.py fallback must key flush state by the SESSION uuid: a
+    store.db's uuid is its directory name — the file stem is just 'store',
+    which would silently no-op the state restore (review finding)."""
+    import capture
+    store = Path("/home/u/.cursor/chats/hash") / SESSION / "store.db"
+    assert capture._session_sid({}, store) == SESSION
+    transcript = Path("/x/agent-transcripts") / SESSION / f"{SESSION}.jsonl"
+    assert capture._session_sid({}, transcript) == SESSION
+    assert capture._session_sid({"session_id": "meta-wins"}, store) == "meta-wins"
+    assert capture._session_sid({"session_id": ""}, store) == SESSION
+    print("PASS test_capture_session_sid_falls_back_to_real_uuid")
+
+
 def test_apply_session_state_without_state_is_inert():
     with tempfile.TemporaryDirectory() as td:
         old_state = cursor_flush.STATE_DIR

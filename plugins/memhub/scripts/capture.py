@@ -113,6 +113,20 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
     return r, path, ""
 
 
+def _session_sid(meta: dict, path: Path) -> str:
+    """The session uuid for state lookups and the conv-id suffix.
+
+    ``meta["session_id"]`` when the reader set it (it always does today);
+    otherwise derived from the path the way the readers themselves do it —
+    a ``store.db``'s uuid is its session DIRECTORY name, every other native
+    layout carries it in the file stem.
+    """
+    sid = meta.get("session_id")
+    if isinstance(sid, str) and sid:
+        return sid
+    return path.parent.name if path.name == "store.db" else path.stem
+
+
 def cmd_import(args) -> int:
     r, path, err = _resolve(args)
     if r is None:
@@ -163,6 +177,12 @@ def cmd_import(args) -> int:
     if not records:
         print(f"ERROR: nothing to import from {path}", file=sys.stderr)
         return 2
+    # The session id keys the conversation id AND (for Cursor) the flush-state
+    # lookup below. Readers always set meta["session_id"], but the defensive
+    # fallback must still be the real session uuid: a store.db's uuid is its
+    # DIRECTORY name — the file stem is just "store", which would silently
+    # no-op the state restore and mis-scope conv_id to "cursor-store".
+    sid = _session_sid(meta, path)
     if r.HOST == "cursor":
         # Cursor artifacts carry clocks/usage for only some records; the live
         # flush observed the rest and pinned them in its session state. This
@@ -170,8 +190,7 @@ def cmd_import(args) -> int:
         # went dormant — re-apply those pins (read-only) so the backstop
         # preserves the same per-turn fidelity the live path ships.
         import cursor_flush
-        cursor_flush.apply_session_state(
-            records, meta.get("session_id") or path.stem)
+        cursor_flush.apply_session_state(records, sid)
     problems = readers.validate_canonical(records)
     if problems:
         print(f"ERROR: transform produced non-canonical records: {problems[:3]}",
@@ -180,7 +199,6 @@ def cmd_import(args) -> int:
 
     # Keep conv_id == <host>-<session-uuid> however the session was addressed,
     # so incremental dedup holds across re-imports.
-    sid = meta.get("session_id") or path.stem
     conv_id = args.conversation_id or f"{r.HOST}-{sid}"
     if not args.title and meta.get("title"):
         passthrough += ["--title", meta["title"]]
