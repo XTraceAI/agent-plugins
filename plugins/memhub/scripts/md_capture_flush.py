@@ -179,7 +179,7 @@ async def flush(session_id: str) -> None:
             # the next Stop rather than drop — bounded by MAX_ATTEMPTS.
             _bump(attempts, raw, processed, f"unreadable ({type(e).__name__})")
             continue
-        ok, why = is_candidate(p, size=len(text.encode("utf-8")), text=text)
+        ok, why = is_candidate(p, size=nbytes, text=text)   # UTF-8: on-disk bytes == encoded length
         if not ok:
             _log(f"skip {p.name}: {why}")
             processed.add(raw)
