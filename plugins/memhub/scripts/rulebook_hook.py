@@ -153,9 +153,12 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
         if hook_phase == "post" and on == "result" and result_text:
             if rule.get("cmd_rx") and not re.search(rule["cmd_rx"], cmd, re.I):
                 return False
-            m = re.search(rule["rx"], result_text[-8000:], re.M)
+            tail = result_text[-8000:]
+            m = re.search(rule["rx"], tail, re.M)
+            # exclude_rx exempts the whole result (an exempt test name usually
+            # sits outside the matched span), not just the matched substring
             return bool(m) and not (
-                rule.get("exclude_rx") and re.search(rule["exclude_rx"], m.group(0)))
+                rule.get("exclude_rx") and re.search(rule["exclude_rx"], tail, re.M))
     except Exception:
         return False
     return False
@@ -439,6 +442,8 @@ def to_hook_rule(row):
         for k, v in m.items():
             if k == "event":
                 continue
+            if k == "result_rx" and "content_rx" in m:
+                continue              # content_rx is the schema key; result_rx is a legacy alias
             dest = keys.get(k, k)
             if dest in _RESERVED_RULE_KEYS:   # a matcher key can never overwrite the row's own fields
                 continue
