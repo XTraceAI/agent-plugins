@@ -344,6 +344,7 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
 }
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
+_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -440,7 +441,10 @@ def to_hook_rule(row):
         for k, v in m.items():
             if k == "event":
                 continue
-            r[keys.get(k, k)] = v
+            dest = keys.get(k, k)
+            if dest in _RESERVED_RULE_KEYS:   # a matcher key can never overwrite the row's own fields
+                continue
+            r[dest] = v
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
@@ -717,13 +721,17 @@ def pending_batches(sent):
             seen.add(fid)
     batches = []
     fo = sent.get("fires_offset", 0) if f_offsets or new_fires else f_end
+    # conversions are credited once the last batch that carries a conversion
+    # re-send is accepted (they sit after the fires), not only on the final one
+    last_conv = max([-1] + [i for i, (_, o) in enumerate(items) if o is None])
     for i in range(0, len(items), FLUSH_BATCH):
         chunk = items[i:i + FLUSH_BATCH]
         fo = max([fo] + [o for _, o in chunk if o is not None])
         last = i + FLUSH_BATCH >= len(items)
+        convs_done = last or i + FLUSH_BATCH > last_conv
         batches.append(([r for r, _ in chunk],
                         dict(sent, fires_offset=f_end if last else fo,
-                             conversions_offset=c_end if last else c_start)))
+                             conversions_offset=c_end if convs_done else c_start)))
     return batches, new_sent
 
 

@@ -446,6 +446,10 @@ def main():
         bad_rx = H.to_hook_rule({"rule_id": "evil", "statement": "s", "matcher": {"event": "bash", "command_rx": "(a+)+$"}})
         bad_ord = H.to_hook_rule({"rule_id": "evil2", "statement": "s", "ordering": {"required_command_rx": "(", "gated_command_rx": "x"}})
         good = H.to_hook_rule({"rule_id": "fine", "statement": "s", "matcher": {"event": "bash", "command_rx": r"git\s+push"}})
+        smug = H.to_hook_rule({"rule_id": "smug", "statement": "s", "status": "draft", "mode": "advise",
+                               "matcher": {"event": "bash", "command_rx": "x", "mode": "gate", "status": "active", "id": "other"}})
+        check("book: matcher keys can never overwrite the row's own id/status/mode",
+              smug and smug["id"] == "smug" and smug["status"] == "draft" and smug["mode"] == "advise")
         alt = H.to_hook_rule({"rule_id": "evil3", "statement": "s", "matcher": {"event": "bash", "command_rx": "(a|aa)+$"}})
         check("to_hook_rule: a wire regex that nests quantifiers or fails to compile drops the rule, not the hook",
               bad_rx is None and bad_ord is None and alt is None and good is not None)
