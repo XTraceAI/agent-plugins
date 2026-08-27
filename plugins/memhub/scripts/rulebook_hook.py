@@ -338,7 +338,7 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
-_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
+_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -387,6 +387,12 @@ def _clean_text(v):
     return t[:_TEXT_MAX]
 
 
+def _why(r):
+    """The parenthetical reason — only when the rule carries one separately;
+    server statements already end in 'Why: …'."""
+    return f"  _(why: {r['why']})_" if r.get("why") else ""
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. Never raises
@@ -407,6 +413,7 @@ def to_hook_rule(row):
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
+             "_label": _clean_text(row.get("title")) or None,
              "mode": row.get("mode", "advise"), "_version": _version_of(row.get("version"))}
         if not r["id"]:
             return None
@@ -987,7 +994,7 @@ def session_digest(rules, repo, gitdir, ctx):
     active = [r for r in in_scope if r.get("on") != "session"]
     lines = ["## 📏 Rulebook (team rules — advisory)"]
     for r in posture:
-        lines.append(f"- {r['text']}  _(why: {r['why']})_")
+        lines.append(f"- {r['text']}{_why(r)}")
     if active:
         lines.append(
             f"- {len(active)} rule{'s' if len(active) != 1 else ''} armed for "
@@ -1151,7 +1158,7 @@ def main():
     lines = ["## 📏 Rulebook (team rules — advisory, not blocking)"]
     for r in shown:
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
-        lines.append(f"- **[{r['id']}]** {r['text']}{detail}  _(why: {r['why']})_")
+        lines.append(f"- **[{r.get('_label') or r['id']}]** {r['text']}{detail}{_why(r)}")
     # §5.3: a gate from a stale book runs as advise and says so once per session.
     degraded = [r["id"] for r in shown if r.get("mode") == "gate"
                 and effective_mode(r, fetched_at) == "advise"]
