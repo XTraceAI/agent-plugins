@@ -809,10 +809,10 @@ def flush_fires(final=False):
                 # a row is a poison batch: log it as rejected and move past it,
                 # so one bad row can never strand every fire behind it.
                 key = batch[0].get("fire_id")
-                stall = sent.get("stall") or {}
+                cur = load_sent()             # the on-disk state, including any
+                stall = cur.get("stall") or {}  # progress written by earlier batches
                 n = (stall.get("n", 0) + 1) if stall.get("key") == key else 1
                 if n < STALL_QUARANTINE_AFTER:
-                    cur = load_sent()
                     cur["stall"] = {"key": key, "n": n}
                     _atomic_json(_sent_path(), cur)
                     return
@@ -822,7 +822,12 @@ def flush_fires(final=False):
             else:
                 _log_rejected(rej, batch)
             accepted += data["accepted"]
-            after.pop("stall", None)
+            if (sent.get("stall") or {}).get("key") != batch[0].get("fire_id"):
+                after["stall"] = sent.get("stall")   # an accepted batch clears only ITS OWN marker
+            else:
+                after.pop("stall", None)
+            if after.get("stall") is None:
+                after.pop("stall", None)
             after["last_flush_at"] = _now()
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
