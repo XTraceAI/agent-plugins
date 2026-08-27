@@ -17,17 +17,16 @@ Lanes (the mode argument):
            behind a sent-watermark (ledger/.sent). `flush final` ignores the
            every-N-fires / every-M-minutes throttle.
 
-Book = server book (cached, ETag) merged with the local rulebook.json; local
-wins on id collision during the pilot. Offline → cached book; no cache → local
-only. A `mode: gate` rule is honoured only from a book fetched within 24 h —
+Book = the server book, fetched once per session and cached with its ETag.
+Offline → the cached book; no cache → no rules. There is no local rule file:
+rules are authored through the memhub `create_rule` tool. A `mode: gate` rule is honoured only from a book fetched within 24 h —
 older caches run it as `advise` (spec §5.3). Wire rows carry identifiers, never
 payloads: `excerpt` is stripped before POST.
 
 Usage (wired in hooks.json): printf %s "$IN" | python3 rulebook_hook.py {session|pre|post}
 
-Rulebook location: $MEMHUB_RULEBOOK, else ~/.claude/scripts/rulebook/rulebook.json.
-State + fire ledger live beside the rulebook so the local pilot and the plugin
-share one history. Stdlib only; every failure path exits 0 with no output — a
+State (book cache, ordering state, fire ledger) lives under
+$MEMHUB_RULEBOOK_BASE, else ~/.config/memhub-plugin/rulebook. Stdlib only; every failure path exits 0 with no output — a
 broken hook must never touch the tool call or the session.
 
 Two engines, one evaluate():
@@ -50,13 +49,12 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
-BASE = os.path.dirname(os.environ.get("MEMHUB_RULEBOOK", "")) or \
-    os.path.expanduser("~/.claude/scripts/rulebook")
-RULEBOOK = os.environ.get("MEMHUB_RULEBOOK") or os.path.join(BASE, "rulebook.json")
+BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
+    os.path.expanduser("~/.config/memhub-plugin/rulebook")
 MAX_ADVISE = 2          # per tool call — habituation guard
 MAX_POSTURE = 3         # full-text rules at session start — context guard
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
-LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2); v1 = per-tool-call rows
+LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
 BOOK_MAX_AGE_S = 24 * 3600   # §5.3: a gate from an older cache degrades to advise
 API_PATH = "/v1/team/rulebook"
@@ -155,9 +153,12 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
         if hook_phase == "post" and on == "result" and result_text:
             if rule.get("cmd_rx") and not re.search(rule["cmd_rx"], cmd, re.I):
                 return False
-            m = re.search(rule["rx"], result_text[-8000:], re.M)
+            tail = result_text[-8000:]
+            m = re.search(rule["rx"], tail, re.M)
+            # exclude_rx exempts the whole result (an exempt test name usually
+            # sits outside the matched span), not just the matched substring
             return bool(m) and not (
-                rule.get("exclude_rx") and re.search(rule["exclude_rx"], m.group(0)))
+                rule.get("exclude_rx") and re.search(rule["exclude_rx"], tail, re.M))
     except Exception:
         return False
     return False
@@ -303,15 +304,6 @@ def bash_ok(resp, *, strict=False):
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
-def load_local_rules():
-    """The local pilot book. Missing → no rules; corrupt → raises (caller is silent)."""
-    if not os.path.isfile(RULEBOOK):
-        return [], ""
-    with open(RULEBOOK, encoding="utf-8") as f:
-        book = json.load(f)
-    return book["rules"], str(book.get("version", ""))
-
-
 def book_path(repo):
     """Readable name + a hash of the RAW name, so two repos that sanitise to
     the same string ('my repo' / 'my_repo') never share a book."""
@@ -342,7 +334,8 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
     "command_rx": "rx", "command_not_rx": "not_rx", "content_not_rx": "content_not_rx",
     "warn_once_per": "fire_scope", "result_rx": "rx",
 }
-_RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx")
+_RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
+                    content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
 
@@ -403,7 +396,13 @@ def to_hook_rule(row):
         if "on" in row:
             r = dict(row)
             r.setdefault("id", row.get("rule_id"))
-            return r if r.get("id") else None
+            r.setdefault("_version", _version_of(row.get("version")))
+            if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
+                return None           # same regex lint as the server shape
+            if isinstance(r.get("ordering"), dict) and not all(
+                    rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
+                return None
+            return r
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
@@ -436,11 +435,15 @@ def to_hook_rule(row):
         m = row.get("matcher")
         if not isinstance(m, dict):
             return None
-        r["on"] = m.get("event") or "bash"
+        # the server names the tool-result event "output" (§3.1); the hook's
+        # post lane calls it "result" and reads content_* as the result pattern
+        r["on"] = {"output": "result"}.get(m.get("event") or "bash", m.get("event") or "bash")
         keys = _RESULT_KEYS if r["on"] == "result" else _MATCHER_KEYS
         for k, v in m.items():
             if k == "event":
                 continue
+            if k == "result_rx" and "content_rx" in m:
+                continue              # content_rx is the schema key; result_rx is a legacy alias
             dest = keys.get(k, k)
             if dest in _RESERVED_RULE_KEYS:   # a matcher key can never overwrite the row's own fields
                 continue
@@ -454,30 +457,21 @@ def to_hook_rule(row):
 
 
 def load_rules(repo):
-    """Local book ∪ cached server book. Local wins on id collision (pilot).
-    Returns (rules, local_version, fetched_at, sources) where sources maps
-    rule id → "local" | "server"."""
-    try:
-        local, version = load_local_rules()
-    except Exception:       # a corrupt local book must not also lose the server book
-        local, version = [], ""
+    """The cached server book as hook rules. Returns (rules, "", fetched_at,
+    sources) — sources maps rule id → "server" (kept for the audit file)."""
     book = load_book(repo)
-    merged, sources = [], {}
-    for r in local:
-        if r.get("id"):
-            merged.append(r)
-            sources[r["id"]] = "local"
+    rules, sources = [], {}
     for row in (book or {}).get("rules", []):
         r = to_hook_rule(row)
         if r and r["id"] not in sources:
-            merged.append(r)
+            rules.append(r)
             sources[r["id"]] = "server"
-    return merged, version, (book or {}).get("fetched_at"), sources
+    return rules, "", (book or {}).get("fetched_at"), sources
 
 
 def effective_mode(rule, fetched_at, now=None):
     """`gate` is honoured only from a book fetched (200 or 304) within the last
-    24 h (§5.3); anything else is `advise`. Local-book rules never gate."""
+    24 h (§5.3); anything else is `advise`. """
     mode = rule.get("mode", "advise")
     if mode != "gate":
         return "advise"
@@ -914,9 +908,7 @@ def _ledger_dir():
     d = os.path.join(BASE, "ledger")
     os.makedirs(d, exist_ok=True)
     sv = os.path.join(d, "schema_version")
-    # stamp v2 only on a FRESH ledger; an unstamped ledger with rows is v1 and
-    # must go through rulebook_ledger_migrate.py — never silently relabel it
-    if not os.path.exists(sv) and not os.path.exists(os.path.join(d, "fires.jsonl")):
+    if not os.path.exists(sv):
         with open(sv, "w", encoding="utf-8") as f:
             f.write(f"{LEDGER_SCHEMA}\n")
     return d

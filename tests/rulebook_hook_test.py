@@ -17,8 +17,8 @@ Covers the properties that make this safe to ship in everyone's harness:
   subagents, never leaking across branches;
 * the post lane fires on failing result text, gated by cmd_rx;
 * repo_scope filters rules to the repo the session is in;
-* MEMHUB_RULEBOOK relocates the book AND its state/ledger together, so tests
-  never touch the developer's real rulebook.
+* MEMHUB_RULEBOOK_BASE relocates the book cache, state and ledger together, so
+  tests never touch the developer's real state.
 
 Run: python3 rulebook_hook_test.py  (stdlib only).
 """
@@ -49,6 +49,21 @@ def run(mode: str, payload: dict, env_extra: dict) -> tuple[int, str]:
     return p.returncode, p.stdout
 
 
+def seed_book(base, repo_name, rules):
+    """Write a cached server book for `repo_name` under `base` (what the fetch
+    lane would have cached). Rows in the pilot shape (an `on` key) pass
+    straight through to_hook_rule."""
+    import datetime as _dt
+    import hashlib
+    d = os.path.join(base, "book")
+    os.makedirs(d, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo_name)[:60]
+    h = hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:8]
+    with open(os.path.join(d, f"{safe}-{h}.json"), "w", encoding="utf-8") as f:
+        json.dump({"etag": "seed", "fetched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                   "rules": rules}, f)
+
+
 def ctx(out: str) -> str:
     if not out.strip():
         return ""
@@ -64,7 +79,6 @@ def main() -> int:
         other = os.path.join(td, "otherrepo")
         os.makedirs(os.path.join(other, ".git"))
 
-        book = os.path.join(td, "rulebook.json")
         rules = {"version": 1, "rules": [
             {"id": "posture-one", "on": "session", "fire_scope": "session",
              "repo_scope": "xmem", "text": "Posture text", "why": "posture why"},
@@ -80,9 +94,11 @@ def main() -> int:
             {"id": "draft-rule", "on": "bash", "rx": r"forbidden-cmd", "status": "draft",
              "fire_scope": "session", "repo_scope": "any", "text": "DRAFT TEXT", "why": "w"},
         ]}
-        with open(book, "w", encoding="utf-8") as f:
-            json.dump(rules, f)
-        env = {"MEMHUB_RULEBOOK": book}
+        for r in rules["rules"]:
+            r["version"] = 1
+        seed_book(td, "xmem", rules["rules"])
+        seed_book(td, "otherrepo", rules["rules"])
+        env = {"MEMHUB_RULEBOOK_BASE": td}
 
         # --- fail-open properties -----------------------------------------
         rc, out = run("pre", {"cwd": "/", "tool_name": "Bash",
@@ -90,16 +106,17 @@ def main() -> int:
         check("non-git cwd is silent", rc == 0 and out.strip() == "")
 
         rc, out = run("session", {"cwd": repo},
-                      {"MEMHUB_RULEBOOK": os.path.join(td, "missing.json")})
-        check("missing rulebook is silent exit-0", rc == 0 and out.strip() == "")
+                      {"MEMHUB_RULEBOOK_BASE": os.path.join(td, "empty-base")})
+        check("no cached book is silent exit-0", rc == 0 and out.strip() == "")
 
-        bad = os.path.join(td, "bad.json")
-        with open(bad, "w", encoding="utf-8") as f:
+        badbase = os.path.join(td, "bad-base")
+        seed_book(badbase, "xmem", [])
+        with open(os.path.join(badbase, "book", os.listdir(os.path.join(badbase, "book"))[0]), "w", encoding="utf-8") as f:
             f.write("{not json")
         rc, out = run("pre", {"cwd": repo, "tool_name": "Bash",
                               "tool_input": {"command": "forbidden-cmd"}},
-                      {"MEMHUB_RULEBOOK": bad})
-        check("corrupt rulebook is silent exit-0", rc == 0 and out.strip() == "")
+                      {"MEMHUB_RULEBOOK_BASE": badbase})
+        check("corrupt cached book is silent exit-0", rc == 0 and out.strip() == "")
 
         p = subprocess.run([sys.executable, HOOK, "pre"], input="}}garbage",
                            capture_output=True, text=True,
@@ -167,20 +184,18 @@ def main() -> int:
                   all(r["mode"] == "advise" for r in rows))
             check("ledger v2: full session_id, rule_version, tz-aware fired_at",
                   all(r["session_id"] in ("s1", "s2", "s6") for r in rows) and
-                  all(r["rule_version"] == "1" for r in rows) and
+                  all(r["rule_version"] == 1 for r in rows) and
                   all(re.search(r"([+-]\d\d:\d\d|Z)$", r["fired_at"]) for r in rows))
             check("ledger v2: schema_version file stamped",
                   open(os.path.join(td, "ledger", "schema_version"), encoding="utf-8").read().strip() == "2")
 
         # --- cap → suppressed rows; converted_rx → conversions sidecar --------
-        cbook = os.path.join(td, "cap.json")
-        with open(cbook, "w", encoding="utf-8") as f:
-            json.dump({"version": "t", "rules": [
+        seed_book(td, "xmem", rules["rules"] + [
                 {"id": f"cap-{i}", "on": "bash", "rx": r"capcmd", "fire_scope": "session",
                  "repo_scope": "any", "text": f"cap {i}", "why": "w",
                  **({"converted_rx": r"do-the-thing"} if i == 0 else {})}
-                for i in range(3)]}, f)
-        cenv = {"MEMHUB_RULEBOOK": cbook}
+                for i in range(3)])
+        cenv = env
         cb = {"cwd": repo, "session_id": "c1", "tool_name": "Bash"}
         rc, out = run("pre", dict(cb, tool_input={"command": "capcmd"}), cenv)
         check("cap: at most MAX_ADVISE rules shown", ctx(out).count("[cap-") == 2)
@@ -247,16 +262,14 @@ def main() -> int:
               H.evaluate({"on": "bash", "rx": "("}, hook_phase="pre", tool="Bash", cmd="x") is False)
 
         # --- ordering engine: arm / receipt / gate, keyed by worktree ---------
-        obook = os.path.join(td, "ordering.json")
-        with open(obook, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "rules": [
+        seed_book(td, "wtrepo", [
                 {"id": "audit-before-push", "on": "ordering", "repo_scope": "any",
                  "ordering": {"required_command_rx": r"pytest\s+\S*tests/architecture",
                               "gated_command_rx": r"git\s+push",
                               "armed_by_events": ["edit", "write"],
                               "min_edits": 1, "display_name": "the architecture suite"},
-                 "text": "Run the architecture suite before pushing", "why": "w"}]}, f)
-        oenv = {"MEMHUB_RULEBOOK": obook}
+                 "text": "Run the architecture suite before pushing", "why": "w"}])
+        oenv = env
         wt = os.path.join(td, "wtrepo")
         os.makedirs(os.path.join(wt, ".git"))
         with open(os.path.join(wt, ".git", "HEAD"), "w", encoding="utf-8") as f:
