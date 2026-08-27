@@ -154,7 +154,11 @@ async def flush(session_id: str) -> None:
         # The collector stored the CANONICAL path. If it no longer resolves to
         # itself, something on the way was swapped for a symlink since — the
         # veto was judged on the recorded path, so don't read through it.
-        if p.is_symlink() or p.resolve() != p:
+        try:
+            canonical = not p.is_symlink() and p.resolve() == p
+        except (OSError, RuntimeError):     # symlink loop etc.: this item only
+            canonical = False
+        if not canonical:
             _log(f"skip {p.name}: no longer canonical")
             processed.add(raw)
             continue
