@@ -29,10 +29,14 @@ import json
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 STATE_PREFIX = "memhub-md-capture-"
+# Per-user, 0700 — the same home the other per-session state lives in
+# (flush_turn / codex_flush / cursor_flush). NOT the shared temp dir: the
+# flusher uploads every path in `dirty`, so a world-writable, predictable
+# state file would let another local user pick what gets shipped.
+STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "mdcapture"
 PATH_KEYS = ("file_path", "notebook_path")
 UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -62,7 +66,7 @@ def state_path(session_id: str) -> Path | None:
     sid = UNSAFE.sub("", session_id or "")
     if not sid:
         return None
-    return Path(tempfile.gettempdir()) / f"{STATE_PREFIX}{sid}.json"
+    return STATE_DIR / f"{STATE_PREFIX}{sid}.json"
 
 
 def load_state(session_id: str) -> dict:
@@ -82,6 +86,11 @@ def save_state(session_id: str, state: dict) -> None:
     p = state_path(session_id)
     if p is None:
         return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(p.parent, 0o700)
+    except OSError:
+        pass
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
     os.replace(tmp, p)

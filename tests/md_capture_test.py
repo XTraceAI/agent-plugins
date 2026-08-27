@@ -79,8 +79,11 @@ check(mc.frontmatter("---\nunterminated") == "", "unterminated → empty")
 print("collector (subprocess, real hook contract)")
 with tempfile.TemporaryDirectory() as td:
     sid = "sess-md-capture-test"
-    env = {**os.environ, "TMPDIR": td}
-    # Python's tempfile honours TMPDIR; the state file lands in td.
+    # State lives under Path.home()/.config/memhub-plugin/mdcapture: point the
+    # subprocess collector's HOME (and USERPROFILE on Windows) at td, and the
+    # in-process modules' STATE_DIR at the same place.
+    env = {**os.environ, "HOME": td, "USERPROFILE": td}
+    mc.STATE_DIR = Path(td) / ".config" / "memhub-plugin" / "mdcapture"
     def run(payload: dict) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload),
                               capture_output=True, text=True, env=env)
@@ -98,10 +101,9 @@ with tempfile.TemporaryDirectory() as td:
     check(r.returncode == 0, "non-md → exit 0")
     r = subprocess.run([sys.executable, str(HOOK)], input="not json", capture_output=True, text=True, env=env)
     check(r.returncode == 0 and r.stdout == "", "garbage stdin → exit 0, silent")
-    import tempfile as _t
-    _t.tempdir = None
-    os.environ["TMPDIR"] = td
     state = mc.load_state(sid)
+    check(mc.state_path(sid).parent == mc.STATE_DIR and (os.name != "posix" or (mc.STATE_DIR.stat().st_mode & 0o777) == 0o700),
+          "state file lives in the per-user 0700 dir, not the shared temp dir")
     check(state["dirty"] == [spec], f"state holds the spec exactly once: {state['dirty']}")
     # create-then-edit through a symlinked dir must map to ONE canonical key
     real = Path(td) / "realrepo" / "docs"; real.mkdir(parents=True)
@@ -123,7 +125,6 @@ with tempfile.TemporaryDirectory() as td:
     if have_flush:
         # race: a path added to `dirty` while a flush is in flight must survive the write-back
         sid2 = "sess-md-flush-race"
-        os.environ["TMPDIR"] = td
         mc.save_state(sid2, {"dirty": ["/Users/me/repo/a.md"], "saved": {}})
         mc.save_state(sid2, {"dirty": ["/Users/me/repo/a.md", "/Users/me/repo/b.md"], "saved": {}})  # collector appended b mid-flight
         f._persist(sid2, processed={"/Users/me/repo/a.md"}, saved={"/Users/me/repo/a.md": "abc"})
