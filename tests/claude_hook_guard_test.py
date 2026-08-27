@@ -79,7 +79,7 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 11
+    assert len(commands) == 13
     assert all("claude_hook_guard.py" in command for _, command in commands)
     capture_events = [event for event, command in commands
                       if "claude_hook_guard.py\" capture " in command]

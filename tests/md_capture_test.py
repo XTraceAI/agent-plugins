@@ -130,6 +130,13 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid2)
         check(st["dirty"] == ["/Users/me/repo/b.md"] and st["saved"] == {"/Users/me/repo/a.md": "abc"},
               f"flush write-back merges, does not clobber: {st}")
+        # `attempts` follows the same merge discipline (bot review on #88): a
+        # processed path's counter is cleared, a counter this pass bumped is
+        # written, and a counter an overlapping flush owns is left alone.
+        mc.save_state(sid2, {"dirty": ["a", "b", "c"], "saved": {}, "attempts": {"a": 1, "b": 2}})
+        f._persist(sid2, processed={"a"}, saved={}, attempts={"c": 1})
+        st = mc.load_state(sid2)
+        check(st["attempts"] == {"b": 2, "c": 1}, f"attempts merged: a cleared, b untouched, c bumped: {st['attempts']}")
 
         # retry semantics (bot review on #88): a failed save and a capped-out
         # candidate must both STAY dirty so the next Stop retries them.
@@ -236,6 +243,13 @@ with tempfile.TemporaryDirectory() as td:
         asyncio.run(f.flush(sid4))
         st = mc.load_state(sid4)
         check(str(undec) in st["saved"] and st.get("attempts") == {}, "recovered file saved; attempt counter reset")
+        # a path that turns out unchanged / non-candidate after an earlier failure
+        # must not leave a dead counter behind
+        st["dirty"] = [str(undec)]; st["attempts"] = {str(undec): 2}
+        mc.save_state(sid4, st)
+        asyncio.run(f.flush(sid4))
+        st = mc.load_state(sid4)
+        check(st["dirty"] == [] and st.get("attempts") == {}, f"unchanged-since-save clears its stale counter: {st.get('attempts')}")
 
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
 

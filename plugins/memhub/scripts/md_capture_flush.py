@@ -139,6 +139,7 @@ async def flush(session_id: str) -> None:
         return
     saved = dict(state.get("saved") or {})   # path -> content digest
     attempts = dict(state.get("attempts") or {})   # path -> consecutive failures
+    attempts0 = dict(attempts)                       # to write back only what changed
     # `processed` is built from OUTCOMES, not from the input list: a path leaves
     # `dirty` only when it was saved, judged a non-candidate, or is unchanged
     # since its last save. Capped-out candidates and failed saves stay in
@@ -182,7 +183,7 @@ async def flush(session_id: str) -> None:
              f"the rest retry next Stop")
         todo = sorted(todo, key=lambda t: -len(t[2]))[:MAX_PER_TURN]
     if not todo:
-        _persist(session_id, processed, saved, attempts)
+        _persist(session_id, processed, saved, _changed(attempts0, attempts))
         return
 
     try:
@@ -230,7 +231,7 @@ async def flush(session_id: str) -> None:
         # Persist whatever was decided even if the connection itself failed:
         # non-candidates drop out, successes record their digest, everything
         # else remains dirty for the next Stop.
-        _persist(session_id, processed, saved, attempts)
+        _persist(session_id, processed, saved, _changed(attempts0, attempts))
 
 
 def _bump(attempts: dict, raw: str, processed: set, why: str) -> None:
@@ -246,6 +247,11 @@ def _bump(attempts: dict, raw: str, processed: set, why: str) -> None:
         _log(f"will retry {name} next Stop ({n}/{MAX_ATTEMPTS}): {why}")
 
 
+def _changed(before: dict, after: dict) -> dict:
+    """The attempt counters this pass bumped (a key it cleared is in `processed`)."""
+    return {k: n for k, n in after.items() if before.get(k) != n}
+
+
 def _persist(session_id: str, processed: set, saved: dict, attempts: dict | None = None) -> None:
     """Write back by MERGING into a fresh read, never from the snapshot taken
     before the network window. The Stop hook is async, so the collector keeps
@@ -255,8 +261,18 @@ def _persist(session_id: str, processed: set, saved: dict, attempts: dict | None
     fresh = load_state(session_id)
     fresh["dirty"] = [d for d in fresh.get("dirty") or [] if d not in processed]
     fresh.setdefault("saved", {}).update(saved)
-    if attempts is not None:
-        fresh["attempts"] = attempts
+    # `attempts` follows the same merge discipline: only the keys THIS pass
+    # decided are written. Every processed path is terminal, so its counter
+    # goes (a non-candidate/unchanged/deleted outcome after an earlier
+    # failure would otherwise leave a dead entry forever); a still-dirty path
+    # carries this pass's count. Keys this pass never touched keep whatever
+    # an overlapping flush wrote.
+    fa = fresh.setdefault("attempts", {})
+    for k in processed:
+        fa.pop(k, None)
+    for k, n in (attempts or {}).items():
+        if k not in processed:
+            fa[k] = n
     save_state(session_id, fresh)
 
 
