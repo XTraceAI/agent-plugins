@@ -189,6 +189,21 @@ def main() -> int:
             check("ledger v2: schema_version file stamped",
                   open(os.path.join(td, "ledger", "schema_version"), encoding="utf-8").read().strip() == "2")
 
+        # --- session lane: posture cap is deterministic and logged -----------
+        seed_book(td, "capsrepo", [
+            {"id": f"post-{c}", "on": "session", "repo_scope": "any", "text": f"POSTURE {c}", "why": "w", "title": f"Posture {c}"}
+            for c in ("D", "B", "A", "C")])
+        caps = os.path.join(td, "capsrepo"); os.makedirs(os.path.join(caps, ".git"))
+        rc, out = run("session", {"cwd": caps, "session_id": "cap1"}, env)
+        shown = [c for c in "ABCD" if f"POSTURE {c}" in ctx(out)]
+        check("session: at most MAX_POSTURE posture rules, chosen by title not book order", shown == ["A", "B", "C"], str(shown))
+        with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            srows = [json.loads(l) for l in f if '"cap1"' in l]
+        sup = [r for r in srows if r["mode"] == "suppressed"]
+        check("session: the rule past the cap is logged as suppressed with a session dedup key",
+              len(sup) == 1 and sup[0]["rule_id"] == "post-D" and sup[0]["dedup_key"] == "post-D@session"
+              and sup[0]["raw_matches_before_fire"] == 0, str(sup))
+
         # --- cap → suppressed rows; converted_rx → conversions sidecar --------
         seed_book(td, "xmem", rules["rules"] + [
                 {"id": f"cap-{i}", "on": "bash", "rx": r"capcmd", "fire_scope": "session",

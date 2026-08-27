@@ -971,7 +971,13 @@ def session_digest(rules, repo, gitdir, ctx):
     in_scope = [r for r in rules if scope_ok(r, repo, gitdir) and r.get("status", "active") == "active"]
     if not in_scope:
         return
-    posture = [r for r in in_scope if r.get("on") == "session"][:MAX_POSTURE]
+    # Session start is the weakest attention slot (measured 4% vs 88%
+    # in-flight), so at most MAX_POSTURE posture rules ride it. Which ones is
+    # deterministic (by title, then id) — not book order — and every rule past
+    # the cap is logged as SUPPRESSED so the ledger sees what was never shown.
+    posture_all = sorted((r for r in in_scope if r.get("on") == "session"),
+                         key=lambda r: ((r.get("_label") or r.get("title") or r["id"]).casefold(), r["id"]))
+    posture, cut = posture_all[:MAX_POSTURE], posture_all[MAX_POSTURE:]
     active = [r for r in in_scope if r.get("on") != "session"]
     lines = ["## 📏 Rulebook (team rules — advisory)"]
     for r in posture:
@@ -985,6 +991,10 @@ def session_digest(rules, repo, gitdir, ctx):
     emit("SessionStart", "\n".join(lines))
     if posture:
         log_fires(ctx, posture, hook_phase="session", mode="advise", excerpt="")
+    if cut:
+        log_fires(ctx, cut, hook_phase="session", mode="suppressed", excerpt="",
+                  dedup_keys={r["id"]: f"{r['id']}@session" for r in cut},
+                  raw_counts={r["id"]: 0 for r in cut})
 
 
 def main():
