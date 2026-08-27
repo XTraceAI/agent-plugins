@@ -434,6 +434,9 @@ def main():
         good = H.to_hook_rule({"rule_id": "fine", "statement": "s", "matcher": {"event": "bash", "command_rx": r"git\s+push"}})
         smug = H.to_hook_rule({"rule_id": "smug", "statement": "s", "status": "draft", "mode": "advise",
                                "matcher": {"event": "bash", "command_rx": "x", "mode": "gate", "status": "active", "id": "other"}})
+        outp = H.to_hook_rule({"rule_id": "o1", "statement": "s", "matcher": {"event": "output", "content_rx": "FAILED", "content_not_rx": "flaky", "command_rx": "pytest"}})
+        check("book: a server 'output' rule becomes a post-lane 'result' rule with rx/exclude_rx/cmd_rx",
+              outp and outp["on"] == "result" and outp["rx"] == "FAILED" and outp["exclude_rx"] == "flaky" and outp["cmd_rx"] == "pytest", str(outp))
         bad_pt = H.to_hook_rule({"id": "pt-evil", "on": "bash", "rx": "(a+)+$", "text": "s"})
         check("book: a pilot-shape row gets the same regex lint", bad_pt is None)
         check("book: matcher keys can never overwrite the row's own id/status/mode",

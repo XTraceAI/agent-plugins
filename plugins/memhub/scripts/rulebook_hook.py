@@ -331,7 +331,8 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
     "command_rx": "rx", "command_not_rx": "not_rx", "content_not_rx": "content_not_rx",
     "warn_once_per": "fire_scope", "result_rx": "rx",
 }
-_RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx")
+_RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
+                    content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
 
@@ -431,7 +432,9 @@ def to_hook_rule(row):
         m = row.get("matcher")
         if not isinstance(m, dict):
             return None
-        r["on"] = m.get("event") or "bash"
+        # the server names the tool-result event "output" (§3.1); the hook's
+        # post lane calls it "result" and reads content_* as the result pattern
+        r["on"] = {"output": "result"}.get(m.get("event") or "bash", m.get("event") or "bash")
         keys = _RESULT_KEYS if r["on"] == "result" else _MATCHER_KEYS
         for k, v in m.items():
             if k == "event":
