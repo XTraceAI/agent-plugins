@@ -30,8 +30,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rulebook_hook import evaluate  # noqa: E402 — the ONE matcher implementation
 
 def load_rule(args):
-    raw = args.rule or open(args.rule_file, encoding="utf-8").read()
-    return json.loads(raw)
+    if args.rule_file:
+        try:
+            with open(args.rule_file, encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as exc:
+            sys.exit(f"cannot read --rule-file {args.rule_file}: {exc}")
+    else:
+        raw = args.rule
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        sys.exit(f"the candidate rule is not valid JSON: {exc}")
 
 
 def repo_of(cwd):

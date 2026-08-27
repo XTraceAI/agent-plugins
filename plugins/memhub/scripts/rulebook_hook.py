@@ -393,7 +393,12 @@ def to_hook_rule(row):
             r = dict(row)
             r.setdefault("id", row.get("rule_id"))
             r.setdefault("_version", _version_of(row.get("version")))
-            return r if r.get("id") else None
+            if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
+                return None           # same regex lint as the server shape
+            if isinstance(r.get("ordering"), dict) and not all(
+                    rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
+                return None
+            return r
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
