@@ -51,6 +51,8 @@ class Fake:
         self.etag = '"v1"'
         self.rules = []
         self.post_reply = {"accepted": None, "rejected": 0}   # None → filled with the batch size
+        self.recalls = []
+        self.recall_reply = []
         self.requests = []
         fake = self
 
@@ -93,6 +95,11 @@ class Fake:
                     time.sleep(3)
                 if fake.mode == "500":
                     return self._send(500, {"detail": "boom"})
+                if self.path.endswith("/recall"):
+                    req = json.loads(body or "{}")
+                    fake.recalls.append(req)
+                    kept = [r for r in fake.recall_reply if r["rule_id"] not in (req.get("already_fired") or [])]
+                    return self._send(200, {"code": 0, "msg": "ok", "data": {"rules": kept, "judge": "gate"}})
                 n = len(json.loads(body or "{}").get("fires", []))
                 rep = dict(fake.post_reply)
                 if "accepted" in rep and rep["accepted"] is None:
@@ -129,6 +136,65 @@ def jl(path):
     except FileNotFoundError:
         return []
 
+
+
+def _anchor_lane_checks(check, run, ctx):
+    """§4.7 — anchor rules go through the server judge; everything fails open.
+    Own fake server + temp dir: this lane must not inherit the flush/fetch
+    state the earlier checks leave behind."""
+    fake = Fake()
+    fake.mode = "ok"
+    fake.etag = '"v-anchor"'
+    fake.rules = [
+        {"rule_id": "a-bus", "title": "bus", "statement": "Mind the context bus.", "delivery": "anchor_recall",
+         "status": "active", "mode": "advise", "version": 1, "scope_repos": [], "anchors": ["context_bus.py"]},
+        {"rule_id": "s-post", "title": "posture", "statement": "POSTURE LINE", "delivery": "session_context",
+         "status": "active", "mode": "advise", "version": 1, "scope_repos": []},
+    ]
+    fake.recall_reply = [{"rule_id": "a-bus", "title": "bus", "statement": "Mind the context bus.",
+                          "version": 1, "anchors": ["context_bus.py"]}]
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "xmem")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/b\n")
+        book = os.path.join(td, "rulebook.json")
+        with open(book, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "rules": []}, f)
+        env = {"MEMHUB_RULEBOOK": book, "MEMHUB_TOKEN": "tok-123",
+               "MEMHUB_MCP_BASE_URL": f"http://127.0.0.1:{fake.port}",
+               "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_TIMEOUT_S": "1"}
+        run("fetch", {"cwd": repo}, env)
+        rc, out = run("session", {"cwd": repo, "session_id": "an1"}, env)
+        check("anchor: session_context rule from the server book is served at SessionStart", "POSTURE LINE" in ctx(out))
+        ev = {"cwd": repo, "session_id": "an1", "tool_name": "Edit",
+              "tool_input": {"file_path": repo + "/xmem/context_bus.py", "new_string": "SECRET BODY"}}
+        rc, out = run("pre", ev, env)
+        last = fake.recalls[-1] if fake.recalls else {}
+        check("anchor: kept rule injected; POST /recall carried the file handle only (no body)",
+              "[a-bus]" in ctx(out) and last.get("args") == {"file_path": repo + "/xmem/context_bus.py"}
+              and "SECRET BODY" not in json.dumps(last), str(last))
+        n = len(fake.recalls)
+        rc, out = run("pre", ev, env)
+        check("anchor: fired once per session — second call makes no recall call and injects nothing",
+              out.strip() == "" and len(fake.recalls) == n)
+        rc, out = run("pre", {"cwd": repo, "session_id": "an2", "tool_name": "Read", "tool_input": {"file_path": "x"}}, env)
+        check("anchor: a tool with no handle → no recall call", len(fake.recalls) == n)
+        rc, out = run("pre", dict(ev, session_id="an2b"), env)
+        check("anchor: a fresh session re-asks and sends its own already_fired (empty)",
+              "[a-bus]" in ctx(out) and fake.recalls[-1]["already_fired"] == [])
+        fake.mode = "500"
+        rc, out = run("pre", dict(ev, session_id="an3"), env)
+        check("anchor: server 500 → silent, exit 0", rc == 0 and out.strip() == "")
+        fake.mode = "slow"
+        import time as _t; t0 = _t.time()
+        rc, out = run("pre", dict(ev, session_id="an4"), env)
+        check("anchor: slow judge → fail open within the hook budget", rc == 0 and out.strip() == "" and _t.time() - t0 < 4.5)
+        fake.mode = "ok"
+        rows = jl(os.path.join(td, "ledger", "fires.jsonl"))
+        check("anchor: the kept rule is logged like any other fire",
+              any(r["rule_id"] == "a-bus" and r["hook_phase"] == "pre" for r in rows))
+    fake.srv.shutdown()
 
 def main():
     fake = Fake()
@@ -440,6 +506,8 @@ def main():
         check("no credential: flush is silent and leaves the watermark",
               rc == 0 and out == "" and json.load(open(sent_p, encoding="utf-8"))["fires_offset"] < os.path.getsize(ledger))
 
+    _anchor_lane_checks(check, run, ctx)
+
     fake.srv.shutdown()
     print()
     if FAILURES:
@@ -447,6 +515,8 @@ def main():
     else:
         print("all rulebook client checks passed")
     return 1 if FAILURES else 0
+
+
 
 
 if __name__ == "__main__":

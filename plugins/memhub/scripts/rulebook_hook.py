@@ -412,6 +412,18 @@ def to_hook_rule(row):
         r["repo_scope"] = "any"
         if scopes:
             r["_scope_repos"] = scopes
+        # v2.4: anchor rules carry their own identifiers; session rules carry nothing
+        if row.get("delivery") == "session_context":
+            r["on"] = "session"
+            return r
+        if isinstance(row.get("anchors"), list) and row["anchors"]:
+            anchors = [_clean_text(a) for a in row["anchors"] if isinstance(a, str) and a.strip()]
+            if not anchors:
+                return None
+            r["on"] = "anchor"
+            r["anchors"] = anchors[:64]
+            r["fire_scope"] = "session"
+            return r
         if isinstance(row.get("ordering"), dict):
             o = row["ordering"]
             if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
@@ -519,6 +531,33 @@ def fetch_book(repo):
             and isinstance(reply.data.get("rules"), list):
         _atomic_json(book_path(repo), {"etag": reply.etag, "fetched_at": _now(),
                                        "rules": reply.data["rules"]})
+
+
+RECALL_TIMEOUT_S = _timeout(1.5)   # inside the PreToolUse hook budget; fail open past it
+
+
+def recall_anchor_rules(repo, tool, handles, already_fired):
+    """POST /recall — the server runs the book's anchor rules through xmem's
+    directive funnel (identifier extraction → exact anchor match → the SLM
+    relevance judge). Returns the kept rule ids, or [] on ANY failure: an
+    anchor being present is not relevance, and a judge outage is never a
+    reason to block or slow the call."""
+    try:
+        api = _api()
+        if not api:
+            return []
+        base, bearer, http = api
+        body = {"tool": tool, "args": handles, "repo": repo,
+                "already_fired": list(already_fired)[:200], "limit": MAX_ADVISE}
+        reply = http.rest(f"{base}{API_PATH}/recall", bearer, "POST", body=body,
+                          timeout=RECALL_TIMEOUT_S)
+        if reply.status != 200 or not isinstance(reply.data, dict):
+            return []
+        return [str(r.get("rule_id")) for r in reply.data.get("rules") or []
+                if isinstance(r, dict) and r.get("rule_id")]
+    except Exception as exc:
+        _breadcrumb("recall", exc)
+        return []
 
 
 def spawn_fetch(repo):
@@ -980,8 +1019,28 @@ def main():
             del st["open"][rid]
             st.get("open_file", {}).pop(rid, None)
 
+    # Anchor rules (§4.7): one server call per tool call, only when the book has
+    # an active anchor rule in scope and the call carries a handle. The server
+    # matches anchors AND judges relevance; the hook just injects what it kept.
+    anchor_rules = {r["id"]: r for r in rules if r.get("on") == "anchor"
+                    and r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
+                    and r["id"] not in st["fired"]}
+    handles = {}
+    if tool == "Bash" and cmd:
+        handles["command"] = shell_only(cmd)[:400]
+    elif tool in EDIT_TOOLS and fp:
+        handles["file_path"] = fp
+    if mode == "pre" and anchor_rules and handles \
+            and os.environ.get("MEMHUB_RULEBOOK_RECALL", "1") != "0":
+        for rid in recall_anchor_rules(repo, tool, handles, st["fired"]):
+            r = anchor_rules.get(rid)
+            if r is not None:
+                st["fired"].append(rid)
+                dedup_keys[rid] = rid
+                fired_now.append(r)
+
     for r in rules:
-        if r.get("on") == "session" or not scope_ok(r, repo, gitdir) \
+        if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
                 or r.get("status", "active") != "active":   # draft = not armed (§6)
             continue
         rid = r["id"]
