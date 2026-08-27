@@ -127,13 +127,13 @@ def test_apply_only_mode_mints_nothing():
 
 
 def test_pin_map_prunes_only_orphaned_uuids_never_present_records():
-    cap = cursor_flush._RECORD_TS_CAP
-    # Over the cap with a mix: pins whose records are still in the batch
+    trigger = cursor_flush._RECORD_TS_PRUNE_TRIGGER
+    # Over the trigger with a mix: pins whose records are still in the batch
     # MUST survive — evicting one would re-date a live record at the next
     # flush's wall clock (the review finding on the original FIFO cap).
     # Only pins orphaned by the artifact (uuids no longer present, e.g. a
     # checkpoint restore shifting the index-derived ids) are pruned.
-    prior = {f"orphan{i}": NOW_1 for i in range(cap)}
+    prior = {f"orphan{i}": NOW_1 for i in range(trigger)}
     prior["live"] = NOW_1
     records = [_rec("live"), _rec("newest")]
     out = cursor_flush._stamp_records(
@@ -148,20 +148,23 @@ def test_pin_map_prunes_only_orphaned_uuids_never_present_records():
     assert rerun[0]["timestamp"] == NOW_1
     assert rerun[1]["timestamp"] == NOW_2
 
-    # Under the cap, orphaned pins are kept (continuity across a transient
-    # shrunk read costs nothing until the map is actually oversized).
+    # Under the trigger, orphaned pins are kept (continuity across a
+    # transient shrunk read costs nothing until the map is actually
+    # oversized).
     small = cursor_flush._stamp_records(
         [_rec("live")], {"gone": NOW_1, "live": NOW_1}, NOW_2,
         first_observation=False)
     assert small == {"gone": NOW_1, "live": NOW_1}
 
-    # All-present pins are never evicted even when over the cap: the map's
-    # true bound is the artifact itself, which every flush re-reads whole.
-    oversized_live = {f"u{i}": NOW_1 for i in range(cap + 10)}
-    batch = [_rec(f"u{i}") for i in range(cap + 10)]
+    # All-present pins survive even past the trigger — the trigger is a
+    # prune opportunity, deliberately NOT a hard cap: the map scales with
+    # the live artifact, which every flush already re-reads and re-uploads
+    # whole, so the transcript itself is the binding cost at that size.
+    oversized_live = {f"u{i}": NOW_1 for i in range(trigger + 10)}
+    batch = [_rec(f"u{i}") for i in range(trigger + 10)]
     kept = cursor_flush._stamp_records(
         batch, oversized_live, NOW_2, first_observation=False)
-    assert len(kept) == cap + 10
+    assert len(kept) == trigger + 10
     print("PASS test_pin_map_prunes_only_orphaned_uuids_never_present_records")
 
 

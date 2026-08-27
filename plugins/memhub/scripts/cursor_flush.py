@@ -532,16 +532,19 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
     return applied
 
 
-# Prune trigger for the per-record timestamp pin map persisted in session
-# state. When the map outgrows this, entries whose record is NO LONGER in the
-# transcript are dropped (a store checkpoint restore shifts the deterministic
-# index-based uuids, stranding the old ones). Pins for records still being
-# re-sent are NEVER evicted — dropping one would re-date a live record at the
-# next flush's wall clock, the exact degeneracy this module exists to prevent
-# — so the map's true bound is the artifact itself, which every flush already
-# re-reads and re-uploads wholesale (a session big enough to blow up this map
-# has long since blown up the flush payload).
-_RECORD_TS_CAP = 8192
+# Prune TRIGGER — deliberately not a hard cap — for the per-record timestamp
+# pin map persisted in session state. When the map outgrows this, entries
+# whose record is NO LONGER in the transcript are dropped (a store checkpoint
+# restore shifts the deterministic index-based uuids, stranding the old
+# ones). Pins for records still being re-sent are NEVER evicted, at ANY map
+# size: dropping one re-dates a live record at the next flush's wall clock,
+# the exact degeneracy this module exists to prevent (review finding on the
+# original FIFO cap). The map therefore scales with the live artifact, by
+# design: one ~70-byte entry per record, against a flush that already
+# re-reads, re-hashes, and re-uploads the ENTIRE transcript on every event —
+# at the session size where this map hurts (~10^5 records ≈ 7 MB state), the
+# per-event whole-transcript flush is the cliff, and it arrives first.
+_RECORD_TS_PRUNE_TRIGGER = 8192
 
 
 def _now_iso() -> str:
@@ -586,7 +589,8 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     much-later wall clock (review finding on the original FIFO cap). Only
     pins ORPHANED by the artifact (a checkpoint restore shifting the
     index-derived uuids) are pruned, and only once the map outgrows
-    ``_RECORD_TS_CAP``.
+    ``_RECORD_TS_PRUNE_TRIGGER`` — which is a prune trigger, not a bound;
+    the map deliberately scales with the live artifact (see the constant).
     """
     stamps: dict = dict(prior) if isinstance(prior, dict) else {}
     present: set = set()
@@ -617,7 +621,7 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
             record["timestamp"] = pinned
         else:
             record.pop("timestamp", None)
-    if len(stamps) > _RECORD_TS_CAP:
+    if len(stamps) > _RECORD_TS_PRUNE_TRIGGER:
         stamps = {rid: pin for rid, pin in stamps.items() if rid in present}
     return stamps
 
