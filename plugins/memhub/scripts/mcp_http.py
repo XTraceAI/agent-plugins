@@ -353,7 +353,7 @@ def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
     # The REST API wraps in {"code": 0, "msg": "ok", "data": …}; a non-zero
     # code is a failure the transport reported as 2xx and must not read as one.
     if isinstance(payload, dict) and "code" in payload:
-        if payload.get("code") not in (0, None):     # error envelope, with or without data
+        if payload.get("code") != 0:                 # error envelope (null counts), data or not
             raise McpError(f"{method} {url}: {payload.get('msg') or payload}", status)
         if "data" in payload:
             payload = payload["data"]
