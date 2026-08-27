@@ -365,6 +365,18 @@ def main():
               len(upd) == 1 and upd[0]["fire_id"] == fid_local and upd[0]["converted"] is True
               and upd[0]["converted_at"], str(upd))
 
+        # a conversion naming a fire the ledger does not hold yet must not be
+        # passed by the conversions watermark (it waits for its fire)
+        conv_p = os.path.join(os.path.dirname(ledger), "conversions.jsonl")
+        with open(conv_p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"fire_id": "not-yet-in-ledger", "converted": True,
+                                "converted_at": "2026-08-26T00:00:00Z"}) + "\n")
+        before = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
+        run("flush", {"session_id": "f1"}, env, ("final",))
+        after = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
+        check("flush: a conversion whose fire is not in the ledger is NOT passed by the watermark",
+              after == before and after < os.path.getsize(conv_p), f"{before} -> {after}")
+
         # rejected rows: logged locally, never retried
         run("pre", dict(base, session_id="f4", tool_input={"command": "server-only-cmd"}), env)
         rej_id = jl(ledger)[-1]["fire_id"]

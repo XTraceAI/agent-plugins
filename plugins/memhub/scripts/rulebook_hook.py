@@ -642,10 +642,10 @@ def pending_batches(sent):
     fpath, cpath = os.path.join(ldir, "fires.jsonl"), os.path.join(ldir, "conversions.jsonl")
     f_offsets = []
     new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets)
-    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0))
-    new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
+    c_offsets = []
+    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets)
     if not new_fires and not new_convs:
-        return [], new_sent
+        return [], dict(sent, fires_offset=f_end, conversions_offset=c_end)
     # New fires carry their own rows. A NEW conversion may name a fire behind
     # the watermark; only THOSE ids are looked up, streaming the ledger without
     # holding it (bounded by the number of new conversions, not by history).
@@ -668,6 +668,17 @@ def pending_batches(sent):
                             break
         except FileNotFoundError:
             pass
+    # A conversion whose fire is not in the ledger yet (the fire line is still
+    # being written, or a rotated ledger) must NOT be passed by the watermark:
+    # stop the conversions offset just before the first unresolved one so the
+    # next flush sees it again once the fire has landed.
+    c_start = sent.get("conversions_offset", 0)
+    for i, c in enumerate(new_convs):
+        if isinstance(c, dict) and c.get("fire_id") and c["fire_id"] not in by_id:
+            c_end = c_offsets[i - 1] if i else c_start
+            new_convs = new_convs[:i]
+            break
+    new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
     # Only conversions past THEIR watermark need merging: the two offsets
     # advance together, so an older conversion was shipped with its fire.
     for c in new_convs:
@@ -694,7 +705,7 @@ def pending_batches(sent):
         last = i + FLUSH_BATCH >= len(items)
         batches.append(([r for r, _ in chunk],
                         dict(sent, fires_offset=f_end if last else fo,
-                             conversions_offset=c_end if last else sent.get("conversions_offset", 0))))
+                             conversions_offset=c_end if last else c_start)))
     return batches, new_sent
 
 
