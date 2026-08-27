@@ -234,8 +234,10 @@ async def flush(session_id: str) -> None:
         # every candidate that never got its turn, or an unreachable server
         # would have us re-read and re-encode all of them on every Stop with
         # no MAX_ATTEMPTS ceiling.
+        # Type only: an auth / transport exception can carry the URL or a
+        # header in its message, and this line goes to stderr.
         for raw in pending:
-            _bump(attempts, raw, processed, f"connection: {type(e).__name__}: {str(e)[:120]}")
+            _bump(attempts, raw, processed, f"connection: {type(e).__name__}")
     finally:
         # Persist whatever was decided even if the connection itself failed:
         # non-candidates drop out, successes record their digest, everything
