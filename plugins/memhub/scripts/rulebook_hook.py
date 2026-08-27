@@ -509,8 +509,12 @@ def fetch_book(repo):
     old = load_book(repo) or {}
     hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
     q = "status=active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
-    reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
-                      timeout=FETCH_TIMEOUT_S)
+    try:
+        reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
+                          timeout=FETCH_TIMEOUT_S)
+    except Exception as exc:          # keep the cache; say so where an operator can look
+        _breadcrumb("fetch", exc)
+        return
     if reply.status == 304 and old:
         _atomic_json(book_path(repo), dict(old, fetched_at=_now()))
     elif reply.status == 200 and isinstance(reply.data, dict) \
