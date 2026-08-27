@@ -809,13 +809,14 @@ def _namespace_of(cwd: str | None) -> str | None:
 async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  flush_mode: str = "now", *, source_kind: str = "store",
                  source_revision: str | None = None,
-                 records: list[dict] | None = None, meta: dict | None = None,
+                 records: list[dict], meta: dict,
                  applied_usage: set[str] | None = None) -> None:
-    if records is None or meta is None:
-        records, meta = cursor_reader.to_canonical(source_path)
-        # main() stamps before calling; this self-read path must not ship
-        # unpinned records (their dates would vary with the re-read).
-        apply_session_state(records, uuid)
+    # ``records``/``meta`` are REQUIRED: reading, stamping, and persisting
+    # pins is main()'s job, in that order, under the session lock. A
+    # self-read fallback here shipped records that bypassed that flow —
+    # apply-only stamping would leave anything not yet pinned undated
+    # (review finding) — so the convenience default was removed rather than
+    # given a third stamping semantics.
     # Close the read span IMMEDIATELY — before redaction and the network call,
     # which together can run for many seconds. Blobs present at both the gate
     # and here existed for the whole span the payload was built from, so their
