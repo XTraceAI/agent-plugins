@@ -151,7 +151,8 @@ with tempfile.TemporaryDirectory() as td:
         # candidate must both STAY dirty so the next Stop retries them.
         import asyncio
         sid3 = "sess-md-flush-retry"
-        root = Path(td) / "r"; root.mkdir()
+        # resolved: the collector stores canonical paths and the flush insists on them
+        root = (Path(td) / "r").resolve(); root.mkdir()
         # six real candidates, each above the floor; none under a veto path
         # (td is /var/folders → vetoed, so build them under a non-temp-looking
         # symlink-free dir: patch VETO_PARTS for this block only)
@@ -278,6 +279,16 @@ with tempfile.TemporaryDirectory() as td:
             else:
                 check(st["dirty"] == [] and st["attempts"] == {}, f"conn pass {i}: both given up, counters cleared")
         sh.streamablehttp_client = prev_ctx
+
+        # a recorded path swapped for a symlink since the edit is not read through
+        sid6 = "sess-md-flush-symlink"
+        target = root / "secret-not-md.txt"; target.write_text("# S\n" + "s" * 7000, encoding="utf-8")
+        lnk = root / "swapped-spec.md"; lnk.symlink_to(target)
+        mc.save_state(sid6, {"dirty": [str(lnk)], "saved": {}, "attempts": {}})
+        n_before = calls["n"]
+        asyncio.run(f.flush(sid6))
+        st = mc.load_state(sid6)
+        check(st["dirty"] == [] and st["saved"] == {} and calls["n"] == n_before, f"symlinked candidate is dropped, not uploaded: {st}")
 
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
 

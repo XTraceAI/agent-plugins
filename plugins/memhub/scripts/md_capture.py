@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 STATE_PREFIX = "memhub-md-capture-"
@@ -99,9 +100,20 @@ def save_state(session_id: str, state: dict) -> None:
         os.chmod(p.parent, 0o700)
     except OSError as e:
         print(f"[memhub-md-capture] state dir not 0700: {e}", file=sys.stderr)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    os.replace(tmp, p)
+    # Unique temp per writer: the sync collector and the async flusher can
+    # write the same session's state at once, and a shared ".tmp" name lets
+    # one truncate the other mid-write and publish a torn file.
+    fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state))
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def edited_path(payload: dict) -> Path | None:

@@ -151,6 +151,13 @@ async def flush(session_id: str) -> None:
         if not p.is_file():
             processed.add(raw)                   # deleted/moved: nothing to retry
             continue
+        # The collector stored the CANONICAL path. If it no longer resolves to
+        # itself, something on the way was swapped for a symlink since — the
+        # veto was judged on the recorded path, so don't read through it.
+        if p.is_symlink() or p.resolve() != p:
+            _log(f"skip {p.name}: no longer canonical")
+            processed.add(raw)
+            continue
         try:
             nbytes = p.stat().st_size
         except OSError:
