@@ -728,9 +728,12 @@ def pending_batches(sent):
             seen.add(fid)
     batches = []
     fo = sent.get("fires_offset", 0) if f_offsets or new_fires else f_end
-    # conversions are credited once the last batch that carries a conversion
-    # re-send is accepted (they sit after the fires), not only on the final one
-    last_conv = max([-1] + [i for i, (_, o) in enumerate(items) if o is None])
+    # conversions are credited once the last batch that carries ANY converted
+    # row (a re-send, or a new fire whose conversion was merged in) is
+    # accepted — a later failed batch must still re-merge its conversions
+    conv_ids = {c.get("fire_id") for c in new_convs if isinstance(c, dict)}
+    last_conv = max([-1] + [i for i, (r, o) in enumerate(items)
+                            if o is None or r.get("fire_id") in conv_ids])
     for i in range(0, len(items), FLUSH_BATCH):
         chunk = items[i:i + FLUSH_BATCH]
         fo = max([fo] + [o for _, o in chunk if o is not None])
