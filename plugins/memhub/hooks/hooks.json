@@ -125,6 +125,17 @@
           }
         ]
       }
+      ,
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "timeout": 60,
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" flush; fi"
+          }
+        ]
+      }
     ],
     "SessionEnd": [
       {
@@ -135,6 +146,16 @@
             "timeout": 300,
             "statusMessage": "MemHub: saving session memory",
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "async": true,
+            "timeout": 60,
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" flush final; fi"
           }
         ]
       }
