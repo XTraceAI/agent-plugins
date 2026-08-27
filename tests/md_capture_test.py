@@ -260,6 +260,25 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid4)
         check(st["dirty"] == [] and st.get("attempts") == {}, f"unchanged-since-save clears its stale counter: {st.get('attempts')}")
 
+        # connection-level failure (SDK import / initialize) counts against every
+        # candidate that never got its turn, so an unreachable server is bounded too
+        sid5 = "sess-md-flush-conn"
+        c1 = root / "c1-spec.md"; c1.write_text("# C1\n" + "a" * 7000, encoding="utf-8")
+        c2 = root / "c2-spec.md"; c2.write_text("# C2\n" + "b" * 7000, encoding="utf-8")
+        mc.save_state(sid5, {"dirty": [str(c1), str(c2)], "saved": {}, "attempts": {}})
+        def _boom(*a, **k):
+            raise ConnectionError("server unreachable")
+        prev_ctx = sh.streamablehttp_client; sh.streamablehttp_client = _boom
+        for i in range(1, f.MAX_ATTEMPTS + 1):
+            asyncio.run(f.flush(sid5))
+            st = mc.load_state(sid5)
+            if i < f.MAX_ATTEMPTS:
+                check(set(st["dirty"]) == {str(c1), str(c2)} and st["attempts"] == {str(c1): i, str(c2): i},
+                      f"conn pass {i}: both dirty, both counted: {st['attempts']}")
+            else:
+                check(st["dirty"] == [] and st["attempts"] == {}, f"conn pass {i}: both given up, counters cleared")
+        sh.streamablehttp_client = prev_ctx
+
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
 
 

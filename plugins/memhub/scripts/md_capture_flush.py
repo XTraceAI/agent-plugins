@@ -186,6 +186,7 @@ async def flush(session_id: str) -> None:
         _persist(session_id, processed, saved, _changed(attempts0, attempts))
         return
 
+    pending = {raw for raw, _, _, _ in todo}   # not yet attempted this pass
     try:
         # Lazy SDK imports INSIDE the guard: if they fail, `finally` still
         # persists the non-candidate / unchanged decisions made above.
@@ -197,6 +198,7 @@ async def flush(session_id: str) -> None:
             async with ClientSession(r, w) as s:
                 await s.initialize()
                 for raw, p, text, d in todo:
+                    pending.discard(raw)
                     # The whole per-item body is guarded, not just the save:
                     # a malformed room file or odd content must skip ONE item
                     # (which stays dirty), never the rest of the turn.
@@ -227,6 +229,13 @@ async def flush(session_id: str) -> None:
                     _log(f"saved '{name}' ({len(body):,} chars) → "
                          f"{room['name'] if room else 'personal memory'} "
                          f"id={out.get('artifact_id') or out.get('id')}")
+    except Exception as e:  # noqa: BLE001 — connection-level: SDK import, auth, initialize
+        # Nothing per-item ran, so nothing was bumped. Count this pass against
+        # every candidate that never got its turn, or an unreachable server
+        # would have us re-read and re-encode all of them on every Stop with
+        # no MAX_ATTEMPTS ceiling.
+        for raw in pending:
+            _bump(attempts, raw, processed, f"connection: {type(e).__name__}: {str(e)[:120]}")
     finally:
         # Persist whatever was decided even if the connection itself failed:
         # non-candidates drop out, successes record their digest, everything
