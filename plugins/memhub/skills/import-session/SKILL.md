@@ -1,30 +1,33 @@
 ---
-description: Use when the user asks to import, upload, or save a Claude Code session/conversation/transcript into MemHub or team memory (e.g. "import this session into memhub", "save session <id> to memhub", "put that conversation in an agent brain"). Ships the transcript via a terminal upload script — any size, no token-by-token re-emit.
+description: Use when the user asks to import, upload, or save a Claude Code, Codex, or Cursor session/conversation/transcript into MemHub or team memory (e.g. "import this session into memhub", "save session <id> to memhub", "put that conversation in an agent brain"). Ships the transcript via a terminal upload script — any size, no token-by-token re-emit.
 argument-hint: <session-id-or-path> [title...]
 allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains
 ---
 
-**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
-Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
-this plugin's root — the ancestor directory of this skill file that contains
-`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+**Plugin root:** Resolve this skill's plugin root once: it is the ancestor of
+this file containing `plugin.json` and the `scripts/` directory. A trusted host
+variable such as `CLAUDE_PLUGIN_ROOT` or `CURSOR_PLUGIN_ROOT` may already point
+there; use it only when it resolves to that same ancestor. Substitute the
+resulting absolute path as `<plugin-root>` below; do not infer it from the
+workspace cwd. Commands show `python3`; on native Windows use `py -3`.
 
-Import a past Claude Code session into MemHub team memory on demand. A helper
-script reads the transcript file and ships it to the `import_conversation` MCP
-tool — **do NOT call the MCP tool yourself and do NOT read or paste transcript
-content**; sessions can exceed a million tokens and the script handles any
-size in one call. This is a terminal operation.
+Import a past Claude Code, Codex, or Cursor session into MemHub team memory on
+demand. The unified capture script locates the host session, normalizes it when
+needed, and ships it to the `import_conversation` MCP tool — **do NOT call the
+MCP tool yourself and do NOT read or paste transcript content**; sessions can
+exceed a million tokens and the script handles any size without putting the
+transcript in model context. This is a terminal operation.
 
 Arguments: `$ARGUMENTS`
-- First token = a session id (e.g. `03374a1f-b074-4eb9-9900-...`) or a path to
-  a `.jsonl` transcript (required). A bare id is resolved automatically under
-  `~/.claude/projects/*/`.
+- First token = a session id or native session path (required). Paths and bare
+  ids are host-detected. A bare id is accepted only when exactly one of Claude,
+  Codex, or Cursor owns it; cross-host collisions are refused.
 - Remaining text = an optional conversation title.
 - If invoked without arguments (e.g. the user said "import this session"), ask
-  which session they mean — or, for "this/the current session", use the most
-  recently modified `.jsonl` sitting DIRECTLY inside the `~/.claude/projects/`
-  directory matching the current working directory (top level only — `.jsonl`
-  files in subdirectories are subagent/workflow transcripts, not sessions).
+  which session they mean. For "this/the current session", determine the
+  current host and run `capture.py list --host <claude|codex|cursor> --limit 20`;
+  select the current session only when its id or cwd is unambiguous, otherwise
+  ask. The literal ref `latest` always requires an explicit current host.
 
 Do exactly this:
 
@@ -32,7 +35,7 @@ Do exactly this:
    repo belongs in that repo's brain, where teammates and future sessions can
    find it; raw workspace memory is the fallback, not the default.
    - **Check the cache first** — `python3
-     "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show` prints the room's brain
+     "<plugin-root>/scripts/room_map.py" show` prints the room's brain
      id when the repo has one. The import script reads that same cache, so on a
      cached repo you can simply omit `--agent-brain-id` and let it route.
    - Nothing cached → derive `Repo: <org>/<name>` from `git remote get-url
@@ -44,26 +47,24 @@ Do exactly this:
      `/memhub:onboard` sets up the repo's room if they want one.
    - The user naming a brain explicitly always wins over all of the above.
    - Edge cases (SSH remotes, no remote, worktrees) and the cache's rules are in
-     `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
+     `<plugin-root>/references/repo-brain.md`.
 
-2. Run the import via Bash — one command, substitute the real values:
+2. Run the import in the terminal — one command, substitute the real values:
 
    ```bash
-   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
-     --session "<session-id-or-path>" [--title "<title>"] \
+   python3 "<plugin-root>/scripts/capture.py" import \
+     --session "<session-id-or-path>" --host auto [--title "<title>"] \
      [--agent-brain-id "<id>"]
 
-   Pass `--agent-brain-id` only when step 1 resolved a room the cache did not
+   For the literal ref `latest`, replace `--host auto` with the explicit current
+   host. Pass `--agent-brain-id` only when step 1 resolved a room the cache did not
    already hold, or when the user named a brain explicitly; a cached repo
    routes on its own. Use `--no-room` for the workspace-memory fallback.
-   NEVER pass `--conversation-id`. Omitted, it defaults to the session's own
-   id — the one per-turn capture already uses — which is what keeps a session
-   to ONE conversation per room. A fresh id would open a second conversation
-   for the same session and split its memory across both. Re-importing under
-   the default id is safe and incremental: the server watermarks it, so an
-   already-captured session simply reports nothing new rather than
-   duplicating. If nothing new lands, that is capture having done its job —
-   not a failure to work around with a new id.
+   NEVER pass `--conversation-id`. Omitted, Claude uses the session id and
+   Codex/Cursor use the same host-prefixed id as automatic capture. That keeps
+   one conversation per room and makes re-imports incremental. A fresh id would
+   split the session's memory. If nothing new lands, automatic capture already
+   did its job; do not work around that with a new id.
    Very large transcripts are AUTO-CHUNKED (default threshold ~3.5MB): the
    script sends disjoint slices sequentially under one conversation_id and
    waits for each slice's extraction (the session gist folding forward)
@@ -72,8 +73,8 @@ Do exactly this:
    just let the command run.
    ```
 
-3. Report back the returned `conversation_id`, `path` (should be `"agentic"`
-   for Claude Code sessions), `messages_received`, and scope. Tell the user:
+3. Report back the returned `conversation_id`, `source_platform`, `path` (should
+   be `"agentic"`), `messages_received`, and scope. Tell the user:
    - **where it landed, by name** — "imported into `Repo: <org>/<name>`" or
      "imported into your workspace memory" — so a wrong destination is
      obvious now rather than weeks from now;

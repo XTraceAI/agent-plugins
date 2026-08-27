@@ -3,6 +3,9 @@
     "memhub": {
       "type": "http",
       "url": "https://api.memhub.xtrace.ai/mcp-server/mcp",
+      "auth": {
+        "CLIENT_ID": "xHoQkYd7uNUfaNX6Tyv143e1Ev7u3XS0"
+      },
       "oauth": {
         "clientId": "xHoQkYd7uNUfaNX6Tyv143e1Ev7u3XS0",
         "callbackPort": 8765,

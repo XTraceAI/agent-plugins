@@ -6,13 +6,15 @@ sessions through one command, using the per-host readers.
 
     uv run --with 'mcp<2' python capture.py import --session <ref> \
         [--host auto|claude|codex|cursor] [--conversation-id <id>] [--title "..."] \
-        [--agent-brain-id <id>] [--namespace <ns>] [--url <mcp-url>] [--dry-run]
+        [--agent-brain-id <id>] [--no-room] [--namespace <ns>] [--url <mcp-url>] \
+        [--dry-run]
 
 ``--session`` accepts a transcript/rollout path, a bare session id, or
-``latest``. ``--host auto`` (default) sniffs the host from a path shape; a
-bare id or ``latest`` is ambiguous across hosts and requires an explicit
-``--host`` (importing the wrong host's "latest" would fold-forward the wrong
-conversation's gist — refuse, never guess).
+``latest``. ``--host auto`` (default) sniffs the host from a path shape or
+accepts a bare id when exactly one installed host owns it. ``latest`` and ids
+found under multiple hosts require an explicit ``--host`` (importing the wrong
+session would fold-forward the wrong conversation's gist — refuse, never
+guess).
 
 Claude sessions are already canonical, so import execs ``import_session.py``
 on the located path directly. Other hosts transform via their reader first,
@@ -70,15 +72,43 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
     if host == "auto":
         host = readers.sniff(args.session)
         if host is None:
+            if args.session == "latest":
+                return None, None, (
+                    "'latest' is ambiguous across hosts; pass "
+                    "--host claude|codex|cursor")
+            matches: list[tuple[object, Path]] = []
+            ambiguities: list[str] = []
+            # Every reader matches the complete native session UUID, never a
+            # prefix. Accept one exact installed-session match; any duplicate
+            # within or across hosts remains an error below.
+            for candidate in readers.READERS.values():
+                candidate_path, candidate_err = candidate.locate(args.session)
+                if candidate_path is not None:
+                    matches.append((candidate, candidate_path))
+                elif (isinstance(candidate_err, str) and
+                      "ambiguous" in candidate_err.lower()):
+                    ambiguities.append(f"{candidate.HOST}: {candidate_err}")
+            if ambiguities:
+                return None, None, (
+                    f"session {args.session!r} is ambiguous: " +
+                    "; ".join(ambiguities) + "; pass the session path")
+            if len(matches) == 1:
+                return matches[0][0], matches[0][1], ""
+            if len(matches) > 1:
+                found = ", ".join(candidate.HOST for candidate, _ in matches)
+                return None, None, (
+                    f"session {args.session!r} exists under multiple hosts "
+                    f"({found}); pass --host claude|codex|cursor")
             return None, None, (
-                f"cannot infer the host from {args.session!r} — a bare id or "
-                "'latest' is ambiguous across hosts; pass "
-                "--host claude|codex|cursor")
+                f"cannot find session {args.session!r} under Claude, Codex, "
+                "or Cursor; pass a session path or an explicit --host")
     r = readers.reader_for(host)
     if r is None:
         return None, None, f"unknown host {host!r} (known: {', '.join(readers.READERS)})"
     path, err = r.locate(args.session)
     if path is None:
+        if not isinstance(err, str) or not err:
+            err = f"cannot find session {args.session!r} for host {host!r}"
         return None, None, err
     return r, path, ""
 
@@ -94,6 +124,8 @@ def cmd_import(args) -> int:
         passthrough += ["--title", args.title]
     if args.agent_brain_id:
         passthrough += ["--agent-brain-id", args.agent_brain_id]
+    if args.no_room:
+        passthrough.append("--no-room")
     if args.namespace is not None:
         passthrough += ["--namespace", args.namespace]
     if args.url:
@@ -109,6 +141,22 @@ def cmd_import(args) -> int:
 
     if r.HOST == claude_reader.HOST:
         # Already canonical — import_session.py reads the transcript in place.
+        if args.dry_run:
+            records, meta = r.to_canonical(path)
+            if not records:
+                print(f"ERROR: nothing to import from {path}", file=sys.stderr)
+                return 2
+            sid = meta.get("session_id") or path.stem
+            conv_id = args.conversation_id or sid
+            print(f"source          : {path}")
+            print(f"claude session  : {sid}")
+            print(f"records         : {len(records)}")
+            print(f"cwd             : {meta.get('cwd')}")
+            print(f"conversation_id : {conv_id}")
+            print("-" * 56)
+            print("[dry-run] Claude transcript is already canonical; "
+                  "skipping import_conversation")
+            return 0
         return run_import(path, args.conversation_id)
 
     records, meta = r.to_canonical(path)
@@ -182,6 +230,9 @@ def main() -> int:
     ip.add_argument("--conversation-id", default=None)
     ip.add_argument("--title", default=None)
     ip.add_argument("--agent-brain-id", default=None)
+    ip.add_argument("--no-room", action="store_true",
+                    help="ignore the repo's cached room and import into "
+                         "workspace memory")
     ip.add_argument("--namespace", default=None,
                     help="repo scope for captured directives; default resolves "
                          "from the session's cwd via git remote, '' disables")

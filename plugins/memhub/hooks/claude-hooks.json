@@ -8,7 +8,7 @@
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking for relevant directives",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
           }
         ]
       },
@@ -19,7 +19,7 @@
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking for relevant directives",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
           }
         ]
       }
@@ -32,7 +32,7 @@
             "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: checking directives for this failure",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reactive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reactive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
           }
         ]
       },
@@ -44,7 +44,7 @@
             "async": true,
             "timeout": 300,
             "statusMessage": "MemHub: flushing session memory",
-            "command": "IN=$(cat); case \"$IN\" in *git*commit*|*\"gh pr\"*) if [ -z \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then echo \"[memhub-flush] CLAUDE_PLUGIN_ROOT unset; cannot locate flush scripts, skipping\" >&2; elif printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi ;; esac"
+            "command": "IN=$(cat); case \"$IN\" in *git*commit*|*\"gh pr\"*) if [ -z \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then echo \"[memhub-flush] CLAUDE_PLUGIN_ROOT unset; cannot locate flush scripts, skipping\" >&2; elif printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi ;; esac"
           }
         ]
       },
@@ -55,7 +55,7 @@
             "type": "command",
             "timeout": 10,
             "statusMessage": "MemHub: checking artifact links",
-            "command": "if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/artifact_sync_reminder.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/artifact_sync_reminder.py\"; fi"
           }
         ]
       },
@@ -66,7 +66,7 @@
             "type": "command",
             "timeout": 30,
             "statusMessage": "MemHub: PR created \u2014 arming babysit loop",
-            "command": "IN=$(cat); case \"$IN\" in *gh*pr*create*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_babysit_trigger.py\"; fi ;; esac"
+            "command": "IN=$(cat); case \"$IN\" in *gh*pr*create*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_babysit_trigger.py\"; fi ;; esac"
           }
         ]
       },
@@ -87,12 +87,12 @@
           {
             "type": "command",
             "timeout": 5,
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/capture_health.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/capture_health.py\"; fi"
           },
           {
             "type": "command",
             "timeout": 5,
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" brief; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" brief; fi"
           }
         ]
       }
@@ -104,13 +104,13 @@
             "type": "command",
             "async": true,
             "timeout": 300,
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/turn_flush_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_turn.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" capture Stop && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/turn_flush_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_turn.py\"; fi"
           },
           {
             "type": "command",
             "async": true,
             "timeout": 60,
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" refresh; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore Stop; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" refresh; fi"
           }
         ]
       },
@@ -133,7 +133,7 @@
             "async": true,
             "timeout": 300,
             "statusMessage": "MemHub: saving session memory",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" capture SessionEnd; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi"
           }
         ]
       }

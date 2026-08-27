@@ -12,7 +12,11 @@ Run: python3 cursor_capture_test.py
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import sys
+import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -20,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 
 import cursor_flush  # noqa: E402
+import cursor_capture  # noqa: E402
 from cursor_flush import (  # noqa: E402
     DORMANT_RETRY_S, _verdict, session_uuid, should_flush)
 
@@ -27,6 +32,133 @@ NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
 SHIPPED = {"blob_ids": ["a", "b"], "last_flush_at": NOW - 300}
 STALE = {"blob_ids": ["a"], "last_flush_at": NOW - 300}   # "b" is new
+
+
+def test_cross_platform_launcher_acknowledges_and_detaches():
+    seen: list[tuple[bytes, str]] = []
+    original_spawn = cursor_capture.spawn_cursor_flush
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    try:
+        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(
+            (raw, event))
+        sys.stdin = io.TextIOWrapper(io.BytesIO(b'{"session_id":"s"}'))
+        sys.stdout = io.StringIO()
+        original_argv = sys.argv
+        sys.argv = ["cursor_capture.py", "stop"]
+        try:
+            assert cursor_capture.main() == 0
+        finally:
+            sys.argv = original_argv
+        output = sys.stdout.getvalue()
+    finally:
+        cursor_capture.spawn_cursor_flush = original_spawn
+        sys.stdin = original_stdin
+        sys.stdout = original_stdout
+
+    assert seen == [(b'{"session_id":"s"}', "stop")]
+    assert json.loads(output) == {"permission": "allow"}
+    print("PASS test_cross_platform_launcher_acknowledges_and_detaches")
+
+
+def test_detached_temporary_stdin_survives_parent_close():
+    """The detached child must retain stdin after the launcher returns.
+
+    A delayed reader makes every parent ``TemporaryFile`` close before the
+    child consumes it. Repeating the real spawn path catches Windows handle
+    inheritance regressions that a mocked ``Popen`` cannot expose.
+    """
+    attempts = 24
+    original_file = cursor_capture.__file__
+    with tempfile.TemporaryDirectory(prefix="memhub-cursor-stdin-") as td:
+        root = Path(td)
+        results = root / "detached results"
+        results.mkdir()
+        helper = root / "cursor_flush.py"
+        helper.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import time\n"
+            "time.sleep(0.1)\n"
+            "Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())\n",
+            encoding="utf-8",
+        )
+
+        expected: dict[Path, bytes] = {}
+        cursor_capture.__file__ = str(root / "cursor_capture.py")
+        try:
+            for attempt in range(attempts):
+                output = results / f"payload-{attempt:02d}.bin"
+                payload = (f"attempt-{attempt:02d}\n".encode("ascii")
+                           + bytes(range(256)) * 384)
+                expected[output] = payload
+                cursor_capture.spawn_cursor_flush(payload, str(output))
+        finally:
+            cursor_capture.__file__ = original_file
+
+        deadline = time.monotonic() + 20
+        pending = list(expected)
+        while pending and time.monotonic() < deadline:
+            pending = [path for path, payload in expected.items()
+                       if not path.exists()
+                       or path.stat().st_size != len(payload)]
+            if pending:
+                time.sleep(0.02)
+
+        assert not pending, f"detached children did not finish: {pending}"
+        for path, payload in expected.items():
+            assert path.read_bytes() == payload, path
+
+    print("PASS test_detached_temporary_stdin_survives_parent_close")
+
+
+def test_cursor_manifest_uses_one_portable_launcher_per_event():
+    document = json.loads(
+        (ROOT / "plugins" / "memhub" / "hooks" / "cursor-hooks.json")
+        .read_text(encoding="utf-8"))
+    assert set(document["hooks"]) == {
+        "beforeShellExecution", "afterFileEdit", "afterAgentResponse",
+        "stop", "beforeSubmitPrompt", "sessionEnd"
+    }
+    for event, handlers in document["hooks"].items():
+        assert len(handlers) == 1, event
+        command = handlers[0]["command"]
+        # Cursor runs stop from the workspace even for plugin hooks. Keep every
+        # event explicit so no event-specific cwd can strand the launcher.
+        expected = f'"${{CURSOR_PLUGIN_ROOT}}/hooks/cursor_capture.cmd" {event}'
+        assert command == expected
+        assert not command.startswith("./hooks/")
+        assert "tee" not in command
+    launcher = (ROOT / "plugins" / "memhub" / "hooks" /
+                "cursor_capture.cmd").read_text(encoding="utf-8")
+    assert not (ROOT / "plugins" / "memhub" / "hooks" /
+                "cursor_capture.sh").exists()
+    assert launcher.startswith(":; ")
+    assert "cursor-root" not in launcher
+    assert "stable_root" not in launcher
+    assert "cleanup_stage" not in launcher
+    assert ".memhub-cursor-hook-" not in launcher
+    assert ":launch\nwhere py" in launcher
+    assert launcher.count('"%ROOT%\\scripts\\cursor_capture.py" %*') == 2
+    assert launcher.count("if errorlevel 1 goto allow") == 2
+    print("PASS test_cursor_manifest_uses_one_portable_launcher_per_event")
+
+
+def test_direct_payload_normalizes_encodings_and_rejects_invalid():
+    expected = b'{"session_id":"s"}'
+    assert cursor_capture._normalize_payload(expected) == expected
+    assert cursor_capture._normalize_payload(
+        b"\xff\xfe" + expected.decode().encode("utf-16le")) == expected
+    assert cursor_capture._normalize_payload(
+        expected.decode().encode("utf-16le")) == expected
+    assert cursor_capture._normalize_payload(
+        expected.decode().encode("utf-16be")) == expected
+    escaped_nul = b'{"value":"\\u0000"}'
+    assert cursor_capture._normalize_payload(escaped_nul) == escaped_nul
+    assert cursor_capture._normalize_payload(b"a\x00b\x00") is None
+    oversized = b"{" + b" " * cursor_capture._MAX_PAYLOAD_BYTES + b"}"
+    assert cursor_capture._normalize_payload(oversized) is None
+    print("PASS test_direct_payload_normalizes_encodings_and_rejects_invalid")
 
 
 def test_real_platform_is_unconditional():
@@ -83,7 +215,8 @@ def test_real_platform_is_unconditional():
 
 
 def test_no_new_blobs_never_flushes():
-    for event in ("stop", "afterFileEdit", "beforeShellExecution", "beforeSubmitPrompt"):
+    for event in ("afterAgentResponse", "stop", "afterFileEdit",
+                  "beforeShellExecution", "beforeSubmitPrompt", "sessionEnd"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 SHIPPED, FRESH, NOW), event
     print("PASS test_no_new_blobs_never_flushes")
@@ -153,8 +286,10 @@ def test_edit_debounce():
 
 
 def test_turn_boundaries_flush_on_new_content():
+    assert should_flush("afterAgentResponse", {}, STALE, FRESH, NOW)
     assert should_flush("stop", {}, STALE, FRESH, NOW)
     assert should_flush("beforeSubmitPrompt", {}, STALE, FRESH, NOW)
+    assert should_flush("sessionEnd", {}, STALE, FRESH, NOW)
     assert not should_flush("unknownEvent", {}, STALE, FRESH, NOW)
     print("PASS test_turn_boundaries_flush_on_new_content")
 
@@ -242,7 +377,8 @@ def test_import_verdicts_and_dormancy():
     # transient blip ships before the streak ever reaches dormancy.
     dormant = {"unsupported": True, "unsupported_at": 1_000.0}
     for event in ("afterFileEdit", "beforeShellExecution",
-                  "stop", "beforeSubmitPrompt"):
+                  "afterAgentResponse", "stop", "beforeSubmitPrompt",
+                  "sessionEnd"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 dormant, {"new-blob"}, 1_000.0), event
     # ...but dormancy is NOT a one-way door: going dormant means never

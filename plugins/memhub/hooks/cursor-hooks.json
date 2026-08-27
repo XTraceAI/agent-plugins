@@ -3,22 +3,32 @@
   "hooks": {
     "beforeShellExecution": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" beforeShellExecution'"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeShellExecution"
       }
     ],
     "afterFileEdit": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" afterFileEdit'"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" afterFileEdit"
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" afterAgentResponse"
       }
     ],
     "stop": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" stop'"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" stop"
       }
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "sh -c 'D=\"${CURSOR_PLUGIN_ROOT:-}\"; [ -n \"$D\" ] && [ -f \"$D/hooks/cursor_capture.sh\" ] || D=\".\"; exec \"$D/hooks/cursor_capture.sh\" beforeSubmitPrompt'"
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeSubmitPrompt"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" sessionEnd"
       }
     ]
   }

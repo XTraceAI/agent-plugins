@@ -73,16 +73,28 @@ _CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 def _plugin_root() -> Path:
     """The installed plugin dir — prod ``memhub`` or ``memhub-staging``.
 
-    Prefer ``$CLAUDE_PLUGIN_ROOT`` (set by Claude Code, authoritative). When it
-    is unset (a standalone script run) fall back to this file's location — but
-    UNRESOLVED: ``scripts/`` is symlinked into the memhub-staging plugin, so
-    ``Path(__file__).resolve()`` would collapse the symlink to the prod
-    ``memhub`` dir and read the wrong ``.mcp.json`` (a staging install would
-    then auth against and talk to prod). The unresolved path keeps the real
-    plugin identity.
+    Claude sets ``$CLAUDE_PLUGIN_ROOT``, but Cursor's compatibility loader can
+    set it to a different installed plugin. Trust the variable only when its
+    auth module is this running file. This also preserves the staging layout:
+    ``scripts/`` is symlinked into the prod plugin in the source tree, so
+    ``samefile`` recognizes the shared module while returning the staging root
+    and its staging ``.mcp.json``.
+
+    When no trustworthy root is present (a standalone script or Cursor), use
+    this file's unresolved location. Resolving it would collapse the staging
+    symlink to the prod plugin and select the wrong backend.
     """
     root = os.environ.get("CLAUDE_PLUGIN_ROOT")
-    return Path(root) if root else Path(__file__).parent.parent
+    if root:
+        candidate = Path(root)
+        try:
+            if (candidate / "scripts" / Path(__file__).name).samefile(__file__):
+                return candidate
+        except OSError:
+            pass
+    # A copied staging install passes samefile above because __file__ is in that
+    # copy; reaching here means the advertised root does not own this module.
+    return Path(__file__).parent.parent
 
 
 def _plugin_mcp_config() -> dict:
@@ -599,12 +611,9 @@ def resolve_bearer(url: str | None = None,
     if token:
         return url, token
 
-    record = _stored_pak(url)
-    # isinstance, not just truthy: the secret is formatted straight into an
-    # Authorization header, so a non-string would be rendered by f-string into
-    # a nonsense credential and fail as a puzzling 401 rather than as "no key".
-    if record and isinstance(record.get("secret"), str):
-        return url, record["secret"]
+    secret = _stored_pak_secret(url)
+    if secret is not None:
+        return url, secret
 
     # Renew before reading: the cached access token is short-lived, and this
     # shim is the only thing that ever renews it from a cold process.
@@ -652,6 +661,17 @@ def _stored_pak(url: str) -> dict | None:
         return None
 
 
+def _stored_pak_secret(url: str) -> str | None:
+    """Return only a secret that is safe to put in a bearer header."""
+    record = _stored_pak(url)
+    if not record:
+        return None
+    # isinstance, not just truthy: f-string would turn a malformed value into
+    # a nonsense credential and fail as a puzzling 401 rather than as "no key".
+    secret = record.get("secret")
+    return secret if isinstance(secret, str) and secret else None
+
+
 def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     """Return (url, headers, auth) for streamablehttp_client.
 
@@ -680,9 +700,9 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     # the OAuth cache is the older credential and may still work, and a
     # degraded-but-working capture beats a confident dead end. The health check
     # reports the lapsed key either way.
-    record = _stored_pak(url)
-    if record:
-        return url, {"Authorization": f"Bearer {record['secret']}"}, None
+    secret = _stored_pak_secret(url)
+    if secret is not None:
+        return url, {"Authorization": f"Bearer {secret}"}, None
 
     _refresh_cached_token_if_stale(url)
     return url, None, build_oauth(url, interactive=interactive)

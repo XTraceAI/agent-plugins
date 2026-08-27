@@ -1,0 +1,16 @@
+{
+  "conversation_id": "11111111-2222-4333-8444-555555555555",
+  "generation_id": "11111111-2222-4333-8444-555555555555",
+  "model": "auto-smart",
+  "command": "echo hook-probe",
+  "cwd": "/tmp/memhub-cursor-probe",
+  "sandbox": false,
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "hook_event_name": "stop",
+  "cursor_version": "2026.08.11-e8db854",
+  "workspace_roots": [
+    "/tmp/memhub-cursor-probe"
+  ],
+  "user_email": "user@example.com",
+  "transcript_path": "/Users/example/.cursor/projects/tmp-memhub-cursor-probe/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl"
+}
