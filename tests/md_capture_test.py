@@ -104,6 +104,14 @@ with tempfile.TemporaryDirectory() as td:
     state = mc.load_state(sid)
     check(mc.state_path(sid).parent == mc.STATE_DIR and (os.name != "posix" or (mc.STATE_DIR.stat().st_mode & 0o777) == 0o700),
           "state file lives in the per-user 0700 dir, not the shared temp dir")
+    if os.name == "posix":
+        # every dir the collector CREATED is 0700 from birth (umask), not just the leaf
+        created = mc.STATE_DIR.parent  # .config/memhub-plugin, new under this td
+        check((created.stat().st_mode & 0o777) == 0o700, f"created parent dir is 0700 too: {oct(created.stat().st_mode & 0o777)}")
+        pre = Path(td) / "pre"; pre.mkdir(mode=0o755); mc.STATE_DIR = pre
+        mc.save_state("sess-pre", {"dirty": []})
+        check((pre.stat().st_mode & 0o777) == 0o700, "pre-existing wider leaf dir is tightened to 0700")
+        mc.STATE_DIR = Path(td) / ".config" / "memhub-plugin" / "mdcapture"
     check(state["dirty"] == [spec], f"state holds the spec exactly once: {state['dirty']}")
     # create-then-edit through a symlinked dir must map to ONE canonical key
     real = Path(td) / "realrepo" / "docs"; real.mkdir(parents=True)

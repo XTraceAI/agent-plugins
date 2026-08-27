@@ -86,11 +86,19 @@ def save_state(session_id: str, state: dict) -> None:
     p = state_path(session_id)
     if p is None:
         return
-    p.parent.mkdir(parents=True, exist_ok=True)
+    # Born 0700: mkdir under a 077 umask so no directory on the path is ever
+    # world-readable, even briefly. The chmod covers a leaf that already
+    # existed with a wider mode; if THAT fails we still write (capture must
+    # never block an edit) but say so.
+    prior = os.umask(0o077)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    finally:
+        os.umask(prior)
     try:
         os.chmod(p.parent, 0o700)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[memhub-md-capture] state dir not 0700: {e}", file=sys.stderr)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
     os.replace(tmp, p)
