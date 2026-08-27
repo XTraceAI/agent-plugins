@@ -7,9 +7,9 @@ refused). What is asserted is the client contract from the spec (§4.1, §4.3,
 
 * fetch sends ``status=active&repo=<repo>&view=hook`` with the bearer, caches
   ``{etag, fetched_at, rules}``, and revalidates with ``If-None-Match``;
-* server rules merge with the local book, local wins on id collision, and the
+* server rules are the only rules (no local book), and the
   merge audit names each rule's source;
-* offline / 500 / slow keep the LAST book; no book at all → local only;
+* offline / 500 / slow keep the LAST book; no book at all → silent;
 * the session lane and the tool-call lanes never wait on the network — the
   pre lane makes zero requests and its latency with the server down is bounded;
 * flush POSTs the v2 rows minus ``excerpt``, advances a watermark only on a
@@ -158,10 +158,7 @@ def _anchor_lane_checks(check, run, ctx):
         os.makedirs(os.path.join(repo, ".git"))
         with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
             f.write("ref: refs/heads/b\n")
-        book = os.path.join(td, "rulebook.json")
-        with open(book, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "rules": []}, f)
-        env = {"MEMHUB_RULEBOOK": book, "MEMHUB_TOKEN": "tok-123",
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_TOKEN": "tok-123",
                "MEMHUB_MCP_BASE_URL": f"http://127.0.0.1:{fake.port}",
                "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_TIMEOUT_S": "1"}
         run("fetch", {"cwd": repo}, env)
@@ -202,8 +199,11 @@ def main():
         {"rule_id": "srv-bash", "title": "Server bash rule", "statement": "SERVER BASH TEXT",
          "mode": "advise", "version": 3, "status": "active", "scope_repos": [],
          "matcher": {"event": "bash", "command_rx": r"server-only-cmd", "warn_once_per": "session"}},
-        {"rule_id": "shared-id", "statement": "SERVER WINS?", "mode": "advise", "version": 1,
+        {"rule_id": "shared-id", "statement": "SERVER WINS", "mode": "advise", "version": 1,
          "scope_repos": ["xmem"], "matcher": {"event": "bash", "command_rx": r"shared-cmd"}},
+        {"rule_id": "local-rule", "statement": "LOCAL TEXT", "mode": "advise", "version": 1,
+         "scope_repos": [], "matcher": {"event": "bash", "command_rx": r"local-cmd",
+                                        "converted_rx": r"do-it", "warn_once_per": "session"}},
         {"rule_id": "srv-gate", "statement": "GATE TEXT", "mode": "gate", "version": 2,
          "scope_repos": [], "matcher": {"event": "bash", "command_rx": r"gated-cmd"}},
     ]
@@ -212,15 +212,7 @@ def main():
         os.makedirs(os.path.join(repo, ".git"))
         with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
             f.write("ref: refs/heads/b\n")
-        book = os.path.join(td, "rulebook.json")
-        with open(book, "w", encoding="utf-8") as f:
-            json.dump({"version": "pilot-t", "rules": [
-                {"id": "local-rule", "on": "bash", "rx": r"local-cmd", "fire_scope": "session",
-                 "repo_scope": "any", "text": "LOCAL TEXT", "why": "w", "converted_rx": r"do-it"},
-                {"id": "shared-id", "on": "bash", "rx": r"shared-cmd", "fire_scope": "session",
-                 "repo_scope": "any", "text": "LOCAL WINS", "why": "w"},
-            ]}, f)
-        env = {"MEMHUB_RULEBOOK": book, "MEMHUB_TOKEN": "tok-123",
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_TOKEN": "tok-123",
                "MEMHUB_MCP_BASE_URL": f"http://127.0.0.1:{fake.port}",
                "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_TIMEOUT_S": "1"}
         import hashlib
@@ -238,7 +230,7 @@ def main():
               req["headers"].get("Authorization") == "Bearer tok-123")
         b = json.load(open(cache, encoding="utf-8"))
         check("fetch: cache {etag, fetched_at, rules}",
-              b["etag"] == '"v1"' and len(b["rules"]) == 3 and b["fetched_at"])
+              b["etag"] == '"v1"' and len(b["rules"]) == 4 and b["fetched_at"])
         first_at = b["fetched_at"]
         time.sleep(1.1)
         run("fetch", {"cwd": repo}, env)
@@ -252,11 +244,11 @@ def main():
         rc, out = run("pre", dict(base, tool_input={"command": "server-only-cmd"}), env)
         check("merge: a server rule fires from the cache", "SERVER BASH TEXT" in ctx(out), out)
         rc, out = run("pre", dict(base, tool_input={"command": "shared-cmd"}), env)
-        check("merge: local wins on id collision", "LOCAL WINS" in ctx(out) and "SERVER WINS" not in ctx(out))
+        check("book: a repo-scoped server rule fires in its repo", "SERVER WINS" in ctx(out))
         run("session", {"cwd": repo, "session_id": "s1"}, env)
         src = json.load(open(cache + ".sources", encoding="utf-8"))["sources"]
         check("merge: audit names each rule's source",
-              src == {"local-rule": "local", "shared-id": "local", "srv-bash": "server", "srv-gate": "server"}, str(src))
+              src == {"local-rule": "server", "shared-id": "server", "srv-bash": "server", "srv-gate": "server"}, str(src))
         rows = jl(os.path.join(td, "ledger", "fires.jsonl"))
         srv = next(r for r in rows if r["rule_id"] == "srv-bash")
         check("ledger: a server rule's fire carries the server's rule version", srv["rule_version"] == 3)
@@ -275,15 +267,9 @@ def main():
               rc == 0 and out == "" and open(cache, encoding="utf-8").read() == before)
         rc, out = run("pre", dict(base, session_id="off", tool_input={"command": "server-only-cmd"}), down)
         check("offline session keeps the last book (server rule still fires)", "SERVER BASH TEXT" in ctx(out))
-        nocache = dict(env, MEMHUB_RULEBOOK=os.path.join(td, "nocache", "rulebook.json"))
-        os.makedirs(os.path.join(td, "nocache"))
-        with open(nocache["MEMHUB_RULEBOOK"], "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "rules": [{"id": "l", "on": "bash", "rx": "zzz", "text": "ONLY LOCAL", "why": "w"}]}, f)
-        rc, out = run("pre", dict(base, tool_input={"command": "zzz server-only-cmd"}), nocache)
-        check("no cache → local book only", "ONLY LOCAL" in ctx(out) and "SERVER" not in ctx(out))
-        os.remove(nocache["MEMHUB_RULEBOOK"])
-        rc, out = run("pre", dict(base, tool_input={"command": "zzz"}), nocache)
-        check("no cache and no local book → silent", rc == 0 and out == "")
+        nocache = dict(env, MEMHUB_RULEBOOK_BASE=os.path.join(td, "nocache"))
+        rc, out = run("pre", dict(base, tool_input={"command": "server-only-cmd"}), nocache)
+        check("no cached book → no rules, silent (there is no local book)", rc == 0 and out == "")
 
         # ── latency: tool-call lanes never touch the network ────────────
         n0 = len(fake.requests)

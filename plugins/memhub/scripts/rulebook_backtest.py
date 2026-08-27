@@ -13,7 +13,6 @@ excerpts this prints and judges them. Stdlib only; read-only.
 Usage:
   rulebook_backtest.py --rule '<json>'            # candidate rule JSON
   rulebook_backtest.py --rule-file cand.json
-  rulebook_backtest.py --id ruff-unpinned         # replay an existing rule
   [--days 30] [--projects ~/.claude/projects] [--max-excerpts 15]
   [--exclude-session <uuid>]                      # ALWAYS pass the current
                                                   # session id: this session's
@@ -30,16 +29,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rulebook_hook import evaluate  # noqa: E402 — the ONE matcher implementation
 
-RULEBOOK = os.path.expanduser("~/.claude/scripts/rulebook/rulebook.json")
-
-
 def load_rule(args):
-    if args.id:
-        with open(RULEBOOK, encoding="utf-8") as f:
-            for r in json.load(f)["rules"]:
-                if r["id"] == args.id:
-                    return r
-        sys.exit(f"no rule '{args.id}' in {RULEBOOK}")
     raw = args.rule or open(args.rule_file, encoding="utf-8").read()
     return json.loads(raw)
 
@@ -63,7 +53,6 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--rule")
     g.add_argument("--rule-file")
-    g.add_argument("--id")
     g.add_argument("--triggers", help="comma-separated trigger identifiers "
                    "(directive mode): replayed as case-insensitive substring "
                    "matches over commands, paths, and edited content — the "
