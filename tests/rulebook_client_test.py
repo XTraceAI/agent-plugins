@@ -169,7 +169,7 @@ def _anchor_lane_checks(check, run, ctx):
         rc, out = run("pre", ev, env)
         last = fake.recalls[-1] if fake.recalls else {}
         check("anchor: kept rule injected; POST /recall carried the file handle only (no body)",
-              "[a-bus]" in ctx(out) and last.get("args") == {"file_path": repo + "/xmem/context_bus.py"}
+              "[bus]" in ctx(out) and last.get("args") == {"file_path": repo + "/xmem/context_bus.py"}
               and "SECRET BODY" not in json.dumps(last), str(last))
         n = len(fake.recalls)
         rc, out = run("pre", ev, env)
@@ -179,7 +179,7 @@ def _anchor_lane_checks(check, run, ctx):
         check("anchor: a tool with no handle → no recall call", len(fake.recalls) == n)
         rc, out = run("pre", dict(ev, session_id="an2b"), env)
         check("anchor: a fresh session re-asks and sends its own already_fired (empty)",
-              "[a-bus]" in ctx(out) and fake.recalls[-1]["already_fired"] == [])
+              "[bus]" in ctx(out) and fake.recalls[-1]["already_fired"] == [])
         fake.mode = "500"
         rc, out = run("pre", dict(ev, session_id="an3"), env)
         check("anchor: server 500 → silent, exit 0", rc == 0 and out.strip() == "")
@@ -243,6 +243,8 @@ def main():
         # ── merge ───────────────────────────────────────────────────────
         rc, out = run("pre", dict(base, tool_input={"command": "server-only-cmd"}), env)
         check("merge: a server rule fires from the cache", "SERVER BASH TEXT" in ctx(out), out)
+        check("render: a server rule is labelled by title and carries no empty why",
+              "[Server bash rule]" in ctx(out) and "(why: )" not in ctx(out), ctx(out))
         rc, out = run("pre", dict(base, tool_input={"command": "shared-cmd"}), env)
         check("book: a repo-scoped server rule fires in its repo", "SERVER WINS" in ctx(out))
         run("session", {"cwd": repo, "session_id": "s1"}, env)
