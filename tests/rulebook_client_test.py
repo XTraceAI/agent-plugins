@@ -383,7 +383,7 @@ def main():
         with open(conv_p, "a", encoding="utf-8") as f:
             f.write(json.dumps({"fire_id": fid_local, "converted": True,
                                 "converted_at": "2026-08-26T00:00:01Z"}) + "\n")
-        run("flush", {"session_id": "f1"}, env, ("final",))
+        run("flush", {"session_id": "f1"}, dict(env, MEMHUB_RULEBOOK_CONVERSION_HOLD_S="0"), ("final",))
         after2 = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
         check("flush: an old orphan conversion is dropped, the watermark moves past it",
               after2 == os.path.getsize(conv_p), f"{after2} vs {os.path.getsize(conv_p)}")

@@ -39,7 +39,7 @@ Two engines, one evaluate():
 """
 import fcntl
 import hashlib
-import datetime
+import datetime as _dt
 import json
 import os
 import re
@@ -633,17 +633,20 @@ def load_sent():
         return {"fires_offset": 0, "conversions_offset": 0, "last_flush_at": None}
 
 
-CONVERSION_HOLD_S = 6 * 3600
+try:
+    CONVERSION_HOLD_S = int(os.environ.get("MEMHUB_RULEBOOK_CONVERSION_HOLD_S", 6 * 3600))
+except ValueError:
+    CONVERSION_HOLD_S = 6 * 3600
 
 
 def _older_than(iso, seconds):
     """True when `iso` (ledger timestamp) is more than `seconds` in the past;
     an unparseable stamp counts as old so it can never hold the watermark."""
     try:
-        ts = datetime.datetime.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+        ts = _dt.datetime.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=_dt.timezone.utc)
     except Exception:
         return True
-    return (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds() > seconds
+    return (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() > seconds
 
 
 def pending_batches(sent):
