@@ -32,6 +32,7 @@ from readers import cursor as cursor_reader  # noqa: E402
 SESSION = "8af6c93d-7e11-4a47-a6a4-2084d62ed1c9"
 GEN_1 = "324ce2e2-d685-4fec-9978-c05b9fb907b3"
 GEN_2 = "ca6fc036-69a7-4e46-bef4-8e773133cabb"
+GEN_3 = "2fea5ff0-44df-4223-b409-0c92ef551c42"
 
 TAG_1 = ("<timestamp>Sunday, Aug 23, 2026, 11:16 AM (UTC-7)</timestamp>\n"
          "<user_query>\nReply once\n</user_query>")
@@ -225,9 +226,12 @@ def test_main_flow_pins_persist_and_ship():
             "now_iso": cursor_flush._now_iso,
         }
 
+        revisions: list[str] = []
+
         async def fake_flush(uuid, source_path, blob_ids, flush_mode="now",
                              **kwargs):
             calls.append(json.loads(json.dumps(kwargs["records"])))
+            revisions.append(kwargs["source_revision"])
             cursor_flush._save_state(
                 uuid, transcript_revision=kwargs["source_revision"],
                 sent_usage_generations=sorted(kwargs["applied_usage"]),
@@ -269,6 +273,17 @@ def test_main_flow_pins_persist_and_ship():
                 ISO_1, ISO_1, None, NOW_1, ISO_2, NOW_2, NOW_2]
             assert calls[1][6]["message"]["usage"]["input_tokens"] == 100
             assert _stamps_of(calls[1])[:4] == _stamps_of(calls[0])
+
+            # A third boundary with NO new content but a fresh usage sample:
+            # the send is forced by usage_pending, and the content revision
+            # is IDENTICAL to the previous send's — the gate hashes pre-stamp
+            # content only, so pin minting/upgrading can never re-fire it.
+            clock["now"] = "2026-08-23T18:20:00.000Z"
+            assert _run_main("stop", _payload(
+                path, "stop", GEN_3, "SECOND")) == 0
+            assert len(calls) == 3
+            assert revisions[2] == revisions[1]
+            assert _stamps_of(calls[2]) == _stamps_of(calls[1])
 
             # apply_session_state restores the same fidelity onto a fresh
             # out-of-band re-read (the capture.py / sweep backstop).
@@ -318,6 +333,34 @@ def test_apply_session_state_without_state_is_inert():
         finally:
             cursor_flush.STATE_DIR = old_state
     print("PASS test_apply_session_state_without_state_is_inert")
+
+
+def test_apply_session_state_refuses_non_uuid_ids():
+    """Same gate as the live path (review finding): a caller-chosen id that
+    is not a real session uuid must not select ANY state file — even one
+    that exists under the sanitized name."""
+    with tempfile.TemporaryDirectory() as td:
+        old_state = cursor_flush.STATE_DIR
+        cursor_flush.STATE_DIR = Path(td) / "state"
+        try:
+            cursor_flush.STATE_DIR.mkdir(parents=True)
+            planted = {"record_ts": {"bare": NOW_1}}
+            for name in ("store", "..", "a/b"):
+                (cursor_flush.STATE_DIR /
+                 f"{cursor_flush._safe_uuid(name)}.json").write_text(
+                    json.dumps(planted), encoding="utf-8")
+                records = [_rec("bare")]
+                cursor_flush.apply_session_state(records, name)
+                assert "timestamp" not in records[0], name
+            # A real uuid still applies its own state.
+            (cursor_flush.STATE_DIR / f"{SESSION}.json").write_text(
+                json.dumps(planted), encoding="utf-8")
+            records = [_rec("bare")]
+            cursor_flush.apply_session_state(records, SESSION)
+            assert records[0]["timestamp"] == NOW_1
+        finally:
+            cursor_flush.STATE_DIR = old_state
+    print("PASS test_apply_session_state_refuses_non_uuid_ids")
 
 
 if __name__ == "__main__":

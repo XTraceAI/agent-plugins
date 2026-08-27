@@ -636,6 +636,12 @@ def apply_session_state(records: list[dict], uuid: str) -> None:
     read-only — nothing here writes state, so a sweep can never perturb the
     live capture's watermarks.
     """
+    if not isinstance(uuid, str) or not _UUID_RE.fullmatch(uuid):
+        # Same gate main() applies before touching per-session state. The
+        # backstop's id comes from a caller-chosen path/meta, so a non-uuid
+        # must not select a state file (even a sanitized one) — skipping the
+        # restore just leaves the records with their artifact-carried clocks.
+        return
     state = _read_state(uuid)
     _stamp_records(records, state.get("record_ts"), None,
                    first_observation=True)
@@ -1120,15 +1126,20 @@ def main() -> int:
             _log(f"{event}: malformed token counters or generation_id — "
                  "leaving this turn unmeasured")
 
+        if source_kind == "transcript":
+            # Content identity only — computed BEFORE _stamp_records and
+            # _apply_usage mutate the records. The send gate answers "is
+            # there new CONTENT?"; it must never re-fire because a timestamp
+            # pin was minted or upgraded (stamps ride along on whatever send
+            # happens, and pending usage forces its own send via
+            # usage_pending). Hashing post-stamp would couple the gate's
+            # stability to the pin map's — the fragility a review round
+            # already caught once on the pin-eviction path.
+            source_revision = _records_revision(records)
         fields["record_ts"] = _stamp_records(
             records, state.get("record_ts"), _now_iso(),
             first_observation="record_ts" not in state,
             boundary_uuids=boundary_uuids)
-        if source_kind == "transcript":
-            # AFTER stamping: the revision must hash the shape that ships.
-            # Pins make it stable across invocations — it moves only when a
-            # new record (uuid) appears, which is precisely "new content".
-            source_revision = _records_revision(records)
 
         _save_state(uuid, **fields)
         state.update(fields)
