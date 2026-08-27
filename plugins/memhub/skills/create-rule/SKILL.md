@@ -46,7 +46,7 @@ that into a `proposed` update) instead of adding a twin.
 | a failing tool result | `agent_hook` | `matcher: {event: "result", result_rx, command_rx?}` |
 | "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, min_edits, display_name}` |
 | applies when a file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server's SLM judge decides relevance per call |
-| worldview with no trigger at all | `session_context` | none — hard budget: ≤ 3 per repo; session start is the weakest attention slot (4% vs 88% in-flight) |
+| worldview with no trigger at all | `session_context` | none — spec budget: 15 rules / ~2k tokens per repo scope; session start is the weakest attention slot (4% vs 88% in-flight), so prefer a checkable shape when one exists |
 
 Plus on every rule: `title` (≤ 60 chars), `statement` (the advisory line and
 the nuance a judge needs: sanctioned forms, exemptions), `scope_repos`

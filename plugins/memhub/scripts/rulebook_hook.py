@@ -52,7 +52,8 @@ from datetime import datetime, timezone
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
 MAX_ADVISE = 2          # per tool call — habituation guard
-MAX_POSTURE = 3         # full-text rules at session start — context guard
+MAX_POSTURE = 15        # spec §2: session_context is hard-capped at 15 rules / ~2k tokens per scope
+POSTURE_BUDGET_CHARS = 8000   # ~2k tokens at ~4 chars/token
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
@@ -978,7 +979,18 @@ def session_digest(rules, repo, gitdir, ctx):
     in_scope = [r for r in rules if scope_ok(r, repo, gitdir) and r.get("status", "active") == "active"]
     if not in_scope:
         return
-    posture = [r for r in in_scope if r.get("on") == "session"][:MAX_POSTURE]
+    # Spec §2: at most MAX_POSTURE session rules and ~2k tokens per scope.
+    # Deterministic (by title, then id) rather than book order, and every rule
+    # past either limit is logged SUPPRESSED so the ledger sees it.
+    posture_all = sorted((r for r in in_scope if r.get("on") == "session"),
+                         key=lambda r: (str(r.get("_label") or r.get("title") or r["id"]).casefold(), str(r["id"])))
+    posture, cut, used = [], [], 0
+    for r in posture_all:
+        cost = len(r.get("text") or "") + len(r.get("why") or "")
+        if len(posture) < MAX_POSTURE and used + cost <= POSTURE_BUDGET_CHARS:
+            posture.append(r); used += cost
+        else:
+            cut.append(r)
     active = [r for r in in_scope if r.get("on") != "session"]
     lines = ["## 📏 Rulebook (team rules — advisory)"]
     for r in posture:
@@ -992,6 +1004,10 @@ def session_digest(rules, repo, gitdir, ctx):
     emit("SessionStart", "\n".join(lines))
     if posture:
         log_fires(ctx, posture, hook_phase="session", mode="advise", excerpt="")
+    if cut:
+        log_fires(ctx, cut, hook_phase="session", mode="suppressed", excerpt="",
+                  dedup_keys={r["id"]: f"{r['id']}@session" for r in cut},
+                  raw_counts={r["id"]: 0 for r in cut})
 
 
 def main():

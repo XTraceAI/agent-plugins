@@ -189,6 +189,22 @@ def main() -> int:
             check("ledger v2: schema_version file stamped",
                   open(os.path.join(td, "ledger", "schema_version"), encoding="utf-8").read().strip() == "2")
 
+        # --- session lane: spec cap (15 / ~2k tokens), deterministic, logged ---
+        seed_book(td, "capsrepo", [
+            {"id": f"post-{i:02d}", "on": "session", "repo_scope": "any", "text": f"POSTURE {i:02d}", "why": "w", "title": f"Posture {i:02d}"}
+            for i in range(17)] + [
+            {"id": "post-big", "on": "session", "repo_scope": "any", "text": "BIG " * 3000, "why": "w", "title": "Posture 00 big"}])
+        caps = os.path.join(td, "capsrepo"); os.makedirs(os.path.join(caps, ".git"))
+        rc, out = run("session", {"cwd": caps, "session_id": "cap1"}, env)
+        shown = [i for i in range(17) if f"POSTURE {i:02d}" in ctx(out)]
+        check("session: at most 15 posture rules, chosen by title", shown == list(range(15)), str(shown))
+        check("session: a rule that would blow the ~2k-token budget is not served", "BIG BIG" not in ctx(out))
+        with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            srows = [json.loads(l) for l in f if '"cap1"' in l]
+        sup = sorted(r["rule_id"] for r in srows if r["mode"] == "suppressed")
+        check("session: every rule past the cap or budget is logged suppressed with a session dedup key",
+              sup == ["post-15", "post-16", "post-big"] and all(r["dedup_key"] == r["rule_id"] + "@session" for r in srows if r["mode"] == "suppressed"), str(sup))
+
         # --- cap → suppressed rows; converted_rx → conversions sidecar --------
         seed_book(td, "xmem", rules["rules"] + [
                 {"id": f"cap-{i}", "on": "bash", "rx": r"capcmd", "fire_scope": "session",

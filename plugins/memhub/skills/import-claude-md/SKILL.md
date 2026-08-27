@@ -48,7 +48,7 @@ delivery, per the table in `/memhub:create-rule` step 3:
 | a command / edit / tool result has a checkable form | `agent_hook` | `matcher` (`event`, `command_rx` / `path_rx` / `result_rx`, `*_not_rx`, `warn_once_per`) |
 | "run X after edits, before Y" | `agent_hook` | `ordering` |
 | applies when a named file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server's SLM judge decides relevance |
-| worldview with no trigger at all | `session_context` | none — hard budget: ≤ 3 per repo, only if no shape exists |
+| worldview with no trigger at all | `session_context` | none — spec budget: 15 rules / ~2k tokens per repo scope; only if no shape exists |
 
 Title = the heading or a ≤ 60-char noun phrase; **one rule per title** within
 a run. Statement = the full sentence including the nuance a judge needs
