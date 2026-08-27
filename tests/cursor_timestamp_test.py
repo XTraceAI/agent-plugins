@@ -126,14 +126,43 @@ def test_apply_only_mode_mints_nothing():
     print("PASS test_apply_only_mode_mints_nothing")
 
 
-def test_pin_map_is_bounded_fifo():
+def test_pin_map_prunes_only_orphaned_uuids_never_present_records():
     cap = cursor_flush._RECORD_TS_CAP
-    prior = {f"u{i}": NOW_1 for i in range(cap)}
+    # Over the cap with a mix: pins whose records are still in the batch
+    # MUST survive — evicting one would re-date a live record at the next
+    # flush's wall clock (the review finding on the original FIFO cap).
+    # Only pins orphaned by the artifact (uuids no longer present, e.g. a
+    # checkpoint restore shifting the index-derived ids) are pruned.
+    prior = {f"orphan{i}": NOW_1 for i in range(cap)}
+    prior["live"] = NOW_1
+    records = [_rec("live"), _rec("newest")]
     out = cursor_flush._stamp_records(
-        [_rec("newest")], prior, NOW_2, first_observation=False)
-    assert len(out) == cap
-    assert "u0" not in out and out["newest"] == NOW_2
-    print("PASS test_pin_map_is_bounded_fifo")
+        records, prior, NOW_2, first_observation=False)
+    assert out == {"live": NOW_1, "newest": NOW_2}, len(out)
+    assert records[0]["timestamp"] == NOW_1
+    # Re-running with the pruned map re-mints nothing: the live pins were
+    # kept, so no record ever falls into the "new uuid" branch again.
+    rerun = [_rec("live"), _rec("newest")]
+    cursor_flush._stamp_records(
+        rerun, out, "2026-08-24T09:00:00.000Z", first_observation=False)
+    assert rerun[0]["timestamp"] == NOW_1
+    assert rerun[1]["timestamp"] == NOW_2
+
+    # Under the cap, orphaned pins are kept (continuity across a transient
+    # shrunk read costs nothing until the map is actually oversized).
+    small = cursor_flush._stamp_records(
+        [_rec("live")], {"gone": NOW_1, "live": NOW_1}, NOW_2,
+        first_observation=False)
+    assert small == {"gone": NOW_1, "live": NOW_1}
+
+    # All-present pins are never evicted even when over the cap: the map's
+    # true bound is the artifact itself, which every flush re-reads whole.
+    oversized_live = {f"u{i}": NOW_1 for i in range(cap + 10)}
+    batch = [_rec(f"u{i}") for i in range(cap + 10)]
+    kept = cursor_flush._stamp_records(
+        batch, oversized_live, NOW_2, first_observation=False)
+    assert len(kept) == cap + 10
+    print("PASS test_pin_map_prunes_only_orphaned_uuids_never_present_records")
 
 
 # ---- main() flow: persisted before send, shipped on every send ---------

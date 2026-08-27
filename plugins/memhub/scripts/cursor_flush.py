@@ -532,11 +532,15 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
     return applied
 
 
-# Per-record timestamp pins persisted in session state. Bounds a pathological
-# session's state file; FIFO eviction drops the OLDEST records, whose rows the
-# server has long since persisted with their original stamps (re-sends of
-# known uuids are folded by the server watermark), so eviction costs revision
-# churn on a giant session, never a wrong stored date.
+# Prune trigger for the per-record timestamp pin map persisted in session
+# state. When the map outgrows this, entries whose record is NO LONGER in the
+# transcript are dropped (a store checkpoint restore shifts the deterministic
+# index-based uuids, stranding the old ones). Pins for records still being
+# re-sent are NEVER evicted — dropping one would re-date a live record at the
+# next flush's wall clock, the exact degeneracy this module exists to prevent
+# — so the map's true bound is the artifact itself, which every flush already
+# re-reads and re-uploads wholesale (a session big enough to blow up this map
+# has long since blown up the flush payload).
 _RECORD_TS_CAP = 8192
 
 
@@ -575,12 +579,22 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     With ``now_iso=None`` this only APPLIES existing pins (read-only replay
     for out-of-band senders); no new stamps are minted. Mutates ``records``
     in place; returns the updated pin map for persisting.
+
+    A pin whose record is still in ``records`` is NEVER evicted: transcripts
+    are append-only, so early records are re-sent on every flush, and losing
+    their pin would re-mint "now" for them — re-dating an early turn at a
+    much-later wall clock (review finding on the original FIFO cap). Only
+    pins ORPHANED by the artifact (a checkpoint restore shifting the
+    index-derived uuids) are pruned, and only once the map outgrows
+    ``_RECORD_TS_CAP``.
     """
     stamps: dict = dict(prior) if isinstance(prior, dict) else {}
+    present: set = set()
     for record in records:
         rid = record.get("uuid")
         if not isinstance(rid, str) or not rid:
             continue
+        present.add(rid)
         reader_ts = record.get("timestamp")
         reader_ts = reader_ts if isinstance(reader_ts, str) and reader_ts else None
         if rid in stamps:
@@ -603,8 +617,8 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
             record["timestamp"] = pinned
         else:
             record.pop("timestamp", None)
-    while len(stamps) > _RECORD_TS_CAP:
-        stamps.pop(next(iter(stamps)))
+    if len(stamps) > _RECORD_TS_CAP:
+        stamps = {rid: pin for rid, pin in stamps.items() if rid in present}
     return stamps
 
 
