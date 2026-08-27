@@ -294,6 +294,72 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
     return result
 
 
+class RestReply:
+    """One plain-HTTP reply: ``status`` (200/202/304/...), the ``etag`` header
+    if any, and ``data`` — the decoded JSON body with the REST ``{code, msg,
+    data}`` envelope unwrapped, or None when there was no body (304)."""
+
+    def __init__(self, status: int, etag: str | None, data):
+        self.status = status
+        self.etag = etag
+        self.data = data
+
+
+def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
+         headers: dict | None = None, timeout: float = _DEFAULT_TIMEOUT_S) -> RestReply:
+    """One REST call over the SAME transport as the MCP path — same opener
+    (never follows a redirect, so the bearer never leaves the host it was
+    issued for), same cleartext refusal, same error taxonomy.
+
+    Exists so the rulebook hook, which speaks plain REST (``GET /rules`` with
+    ``If-None-Match``, ``POST /fires``), does not grow a second HTTP client
+    beside this one. ``304`` and ``202`` are ordinary replies here, not
+    errors; ``McpError`` carries the status for everything 4xx/5xx.
+    """
+    require_secure(url)
+    hdrs = {"Authorization": f"Bearer {bearer}", "Accept": "application/json"}
+    if body is not None:
+        hdrs["Content-Type"] = "application/json"
+    hdrs.update(headers or {})
+    req = urllib.request.Request(
+        url, method=method,
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        headers=hdrs)
+    try:
+        with _opener().open(req, timeout=timeout) as resp:
+            status = resp.status
+            etag = resp.headers.get("ETag")
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return RestReply(304, exc.headers.get("ETag"), None)
+        detail = (exc.read() or b"").decode("utf-8", errors="replace")[:200]
+        if exc.code == 429:
+            raw_ra = exc.headers.get("Retry-After")
+            try:
+                retry_after = float(raw_ra) if raw_ra else None
+            except ValueError:
+                retry_after = None
+            raise McpRateLimited(f"rate limited: {detail}", retry_after) from exc
+        raise McpError(f"{method} {url} failed ({exc.code}): {detail}", exc.code) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise McpError(f"{method} {url} failed: {exc}") from exc
+    if not raw.strip():
+        return RestReply(status, etag, None)
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise McpError(f"{method} {url}: reply was not JSON: {raw[:200]!r}") from exc
+    # The REST API wraps in {"code": 0, "msg": "ok", "data": …}; a non-zero
+    # code is a failure the transport reported as 2xx and must not read as one.
+    if isinstance(payload, dict) and "code" in payload:
+        if payload.get("code") != 0:                 # error envelope (null counts), data or not
+            raise McpError(f"{method} {url}: {payload.get('msg') or payload}", status)
+        if "data" in payload:
+            payload = payload["data"]
+    return RestReply(status, etag, payload)
+
+
 def call_tool(url: str, bearer: str, name: str, arguments: dict,
               timeout: float = _DEFAULT_TIMEOUT_S) -> ToolResult:
     """Invoke a tool and return an SDK-shaped result."""
