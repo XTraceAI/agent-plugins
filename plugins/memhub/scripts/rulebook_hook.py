@@ -39,6 +39,7 @@ Two engines, one evaluate():
 """
 import fcntl
 import hashlib
+import datetime
 import json
 import os
 import re
@@ -628,6 +629,19 @@ def load_sent():
         return {"fires_offset": 0, "conversions_offset": 0, "last_flush_at": None}
 
 
+CONVERSION_HOLD_S = 6 * 3600
+
+
+def _older_than(iso, seconds):
+    """True when `iso` (ledger timestamp) is more than `seconds` in the past;
+    an unparseable stamp counts as old so it can never hold the watermark."""
+    try:
+        ts = datetime.datetime.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return True
+    return (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds() > seconds
+
+
 def pending_batches(sent):
     """Rows to POST = fires past the watermark ∪ fires named by conversions past
     THEIR watermark (each re-sent with converted/converted_at merged — the
@@ -672,9 +686,13 @@ def pending_batches(sent):
     # being written, or a rotated ledger) must NOT be passed by the watermark:
     # stop the conversions offset just before the first unresolved one so the
     # next flush sees it again once the fire has landed.
+    # The hold is bounded: a conversion older than CONVERSION_HOLD_S whose
+    # fire never landed (corrupt or rotated fire line) is dropped so it can
+    # never stall the conversions behind it.
     c_start = sent.get("conversions_offset", 0)
     for i, c in enumerate(new_convs):
-        if isinstance(c, dict) and c.get("fire_id") and c["fire_id"] not in by_id:
+        if isinstance(c, dict) and c.get("fire_id") and c["fire_id"] not in by_id \
+                and not _older_than(c.get("converted_at"), CONVERSION_HOLD_S):
             c_end = c_offsets[i - 1] if i else c_start
             new_convs = new_convs[:i]
             break

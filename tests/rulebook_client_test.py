@@ -369,13 +369,24 @@ def main():
         # passed by the conversions watermark (it waits for its fire)
         conv_p = os.path.join(os.path.dirname(ledger), "conversions.jsonl")
         with open(conv_p, "a", encoding="utf-8") as f:
+            import datetime as _dt
+            fresh = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             f.write(json.dumps({"fire_id": "not-yet-in-ledger", "converted": True,
-                                "converted_at": "2026-08-26T00:00:00Z"}) + "\n")
+                                "converted_at": fresh}) + "\n")
         before = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
         run("flush", {"session_id": "f1"}, env, ("final",))
         after = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
         check("flush: a conversion whose fire is not in the ledger is NOT passed by the watermark",
               after == before and after < os.path.getsize(conv_p), f"{before} -> {after}")
+        # ...but the hold is bounded: an old orphan conversion is dropped so it
+        # never stalls newer ones (stamp above is 2026-08-26, older than the hold)
+        with open(conv_p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"fire_id": fid_local, "converted": True,
+                                "converted_at": "2026-08-26T00:00:01Z"}) + "\n")
+        run("flush", {"session_id": "f1"}, env, ("final",))
+        after2 = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
+        check("flush: an old orphan conversion is dropped, the watermark moves past it",
+              after2 == os.path.getsize(conv_p), f"{after2} vs {os.path.getsize(conv_p)}")
 
         # rejected rows: logged locally, never retried
         run("pre", dict(base, session_id="f4", tool_input={"command": "server-only-cmd"}), env)
