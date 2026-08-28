@@ -365,6 +365,8 @@ def test_cursor_failed_provenance_attempt_starts_retry_backoff():
 def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     url = "https://github.com/xtraceai/agent-plugins/pull/323"
     state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
+    calls = []
+    accept_provenance = False
     originals = {
         "current_blob_ids": cursor_flush.current_blob_ids,
         "redact_records": cursor_flush.redact_records,
@@ -380,11 +382,17 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
             pass
 
         async def call_tool(self, _name, _arguments=None, **_kwargs):
+            calls.append(_kwargs.get("arguments", _arguments))
+            structured = {
+                "conversation_id": "cursor-session-1",
+                "ack_through": "u1",
+            }
+            if accept_provenance:
+                structured["provenance_received"] = {
+                    "github_pr_urls": [url],
+                }
             return types.SimpleNamespace(
-                structuredContent={
-                    "conversation_id": "cursor-session-1",
-                    "ack_through": "u1",
-                },
+                structuredContent=structured,
                 content=[], isError=False)
 
     def save_state(_sid, **fields):
@@ -428,6 +436,44 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     assert _pr_url_retry_due(
         pending=True, new_urls=True, event="afterShellExecution",
         state=state, now=later)
+
+    # The retry budget gates only unchanged-content sends. A later server
+    # upgrade still receives the queued URL with the next genuine transcript
+    # write and may acknowledge it normally.
+    grown_blobs = {"blob-1", "blob-2"}
+    assert should_flush(
+        "stop", {}, state, grown_blobs, later,
+        provenance_pending=False)
+    try:
+        accept_provenance = True
+        cursor_flush.current_blob_ids = lambda _path: grown_blobs
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        cursor_flush.mcp_http.Session = OlderServer
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/store.db"), grown_blobs,
+            source_kind="store", records=[{
+                "type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "new content"},
+            }], meta={"cwd": None, "title": None},
+            pending_pr_urls=[url]))
+    finally:
+        cursor_flush.current_blob_ids = originals["current_blob_ids"]
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert calls[-1]["provenance"]["github_pr_urls"] == [url]
+    assert state["pending_pr_urls"] == []
+    assert state["accepted_pr_urls"] == [url]
+    assert state["pr_url_unconfirmed"] == 0
     print("PASS test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks")
 
 

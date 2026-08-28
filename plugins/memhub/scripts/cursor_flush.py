@@ -773,6 +773,9 @@ def _pr_url_retry_due(
     if new_urls:
         unconfirmed = 0
     if unconfirmed >= MAX_PR_URL_UNCONFIRMED:
+        # The cap disables only unchanged-content provenance retries. New
+        # transcript content still passes should_flush's normal watermark gate,
+        # and _flush includes every pending URL independently of this flag.
         return False
     return (
         event == "sessionEnd"
