@@ -1,20 +1,16 @@
 ---
-description: Use when the user wants to turn a CLAUDE.md (or any conventions doc) into Rulebook rules — "/memhub:import-claude-md", "import our CLAUDE.md as rules", "re-import the rules from CLAUDE.md". Reads the file HERE in the repo, decomposes it in-agent, backtests every candidate against past sessions, and files the survivors as drafts through the memhub `create_rule` tool. A re-import updates rules instead of duplicating them.
+description: Use when the user wants to turn a CLAUDE.md (or any conventions doc) into Rulebook rules — "/memhub:import-claude-md", "import our CLAUDE.md as rules", "re-import the rules from CLAUDE.md". Reads the file HERE in the repo, decomposes it in-agent, and files each rule as a draft through the memhub `create_rule` tool. A re-import updates rules instead of duplicating them.
 argument-hint: [path to the doc, default ./CLAUDE.md] [--brain "<rulebook brain name>"] [--dry-run]
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. If unset, export it
-first — it is the ancestor directory of this skill file containing `.claude-plugin/`.
-
 You are importing a conventions document into the team **Rulebook**. This runs
 **in the coding agent, not on the server**, on purpose: decomposing a doc into
 rules needs the repo (which paths a rule scopes to, whether a pattern matches
-real commands here), the local transcripts to **backtest** each candidate, and
-the checkout's sha for provenance — none of which the server has. You are
-already reading the file; a second model call server-side would only lose that
-context. The server's one job is the **re-import identity**: it recognises a
-rule it already holds (spec §4.5).
+real commands here) and the checkout's sha for provenance — neither of which
+the server has. You are already reading the file; a second model call
+server-side would only lose that context. The server's one job is the
+**re-import identity**: it recognises a rule it already holds.
 
 Arguments: `$ARGUMENTS`
 - Path (optional, default `./CLAUDE.md`). Must be inside the current repo.
@@ -45,14 +41,19 @@ delivery, per the table in `/memhub:create-rule` step 3:
 
 | shape of the rule | delivery | engine block |
 |---|---|---|
-| a command / edit / tool result has a checkable form | `agent_hook` | `matcher` (`event`, `command_rx` / `path_rx` / `result_rx`, `*_not_rx`, `warn_once_per`) |
+| a command / edit / tool output has a checkable form | `agent_hook` | `matcher` (`event: bash \| edit \| write \| output`, `command_rx` / `path_rx` / `content_rx`, `*_not_rx`, `warn_once_per`) |
 | "run X after edits, before Y" | `agent_hook` | `ordering` |
-| applies when a named file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server's SLM judge decides relevance |
-| worldview with no trigger at all | `session_context` | none — spec budget: 15 rules / ~2k tokens per repo scope; only if no shape exists |
+| applies when a named file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server decides relevance |
+| worldview with no trigger at all | `session_context` | none — at most 15 such rules per repo scope are shown at session start; only if no checkable shape exists |
 
-Title = the heading or a ≤ 60-char noun phrase; **one rule per title** within
-a run. Statement = the full sentence including the nuance a judge needs
-(sanctioned forms, exemptions), ≤ 500 chars.
+Title = the heading or a short noun phrase (aim for under 60 chars); **one rule
+per title** within a run. Statement = the full sentence including the nuance a
+reviewer needs (sanctioned forms, exemptions); keep it to a few sentences.
+
+Apply the matcher-authoring rules from `/memhub:create-rule` step 3
+(pre-heredoc matching, shape-specific patterns, exemptions in `command_not_rx`
+up front, `warn_once_per: "session"` by default), and sanity-check each regex
+against a real command from this repo that should fire and one that should not.
 
 ### 3. Duplicate check against the book
 
@@ -61,28 +62,10 @@ against existing titles and statements. Same subject → prefer **re-importing
 under the existing title** (the server then reports `unchanged` or files a
 `proposed` update) over adding a twin under a new name.
 
-### 4. Backtest — the arming gate, per candidate
+### 4. Show the table, then file
 
-```bash
-# matcher / ordering rules: replay the matcher itself
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_backtest.py" \
-  --rule '<candidate as hook JSON: on/rx/not_rx/path_rx…>' --days 30 --exclude-session "<this session id>"
-# anchor rules: replay the anchors as triggers
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_backtest.py" \
-  --triggers "<anchor1>,<anchor2>" --days 30 --exclude-session "<this session id>"
-```
-
-Always pass `--exclude-session` (this transcript contains the candidate text).
-**Read every excerpt** and judge each session-hit true / false positive; tighten
-`command_rx` / add `command_not_rx` and re-run until the excerpts are clean.
-Zero fires in the window is allowed for rare, high-blast rules — say so.
-`session_context` rules skip the backtest (nothing to match).
-
-### 5. Show the table, then file
-
-Show the user one table: title · delivery · engine · backtest verdict
-(`N sessions hit / M scanned, judged TP/FP`) · source_ref. Get a yes (or drop
-rows). With `--dry-run`, stop here.
+Show the user one table: title · delivery · engine · source_ref. Get a yes (or
+drop rows). With `--dry-run`, stop here.
 
 On approval call the memhub **`create_rule`** tool once per row:
 `title`, `statement`, `delivery`, the engine block (`matcher` / `ordering` /
@@ -91,19 +74,16 @@ On approval call the memhub **`create_rule`** tool once per row:
 
 - `unchanged: true` → already in the book, nothing written.
 - `status: "proposed"` + `supersedes_rule_id` → an update to an existing rule;
-  it replaces the old one when a human activates it.
+  it replaces the old one when a reviewer activates it.
 - `status: "draft"` → new.
 
-Every row lands **draft/proposed, advise** — nothing imported is active until a
-human reviews it and activates it (`POST /rules/{id}/activate` needs a
-backtest for that version). Never call any activation path from this skill.
+Every row lands **draft/proposed, advise** — nothing imported is active until
+the rule's owner or an admin activates it in MemHub. Never call any activation
+path from this skill.
 
-### 6. Report
+### 5. Report
 
 Per row: filed as draft / proposed (with what it supersedes) / unchanged /
-skipped (why: narrative, already enforced, failed backtest). Then the follow-up
-the user owns: review the drafts (`list_rules`, status `draft` / `proposed`)
-and activate the ones they want live.
-
-Known limit, say it out loud: `result`-event rules cannot be backtested from
-transcripts (results aren't replayed) — they arm from live advisory data.
+skipped (why: narrative, already enforced). Then the follow-up the user owns:
+review the drafts (`list_rules`, status `draft` / `proposed`) and activate the
+ones they want live.
