@@ -474,18 +474,15 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         if records:
             _log(f"all {len(records)} record(s) redacted away — nothing to "
                  f"send (check redact rules if this recurs on real content)")
-        # Ordinarily advance the watermark: growth gates purely on bytes, so
-        # leaving it behind would re-parse and re-redact the whole rollout on
-        # every later event. PR evidence is the exception. It cannot be sent
-        # without a message payload, and advancing past the bytes that carried
-        # it would strand the only durable copy. Hold the previous watermark so
-        # Stop (Codex has no SessionEnd) can retry the complete rollout after a
-        # corrected redaction rule or a later sendable record. fail_streak
-        # clears because the server was never contacted (see _note_failure).
-        fields = {"fail_streak": 0}
-        if not pending_pr_urls:
-            fields["rollout_size"] = size
-        _save_state(sid, **fields)
+        # Always advance the content watermark after the URL queue above is
+        # durable. Holding it cannot deliver provenance because the importer
+        # requires a message, and it makes every later Stop re-parse the same
+        # permanently redacted bytes. Pending URLs live independently in
+        # state; the next byte of transcript growth still triggers a full
+        # canonical read and carries them with the next sendable record.
+        # fail_streak clears because the server was never contacted (see
+        # _note_failure).
+        _save_state(sid, rollout_size=size, fail_streak=0)
         return
 
     url, bearer = await asyncio.to_thread(resolve_bearer)

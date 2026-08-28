@@ -423,17 +423,35 @@ def test_codex_pr_url_ack_clears_only_server_accepted_evidence():
     print("PASS test_codex_pr_url_ack_clears_only_server_accepted_evidence")
 
 
-def test_empty_redaction_holds_watermark_for_pending_pr_evidence():
+def test_empty_redaction_advances_content_but_keeps_pending_pr_evidence():
     url = "https://github.com/xtraceai/agent-plugins/pull/445"
     state = {"rollout_size": 40, "pending_pr_urls": [url]}
+    sendable = {"value": False}
+    seen: list[dict] = []
     originals = {
         "to_canonical": codex_flush.codex_reader.to_canonical,
         "read_state": codex_flush._read_state,
         "save_state": codex_flush._save_state,
         "snapshot_branch": codex_flush.git_provenance.snapshot_branch,
         "redact_records": codex_flush.redact_records,
+        "resolve_bearer": codex_flush.resolve_bearer,
+        "session": codex_flush.mcp_http.Session,
         "log": codex_flush._log,
     }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": "codex-session-1",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": [url]},
+                },
+                content=[], isError=False)
 
     def save_state(_sid, **fields):
         state.update(fields)
@@ -446,11 +464,23 @@ def test_empty_redaction_holds_watermark_for_pending_pr_evidence():
         codex_flush._read_state = lambda _sid: dict(state)
         codex_flush._save_state = save_state
         codex_flush.git_provenance.snapshot_branch = lambda _cwd: (False, None)
-        codex_flush.redact_records = lambda _records: []
+        codex_flush.redact_records = lambda records: (
+            records if sendable["value"] else [])
+        codex_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        codex_flush.mcp_http.Session = Session
         codex_flush._log = lambda _message: None
 
         asyncio.run(codex_flush._flush(
             "session-1", Path("/tmp/rollout.jsonl"), 100))
+        assert state["pending_pr_urls"] == [url]
+        assert state["rollout_size"] == 100
+        assert not codex_flush.should_flush("Stop", {}, state, 100)
+
+        sendable["value"] = True
+        assert codex_flush.should_flush("Stop", {}, state, 101)
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 101))
     finally:
         codex_flush.codex_reader.to_canonical = originals["to_canonical"]
         codex_flush._read_state = originals["read_state"]
@@ -458,12 +488,16 @@ def test_empty_redaction_holds_watermark_for_pending_pr_evidence():
         codex_flush.git_provenance.snapshot_branch = originals[
             "snapshot_branch"]
         codex_flush.redact_records = originals["redact_records"]
+        codex_flush.resolve_bearer = originals["resolve_bearer"]
+        codex_flush.mcp_http.Session = originals["session"]
         codex_flush._log = originals["log"]
 
-    assert state["pending_pr_urls"] == [url]
-    assert state["rollout_size"] == 40
-    assert codex_flush.should_flush("Stop", {}, state, 100)
-    print("PASS test_empty_redaction_holds_watermark_for_pending_pr_evidence")
+    assert seen[0]["provenance"] == {"github_pr_urls": [url]}
+    assert state["pending_pr_urls"] == []
+    assert state["accepted_pr_urls"] == [url]
+    assert state["rollout_size"] == 101
+    print("PASS "
+          "test_empty_redaction_advances_content_but_keeps_pending_pr_evidence")
 
 
 if __name__ == "__main__":
