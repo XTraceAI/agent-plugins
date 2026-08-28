@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -250,17 +251,25 @@ def test_pending_usage_retry_obeys_debounce_and_dormancy():
 def test_empty_transcript_revision_is_marked_examined():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
+        pending_url = "https://github.com/xtraceai/agent-plugins/pull/444"
         old_state = cursor_flush.STATE_DIR
         old_redact = cursor_flush.redact_records
         cursor_flush.STATE_DIR = root / "state"
         cursor_flush.redact_records = lambda records: records
         try:
+            cursor_flush._save_state(
+                SESSION, pending_pr_urls=[pending_url])
+            before = time.time()
             asyncio.run(cursor_flush._flush(
                 SESSION, root / f"{SESSION}.jsonl", set(),
                 source_kind="transcript", source_revision="empty-revision",
-                records=[], meta={}))
+                records=[], meta={}, pending_pr_urls=[pending_url]))
             state = cursor_flush._read_state(SESSION)
             assert state["transcript_revision"] == "empty-revision"
+            assert state["pending_pr_urls"] == [pending_url]
+            assert state["pr_url_attempt_at"] >= before
+            assert time.time() - state["pr_url_attempt_at"] < (
+                cursor_flush.DORMANT_RETRY_S)
 
             # A defensive future redactor that drops non-empty content must not
             # mark that content examined; a later corrected rule can resend it.

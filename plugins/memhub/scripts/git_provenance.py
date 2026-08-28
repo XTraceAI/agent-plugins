@@ -99,6 +99,10 @@ def _run(cwd: str, args: list[str]) -> subprocess.CompletedProcess[str] | None:
     if not usable_cwd(cwd):
         return None
     try:
+        # Keep the hardening adjacent to every probe. ``cwd`` is session
+        # content, and a repository-local core.fsmonitor is executable config;
+        # git_readonly disarms it (plus hooks/credentials/ext transports) while
+        # git_env prevents this process's MemHub bearer reaching the child.
         return subprocess.run(
             git_readonly(cwd) + args,
             capture_output=True,

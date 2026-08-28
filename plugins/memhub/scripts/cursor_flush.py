@@ -931,6 +931,13 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # to lose, so mark its revision examined and avoid parsing it again at
         # every turn boundary until Cursor writes something new.
         fields = {"last_flush_at": time.time(), "fail_streak": 0}
+        if pr_provenance.merge_urls(pending_pr_urls or []):
+            # A hook can deliver exact PR evidence before Cursor has written a
+            # sendable transcript record. Keep that evidence pending, but mark
+            # this provenance-only attempt so the unchanged empty transcript
+            # obeys the normal dormant retry interval instead of re-entering
+            # this branch on every hook event.
+            fields["pr_url_attempt_at"] = time.time()
         if (source_kind == "transcript" and source_revision and not records):
             fields["transcript_revision"] = source_revision
         _save_state(uuid, **fields)

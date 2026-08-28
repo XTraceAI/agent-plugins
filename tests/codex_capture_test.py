@@ -423,6 +423,49 @@ def test_codex_pr_url_ack_clears_only_server_accepted_evidence():
     print("PASS test_codex_pr_url_ack_clears_only_server_accepted_evidence")
 
 
+def test_empty_redaction_holds_watermark_for_pending_pr_evidence():
+    url = "https://github.com/xtraceai/agent-plugins/pull/445"
+    state = {"rollout_size": 40, "pending_pr_urls": [url]}
+    originals = {
+        "to_canonical": codex_flush.codex_reader.to_canonical,
+        "read_state": codex_flush._read_state,
+        "save_state": codex_flush._save_state,
+        "snapshot_branch": codex_flush.git_provenance.snapshot_branch,
+        "redact_records": codex_flush.redact_records,
+        "log": codex_flush._log,
+    }
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        codex_flush.codex_reader.to_canonical = lambda _path: ([{
+            "type": "user", "uuid": "u1",
+            "message": {"role": "user", "content": "content"},
+        }], {"cwd": None, "title": None})
+        codex_flush._read_state = lambda _sid: dict(state)
+        codex_flush._save_state = save_state
+        codex_flush.git_provenance.snapshot_branch = lambda _cwd: (False, None)
+        codex_flush.redact_records = lambda _records: []
+        codex_flush._log = lambda _message: None
+
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+    finally:
+        codex_flush.codex_reader.to_canonical = originals["to_canonical"]
+        codex_flush._read_state = originals["read_state"]
+        codex_flush._save_state = originals["save_state"]
+        codex_flush.git_provenance.snapshot_branch = originals[
+            "snapshot_branch"]
+        codex_flush.redact_records = originals["redact_records"]
+        codex_flush._log = originals["log"]
+
+    assert state["pending_pr_urls"] == [url]
+    assert state["rollout_size"] == 40
+    assert codex_flush.should_flush("Stop", {}, state, 100)
+    print("PASS test_empty_redaction_holds_watermark_for_pending_pr_evidence")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

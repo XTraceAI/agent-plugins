@@ -2,6 +2,7 @@
 """Git provenance resolution and durable record-branch pinning."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,61 @@ def test_probe_failure_is_unavailable_not_detached():
     finally:
         git_provenance.subprocess.run = original
     print("PASS test_probe_failure_is_unavailable_not_detached")
+
+
+def test_session_probes_disarm_hostile_repository_config():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo, commit = _repo(root)
+        marker = root / "PWNED"
+        fsmonitor = root / "fsmonitor"
+        fsmonitor.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        fsmonitor.chmod(0o700)
+        _git(repo, "config", "--local", "core.fsmonitor", str(fsmonitor))
+
+        calls: list[tuple[list[str], dict[str, str]]] = []
+        original_run = git_provenance.subprocess.run
+        old_token = os.environ.get("MEMHUB_ACCESS_TOKEN")
+
+        def checked_run(command, **kwargs):
+            calls.append((list(command), dict(kwargs.get("env") or {})))
+            return original_run(command, **kwargs)
+
+        try:
+            os.environ["MEMHUB_ACCESS_TOKEN"] = "must-not-reach-git"
+            git_provenance.subprocess.run = checked_run
+            assert git_provenance.snapshot(str(repo)) == {
+                "branch": "feature/session-provenance",
+                "commit_hash": commit,
+                "repository_url": "git@github.com:XTraceAI/demo.git",
+            }
+        finally:
+            git_provenance.subprocess.run = original_run
+            if old_token is None:
+                os.environ.pop("MEMHUB_ACCESS_TOKEN", None)
+            else:
+                os.environ["MEMHUB_ACCESS_TOKEN"] = old_token
+
+        assert len(calls) == 3
+        for command, env in calls:
+            assert command[:3] == ["git", "-C", str(repo)]
+            assert ["-c", "core.fsmonitor="] in [
+                command[i:i + 2] for i in range(len(command) - 1)]
+            assert ["-c", "core.hooksPath=/dev/null"] in [
+                command[i:i + 2] for i in range(len(command) - 1)]
+            assert ["-c", "credential.helper="] in [
+                command[i:i + 2] for i in range(len(command) - 1)]
+            assert ["-c", "protocol.ext.allow=never"] in [
+                command[i:i + 2] for i in range(len(command) - 1)]
+            assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+            assert "MEMHUB_ACCESS_TOKEN" not in env
+        assert not marker.exists()
+    print("PASS test_session_probes_disarm_hostile_repository_config")
 
 
 def test_unavailable_probe_preserves_reader_native_branch():
