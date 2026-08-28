@@ -55,17 +55,52 @@ Apply the matcher-authoring rules from `/memhub:create-rule` step 3
 up front, `warn_once_per: "session"` by default), and sanity-check each regex
 against a real command from this repo that should fire and one that should not.
 
-### 3. Duplicate check against the book
+### 3. Conflict check against the book — before anything is filed
 
-Call the memhub `list_rules` tool (the target brain) and compare each candidate
-against existing titles and statements. Same subject → prefer **re-importing
-under the existing title** (the server then reports `unchanged` or files a
-`proposed` update) over adding a twin under a new name.
+The server's re-import identity is (rulebook, `source_ref` path before `@`,
+title). It adopts a rule filed under the same title with **no** `source_ref`
+(an authored draft you are now importing), but it never adopts a rule owned
+by another document — a colliding title or matcher from a different source
+lands as a **second draft, silently**. So the check happens here, in your
+hands, with the candidates and the book both in view.
+
+1. Call the memhub `list_rules` tool (the target brain, every status) and save
+   the reply to a file. Write the candidate `create_rule` bodies to another.
+2. Run the deterministic pass:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
+     --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>"
+   ```
+   It flags `same_title` (any status, case/punctuation-insensitive),
+   `same_matcher` (same event + same primary pattern as an **active** rule —
+   two of those fire on the same call) and `anchors_overlap` (with the shared
+   identifiers listed). The active book comes from the server's hook view;
+   if it is unreachable the script says `active book: unavailable` and you
+   still get the title pass.
+3. Then the semantic pass, in your own reading — no model call: the script
+   prints `judge_by_statement`, every live rule with no deterministic hit, with
+   its statement. Read each candidate against that list and mark
+   `duplicate` (same trigger, same advice), `contradicts` (same trigger,
+   opposite advice) or `distinct`.
+
+What each verdict does to the row:
+- `same_title` / `duplicate` on a rule with **no** `source_ref` → re-file under
+  that exact title; the server returns `unchanged` or a `proposed` update.
+- `same_title` / `same_matcher` / `duplicate` on a rule that **has** a
+  `source_ref` from another document → do NOT file a twin by default; show
+  the collision and let the user choose (drop the candidate, or file it and
+  retire the other by hand).
+- `contradicts` → file it as a draft, but say in the table and the report
+  which rule it fights and whether that rule is active — the reviewer must
+  retire one before activating the other.
+- `anchors_overlap` on its own is a hint, not a verdict — judge the
+  statements.
 
 ### 4. Show the table, then file
 
-Show the user one table: title · delivery · engine · source_ref. Get a yes (or
-drop rows). With `--dry-run`, stop here.
+Show the user one table: title · delivery · engine · **conflicts** (rule
+title + reason + your verdict, or "none") · source_ref. Get a yes (or drop
+rows). With `--dry-run`, stop here.
 
 On approval call the memhub **`create_rule`** tool once per row:
 `title`, `statement`, `delivery`, the engine block (`matcher` / `ordering` /
@@ -84,6 +119,9 @@ path from this skill.
 ### 5. Report
 
 Per row: filed as draft / proposed (with what it supersedes) / unchanged /
-skipped (why: narrative, already enforced). Then the follow-up the user owns:
-review the drafts (`list_rules`, status `draft` / `proposed`) and activate the
-ones they want live.
+skipped (why: narrative, already enforced, collides with `<rule>`). List every
+`contradicts` verdict again under a **Conflicts to resolve** heading — the
+reviewer has to retire one side before activating the other, and nothing in
+the server will tell them. Then the follow-up the user owns: review the drafts
+(`list_rules`, status `draft` / `proposed`) and activate the ones they want
+live.
