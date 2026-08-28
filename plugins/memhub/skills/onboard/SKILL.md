@@ -33,10 +33,8 @@ Not logged in → run `/memhub:login` (no `--status`) and let it finish before
 continuing. Everything below needs it: the seed import in §2 sends as this user,
 and the capture hooks in §1 cannot run without it.
 
-This is **not** the `/mcp` connector's login. They share an Auth0 client but
-store tokens in different places, so "connected in `/mcp`" and "my sessions are
-being captured" are independent facts — never treat the first as evidence of the
-second. What the hooks actually use is a **personal access key** (`mhk_…`) that
+This is the plugin's only login — the MCP tools and the capture hooks share
+it. What they use is a **personal access key** (`mhk_…`) that
 `/memhub:login` mints and stores at `~/.config/memhub-plugin/pak-<host>.json`: a
 static bearer, because a hook is a cold background process that can never open a
 browser to refresh an expiring token. See `/memhub:login` for the full story.
@@ -107,7 +105,7 @@ The script targets the plugin's default endpoint — **production**
 (`api.memhub.xtrace.ai`) when installed as `memhub`, staging when installed as
 `memhub-staging`. Do NOT pass `--url` to cross between them: `--url` overrides
 only the endpoint, while the OAuth client id and Auth0 tenant still come from
-the *installed* plugin's `.mcp.json`, so a prod install pointed at staging
+the *installed* plugin's `.mcp.json` `env` block, so a prod install pointed at staging
 authenticates with prod credentials against the staging tenant and fails.
 
 Seeding a **staging** brain means running from the staging install, which is
@@ -193,9 +191,8 @@ after substantive work (`/memhub:import-session`), and (when available) enable
 PR-merge memory so the brain compounds automatically.
 
 Plain-English output throughout. If a step fails on authentication, send the
-user to `/memhub:login`, not to `/mcp` — the hooks and the scripts here use the
-plugin's own credential, and a connected `/mcp` says nothing about whether they
-have one.
+user to `/memhub:login` — the one credential the hooks, the scripts here and
+the MCP tools all use.
 
 **On overview latency:** the digest normally lands via the async event trigger
 fired by the import. `refresh_brain_overview` (step 3) runs it on demand when

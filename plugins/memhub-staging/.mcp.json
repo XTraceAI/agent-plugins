@@ -1,15 +1,16 @@
 {
   "mcpServers": {
     "memhub": {
-      "type": "http",
-      "url": "https://api.staging.memhub.xtrace.ai/mcp-server/mcp",
-      "auth": {
-        "CLIENT_ID": "mYTjrWldX9ZFGtDES3hQDEHSis9gIjiq"
-      },
-      "oauth": {
-        "clientId": "mYTjrWldX9ZFGtDES3hQDEHSis9gIjiq",
-        "callbackPort": 8765,
-        "authServerMetadataUrl": "https://memhub.us.auth0.com/.well-known/openid-configuration"
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/mcp_proxy.py"
+      ],
+      "env": {
+        "MEMHUB_MCP_URL": "https://api.staging.memhub.xtrace.ai/mcp-server/mcp",
+        "MEMHUB_OAUTH_CLIENT_ID": "mYTjrWldX9ZFGtDES3hQDEHSis9gIjiq",
+        "MEMHUB_OAUTH_METADATA_URL": "https://memhub.us.auth0.com/.well-known/openid-configuration",
+        "MEMHUB_OAUTH_CALLBACK_PORT": "8765"
       }
     }
   }

@@ -294,6 +294,49 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
     return result
 
 
+def forward(url: str, bearer: str, envelope: dict,
+            timeout: float = _DEFAULT_TIMEOUT_S) -> dict | None:
+    """Relay one JSON-RPC envelope verbatim and return the server's envelope.
+
+    The stdio proxy (``mcp_proxy.py``) needs the reply as the client sent it —
+    same ``id``, ``error`` objects intact — so it cannot go through ``request``,
+    which allocates its own id and turns errors into exceptions. Transport-level
+    failures still raise ``McpError`` / ``McpRateLimited``.
+
+    Returns None for a notification the server acknowledged without a body
+    (HTTP 202), which is the normal reply to ``notifications/initialized``.
+    """
+    require_secure(url)
+    req = urllib.request.Request(
+        url, data=json.dumps(envelope).encode("utf-8"), method="POST",
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": PROTOCOL_VERSION,
+        })
+    try:
+        with _opener().open(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            content_type = resp.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as exc:
+        detail = (exc.read() or b"").decode("utf-8", errors="replace")[:200]
+        if exc.code == 429:
+            raw = exc.headers.get("Retry-After")
+            try:
+                retry_after = float(raw) if raw else None
+            except ValueError:
+                retry_after = None
+            raise McpRateLimited(f"rate limited: {detail}", retry_after) from exc
+        raise McpError(f"{envelope.get('method')} failed ({exc.code}): {detail}",
+                       exc.code) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise McpError(f"{envelope.get('method')} failed: {exc}") from exc
+    if not body.strip():
+        return None
+    return _decode(body, content_type)
+
+
 class RestReply:
     """One plain-HTTP reply: ``status`` (200/202/304/...), the ``etag`` header
     if any, and ``data`` — the decoded JSON body with the REST ``{code, msg,

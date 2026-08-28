@@ -6,12 +6,12 @@ For XTrace developers working on the MemHub plugin itself. If you just want to
 ## Two backends, two plugins
 
 `plugins/memhub/` points at production; `plugins/memhub-staging/` points at
-staging. They exist as separate plugin directories for one reason: `.mcp.json`
-env-var expansion (`${VAR:-default}`) covers `url`, `command`, `args`, `env`,
-and `headers`, but **not** the nested `oauth` fields (`clientId`,
-`authServerMetadataUrl`). Prod and staging are different Auth0 tenants with
-different OAuth clients, so a single plugin entry cannot toggle between them at
-runtime.
+staging. Each `.mcp.json` starts the same stdio proxy (`scripts/mcp_proxy.py`)
+and declares its backend — URL, Auth0 client, metadata URL — in the entry's
+`env` block, which the proxy, the hooks and `/memhub:login` all read. Prod and
+staging are different Auth0 tenants with different OAuth clients, and the
+public marketplace pins `memhub` to a released tag while staging tracks
+development, so they stay separate plugin directories.
 
 Everything else is shared: `skills/`, `hooks/`, `scripts/`, and `references/`
 in `plugins/memhub-staging/` are **relative symlinks** into `../memhub/`, so the
@@ -68,9 +68,9 @@ Because it installs from your working tree, the staging build reflects whatever
 branch is checked out — it does not track `staging` on its own. Re-run
 `/plugin marketplace update memhub-internal` after switching branches.
 
-Then `/mcp` → `memhub` → **Authenticate** against the staging tenant. Prod and
-staging issue non-interchangeable tokens; they're cached in separate files keyed
-by host under `~/.config/memhub-plugin/`.
+Then `/memhub:login` against the staging tenant. Prod and staging issue
+non-interchangeable tokens; they're cached in separate files keyed by host under
+`~/.config/memhub-plugin/`.
 
 ### Switching a repo between backends
 

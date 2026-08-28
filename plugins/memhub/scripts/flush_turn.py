@@ -29,10 +29,9 @@ not an error: the cursor did not move, so the next turn's flush carries both.
 Discipline mirrors the other capture hooks: THIS SCRIPT NEVER FAILS LOUDLY.
 Any error exits 0 quietly — memory capture must never disturb the session.
 
-Auth = the plugin's OWN token cache (shared ``_memhub_auth``) — a different
-store from the /mcp connector's, so being connected in /mcp does NOT mean this
-hook can authenticate. Non-interactive: a per-turn background hook must never
-pop a browser, so it can only consume a token ``/memhub:login`` already minted.
+Auth = the plugin's token cache (shared ``_memhub_auth``, the same one the
+MCP proxy uses). Non-interactive: a per-turn background hook must never pop a
+browser, so it can only consume a credential ``/memhub:login`` already minted.
 """
 from __future__ import annotations
 

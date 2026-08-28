@@ -90,9 +90,8 @@ Do exactly this:
 4. If the script prints an auth error, no setup is needed — it opens the browser
    ONCE for approval and then mints a personal access key (`mhk_…`) that later
    runs and the capture hooks reuse without a browser. `/memhub:login` does the
-   same thing deliberately if you would rather provision it up front. This is
-   the plugin's own credential, not the `/mcp` connector's, so being connected
-   in `/mcp` will not satisfy it. If it can't find the session id, ask the user
+   same thing deliberately if you would rather provision it up front, and the
+   MCP tools use the same key. If it can't find the session id, ask the user
    for the transcript path.
 
 Never use curl or raw HTTP; never pass transcript content as tool arguments.
