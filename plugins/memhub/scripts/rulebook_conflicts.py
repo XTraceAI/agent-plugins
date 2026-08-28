@@ -187,6 +187,10 @@ def main(argv=None) -> int:
         # the documented usage is a glob (the cache file name carries a hash
         # of the repo name); resolve it here so a quoted pattern works too
         matches = sorted(glob.glob(os.path.expanduser(args.book))) or [args.book]
+        if len(matches) > 1:
+            print(f"--book matched {len(matches)} files; using {matches[0]} "
+                  f"(skipped: {', '.join(matches[1:])}) — pass one file to disambiguate",
+                  file=sys.stderr)
         try:
             with open(matches[0], encoding="utf-8") as f:
                 b = json.load(f)
