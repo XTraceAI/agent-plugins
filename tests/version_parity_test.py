@@ -23,6 +23,13 @@ Cursor, and every other AP client) and `.mcp.json` (Claude) both name the
 production server. If they diverge, half the hosts talk to a different backend
 than the other half — with no error anywhere.
 
+Manifests must also parse with UNIQUE keys. JSON parsers keep the LAST
+occurrence of a duplicate key, so an edit that adds a rewritten field without
+deleting the old line ships the OLD text while the new wording sits dead in
+the file. That happened too: the v0.29.1 audit pass left four memhub manifests
+carrying two "description" keys each, and every host kept rendering the stale
+one.
+
 Run: python3 version_parity_test.py   (stdlib only)
 """
 from __future__ import annotations
@@ -46,11 +53,25 @@ MCP_CLAUDE = MEMHUB / ".mcp.json"     # Claude Code format (carries oauth)
 MCP_STAGING = ROOT / "plugins" / "memhub-staging" / ".mcp.json"
 
 
+def _reject_dupes(pairs: list[tuple[str, object]]) -> dict:
+    keys = [key for key, _ in pairs]
+    dupes = sorted({key for key in keys if keys.count(key) > 1})
+    if dupes:
+        raise ValueError(f"duplicate keys {dupes}: parsers keep the last "
+                         "occurrence, so the earlier value silently never "
+                         "renders")
+    return dict(pairs)
+
+
 def _load(path: Path) -> dict | None:
     if not path.exists():
         print(f"FAIL missing manifest: {path}")
         return None
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text(), object_pairs_hook=_reject_dupes)
+    except ValueError as exc:  # JSONDecodeError is a ValueError too
+        print(f"FAIL {path}: {exc}")
+        return None
 
 
 def main() -> int:
