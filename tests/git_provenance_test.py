@@ -120,6 +120,16 @@ def test_repository_urls_never_carry_credentials():
         "git@github.com:XTraceAI",
     ):
         assert git_provenance.normalize_repository_url(incomplete) is None
+    for hostile in (
+        " https://github.com/XTraceAI/demo.git",
+        "https://github.com\\@evil.example/XTraceAI/demo.git",
+        "https://g\u0456thub.com/XTraceAI/demo.git",
+        "https://github.com/XTraceAI/%53ECRET.git",
+        "git@github.com:token@XTraceAI/demo.git",
+        "git@github.com:XTraceAI/secret:demo.git",
+        "git@github.com:XTraceAI/dem\u043e.git",
+    ):
+        assert git_provenance.normalize_repository_url(hostile) is None, hostile
     print("PASS test_repository_urls_never_carry_credentials")
 
 

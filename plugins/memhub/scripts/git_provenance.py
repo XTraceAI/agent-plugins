@@ -20,6 +20,9 @@ _BRANCH_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
 _SCP_REMOTE_RE = re.compile(
     r"(?:(?P<user>[^/@:\s]+)@)?(?P<host>[^/@:\s]+):(?P<path>[^\s]+)\Z")
 _REMOTE_SCHEMES = frozenset(("git", "http", "https", "ssh"))
+_GITHUB_OWNER_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z")
+_GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 
 
 def _is_repository_path(value: str) -> bool:
@@ -28,10 +31,14 @@ def _is_repository_path(value: str) -> bool:
     if path.endswith("/"):
         path = path[:-1]
     parts = path.split("/")
-    return (
-        len(parts) == 2
-        and all(part not in ("", ".", "..") for part in parts)
-        and parts[1] != ".git"
+    if len(parts) != 2:
+        return False
+    owner, repository = parts
+    repository = repository.removesuffix(".git")
+    return bool(
+        _GITHUB_OWNER_RE.fullmatch(owner)
+        and repository not in ("", ".", "..")
+        and _GITHUB_REPOSITORY_RE.fullmatch(repository)
     )
 
 
