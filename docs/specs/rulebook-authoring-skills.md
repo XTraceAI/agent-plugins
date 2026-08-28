@@ -57,8 +57,17 @@ back.
 
 Settled with the owner before implementation. Do not relitigate.
 
-1. **Base is `main`.** `origin/staging` was deleted; every PR since #115 merged
-   into `main`. Branch `feat/rulebook-authoring-skills`, PR base `main`.
+1. **Base is the `rulebook` integration branch**, cut from `main` at `019cc51`.
+   `origin/staging` was deleted and every PR since #115 merged into `main`, so
+   `main` was the obvious base — but merging there would *release*. This repo
+   carries four marketplace manifests and only Claude Code's pins `memhub` to a
+   tag (`memhub--v0.27.13` + sha); Codex (`.agents/plugins/marketplace.json`)
+   and Cursor (`.cursor-plugin/marketplace.json`) both source
+   `./plugins/memhub` from the marketplace snapshot, and the plugin cache is
+   keyed by version — so a version bump reaching `main` IS the release on those
+   two channels. Every wave-2 plugin domain (`AUTHORING-SKILLS`, `HOOK`) lands
+   on `rulebook` instead; `rulebook` → `main` is a later, deliberate PR.
+   Branch `feat/rulebook-authoring-skills`, PR base `rulebook` (#124).
 2. **The backtest is dead and is not resurrected.** Column, argument and gate
    were all removed (#1103). Waves §7 decision 3 is superseded by backend spec
    v2.6. Passing `backtest` is an unknown-argument error.
