@@ -23,6 +23,7 @@ re-imports forward per host instead of colliding across hosts.
 """
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 
 from . import claude, codex, cursor
@@ -63,6 +64,17 @@ def sniff(ref: str) -> str | None:
     return None
 
 
+def _parseable_timestamp(value) -> bool:
+    """Would the server's ``_parse_ts`` read this? (ISO-8601, ``Z`` ok.)"""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
 def validate_canonical(records: list[dict]) -> list[str]:
     """Structural check that ``records`` will trip the agentic detector.
 
@@ -79,13 +91,22 @@ def validate_canonical(records: list[dict]) -> list[str]:
         if r.get("type") not in ("user", "assistant"):
             problems.append(f"record {i}: type={r.get('type')!r}")
             continue
-        # The agentic parser SKIPS records without a uuid (replay-dedup key)
-        # and dates turns from ``timestamp`` — both verified against the
-        # backend: uuid-less records import as NOTHING, silently.
+        # The agentic parser SKIPS records without a uuid (replay-dedup key) —
+        # verified against the backend: uuid-less records import as NOTHING,
+        # silently. ``timestamp`` is different: the server dates turns from it
+        # when present and stores NULL event_date ("unmeasured") when absent —
+        # a legitimate state per the claude_parts contract (ENG-675b). So a
+        # MISSING timestamp is not a problem (fabricating one at read time is
+        # the actual bug — it collapses a session onto flush-adjacent clocks),
+        # but a PRESENT-yet-unparseable one is: the server would silently null
+        # it, which always means a reader formatting regression.
         if not r.get("uuid"):
             problems.append(f"record {i}: missing uuid (server skips it)")
-        if not r.get("timestamp"):
-            problems.append(f"record {i}: missing timestamp (event_date null)")
+        ts = r.get("timestamp")
+        if ts is not None and not _parseable_timestamp(ts):
+            problems.append(
+                f"record {i}: unparseable timestamp {ts!r} "
+                f"(server would null event_date)")
         if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
             problems.append(f"record {i}: missing message/role")
             continue

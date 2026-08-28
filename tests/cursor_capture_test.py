@@ -164,7 +164,6 @@ def test_direct_payload_normalizes_encodings_and_rejects_invalid():
 def test_real_platform_is_unconditional():
     seen: list[dict] = []
     originals = {
-        "to_canonical": cursor_flush.cursor_reader.to_canonical,
         "current_blob_ids": cursor_flush.current_blob_ids,
         "redact_records": cursor_flush.redact_records,
         "resolve_bearer": cursor_flush.resolve_bearer,
@@ -186,11 +185,13 @@ def test_real_platform_is_unconditional():
                 },
                 content=[], isError=False)
 
+    # _flush requires records+meta (reading and stamping is main()'s job).
+    records = [{
+        "type": "user", "uuid": "record-1",
+        "message": {"role": "user", "content": "hello"},
+    }]
+    meta = {"cwd": None, "title": None}
     try:
-        cursor_flush.cursor_reader.to_canonical = lambda _path: ([{
-            "type": "user", "uuid": "record-1",
-            "message": {"role": "user", "content": "hello"},
-        }], {"cwd": None, "title": None})
         cursor_flush.current_blob_ids = lambda _path: {"blob-1"}
         cursor_flush.redact_records = lambda records: records
         cursor_flush.mcp_http.Session = Session
@@ -200,9 +201,9 @@ def test_real_platform_is_unconditional():
                     "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"):
             cursor_flush.resolve_bearer = lambda u=url: (u, "token")
             asyncio.run(cursor_flush._flush(
-                "session-1", Path("/tmp/store.db"), {"blob-1"}))
+                "session-1", Path("/tmp/store.db"), {"blob-1"},
+                records=records, meta=meta))
     finally:
-        cursor_flush.cursor_reader.to_canonical = originals["to_canonical"]
         cursor_flush.current_blob_ids = originals["current_blob_ids"]
         cursor_flush.redact_records = originals["redact_records"]
         cursor_flush.resolve_bearer = originals["resolve_bearer"]
