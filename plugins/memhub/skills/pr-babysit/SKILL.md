@@ -135,8 +135,6 @@ and END the loop: call `ScheduleWakeup` with `stop: true` so no further
 wake-up is scheduled.
 
 Plain-English output throughout. If the memory save fails on authentication, do
-the fixing anyway and send the user to `/memhub:login` — **not** `/mcp`. The
-save runs through the plugin's own credential (the personal access key
-`/memhub:login` mints), which is a separate store from the `/mcp` connector's
-token, so a connected `/mcp` does not mean the save can authenticate. Never fail
-the babysit over it.
+the fixing anyway and send the user to `/memhub:login` — the save runs on the
+personal access key it mints, the same one the MCP tools use. Never fail the
+babysit over it.

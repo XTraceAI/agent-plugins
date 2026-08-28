@@ -1,5 +1,5 @@
 ---
-description: Use when the user wants to authenticate or re-authenticate the MemHub plugin, or when memory capture is not working because of auth (e.g. "log in to memhub", "memhub login", "authenticate memhub", "memhub says I'm not authenticated", "my sessions aren't being saved", "capture stopped working", "re-auth memhub"). Provisions the plugin's own OAuth token — which is SEPARATE from the /mcp connector's login — and verifies it works.
+description: Use when the user wants to authenticate or re-authenticate the MemHub plugin, or when memory capture is not working because of auth (e.g. "log in to memhub", "memhub login", "authenticate memhub", "memhub says I'm not authenticated", "my sessions aren't being saved", "capture stopped working", "re-auth memhub"). Provisions the one credential the plugin's MCP tools and capture hooks share, and verifies it works.
 argument-hint: [--status | --force]
 allowed-tools: Bash
 ---
@@ -11,19 +11,17 @@ this plugin's root — the ancestor directory of this skill file that contains
 
 Authenticate this MemHub plugin install and confirm capture can actually run.
 
-**The one thing to understand before answering any question here:** the plugin's
-hooks do NOT use the `/mcp` connector's login. They share an Auth0 client, but
-the credentials live in different stores — Claude Code keeps the connector's in
-its own credential store, while the hooks resolve theirs in this order:
-`$MEMHUB_TOKEN`, then the **personal access key** (`mhk_…`) at
-`~/.config/memhub-plugin/pak-<host>.json` (the normal case — a static bearer
-that `login.py` mints, because a cold background hook can never open a browser
-to refresh a token), then the OAuth token cache at
-`~/.config/memhub-plugin/tokens-<host>.json`. Only a foreground plugin script
-can write those files. So "I'm connected in `/mcp`" and "my sessions are being
-captured" are independent facts, and a user can very reasonably have the first
-without the second. Never tell someone their capture is fine because `/mcp`
-shows connected.
+**The one thing to understand before answering any question here:** this is
+the plugin's only login. The `memhub` server in `/mcp` is a local proxy
+(`scripts/mcp_proxy.py`) and the capture hooks are background scripts, and
+both resolve the same credential in the same order: `$MEMHUB_TOKEN`, then the
+**personal access key** (`mhk_…`) at `~/.config/memhub-plugin/pak-<host>.json`
+(the normal case — a static bearer that `login.py` mints, because a cold
+background hook can never open a browser to refresh a token), then the OAuth
+token cache at `~/.config/memhub-plugin/tokens-<host>.json`. Only a foreground
+plugin script can write those files, which is why this command exists. Until it
+has run, `/mcp` shows the `memhub` server failing with "not logged in" and
+nothing is captured; after it, both work.
 
 Arguments: `$ARGUMENTS`
 

@@ -1,26 +1,18 @@
-"""Shared auth for the plugin's scripts and hooks.
+"""Shared auth for the plugin's scripts, hooks and MCP proxy.
 
-**This is a SEPARATE token store from the /mcp connector's.** Both use the same
-Auth0 client (the ``clientId`` in the plugin's ``.mcp.json``), which makes them
-easy to assume are interchangeable — they are not. Claude Code keeps the /mcp
-connector's tokens in its own credential store; every token here is written by
-exactly one place, ``_FileTokenStorage`` below, into
-``~/.config/memhub-plugin/tokens-<host>.json``.
-
-The consequence is the whole reason ``/memhub:login`` exists: a user who
-installs the plugin and authenticates in ``/mcp`` gets working MCP tools and a
-completely unauthenticated capture pipeline. The hooks call
-``resolve_url_and_auth(interactive=False)``, find no token here, and — because a
-background hook must never pop a browser — skip in silence. Nothing can mint
-this token except a FOREGROUND run of a plugin script, so provisioning it must
-be something the user is told to do, not something they stumble into.
+**One credential store for the whole plugin.** The hooks, the skills' scripts
+and the MCP server the model talks to (``mcp_proxy.py``, which ``.mcp.json``
+starts) all resolve their bearer here, from
+``~/.config/memhub-plugin/``. Nothing can write that store except a FOREGROUND
+run of a plugin script — a background hook must never pop a browser — so
+provisioning it is one explicit step, ``/memhub:login``, after which every
+part of the plugin is authenticated.
 
 Resolution order:
 1. ``$MEMHUB_TOKEN`` — explicit bearer for CI / headless runs.
-2. OAuth (PKCE, public client) against the MemHub MCP server, using the same
-   ``clientId`` / ``callbackPort`` the plugin's ``.mcp.json`` declares for the
-   /mcp connector. First run opens the browser once (exactly like
-   authenticating in /mcp); tokens are cached at
+2. OAuth (PKCE, public client) against the MemHub MCP server, using the
+   ``clientId`` / ``callbackPort`` the plugin's ``.mcp.json`` declares. First
+   run opens the browser once; tokens are cached at
    ``~/.config/memhub-plugin/tokens-<host>.json`` (0600). A stale access
    token is refreshed proactively by ``_refresh_cached_token_if_stale``
    (below) before the SDK runs — see that function for why the SDK's own
@@ -97,15 +89,36 @@ def _plugin_root() -> Path:
     return Path(__file__).parent.parent
 
 
+def backend_config(server: dict) -> dict:
+    """``{"url", "oauth": {...}}`` from a memhub server entry, whichever shape.
+
+    The entry is a stdio proxy (``mcp_proxy.py``) whose backend URL and OAuth
+    client live in its ``env`` block — the one place a stdio entry can carry
+    them. An entry that names ``url``/``oauth`` directly is the pre-proxy
+    shape and still resolves, so an old install keeps working.
+    """
+    env = server.get("env") or {}
+    if not isinstance(env, dict):
+        env = {}
+    oauth = dict(server.get("oauth") or {})
+    for key, var in (("clientId", "MEMHUB_OAUTH_CLIENT_ID"),
+                     ("authServerMetadataUrl", "MEMHUB_OAUTH_METADATA_URL"),
+                     ("callbackPort", "MEMHUB_OAUTH_CALLBACK_PORT")):
+        if key not in oauth and env.get(var):
+            oauth[key] = env[var]
+    return {"url": server.get("url") or env.get("MEMHUB_MCP_URL"),
+            "oauth": oauth}
+
+
 def _plugin_mcp_config() -> dict:
-    """The memhub server entry from the plugin's .mcp.json (url, oauth)."""
+    """The memhub backend (url, oauth) from the plugin's .mcp.json."""
     cfg = _plugin_root() / ".mcp.json"
     servers = json.loads(cfg.read_text(encoding="utf-8")).get("mcpServers", {})
     name = next((k for k in servers if k.lower().startswith("memhub")),
                 next(iter(servers)) if len(servers) == 1 else None)
     if not name:
         raise RuntimeError(f"no memhub server entry in {cfg}")
-    return servers[name]
+    return backend_config(servers[name])
 
 
 def default_url() -> str:
@@ -169,7 +182,7 @@ def _file_token_storage(url: str, client_id: str, redirect_uri: str):
     class _FileTokenStorage(TokenStorage):
         """Token cache keyed by server host; client info seeded statically from
         .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
-        a pre-registered public client — same one /mcp uses)."""
+        a pre-registered public client)."""
 
         def __init__(self):
             self._path = token_cache_path(url)
@@ -238,7 +251,7 @@ def build_oauth(url: str, interactive: bool = True):
             raise NonInteractiveAuthRequired(
                 "no cached OAuth token and interactive auth is disabled"
             )
-        print(f"Opening browser to authenticate (same flow as /mcp)...\n  {auth_url}")
+        print(f"Opening browser to authenticate...\n  {auth_url}")
         webbrowser.open(auth_url)
 
     return OAuthClientProvider(
@@ -298,7 +311,7 @@ def _make_callback_handler(port: int):
         # The callback port is FIXED (it's part of the pre-registered OAuth
         # client's redirect URI), so on "address already in use" we cannot
         # fall back to another port — we wait for the holder (a parallel
-        # script run or an in-flight /mcp authentication) to release it,
+        # script run mid-approval) to release it,
         # then fail with guidance instead of a raw OSError traceback.
         bind_deadline = time.monotonic() + float(
             os.environ.get("MEMHUB_OAUTH_BIND_TIMEOUT", "30")
@@ -316,9 +329,9 @@ def _make_callback_handler(port: int):
                 if time.monotonic() >= bind_deadline:
                     raise RuntimeError(
                         f"OAuth callback port {port} is busy — another memhub "
-                        "script or an /mcp authentication is mid-flow. Finish "
-                        "that approval (or wait a moment) and re-run; the port "
-                        "comes from .mcp.json oauth.callbackPort."
+                        "script's login is mid-flow. Finish that approval (or "
+                        "wait a moment) and re-run; the port comes from "
+                        ".mcp.json (MEMHUB_OAUTH_CALLBACK_PORT)."
                     ) from e
                 await asyncio.sleep(1.0)
         server.timeout = 1  # let handle_request tick so the loop can exit
@@ -459,7 +472,7 @@ def _refresh_cached_token_if_stale(url: str) -> None:
 
     Net effect without this shim: the hook works only while the cached access
     token is inside its short lifetime, then silently stops until the next
-    interactive ``/mcp`` or terminal-script auth re-seeds it. So we do the
+    interactive terminal-script auth re-seeds it. So we do the
     refresh here — against the *correct* auth-server ``token_endpoint`` — and
     write the fresh token back, leaving the SDK a valid token to send.
 

@@ -17,7 +17,7 @@ This repo is a **marketplace** with two installable plugins — `memhub` and
 .claude-plugin/marketplace.json     # makes the plugins installable
 plugins/memhub/                     # PROD build — install this one
 ├── .claude-plugin/plugin.json      # plugin manifest
-├── .mcp.json                       # the memhub MCP server → prod (per-user OAuth)
+├── .mcp.json                       # the memhub MCP server: stdio proxy → prod
 ├── hooks/claude-hooks.json         # Stop/SessionEnd/SessionStart/PreToolUse/PostToolUse
 └── skills/                         # /memhub:* skills (also auto-invoked by Claude)
     ├── handoff-session/            # hand the current session to a teammate
@@ -32,7 +32,7 @@ plugins/.claude-plugin/             # internal-only marketplace (staging build)
 plugins/memhub-staging/             # INTERNAL staging build — not published here,
                                     # see CONTRIBUTING.md
 ├── .claude-plugin/plugin.json      # its own manifest
-├── .mcp.json                       # the memhub MCP server → staging
+├── .mcp.json                       # the memhub MCP server: stdio proxy → staging
 ├── skills/  → ../memhub/skills     # symlinked: shared with memhub, never drifts
 ├── hooks/   → ../memhub/hooks      # symlinked
 └── scripts/ → ../memhub/scripts    # symlinked
@@ -63,33 +63,23 @@ change).
 /plugin install memhub@memhub
 ```
 
-Then authenticate **twice** — these are two separate credential stores that
-happen to share an Auth0 client, and each covers a different half of the
-plugin:
-
-```text
-/mcp
-```
-
-Select `memhub`, choose **Authenticate**, and approve in the browser. This
-connects the interactive MCP tools (`search_memory`, `save_artifact`, …).
+Then authenticate once:
 
 ```text
 /memhub:login
 ```
 
-This provisions *capture's* credential. The hooks run as cold background
-processes that can never open a browser, so `/mcp`'s token — kept in Claude
-Code's own store — is invisible to them; they read
-`~/.config/memhub-plugin/tokens-<host>.json`, which only a foreground plugin
-script can write. `/memhub:login` opens the browser once, then mints a
-personal access key (`mhk_…`, 90-day, one per machine) that the Stop/
-SessionEnd/commit-PR hooks authenticate with directly. Skipping it leaves
-capture silently unauthenticated even though `/mcp` shows connected — there is
-no automatic link between the two. Follow it with `/memhub:onboard` to connect
-the repo to its team brain (its own agent brain, seeded from a real session);
-without that step, capture still runs but lands in personal memory instead of
-the repo's room.
+It opens the browser once, then mints a personal access key (`mhk_…`, 90-day,
+one per machine) stored under `~/.config/memhub-plugin/`. Everything in the
+plugin authenticates with that one key: the interactive MCP tools
+(`search_memory`, `save_artifact`, …) reach the server through a local stdio
+proxy (`scripts/mcp_proxy.py`, the server `.mcp.json` declares) that sends it,
+and the Stop/SessionEnd/commit-PR hooks send it directly. There is no separate
+`/mcp` login — until `/memhub:login` has run, the `memhub` server in `/mcp`
+reports "not logged in" and capture stays off. Follow it with
+`/memhub:onboard` to connect the repo to its team brain (its own agent brain,
+seeded from a real session); without that step, capture still runs but lands
+in personal memory instead of the repo's room.
 
 `memhub` is pinned to a released tag, so `/plugin install` always gives you a
 version that shipped — never whatever happens to be on `main` mid-development.
@@ -131,9 +121,10 @@ Capture runs on independent paths that all feed one server-side watermark
    and read by every writer, capture included; until then, everything lands
    in personal memory instead of the repo's room.
 
-All of the above authenticate with the plugin's own credential — separate
-from `/mcp`, provisioned by `/memhub:login` (see Install) — because they run
-as cold background processes that can never open a browser.
+All of the above authenticate with the personal access key `/memhub:login`
+provisions (see Install) — the same one the MCP proxy uses for the model's
+tool calls. The hooks read it directly because they run as cold background
+processes that can never open a browser.
 `SessionStart` also runs `capture_health.py`, a *synchronous* check (the
 async flush hooks can't surface anything to the user) that reports via
 `systemMessage` when the capture credential has expired or a recent flush
@@ -178,11 +169,11 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
 
-- `/memhub:login [--status | --force]` — authenticates capture's own
-  credential (see Install/How it works): mints or verifies the personal
-  access key the background hooks use, distinct from `/mcp`'s connector
-  login. `--status` reports without opening a browser; `--force` discards the
-  cached credential and redoes the browser flow.
+- `/memhub:login [--status | --force]` — the plugin's one login (see
+  Install/How it works): mints or verifies the personal access key that the
+  MCP tools and the background hooks both use. `--status` reports without
+  opening a browser; `--force` discards the cached credential and redoes the
+  browser flow.
 - `/memhub:onboard [session-id-or-path]` — crosses the empty-brain cold
   start for a repo: resolves or creates its agent brain, caches the room so
   automatic capture routes there, seeds it from one real session, and proves
@@ -339,13 +330,12 @@ soft (not a git repo / hook error → silent no-op).
 
 ## Notes & trade-offs
 
-- **Auth is per-user, and split in two.** Nothing secret travels with the
-  plugin. Each person authenticates the interactive MCP tools themselves via
-  `/mcp`, and separately authenticates the background hooks via
-  `/memhub:login` (see Install) — being connected in one says nothing about
-  the other. Capture hooks talk to the MCP server directly (their own
-  credential, their own connection), so they don't go through Claude Code's
-  per-tool-call permission prompt the way a model-invoked MCP tool call does.
+- **Auth is per-user, and there is one of it.** Nothing secret travels with
+  the plugin. Each person runs `/memhub:login` once (see Install); the MCP
+  proxy and the background hooks then share that personal access key. Capture
+  hooks talk to the server directly (their own connection), so they don't go
+  through Claude Code's per-tool-call permission prompt the way a
+  model-invoked MCP tool call does.
 - **Cost.** Per-turn capture ships only the bytes written since the last
   flush, so its cost scales with the turn, not the whole session. The
   `SessionEnd` backstop still re-sends the full transcript-so-far once per
@@ -353,10 +343,12 @@ soft (not a git repo / hook error → silent no-op).
   sent) — a non-trivial token cost for a very long session, paid once rather
   than per turn.
 - **Requires** the MemHub server to expose `import_conversation` (capture)
-  and, for directive recall, `recall_directives`. If your `/mcp` connection
-  lists both, you're good.
+  and, for directive recall, `recall_directives`. If the `memhub` server in
+  `/mcp` lists both, you're good.
 
 ## Configuration
 
-To point at a different MemHub instance, edit `plugins/memhub/.mcp.json`
-(`url` and `oauth.clientId`).
+To point at a different MemHub instance, edit the `env` block in
+`plugins/memhub/.mcp.json` (`MEMHUB_MCP_URL`, `MEMHUB_OAUTH_CLIENT_ID`,
+`MEMHUB_OAUTH_METADATA_URL`). The proxy, the hooks and `/memhub:login` all
+read the backend from there.

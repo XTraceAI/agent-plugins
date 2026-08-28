@@ -64,9 +64,9 @@ Do exactly this:
    in, by name** — automatic routing that happens silently reads as losing
    things. On first ever run the script may open the browser once for approval
    and then mint a personal access key (`mhk_…`) that later runs reuse without
-   one — that is expected, not an error. It is the plugin's own credential, not
-   the `/mcp` connector's; `/memhub:login` provisions it up front if you would
-   rather not be interrupted mid-save.
+   one — that is expected, not an error. It is the same key the MCP tools use;
+   `/memhub:login` provisions it up front if you would rather not be
+   interrupted mid-save.
 
 You only emit the short command with a path — the script reads the file and
 ships it to `save_artifact`.

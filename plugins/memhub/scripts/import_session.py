@@ -13,7 +13,7 @@ Mirrors the SessionEnd hook's contract exactly:
   records it hasn't seen, and the session gist folds forward instead of
   duplicating.
 
-Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
+Auth = the plugin's one credential (shared `_memhub_auth`):
 $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 

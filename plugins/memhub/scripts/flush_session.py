@@ -28,11 +28,10 @@ Discipline mirrors the per-turn hook: THIS SCRIPT NEVER FAILS LOUDLY —
 any error exits 0 quietly (the hook is async fire-and-forget; memory capture
 must never disturb the user's session).
 
-Auth = the plugin's OWN token cache (shared `_memhub_auth`), which is a
-different store from the /mcp connector's despite sharing an Auth0 client:
-$MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
-refreshed automatically. interactive=False — a background hook must never
-pop a browser, so with no cached token it degrades quietly (run
+Auth = the plugin's token cache (shared `_memhub_auth`, the same one the MCP
+proxy uses): $MEMHUB_TOKEN if set (CI escape hatch), else the stored personal
+access key, else the cached OAuth token refreshed automatically. A background
+hook must never pop a browser, so with no credential it degrades quietly (run
 /memhub:login once to seed the cache).
 Endpoint: $MEMHUB_MCP_BASE_URL(+_SERVER_PATH) > the plugin's .mcp.json
 mcpServers.*.url > a default derived from the plugin install path (prod for

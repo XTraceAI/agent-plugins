@@ -120,7 +120,9 @@ def _env_host() -> str | None:
         return None
     for name, cfg in servers.items():
         if name.lower().startswith("memhub") and isinstance(cfg, dict):
-            return urlparse(cfg.get("url") or "").netloc or None
+            env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+            url = cfg.get("url") or env.get("MEMHUB_MCP_URL") or ""
+            return urlparse(url).netloc or None
     return None
 
 
@@ -338,8 +340,7 @@ def _message(host: str, token_problem: str | None,
     # /memhub:login, not /memhub:import-session — importing a session is a
     # different operation that does real unrequested work and can fail for
     # reasons unrelated to auth, which muddies the very signal being reported.
-    fix = ("Run /memhub:login to authenticate "
-           "(the plugin has its own login, separate from /mcp).")
+    fix = "Run /memhub:login to authenticate."
     if token_problem == "never":
         return (f"MemHub capture is not authenticated for {host}, so this "
                 f"session is not being saved to memory. {fix}")
@@ -372,9 +373,6 @@ def _message(host: str, token_problem: str | None,
         detail = _REASONS.get(reason, "the capture hook failed")
         ago = max(0, int((time.time() - when) / 60))
         when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
-        # NOT "check /mcp" — the connector is a separate token store, so its
-        # status says nothing about capture health. Sending someone there to
-        # diagnose this would contradict the whole reason this check exists.
         if reason == "auth":
             tail = fix
         elif reason == "budget_exhausted":

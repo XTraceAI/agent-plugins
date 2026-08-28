@@ -5,7 +5,7 @@ The point: the artifact body is read off disk / the pipe and shipped straight
 to the `save_artifact` MCP tool. The model never re-emits the content token by
 token — it just runs this with a path, the same way it would `cat` a file.
 
-Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
+Auth = the plugin's one credential (shared `_memhub_auth`):
 $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
 else a one-time browser approval. No memhub-cli required.
 

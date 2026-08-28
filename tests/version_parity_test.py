@@ -42,7 +42,7 @@ MANIFESTS = {
 }
 AP_SCHEMA_PREFIX = "https://agent-plugins.org/schemas/"
 MCP_AP = MEMHUB / "mcp.json"          # Agent Plugins format (Codex, Cursor, …)
-MCP_CLAUDE = MEMHUB / ".mcp.json"     # Claude Code format (carries oauth)
+MCP_CLAUDE = MEMHUB / ".mcp.json"     # Claude Code format (stdio proxy + backend env)
 MCP_STAGING = ROOT / "plugins" / "memhub-staging" / ".mcp.json"
 
 
@@ -88,22 +88,29 @@ def main() -> int:
     if not failures:
         print("ok  AP manifests carry the agent-plugins.org $schema")
 
+    # Both Claude entries start the same stdio proxy and carry the backend the
+    # proxy, the hooks and /memhub:login all read from the env block. A missing
+    # key here is a plugin whose tools and capture disagree about where to go.
+    PROXY_ARGS = ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp_proxy.py"]
+    ENV_KEYS = ("MEMHUB_MCP_URL", "MEMHUB_OAUTH_CLIENT_ID",
+                "MEMHUB_OAUTH_METADATA_URL", "MEMHUB_OAUTH_CALLBACK_PORT")
     for label, config in (("production", claude_mcp),
                           ("staging", staging_mcp)):
         server = config.get("mcpServers", {}).get("memhub", {})
-        cursor_client = server.get("auth", {}).get("CLIENT_ID")
-        capture_client = server.get("oauth", {}).get("clientId")
-        if not cursor_client or cursor_client != capture_client:
-            print(f"FAIL {label} MCP OAuth clients disagree: "
-                  f"auth.CLIENT_ID={cursor_client!r}, "
-                  f"oauth.clientId={capture_client!r}")
+        env = server.get("env", {})
+        missing = [k for k in ENV_KEYS if not env.get(k)]
+        if (server.get("type") != "stdio" or server.get("args") != PROXY_ARGS
+                or missing):
+            print(f"FAIL {label} .mcp.json is not the stdio proxy with a full "
+                  f"backend env (type={server.get('type')!r}, "
+                  f"args={server.get('args')!r}, missing={missing})")
             failures += 1
         else:
-            print(f"ok  {label} keeps Cursor auth and capture OAuth aligned")
+            print(f"ok  {label} starts mcp_proxy.py with its backend declared")
 
     def server_url(cfg: dict) -> str | None:
         server = cfg.get("mcpServers", {}).get("memhub", {})
-        return server.get("url")
+        return server.get("url") or server.get("env", {}).get("MEMHUB_MCP_URL")
 
     ap_url, claude_url = server_url(ap_mcp), server_url(claude_mcp)
     print(f"  mcp.json   → {ap_url}")
