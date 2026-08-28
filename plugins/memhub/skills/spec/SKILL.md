@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants spec-driven development backed by team memory — create, revise, drift-check, or report on a spec held in MemHub (e.g. "start a spec for X", "save this as the team spec", "revise the spec", "did the spec change under me?", "what's the status of the retry-policy spec?"). Specs are versioned artifacts in the repo's shared agent brain; every revision carries a rationale and is diffable.
 argument-hint: <init|revise|check|status> [file|topic] [...]
-allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__get_artifact, mcp__plugin_memhub-staging_memhub__get_artifact, mcp__plugin_memhub_memhub__get_artifact_lineage, mcp__plugin_memhub-staging_memhub__get_artifact_lineage, mcp__plugin_memhub_memhub__diff_artifact_versions, mcp__plugin_memhub-staging_memhub__diff_artifact_versions, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, Bash
+allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__get_artifact, mcp__plugin_memhub-staging_memhub__get_artifact, mcp__plugin_memhub_memhub__get_artifact_lineage, mcp__plugin_memhub-staging_memhub__get_artifact_lineage, mcp__plugin_memhub_memhub__diff_artifact_versions, mcp__plugin_memhub-staging_memhub__diff_artifact_versions, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__search_brains, Bash, Read, Write, Edit
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -30,20 +30,28 @@ Run spec-driven development on top of MemHub. The model:
 - A **work-item tag `spec:<slug>`** (kebab-case from the title) goes on the
   spec and every related artifact. Many specs share one room, so the tag
   (plus the artifact name `Spec: <title>`) is how revise/check/status pick
-  out THIS spec — never guess by name similarity alone.
+  out THIS spec — never guess by name similarity alone. Tags are
+  **normalised by the server** — lowercased, every non-alphanumeric run
+  collapsed to `_`, capped at 64 chars — so `spec:retry-policy` is stored as
+  `spec_retry_policy`. Searches normalise the same way, so filtering on
+  `spec:retry-policy` still matches; just don't expect the stored tag to
+  carry punctuation, and never encode a file path in a tag (it would come
+  back as `path_docs_specs_x_md`).
 - The spec also lives **in the repo as a file** (default
   `docs/specs/<slug>.md`). The file is what implementers read in their
   worktree; the artifact is the shared truth. `check` compares the two.
   Because `init` accepts any existing file as the spec, the file's
-  repo-relative path is recorded on the artifact as a **`path:<repo-relative-path>`
-  tag** — that tag, not the default location, is how later sessions find the
-  file again.
-- The spec records **which source files it governs**, in the repo-local
+  repo-relative path is recorded as the link's **`path`** in the repo-local
+  `.claude/artifact-map.json` (below) — that entry, not the default
+  location, is how later sessions find the file again.
+- The spec records **which source files it governs**, in the same
   `.claude/artifact-map.json` (written by the helper script below, never by
   hand). That map is what the plugin's artifact-sync PostToolUse hook reads:
   editing a mapped file injects a reminder to VERSION this spec rather than
   publish a parallel artifact. Writing it is part of `init`/`revise` — the
-  index is a byproduct of spec-driven development, not a second chore.
+  index is a byproduct of spec-driven development, not a second chore. The
+  map holds **no brain id** (a brain id is account state, not project state):
+  the upload script resolves the repo's room itself.
 - Sharing is **read-only**: teammates can search/check/status the room, but
   uploads into it work only for its creator. The intended flow: the spec
   owner runs `init`/`revise`; read-only members propose changes by editing
@@ -55,9 +63,16 @@ File uploads ALWAYS go through the helper script (never call the
 ```bash
 uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
   --file "<path>" --name "Spec: <title>" --type spec \
-  --agent-brain-id "<repo-ab-id>" --tags "spec,spec:<slug>,path:<repo-relative-path>" \
-  [--parent-id "<latest-version-id>"] [--rationale "<why>"]
+  --agent-brain-id "<repo-ab-id>" --tags "spec,spec:<slug>" \
+  [--rationale "<why>"]
 ```
+
+**Versioning is by name.** Re-uploading under the same `--name` into the same
+brain chains a new version onto that lineage's current head — no `--parent-id`
+needed. Don't pass one from memory: the server rejects any `parent_id` that
+is not the CURRENT latest version (`parent_stale`), so an id noted earlier in
+the session is already wrong after one revision. If you want explicit
+chaining anyway, `get_artifact_lineage` first and pass the head's id.
 
 Linking the spec to the code it governs ALWAYS goes through the map script
 (never hand-edit `.claude/artifact-map.json`). It is idempotent per artifact
@@ -66,15 +81,17 @@ globs:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/artifact_map.py" add \
-  --artifact-id "<root-version-id>" --brain-id "<repo-ab-id>" \
-  --name "Spec: <title>" --glob "<repo-relative globs>"
+  --artifact-id "<root-version-id>" --name "Spec: <title>" \
+  --path "<repo-relative spec path>" --glob "<repo-relative globs>"
 ```
 
-`--glob` takes repo-relative POSIX patterns with `*`, `**`, `{a,b}` braces,
-and `|` between alternatives (e.g. `app/retry.py|app/**/backoff.py`). Use the
+`--path` is the spec file itself (repo-relative POSIX — the path the user
+gave or the `docs/specs/<slug>.md` you wrote; never absolute). `--glob` takes
+repo-relative POSIX patterns with `*`, `**`, `{a,b}` braces, and `|` between
+alternatives (e.g. `app/retry.py|app/**/backoff.py`). Use the
 `--artifact-id` of the lineage's FIRST version and keep it stable across
-revisions — the hook passes it as `parent_id`, which chains the new version
-onto the lineage regardless of which version is currently latest.
+revisions — it is the link's key, and the hook's reminder re-uploads the
+`--path` file by name, so it never goes stale.
 
 Arguments: `$ARGUMENTS` — the first token is the subcommand and is consumed
 before the per-subcommand parsing below; each subcommand reads only the
@@ -99,28 +116,45 @@ brain to use.
    and write it to `docs/specs/<slug>.md` in the repo — composing it yourself
    is the point here; this is NOT the file-upload case the save-artifact
    skill guards against. Derive `<title>` from the argument or content;
-   `<slug>` is its short kebab-case form.
+   `<slug>` is its short kebab-case form. Start the file with YAML
+   frontmatter carrying the artifact name, quoted:
+
+   ```
+   ---
+   title: "Spec: <title>"
+   type: spec
+   ---
+   ```
+
+   The plugin's markdown auto-capture names drafts from this `title:` (else
+   from the H1 plus the path), so without it a Stop-hook draft and your
+   hand-saved spec would open two lineages. An existing file you were handed
+   gets the same frontmatter added before upload.
 2. Resolve the repo's room; create it only if no exact-name match exists.
 3. Check whether THIS spec already has a lineage there: `search_memory` with
    `memory_type: "artifacts"`, `tags: ["spec:<slug>"]`, and the room's
    `agent_brain_id`. A hit → STOP the init flow and run the **revise**
-   steps instead (`--parent-id` the newest version, rationale required) —
-   uploading without a parent would create a second root artifact and break
-   check/revise diffs. Any `for <teammates>` sharing still applies (step 6).
-4. Upload the file with the script (no `--parent-id` — this is the first
-   version of a fresh lineage). `path:` in `--tags` is the spec file's path
-   relative to the repo root — the path the user gave, or the
-   `docs/specs/<slug>.md` you wrote; never an absolute path.
+   steps instead (rationale required) — the upload will version that
+   lineage by name, and a different name would create a second root artifact
+   and break check/revise diffs. Any `for <teammates>` sharing still applies
+   (step 6).
+4. Upload the file with the script — the first version of a fresh lineage.
 5. Link the spec to the code it governs: run the map script with the new
-   artifact's id. Derive the globs from the spec's own Design/Milestones —
+   artifact's id and `--path` the spec file's repo-relative path (the path
+   the user gave, or the `docs/specs/<slug>.md` you wrote). Always write
+   the link — it is how `check`/`revise` find the file again and how the
+   auto-capture knows to leave it alone. Derive the globs from the spec's own Design/Milestones —
    the files it says will be written or changed — and confirm them with the
    user in one line before writing ("this spec governs `app/retry.py`,
    `app/**/backoff.py` — right?"). A spec that governs nothing concrete yet
-   (pure research or a decision record) → skip and say you skipped it.
+   (pure research or a decision record) → say so and pass the spec's own
+   path as the `--glob`.
 6. If the user named teammates ("for Alice and Bob"), resolve each via
    `list_teammates` (case-insensitive; ambiguous → show candidates and ask,
-   never guess between two people) and `share_agent_brain` with each
-   `user_id`. Tell the user this opens the repo's WHOLE room — every spec
+   never guess between two people) and `share_agent_brain` with
+   `teammate_user_id` = that teammate's `user_id` from `list_teammates`
+   (`permission` defaults to `viewer`, which is what a spec room wants).
+   Tell the user this opens the repo's WHOLE room — every spec
    and imported session in it, now and future — not just this spec. Nobody
    named → skip; note it may already be shared from an earlier spec.
 7. Report: artifact id, room name, file path, the `spec:<slug>` tag, the
@@ -136,23 +170,24 @@ brain to use.
    `memory_type: "artifacts"`, the room's `agent_brain_id`, and
    `tags: ["spec:<slug>"]` if the slug is known from context, else
    `tags: ["spec"]` plus a query for the topic. Several candidates → ask.
-2. `get_artifact_lineage` on it; the NEWEST version's id is the
-   `--parent-id`.
+2. `get_artifact_lineage` on it, so the report in step 6 can name the
+   version you are superseding.
 3. The revised content is the repo file — the path given as the argument,
-   else the artifact's `path:` tag, else `docs/specs/<slug>.md`. If the
-   change was discussed but not yet applied, edit the file first. A rationale
-   is REQUIRED — take it from the arguments or the conversation; if you can't
-   state why this version supersedes the last, ask.
-4. Upload with the script (`--parent-id`, `--rationale`, same `--name` and
-   tags as before — except `path:`, which must reflect the file's current
-   repo-relative path: update it if the file moved, add it if the lineage
-   predates path tags).
+   else the link's `path` from `artifact_map.py list`, else
+   `docs/specs/<slug>.md`. If the change was discussed but not yet applied,
+   edit the file first. A rationale is REQUIRED — take it from the arguments
+   or the conversation; if you can't state why this version supersedes the
+   last, ask.
+4. Upload with the script (`--rationale`, the SAME `--name` and tags as
+   before — the same name is what chains this onto the lineage; no
+   `--parent-id`).
 5. Refresh the link if the revision changed which files the spec governs
-   (new components, moved paths): re-run the map script with the SAME
-   `--artifact-id` as the existing link (`artifact_map.py list` shows it) and
-   the updated globs — it replaces that link rather than adding a second. No
-   link yet (lineage predates the map) → add one now, keyed on the lineage's
-   root version id.
+   (new components, moved paths) or the spec file itself moved: re-run the
+   map script with the SAME `--artifact-id` as the existing link
+   (`artifact_map.py list` shows it), the current `--path`, and the updated
+   globs — it replaces that link rather than adding a second. No link yet
+   (lineage predates the map) → add one now, keyed on the lineage's root
+   version id.
 6. `diff_artifact_versions` (previous → new) and report the delta in plain
    English plus the rationale. Remind the user that teammates' agents see the
    new version on their next `check` — there is no push notification.
@@ -169,8 +204,8 @@ Answer: "is the spec I'm building against still the spec?"
 1. Resolve the room and the spec (as in revise), `get_artifact` the latest
    version.
 2. Find the local spec file — first existing match wins: the argument; the
-   artifact's `path:` tag; `docs/specs/<slug>.md`; the file from earlier in
-   this session. A candidate missing on disk just falls through to the next
+   link's `path` (`artifact_map.py list`); `docs/specs/<slug>.md`; the file
+   from earlier in this session. A candidate missing on disk just falls through to the next
    (only an explicit argument that doesn't exist is an error worth raising).
    Compare contents:
    - identical → in sync; say so, one line, done.
@@ -184,14 +219,18 @@ Answer: "is the spec I'm building against still the spec?"
      overwriting the file with the latest artifact content (if the team
      version should win). Never overwrite without asking.
 2b. Also check the other direction — has the CODE moved out from under the
-   spec? Read this spec's globs (`artifact_map.py list`) and run
-   `git log --oneline --since=<the latest version's date> -- <globs>`. Commits
-   there mean mapped files changed after the spec's last revision: name them
-   and ask whether the spec needs a `revise`. No link for this spec → say so
-   and offer to add one, since without it the artifact-sync hook can't fire.
+   spec? Read this spec's globs and `path` (`artifact_map.py list`), take
+   the spec file's last commit date as the since-bound —
+   `git log -1 --format=%cI -- <spec path>` (the artifact tools return no
+   version dates) — and run
+   `git log --oneline --since=<that date> -- <globs>`. Commits there mean
+   mapped files changed after the spec file last moved: name them and ask
+   whether the spec needs a `revise`. An uncommitted spec file has no date →
+   say so and skip this half. No link for this spec → say so and offer to
+   add one, since without it the artifact-sync hook can't fire.
 3. No local file at all → print the latest version's content summary,
-   rationale chain, and where to write the file (the `path:` tag's location,
-   else `docs/specs/<slug>.md`).
+   rationale chain, and where to write the file (the link's `path`, else
+   `docs/specs/<slug>.md`).
 
 ## status `[topic]`
 

@@ -10,6 +10,14 @@ all — their memories landed in personal memory. A cached id makes the routing 
 property of the repo rather than something each caller rediscovers (and
 occasionally gets wrong).
 
+The capture hooks no longer depend on `set` having run: on a cache miss they
+call `brain_resolve.resolve_repo_brain`, which does the same exact-name lookup
+against the server and caches what it finds. `set` is how a skill records a
+room it just resolved or created — so the first capture after onboarding
+routes without a lookup, and so the ORG that owns the room is recorded (see
+`--org-id`). Capture only falls back to personal memory when no brain of the
+repo's exact name exists on this backend.
+
 The cache lives in the user's own config dir, NEVER inside the repo:
 
     ~/.config/memhub-plugin/rooms.json
@@ -34,7 +42,7 @@ silently write to the wrong backend's brain on whichever install didn't match:
     python3 room_map.py show [--cwd <dir>] [--env production|staging]
 
     # record the room after resolving it via list_agent_brains/create_agent_brain
-    python3 room_map.py set --brain-id <uuid> [--name "Repo: org/name"]
+    python3 room_map.py set --brain-id <uuid> [--org-id <uuid>] [--name "Repo: org/name"]
 
     # the conventional room NAME for this repo, for the exact-match lookup
     python3 room_map.py name
@@ -545,7 +553,8 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_set(args: argparse.Namespace) -> int:
-    path = write_room(args.brain_id, args.name, args.cwd, args.env)
+    path = write_room(args.brain_id, args.name, args.cwd, args.env,
+                      org_id=args.org_id)
     env = args.env or current_env()
     print(f"room for {env}: {args.brain_id} -> {path}")
     return 0
@@ -578,6 +587,12 @@ def main() -> int:
     setter = sub.add_parser("set", parents=[common], help="cache the resolved room")
     setter.add_argument("--brain-id", required=True)
     setter.add_argument("--name", help="the room's exact name")
+    # Without the org, `resolve_due` treats the entry as incomplete and
+    # re-probes it (rate-limited), and a capture into a room outside the
+    # caller's default org fails with "Agent brain not found".
+    setter.add_argument("--org-id",
+                        help="the org that owns the brain (recommended; "
+                             "required to route in multi-org accounts)")
     setter.set_defaults(func=cmd_set)
 
     naming = sub.add_parser("name", parents=[common],

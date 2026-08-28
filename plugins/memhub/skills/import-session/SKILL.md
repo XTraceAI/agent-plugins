@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks to import, upload, or save a Claude Code, Codex, or Cursor session/conversation/transcript into MemHub or team memory (e.g. "import this session into memhub", "save session <id> to memhub", "put that conversation in an agent brain"). Ships the transcript via a terminal upload script — any size, no token-by-token re-emit.
 argument-hint: <session-id-or-path> [title...]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains
+allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs
 ---
 
 **Plugin root:** Resolve this skill's plugin root once: it is the ancestor of
@@ -41,7 +41,10 @@ Do exactly this:
    - Nothing cached → derive `Repo: <org>/<name>` from `git remote get-url
      origin` (host and `.git` stripped), then `list_agent_brains` →
      **exact-name match**. Found → use its `agent_brain_id`, and persist it
-     (`room_map.py set --brain-id <id>`) so nothing repeats this lookup.
+     (`room_map.py set --brain-id <id> --org-id <org-id>` — the org id is the
+     one you passed to `list_agent_brains`, or the default org's from
+     `list_orgs`; the response's `scope` carries only `org_name`) so later
+     writers route without repeating this lookup.
    - **No match, or not in a git repo → do NOT create a brain.** Import into
      workspace memory (pass `--no-room`) and say so, mentioning that
      `/memhub:onboard` sets up the repo's room if they want one.

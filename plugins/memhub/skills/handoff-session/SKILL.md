@@ -48,8 +48,9 @@ Do exactly this:
    Composing this content yourself is the point here — this is NOT the
    file-upload case the save-artifact skill guards against.
 
-4. Share it: `share_agent_brain` with the agent brain id and the teammate's
-   `user_id`. Read-only is what you get and all a handoff needs.
+4. Share it: `share_agent_brain` with the agent brain id and
+   `teammate_user_id` = the teammate's `user_id` from `list_teammates`.
+   `permission` defaults to `viewer` — read-only, all a handoff needs.
 
 5. Give the teammate the session's memory — do NOT import the session.
    Per-turn capture has been shipping this session into the repo's room since

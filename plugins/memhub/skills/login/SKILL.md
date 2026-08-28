@@ -13,10 +13,14 @@ Authenticate this MemHub plugin install and confirm capture can actually run.
 
 **The one thing to understand before answering any question here:** the plugin's
 hooks do NOT use the `/mcp` connector's login. They share an Auth0 client, but
-the tokens live in two different stores — Claude Code keeps the connector's in
-its own credential store, while the hooks read
-`~/.config/memhub-plugin/tokens-<host>.json`, which only a foreground plugin
-script can write. So "I'm connected in `/mcp`" and "my sessions are being
+the credentials live in different stores — Claude Code keeps the connector's in
+its own credential store, while the hooks resolve theirs in this order:
+`$MEMHUB_TOKEN`, then the **personal access key** (`mhk_…`) at
+`~/.config/memhub-plugin/pak-<host>.json` (the normal case — a static bearer
+that `login.py` mints, because a cold background hook can never open a browser
+to refresh a token), then the OAuth token cache at
+`~/.config/memhub-plugin/tokens-<host>.json`. Only a foreground plugin script
+can write those files. So "I'm connected in `/mcp`" and "my sessions are being
 captured" are independent facts, and a user can very reasonably have the first
 without the second. Never tell someone their capture is fine because `/mcp`
 shows connected.
@@ -85,6 +89,8 @@ It prints `environment`, `mode`, `status`, then one of `credential` or
 
 ## After a successful first login
 
-If this was a first-time setup, mention that `/memhub:onboard` connects the repo
-to its team brain — without it capture still runs, but everything it saves lands
-in personal memory instead of the repo's room. Do not run it unprompted.
+If this was a first-time setup, mention that `/memhub:onboard` creates and
+seeds the repo's team brain. Capture already runs, and the hooks route to a
+brain named `Repo: <org>/<name>` on their own if one exists — but a repo with
+no such brain yet saves to personal memory until onboard creates it. Do not
+run it unprompted.

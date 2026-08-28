@@ -1,8 +1,9 @@
 """Self-test for the artifact-sync reminder hook.
 
 Covers the spec's acceptance criteria: mapped edit reminds with the exact
-save_artifact call, unmapped edit is silent, N files -> one reminder per
-artifact (session debounce), and a missing/invalid map is a clean no-op.
+save_artifact.py upload command (by name — no parent_id, no brain id in the
+repo tree), unmapped edit is silent, N files -> one reminder per artifact
+(session debounce), and a missing/invalid map is a clean no-op.
 
 Run: python3 artifact_sync_reminder_test.py  (stdlib only).
 """
@@ -25,16 +26,18 @@ HOOK = SCRIPTS / "artifact_sync_reminder.py"
 
 BRAIN = "11111111-1111-4111-8111-111111111111"
 ARTIFACT = "22222222-2222-4222-8222-222222222222"
+SPEC_PATH = "docs/specs/appworld-harness.md"
 MAP = {
     "version": 1,
     "links": [
         {
             "glob": "appworld/{run,agent,worker}.py",
-            "brain_id": BRAIN,
             "artifact_id": ARTIFACT,
             "artifact_name": "AppWorld eval harness + results (canonical)",
+            "path": SPEC_PATH,
         },
         {
+            # a pre-`path` link, as older maps still hold (brain_id is ignored)
             "glob": "xmem/**/reanchor.py|xmem/serve/entities.py",
             "brain_id": BRAIN,
             "artifact_id": "33333333-3333-4333-8333-333333333333",
@@ -104,16 +107,45 @@ def _run(root: Path, relpath: str, session: str, tmpdir: Path) -> str:
     return proc.stdout.strip()
 
 
-def test_mapped_edit_emits_the_literal_save_artifact_call():
+def test_mapped_edit_emits_the_upload_command_by_name():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         root = _repo(tmp, json.dumps(MAP))
         out = _run(root, "appworld/run.py", "sess-a", tmp)
         context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert f'parent_id="{ARTIFACT}"' in context
-        assert f'agent_brain_id="{BRAIN}"' in context
+        assert "scripts/save_artifact.py" in context
+        assert f'--file "{SPEC_PATH}"' in context
+        assert '--name "AppWorld eval harness + results (canonical)"' in context
+        assert ARTIFACT in context
         assert "appworld/run.py" in context
         assert "Do NOT create a new artifact" in context
+        # The server rejects a non-head parent_id (parent_stale) and the skill
+        # forbids re-emitting contents: neither may appear in the instruction.
+        assert "parent_id=" not in context and "--parent-id" not in context
+        assert "content=" not in context
+        # No brain id is read from the repo tree (room_map: account state).
+        assert BRAIN not in context
+
+
+def test_legacy_link_without_path_still_reminds_and_ignores_brain_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        root = _repo(tmp, json.dumps(MAP))
+        (root / "xmem" / "serve").mkdir(parents=True)
+        out = _run(root, "xmem/serve/entities.py", "sess-legacy", tmp)
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert '--name "Directive-anchoring handoff"' in context
+        assert "<the artifact's file>" in context
+        assert BRAIN not in context
+
+
+def test_link_for_path_finds_the_artifacts_own_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _repo(Path(tmp), json.dumps(MAP))
+        hit = asr.link_for_path(root, SPEC_PATH)
+        assert hit and hit["artifact_id"] == ARTIFACT
+        assert asr.link_for_path(root, "appworld/run.py") is None   # governed, not owned
+        assert asr.link_for_path(root / "nowhere", SPEC_PATH) is None
 
 
 def test_unmapped_edit_is_silent():
@@ -201,30 +233,47 @@ def test_map_add_is_idempotent_per_artifact_and_feeds_the_hook():
         _git_init(root)
         (root / "app").mkdir()
 
-        add = ["add", "--artifact-id", ARTIFACT, "--brain-id", BRAIN,
-               "--name", "Spec: Retry policy", "--glob", "app/retry.py"]
+        add = ["add", "--artifact-id", ARTIFACT, "--name", "Spec: Retry policy",
+               "--path", "docs/specs/retry-policy.md", "--glob", "app/retry.py"]
         assert _map_cli(root, *add).returncode == 0
         # Re-linking the same artifact with new globs replaces, never appends.
         proc = _map_cli(root, *add[:-1], "app/{retry,backoff}.py")
         assert proc.returncode == 0, proc.stderr
         written = json.loads((root / ".claude" / "artifact-map.json").read_text())
         assert len(written["links"]) == 1
+        link = written["links"][0]
+        assert link["path"] == "docs/specs/retry-policy.md"
+        # A brain id is account state — it never lands in the repo tree.
+        assert "brain_id" not in link
+        assert set(link) == {"glob", "artifact_id", "artifact_name", "path"}
 
         # The hook picks the map up with no further wiring.
         out = _run(root, "app/backoff.py", "sess-map", tmp)
         context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert f'parent_id="{ARTIFACT}"' in context
+        assert '--file "docs/specs/retry-policy.md"' in context
+        assert '--name "Spec: Retry policy"' in context
         assert _run(root, "app/unrelated.py", "sess-map2", tmp) == ""
+
+
+def test_map_add_refuses_a_brain_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "repo"
+        _git_init(root)
+        proc = _map_cli(root, "add", "--artifact-id", ARTIFACT, "--brain-id", BRAIN,
+                        "--name", "x", "--path", "docs/x.md", "--glob", "app/x.py")
+        assert proc.returncode != 0
+        assert not (root / ".claude" / "artifact-map.json").exists()
 
 
 def test_map_list_for_path_reports_the_governing_artifact():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "repo"
         _git_init(root)
-        _map_cli(root, "add", "--artifact-id", ARTIFACT, "--brain-id", BRAIN,
-                 "--name", "Spec: Retry policy", "--glob", "app/**/retry.py")
+        _map_cli(root, "add", "--artifact-id", ARTIFACT, "--name", "Spec: Retry policy",
+                 "--path", "docs/specs/retry-policy.md", "--glob", "app/**/retry.py")
         hit = _map_cli(root, "list", "--for", "app/deep/retry.py")
         assert "Spec: Retry policy" in hit.stdout
+        assert "docs/specs/retry-policy.md" in hit.stdout
         miss = _map_cli(root, "list", "--for", "app/other.py")
         assert "not linked to any artifact" in miss.stdout
 

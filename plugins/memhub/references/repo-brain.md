@@ -127,13 +127,21 @@ Duplicate brains are the main way a MemHub org degrades: cross-brain routing
 ranks brains by their overview, so several near-identical rooms on one
 subject make the right one harder to find for every future search.
 
-## 4. Cache the resolution — resolve once, route forever
+## 4. Cache the resolution — resolve once, route from then on
 
-Once §3 gives you an id, **persist it** so nothing has to redo the lookup:
+Once §3 gives you an id, **persist it** so later writers don't redo the lookup:
 
 ```sh
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" --org-id "<ORG_ID>"
 ```
+
+`--org-id` is the org that owns the brain — the `org_id` you passed to
+`list_agent_brains` / `create_agent_brain`, or the default org's `org_id` from
+`list_orgs` when you passed none (the response's `scope` carries only
+`org_name`). Single-org accounts can omit it; multi-org accounts must not,
+because a brain lives in exactly one org and the caller's default org follows
+whatever was last selected in the MemHub app. An entry cached without it is
+re-probed (rate-limited) until the org is known.
 
 That writes `~/.config/memhub-plugin/rooms.json` — the plugin's per-user state
 dir, alongside the OAuth token cache. **Never inside the repo.** A brain id is
@@ -152,12 +160,17 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" name   # the §1 name
 ```
 
-Why this exists: the two AUTOMATIC capture paths — the SessionEnd hook and the
-commit/PR flush — run with no model in the loop for the `list_agent_brains`
-match, so before the cache they passed only `namespace` and their memories
-landed in **personal memory, never in the room**. The cache is what lets them
-route. It also collapses five skills' worth of independent re-derivation into
-one answer, which is the drift §1 warns about.
+Why this exists: the AUTOMATIC capture paths — the per-turn Stop flush, the
+SessionEnd hook and the commit/PR flush — run with no model in the loop. Before
+the cache they passed only `namespace` and their memories landed in **personal
+memory, never in the room**. Today the hooks resolve the room themselves on a
+cache miss (`brain_resolve.resolve_repo_brain` does the exact-name lookup and
+caches the answer), so capture only falls back to personal memory when no brain
+of the repo's exact name exists on this backend. The cache is what makes that
+resolution a once-per-repo cost, records the org that owns the room
+(`set --org-id`, needed for writes outside the caller's default org), and
+collapses five skills' worth of independent re-derivation into one answer,
+which is the drift §1 warns about.
 
 `import_session.py` and `save_artifact.py` read it automatically when
 `--agent-brain-id` is not passed (`--no-room` opts out), so a plain invocation

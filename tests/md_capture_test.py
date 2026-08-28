@@ -290,6 +290,51 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid6)
         check(st["dirty"] == [] and st["saved"] == {} and calls["n"] == n_before, f"symlinked candidate is dropped, not uploaded: {st}")
 
+        # (audit #5) cache miss → the room is resolved from the server over the
+        # open session, exactly like the transcript capture hooks, so an
+        # auto-captured spec lands in the repo room when one exists.
+        sid7 = "sess-md-flush-resolve"
+        r7 = root / "resolve-spec.md"; r7.write_text("# R7\n" + "r" * 7000, encoding="utf-8")
+        mc.save_state(sid7, {"dirty": [str(r7)], "saved": {}, "attempts": {}})
+        seen_args: list = []
+        async def capture_save(session, call_args):
+            seen_args.append(call_args); return {"artifact_id": "aid"}
+        resolved: list = []
+        async def fake_resolve(session, cwd, env):
+            resolved.append((cwd, env)); return {"brain_id": "B-RESOLVED", "name": "Repo: x/y"}
+        f._save = capture_save
+        f.repo_root = lambda *a, **k: root
+        f.read_room = lambda *a, **k: None
+        f.resolve_repo_brain = fake_resolve
+        asyncio.run(f.flush(sid7))
+        check(len(resolved) == 1 and resolved[0][0] == root, f"cache miss → resolve_repo_brain called once with the file's dir: {resolved}")
+        check(seen_args and seen_args[-1].get("agent_brain_id") == "B-RESOLVED", "resolved room's brain id is what gets saved into")
+        # a cache HIT never resolves
+        resolved.clear(); seen_args.clear()
+        r7.write_text("# R7\n" + "q" * 7000, encoding="utf-8")
+        mc.save_state(sid7, {"dirty": [str(r7)], "saved": {}, "attempts": {}})
+        f.read_room = lambda *a, **k: {"brain_id": "B-CACHED", "name": "Repo: x/y"}
+        asyncio.run(f.flush(sid7))
+        check(resolved == [] and seen_args[-1].get("agent_brain_id") == "B-CACHED", "cache hit → no server resolution, cached brain used")
+
+        # (audit #3b) a file linked by `path` in .claude/artifact-map.json is
+        # owned by a hand-saved lineage (/memhub:spec) — the auto-capture must
+        # not open a second lineage under an H1-derived name.
+        sid8 = "sess-md-flush-linked"
+        (root / ".claude").mkdir(exist_ok=True)
+        owned = root / "owned-spec.md"; owned.write_text("# Owned\n" + "o" * 7000, encoding="utf-8")
+        free = root / "free-spec.md"; free.write_text("# Free\n" + "f" * 7000, encoding="utf-8")
+        (root / ".claude" / "artifact-map.json").write_text(json.dumps({"version": 1, "links": [
+            {"glob": "app/*.py", "artifact_id": "a-owned", "artifact_name": "Spec: Owned", "path": "owned-spec.md"}]}))
+        mc.save_state(sid8, {"dirty": [str(owned), str(free)], "saved": {}, "attempts": {}})
+        seen_args.clear()
+        f.read_room = lambda *a, **k: None
+        asyncio.run(f.flush(sid8))
+        st = mc.load_state(sid8)
+        check([a["name"] for a in seen_args] == ["Free (free-spec.md)"], f"linked file skipped, unlinked file saved: {[a['name'] for a in seen_args]}")
+        check(st["dirty"] == [] and str(owned) not in st["saved"], f"linked file leaves dirty without a digest (not retried): {st}")
+        (root / ".claude" / "artifact-map.json").unlink()
+
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
 
 
