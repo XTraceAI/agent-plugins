@@ -2,6 +2,7 @@
 """Trust-boundary tests for exact PR URL provenance."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -116,6 +117,11 @@ def test_import_payload_and_ack_are_explicit():
         "provenance_received": {"github_pr_urls": [url]},
     }) == [url]
     assert p.accepted_urls({"conversation_id": "c"}) == []
+    sanitized = p.import_provenance(
+        [url], {"repository_url":
+                "https://x-access-token:SECRET@github.com/x/r.git"})
+    assert sanitized["git"]["repository_url"] == "https://github.com/x/r.git"
+    assert "SECRET" not in json.dumps(sanitized)
 
 
 def test_merge_state_rejects_noncanonical_suffixes_fail_closed():

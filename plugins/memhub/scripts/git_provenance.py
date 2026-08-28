@@ -11,11 +11,15 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from room_map import git_env, git_readonly
 
 _COMMIT_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 _BRANCH_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+_SCP_REMOTE_RE = re.compile(
+    r"(?:(?P<user>[^/@:\s]+)@)?(?P<host>[^/@:\s]+):(?P<path>[^\s]+)\Z")
+_REMOTE_SCHEMES = frozenset(("git", "http", "https", "ssh"))
 
 
 def usable_cwd(cwd) -> bool:
@@ -52,11 +56,43 @@ def normalize_commit(value) -> str | None:
 
 
 def normalize_repository_url(value) -> str | None:
+    """A bounded Git remote with all credential-bearing components removed.
+
+    Repository URLs leave the machine as linking metadata, so a convenient
+    ``git remote get-url`` result is not safe to persist verbatim. URL-form
+    remotes lose userinfo, query, and fragment fields. SCP-form remotes retain
+    only Git's conventional non-secret ``git@`` username; any other username
+    is rejected rather than risking an access token in state or on the wire.
+    """
     if not isinstance(value, str) or not value or value != value.strip():
         return None
     if len(value) > 4096 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
         return None
-    return value
+
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+            if (parsed.scheme.lower() not in _REMOTE_SCHEMES
+                    or not parsed.hostname or not parsed.path
+                    or parsed.hostname.lower() != "github.com"):
+                return None
+            host = parsed.hostname
+            if ":" in host:
+                host = f"[{host}]"
+            port = parsed.port
+        except ValueError:
+            return None
+        authority = host + (f":{port}" if port is not None else "")
+        return urlunsplit((parsed.scheme.lower(), authority, parsed.path, "", ""))
+
+    scp = _SCP_REMOTE_RE.fullmatch(value)
+    if not scp:
+        return None
+    user = scp.group("user")
+    if user not in (None, "git") or scp.group("host").lower() != "github.com":
+        return None
+    prefix = "git@" if user == "git" else ""
+    return f"{prefix}{scp.group('host')}:{scp.group('path')}"
 
 
 def _run(cwd: str, args: list[str]) -> subprocess.CompletedProcess[str] | None:

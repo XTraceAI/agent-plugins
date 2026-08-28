@@ -83,6 +83,25 @@ def test_native_priority_and_fail_closed_validation():
     print("PASS test_native_priority_and_fail_closed_validation")
 
 
+def test_repository_urls_never_carry_credentials():
+    assert git_provenance.normalize_repository_url(
+        "https://x-access-token:SECRET@github.com/XTraceAI/demo.git?token=SECOND#x"
+    ) == "https://github.com/XTraceAI/demo.git"
+    assert git_provenance.normalize_repository_url(
+        "ssh://git:SECRET@github.com/XTraceAI/demo.git"
+    ) == "ssh://github.com/XTraceAI/demo.git"
+    assert git_provenance.normalize_repository_url(
+        "git@github.com:XTraceAI/demo.git"
+    ) == "git@github.com:XTraceAI/demo.git"
+    assert git_provenance.normalize_repository_url(
+        "SECRET@github.com:XTraceAI/demo.git") is None
+    assert git_provenance.normalize_repository_url(
+        "https://user:SECRET@git.internal.example/XTraceAI/demo.git") is None
+    assert git_provenance.normalize_repository_url(
+        "C:\\Users\\private\\demo.git") is None
+    print("PASS test_repository_urls_never_carry_credentials")
+
+
 def test_probe_failure_is_unavailable_not_detached():
     original = git_provenance.subprocess.run
     try:

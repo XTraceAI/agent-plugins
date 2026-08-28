@@ -14,6 +14,8 @@ import re
 import shlex
 from collections.abc import Iterable
 
+import git_provenance
+
 MAX_URLS = 50
 MAX_TEXT_BYTES = 1024 * 1024
 MAX_NODES = 10_000
@@ -204,8 +206,9 @@ def import_provenance(
         return None
     payload: dict = {"github_pr_urls": canonical}
     if isinstance(git, dict):
-        repository_url = git.get("repository_url")
-        if isinstance(repository_url, str) and 0 < len(repository_url) <= 4096:
+        repository_url = git_provenance.normalize_repository_url(
+            git.get("repository_url"))
+        if repository_url:
             payload["git"] = {"repository_url": repository_url}
     return payload
 

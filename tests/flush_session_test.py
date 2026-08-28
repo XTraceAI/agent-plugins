@@ -12,6 +12,7 @@ hole in the middle of the conversation.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -102,6 +103,78 @@ check("an org-less room sends no org", "org_id" not in args)
 ok, args = send(OK, title="Fix the flush hook", namespace="memhub")
 check("the title is sent", args.get("title") == "Fix the flush hook")
 check("the namespace is sent", args.get("namespace") == "memhub")
+
+
+# The whole-session hook is independent of the per-turn state by design. It
+# must therefore re-extract exact PR evidence itself and repeat it on every
+# slice, or an unsupported per-turn server can strand the URL at SessionEnd.
+class FlushSessionCapture(FakeSession):
+    latest = None
+
+    def __init__(self, *_args, **_kwargs):
+        super().__init__(OK)
+        FlushSessionCapture.latest = self
+
+
+with tempfile.TemporaryDirectory() as td:
+    transcript = Path(td) / "session.jsonl"
+    pr_url = "https://github.com/xtraceai/agent-plugins/pull/401"
+    rows = [
+        {"type": "assistant", "uuid": "a1", "cwd": "/repo",
+         "message": {"role": "assistant", "content": [{
+             "type": "tool_use", "id": "create", "name": "Bash",
+             "input": {"command": "gh pr create --fill"},
+         }]}},
+        {"type": "user", "uuid": "u1", "cwd": "/repo",
+         "message": {"role": "user", "content": [{
+             "type": "tool_result", "tool_use_id": "create",
+             "content": f"Created {pr_url}",
+         }]}},
+    ]
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    originals = {
+        "resolve_bearer": fs.resolve_bearer,
+        "session": fs.mcp_http.Session,
+        "resolve_repo_brain": fs.resolve_repo_brain,
+        "slices": fs.make_slices,
+        "git": fs.git_provenance.resolve,
+        "log": fs._log,
+    }
+
+    async def no_room(_session, _cwd, _env):
+        return None
+
+    try:
+        fs.resolve_bearer = lambda: ("https://example.test/mcp", "token")
+        fs.mcp_http.Session = FlushSessionCapture
+        fs.resolve_repo_brain = no_room
+        fs.make_slices = lambda records: [[records[0]], [records[1]]]
+        fs.git_provenance.resolve = lambda _cwd: {
+            "repository_url":
+                "https://x-access-token:SECRET@github.com/XTraceAI/agent-plugins.git",
+        }
+        fs._log = lambda _message: None
+        asyncio.run(fs._flush("session-pr", str(transcript)))
+    finally:
+        fs.resolve_bearer = originals["resolve_bearer"]
+        fs.mcp_http.Session = originals["session"]
+        fs.resolve_repo_brain = originals["resolve_repo_brain"]
+        fs.make_slices = originals["slices"]
+        fs.git_provenance.resolve = originals["git"]
+        fs._log = originals["log"]
+
+    sent = [args for _name, args in FlushSessionCapture.latest.sent]
+    expected = {
+        "github_pr_urls": [pr_url],
+        "git": {"repository_url":
+                "https://github.com/XTraceAI/agent-plugins.git"},
+    }
+    check("SessionEnd re-extracts exact PR evidence", len(sent) == 2)
+    check("SessionEnd repeats provenance on every slice",
+          all(args.get("provenance") == expected for args in sent))
+    check("SessionEnd never sends remote credentials",
+          all("SECRET" not in json.dumps(args) for args in sent))
 
 
 # MCP signals tool failure with isError, NOT an exception. Treating that as

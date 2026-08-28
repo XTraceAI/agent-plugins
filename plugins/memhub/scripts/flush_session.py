@@ -50,7 +50,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
+import git_provenance  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
+import pr_provenance  # noqa: E402
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
@@ -235,6 +237,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     cwd = next((r.get("cwd") for r in records
                 if isinstance(r, dict) and isinstance(r.get("cwd"), str)
                 and r.get("cwd")), None)
+    # This path is deliberately independent of the per-turn cursor/state. It
+    # therefore re-extracts exact PR-create results from the full transcript
+    # and sends them with every slice, so SessionEnd remains a real provenance
+    # backstop even after the per-turn path went dormant on an older server.
+    provenance = pr_provenance.import_provenance(
+        pr_provenance.urls_from_tool_results(records),
+        git_provenance.resolve(cwd),
+    )
     namespace = None
     if cwd:
         try:
@@ -329,6 +339,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "conversation_id": session_id,
             "source_platform": "claude",
         }
+        if provenance:
+            arguments["provenance"] = provenance
         # Bound this call by the time LEFT, not a fixed fraction of the
         # budget. `_stop_before_slice` only checks BEFORE a slice, so a
         # slice starting just under the deadline could otherwise run a full

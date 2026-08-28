@@ -318,6 +318,49 @@ def test_cursor_pr_url_ack_clears_only_server_accepted_evidence():
     print("PASS test_cursor_pr_url_ack_clears_only_server_accepted_evidence")
 
 
+def test_cursor_failed_provenance_attempt_starts_retry_backoff():
+    url = "https://github.com/xtraceai/agent-plugins/pull/322"
+    state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
+    originals = {
+        "redact_records": cursor_flush.redact_records,
+        "resolve_bearer": cursor_flush.resolve_bearer,
+        "read_state": cursor_flush._read_state,
+        "save_state": cursor_flush._save_state,
+        "log": cursor_flush._log,
+    }
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.resolve_bearer = lambda: ("https://example.test/mcp", None)
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        before = time.time()
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=[{
+                "type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "hello"},
+            }],
+            meta={"cwd": None, "title": None},
+            pending_pr_urls=[url]))
+    finally:
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert state["pending_pr_urls"] == [url]
+    assert state["pr_url_attempt_at"] >= before
+    assert time.time() - state["pr_url_attempt_at"] < DORMANT_RETRY_S
+    print("PASS test_cursor_failed_provenance_attempt_starts_retry_backoff")
+
+
 def test_milestone_gates_shell_events():
     assert should_flush("beforeShellExecution", {"command": "git commit -m x"},
                         STALE, FRESH, NOW)
@@ -473,10 +516,12 @@ def test_import_verdicts_and_dormancy():
     # transient blip ships before the streak ever reaches dormancy.
     dormant = {"unsupported": True, "unsupported_at": 1_000.0}
     for event in ("afterFileEdit", "beforeShellExecution",
-                  "afterAgentResponse", "stop", "beforeSubmitPrompt",
-                  "sessionEnd"):
+                  "afterAgentResponse", "stop", "beforeSubmitPrompt"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 dormant, {"new-blob"}, 1_000.0), event
+    assert should_flush(
+        "sessionEnd", {}, dormant, {"new-blob"}, 1_000.0), (
+            "the one final backstop attempt bypasses per-event dormancy")
     # ...but dormancy is NOT a one-way door: going dormant means never
     # flushing again, so nothing could otherwise observe that the server was
     # upgraded. After the re-probe window one flush is allowed through, and a

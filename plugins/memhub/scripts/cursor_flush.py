@@ -709,13 +709,14 @@ def should_flush(event: str, payload: dict, state: dict,
     point of milestone capture), turn boundaries ship, plain edits debounce,
     and non-milestone shell commands never trigger (too chatty).
     """
-    # Dormancy gates EVERY event including the turn boundaries: a
+    # Dormancy gates ordinary events including turn boundaries: a
     # persistently-down server is re-probed once per DORMANT_RETRY_S, never
     # hammered per-turn (boundaries can fire many times a minute). A boundary
     # whose tail falls inside a dormant window is captured by the
-    # import-session sweep, not by attempting a full flush every turn against
-    # an already-struggling backend. A successful re-probe clears the flag.
-    if state.get("unsupported") and (
+    # import-session sweep. SessionEnd is the one exception: it is a single
+    # final backstop attempt, not an event loop, and must not strand pending PR
+    # evidence merely because an older per-turn reply lacked ack_through.
+    if event != "sessionEnd" and state.get("unsupported") and (
             now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
         return False
     # Pending usage deliberately retries an unchanged transcript, but never
@@ -935,6 +936,14 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         _save_state(uuid, **fields)
         return
 
+    provenance = pr_provenance.import_provenance(
+        pending_pr_urls or [], meta.get("git"))
+    if provenance:
+        # This timestamp controls provenance-only retries. Persist it before
+        # every fallible auth/routing/network step so a failed attempt backs off
+        # instead of re-reading and re-sending on every later hook event.
+        _save_state(uuid, pr_url_attempt_at=time.time())
+
     try:
         url, bearer = await asyncio.to_thread(resolve_bearer)
     except Exception as e:  # noqa: BLE001
@@ -1019,8 +1028,6 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # Same scope stamp flush_turn sends: directives extracted from this
         # session must recall in this repo's context, not everywhere.
         arguments["namespace"] = namespace
-    provenance = pr_provenance.import_provenance(
-        pending_pr_urls or [], meta.get("git"))
     if provenance:
         arguments["provenance"] = provenance
     title = meta.get("title")
@@ -1090,8 +1097,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
               "fail_streak": 0,
               "pending_pr_urls": pending_pr_urls,
               "accepted_pr_urls": accepted_pr_urls,
-              "pr_url_attempt_at": time.time() if provenance else
-              state.get("pr_url_attempt_at", 0)}
+              "pr_url_attempt_at": state.get("pr_url_attempt_at", 0)}
     if source_kind == "store":
         # On a CONFIRMED import, advance the watermark even when the post-read
         # failed (shipped is None): the server acked the payload built from the
@@ -1276,7 +1282,8 @@ def main() -> int:
         sent_usage = set(state.get("sent_usage_generations") or [])
         usage_pending = bool(applied_usage - sent_usage)
         provenance_pending = bool(pending_pr_urls) and (
-            bool(new_pr_urls)
+            event == "sessionEnd"
+            or bool(new_pr_urls)
             or time.time() - (state.get("pr_url_attempt_at") or 0)
             >= DORMANT_RETRY_S
         )
