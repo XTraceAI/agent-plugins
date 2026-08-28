@@ -37,7 +37,21 @@ def _repo(root: Path) -> tuple[Path, str]:
 
 def test_real_attached_and_detached_snapshots():
     with tempfile.TemporaryDirectory() as td:
-        repo, commit = _repo(Path(td))
+        root = Path(td)
+        unborn = root / "unborn"
+        unborn.mkdir()
+        _git(unborn, "init")
+        unborn_branch = _git(unborn, "symbolic-ref", "--short", "HEAD")
+        observed, branch = git_provenance.snapshot_branch(str(unborn))
+        assert observed and branch == unborn_branch
+
+        bare = root / "bare.git"
+        _git(root, "init", "--bare", str(bare))
+        bare_branch = _git(bare, "symbolic-ref", "--short", "HEAD")
+        observed, branch = git_provenance.snapshot_branch(str(bare))
+        assert observed and branch == bare_branch
+
+        repo, commit = _repo(root)
         observed, branch = git_provenance.snapshot_branch(str(repo))
         assert observed and branch == "feature/session-provenance"
         assert git_provenance.snapshot(str(repo)) == {

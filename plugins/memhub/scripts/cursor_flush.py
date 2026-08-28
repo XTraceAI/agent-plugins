@@ -937,7 +937,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  applied_usage: set[str] | None = None,
                  pending_pr_urls: list[str] | None = None,
                  final_provenance_attempt: bool = False,
-                 provenance_only_attempt: bool = False) -> None:
+                 provenance_only_attempt: bool = False,
+                 content_driven_attempt: bool = False) -> None:
     # ``records``/``meta`` are REQUIRED: reading, stamping, and persisting
     # pins is main()'s job, in that order, under the session lock. A
     # self-read fallback here shipped records that bypassed that flow —
@@ -1201,9 +1202,12 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
               "pr_url_unconfirmed": pr_url_unconfirmed,
               "pr_url_empty_attempts": 0,
               "dormant_session_end_attempted": False,
+              # Confirmed new content starts a new terminal cycle. Re-arm the
+              # one SessionEnd backstop without replenishing the separate
+              # ordinary provenance-only retry budget above.
               "pr_url_session_end_attempted": (
                   state.get("pr_url_session_end_attempted") is True
-                  if pending_pr_urls else False
+                  if pending_pr_urls and not content_driven_attempt else False
               ),
               "pr_url_attempt_at": state.get("pr_url_attempt_at", 0)}
     if source_kind == "store":
@@ -1455,7 +1459,8 @@ def main() -> int:
                     final_provenance_attempt=(
                         event == "sessionEnd" and provenance_only_attempt
                     ),
-                    provenance_only_attempt=provenance_only_attempt),
+                    provenance_only_attempt=provenance_only_attempt,
+                    content_driven_attempt=content_pending),
                 timeout=FLUSH_TIMEOUT_S))
         except Exception as e:
             # A timeout or any raise past _flush's own handlers (the broad

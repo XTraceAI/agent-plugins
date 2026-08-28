@@ -545,7 +545,7 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
                 "type": "user", "uuid": "u1",
                 "message": {"role": "user", "content": "new content"},
             }], meta={"cwd": None, "title": None},
-            pending_pr_urls=[url]))
+            pending_pr_urls=[url], content_driven_attempt=True))
     finally:
         cursor_flush.current_blob_ids = originals["current_blob_ids"]
         cursor_flush.redact_records = originals["redact_records"]
@@ -558,8 +558,12 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     assert calls[-1]["provenance"]["github_pr_urls"] == [url]
     assert state["pending_pr_urls"] == [url]
     assert state["pr_url_unconfirmed"] == MAX_PR_URL_UNCONFIRMED
+    assert state["pr_url_session_end_attempted"] is False
     assert not _pr_url_retry_due(
         pending=True, new_urls=False, event="stop", state=state,
+        now=later + DORMANT_RETRY_S + 1)
+    assert _pr_url_retry_due(
+        pending=True, new_urls=False, event="sessionEnd", state=state,
         now=later + DORMANT_RETRY_S + 1)
 
     # The retry budget gates only unchanged-content sends. A later server
@@ -585,7 +589,7 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
                 "type": "user", "uuid": "u1",
                 "message": {"role": "user", "content": "newer content"},
             }], meta={"cwd": None, "title": None},
-            pending_pr_urls=[url]))
+            pending_pr_urls=[url], content_driven_attempt=True))
     finally:
         cursor_flush.current_blob_ids = originals["current_blob_ids"]
         cursor_flush.redact_records = originals["redact_records"]
@@ -818,6 +822,9 @@ def test_import_verdicts_and_dormancy():
     # confirmed import clears the flag.
     assert should_flush("stop", {}, dormant, {"new-blob"},
                         1_000.0 + DORMANT_RETRY_S + 1)
+    assert should_flush("sessionEnd", {}, attempted, {"new-blob"},
+                        1_000.0 + DORMANT_RETRY_S + 1), (
+        "the consumed terminal marker applies only to its dormant window")
     assert should_flush("stop", {}, {"unsupported": False}, {"new-blob"}, 5_000.0)
     print("PASS test_import_verdicts_and_dormancy")
 
