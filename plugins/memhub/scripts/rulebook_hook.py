@@ -30,8 +30,8 @@ $MEMHUB_RULEBOOK_BASE, else ~/.config/memhub-plugin/rulebook. Stdlib only; every
 broken hook must never touch the tool call or the session.
 
 Two engines, one evaluate():
-  * matcher rules — `evaluate()` is a pure function of (rule, event); the
-    backtest imports it so the replay exercises the code that runs live.
+  * matcher rules — `evaluate()` is a pure function of (rule, event), so it
+    can be exercised in isolation by the tests.
   * ordering rules — "run X after the last edit, before Y": an obligation
     state machine keyed by (worktree_root, branch, rule), never by session,
     so receipts from subagents and sibling sessions in the same checkout count.
@@ -119,8 +119,7 @@ def last_segment(shell):
 
 # ── matcher engine: pure ────────────────────────────────────────────────────
 def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text=""):
-    """True if `rule` fires on this event. No I/O, no dedup — the backtest
-    replays this exact function. Ordering rules are not matchers (see
+    """True if `rule` fires on this event. No I/O, no dedup. Ordering rules are not matchers (see
     OrderingEngine)."""
     on = rule.get("on")
     try:
