@@ -26,8 +26,8 @@ sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 import cursor_flush  # noqa: E402
 import cursor_capture  # noqa: E402
 from cursor_flush import (  # noqa: E402
-    DORMANT_RETRY_S, MAX_PR_URL_UNCONFIRMED, _pr_url_retry_due, _verdict,
-    session_uuid, should_flush)
+    DORMANT_RETRY_S, MAX_PR_URL_EMPTY_ATTEMPTS, MAX_PR_URL_UNCONFIRMED,
+    _pr_url_retry_due, _verdict, session_uuid, should_flush)
 
 NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
@@ -364,7 +364,13 @@ def test_cursor_failed_provenance_attempt_starts_retry_backoff():
 
 def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     url = "https://github.com/xtraceai/agent-plugins/pull/323"
-    state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
+    state = {
+        "pending_pr_urls": [url],
+        "accepted_pr_urls": [],
+        # A previous empty-transcript cap must not follow this URL once genuine
+        # content appears and a real server exchange becomes possible.
+        "pr_url_empty_attempts": MAX_PR_URL_EMPTY_ATTEMPTS,
+    }
     calls = []
     accept_provenance = False
     originals = {
@@ -417,6 +423,7 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
             }], meta={"cwd": None, "title": None},
             pending_pr_urls=[url]))
         assert state.get("pr_url_unconfirmed", 0) == 0
+        assert state["pr_url_empty_attempts"] == 0
         for _ in range(MAX_PR_URL_UNCONFIRMED):
             asyncio.run(cursor_flush._flush(
                 "session-1", Path("/tmp/store.db"), {"blob-1"},
@@ -524,7 +531,7 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     print("PASS test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks")
 
 
-def test_empty_provenance_only_retries_consume_the_same_bounded_budget():
+def test_empty_provenance_only_retries_use_a_local_bounded_budget():
     url = "https://github.com/xtraceai/agent-plugins/pull/324"
     state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
     originals = {
@@ -542,7 +549,7 @@ def test_empty_provenance_only_retries_consume_the_same_bounded_budget():
         cursor_flush._read_state = lambda _sid: dict(state)
         cursor_flush._save_state = save_state
         cursor_flush._log = lambda _message: None
-        for _ in range(MAX_PR_URL_UNCONFIRMED):
+        for _ in range(MAX_PR_URL_EMPTY_ATTEMPTS):
             asyncio.run(cursor_flush._flush(
                 "session-empty", Path("/tmp/transcript.jsonl"), set(),
                 source_kind="transcript", source_revision="empty-revision",
@@ -554,13 +561,18 @@ def test_empty_provenance_only_retries_consume_the_same_bounded_budget():
         cursor_flush._save_state = originals["save_state"]
         cursor_flush._log = originals["log"]
 
-    assert state["pr_url_unconfirmed"] == MAX_PR_URL_UNCONFIRMED
+    assert state.get("pr_url_unconfirmed", 0) == 0
+    assert state["pr_url_empty_attempts"] == MAX_PR_URL_EMPTY_ATTEMPTS
     assert state["pr_url_attempt_at"] > 0
     assert not _pr_url_retry_due(
         pending=True, new_urls=False, event="stop", state=state,
         now=state["pr_url_attempt_at"] + DORMANT_RETRY_S + 1,
     )
-    print("PASS test_empty_provenance_only_retries_consume_the_same_bounded_budget")
+    assert _pr_url_retry_due(
+        pending=True, new_urls=True, event="afterShellExecution", state=state,
+        now=state["pr_url_attempt_at"] + DORMANT_RETRY_S + 1,
+    ), "new exact evidence gets a fresh local-empty budget"
+    print("PASS test_empty_provenance_only_retries_use_a_local_bounded_budget")
 
 
 def test_milestone_gates_shell_events():
@@ -724,6 +736,10 @@ def test_import_verdicts_and_dormancy():
     assert should_flush(
         "sessionEnd", {}, dormant, {"new-blob"}, 1_000.0), (
             "the one final backstop attempt bypasses per-event dormancy")
+    attempted = {**dormant, "dormant_session_end_attempted": True}
+    assert not should_flush(
+        "sessionEnd", {}, attempted, {"new-blob"}, 1_000.0), (
+            "duplicate terminal delivery cannot bypass the same dormant window")
     # ...but dormancy is NOT a one-way door: going dormant means never
     # flushing again, so nothing could otherwise observe that the server was
     # upgraded. After the re-probe window one flush is allowed through, and a

@@ -93,6 +93,11 @@ MAX_UNCONFIRMED = 5
 # provenance acknowledgement field. Bound unchanged-content retries separately
 # so that compatibility case cannot upload a whole store forever.
 MAX_PR_URL_UNCONFIRMED = 5
+# Empty/fully-redacted transcripts never contact the server, so they need a
+# separate bounded read budget rather than consuming the server-unconfirmed
+# budget above. Genuine transcript growth still bypasses this provenance-only
+# cap through the normal content watermark gate.
+MAX_PR_URL_EMPTY_ATTEMPTS = 5
 
 
 def _note_failure(uuid: str, reason: str) -> None:
@@ -717,11 +722,14 @@ def should_flush(event: str, payload: dict, state: dict,
     # persistently-down server is re-probed once per DORMANT_RETRY_S, never
     # hammered per-turn (boundaries can fire many times a minute). A boundary
     # whose tail falls inside a dormant window is captured by the
-    # import-session sweep. SessionEnd is the one exception: it is a single
-    # final backstop attempt, not an event loop, and must not strand pending PR
-    # evidence merely because an older per-turn reply lacked ack_through.
-    if event != "sessionEnd" and state.get("unsupported") and (
-            now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
+    # import-session sweep. SessionEnd gets one final backstop attempt, but the
+    # persisted marker makes duplicate/replayed delivery obey dormancy too.
+    dormant = state.get("unsupported") and (
+        now - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S
+    )
+    if dormant and (
+            event != "sessionEnd"
+            or state.get("dormant_session_end_attempted") is True):
         return False
     # Pending usage deliberately retries an unchanged transcript, but never
     # bypasses the global dormancy gate above or the event-specific debounce
@@ -767,15 +775,18 @@ def _pr_url_retry_due(
     if not pending:
         return False
     unconfirmed = _pr_url_unconfirmed(state)
+    empty_attempts = _pr_url_empty_attempts(state)
     if new_urls:
         unconfirmed = 0
+        empty_attempts = 0
     # Preserve one terminal backstop even after ordinary provenance-only
     # retries are exhausted. The marker is persisted before auth/network work,
     # so a duplicated sessionEnd cannot turn this into an upload loop.
     if (event == "sessionEnd" and
             state.get("pr_url_session_end_attempted") is not True):
         return True
-    if unconfirmed >= MAX_PR_URL_UNCONFIRMED:
+    if (unconfirmed >= MAX_PR_URL_UNCONFIRMED
+            or empty_attempts >= MAX_PR_URL_EMPTY_ATTEMPTS):
         # The cap disables only unchanged-content provenance retries. New
         # transcript content still passes should_flush's normal watermark gate,
         # and _flush includes every pending URL independently of this flag.
@@ -794,6 +805,15 @@ def _pr_url_unconfirmed(state: dict) -> int:
     except (TypeError, ValueError):
         value = 0
     return min(MAX_PR_URL_UNCONFIRMED, value)
+
+
+def _pr_url_empty_attempts(state: dict) -> int:
+    """Return the bounded count of local empty-transcript retries."""
+    try:
+        value = max(0, int(state.get("pr_url_empty_attempts") or 0))
+    except (TypeError, ValueError):
+        value = 0
+    return min(MAX_PR_URL_EMPTY_ATTEMPTS, value)
 
 
 def _event_can_flush(event: str, payload: dict) -> bool:
@@ -984,9 +1004,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                 fields["pr_url_session_end_attempted"] = True
             if provenance_only_attempt:
                 state = _read_state(uuid)
-                fields["pr_url_unconfirmed"] = min(
-                    MAX_PR_URL_UNCONFIRMED,
-                    _pr_url_unconfirmed(state) + 1,
+                fields["pr_url_empty_attempts"] = min(
+                    MAX_PR_URL_EMPTY_ATTEMPTS,
+                    _pr_url_empty_attempts(state) + 1,
                 )
         if (source_kind == "transcript" and source_revision and not records):
             fields["transcript_revision"] = source_revision
@@ -999,7 +1019,14 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # This timestamp controls provenance-only retries. Persist it before
         # every fallible auth/routing/network step so a failed attempt backs off
         # instead of re-reading and re-sending on every later hook event.
-        attempt_fields = {"pr_url_attempt_at": time.time()}
+        attempt_fields = {
+            "pr_url_attempt_at": time.time(),
+            # We reached a sendable transcript, so any earlier local-empty cap
+            # no longer describes this source. Clear it before fallible auth and
+            # network work so a later provenance retry is not suppressed by an
+            # obstacle that has already disappeared.
+            "pr_url_empty_attempts": 0,
+        }
         if final_provenance_attempt:
             attempt_fields["pr_url_session_end_attempted"] = True
         _save_state(uuid, **attempt_fields)
@@ -1169,6 +1196,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
               "pending_pr_urls": pending_pr_urls,
               "accepted_pr_urls": accepted_pr_urls,
               "pr_url_unconfirmed": pr_url_unconfirmed,
+              "pr_url_empty_attempts": 0,
+              "dormant_session_end_attempted": False,
               "pr_url_session_end_attempted": (
                   state.get("pr_url_session_end_attempted") is True
                   if pending_pr_urls else False
@@ -1355,6 +1384,7 @@ def main() -> int:
             # A newly discovered URL gets its own bounded confirmation budget;
             # an older permanently-unacknowledged URL must not starve it.
             fields["pr_url_unconfirmed"] = 0
+            fields["pr_url_empty_attempts"] = 0
             fields["pr_url_session_end_attempted"] = False
         fields["pending_pr_urls"] = pending_pr_urls
         fields["accepted_pr_urls"] = accepted_pr_urls
@@ -1375,6 +1405,13 @@ def main() -> int:
             content_pending = not blob_ids <= set(state.get("blob_ids") or [])
         provenance_only_attempt = (
             provenance_pending and not content_pending and not usage_pending
+        )
+        dormant_session_end_attempt = (
+            event == "sessionEnd"
+            and state.get("unsupported") is True
+            and time.time() - (state.get("unsupported_at") or 0)
+            < DORMANT_RETRY_S
+            and state.get("dormant_session_end_attempted") is not True
         )
 
         # should_flush reads only watermark/backoff state (transcript_revision,
@@ -1398,6 +1435,11 @@ def main() -> int:
         fields["record_git_branches"] = git_provenance.pin_record_branches(
             records, state.get("record_git_branches"),
             observed=branch_observed, branch=branch)
+        if dormant_session_end_attempt:
+            # Persist before auth/network work so duplicate SessionEnd delivery
+            # cannot repeatedly bypass a live dormancy window after a crash or
+            # a failed final attempt.
+            fields["dormant_session_end_attempted"] = True
         _save_state(uuid, **fields)
         try:
             mode = _FLUSH_MODE.get(event, "now")
