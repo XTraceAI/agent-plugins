@@ -490,7 +490,8 @@ def _make_cursor_transcript(base: Path,
 
 
 def _make_cursor_store(base: Path, uuid: str = "11111111-2222-3333-4444-555555555555",
-                       cwd: str = "/repo/proj", schema_version: int = 1) -> Path:
+                       cwd: str = "/repo/proj", schema_version: int = 1,
+                       node_clocks: bool = True) -> Path:
     """Build a store.db + meta.json mirroring the observed format: JSON leaf
     blobs id'd by sha256, an interior node, and a root whose protobuf field 1
     lists child hashes in order."""
@@ -530,9 +531,15 @@ def _make_cursor_store(base: Path, uuid: str = "11111111-2222-3333-4444-55555555
     # interior node (first checkpoint) holds the first two messages; root
     # (second checkpoint, 12s later) adds the rest + trailing metadata —
     # mimics the real store: leaves inherit their nearest ancestor's clock.
-    interior = node([leaves[0][0], leaves[1][0]], ts_ms=1_787_116_704_000)
+    # node_clocks=False builds the same tree with NO readable wall clocks
+    # (the field churns with cursor versions, so the range heuristic can
+    # find nothing) — the shape that used to trigger the updatedAtMs
+    # fallback.
+    interior = node([leaves[0][0], leaves[1][0]],
+                    ts_ms=1_787_116_704_000 if node_clocks else None)
     root = node([interior[0], leaves[2][0], leaves[3][0]],
-                ts_ms=1_787_116_716_000, extra=b"\xb2\x01\x03cli")
+                ts_ms=1_787_116_716_000 if node_clocks else None,
+                extra=b"\xb2\x01\x03cli")
 
     con = sq.connect(d / "store.db")
     con.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
@@ -588,13 +595,32 @@ def test_cursor_reader_end_to_end():
                       "content": "file.py"}, tr
         for r in recs:
             assert r.get("cwd") == "/repo/proj", r
-            assert r.get("uuid") and r.get("timestamp"), r   # server contract
+            assert r.get("uuid"), r          # server replay-dedup contract
+            assert r.get("timestamp"), r     # every fixture node carries a clock
         # A real timeline, not one instant: the banner carries meta.json's
         # createdAtMs, and leaves inherit their checkpoint node's clock —
         # first two messages the first checkpoint, the rest the second.
         stamps = {r["timestamp"] for r in recs}
         assert len(stamps) == 3, stamps
     print("PASS test_cursor_reader_end_to_end")
+
+
+def test_cursor_store_without_node_clocks_stays_unmeasured():
+    """A store whose checkpoint nodes carry no readable wall clock yields
+    UNDATED message records — never meta.json's ``updatedAtMs``. That
+    fallback dated every otherwise-undated record at flush-adjacent time,
+    collapsing a session's event_date onto one instant (the production
+    degeneracy this pins against regressing). The banner alone keeps
+    ``createdAtMs`` — a real session-start clock the artifact does carry."""
+    with tempfile.TemporaryDirectory() as td:
+        db = _make_cursor_store(Path(td), node_clocks=False)
+        recs, _ = cursor.to_canonical(db)
+        assert recs[0]["message"]["content"].startswith("[Imported from Cursor")
+        assert recs[0]["timestamp"] == "2026-08-19T05:18:24.338Z", recs[0]
+        for r in recs[1:]:
+            assert "timestamp" not in r, r
+        assert not readers.validate_canonical(recs)
+    print("PASS test_cursor_store_without_node_clocks_stays_unmeasured")
 
 
 def test_cursor_transcript_reader_end_to_end():
@@ -627,8 +653,18 @@ def test_cursor_transcript_reader_end_to_end():
         assert recs[6]["message"]["content"][0]["text"] == "DONE"
         assert recs[6]["message"]["model"] == "cursor-test-hook-model"
         assert "usage" not in recs[6]["message"]
-        assert {record["timestamp"] for record in recs} == {
-            "2026-08-23T18:16:00.000Z", "2026-08-23T18:18:00.000Z"}
+        # Real-or-absent timestamps: each user turn keeps its OWN embedded
+        # tag (banner inherits the earliest), and the assistant records —
+        # which the transcript carries no clock for — stay UNDATED rather
+        # than inheriting a carried-forward or file-time stamp (the collapse
+        # this reader used to produce; the live flush dates them first-seen).
+        assert [record.get("timestamp") for record in recs] == [
+            "2026-08-23T18:16:00.000Z",   # banner ← earliest tag
+            "2026-08-23T18:16:00.000Z",   # "Reply once" — own tag
+            None,                          # assistant: no source clock
+            "2026-08-23T18:18:00.000Z",   # "Edit it" — own tag
+            None, None, None,              # assistant records of turn 2
+        ], [record.get("timestamp") for record in recs]
         again, _ = cursor.to_canonical(
             path, cwd="/repo/proj", model="cursor-test-hook-model")
         assert [record["uuid"] for record in again] == [
@@ -754,6 +790,15 @@ def test_validate_canonical_catches_breakage():
     bad = [{"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "name": "f", "input": {}}]}}]   # missing id
     assert any("tool_use without id" in p for p in readers.validate_canonical(bad))
+    # Timestamps: ABSENT is legal (server stores NULL event_date =
+    # "unmeasured"); present-but-unparseable is a reader formatting bug.
+    undated = [{"type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "hi"}}]
+    assert not readers.validate_canonical(undated), readers.validate_canonical(undated)
+    garbled = [{"type": "user", "uuid": "u1", "timestamp": "Sunday, Aug 23",
+                "message": {"role": "user", "content": "hi"}}]
+    assert any("unparseable timestamp" in p
+               for p in readers.validate_canonical(garbled))
     print("PASS test_validate_canonical_catches_breakage")
 
 

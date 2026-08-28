@@ -13,7 +13,11 @@ The Cursor analog of ``flush_turn.py``, reusing its whole downstream —
    canonical-content digest. Exact completed-turn hook usage is persisted by
    generation id before the network call and folded into the final assistant
    record, so retries retain telemetry and duplicate ``afterAgentResponse`` /
-   ``stop`` delivery never double-counts it.
+   ``stop`` delivery never double-counts it. Per-record timestamps follow the
+   same discipline: Cursor's artifacts carry real clocks for only some
+   records, so each record is dated the moment a hook FIRST OBSERVES it and
+   that pin is persisted before the network call (``_stamp_records``) — a
+   re-send ships the original dates, never the re-send's wall clock.
 
 The full canonical transcript is re-sent each flush under the constant
 ``conversation_id cursor-<uuid>``; the SERVER's watermark folds re-sends
@@ -528,6 +532,143 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
     return applied
 
 
+# Prune TRIGGER — deliberately not a hard cap — for the per-record timestamp
+# pin map persisted in session state. When the map outgrows this, entries
+# whose record is NO LONGER in the transcript are dropped (a store checkpoint
+# restore shifts the deterministic index-based uuids, stranding the old
+# ones). Pins for records still being re-sent are NEVER evicted, at ANY map
+# size: dropping one re-dates a live record at the next flush's wall clock,
+# the exact degeneracy this module exists to prevent (review finding on the
+# original FIFO cap). The map therefore scales with the live artifact, by
+# design: one ~70-byte entry per record, against a flush that already
+# re-reads, re-hashes, and re-uploads the ENTIRE transcript on every event —
+# at the session size where this map hurts (~10^5 records ≈ 7 MB state), the
+# per-event whole-transcript flush is the cliff, and it arrives first.
+_RECORD_TS_PRUNE_TRIGGER = 8192
+
+
+def _now_iso() -> str:
+    now = time.time()
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+            + f".{int(now * 1000) % 1000:03d}Z")
+
+
+def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
+                   first_observation: bool,
+                   boundary_uuids: frozenset | set = frozenset()) -> dict:
+    """Date every record with a REAL clock, pinned across re-sends.
+
+    The server persists ``timestamp`` as the row's ``event_date`` — "the
+    turn's clock at its source, NULL when unmeasured" (claude_parts,
+    ENG-675b). Cursor's artifacts only carry clocks for SOME records (user
+    turns' embedded tags, store checkpoint nodes), so this fills the gap with
+    the one other real clock available: the moment THIS hook first observed
+    the record. Once a session is under observation, any FLUSHING hook's
+    sighting qualifies — the record provably exists at that instant, so
+    first-seen bounds its production time from above by the gap since the
+    previous event. (A debounced afterFileEdit — the one event that reads
+    yet declines to send — skips minting so it never rewrites the pin map;
+    the next flushing hook dates what it saw, a deferral bounded by the
+    debounce interval. Guaranteed non-senders never read at all — see
+    ``_event_can_flush``.) Boundary hooks (afterAgentResponse / stop /
+    beforeSubmitPrompt) are the common observers, but a mid-turn edit hook
+    that flushes and sees a record first dates it TIGHTER than waiting for
+    the turn's end would — matching Claude transcripts, whose records carry
+    per-record production times, not turn-boundary times. The session's FIRST-EVER observation is the one
+    exception: its pre-existing backlog predates any hook by an unknowable
+    margin, so those records are marked unmeasured rather than dated (the
+    pinning rules below). What first-seen is never: the import/flush clock
+    of a whole-session re-send, the degeneracy this replaces (a 44-turn
+    production session dated at a single instant).
+
+    Pinning: the first stamp a record ever gets — artifact-carried or
+    first-seen — is stored in the session state and re-applied verbatim on
+    every later re-send, so a record's date never drifts with the re-flush
+    schedule. ``None`` pins mean "observed, no clock": records already present
+    at the session's FIRST observation (a mid-session install, a backfill)
+    predate any hook by an unknowable margin, so they stay unmeasured rather
+    than inheriting "now" — except a ``boundary_uuids`` record, which the
+    current hook explicitly dates (its generation just ended). A ``None`` pin
+    upgrades if the artifact later supplies a real clock for that record; a
+    MINTED pin is never displaced by one. That asymmetry is deliberate: a
+    transcript record's embedded tag lives inside its content and exists
+    from the record's birth (append-only files cannot grow one later — when
+    both exist they are the same instant), while a store clock that APPEARS
+    after a record was already observed live belongs to a NEWER checkpoint
+    that re-parented the leaf — later than production, so the first-seen
+    pin is the tighter bound. Displacement would also let one record ship
+    different dates on the live path (pin) and the backstop re-read (reader
+    clock) — exactly the flapping pinning exists to prevent.
+
+    With ``now_iso=None`` this only APPLIES existing pins (read-only replay
+    for out-of-band senders); no new stamps are minted. Mutates ``records``
+    in place; returns the updated pin map for persisting.
+
+    A pin whose record is still in ``records`` is NEVER evicted: transcripts
+    are append-only, so early records are re-sent on every flush, and losing
+    their pin would re-mint "now" for them — re-dating an early turn at a
+    much-later wall clock (review finding on the original FIFO cap). Only
+    pins ORPHANED by the artifact (a checkpoint restore shifting the
+    index-derived uuids) are pruned, and only once the map outgrows
+    ``_RECORD_TS_PRUNE_TRIGGER`` — which is a prune trigger, not a bound;
+    the map deliberately scales with the live artifact (see the constant).
+    """
+    stamps: dict = dict(prior) if isinstance(prior, dict) else {}
+    present: set = set()
+    for record in records:
+        rid = record.get("uuid")
+        if not isinstance(rid, str) or not rid:
+            continue
+        present.add(rid)
+        reader_ts = record.get("timestamp")
+        reader_ts = reader_ts if isinstance(reader_ts, str) and reader_ts else None
+        if rid in stamps:
+            pinned = stamps[rid]
+            if not isinstance(pinned, str) or not pinned:
+                pinned = None
+            if pinned is None and reader_ts:
+                stamps[rid] = pinned = reader_ts
+            elif pinned is None and now_iso and rid in boundary_uuids:
+                stamps[rid] = pinned = now_iso
+        else:
+            if reader_ts:
+                pinned = reader_ts
+            elif now_iso and (not first_observation or rid in boundary_uuids):
+                pinned = now_iso
+            else:
+                pinned = None
+            stamps[rid] = pinned
+        if pinned:
+            record["timestamp"] = pinned
+        else:
+            record.pop("timestamp", None)
+    if len(stamps) > _RECORD_TS_PRUNE_TRIGGER:
+        stamps = {rid: pin for rid, pin in stamps.items() if rid in present}
+    return stamps
+
+
+def apply_session_state(records: list[dict], uuid: str) -> None:
+    """Restore live-observed fidelity onto an out-of-band re-read.
+
+    capture.py (the manual import / sweep backstop for sessions whose
+    per-event flush went dormant) re-reads the artifact from scratch, which
+    carries neither the first-seen timestamp pins nor the exact hook usage
+    this machine observed live. Re-apply both from the session's flush state,
+    read-only — nothing here writes state, so a sweep can never perturb the
+    live capture's watermarks.
+    """
+    if not isinstance(uuid, str) or not _UUID_RE.fullmatch(uuid):
+        # Same gate main() applies before touching per-session state. The
+        # backstop's id comes from a caller-chosen path/meta, so a non-uuid
+        # must not select a state file (even a sanitized one) — skipping the
+        # restore just leaves the records with their artifact-carried clocks.
+        return
+    state = _read_state(uuid)
+    _stamp_records(records, state.get("record_ts"), None,
+                   first_observation=True)
+    _apply_usage(records, state.get("usage_events"))
+
+
 def _records_revision(records: list[dict]) -> str:
     encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":"),
                          sort_keys=True).encode("utf-8")
@@ -601,6 +742,32 @@ def should_flush(event: str, payload: dict, state: dict,
                  "sessionEnd"):
         return True
     return False
+
+
+def _event_can_flush(event: str, payload: dict) -> bool:
+    """Purely payload-decidable: can this invocation EVER become a send?
+
+    Non-milestone shell events and unrecognized events cannot — the event
+    gate in ``should_flush`` refuses them regardless of content, and pending
+    usage does not override it — so ``main`` exits before locking and
+    reading the transcript. That is an I/O saving (no parse per shell
+    command), but the load-bearing property is OBSERVATION: every event
+    that reads the transcript is a potential flusher, so a session with no
+    ``record_ts`` in state has provably never been observed with content —
+    which is what lets ``first_observation`` be derived from the pin map's
+    absence without a separate marker. A quiet READER would break that
+    (records arriving between its sighting and the first flush would be
+    mis-classed as unknowable backlog — review finding); the only reader
+    that declines to flush is a debounced ``afterFileEdit``, and a debounce
+    implies a recent flush, hence an existing pin map.
+    """
+    if event == "beforeShellExecution":
+        cmd = payload.get("command")
+        if not isinstance(cmd, str):
+            return False
+        return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
+    return event in ("afterFileEdit", "afterAgentResponse", "stop",
+                     "beforeSubmitPrompt", "sessionEnd")
 
 
 # Reading a remote URL means reading the TARGET repo's own config — that is
@@ -689,10 +856,14 @@ def _namespace_of(cwd: str | None) -> str | None:
 async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  flush_mode: str = "now", *, source_kind: str = "store",
                  source_revision: str | None = None,
-                 records: list[dict] | None = None, meta: dict | None = None,
+                 records: list[dict], meta: dict,
                  applied_usage: set[str] | None = None) -> None:
-    if records is None or meta is None:
-        records, meta = cursor_reader.to_canonical(source_path)
+    # ``records``/``meta`` are REQUIRED: reading, stamping, and persisting
+    # pins is main()'s job, in that order, under the session lock. A
+    # self-read fallback here shipped records that bypassed that flow —
+    # apply-only stamping would leave anything not yet pinned undated
+    # (review finding) — so the convenience default was removed rather than
+    # given a third stamping semantics.
     # Close the read span IMMEDIATELY — before redaction and the network call,
     # which together can run for many seconds. Blobs present at both the gate
     # and here existed for the whole span the payload was built from, so their
@@ -926,6 +1097,12 @@ def main() -> int:
         _log(f"{event}: session id {uuid!r} is not a uuid — refusing the "
              f"store lookup")
         return 0
+    if not _event_can_flush(event, payload):
+        # A guaranteed non-send (plain shell traffic, unknown event) exits
+        # before the lock and the transcript read — no I/O per `ls`, and no
+        # quiet OBSERVATION that would skew first_observation (see
+        # _event_can_flush).
+        return 0
 
     # Serialize the whole check-then-act: reading the watermark, sending, and
     # writing it back must not interleave with a concurrent flush for this
@@ -965,20 +1142,30 @@ def main() -> int:
                 records, meta = cursor_reader.to_canonical(
                     source_path, session_id=uuid,
                     cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
-                source_revision = _records_revision(records)
         except Exception as e:  # locked/partial/corrupt source — next hook retries
             _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
             return 0
 
-        # Persist source identity and exact usage BEFORE any network work.
-        # afterAgentResponse and stop duplicate the same generation; replacing
-        # that dictionary key makes delivery idempotent, while a later hook can
-        # retry an auth/server failure without needing Cursor to repeat usage.
+        # Persist source identity and exact usage BEFORE any network work —
+        # on EVERY event, flushing or not, so a dormant boundary's usage
+        # sample survives to the eventual send. afterAgentResponse and stop
+        # duplicate the same generation; replacing that dictionary key makes
+        # delivery idempotent, while a later hook can retry an auth/server
+        # failure without needing Cursor to repeat usage. Timestamp pins are
+        # different: they are minted and persisted ONLY on the flush path
+        # below (still before the network call, so a failed send retries
+        # with identical stamps) — a declined event must not rewrite a large
+        # pin map for nothing (review finding). The only event that reads
+        # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
+        # exit in main() before reading — see _event_can_flush), and a
+        # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
+        # by the next flushing hook at most that interval later.
         fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
         if source_kind == "transcript":
             fields["transcript_path"] = str(source_path)
         usage_events = state.get("usage_events")
         usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
+        boundary_uuids: set[str] = set()
         sample = _hook_usage(event, payload)
         if sample is not None:
             generation, usage = sample
@@ -991,22 +1178,46 @@ def main() -> int:
                 usage_events = _usage_events_with(
                     state, generation, target, usage)
                 fields["usage_events"] = usage_events
+                # This hook explicitly dates that record: its generation ended
+                # NOW, so it gets a real clock even in a first-observation
+                # backlog (where everything else stays unmeasured).
+                boundary_uuids = {target}
         elif (event in ("afterAgentResponse", "stop") and
               any(key in payload for key in _HOOK_USAGE_KEYS)):
             _log(f"{event}: malformed token counters or generation_id — "
                  "leaving this turn unmeasured")
 
-        _save_state(uuid, **fields)
-        state.update(fields)
+        if source_kind == "transcript":
+            # Content identity only — computed BEFORE _stamp_records and
+            # _apply_usage mutate the records. The send gate answers "is
+            # there new CONTENT?"; it must never re-fire because a timestamp
+            # pin was minted or upgraded (stamps ride along on whatever send
+            # happens, and pending usage forces its own send via
+            # usage_pending). Hashing post-stamp would couple the gate's
+            # stability to the pin map's — the fragility a review round
+            # already caught once on the pin-eviction path.
+            source_revision = _records_revision(records)
+
         applied_usage = _apply_usage(records, usage_events)
         sent_usage = set(state.get("sent_usage_generations") or [])
         usage_pending = bool(applied_usage - sent_usage)
 
+        # should_flush reads only watermark/backoff state (transcript_revision,
+        # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
+        # the decision comes FIRST and a quiet event saves only the small
+        # fields, leaving the pin map untouched on disk.
         if not should_flush(
                 event, payload, state, blob_ids, time.time(),
                 source_kind=source_kind, source_revision=source_revision,
                 usage_pending=usage_pending):
+            _save_state(uuid, **fields)
             return 0
+
+        fields["record_ts"] = _stamp_records(
+            records, state.get("record_ts"), _now_iso(),
+            first_observation="record_ts" not in state,
+            boundary_uuids=boundary_uuids)
+        _save_state(uuid, **fields)
         try:
             mode = _FLUSH_MODE.get(event, "now")
             asyncio.run(asyncio.wait_for(
