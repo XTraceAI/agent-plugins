@@ -745,7 +745,7 @@ def should_flush(event: str, payload: dict, state: dict,
     if event == "afterShellExecution":
         return (
             pr_provenance.is_pr_creation_command(payload.get("command"))
-            and bool(pr_provenance.urls_from_trusted_text(payload.get("output")))
+            and bool(pr_provenance.urls_from_output_text(payload.get("output")))
         )
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
@@ -780,7 +780,7 @@ def _event_can_flush(event: str, payload: dict) -> bool:
     if event == "afterShellExecution":
         return (
             pr_provenance.is_pr_creation_command(payload.get("command"))
-            and bool(pr_provenance.urls_from_trusted_text(payload.get("output")))
+            and bool(pr_provenance.urls_from_output_text(payload.get("output")))
         )
     return event in ("afterFileEdit", "afterAgentResponse", "stop",
                      "beforeSubmitPrompt", "sessionEnd")
@@ -1162,7 +1162,7 @@ def main() -> int:
         previous_pending = pr_provenance.merge_urls(
             state.get("pending_pr_urls") or [])
         hook_pr_urls = (
-            pr_provenance.urls_from_trusted_text(payload.get("output"))
+            pr_provenance.urls_from_output_text(payload.get("output"))
             if (event == "afterShellExecution"
                 and pr_provenance.is_pr_creation_command(
                     payload.get("command"))) else []
@@ -1176,7 +1176,7 @@ def main() -> int:
         if hook_pr_urls:
             # afterShellExecution can precede Cursor's transcript write. Save
             # the exact URL before source discovery so an unreadable/missing
-            # source cannot make the only host-owned copy disappear.
+            # source cannot make the only hook-delivered copy disappear.
             _save_state(
                 uuid, pending_pr_urls=pending_pr_urls,
                 accepted_pr_urls=accepted_pr_urls)

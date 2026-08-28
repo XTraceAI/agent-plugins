@@ -11,14 +11,14 @@ sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 import pr_provenance as p  # noqa: E402
 
 
-def test_trusted_text_canonicalizes_and_deduplicates():
+def test_output_text_canonicalizes_and_deduplicates():
     text = (
         "Created https://github.com/XTraceAI/Web/pull/42\n"
         "again https://github.com/xtraceai/web/pull/42/\n"
         "files https://github.com/xtraceai/web/pull/42/files\n"
         "other https://github.com/xtraceai/api/pull/7)."
     )
-    assert p.urls_from_trusted_text(text) == [
+    assert p.urls_from_output_text(text) == [
         "https://github.com/xtraceai/web/pull/42",
         "https://github.com/xtraceai/api/pull/7",
     ]
@@ -57,7 +57,7 @@ def test_only_direct_pr_create_results_qualify():
             {"type": "tool_use", "id": "view", "input": {
                 "command": "gh pr view 6"}},
             {"type": "tool_use", "id": "create", "input": {
-                "command": "bash -lc 'cd repo && gh pr create --fill'"}},
+                "command": "gh --repo x/r pr create --fill"}},
         ]}},
         {"message": {"content": [
             {"type": "tool_result", "tool_use_id": "cat", "content": url},
@@ -76,8 +76,17 @@ def test_lookalikes_and_non_strings_are_rejected():
         "https://github.com/x/r/pull/4abc",
         "https://github.com/x/r/pull/5/files",
     ))
-    assert p.urls_from_trusted_text(text) == []
-    assert p.urls_from_trusted_text(None) == []
+    assert p.urls_from_output_text(text) == []
+    assert p.urls_from_output_text(None) == []
+
+
+def test_shell_chains_wrappers_and_output_mentions_do_not_qualify():
+    assert p.is_pr_creation_command("gh pr create --fill") is True
+    assert p.is_pr_creation_command("gh --repo x/r pr create --fill") is True
+    assert p.is_pr_creation_command("FOO=1 gh pr create --fill") is True
+    assert p.is_pr_creation_command("echo x; gh pr create --fill") is False
+    assert p.is_pr_creation_command("bash -lc 'gh pr create --fill'") is False
+    assert p.is_pr_creation_command("printf 'gh pr create'") is False
 
 
 def test_scan_budget_is_utf8_bytes_not_characters():
@@ -86,7 +95,7 @@ def test_scan_budget_is_utf8_bytes_not_characters():
     # UTF-8 bytes before the URL. The URL must therefore be outside the cap.
     text = ("\u00e9" * (p.MAX_TEXT_BYTES // 2 + 1)) + url
     assert len(text) < p.MAX_TEXT_BYTES
-    assert p.urls_from_trusted_text(text) == []
+    assert p.urls_from_output_text(text) == []
     records = [{"message": {"content": [
         {"type": "tool_use", "id": "create", "input": {
             "command": "gh pr create --fill"}},

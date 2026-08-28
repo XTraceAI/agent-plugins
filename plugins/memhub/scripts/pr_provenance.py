@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Exact GitHub pull-request provenance from trusted host output.
+"""Bounded GitHub pull-request reference hints from coding-host output.
 
 User prompts and assistant prose are intentionally outside this module's input
-surface. Transcript extraction visits only canonical ``tool_result`` blocks;
-Cursor's shell hook uses :func:`urls_from_trusted_text` explicitly on the
-host-owned command output. The backend still authorizes every URL against the
-session repository and the org's GitHub catalog before confirming a link.
+surface. Transcript extraction visits only a result paired to a direct
+``gh pr create`` call, and Cursor's shell hook inspects that command's output.
+Neither transcript structure nor hook payload is an authentication boundary:
+the backend treats these as authenticated-client telemetry, requires the org's
+repository catalog and an independently observed PR row, and owns link policy.
 """
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Iterable
 
 MAX_URLS = 50
@@ -24,13 +26,8 @@ _PR_URL_RE = re.compile(
     r"(?![A-Za-z0-9/])",
     re.IGNORECASE,
 )
-_PR_CREATE_RE = re.compile(
-    r"(?:^|[;&|]\s*|\b(?:ba)?sh\s+-[a-z]*c\s*['\"]?)\s*"
-    r"(?:(?:sudo|env|command|time|nice)\s+"
-    r"(?:[A-Za-z_]\w*=\S*\s+)*)*"
-    r"gh(?:\s+-{1,2}[\w-]+(?:=\S+)?(?:\s+[^\s-]\S*)?)*"
-    r"\s+pr\s+create\b",
-)
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*=\S*\Z")
+_SHELL_PUNCTUATION = ";&|`()\n"
 
 
 def _bounded_utf8(value: str, limit: int) -> tuple[str, int]:
@@ -42,8 +39,8 @@ def _bounded_utf8(value: str, limit: int) -> tuple[str, int]:
     return encoded.decode("utf-8", errors="ignore"), len(encoded)
 
 
-def urls_from_trusted_text(value: object) -> list[str]:
-    """Canonical PR URLs in one host-owned output string, bounded and unique."""
+def urls_from_output_text(value: object) -> list[str]:
+    """Canonical PR URLs in one output string, bounded and unique."""
     if not isinstance(value, str) or not value:
         return []
     text, _ = _bounded_utf8(value, MAX_TEXT_BYTES)
@@ -62,8 +59,44 @@ def urls_from_trusted_text(value: object) -> list[str]:
 
 
 def is_pr_creation_command(value: object) -> bool:
-    """Whether one bounded shell command directly invokes ``gh pr create``."""
-    return isinstance(value, str) and bool(_PR_CREATE_RE.search(value[:16384]))
+    """Whether one bounded command directly invokes ``gh pr create``.
+
+    Shell chains, command substitutions, and shell wrappers are rejected. This
+    reduces accidental evidence capture; it does not make caller-supplied hook
+    or transcript data authentic.
+    """
+    if not isinstance(value, str) or not value or len(value) > 16384:
+        return False
+    try:
+        lexer = shlex.shlex(
+            value, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if not tokens or any(
+            token and all(ch in _SHELL_PUNCTUATION for ch in token)
+            for token in tokens):
+        return False
+
+    i = 0
+    if tokens[i] == "env":
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-"):
+            i += 1
+    while i < len(tokens) and _ASSIGNMENT_RE.fullmatch(tokens[i]):
+        i += 1
+    if i >= len(tokens) or tokens[i] != "gh":
+        return False
+    i += 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        option = tokens[i]
+        i += 1
+        if ("=" not in option and i < len(tokens)
+                and not tokens[i].startswith("-") and tokens[i] != "pr"):
+            i += 1
+    return i + 1 < len(tokens) and tokens[i:i + 2] == ["pr", "create"]
 
 
 def _tool_command(block: dict) -> str | None:
@@ -134,7 +167,7 @@ def urls_from_tool_results(records: Iterable[object]) -> list[str]:
                 continue
             for text in _trusted_strings(
                     block.get("content"), budget, nodes):
-                for url in urls_from_trusted_text(text):
+                for url in urls_from_output_text(text):
                     if url not in found:
                         found.append(url)
                         if len(found) >= MAX_URLS:
@@ -149,7 +182,7 @@ def merge_urls(*groups: Iterable[object]) -> list[str]:
     merged: list[str] = []
     for group in groups:
         for value in group:
-            parsed = urls_from_trusted_text(value) if isinstance(value, str) else []
+            parsed = urls_from_output_text(value) if isinstance(value, str) else []
             # Persisted state and server acknowledgements must already be the
             # minimal canonical form. A suffix from a corrupt/older state is
             # rejected fail-closed rather than silently broadened into evidence.
