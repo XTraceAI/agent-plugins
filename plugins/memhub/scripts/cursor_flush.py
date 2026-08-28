@@ -1182,7 +1182,10 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     elif not pending_pr_urls:
         pr_url_unconfirmed = 0
     else:
-        pr_url_unconfirmed = state.get("pr_url_unconfirmed", 0)
+        # Preserve the separate unchanged-content retry budget on ordinary
+        # content sends, but never copy corrupt or legacy-unbounded state back
+        # to disk without normalizing it through the shared accessor.
+        pr_url_unconfirmed = _pr_url_unconfirmed(state)
     # `shipped` was fixed at the end of the transcript read (see above), NOT
     # re-read here: a post-send read would span the whole network round trip.
     # The timestamps land either way — the debounce must still hold after a

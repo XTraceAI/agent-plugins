@@ -250,6 +250,36 @@ def test_after_shell_flushes_only_exact_host_output_pr_urls():
     print("PASS test_after_shell_flushes_only_exact_host_output_pr_urls")
 
 
+def test_duplicate_after_shell_url_does_not_bypass_recent_retry_gate():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    payload = {
+        "command": "gh pr create --fill",
+        "output": f"Created pull request {url}",
+    }
+    state = {
+        **SHIPPED,
+        "pending_pr_urls": [url],
+        "accepted_pr_urls": [],
+        "pr_url_attempt_at": NOW,
+    }
+    merged = cursor_flush.pr_provenance.merge_urls(
+        state["pending_pr_urls"],
+        cursor_flush.pr_provenance.urls_from_output_text(payload["output"]),
+    )
+    new_urls = set(merged) - set(state["pending_pr_urls"])
+    assert not new_urls
+    retry_due = _pr_url_retry_due(
+        pending=True, new_urls=False, event="afterShellExecution",
+        state=state, now=NOW,
+    )
+    assert not retry_due
+    assert not should_flush(
+        "afterShellExecution", payload, state, FRESH, NOW,
+        provenance_pending=retry_due,
+    )
+    print("PASS test_duplicate_after_shell_url_does_not_bypass_recent_retry_gate")
+
+
 def test_cursor_pr_url_ack_clears_only_server_accepted_evidence():
     url = "https://github.com/xtraceai/agent-plugins/pull/321"
     state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
@@ -367,6 +397,8 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     state = {
         "pending_pr_urls": [url],
         "accepted_pr_urls": [],
+        # Legacy/corrupt state must be normalized before being persisted again.
+        "pr_url_unconfirmed": "not-an-integer",
         # A previous empty-transcript cap must not follow this URL once genuine
         # content appears and a real server exchange becomes possible.
         "pr_url_empty_attempts": MAX_PR_URL_EMPTY_ATTEMPTS,
