@@ -588,7 +588,16 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     predate any hook by an unknowable margin, so they stay unmeasured rather
     than inheriting "now" — except a ``boundary_uuids`` record, which the
     current hook explicitly dates (its generation just ended). A ``None`` pin
-    upgrades if the artifact later supplies a real clock for that record.
+    upgrades if the artifact later supplies a real clock for that record; a
+    MINTED pin is never displaced by one. That asymmetry is deliberate: a
+    transcript record's embedded tag lives inside its content and exists
+    from the record's birth (append-only files cannot grow one later — when
+    both exist they are the same instant), while a store clock that APPEARS
+    after a record was already observed live belongs to a NEWER checkpoint
+    that re-parented the leaf — later than production, so the first-seen
+    pin is the tighter bound. Displacement would also let one record ship
+    different dates on the live path (pin) and the backstop re-read (reader
+    clock) — exactly the flapping pinning exists to prevent.
 
     With ``now_iso=None`` this only APPLIES existing pins (read-only replay
     for out-of-band senders); no new stamps are minted. Mutates ``records``
