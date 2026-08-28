@@ -26,7 +26,8 @@ sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 import cursor_flush  # noqa: E402
 import cursor_capture  # noqa: E402
 from cursor_flush import (  # noqa: E402
-    DORMANT_RETRY_S, _verdict, session_uuid, should_flush)
+    DORMANT_RETRY_S, MAX_PR_URL_UNCONFIRMED, _pr_url_retry_due, _verdict,
+    session_uuid, should_flush)
 
 NOW = 1_787_000_000.0
 FRESH = {"a", "b"}          # two blobs in the store
@@ -359,6 +360,75 @@ def test_cursor_failed_provenance_attempt_starts_retry_backoff():
     assert state["pr_url_attempt_at"] >= before
     assert time.time() - state["pr_url_attempt_at"] < DORMANT_RETRY_S
     print("PASS test_cursor_failed_provenance_attempt_starts_retry_backoff")
+
+
+def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
+    url = "https://github.com/xtraceai/agent-plugins/pull/323"
+    state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
+    originals = {
+        "current_blob_ids": cursor_flush.current_blob_ids,
+        "redact_records": cursor_flush.redact_records,
+        "resolve_bearer": cursor_flush.resolve_bearer,
+        "session": cursor_flush.mcp_http.Session,
+        "read_state": cursor_flush._read_state,
+        "save_state": cursor_flush._save_state,
+        "log": cursor_flush._log,
+    }
+
+    class OlderServer:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, _arguments=None, **_kwargs):
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": "cursor-session-1",
+                    "ack_through": "u1",
+                },
+                content=[], isError=False)
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        cursor_flush.current_blob_ids = lambda _path: {"blob-1"}
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        cursor_flush.mcp_http.Session = OlderServer
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        for _ in range(MAX_PR_URL_UNCONFIRMED):
+            asyncio.run(cursor_flush._flush(
+                "session-1", Path("/tmp/store.db"), {"blob-1"},
+                source_kind="store", records=[{
+                    "type": "user", "uuid": "u1",
+                    "message": {"role": "user", "content": "hello"},
+                }], meta={"cwd": None, "title": None},
+                pending_pr_urls=[url]))
+    finally:
+        cursor_flush.current_blob_ids = originals["current_blob_ids"]
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert state["pending_pr_urls"] == [url]
+    assert state["pr_url_unconfirmed"] == MAX_PR_URL_UNCONFIRMED
+    later = state["pr_url_attempt_at"] + DORMANT_RETRY_S + 1
+    retry_due = _pr_url_retry_due(
+        pending=True, new_urls=False, event="stop", state=state, now=later)
+    assert retry_due is False
+    assert not should_flush(
+        "stop", {}, state, {"blob-1"}, later,
+        provenance_pending=retry_due)
+    assert _pr_url_retry_due(
+        pending=True, new_urls=True, event="afterShellExecution",
+        state=state, now=later)
+    print("PASS test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks")
 
 
 def test_milestone_gates_shell_events():

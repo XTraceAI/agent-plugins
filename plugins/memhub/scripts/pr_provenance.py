@@ -18,8 +18,13 @@ import git_provenance
 
 MAX_URLS = 50
 MAX_TEXT_BYTES = 1024 * 1024
-MAX_NODES = 10_000
 MAX_DEPTH = 64
+# A real ``gh pr create`` result is tiny. Give every qualifying result its own
+# bounded scan so a large earlier result cannot consume the whole session's
+# allowance and hide a later PR, while bounding aggregate work across a session.
+MAX_MATCHED_RESULTS = MAX_URLS
+MAX_RESULT_TEXT_BYTES = 64 * 1024
+MAX_RESULT_NODES = 512
 
 _PR_URL_RE = re.compile(
     r"https://github\.com/"
@@ -145,9 +150,8 @@ def _trusted_strings(
 def urls_from_tool_results(records: Iterable[object]) -> list[str]:
     """Exact PR URLs returned by paired ``gh pr create`` tool calls only."""
     found: list[str] = []
-    budget = [MAX_TEXT_BYTES]
-    nodes = [MAX_NODES]
     pr_create_calls: set[str] = set()
+    matched_results = 0
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -167,6 +171,11 @@ def urls_from_tool_results(records: Iterable[object]) -> list[str]:
             if (block.get("type") != "tool_result"
                     or block.get("tool_use_id") not in pr_create_calls):
                 continue
+            matched_results += 1
+            if matched_results > MAX_MATCHED_RESULTS:
+                return found
+            budget = [MAX_RESULT_TEXT_BYTES]
+            nodes = [MAX_RESULT_NODES]
             for text in _trusted_strings(
                     block.get("content"), budget, nodes):
                 for url in urls_from_output_text(text):
@@ -174,8 +183,6 @@ def urls_from_tool_results(records: Iterable[object]) -> list[str]:
                         found.append(url)
                         if len(found) >= MAX_URLS:
                             return found
-            if budget[0] <= 0 or nodes[0] <= 0:
-                return found
     return found
 
 

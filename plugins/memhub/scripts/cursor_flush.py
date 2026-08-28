@@ -89,6 +89,10 @@ LOCK_WAIT_S = 60.0
 # unconfirmed replies the session goes dormant like an unsupported one — and
 # re-probes on the same timer, so a fixed server still heals.
 MAX_UNCONFIRMED = 5
+# A server can confirm transcript persistence while ignoring the newer
+# provenance acknowledgement field. Bound unchanged-content retries separately
+# so that compatibility case cannot upload a whole store forever.
+MAX_PR_URL_UNCONFIRMED = 5
 
 
 def _note_failure(uuid: str, reason: str) -> None:
@@ -756,6 +760,27 @@ def should_flush(event: str, payload: dict, state: dict,
     return False
 
 
+def _pr_url_retry_due(
+    *, pending: bool, new_urls: bool, event: str, state: dict, now: float,
+) -> bool:
+    """Whether pending URL evidence may bypass an unchanged-content gate."""
+    if not pending:
+        return False
+    try:
+        unconfirmed = max(0, int(state.get("pr_url_unconfirmed") or 0))
+    except (TypeError, ValueError):
+        unconfirmed = 0
+    if new_urls:
+        unconfirmed = 0
+    if unconfirmed >= MAX_PR_URL_UNCONFIRMED:
+        return False
+    return (
+        event == "sessionEnd"
+        or new_urls
+        or now - (state.get("pr_url_attempt_at") or 0) >= DORMANT_RETRY_S
+    )
+
+
 def _event_can_flush(event: str, payload: dict) -> bool:
     """Purely payload-decidable: can this invocation EVER become a send?
 
@@ -1092,6 +1117,23 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         url for url in pr_provenance.merge_urls(pending_pr_urls or [])
         if url not in accepted_set
     ]
+    attempted_pr_urls = set(
+        provenance.get("github_pr_urls", []) if provenance else [])
+    pending_set = set(pending_pr_urls)
+    if attempted_pr_urls & pending_set:
+        try:
+            pr_url_unconfirmed = max(
+                0, int(state.get("pr_url_unconfirmed") or 0),
+            )
+        except (TypeError, ValueError):
+            pr_url_unconfirmed = 0
+        pr_url_unconfirmed = min(
+            MAX_PR_URL_UNCONFIRMED, pr_url_unconfirmed + 1,
+        )
+    elif not pending_pr_urls:
+        pr_url_unconfirmed = 0
+    else:
+        pr_url_unconfirmed = state.get("pr_url_unconfirmed", 0)
     # `shipped` was fixed at the end of the transcript read (see above), NOT
     # re-read here: a post-send read would span the whole network round trip.
     # The timestamps land either way — the debounce must still hold after a
@@ -1104,6 +1146,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
               "fail_streak": 0,
               "pending_pr_urls": pending_pr_urls,
               "accepted_pr_urls": accepted_pr_urls,
+              "pr_url_unconfirmed": pr_url_unconfirmed,
               "pr_url_attempt_at": state.get("pr_url_attempt_at", 0)}
     if source_kind == "store":
         # On a CONFIRMED import, advance the watermark even when the post-read
@@ -1282,17 +1325,19 @@ def main() -> int:
         ]
         new_pr_urls = new_hook_urls | (
             set(pending_pr_urls) - before_transcript)
+        if new_pr_urls:
+            # A newly discovered URL gets its own bounded confirmation budget;
+            # an older permanently-unacknowledged URL must not starve it.
+            fields["pr_url_unconfirmed"] = 0
         fields["pending_pr_urls"] = pending_pr_urls
         fields["accepted_pr_urls"] = accepted_pr_urls
 
         applied_usage = _apply_usage(records, usage_events)
         sent_usage = set(state.get("sent_usage_generations") or [])
         usage_pending = bool(applied_usage - sent_usage)
-        provenance_pending = bool(pending_pr_urls) and (
-            event == "sessionEnd"
-            or bool(new_pr_urls)
-            or time.time() - (state.get("pr_url_attempt_at") or 0)
-            >= DORMANT_RETRY_S
+        provenance_pending = _pr_url_retry_due(
+            pending=bool(pending_pr_urls), new_urls=bool(new_pr_urls),
+            event=event, state=state, now=time.time(),
         )
 
         # should_flush reads only watermark/backoff state (transcript_revision,

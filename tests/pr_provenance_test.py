@@ -105,6 +105,20 @@ def test_scan_budget_is_utf8_bytes_not_characters():
     assert p.urls_from_tool_results(records) == []
 
 
+def test_large_earlier_result_cannot_starve_a_later_pr_result():
+    url = "https://github.com/x/r/pull/18"
+    records = [{"message": {"content": [
+        {"type": "tool_use", "id": "first", "input": {
+            "command": "gh pr create --fill"}},
+        {"type": "tool_result", "tool_use_id": "first",
+         "content": "x" * (p.MAX_RESULT_TEXT_BYTES + 1)},
+        {"type": "tool_use", "id": "second", "input": {
+            "command": "gh pr create --fill"}},
+        {"type": "tool_result", "tool_use_id": "second", "content": url},
+    ]}}]
+    assert p.urls_from_tool_results(records) == [url]
+
+
 def test_import_payload_and_ack_are_explicit():
     url = "https://github.com/x/r/pull/9"
     assert p.import_provenance(
