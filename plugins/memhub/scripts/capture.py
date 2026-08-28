@@ -113,6 +113,26 @@ def _resolve(args) -> tuple[object | None, Path | None, str]:
     return r, path, ""
 
 
+def _restore_cursor_state(records: list, sid: str) -> None:
+    """Best-effort fidelity restore for a Cursor import — never fatal.
+
+    Cursor artifacts carry clocks/usage for only some records; the live
+    flush observed the rest and pinned them in its session state. This
+    import is the documented backstop for sessions whose per-event flush
+    went dormant — re-apply those pins (read-only) so the backstop
+    preserves the same per-turn fidelity the live path ships. It is an
+    ENHANCEMENT of the import, not a precondition: if cursor_flush or one
+    of its sibling modules cannot even import in this environment, the
+    import proceeds with artifact-carried clocks rather than aborting.
+    """
+    try:
+        import cursor_flush
+        cursor_flush.apply_session_state(records, sid)
+    except Exception as e:  # noqa: BLE001 — degrade, never kill the import
+        print(f"warning: live-capture state restore failed ({e!r}); "
+              "importing with artifact-carried clocks only", file=sys.stderr)
+
+
 def _session_sid(meta: dict, path: Path) -> str:
     """The session uuid for state lookups and the conv-id suffix.
 
@@ -184,13 +204,7 @@ def cmd_import(args) -> int:
     # no-op the state restore and mis-scope conv_id to "cursor-store".
     sid = _session_sid(meta, path)
     if r.HOST == "cursor":
-        # Cursor artifacts carry clocks/usage for only some records; the live
-        # flush observed the rest and pinned them in its session state. This
-        # import is the documented backstop for sessions whose per-event flush
-        # went dormant — re-apply those pins (read-only) so the backstop
-        # preserves the same per-turn fidelity the live path ships.
-        import cursor_flush
-        cursor_flush.apply_session_state(records, sid)
+        _restore_cursor_state(records, sid)
     problems = readers.validate_canonical(records)
     if problems:
         print(f"ERROR: transform produced non-canonical records: {problems[:3]}",

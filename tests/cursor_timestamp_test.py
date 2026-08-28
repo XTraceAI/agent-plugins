@@ -33,6 +33,7 @@ SESSION = "8af6c93d-7e11-4a47-a6a4-2084d62ed1c9"
 GEN_1 = "324ce2e2-d685-4fec-9978-c05b9fb907b3"
 GEN_2 = "ca6fc036-69a7-4e46-bef4-8e773133cabb"
 GEN_3 = "2fea5ff0-44df-4223-b409-0c92ef551c42"
+GEN_4 = "109a78fc-9b1f-41bc-95ac-5e0628efb894"
 
 TAG_1 = ("<timestamp>Sunday, Aug 23, 2026, 11:16 AM (UTC-7)</timestamp>\n"
          "<user_query>\nReply once\n</user_query>")
@@ -285,16 +286,47 @@ def test_main_flow_pins_persist_and_ship():
             assert revisions[2] == revisions[1]
             assert _stamps_of(calls[2]) == _stamps_of(calls[1])
 
+            # A QUIET event (non-milestone shell) sees new content but must
+            # not mint or persist pins — the map is rewritten only on the
+            # flush path (review finding). The next flushing hook dates the
+            # new record at ITS clock, so the quiet event's clock appears in
+            # no pin.
+            _write_rows(path, TURN_1 + TURN_2 + [
+                {"role": "assistant", "message": {"content": [
+                    {"type": "text", "text": "THIRD"}]}},
+                {"type": "turn_ended", "status": "success"},
+            ])
+            quiet_clock = "2026-08-23T18:20:30.000Z"
+            clock["now"] = quiet_clock
+            assert _run_main("beforeShellExecution", {
+                "hook_event_name": "beforeShellExecution",
+                "session_id": SESSION, "conversation_id": SESSION,
+                "transcript_path": str(path),
+                "workspace_roots": [str(path.parent)],
+                "command": "ls",
+            }) == 0
+            assert len(calls) == 3                      # no flush happened
+            state = cursor_flush._read_state(SESSION)
+            assert len(state["record_ts"]) == 7         # THIRD not pinned
+            clock["now"] = "2026-08-23T18:21:00.000Z"
+            assert _run_main("stop", _payload(
+                path, "stop", GEN_4, "THIRD")) == 0
+            assert len(calls) == 4
+            assert _stamps_of(calls[3]) == _stamps_of(calls[1]) + [
+                "2026-08-23T18:21:00.000Z"]
+            state = cursor_flush._read_state(SESSION)
+            assert quiet_clock not in state["record_ts"].values()
+
             # apply_session_state restores the same fidelity onto a fresh
             # out-of-band re-read (the capture.py / sweep backstop).
             records, _meta = cursor_reader.to_canonical(
                 path, session_id=SESSION)
             assert _stamps_of(records) == [
-                ISO_1, ISO_1, None, None, ISO_2, None, None]
+                ISO_1, ISO_1, None, None, ISO_2, None, None, None]
             cursor_flush.apply_session_state(records, SESSION)
-            assert _stamps_of(records) == _stamps_of(calls[1])
+            assert _stamps_of(records) == _stamps_of(calls[3])
             assert records[3]["message"]["usage"]["input_tokens"] == 100
-            assert records[6]["message"]["usage"]["input_tokens"] == 100
+            assert records[7]["message"]["usage"]["input_tokens"] == 100
         finally:
             cursor_flush.STATE_DIR = originals["state_dir"]
             cursor_flush._CURSOR_PROJECTS = originals["projects"]
@@ -333,6 +365,35 @@ def test_apply_session_state_without_state_is_inert():
         finally:
             cursor_flush.STATE_DIR = old_state
     print("PASS test_apply_session_state_without_state_is_inert")
+
+
+def test_capture_restore_is_best_effort_never_fatal():
+    """A broken cursor_flush (or a failing state read) must degrade the
+    import to artifact-carried clocks, not abort it (review finding)."""
+    import types as _types
+    import capture
+    poisoned = _types.ModuleType("cursor_flush")
+
+    def _boom(*_args):
+        raise RuntimeError("boom")
+
+    poisoned.apply_session_state = _boom
+    real = sys.modules.get("cursor_flush")
+    old_stderr = sys.stderr
+    try:
+        sys.modules["cursor_flush"] = poisoned
+        sys.stderr = io.StringIO()
+        records = [_rec("tagged", ts=ISO_1)]
+        capture._restore_cursor_state(records, SESSION)   # must not raise
+        assert records[0]["timestamp"] == ISO_1
+        assert "artifact-carried clocks" in sys.stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
+        if real is not None:
+            sys.modules["cursor_flush"] = real
+        else:
+            sys.modules.pop("cursor_flush", None)
+    print("PASS test_capture_restore_is_best_effort_never_fatal")
 
 
 def test_apply_session_state_refuses_non_uuid_ids():
