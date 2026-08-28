@@ -376,12 +376,18 @@ def test_codex_pr_url_ack_clears_only_server_accepted_evidence():
         state.update(fields)
 
     try:
-        codex_flush.codex_reader.to_canonical = lambda _path: ([{
-            "type": "user", "uuid": "u1",
-            "message": {"role": "user", "content": [{
-                "type": "tool_result", "content": f"Created {url}",
-            }]},
-        }], {
+        codex_flush.codex_reader.to_canonical = lambda _path: ([
+            {"type": "assistant", "uuid": "u0", "message": {
+                "role": "assistant", "content": [{
+                    "type": "tool_use", "id": "create", "name": "exec",
+                    "input": {"cmd": "gh pr create --fill"},
+                }]}},
+            {"type": "user", "uuid": "u1",
+             "message": {"role": "user", "content": [{
+                 "type": "tool_result", "tool_use_id": "create",
+                 "content": f"Created {url}",
+             }]}},
+        ], {
             "cwd": None, "title": None,
             "git": {"repository_url":
                     "https://github.com/XTraceAI/agent-plugins.git"},

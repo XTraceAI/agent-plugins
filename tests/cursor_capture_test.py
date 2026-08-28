@@ -226,7 +226,10 @@ def test_no_new_blobs_never_flushes():
 
 def test_after_shell_flushes_only_exact_host_output_pr_urls():
     url = "https://github.com/xtraceai/agent-plugins/pull/321"
-    payload = {"output": f"Created pull request {url}"}
+    payload = {
+        "command": "gh pr create --fill",
+        "output": f"Created pull request {url}",
+    }
     assert cursor_flush._event_can_flush("afterShellExecution", payload)
     assert should_flush(
         "afterShellExecution", payload, SHIPPED, FRESH, NOW,
@@ -235,6 +238,12 @@ def test_after_shell_flushes_only_exact_host_output_pr_urls():
     # too chatty to justify reading and uploading the transcript.
     assert not cursor_flush._event_can_flush(
         "afterShellExecution", {"command": f"echo {url}"})
+    assert not cursor_flush._event_can_flush(
+        "afterShellExecution", {
+            "command": "cat README.md", "output": url})
+    assert not cursor_flush._event_can_flush(
+        "afterShellExecution", {
+            "command": "gh pr view 321", "output": url})
     assert not cursor_flush._event_can_flush(
         "afterShellExecution", {"output": "git status is clean"})
     print("PASS test_after_shell_flushes_only_exact_host_output_pr_urls")

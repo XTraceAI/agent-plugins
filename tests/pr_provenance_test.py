@@ -33,6 +33,8 @@ def test_only_tool_results_are_scanned():
              "https://github.com/x/assistant-prose/pull/2"},
             {"type": "tool_use", "input": {"url":
              "https://github.com/x/tool-input/pull/3"}},
+            {"type": "tool_use", "id": "call-1", "name": "exec_command",
+             "input": {"cmd": "gh pr create --fill"}},
         ]}},
         {"message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call-1", "content": [
@@ -44,6 +46,26 @@ def test_only_tool_results_are_scanned():
     assert p.urls_from_tool_results(records) == [
         "https://github.com/x/trusted/pull/4",
     ]
+
+
+def test_only_direct_pr_create_results_qualify():
+    url = "https://github.com/x/r/pull/6"
+    records = [
+        {"message": {"content": [
+            {"type": "tool_use", "id": "cat", "input": {
+                "command": "cat README.md"}},
+            {"type": "tool_use", "id": "view", "input": {
+                "command": "gh pr view 6"}},
+            {"type": "tool_use", "id": "create", "input": {
+                "command": "bash -lc 'cd repo && gh pr create --fill'"}},
+        ]}},
+        {"message": {"content": [
+            {"type": "tool_result", "tool_use_id": "cat", "content": url},
+            {"type": "tool_result", "tool_use_id": "view", "content": url},
+            {"type": "tool_result", "tool_use_id": "create", "content": url},
+        ]}},
+    ]
+    assert p.urls_from_tool_results(records) == [url]
 
 
 def test_lookalikes_and_non_strings_are_rejected():
@@ -66,7 +88,9 @@ def test_scan_budget_is_utf8_bytes_not_characters():
     assert len(text) < p.MAX_TEXT_BYTES
     assert p.urls_from_trusted_text(text) == []
     records = [{"message": {"content": [
-        {"type": "tool_result", "content": text},
+        {"type": "tool_use", "id": "create", "input": {
+            "command": "gh pr create --fill"}},
+        {"type": "tool_result", "tool_use_id": "create", "content": text},
     ]}}]
     assert p.urls_from_tool_results(records) == []
 
@@ -83,6 +107,12 @@ def test_import_payload_and_ack_are_explicit():
         "provenance_received": {"github_pr_urls": [url]},
     }) == [url]
     assert p.accepted_urls({"conversation_id": "c"}) == []
+
+
+def test_merge_state_rejects_noncanonical_suffixes_fail_closed():
+    canonical = "https://github.com/x/r/pull/9"
+    assert p.merge_urls([canonical.upper()]) == [canonical]
+    assert p.merge_urls([canonical + "/files", canonical + ")"]) == []
 
 
 if __name__ == "__main__":

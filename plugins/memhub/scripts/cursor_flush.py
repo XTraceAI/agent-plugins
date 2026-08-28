@@ -743,7 +743,10 @@ def should_flush(event: str, payload: dict, state: dict,
         # even behind a long wrapper prefix, is never truncated away.
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
     if event == "afterShellExecution":
-        return bool(pr_provenance.urls_from_trusted_text(payload.get("output")))
+        return (
+            pr_provenance.is_pr_creation_command(payload.get("command"))
+            and bool(pr_provenance.urls_from_trusted_text(payload.get("output")))
+        )
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
     if event in ("afterAgentResponse", "stop", "beforeSubmitPrompt",
@@ -775,7 +778,10 @@ def _event_can_flush(event: str, payload: dict) -> bool:
             return False
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
     if event == "afterShellExecution":
-        return bool(pr_provenance.urls_from_trusted_text(payload.get("output")))
+        return (
+            pr_provenance.is_pr_creation_command(payload.get("command"))
+            and bool(pr_provenance.urls_from_trusted_text(payload.get("output")))
+        )
     return event in ("afterFileEdit", "afterAgentResponse", "stop",
                      "beforeSubmitPrompt", "sessionEnd")
 
@@ -1157,7 +1163,9 @@ def main() -> int:
             state.get("pending_pr_urls") or [])
         hook_pr_urls = (
             pr_provenance.urls_from_trusted_text(payload.get("output"))
-            if event == "afterShellExecution" else []
+            if (event == "afterShellExecution"
+                and pr_provenance.is_pr_creation_command(
+                    payload.get("command"))) else []
         )
         pending_pr_urls = [
             url for url in pr_provenance.merge_urls(

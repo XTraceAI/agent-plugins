@@ -375,12 +375,18 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
 
     with tempfile.TemporaryDirectory() as tmp:
         transcript = Path(tmp) / "session.jsonl"
-        _write(transcript, [{
-            "type": "user", "uuid": "u1", "cwd": "/repo",
-            "message": {"role": "user", "content": [{
-                "type": "tool_result", "content": f"Created {url}",
-            }]},
-        }])
+        _write(transcript, [
+            {"type": "assistant", "uuid": "u0", "cwd": "/repo",
+             "message": {"role": "assistant", "content": [{
+                 "type": "tool_use", "id": "create", "name": "Bash",
+                 "input": {"command": "gh pr create --fill"},
+             }]}},
+            {"type": "user", "uuid": "u1", "cwd": "/repo",
+             "message": {"role": "user", "content": [{
+                 "type": "tool_result", "tool_use_id": "create",
+                 "content": f"Created {url}",
+             }]}},
+        ])
         ft.STATE_DIR = Path(tmp) / "state"
         ft._namespace = lambda _records: ("/repo", "agent-plugins")
         ft.resolve_repo_brain = no_room

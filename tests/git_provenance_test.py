@@ -96,6 +96,15 @@ def test_probe_failure_is_unavailable_not_detached():
     print("PASS test_probe_failure_is_unavailable_not_detached")
 
 
+def test_unavailable_probe_preserves_reader_native_branch():
+    records = [{"uuid": "u1", "gitBranch": "native/topic"}]
+    pins = git_provenance.pin_record_branches(
+        records, None, observed=False, branch=None)
+    assert pins == {"u1": "native/topic"}
+    assert records[0]["gitBranch"] == "native/topic"
+    print("PASS test_unavailable_probe_preserves_reader_native_branch")
+
+
 def test_record_pins_survive_retry_and_branch_switch():
     first = [{"uuid": "u1"}, {"uuid": "u2"}]
     pins = git_provenance.pin_record_branches(
