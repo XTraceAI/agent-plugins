@@ -151,8 +151,18 @@ async def main() -> int:
     async with streamablehttp_client(url, headers=headers, auth=auth) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            if want_room and room is None:
-                room = await resolve_repo_brain(session, room_cwd, env)
+            if want_room and room is None and room_cwd is not None:
+                # Cache miss inside a repo: ask the server, the same exact-name
+                # lookup the capture hooks do. room_cwd is None only when the
+                # file is outside any repo — never resolve from the process
+                # cwd, that would file it into an unrelated repo's room. A
+                # lookup failure is not a reason to lose the save: fall back
+                # to personal memory and say so.
+                try:
+                    room = await resolve_repo_brain(session, room_cwd, env)
+                except Exception as exc:  # noqa: BLE001 — degrade, never abort the save
+                    print(f"room     : lookup failed ({exc.__class__.__name__}); saving to personal memory")
+                    room = None
             if room:
                 call_args["agent_brain_id"] = room["brain_id"]
             if call_args.get("agent_brain_id"):
