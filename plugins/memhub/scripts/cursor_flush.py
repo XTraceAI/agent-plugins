@@ -766,10 +766,7 @@ def _pr_url_retry_due(
     """Whether pending URL evidence may bypass an unchanged-content gate."""
     if not pending:
         return False
-    try:
-        unconfirmed = max(0, int(state.get("pr_url_unconfirmed") or 0))
-    except (TypeError, ValueError):
-        unconfirmed = 0
+    unconfirmed = _pr_url_unconfirmed(state)
     if new_urls:
         unconfirmed = 0
     # Preserve one terminal backstop even after ordinary provenance-only
@@ -788,6 +785,15 @@ def _pr_url_retry_due(
         or new_urls
         or now - (state.get("pr_url_attempt_at") or 0) >= DORMANT_RETRY_S
     )
+
+
+def _pr_url_unconfirmed(state: dict) -> int:
+    """Return the bounded count of spent provenance-only attempts."""
+    try:
+        value = max(0, int(state.get("pr_url_unconfirmed") or 0))
+    except (TypeError, ValueError):
+        value = 0
+    return min(MAX_PR_URL_UNCONFIRMED, value)
 
 
 def _event_can_flush(event: str, payload: dict) -> bool:
@@ -910,7 +916,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  records: list[dict], meta: dict,
                  applied_usage: set[str] | None = None,
                  pending_pr_urls: list[str] | None = None,
-                 final_provenance_attempt: bool = False) -> None:
+                 final_provenance_attempt: bool = False,
+                 provenance_only_attempt: bool = False) -> None:
     # ``records``/``meta`` are REQUIRED: reading, stamping, and persisting
     # pins is main()'s job, in that order, under the session lock. A
     # self-read fallback here shipped records that bypassed that flow —
@@ -975,6 +982,12 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
             fields["pr_url_attempt_at"] = time.time()
             if final_provenance_attempt:
                 fields["pr_url_session_end_attempted"] = True
+            if provenance_only_attempt:
+                state = _read_state(uuid)
+                fields["pr_url_unconfirmed"] = min(
+                    MAX_PR_URL_UNCONFIRMED,
+                    _pr_url_unconfirmed(state) + 1,
+                )
         if (source_kind == "transcript" and source_revision and not records):
             fields["transcript_revision"] = source_revision
         _save_state(uuid, **fields)
@@ -1135,15 +1148,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     attempted_pr_urls = set(
         provenance.get("github_pr_urls", []) if provenance else [])
     pending_set = set(pending_pr_urls)
-    if attempted_pr_urls & pending_set:
-        try:
-            pr_url_unconfirmed = max(
-                0, int(state.get("pr_url_unconfirmed") or 0),
-            )
-        except (TypeError, ValueError):
-            pr_url_unconfirmed = 0
+    if provenance_only_attempt and attempted_pr_urls & pending_set:
         pr_url_unconfirmed = min(
-            MAX_PR_URL_UNCONFIRMED, pr_url_unconfirmed + 1,
+            MAX_PR_URL_UNCONFIRMED, _pr_url_unconfirmed(state) + 1,
         )
     elif not pending_pr_urls:
         pr_url_unconfirmed = 0
@@ -1359,6 +1366,16 @@ def main() -> int:
             pending=bool(pending_pr_urls), new_urls=bool(new_pr_urls),
             event=event, state=state, now=time.time(),
         )
+        if source_kind == "transcript":
+            content_pending = bool(
+                source_revision
+                and source_revision != state.get("transcript_revision")
+            )
+        else:
+            content_pending = not blob_ids <= set(state.get("blob_ids") or [])
+        provenance_only_attempt = (
+            provenance_pending and not content_pending and not usage_pending
+        )
 
         # should_flush reads only watermark/backoff state (transcript_revision,
         # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
@@ -1391,8 +1408,9 @@ def main() -> int:
                     records=records, meta=meta, applied_usage=applied_usage,
                     pending_pr_urls=pending_pr_urls,
                     final_provenance_attempt=(
-                        event == "sessionEnd" and provenance_pending
-                    )),
+                        event == "sessionEnd" and provenance_only_attempt
+                    ),
+                    provenance_only_attempt=provenance_only_attempt),
                 timeout=FLUSH_TIMEOUT_S))
         except Exception as e:
             # A timeout or any raise past _flush's own handlers (the broad

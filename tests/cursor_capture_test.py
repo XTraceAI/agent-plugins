@@ -407,6 +407,16 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
         cursor_flush._read_state = lambda _sid: dict(state)
         cursor_flush._save_state = save_state
         cursor_flush._log = lambda _message: None
+        # A normal content-driven send may carry the URL, but it does not spend
+        # the separate budget reserved for unchanged-content recovery.
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/store.db"), {"blob-1"},
+            source_kind="store", records=[{
+                "type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "hello"},
+            }], meta={"cwd": None, "title": None},
+            pending_pr_urls=[url]))
+        assert state.get("pr_url_unconfirmed", 0) == 0
         for _ in range(MAX_PR_URL_UNCONFIRMED):
             asyncio.run(cursor_flush._flush(
                 "session-1", Path("/tmp/store.db"), {"blob-1"},
@@ -414,7 +424,7 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
                     "type": "user", "uuid": "u1",
                     "message": {"role": "user", "content": "hello"},
                 }], meta={"cwd": None, "title": None},
-                pending_pr_urls=[url]))
+                pending_pr_urls=[url], provenance_only_attempt=True))
     finally:
         cursor_flush.current_blob_ids = originals["current_blob_ids"]
         cursor_flush.redact_records = originals["redact_records"]
@@ -454,7 +464,8 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
                 "type": "user", "uuid": "u1",
                 "message": {"role": "user", "content": "hello"},
             }], meta={"cwd": None, "title": None},
-            pending_pr_urls=[url], final_provenance_attempt=True))
+            pending_pr_urls=[url], final_provenance_attempt=True,
+            provenance_only_attempt=True))
     finally:
         cursor_flush.current_blob_ids = originals["current_blob_ids"]
         cursor_flush.redact_records = originals["redact_records"]
@@ -511,6 +522,45 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     assert state["pr_url_unconfirmed"] == 0
     assert state["pr_url_session_end_attempted"] is False
     print("PASS test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks")
+
+
+def test_empty_provenance_only_retries_consume_the_same_bounded_budget():
+    url = "https://github.com/xtraceai/agent-plugins/pull/324"
+    state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
+    originals = {
+        "redact_records": cursor_flush.redact_records,
+        "read_state": cursor_flush._read_state,
+        "save_state": cursor_flush._save_state,
+        "log": cursor_flush._log,
+    }
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        cursor_flush.redact_records = lambda _records: []
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        for _ in range(MAX_PR_URL_UNCONFIRMED):
+            asyncio.run(cursor_flush._flush(
+                "session-empty", Path("/tmp/transcript.jsonl"), set(),
+                source_kind="transcript", source_revision="empty-revision",
+                records=[], meta={"cwd": None, "title": None},
+                pending_pr_urls=[url], provenance_only_attempt=True))
+    finally:
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert state["pr_url_unconfirmed"] == MAX_PR_URL_UNCONFIRMED
+    assert state["pr_url_attempt_at"] > 0
+    assert not _pr_url_retry_due(
+        pending=True, new_urls=False, event="stop", state=state,
+        now=state["pr_url_attempt_at"] + DORMANT_RETRY_S + 1,
+    )
+    print("PASS test_empty_provenance_only_retries_consume_the_same_bounded_budget")
 
 
 def test_milestone_gates_shell_events():
