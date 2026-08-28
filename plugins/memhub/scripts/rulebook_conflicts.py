@@ -165,6 +165,8 @@ def _summary(report: dict) -> str:
         for h in c["hits"]:
             extra = f" shared={','.join(h['anchors_shared'])}" if h.get("anchors_shared") else ""
             lines.append(f"  {c['title']}: {'+'.join(h['reasons'])} -> {h['title']} [{h['status']}]{extra}")
+            if h["rule_id"]:
+                lines.append(f"    if this is the same rule: create_rule supersedes_rule_id=\"{h['rule_id']}\"")
     lines.append(f"  active book: {report['active_book']}; "
                  f"{len(report['judge_by_statement'])} existing rules left to judge by statement")
     return "\n".join(lines)

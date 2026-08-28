@@ -31,12 +31,10 @@ war story, extract the conditional from it and confirm your reading.
 
 Call the memhub `list_rules` tool for the target rulebook (every status) and
 read the new rule against every title and statement. Same subject → plan to
-tighten the existing rule instead of adding a twin: re-file under its **exact
-title**. The server's identity key is (rulebook, `source_ref` path before `@`,
-title); it adopts a same-title rule that has **no** `source_ref` (returns
-`unchanged` or a `proposed` update), but a same-title rule already owned by a
-document is never adopted — adding a `source_ref` to it files a twin. Keep the
-`list_rules` reply: step 4 runs the deterministic check over it.
+replace the existing rule instead of adding a twin: note its `rule_id` for
+`supersedes_rule_id` in step 4. The server does no title matching — you
+decide what a rule replaces. Keep the `list_rules` reply: step 4 runs the
+deterministic check over it.
 
 ### 3. Draft the rule — one delivery, one engine block
 
@@ -74,8 +72,8 @@ that should not — before filing.
 ### 4. Conflict check, confirm, then file
 
 Before showing the rule, check it against the book — the server files a
-colliding title or matcher from a different source as a silent second draft,
-so this is the only place it gets caught. Call `list_rules` (every status),
+colliding title or matcher as a silent second draft unless you name what it
+replaces, so this is the only place it gets caught. Call `list_rules` (every status),
 save the reply, write the candidate `create_rule` body to a file, and run:
 
 ```bash
@@ -86,19 +84,27 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
 `same_title` / `same_matcher` (an **active** rule fires on the same call) /
 `anchors_overlap` are deterministic; then read the `judge_by_statement` list
 it prints and mark the candidate `duplicate`, `contradicts` or `distinct`
-against each. A `duplicate` of a rule with no `source_ref` → re-file under
-that exact title (the server updates it). A `duplicate` of a rule owned by
-another document, or any `same_matcher` → say so and let the user decide
-instead of filing a twin. `contradicts` → file, but name the rule it fights
-in the report; a reviewer retires one side before activating the other.
+against each (the script prints the exact `supersedes_rule_id` value under
+each hit). `duplicate` (or a `same_title` / `same_matcher` hit you judge to
+be the same rule) → file with `supersedes_rule_id: <that rule's rule_id>`;
+the server files it as `proposed` and activation replaces exactly that rule.
+`same_matcher` against an **active** rule that is NOT the same rule → do not
+file; tell the user. `contradicts` → file as a draft WITHOUT
+`supersedes_rule_id`, but name the rule it fights in the report; a reviewer
+retires one side before activating the other.
 
 Show the user: the rule sentence, the delivery + engine block, the sample
 commands it does and doesn't match, and the conflict verdict. On approval call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `xmem/CLAUDE.md@<sha>#<heading>` or
-`user correction, session <id>`), and `agent_brain_id` when `--brain` was
-given. The reply is `status: "draft"` (or `proposed` with `supersedes_rule_id`
-when a `source_ref` matched an existing rule; `unchanged` when it is identical).
+`user correction, session <id>`), `supersedes_rule_id` when it replaces a
+rule, and `agent_brain_id` when `--brain` was given. Read the reply:
+
+- `unchanged: true` → identical content is already in the book (a retried
+  call with the same `source_ref` path and title); nothing written.
+- `status: "proposed"` + `supersedes_rule_id` → filed as a replacement for
+  the rule you named; it retires that rule when a reviewer activates it.
+- `status: "draft"` → new.
 
 **New rules always land draft / advise.** Activation and any blocking tier are
 reviewer decisions this skill never makes. Never call an activation path.
@@ -109,7 +115,8 @@ it lands as `proposed` for a reviewer.
 
 ### 5. Report
 
-Tell the user: the rule is filed as a draft and what happens next — the rule's
-owner or an admin activates it in MemHub, every teammate's coding agent picks
+Tell the user: the rule is filed as a draft — or as `proposed`, naming the
+rule it replaces by title — and what happens next: the rule's owner or an
+admin activates it in MemHub (a `proposed` rule retires the one it replaces), every teammate's coding agent picks
 it up on their next session, and its firing history accrues in MemHub as the
 evidence that later decides whether to keep, narrow, or retire it.
