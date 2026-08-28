@@ -444,8 +444,11 @@ def to_hook_rule(row):
         if not isinstance(m, dict):
             return None
         # the server names the tool-result event "output" (§3.1); the hook's
-        # post lane calls it "result" and reads content_* as the result pattern
-        r["on"] = {"output": "result"}.get(m.get("event") or "bash", m.get("event") or "bash")
+        # post lane calls it "result" and reads content_* as the result pattern.
+        # A server "write" rule is an edit-family rule here: the pre lane's
+        # on="edit" branch already covers EDIT_TOOLS (Write included).
+        ev = m.get("event") or "bash"
+        r["on"] = {"output": "result", "write": "edit"}.get(ev, ev)
         keys = _RESULT_KEYS if r["on"] == "result" else _MATCHER_KEYS
         for k, v in m.items():
             if k == "event":

@@ -25,6 +25,8 @@ than the other half — with no error anywhere.
 
 Run: python3 version_parity_test.py   (stdlib only)
 """
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path

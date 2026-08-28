@@ -1,7 +1,7 @@
 ---
 description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or auto-armed by the memhub hook right after `gh pr create`). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
 argument-hint: [pr-number-or-url]
-allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, Bash, Read, Edit, Write, Glob, Grep
+allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash, Read, Edit, Write, Glob, Grep
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -27,8 +27,10 @@ already resolved.
    stripped), match it EXACTLY in `list_agent_brains` — a teammate may have
    created it; use theirs. No match → `create_agent_brain` (omit
    `workspace_id`). Either way, persist what you resolved with `room_map.py set
-   --brain-id <id>` so later passes and the capture hooks route without
-   repeating this. Edge cases (SSH remotes, no remote, worktrees, not a git
+   --brain-id <id> --org-id <org-id>` (the org id is the one you passed to
+   `list_agent_brains`, or the default org's from `list_orgs` — the response's
+   `scope` carries only `org_name`) so later passes and the capture hooks
+   route without repeating this lookup. Edge cases (SSH remotes, no remote, worktrees, not a git
    repo) and the create-time rules — resolve before create, required
    description, report where it landed — are in
    `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
@@ -56,7 +58,7 @@ already resolved.
 5. **Decide: another pass, or done?**
    - Pushed fixes this pass → NOT clean; the bots need time to re-review.
      End the turn so the loop re-wakes; bots typically take a few minutes,
-     so self-pace around 4–5 minutes (stay under the 5-minute cache window).
+     so self-pace around 4–5 minutes.
    - Clean = a pass that pushed nothing AND found no new findings AND no
      required check is failing or pending on the head commit AND the bots
      have had their review window: at least one bot review/comment exists
@@ -74,7 +76,8 @@ already resolved.
 
 Save a **PR-scoped artifact** — the review record — into the repo's room.
 Do NOT import the session transcript. The Stop-hook capture already ships
-this session to this same room continuously, routed by `resolve_repo_brain`,
+this session to this same room continuously, routed by the same room cache the
+capture hooks use,
 so an import would write a SECOND copy of the same conversation under a
 different id. Two transcripts of one session in one room produce competing
 facts and episodes that BOTH surface in retrieval — the exact failure
@@ -128,7 +131,8 @@ step's whole value, and it is a page of text.
    any repo-specific gotcha or bot false-positive tendency observed.
 
 Then report to the user (PR state, what was fixed, where the memory went)
-and END the loop — do not schedule another wake-up.
+and END the loop: call `ScheduleWakeup` with `stop: true` so no further
+wake-up is scheduled.
 
 Plain-English output throughout. If the memory save fails on authentication, do
 the fixing anyway and send the user to `/memhub:login` — **not** `/mcp`. The

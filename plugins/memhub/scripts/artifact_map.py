@@ -8,8 +8,9 @@ at init/revise time so the index is a byproduct of spec-driven development
 rather than a second thing to maintain by hand.
 
     # link (or re-link) an artifact to the files it governs
-    python3 artifact_map.py add --artifact-id <id> --brain-id <id> \\
-        --name "Spec: Retry policy" --glob "app/retry.py|app/**/backoff.py"
+    python3 artifact_map.py add --artifact-id <id> \\
+        --name "Spec: Retry policy" --path docs/specs/retry-policy.md \\
+        --glob "app/retry.py|app/**/backoff.py"
 
     # what does this repo map, and what governs a given file?
     python3 artifact_map.py list [--for app/retry.py]
@@ -17,7 +18,13 @@ rather than a second thing to maintain by hand.
 `add` is idempotent per artifact id: an existing link with the same
 `artifact_id` is replaced, so re-running after a spec revision just refreshes
 the globs. Paths are repo-relative POSIX; `--glob` accepts `*`, `**`, `{a,b}`
-braces, and `|`-separated alternatives (same semantics as the hook).
+braces, and `|`-separated alternatives (same semantics as the hook). `--path`
+is the artifact's OWN file (the spec), which is what the reminder tells the
+agent to re-upload and what the markdown auto-capture leaves alone.
+
+The map deliberately holds NO brain id: a brain id is account state, not
+project state (`room_map.py`), and the map is committed into the repo tree.
+The upload script resolves the repo's room from the user's own cache.
 """
 
 from __future__ import annotations
@@ -63,9 +70,9 @@ def cmd_add(args: argparse.Namespace) -> int:
     data = _load(path)
     link = {
         "glob": args.glob,
-        "brain_id": args.brain_id,
         "artifact_id": args.artifact_id,
         "artifact_name": args.name,
+        "path": args.path,
     }
     links = [l for l in data["links"] if l.get("artifact_id") != args.artifact_id]
     replaced = len(links) != len(data["links"])
@@ -108,7 +115,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f'{link.get("artifact_name", "(unnamed)")}')
         print(f'  glob:     {link.get("glob")}')
         print(f'  artifact: {link.get("artifact_id")}')
-        print(f'  brain:    {link.get("brain_id")}')
+        print(f'  path:     {link.get("path")}')
     return 0
 
 
@@ -118,8 +125,9 @@ def main() -> int:
 
     add = sub.add_parser("add", help="link an artifact to the files it governs")
     add.add_argument("--artifact-id", required=True)
-    add.add_argument("--brain-id", required=True)
     add.add_argument("--name", required=True, help="the artifact's exact name")
+    add.add_argument("--path", required=True,
+                     help="repo-relative POSIX path of the artifact's own file (the spec)")
     add.add_argument("--glob", required=True, help="repo-relative glob(s), `|`-separated")
     add.set_defaults(func=cmd_add)
 

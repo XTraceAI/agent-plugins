@@ -103,9 +103,22 @@ installs from a local clone:
   symlinks to resolve inside the plugin root; staging's escape to
   `../memhub/` disqualifies it from any spec-conformant installer. One more
   reason it never enters the Codex/Cursor catalogs.
-- **Staging reflects your working tree** — it does not track the `staging`
-  branch on its own. Re-run `/plugin marketplace update memhub-internal`
-  after branch switches.
+- **Staging is an rsync of `main`'s working tree, not a git branch.** The
+  `staging` git branch is being retired; the internal marketplace at
+  `~/.claude/plugins/memhub-internal-marketplace` is refreshed by copying
+  the plugin directory out of the checkout, dereferencing the symlinks:
+
+  ```sh
+  rsync -aL --delete --exclude __pycache__ \
+    plugins/memhub-staging/ \
+    ~/.claude/plugins/memhub-internal-marketplace/plugins/memhub-staging/
+  ```
+
+  If the version did not change, the version-keyed cache dir
+  (`~/.claude/plugins/cache/memhub-internal/memhub-staging/<version>/`) is
+  never re-fetched, so rsync the same tree into it as well — otherwise
+  `/plugin update` reports success and installs nothing. Restart the
+  session afterwards; a running session does not pick up the new files.
 
 `plugins/memhub/` holds real files with no symlinks of its own, which is
 exactly why the PUBLIC entry is safe to pin via `git-subdir`.
@@ -156,6 +169,3 @@ cleanup, changed shipped auth and capture code. Tag the SHA you tested, not
   LAST, after the 0.27.0 bump/tag/pin, so the first state Codex/Cursor can
   ever resolve is a released version.
 - Cursor official-directory submission (claims the `memhub` name).
-- Backend #932 (agent-brain partition recall) is staging-only; onboard
-  proactive recall stays empty on production until it promotes — tracked
-  separately from plugin releases.

@@ -11,7 +11,15 @@ This is the arming gate: a rule is added only after a human reads the
 excerpts this prints and judges them. Stdlib only; read-only.
 
 Usage:
-  rulebook_backtest.py --rule '<json>'            # candidate rule JSON
+  rulebook_backtest.py --rule '<json>'            # the SAME JSON you will send
+                                                  # to create_rule: either the
+                                                  # full call body ({"delivery":
+                                                  # "agent_hook","matcher":{...},
+                                                  # "scope_repos":[...]}) or a
+                                                  # bare matcher ({"event":
+                                                  # "bash","command_rx":...}).
+                                                  # Hook-shaped rows (on/rx/…)
+                                                  # are still accepted.
   rulebook_backtest.py --rule-file cand.json
   [--days 30] [--projects ~/.claude/projects] [--max-excerpts 15]
   [--exclude-session <uuid>]                      # ALWAYS pass the current
@@ -27,7 +35,11 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rulebook_hook import evaluate  # noqa: E402 — the ONE matcher implementation
+# the ONE matcher implementation + the ONE server→hook shape conversion
+from rulebook_hook import _RX_KEYS, evaluate, scope_ok, to_hook_rule  # noqa: E402
+
+SUPPORTED_ON = ("bash", "edit", "write_stdlib", "result")
+
 
 def load_rule(args):
     if args.rule_file:
@@ -39,9 +51,40 @@ def load_rule(args):
     else:
         raw = args.rule
     try:
-        return json.loads(raw)
+        cand = json.loads(raw)
     except ValueError as exc:
         sys.exit(f"the candidate rule is not valid JSON: {exc}")
+    return normalise_rule(cand)
+
+
+def normalise_rule(cand):
+    """Accept the exact JSON the agent will send to `create_rule` (a full call
+    body with `matcher`/`ordering`, or a bare matcher dict with `event`) and
+    convert it through the hook's own to_hook_rule() — so the backtest runs
+    the rule the server will store, not a hand-translated twin. Hook-shaped
+    rows (an `on` key) pass through; on=write is the edit family."""
+    if not isinstance(cand, dict):
+        sys.exit("the candidate rule must be a JSON object")
+    if "on" in cand:
+        rule = dict(cand)
+        if rule.get("on") == "write":
+            rule["on"] = "edit"
+        return rule
+    row = dict(cand)
+    if "matcher" not in row and "ordering" not in row:
+        if "event" in row:
+            row = {"matcher": row}          # bare matcher block
+        else:
+            sys.exit("the candidate rule needs `event` (a matcher) or `on` (hook shape); "
+                     "anchor rules use --triggers, session_context rules have no backtest.")
+    row.setdefault("rule_id", "candidate")
+    row.setdefault("statement", row.get("title") or "candidate")
+    rule = to_hook_rule(row)
+    if rule is None:
+        sys.exit("the candidate rule was rejected by the hook's loader (to_hook_rule): "
+                 "check the matcher keys and that every *_rx compiles, is < 400 chars, "
+                 "and nests no quantifiers.")
+    return rule
 
 
 def repo_of(cwd):
@@ -85,13 +128,18 @@ def main():
     else:
         rule = load_rule(args)
     on = rule.get("on")
-    if on not in ("bash", "edit", "write_stdlib", "result"):
-        sys.exit(f"backtest supports on=bash|edit|write_stdlib|result (got {on!r}); "
+    if on not in SUPPORTED_ON:
+        sys.exit(f"backtest supports on=bash|edit|write|write_stdlib|result (got {on!r}); "
                  "session-lane posture rules are not matchers and have no backtest.")
-    # Fail fast on a broken regex before scanning anything.
-    for k in ("rx", "not_rx", "path_rx", "path_not_rx", "content_rx"):
+    # Fail fast on a broken regex before scanning anything — every regex key
+    # the hook knows, so a bad body_rx/cmd_rx/exclude_rx errors out instead
+    # of silently reading as zero-fire.
+    for k in _RX_KEYS:
         if rule.get(k):
-            re.compile(rule[k])
+            try:
+                re.compile(rule[k])
+            except re.error as exc:
+                sys.exit(f"regex in {k!r} does not compile: {exc}")
 
     import time
     cutoff = time.time() - args.days * 86400
@@ -107,7 +155,6 @@ def main():
     raw_hits = 0
     session_hits = {}   # session_file -> [excerpt, ...]
     excerpts = []
-    scope = rule.get("repo_scope", "any")
 
     for p in sorted(files):
         session = os.path.basename(p)[:-6]
@@ -147,7 +194,9 @@ def main():
                     continue
                 if d.get("type") != "assistant":
                     continue
-                if scope == "xmem" and "xmem" not in repo_of(d.get("cwd", "")):
+                # same scope test the live hook applies: server scope_repos
+                # (any names) exact-match the session's repo; "any" → all
+                if not scope_ok(rule, repo_of(d.get("cwd", "")), ""):
                     continue
                 for c in (d.get("message") or {}).get("content") or []:
                     if not (isinstance(c, dict) and c.get("type") == "tool_use"):
@@ -216,6 +265,16 @@ def main():
         "fire_scope": fire_scope,
         "excerpts": excerpts,
     }, indent=1))
+    # Verdict summary for the skill's table / report. The backtest is the
+    # CLIENT-side arming gate; the server does not store it and create_rule
+    # does not take it. Fill judged_tp / judged_fp AFTER reading the excerpts.
+    print("\nVerdict summary for your report (judged_tp + judged_fp = "
+          "sessions you read):", file=sys.stderr)
+    print(json.dumps({"backtest": {
+        "sessions": len(files), "hits": len(session_hits), "days": args.days,
+        "judged_tp": 0, "judged_fp": 0,
+        "note": "FILL judged_tp/judged_fp from the excerpts before filing",
+    }}, indent=1))
     if raw_hits == 0:
         print("\nZERO-FIRE: no hits in the window. Fine for rare/high-blast "
               "tripwires; say so explicitly when arming.", file=sys.stderr)
