@@ -22,6 +22,19 @@ _SCP_REMOTE_RE = re.compile(
 _REMOTE_SCHEMES = frozenset(("git", "http", "https", "ssh"))
 
 
+def _is_repository_path(value: str) -> bool:
+    """Whether a GitHub remote path names exactly one owner/repository pair."""
+    path = value[1:] if value.startswith("/") else value
+    if path.endswith("/"):
+        path = path[:-1]
+    parts = path.split("/")
+    return (
+        len(parts) == 2
+        and all(part not in ("", ".", "..") for part in parts)
+        and parts[1] != ".git"
+    )
+
+
 def usable_cwd(cwd) -> bool:
     """Whether semi-trusted session content is safe to pass to ``git -C``."""
     if not isinstance(cwd, str) or not cwd or cwd.startswith("-"):
@@ -74,7 +87,8 @@ def normalize_repository_url(value) -> str | None:
             parsed = urlsplit(value)
             if (parsed.scheme.lower() not in _REMOTE_SCHEMES
                     or not parsed.hostname or not parsed.path
-                    or parsed.hostname.lower() != "github.com"):
+                    or parsed.hostname.lower() != "github.com"
+                    or not _is_repository_path(parsed.path)):
                 return None
             host = parsed.hostname
             if ":" in host:
@@ -89,7 +103,9 @@ def normalize_repository_url(value) -> str | None:
     if not scp:
         return None
     user = scp.group("user")
-    if user not in (None, "git") or scp.group("host").lower() != "github.com":
+    if (user not in (None, "git")
+            or scp.group("host").lower() != "github.com"
+            or not _is_repository_path(scp.group("path"))):
         return None
     prefix = "git@" if user == "git" else ""
     return f"{prefix}{scp.group('host')}:{scp.group('path')}"

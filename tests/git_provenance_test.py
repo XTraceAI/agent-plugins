@@ -100,6 +100,12 @@ def test_repository_urls_never_carry_credentials():
         "https://user:SECRET@git.internal.example/XTraceAI/demo.git") is None
     assert git_provenance.normalize_repository_url(
         "C:\\Users\\private\\demo.git") is None
+    for incomplete in (
+        "https://github.com/",
+        "https://github.com/XTraceAI",
+        "git@github.com:XTraceAI",
+    ):
+        assert git_provenance.normalize_repository_url(incomplete) is None
     print("PASS test_repository_urls_never_carry_credentials")
 
 
