@@ -2,19 +2,20 @@
 """Flag candidate rules that collide with rules already in the book — BEFORE
 they are filed. Deterministic, offline-capable, stdlib only.
 
-Why this lives in the skill and not on the server: the server's re-import
-identity is (rulebook, source_ref path, title) and it deliberately never
-adopts a rule owned by another document — so a candidate whose title or
-matcher collides with an existing rule is filed as a second draft, silently.
-The agent running `/memhub:create-rule` or `/memhub:import-claude-md` is the
-right place to notice: it is already holding the candidates and the book, and
-it can read two statements and say "same rule" better than any key can.
+Why this lives in the skill and not on the server: which rule a new one
+replaces is the CALLER's decision — the server never matches by title, and
+without an explicit `supersedes_rule_id` a candidate whose title or matcher
+collides with an existing rule is filed as a silent second rule. The agent
+running `/memhub:create-rule` or `/memhub:import-claude-md` is the right place
+to notice: it is already holding the candidates and the book, and it can read
+two statements and say "same rule" better than any key can.
 
 Two inputs, three checks:
 
   --candidates <file|->   the create_rule bodies you are about to send
   --existing   <file>     the `list_rules` reply (every status; no engine
-                          blocks) — title collisions across the WHOLE book
+                          blocks) — title collisions across the whole LIVE
+                          book (retired and dismissed rows are excluded)
   --repo <name>           the hook view of the ACTIVE book (engine blocks),
                           fetched from the server, or --book <file> to read a
                           cached / test book instead — matcher + anchor
@@ -52,7 +53,11 @@ from rulebook_hook import API_PATH, FETCH_TIMEOUT_S, _api, load_book  # noqa: E4
 
 _NON_WORD = re.compile(r"[^\w]+")
 _WS = re.compile(r"\s+")
-RETIRED = ("deprecated", "superseded")
+# Terminal states: nothing here can fire or be replaced, so a collision with
+# one is not a conflict. `dismissed` belongs with the retired pair — a declined
+# nomination was never a rule the team had, and leaving it in would make its
+# title collide with every later attempt at the same rule, forever.
+RETIRED = ("deprecated", "superseded", "dismissed")
 PRIMARY_RX = ("command_rx", "path_rx", "content_rx")
 
 

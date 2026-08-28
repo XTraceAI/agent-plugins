@@ -25,8 +25,9 @@ def check(cond, msg):
 
 EXISTING = [  # list_rules shape: all statuses, no engine blocks
     {"rule_id": "a1", "title": "Pre-push audit", "status": "active", "statement": "Read the diff before pushing."},
-    {"rule_id": "d1", "title": "no-force-push", "status": "draft", "statement": "Never bare --force."},
+    {"rule_id": "d1", "title": "no-force-push", "status": "proposed", "statement": "Never bare --force."},
     {"rule_id": "x1", "title": "pre push audit", "status": "deprecated", "statement": "old twin"},
+    {"rule_id": "n1", "title": "Ban print debugging", "status": "dismissed", "statement": "declined nomination"},
     {"rule_id": "s1", "title": "public-sdk-posture", "status": "active", "statement": "Design for an external consumer."},
 ]
 ACTIVE = [  # hook view: engine blocks, active only, no status field
@@ -45,6 +46,16 @@ def main() -> int:
     check([h["rule_id"] for h in hits] == ["a1"], f"same_title should hit a1 only (not deprecated x1): {hits}")
     check(hits[0]["reasons"] == ["same_title"], hits)
     check(r["active_book"] == "unavailable", r["active_book"])
+
+    # 1b. a DISMISSED row is terminal — it was never a rule the team had, so it
+    # is neither a title conflict nor something to judge by statement. Without
+    # this, a declined nomination collides with every later attempt at the same
+    # rule, forever.
+    r = rc.find_conflicts([{"title": "ban print debugging", "delivery": "agent_hook"}],
+                          EXISTING, None)
+    check(r["candidates"][0]["hits"] == [], f"dismissed row must not hit: {r['candidates'][0]['hits']}")
+    check("n1" not in [u["rule_id"] for u in r["judge_by_statement"]],
+          "dismissed row must not reach judge_by_statement")
 
     # 2. same_matcher: same event + same primary regex (whitespace-normalised), different title
     cand = {"title": "Push needs a diff read", "delivery": "agent_hook",
@@ -105,7 +116,7 @@ def main() -> int:
         check(out["candidates"][0]["hits"][0]["rule_id"] == "d1"
               and out["candidates"][0]["hits"][0]["reasons"] == ["same_title"], out)
         check(out["active_book"] == "checked", out["active_book"])
-        check("CONFLICTS" in p.stderr and "no-force-push [draft]" in p.stderr, p.stderr)
+        check("CONFLICTS" in p.stderr and "no-force-push [proposed]" in p.stderr, p.stderr)
 
         # 8b. --book accepts a quoted glob (the documented usage)
         p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "rulebook_conflicts.py"),
