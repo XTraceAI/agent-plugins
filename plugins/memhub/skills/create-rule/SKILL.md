@@ -27,12 +27,16 @@ Get to a **when-X-then-Y** sentence with a **why**. A conditional shape is what
 makes a rule actionable; a bare observation is not a rule. If the user gave a
 war story, extract the conditional from it and confirm your reading.
 
-### 2. Duplicate check
+### 2. Duplicate check — by eye now, deterministically in step 4
 
-Call the memhub `list_rules` tool for the target rulebook and compare the new
-rule against every title and statement. Overlap → propose tightening the
-existing rule (re-file under its title with a `source_ref`; the server turns
-that into a `proposed` update) instead of adding a twin.
+Call the memhub `list_rules` tool for the target rulebook (every status) and
+read the new rule against every title and statement. Same subject → plan to
+tighten the existing rule instead of adding a twin: re-file under its **exact
+title**. The server's identity key is (rulebook, `source_ref` path before `@`,
+title); it adopts a same-title rule that has **no** `source_ref` (returns
+`unchanged` or a `proposed` update), but a same-title rule already owned by a
+document is never adopted — adding a `source_ref` to it files a twin. Keep the
+`list_rules` reply: step 4 runs the deterministic check over it.
 
 ### 3. Draft the rule — one delivery, one engine block
 
@@ -67,10 +71,29 @@ Sanity-check every regex against two or three real commands from this repo's
 history (`git log`, your own shell history) — one that should fire and one
 that should not — before filing.
 
-### 4. Confirm, then file
+### 4. Conflict check, confirm, then file
 
-Show the user: the rule sentence, the delivery + engine block, and the sample
-commands it does and doesn't match. On approval call the memhub
+Before showing the rule, check it against the book — the server files a
+colliding title or matcher from a different source as a silent second draft,
+so this is the only place it gets caught. Call `list_rules` (every status),
+save the reply, write the candidate `create_rule` body to a file, and run:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
+  --candidates <candidate.json> --existing <list_rules.json> --repo "<repo>"
+```
+
+`same_title` / `same_matcher` (an **active** rule fires on the same call) /
+`anchors_overlap` are deterministic; then read the `judge_by_statement` list
+it prints and mark the candidate `duplicate`, `contradicts` or `distinct`
+against each. A `duplicate` of a rule with no `source_ref` → re-file under
+that exact title (the server updates it). A `duplicate` of a rule owned by
+another document, or any `same_matcher` → say so and let the user decide
+instead of filing a twin. `contradicts` → file, but name the rule it fights
+in the report; a reviewer retires one side before activating the other.
+
+Show the user: the rule sentence, the delivery + engine block, the sample
+commands it does and doesn't match, and the conflict verdict. On approval call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `xmem/CLAUDE.md@<sha>#<heading>` or
 `user correction, session <id>`), and `agent_brain_id` when `--brain` was
