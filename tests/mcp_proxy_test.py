@@ -43,47 +43,71 @@ def _forward_raise(exc):
 def test_no_credential():
     print("\nno credential")
     reply = proxy.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"},
-                         resolve=lambda: (URL, None), forward=_forward_ok)
+                         resolve=lambda **kw: (URL, None), forward=_forward_ok)
     check("request gets an error", reply["error"]["code"], proxy.ERR_NO_CREDENTIAL)
     check("error names the fix", "/memhub:login" in reply["error"]["message"], True)
     check("keeps the client's id", reply["id"], 1)
     reply = proxy.handle({"jsonrpc": "2.0", "method": "notifications/initialized"},
-                         resolve=lambda: (URL, None), forward=_forward_ok)
+                         resolve=lambda **kw: (URL, None), forward=_forward_ok)
     check("notification stays silent", reply, None)
 
 
 def test_forwarded_reply_keeps_id():
     print("\nforwarded reply")
     reply = proxy.handle({"jsonrpc": "2.0", "id": "abc", "method": "tools/list"},
-                         resolve=lambda: (URL, "mhk_x"), forward=_forward_ok)
+                         resolve=lambda **kw: (URL, "mhk_x"), forward=_forward_ok)
     check("result relayed", reply["result"], {"echo": "tools/list"})
     check("id is the client's, not the server's", reply["id"], "abc")
     reply = proxy.handle({"jsonrpc": "2.0", "method": "notifications/initialized"},
-                         resolve=lambda: (URL, "mhk_x"),
+                         resolve=lambda **kw: (URL, "mhk_x"),
                          forward=lambda *a: None)
     check("acknowledged notification stays silent", reply, None)
     reply = proxy.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
-                         resolve=lambda: (URL, "mhk_x"),
+                         resolve=lambda **kw: (URL, "mhk_x"),
                          forward=lambda *a: None)
     check("empty body to a request is an error, not silence",
           reply["error"]["code"], proxy.ERR_TRANSPORT)
+    reply = proxy.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
+                         resolve=lambda **kw: (URL, "mhk_x"),
+                         forward=lambda *a: [{"jsonrpc": "2.0", "id": 4}])
+    check("non-object reply is an error, not a crash",
+          reply["error"]["code"], proxy.ERR_TRANSPORT)
+
+
+def test_lock_only_on_refresh():
+    print("\nlock scope")
+    calls = []
+    def resolve(refresh=True):
+        calls.append(refresh)
+        return (URL, "mhk_x") if not refresh else (URL, "oauth")
+    proxy.handle({"jsonrpc": "2.0", "id": 5, "method": "ping"},
+                 resolve=resolve, forward=_forward_ok)
+    check("key path never asks for a refresh", calls, [False])
+    calls.clear()
+    def resolve_oauth_only(refresh=True):
+        calls.append(refresh)
+        return (URL, "oauth" if refresh else None)
+    reply = proxy.handle({"jsonrpc": "2.0", "id": 6, "method": "ping"},
+                         resolve=resolve_oauth_only, forward=_forward_ok)
+    check("OAuth-cache install falls through to the refreshing path", calls, [False, True])
+    check("and is served", "result" in reply, True)
 
 
 def test_transport_errors():
     print("\ntransport errors")
     req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
-    reply = proxy.handle(req, resolve=lambda: (URL, "stale"),
+    reply = proxy.handle(req, resolve=lambda **kw: (URL, "stale"),
                          forward=_forward_raise(mcp_http.McpError("nope", 401)))
     check("401 → credential error", reply["error"]["code"], proxy.ERR_NO_CREDENTIAL)
     check("401 names the fix", "/memhub:login" in reply["error"]["message"], True)
-    reply = proxy.handle(req, resolve=lambda: (URL, "k"),
+    reply = proxy.handle(req, resolve=lambda **kw: (URL, "k"),
                          forward=_forward_raise(mcp_http.McpRateLimited("slow", 3.0)))
     check("429 → rate-limit error", reply["error"]["code"], proxy.ERR_RATE_LIMITED)
-    reply = proxy.handle(req, resolve=lambda: (URL, "k"),
+    reply = proxy.handle(req, resolve=lambda **kw: (URL, "k"),
                          forward=_forward_raise(mcp_http.McpError("boom", 500)))
     check("500 → transport error", reply["error"]["code"], proxy.ERR_TRANSPORT)
     reply = proxy.handle({"jsonrpc": "2.0", "method": "notifications/x"},
-                         resolve=lambda: (URL, "k"),
+                         resolve=lambda **kw: (URL, "k"),
                          forward=_forward_raise(mcp_http.McpError("boom", 500)))
     check("failed notification stays silent", reply, None)
 

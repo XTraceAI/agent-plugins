@@ -67,8 +67,13 @@ def handle(envelope: dict, resolve=resolve_bearer,
     """
     msg_id = envelope.get("id")
     is_notification = "id" not in envelope
-    with _auth_lock:
-        url, bearer = resolve()
+    # Fast path first: a stored access key or $MEMHUB_TOKEN is a file read and
+    # needs no lock. Only an install still on the OAuth cache reaches the
+    # refresh, and only that is serialized.
+    url, bearer = resolve(refresh=False)
+    if not bearer:
+        with _auth_lock:
+            url, bearer = resolve()
     if not bearer:
         # A notification carries no id, so there is nothing to answer it with;
         # the next request will say why.
@@ -95,6 +100,10 @@ def handle(envelope: dict, resolve=resolve_bearer,
         # waiting on this id forever.
         return _error(msg_id, ERR_TRANSPORT,
                       f"{envelope.get('method')}: server returned no reply")
+    if not isinstance(reply, dict):
+        return _error(msg_id, ERR_TRANSPORT,
+                      f"{envelope.get('method')}: reply was "
+                      f"{type(reply).__name__}, expected a JSON-RPC object")
     # The server answers with our id, but pin it anyway: a mismatched id would
     # be a reply the client can never correlate.
     reply["id"] = msg_id
