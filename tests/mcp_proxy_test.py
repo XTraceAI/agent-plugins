@@ -62,6 +62,11 @@ def test_forwarded_reply_keeps_id():
                          resolve=lambda: (URL, "mhk_x"),
                          forward=lambda *a: None)
     check("acknowledged notification stays silent", reply, None)
+    reply = proxy.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+                         resolve=lambda: (URL, "mhk_x"),
+                         forward=lambda *a: None)
+    check("empty body to a request is an error, not silence",
+          reply["error"]["code"], proxy.ERR_TRANSPORT)
 
 
 def test_transport_errors():

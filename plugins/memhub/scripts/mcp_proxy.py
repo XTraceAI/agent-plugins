@@ -87,8 +87,14 @@ def handle(envelope: dict, resolve=resolve_bearer,
                           f"MemHub rejected the credential ({exc.status}) — "
                           "run /memhub:login to mint a fresh one.")
         return _error(msg_id, ERR_TRANSPORT, str(exc))
-    if is_notification or reply is None:
+    if is_notification:
         return None
+    if reply is None:
+        # An empty body is the ack a notification gets; to a REQUEST it is a
+        # reply that never came, and saying nothing would leave the client
+        # waiting on this id forever.
+        return _error(msg_id, ERR_TRANSPORT,
+                      f"{envelope.get('method')}: server returned no reply")
     # The server answers with our id, but pin it anyway: a mismatched id would
     # be a reply the client can never correlate.
     reply["id"] = msg_id
