@@ -40,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -95,9 +96,6 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
     """Pure. `existing` = list_rules rows (any status; titles + statements);
     `active` = hook-view rows (engine blocks) or None when unavailable."""
     live = [r for r in existing if r.get("status") not in RETIRED]
-    by_id: dict[str, dict] = {}
-    for r in live:
-        by_id[str(r.get("rule_id"))] = r
     out = []
     hit_ids: set[str] = set()
     for cand in candidates:
@@ -186,12 +184,15 @@ def main(argv=None) -> int:
     existing = _load(args.existing) if args.existing else []
     active = None
     if args.book:
+        # the documented usage is a glob (the cache file name carries a hash
+        # of the repo name); resolve it here so a quoted pattern works too
+        matches = sorted(glob.glob(os.path.expanduser(args.book))) or [args.book]
         try:
-            with open(args.book, encoding="utf-8") as f:
+            with open(matches[0], encoding="utf-8") as f:
                 b = json.load(f)
             active = b.get("rules") if isinstance(b, dict) else b
         except Exception as exc:
-            print(f"could not read --book: {exc}", file=sys.stderr)
+            print(f"could not read --book {matches[0]}: {exc}", file=sys.stderr)
     elif args.repo:
         active = fetch_active(args.repo)
         if active is None:

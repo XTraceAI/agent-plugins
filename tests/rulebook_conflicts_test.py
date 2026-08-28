@@ -107,6 +107,13 @@ def main() -> int:
         check(out["active_book"] == "checked", out["active_book"])
         check("CONFLICTS" in p.stderr and "no-force-push [draft]" in p.stderr, p.stderr)
 
+        # 8b. --book accepts a quoted glob (the documented usage)
+        p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "rulebook_conflicts.py"),
+                            "--candidates", "-", "--book", os.path.join(td, "bo*.json")],
+                           input=cands, capture_output=True, text=True,
+                           env={**os.environ, "MEMHUB_RULEBOOK_BASE": td})
+        check(p.returncode == 0 and json.loads(p.stdout)["active_book"] == "checked", p.stderr)
+
         # 9. unreadable --book degrades to "unavailable", still exit 0
         p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "rulebook_conflicts.py"),
                             "--candidates", "-", "--book", os.path.join(td, "missing.json")],
