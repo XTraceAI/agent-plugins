@@ -566,10 +566,11 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     the record. Once a session is under observation, any FLUSHING hook's
     sighting qualifies — the record provably exists at that instant, so
     first-seen bounds its production time from above by the gap since the
-    previous event. (Quiet events — debounced edits, non-milestone shell —
-    skip minting entirely so they never rewrite the pin map; the next
-    flushing hook dates what they saw, a deferral bounded by the debounce
-    interval.) Boundary hooks (afterAgentResponse / stop /
+    previous event. (A debounced afterFileEdit — the one event that reads
+    yet declines to send — skips minting so it never rewrites the pin map;
+    the next flushing hook dates what it saw, a deferral bounded by the
+    debounce interval. Guaranteed non-senders never read at all — see
+    ``_event_can_flush``.) Boundary hooks (afterAgentResponse / stop /
     beforeSubmitPrompt) are the common observers, but a mid-turn edit hook
     that flushes and sees a record first dates it TIGHTER than waiting for
     the turn's end would — matching Claude transcripts, whose records carry
@@ -741,6 +742,32 @@ def should_flush(event: str, payload: dict, state: dict,
                  "sessionEnd"):
         return True
     return False
+
+
+def _event_can_flush(event: str, payload: dict) -> bool:
+    """Purely payload-decidable: can this invocation EVER become a send?
+
+    Non-milestone shell events and unrecognized events cannot — the event
+    gate in ``should_flush`` refuses them regardless of content, and pending
+    usage does not override it — so ``main`` exits before locking and
+    reading the transcript. That is an I/O saving (no parse per shell
+    command), but the load-bearing property is OBSERVATION: every event
+    that reads the transcript is a potential flusher, so a session with no
+    ``record_ts`` in state has provably never been observed with content —
+    which is what lets ``first_observation`` be derived from the pin map's
+    absence without a separate marker. A quiet READER would break that
+    (records arriving between its sighting and the first flush would be
+    mis-classed as unknowable backlog — review finding); the only reader
+    that declines to flush is a debounced ``afterFileEdit``, and a debounce
+    implies a recent flush, hence an existing pin map.
+    """
+    if event == "beforeShellExecution":
+        cmd = payload.get("command")
+        if not isinstance(cmd, str):
+            return False
+        return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
+    return event in ("afterFileEdit", "afterAgentResponse", "stop",
+                     "beforeSubmitPrompt", "sessionEnd")
 
 
 # Reading a remote URL means reading the TARGET repo's own config — that is
@@ -1070,6 +1097,12 @@ def main() -> int:
         _log(f"{event}: session id {uuid!r} is not a uuid — refusing the "
              f"store lookup")
         return 0
+    if not _event_can_flush(event, payload):
+        # A guaranteed non-send (plain shell traffic, unknown event) exits
+        # before the lock and the transcript read — no I/O per `ls`, and no
+        # quiet OBSERVATION that would skew first_observation (see
+        # _event_can_flush).
+        return 0
 
     # Serialize the whole check-then-act: reading the watermark, sending, and
     # writing it back must not interleave with a concurrent flush for this
@@ -1121,11 +1154,12 @@ def main() -> int:
         # failure without needing Cursor to repeat usage. Timestamp pins are
         # different: they are minted and persisted ONLY on the flush path
         # below (still before the network call, so a failed send retries
-        # with identical stamps) — a quiet event (debounced edit,
-        # non-milestone shell) must not rewrite a large pin map for nothing
-        # (review finding). A record a quiet event would have dated is dated
-        # by the NEXT flushing hook at its clock — a real observation,
-        # deferred by at most the debounce interval.
+        # with identical stamps) — a declined event must not rewrite a large
+        # pin map for nothing (review finding). The only event that reads
+        # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
+        # exit in main() before reading — see _event_can_flush), and a
+        # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
+        # by the next flushing hook at most that interval later.
         fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
         if source_kind == "transcript":
             fields["transcript_path"] = str(source_path)

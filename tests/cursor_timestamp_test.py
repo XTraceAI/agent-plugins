@@ -286,11 +286,12 @@ def test_main_flow_pins_persist_and_ship():
             assert revisions[2] == revisions[1]
             assert _stamps_of(calls[2]) == _stamps_of(calls[1])
 
-            # A QUIET event (non-milestone shell) sees new content but must
-            # not mint or persist pins — the map is rewritten only on the
-            # flush path (review finding). The next flushing hook dates the
-            # new record at ITS clock, so the quiet event's clock appears in
-            # no pin.
+            # A guaranteed non-sender (non-milestone shell) exits before
+            # even reading the transcript — no pins minted or persisted,
+            # no observation recorded (a quiet READER before the first
+            # flush would skew first_observation — review finding). The
+            # next flushing hook dates the new record at ITS clock, so the
+            # shell event's clock appears in no pin.
             _write_rows(path, TURN_1 + TURN_2 + [
                 {"role": "assistant", "message": {"content": [
                     {"type": "text", "text": "THIRD"}]}},
@@ -365,6 +366,24 @@ def test_apply_session_state_without_state_is_inert():
         finally:
             cursor_flush.STATE_DIR = old_state
     print("PASS test_apply_session_state_without_state_is_inert")
+
+
+def test_event_can_flush_seals_quiet_observers():
+    """Every event that READS the transcript must be a potential sender —
+    that is what lets ``record_ts`` absence mean "never observed" for
+    first_observation. Guaranteed non-senders are refused up front."""
+    can = cursor_flush._event_can_flush
+    assert not can("beforeShellExecution", {"command": "ls -la"})
+    assert not can("beforeShellExecution", {"command": ["git", "commit"]})
+    assert not can("beforeShellExecution", {})
+    assert can("beforeShellExecution", {"command": "git commit -m x"})
+    assert can("beforeShellExecution", {"command": "gh pr create -f"})
+    for event in ("afterFileEdit", "afterAgentResponse", "stop",
+                  "beforeSubmitPrompt", "sessionEnd"):
+        assert can(event, {}), event
+    assert not can("someFutureHook", {})
+    assert not can("unknown", {})
+    print("PASS test_event_can_flush_seals_quiet_observers")
 
 
 def test_capture_restore_is_best_effort_never_fatal():
