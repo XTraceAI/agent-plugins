@@ -1,104 +1,120 @@
-# MemHub for Claude Code
+# MemHub for Claude Code, Codex, and Cursor
 
-Auto-capture your Claude Code sessions into **MemHub team memory**. A `Stop`
-hook ships each turn as it happens — only the transcript bytes written since
-the last flush — with `PostToolUse` flushes on `git commit` / `gh pr create` /
-`gh pr merge` and a `SessionEnd` backstop for anything the per-turn path
-missed. The `memhub` MCP server runs **tool-aware (agentic) extraction** of
-facts, episodes, and artifacts, batching so per-turn capture doesn't fragment
-episodes.
+MemHub gives coding agents shared team memory: interactive MCP tools for
+searching and saving knowledge, automatic session capture, situated directive
+recall, and workflows for artifacts, specs, handoffs, rules, and PR review.
+The same `memhub` plugin supports Claude Code, OpenAI Codex, and Cursor through
+each host's native plugin system.
 
 ## What's in here
 
-This repo is a **marketplace** with two installable plugins — `memhub` and
-`fleet`:
+This repository publishes the `memhub` plugin to all three hosts. It also
+contains the Claude Code-only `fleet` plugin for coordinating parallel agents.
 
 ```
-.claude-plugin/marketplace.json     # makes the plugins installable
-plugins/memhub/                     # PROD build — install this one
-├── .claude-plugin/plugin.json      # plugin manifest
-├── .mcp.json                       # the memhub MCP server → prod (per-user OAuth)
-├── hooks/claude-hooks.json         # Stop/SessionEnd/SessionStart/PreToolUse/PostToolUse
-└── skills/                         # /memhub:* skills (also auto-invoked by Claude)
-    ├── handoff-session/            # hand the current session to a teammate
-    ├── import-session/             # import a past session, any size
-    ├── login/                      # authenticate the plugin's own capture credential
-    ├── onboard/                    # seed a repo's agent brain, prove recall
-    ├── pr-babysit/                 # self-paced loop fixing PR review-bot findings
-    ├── save-artifact/              # store a file as a MemHub artifact
-    ├── search-memory/              # read-only team-memory recall
-    └── spec/                       # spec-driven dev on versioned spec artifacts
-plugins/.claude-plugin/             # internal-only marketplace (staging build)
-plugins/memhub-staging/             # INTERNAL staging build — not published here,
-                                    # see CONTRIBUTING.md
-├── .claude-plugin/plugin.json      # its own manifest
-├── .mcp.json                       # the memhub MCP server → staging
-├── skills/  → ../memhub/skills     # symlinked: shared with memhub, never drifts
-├── hooks/   → ../memhub/hooks      # symlinked
-└── scripts/ → ../memhub/scripts    # symlinked
+.agents/plugins/marketplace.json    # Codex and Cursor marketplace
+.claude-plugin/marketplace.json     # Claude Code marketplace
+plugins/memhub/                     # production plugin installed by every host
+├── .claude-plugin/plugin.json      # Claude Code manifest
+├── .codex-plugin/plugin.json       # Codex manifest
+├── .cursor-plugin/plugin.json      # Cursor manifest
+├── plugin.json                     # Agent Plugins manifest
+├── .mcp.json                       # Claude Code MCP configuration
+├── mcp.json                        # Codex/Cursor MCP configuration
+├── hooks/                          # host-specific capture and recall hooks
+├── scripts/                        # shared readers, capture, auth, and setup code
+└── skills/                         # model-invoked MemHub workflows
 plugins/fleet/
-├── .claude-plugin/plugin.json      # plugin manifest
-├── hooks/hooks.json                # (fleet) SessionStart/UserPromptSubmit/PostToolUse/SessionEnd
-├── scripts/fleet_board.py          # one script, one subcommand per hook event
-├── scripts/fleet_start_launch.sh   # session launcher (tmux/iTerm/Terminal/headless)
-├── skills/start/                   # /fleet:start — decompose, provision, launch
-└── skills/status/                  # /fleet:status — pretty-print the board
-codex/                              # OpenAI Codex integration (not a Claude plugin)
-├── codex_to_claude.py              # transform a Codex rollout → Claude Code record shape
-├── import_codex_session.py         # import a Codex session into MemHub (reuses import_session.py)
-├── codex_notify.py                 # optional `notify` hook for auto-capture
-└── README.md                       # Codex MCP config + session capture
+└── ...                             # optional Claude Code fleet coordination
+codex/                              # legacy forwarding shims and Codex reference guide
 ```
-
-**Using Codex instead of Claude Code?** See [`codex/README.md`](codex/README.md):
-the MemHub MCP server drops into `~/.codex/config.toml`, and
-`import_codex_session.py` captures Codex sessions into the same team memory (it
-reshapes the rollout so MemHub's agentic extraction kicks in — no backend
-change).
 
 ## Install
+
+There are two separate authentications on every host:
+
+1. the **MCP connector login** enables interactive tools such as
+   `search_memory` and `save_artifact`;
+2. **Log in to MemHub** provisions the credential used by background capture
+   hooks.
+
+Completing one does not complete the other.
+
+### Claude Code
 
 ```text
 /plugin marketplace add XTraceAI/agent-plugins
 /plugin install memhub@memhub
+/reload-plugins
 ```
 
-Then authenticate **twice** — these are two separate credential stores that
-happen to share an Auth0 client, and each covers a different half of the
-plugin:
+Open `/mcp`, select `memhub`, choose **Authenticate**, and approve in the
+browser. Then run `/memhub:login` for capture and `/memhub:onboard` from the
+repository whose team brain you want to create or select.
 
-```text
-/mcp
+### OpenAI Codex
+
+```bash
+codex plugin marketplace add XTraceAI/agent-plugins
+codex plugin add memhub@xtrace-plugins
 ```
 
-Select `memhub`, choose **Authenticate**, and approve in the browser. This
-connects the interactive MCP tools (`search_memory`, `save_artifact`, …).
+Restart Codex after installation. Codex normally starts MCP authentication
+during installation; if it still reports that `memhub` is not logged in, run:
 
-```text
-/memhub:login
+```bash
+codex mcp login memhub --oauth-client-registration cimd
 ```
 
-This provisions *capture's* credential. The hooks run as cold background
-processes that can never open a browser, so `/mcp`'s token — kept in Claude
-Code's own store — is invisible to them; they read
-`~/.config/memhub-plugin/tokens-<host>.json`, which only a foreground plugin
-script can write. `/memhub:login` opens the browser once, then mints a
-personal access key (`mhk_…`, 90-day, one per machine) that the Stop/
-SessionEnd/commit-PR hooks authenticate with directly. Skipping it leaves
-capture silently unauthenticated even though `/mcp` shows connected — there is
-no automatic link between the two. Follow it with `/memhub:onboard` to connect
-the repo to its team brain (its own agent brain, seeded from a real session);
-without that step, capture still runs but lands in personal memory instead of
-the repo's room.
+Do **not** manually add a second `memhub` server or OAuth client in
+`~/.codex/config.toml`. A global server with the same name shadows the plugin
+server and can force an incompatible static OAuth client. See
+[`codex/README.md`](codex/README.md) for the complete setup, hook approval, and
+recovery steps.
 
-`memhub` is pinned to a released tag, so `/plugin install` always gives you a
-version that shipped — never whatever happens to be on `main` mid-development.
+In a new Codex task, ask it to **Log in to MemHub**, then **Set up MemHub**.
+Restart, open `/hooks`, and trust only MemHub's `PreToolUse`, `PostToolUse`, and
+`Stop` handlers from `~/.codex/hooks.json`. Finally ask it to **Onboard MemHub
+for this repo**.
+
+### Cursor
+
+```bash
+cursor-agent plugin marketplace add https://github.com/XTraceAI/agent-plugins
+```
+
+Open **Customize**, find **MemHub** in the XTrace marketplace, and select
+**Add**. In the MemHub plugin details, authenticate the MCP entry when it says
+it needs attention. Then ask Cursor Agent to **Log in to MemHub** for capture
+and **Onboard MemHub for this repo**.
+
+### Capture credential
+
+The foreground login skill opens a browser once and mints a 90-day personal
+access key (`mhk_…`) under `~/.config/memhub-plugin/`. Background hooks use
+that key because they cannot use the host application's MCP credential store
+or open a browser to refresh an OAuth token. Skipping this step leaves capture
+unauthenticated even when interactive MCP tools work.
+
+The Claude Code marketplace pins `memhub` to a released tag. Codex and Cursor
+install from the Agent Plugins marketplace snapshot and refresh that snapshot
+through their marketplace update flow.
 
 > **Working on MemHub itself?** There's a staging build that points at the
 > staging backend. It is not part of this marketplace — see
 > [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## How it works
+## How capture works
+
+Claude Code and Cursor load their bundled hooks natively. Codex currently uses
+the user-level compatibility bridge installed by the `setup` skill. All hosts
+normalize their native transcript format before sending it to the same
+watermark-based ingestion endpoint; native usage counters are included where
+the host exposes them.
+
+The detailed lifecycle below describes the Claude Code path. Codex and Cursor
+use equivalent host-specific readers and flushers under
+`plugins/memhub/scripts/`.
 
 Capture runs on independent paths that all feed one server-side watermark
 (keyed on `conversation_id` = `session_id`), so re-sending never double-saves:
@@ -173,13 +189,16 @@ days, not turns.
 
 ## Skills
 
-Eight skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Eleven skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
 
+- `/memhub:setup [--status | --remove]` — installs, checks, or removes the
+  Codex user-hooks compatibility bridge; on Claude Code and Cursor it checks
+  the native integration without writing Codex configuration.
 - `/memhub:login [--status | --force]` — authenticates capture's own
-  credential (see Install/How it works): mints or verifies the personal
+  credential (see Install/How capture works): mints or verifies the personal
   access key the background hooks use, distinct from `/mcp`'s connector
   login. `--status` reports without opening a browser; `--force` discards the
   cached credential and redoes the browser flow.
@@ -223,6 +242,11 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   multiplayer view — repo overview with no topic, per-spec activity with one.
   Sharing is read-only, so the room's creator owns revisions; teammates
   propose spec changes through the normal repo/PR flow.
+- `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
+  failure, correction, or procedure and checks for conflicts before saving it.
+- `/memhub:import-claude-md` — imports reusable instructions from a
+  `CLAUDE.md` file into Rulebook without turning generic prose into noisy
+  directives.
 - `/memhub:pr-babysit [pr-number-or-url]` — usually **auto-armed**, not typed:
   a hook offers to start this as a self-paced loop right after `gh pr
   create` (see PR babysitting below). One pass polls the PR's review bots and

@@ -1,173 +1,205 @@
 # MemHub for OpenAI Codex
 
-> **Moved (multi-host refactor):** the transform now lives at
-> `plugins/memhub/scripts/readers/codex.py`, and the import entry point is
-> `plugins/memhub/scripts/capture.py import --host codex`. The commands below
-> still work — `codex_to_claude.py` and `import_codex_session.py` are thin
-> forwarding shims kept for one release.
+MemHub is a native Codex plugin. Installing it provides:
 
-Codex isn't a Claude Code plugin, so the marketplace at the repo root doesn't
-apply to it. Instead MemHub reaches Codex two ways, and neither needs a new
-repo or a backend change:
+- the `memhub` MCP server for interactive memory tools;
+- skills for login, onboarding, search, artifacts, imports, handoffs, specs,
+  rules, and PR review;
+- automatic session capture and directive recall through a three-hook
+  compatibility bridge.
 
-1. **Memory tools inside Codex** — the MemHub MCP server is plain MCP, and
-   Codex speaks MCP. Add one block to `~/.codex/config.toml` and
-   `search_memory` / `save_artifact` / `import_conversation` are available in
-   Codex.
-2. **Session capture** — `import_codex_session.py` reads a Codex *rollout*
-   transcript, reshapes it into the Claude Code record shape, and hands it to
-   the plugin's `import_session.py`. That reshape is the whole trick: MemHub's
-   agentic (tool-aware, gist-composing) ingestion auto-detects by *structure*,
-   not by a platform tag, so a faithful transform gets the full extraction with
-   no server change.
+Do not configure MemHub as a separate global MCP server. The installed plugin
+already supplies it.
 
-## 1. Memory tools in Codex (MCP)
+## Fresh installation
 
-Add to `~/.codex/config.toml` (prod shown; swap the URL for staging if you're a
-MemHub developer):
-
-```toml
-[mcp_servers.memhub]
-url = "https://api.memhub.xtrace.ai/mcp-server/mcp"
-# staging: "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"
-```
-
-Codex handles the OAuth browser flow on first use (same as its Notion server).
-Verify with `codex mcp` / `codex doctor`.
-
-## 2. Import a Codex session into team memory
+Run these commands in a terminal:
 
 ```bash
-# newest session:
-uv run --with 'mcp<2' python codex/import_codex_session.py --session latest
-
-# a specific session (rollout path, or the bare session id), into a shared room:
-uv run --with 'mcp<2' python codex/import_codex_session.py \
-    --session 019c6e48-b66c-7881-9301-99c87fc66cf6 \
-    --agent-brain-id <room-id>
+codex plugin marketplace add XTraceAI/agent-plugins
+codex plugin add memhub@xtrace-plugins
 ```
 
-`--session` accepts a rollout path, a bare Codex session id (searched under
-`~/.codex/sessions/`), or `latest`. The conversation id defaults to
-`codex-<session-id>`, so re-imports are **incremental** — the server watermark
-folds the session gist forward instead of duplicating.
+Then fully restart Codex so the installed skills and MCP server load.
 
-Use `--dry-run` to see what would be sent (record count, tool calls, resolved
-cwd/title) and write the transformed transcript without calling the server.
-Auth is the same OAuth the MCP connector uses — no separate token to provision.
-
-### What the transform does
-
-Codex rollouts carry two parallel streams; capture reads the `response_item`
-stream (the OpenAI Responses items actually exchanged with the model — the one
-with tool I/O in order) and maps it 1:1 onto Claude Code records:
-
-| Codex `response_item` | Claude Code record |
-|---|---|
-| `message` role=user | user text (Codex context injections — AGENTS.md, `<environment_context>`, IDE-setup wrappers — are stripped to the real ask) |
-| `message` role=assistant | assistant text block |
-| `reasoning` | assistant `thinking` block (summary only; `encrypted_content` dropped) |
-| `function_call` / `custom_tool_call` | assistant `tool_use` block |
-| `function_call_output` / `custom_tool_call_output` | user `tool_result` block |
-
-Order is preserved (gpt-5.x emits `reasoning` before its `function_call`). A
-leading provenance banner records the Codex origin, model, and cwd, since the
-agentic path always tags the platform `claude`.
-
-Run the tests: `python3 codex/test_codex_to_claude.py`.
-
-## 3. Automatic capture and directive recall — the hooks bridge
-
-After installing the plugin, ask Codex to `set up MemHub`. In the Codex CLI,
-skills are model-invoked; `/memhub:setup` is not a slash command. The same
-operation is available directly:
+Check the installed package:
 
 ```bash
-python3 plugins/memhub/scripts/setup_codex_hooks.py install
+codex plugin list --json
+codex mcp list
 ```
 
-The installer preserves unrelated hooks, backs up a changed existing file, and
-survives plugin upgrades. It folds all behavior into three handlers: one each
-for `PreToolUse`, `PostToolUse`, and `Stop`. The bridge still provides directive
-recall, reactive failure recall, artifact reminders, milestone capture, and
-per-turn capture.
+The first command should list `memhub@xtrace-plugins` as installed and enabled.
+The second should list one `memhub` server.
 
-Codex requires an explicit review because trust is per command hash. MemHub
-cannot approve its own hooks. Restart Codex, choose **Review hooks** at startup
-or open `/hooks`, and trust only the three handlers with both of these traits:
+## 1. Connect the interactive memory tools
 
-- source: `User config - ~/.codex/hooks.json`
-- command contains: `memhub_hook_bridge.py`
+Codex normally starts the browser login while installing a plugin whose MCP
+server requires authentication. If Codex still says `memhub` is not logged in,
+run:
 
-If more than three handlers need review, the others are unrelated to MemHub's
-installer. Do not choose **Trust all** unless you have separately reviewed
-those too. Re-run `setup_codex_hooks.py status` to verify installation; Codex
-does not expose trust approval to this setup script, so the script reports that
-state separately instead of pretending the handlers are active.
-
-**Why user-level and not the plugin's own `hooks/codex-hooks.json`.** Verified
-live on codex-cli 0.148 and 0.149: plugin-bundled hooks are **not mounted**, via
-either a manifest pointer or the default `hooks/hooks.json` path. User-level
-`~/.codex/hooks.json` hooks do fire, and 0.149 delivers
-`PreToolUse.hookSpecificOutput.additionalContext` to the model. The plugin keeps
-its native hook declaration ready for the Codex release that mounts it; the
-bridge is the working compatibility path today.
-
-The installed trampoline resolves the highest naturally ordered plugin version
-at run time instead of naming one. Natural ordering matters: lexical ordering
-puts `0.9.0` above `0.10.0`, while mtime can be changed by merely touching a
-directory. The version directory is the installer's actual upgrade boundary.
-
-The marketplace namespace is **pinned** (`cache/xtrace-plugins/memhub/*/`),
-only the version segment is a wildcard. The cache is shared by every
-marketplace you have installed — `openai-bundled`, `openai-curated-remote`,
-and so on all live beside ours — so a namespace wildcard would let any other
-marketplace shipping a plugin named `memhub` supply the code this hook runs.
-Pinning removes that without giving up upgrade-safety.
-
-**Trust assumption.** The bridge runs scripts from the highest-versioned directory
-under `~/.codex/plugins/cache/xtrace-plugins/memhub/`,
-without verifying a signature or hash. That directory is inside your own home:
-writing a higher-versioned sibling there requires the ability to write your home
-directory, and anything with that ability can already rewrite `~/.codex/hooks.json`
-(which *defines* this hook), edit the installed plugin in place, or alter your
-shell startup — so the bridge is not a distinct escalation path, and a hash
-stored in that same writable tree would verify nothing an attacker couldn't also
-change. The assumption, stated plainly, is that `~/.codex/plugins/cache/` is
-written only by the Codex plugin installer and by you. Pinning an exact version
-instead would trade this for a concrete regression: capture silently stops on
-every plugin upgrade until the pin is bumped.
-
-Four implementation facts matter if you edit the bridge:
-
-* every handler drains stdin;
-* one dispatcher per event keeps the review surface to three command hashes;
-* `"async": true` hooks are killed with `codex exec`, so capture detaches from
-  the synchronous trampoline itself;
-* Codex ignores plain text from `PreToolUse` and `PostToolUse`; model-visible
-  bridge output uses `hookSpecificOutput.additionalContext`.
-
-## 4. Auto-capture via `notify` (legacy, verify on your Codex version)
-
-Predates the bridge and is strictly worse — it imports whole rollouts on a
-debounce rather than flushing incrementally, and Codex allows only ONE `notify`
-program, so this conflicts with anything else already using that slot (the
-ChatGPT desktop client claims it). Prefer the bridge above.
-
-Codex's `notify` config runs a program on session events. Point it at a wrapper
-that imports the newest rollout when a session ends:
-
-```toml
-# ~/.codex/config.toml
-notify = ["python3", "/absolute/path/to/codex/codex_notify.py"]
+```bash
+codex mcp login memhub --oauth-client-registration cimd
 ```
 
-`codex_notify.py` is a thin filter: on a turn/session-completion event it runs
-`import_codex_session.py` detached, with a debounce (one auto-import per ~2 min)
-so a burst of turns doesn't re-send the whole rollout each time. It imports the
-session named in the notify event when the payload identifies one; otherwise it
-falls back to `--session latest` (the newest rollout by mtime), which is the
-right session only when a **single** Codex session is active — with concurrent
-sessions, prefer the manual import. Whether Codex emits a usable completion
-event (and which id fields it carries) varies by version — confirm with your
-build before relying on it; the manual import above always works.
+Open the printed URL and complete the browser approval. The authorization URL
+should identify Codex with a client metadata document under
+`https://chatgpt.com/oauth/codex/`; it should not contain MemHub's legacy static
+OAuth client id.
+
+This login enables interactive tools such as `search_memory`, `save_artifact`,
+and `import_conversation`. It does not authenticate automatic capture.
+
+## 2. Authenticate automatic capture
+
+Start a new Codex task and ask:
+
+```text
+Log in to MemHub
+```
+
+The installed `login` skill opens a separate browser flow and provisions the
+90-day personal access key used by background hooks. The connector login from
+the previous step lives in Codex's credential store and is not available to
+those hook processes, so both logins are required.
+
+## 3. Install and approve the hooks bridge
+
+Ask Codex:
+
+```text
+Set up MemHub
+```
+
+Codex 0.148 and 0.149 support user-level hooks but do not mount hooks bundled
+inside an installed plugin. The `setup` skill therefore merges three MemHub
+handlers into `~/.codex/hooks.json` while preserving unrelated hooks:
+
+- `PreToolUse`: situated directive recall;
+- `PostToolUse`: reactive recall, artifact reminders, and milestone capture;
+- `Stop`: incremental session capture.
+
+MemHub cannot approve its own command hooks. Restart Codex, choose **Review
+hooks** or open `/hooks`, and trust only handlers with both of these traits:
+
+- source: `User config - ~/.codex/hooks.json`;
+- command contains: `memhub_hook_bridge.py`.
+
+There should be one MemHub handler under each of `PreToolUse`, `PostToolUse`,
+and `Stop`. Review any other waiting hooks separately instead of choosing
+**Trust all**.
+
+## 4. Connect the repository to its team brain
+
+From the repository you want MemHub to remember, ask Codex:
+
+```text
+Onboard MemHub for this repo
+```
+
+The `onboard` skill creates or selects the repository's shared agent brain,
+stores the routing choice in the user's MemHub configuration, seeds the brain
+from one substantive session, and verifies recall. Until a repository brain
+exists, authenticated capture can still write to personal memory.
+
+## Updating MemHub
+
+Refresh the Git marketplace and reinstall the plugin package:
+
+```bash
+codex plugin marketplace upgrade xtrace-plugins
+codex plugin remove memhub@xtrace-plugins
+codex plugin add memhub@xtrace-plugins
+```
+
+Restart Codex after updating. The hooks bridge follows the installed plugin
+version, so a normal update does not require rewriting `~/.codex/hooks.json`.
+Asking Codex to `Set up MemHub` again is safe and verifies the bridge and
+capture credential.
+
+## Troubleshooting callback URL mismatch
+
+The supported plugin login uses Codex's client metadata document (CIMD). A
+manual global `memhub` MCP entry can shadow the plugin server and force the old
+static OAuth client instead. The visible symptom is an Auth0 error like:
+
+```text
+unauthorized_client: Callback URL mismatch
+```
+
+This commonly follows a command that manually adds `memhub` with an OAuth
+client id. Adding the reported random loopback port to Auth0 is not a fix; the
+port changes between login attempts.
+
+1. Fully exit Codex.
+2. Clear credentials for the shadowing entry. If this reports that it was not
+   logged in, continue:
+
+   ```bash
+   codex mcp logout memhub
+   ```
+
+3. Remove only the global MCP configuration. This does not remove the MCP
+   server supplied by the installed plugin:
+
+   ```bash
+   codex mcp remove memhub
+   ```
+
+4. Confirm no manual section remains:
+
+   ```bash
+   grep -n '^\[mcp_servers\.memhub' ~/.codex/config.toml
+   ```
+
+   Expected: no output.
+
+5. Confirm the plugin-provided server still appears, then use CIMD explicitly:
+
+   ```bash
+   codex mcp list
+   codex mcp login memhub --oauth-client-registration cimd
+   ```
+
+The new authorization URL's decoded `client_id` should begin with
+`https://chatgpt.com/oauth/codex/`. If it is a short Auth0 application id, a
+manual configuration is still taking precedence.
+
+## Troubleshooting a local or stale marketplace
+
+Pulling a source checkout does not update an installed Codex plugin. Check the
+configured marketplace source:
+
+```bash
+codex plugin marketplace list --json
+```
+
+The public `xtrace-plugins` marketplace should be Git-backed by
+`https://github.com/XTraceAI/agent-plugins.git`. If it points at an old local
+clone, replace the registration and reinstall:
+
+```bash
+codex plugin remove memhub@xtrace-plugins
+codex plugin marketplace remove xtrace-plugins
+codex plugin marketplace add XTraceAI/agent-plugins
+codex plugin add memhub@xtrace-plugins
+```
+
+Removing a local marketplace registration does not delete its source checkout
+or its branches.
+
+## Developer reference
+
+The installed plugin reads Codex rollouts through
+`plugins/memhub/scripts/readers/codex.py` and routes imports through
+`plugins/memhub/scripts/capture.py`. Files under this repository's `codex/`
+directory other than this guide are compatibility shims for older workflows;
+new users should use the installed skills and plugin commands above.
+
+Focused Codex integration tests:
+
+```bash
+python3 tests/codex_capture_test.py
+python3 tests/codex_hooks_setup_test.py
+python3 tests/codex_hooks_parity_test.py
+```
