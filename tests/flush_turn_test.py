@@ -428,6 +428,57 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
             ft._log = originals["log"]
 
 
+def test_inert_filtered_delta_preserves_pr_url_evidence():
+    """Out-of-band PR evidence survives even when its records are not sent.
+
+    Slash-command filtering and redaction are allowed to consume a delta without
+    a server round-trip. The raw paired tool result still has an independent
+    lifetime: advancing the transcript offset must first make its exact URL
+    durable for a later turn or SessionEnd replay.
+    """
+    print("inert filtered PR URL provenance")
+    url = "https://github.com/xtraceai/agent-plugins/pull/654"
+    originals = {
+        "state_dir": ft.STATE_DIR,
+        "drop_command_wrappers": ft.drop_command_wrappers,
+        "resolve_bearer": ft.resolve_bearer,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        transcript = Path(tmp) / "session.jsonl"
+        size = _write(transcript, [
+            {"type": "assistant", "uuid": "u0",
+             "message": {"role": "assistant", "content": [{
+                 "type": "tool_use", "id": "create", "name": "Bash",
+                 "input": {"command": "gh pr create --fill"},
+             }]}},
+            {"type": "user", "uuid": "u1",
+             "message": {"role": "user", "content": [{
+                 "type": "tool_result", "tool_use_id": "create",
+                 "content": f"Created {url}",
+             }]}},
+        ])
+        ft.STATE_DIR = Path(tmp) / "state"
+        ft.drop_command_wrappers = lambda _records: []
+
+        def unexpected_auth():
+            raise AssertionError("an inert delta must not resolve auth")
+
+        ft.resolve_bearer = unexpected_auth
+        try:
+            asyncio.run(ft._flush("session-inert-pr", str(transcript)))
+            state = ft._read_state("session-inert-pr")
+            check("inert delta advances its offset", state.get("offset"), size)
+            check("inert delta keeps URL pending",
+                  state.get("pending_pr_urls"), [url])
+            check("inert delta has no accepted URLs",
+                  state.get("accepted_pr_urls"), [])
+        finally:
+            ft.STATE_DIR = originals["state_dir"]
+            ft.drop_command_wrappers = originals["drop_command_wrappers"]
+            ft.resolve_bearer = originals["resolve_bearer"]
+
+
 def test_timeout_override_never_breaks_the_hook():
     """The override is parsed at CALL time and floors at the default. Parsing it
     at import meant a bad value crashed the module before the handler that keeps

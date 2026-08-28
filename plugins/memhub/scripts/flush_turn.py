@@ -337,6 +337,17 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if not records:
         return
 
+    accepted_pr_urls = pr_provenance.merge_urls(
+        state.get("accepted_pr_urls") or [])
+    accepted_pr_url_set = set(accepted_pr_urls)
+    pending_pr_urls = [
+        url for url in pr_provenance.merge_urls(
+            state.get("pending_pr_urls") or [],
+            pr_provenance.urls_from_tool_results(records),
+        )
+        if url not in accepted_pr_url_set
+    ]
+
     # Only user / assistant / attachment records carry ``cwd`` — the UI sidecar
     # types (mode, last-prompt, ai-title, …) never do. A delta made up solely of
     # sidecars therefore resolves no cwd, and without the remembered one this
@@ -347,7 +358,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Checked BEFORE resolving cwd, because resolving shells out to git and an
     # inert delta should cost nothing at all.
     # Slash-command bookkeeping never leaves the machine. Dropped from what is
-    # SENT, not from what is read: the metadata harvest below still sees every
+    # SENT, not from what is read: the metadata harvest above still sees every
     # record, and the cursor still advances past these, because they are
     # deliberately never shipped rather than deferred.
     # Redact AFTER filtering and before anything leaves the machine. Applied to
@@ -368,6 +379,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             fields["title"] = inert_title
         if inert_custom:
             fields["custom_title"] = inert_custom
+        if pending_pr_urls or accepted_pr_urls:
+            fields["pending_pr_urls"] = pending_pr_urls
+            fields["accepted_pr_urls"] = accepted_pr_urls
         # Plain ``_save_state``, NOT ``_mark_success`` — deliberately. This
         # branch returns above ``resolve_url_and_auth`` and never touches the
         # network, so reaching it says nothing about whether the server or the
@@ -393,16 +407,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # Remembered, so this is a dict lookup rather than re-running git.
         namespace = state.get("namespace") or None
 
-    accepted_pr_urls = pr_provenance.merge_urls(
-        state.get("accepted_pr_urls") or [])
-    accepted_pr_url_set = set(accepted_pr_urls)
-    pending_pr_urls = [
-        url for url in pr_provenance.merge_urls(
-            state.get("pending_pr_urls") or [],
-            pr_provenance.urls_from_tool_results(records),
-        )
-        if url not in accepted_pr_url_set
-    ]
     # The transcript cursor cannot advance until the import commits, but PR URL
     # evidence has its own lifetime: an auth or transport failure must not make
     # a trusted `gh pr create` result disappear when this delta is retried later.
