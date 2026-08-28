@@ -563,15 +563,18 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     ENG-675b). Cursor's artifacts only carry clocks for SOME records (user
     turns' embedded tags, store checkpoint nodes), so this fills the gap with
     the one other real clock available: the moment THIS hook first observed
-    the record. ANY hook's observation qualifies — the record provably
-    exists at that instant, so first-seen bounds its production time from
-    above by the gap since the previous event. Boundary hooks
-    (afterAgentResponse / stop / beforeSubmitPrompt) are the common
-    observers, but a mid-turn edit hook that sees a record FIRST dates it
-    TIGHTER than waiting for the turn's end would — matching Claude
-    transcripts, whose records carry per-record production times, not
-    turn-boundary times. What first-seen is never: the import/flush clock of
-    a whole-session re-send, the degeneracy this replaces (a 44-turn
+    the record. Once a session is UNDER OBSERVATION, any hook's sighting
+    qualifies — the record provably exists at that instant, so first-seen
+    bounds its production time from above by the gap since the previous
+    event. Boundary hooks (afterAgentResponse / stop / beforeSubmitPrompt)
+    are the common observers, but a mid-turn edit hook that sees a record
+    first dates it TIGHTER than waiting for the turn's end would — matching
+    Claude transcripts, whose records carry per-record production times, not
+    turn-boundary times. The session's FIRST-EVER observation is the one
+    exception: its pre-existing backlog predates any hook by an unknowable
+    margin, so those records are marked unmeasured rather than dated (the
+    pinning rules below). What first-seen is never: the import/flush clock
+    of a whole-session re-send, the degeneracy this replaces (a 44-turn
     production session dated at a single instant).
 
     Pinning: the first stamp a record ever gets — artifact-carried or
