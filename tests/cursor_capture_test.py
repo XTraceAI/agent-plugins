@@ -434,6 +434,41 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
         "stop", {}, state, {"blob-1"}, later,
         provenance_pending=retry_due)
     assert _pr_url_retry_due(
+        pending=True, new_urls=False, event="sessionEnd",
+        state=state, now=later)
+
+    # SessionEnd gets one terminal unchanged-content attempt after the normal
+    # cap, and persists that fact before the server can respond without an ack.
+    try:
+        cursor_flush.current_blob_ids = lambda _path: {"blob-1"}
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        cursor_flush.mcp_http.Session = OlderServer
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/store.db"), {"blob-1"},
+            source_kind="store", records=[{
+                "type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "hello"},
+            }], meta={"cwd": None, "title": None},
+            pending_pr_urls=[url], final_provenance_attempt=True))
+    finally:
+        cursor_flush.current_blob_ids = originals["current_blob_ids"]
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert state["pr_url_session_end_attempted"] is True
+    assert not _pr_url_retry_due(
+        pending=True, new_urls=False, event="sessionEnd",
+        state=state, now=later)
+    assert _pr_url_retry_due(
         pending=True, new_urls=True, event="afterShellExecution",
         state=state, now=later)
 
@@ -474,6 +509,7 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
     assert state["pending_pr_urls"] == []
     assert state["accepted_pr_urls"] == [url]
     assert state["pr_url_unconfirmed"] == 0
+    assert state["pr_url_session_end_attempted"] is False
     print("PASS test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks")
 
 

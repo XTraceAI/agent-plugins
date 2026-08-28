@@ -772,6 +772,12 @@ def _pr_url_retry_due(
         unconfirmed = 0
     if new_urls:
         unconfirmed = 0
+    # Preserve one terminal backstop even after ordinary provenance-only
+    # retries are exhausted. The marker is persisted before auth/network work,
+    # so a duplicated sessionEnd cannot turn this into an upload loop.
+    if (event == "sessionEnd" and
+            state.get("pr_url_session_end_attempted") is not True):
+        return True
     if unconfirmed >= MAX_PR_URL_UNCONFIRMED:
         # The cap disables only unchanged-content provenance retries. New
         # transcript content still passes should_flush's normal watermark gate,
@@ -903,7 +909,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  source_revision: str | None = None,
                  records: list[dict], meta: dict,
                  applied_usage: set[str] | None = None,
-                 pending_pr_urls: list[str] | None = None) -> None:
+                 pending_pr_urls: list[str] | None = None,
+                 final_provenance_attempt: bool = False) -> None:
     # ``records``/``meta`` are REQUIRED: reading, stamping, and persisting
     # pins is main()'s job, in that order, under the session lock. A
     # self-read fallback here shipped records that bypassed that flow —
@@ -966,6 +973,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
             # obeys the normal dormant retry interval instead of re-entering
             # this branch on every hook event.
             fields["pr_url_attempt_at"] = time.time()
+            if final_provenance_attempt:
+                fields["pr_url_session_end_attempted"] = True
         if (source_kind == "transcript" and source_revision and not records):
             fields["transcript_revision"] = source_revision
         _save_state(uuid, **fields)
@@ -977,7 +986,10 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # This timestamp controls provenance-only retries. Persist it before
         # every fallible auth/routing/network step so a failed attempt backs off
         # instead of re-reading and re-sending on every later hook event.
-        _save_state(uuid, pr_url_attempt_at=time.time())
+        attempt_fields = {"pr_url_attempt_at": time.time()}
+        if final_provenance_attempt:
+            attempt_fields["pr_url_session_end_attempted"] = True
+        _save_state(uuid, **attempt_fields)
 
     try:
         url, bearer = await asyncio.to_thread(resolve_bearer)
@@ -1150,6 +1162,10 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
               "pending_pr_urls": pending_pr_urls,
               "accepted_pr_urls": accepted_pr_urls,
               "pr_url_unconfirmed": pr_url_unconfirmed,
+              "pr_url_session_end_attempted": (
+                  state.get("pr_url_session_end_attempted") is True
+                  if pending_pr_urls else False
+              ),
               "pr_url_attempt_at": state.get("pr_url_attempt_at", 0)}
     if source_kind == "store":
         # On a CONFIRMED import, advance the watermark even when the post-read
@@ -1332,6 +1348,7 @@ def main() -> int:
             # A newly discovered URL gets its own bounded confirmation budget;
             # an older permanently-unacknowledged URL must not starve it.
             fields["pr_url_unconfirmed"] = 0
+            fields["pr_url_session_end_attempted"] = False
         fields["pending_pr_urls"] = pending_pr_urls
         fields["accepted_pr_urls"] = accepted_pr_urls
 
@@ -1372,7 +1389,10 @@ def main() -> int:
                     uuid, source_path, blob_ids, mode,
                     source_kind=source_kind, source_revision=source_revision,
                     records=records, meta=meta, applied_usage=applied_usage,
-                    pending_pr_urls=pending_pr_urls),
+                    pending_pr_urls=pending_pr_urls,
+                    final_provenance_attempt=(
+                        event == "sessionEnd" and provenance_pending
+                    )),
                 timeout=FLUSH_TIMEOUT_S))
         except Exception as e:
             # A timeout or any raise past _flush's own handlers (the broad
