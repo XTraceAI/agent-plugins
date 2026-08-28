@@ -46,6 +46,12 @@ def test_import_request_uses_requested_platform() -> None:
         pass
     else:
         raise AssertionError("unknown platform was accepted")
+    provenance = {
+        "github_pr_urls": ["https://github.com/xtraceai/agent-plugins/pull/1"],
+    }
+    args = import_session.import_call_args(
+        [], "conversation", "cursor", provenance)
+    assert args["provenance"] == provenance
     print("PASS test_import_request_uses_requested_platform")
 
 

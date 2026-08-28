@@ -217,6 +217,7 @@ def test_main_flow_pins_persist_and_ship():
                 f"{SESSION}.jsonl")
         calls: list[list[dict]] = []
         clock = {"now": NOW_1}
+        git_clock = {"branch": "feature/one"}
         originals = {
             "state_dir": cursor_flush.STATE_DIR,
             "projects": cursor_flush._CURSOR_PROJECTS,
@@ -225,6 +226,7 @@ def test_main_flow_pins_persist_and_ship():
             "flush": cursor_flush._flush,
             "log": cursor_flush._log,
             "now_iso": cursor_flush._now_iso,
+            "snapshot_branch": cursor_flush.git_provenance.snapshot_branch,
         }
 
         revisions: list[str] = []
@@ -246,6 +248,8 @@ def test_main_flow_pins_persist_and_ship():
             cursor_flush._flush = fake_flush
             cursor_flush._log = lambda _message: None
             cursor_flush._now_iso = lambda: clock["now"]
+            cursor_flush.git_provenance.snapshot_branch = lambda _cwd: (
+                True, git_clock["branch"])
 
             _write_rows(path, TURN_1)
             assert _run_main("afterAgentResponse", _payload(
@@ -256,6 +260,8 @@ def test_main_flow_pins_persist_and_ship():
             # backlog; the mid-turn record has no real clock and stays
             # unmeasured.
             assert _stamps_of(calls[0]) == [ISO_1, ISO_1, None, NOW_1]
+            assert {record.get("gitBranch") for record in calls[0]} == {
+                "feature/one"}
             assert calls[0][3]["message"]["usage"]["input_tokens"] == 100
             state = cursor_flush._read_state(SESSION)
             assert sorted(state["record_ts"].values(),
@@ -267,6 +273,7 @@ def test_main_flow_pins_persist_and_ship():
             # unmeasured one), whatever the wall clock now says.
             _write_rows(path, TURN_1 + TURN_2)
             clock["now"] = NOW_2
+            git_clock["branch"] = "feature/two"
             assert _run_main("stop", _payload(
                 path, "stop", GEN_2, "SECOND")) == 0
             assert len(calls) == 2
@@ -274,6 +281,9 @@ def test_main_flow_pins_persist_and_ship():
                 ISO_1, ISO_1, None, NOW_1, ISO_2, NOW_2, NOW_2]
             assert calls[1][6]["message"]["usage"]["input_tokens"] == 100
             assert _stamps_of(calls[1])[:4] == _stamps_of(calls[0])
+            assert [record.get("gitBranch") for record in calls[1]] == [
+                "feature/one", "feature/one", "feature/one", "feature/one",
+                "feature/two", "feature/two", "feature/two"]
 
             # A third boundary with NO new content but a fresh usage sample:
             # the send is forced by usage_pending, and the content revision
@@ -326,6 +336,8 @@ def test_main_flow_pins_persist_and_ship():
                 ISO_1, ISO_1, None, None, ISO_2, None, None, None]
             cursor_flush.apply_session_state(records, SESSION)
             assert _stamps_of(records) == _stamps_of(calls[3])
+            assert [record.get("gitBranch") for record in records] == [
+                record.get("gitBranch") for record in calls[3]]
             assert records[3]["message"]["usage"]["input_tokens"] == 100
             assert records[7]["message"]["usage"]["input_tokens"] == 100
         finally:
@@ -336,6 +348,8 @@ def test_main_flow_pins_persist_and_ship():
             cursor_flush._flush = originals["flush"]
             cursor_flush._log = originals["log"]
             cursor_flush._now_iso = originals["now_iso"]
+            cursor_flush.git_provenance.snapshot_branch = originals[
+                "snapshot_branch"]
     print("PASS test_main_flow_pins_persist_and_ship")
 
 

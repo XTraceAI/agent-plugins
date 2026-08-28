@@ -284,6 +284,139 @@ def test_real_platform_is_unconditional():
     print("PASS test_real_platform_is_unconditional")
 
 
+def test_branch_pins_persist_before_auth_and_survive_checkout():
+    state: dict = {}
+    branch = {"value": "feature/one"}
+    records = {"value": [{
+        "type": "user", "uuid": "u1",
+        "message": {"role": "user", "content": "one"},
+    }]}
+    originals = {
+        "to_canonical": codex_flush.codex_reader.to_canonical,
+        "read_state": codex_flush._read_state,
+        "save_state": codex_flush._save_state,
+        "snapshot_branch": codex_flush.git_provenance.snapshot_branch,
+        "redact_records": codex_flush.redact_records,
+        "resolve_bearer": codex_flush.resolve_bearer,
+        "log": codex_flush._log,
+    }
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        codex_flush.codex_reader.to_canonical = lambda _path: (
+            [dict(record) for record in records["value"]],
+            {"cwd": "/repo", "title": None})
+        codex_flush._read_state = lambda _sid: dict(state)
+        codex_flush._save_state = save_state
+        codex_flush.git_provenance.snapshot_branch = lambda _cwd: (
+            True, branch["value"])
+        codex_flush.redact_records = lambda value: value
+        # Auth failure happens after the provenance save and no network client
+        # is created. This is the retry path the pin map must survive.
+        codex_flush.resolve_bearer = lambda: ("https://example.test/mcp", None)
+        codex_flush._log = lambda _message: None
+
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+        assert state["record_git_branches"] == {"u1": "feature/one"}
+
+        records["value"].append({
+            "type": "assistant", "uuid": "u2",
+            "message": {"role": "assistant", "content": "two"},
+        })
+        branch["value"] = "feature/two"
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 200))
+        assert state["record_git_branches"] == {
+            "u1": "feature/one", "u2": "feature/two"}
+    finally:
+        codex_flush.codex_reader.to_canonical = originals["to_canonical"]
+        codex_flush._read_state = originals["read_state"]
+        codex_flush._save_state = originals["save_state"]
+        codex_flush.git_provenance.snapshot_branch = originals[
+            "snapshot_branch"]
+        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.resolve_bearer = originals["resolve_bearer"]
+        codex_flush._log = originals["log"]
+    print("PASS test_branch_pins_persist_before_auth_and_survive_checkout")
+
+
+def test_codex_pr_url_ack_clears_only_server_accepted_evidence():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    state: dict = {}
+    seen: list[dict] = []
+    originals = {
+        "to_canonical": codex_flush.codex_reader.to_canonical,
+        "read_state": codex_flush._read_state,
+        "save_state": codex_flush._save_state,
+        "snapshot_branch": codex_flush.git_provenance.snapshot_branch,
+        "redact_records": codex_flush.redact_records,
+        "resolve_bearer": codex_flush.resolve_bearer,
+        "session": codex_flush.mcp_http.Session,
+        "log": codex_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": "codex-session-1",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": [url]},
+                },
+                content=[], isError=False)
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        codex_flush.codex_reader.to_canonical = lambda _path: ([{
+            "type": "user", "uuid": "u1",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "content": f"Created {url}",
+            }]},
+        }], {
+            "cwd": None, "title": None,
+            "git": {"repository_url":
+                    "https://github.com/XTraceAI/agent-plugins.git"},
+        })
+        codex_flush._read_state = lambda _sid: dict(state)
+        codex_flush._save_state = save_state
+        codex_flush.git_provenance.snapshot_branch = lambda _cwd: (False, None)
+        codex_flush.redact_records = lambda records: records
+        codex_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        codex_flush.mcp_http.Session = Session
+        codex_flush._log = lambda _message: None
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+    finally:
+        codex_flush.codex_reader.to_canonical = originals["to_canonical"]
+        codex_flush._read_state = originals["read_state"]
+        codex_flush._save_state = originals["save_state"]
+        codex_flush.git_provenance.snapshot_branch = originals[
+            "snapshot_branch"]
+        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.resolve_bearer = originals["resolve_bearer"]
+        codex_flush.mcp_http.Session = originals["session"]
+        codex_flush._log = originals["log"]
+
+    assert seen[0]["provenance"] == {
+        "github_pr_urls": [url],
+        "git": {"repository_url":
+                "https://github.com/XTraceAI/agent-plugins.git"},
+    }
+    assert state["pending_pr_urls"] == []
+    assert state["accepted_pr_urls"] == [url]
+    print("PASS test_codex_pr_url_ack_clears_only_server_accepted_evidence")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

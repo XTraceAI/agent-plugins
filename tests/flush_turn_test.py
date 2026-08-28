@@ -8,12 +8,14 @@ captured correctly — so they are asserted here instead.
 Run: python3 flush_turn_test.py   (stdlib only; the mcp import in flush_turn
 is lazy, inside _flush.)
 """
+import asyncio
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 # The tests live outside the plugin so they are not shipped to users;
@@ -335,6 +337,89 @@ def test_a_title_never_carries_a_credential():
     check("ordinary titles are untouched",
           ft._titles([{"type": "custom-title", "customTitle": "fix the auth bug"}], {})[0],
           "fix the auth bug")
+
+
+def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
+    """Trusted tool output is durable before auth and removed only on server ack."""
+    print("PR URL provenance retry")
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    originals = {
+        "state_dir": ft.STATE_DIR,
+        "namespace": ft._namespace,
+        "resolve_bearer": ft.resolve_bearer,
+        "resolve_repo_brain": ft.resolve_repo_brain,
+        "env_for_url": ft.env_for_url,
+        "session": ft.mcp_http.Session,
+        "git_resolve": ft.git_provenance.resolve,
+        "log": ft._log,
+    }
+    seen = []
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": "session-pr",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": [url]},
+                },
+                content=[], isError=False,
+            )
+
+    async def no_room(_session, _cwd, _env):
+        return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        transcript = Path(tmp) / "session.jsonl"
+        _write(transcript, [{
+            "type": "user", "uuid": "u1", "cwd": "/repo",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "content": f"Created {url}",
+            }]},
+        }])
+        ft.STATE_DIR = Path(tmp) / "state"
+        ft._namespace = lambda _records: ("/repo", "agent-plugins")
+        ft.resolve_repo_brain = no_room
+        ft.env_for_url = lambda _url: "staging"
+        ft.git_provenance.resolve = lambda _cwd: {
+            "branch": "feature/pr-link",
+            "repository_url": "https://github.com/XTraceAI/agent-plugins.git",
+        }
+        ft._log = lambda _message: None
+        try:
+            ft.resolve_bearer = lambda: ("https://example.test/mcp", None)
+            try:
+                asyncio.run(ft._flush("session-pr", str(transcript)))
+            except ft._NoCredential:
+                pass
+            state = ft._read_state("session-pr")
+            check("auth failure keeps URL pending", state.get("pending_pr_urls"), [url])
+            check("auth failure keeps cursor pinned", state.get("offset"), None)
+
+            ft.resolve_bearer = lambda: ("https://example.test/mcp", "token")
+            ft.mcp_http.Session = Session
+            asyncio.run(ft._flush("session-pr", str(transcript)))
+            state = ft._read_state("session-pr")
+            check("ack clears pending URL", state.get("pending_pr_urls"), [])
+            check("ack remembers accepted URL", state.get("accepted_pr_urls"), [url])
+            check("provenance sent once", seen[0].get("provenance"), {
+                "github_pr_urls": [url],
+                "git": {"repository_url":
+                        "https://github.com/XTraceAI/agent-plugins.git"},
+            })
+        finally:
+            ft.STATE_DIR = originals["state_dir"]
+            ft._namespace = originals["namespace"]
+            ft.resolve_bearer = originals["resolve_bearer"]
+            ft.resolve_repo_brain = originals["resolve_repo_brain"]
+            ft.env_for_url = originals["env_for_url"]
+            ft.mcp_http.Session = originals["session"]
+            ft.git_provenance.resolve = originals["git_resolve"]
+            ft._log = originals["log"]
 
 
 def test_timeout_override_never_breaks_the_hook():

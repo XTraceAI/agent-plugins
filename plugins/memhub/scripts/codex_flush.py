@@ -37,6 +37,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
+import git_provenance  # noqa: E402
+import pr_provenance  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
@@ -440,6 +442,29 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
     records, meta = codex_reader.to_canonical(rollout)
+    state = _read_state(sid)
+    accepted_pr_urls = pr_provenance.merge_urls(
+        state.get("accepted_pr_urls") or [])
+    accepted_pr_url_set = set(accepted_pr_urls)
+    pending_pr_urls = [
+        url for url in pr_provenance.merge_urls(
+            state.get("pending_pr_urls") or [],
+            pr_provenance.urls_from_tool_results(records),
+        )
+        if url not in accepted_pr_url_set
+    ]
+    branch_observed, branch = git_provenance.snapshot_branch(meta.get("cwd"))
+    record_git_branches = git_provenance.pin_record_branches(
+        records, state.get("record_git_branches"),
+        observed=branch_observed, branch=branch)
+    # Persist provenance before auth, routing, or network work. A failed send
+    # after checkout therefore retries each deterministic UUID with the branch
+    # it had when first observed instead of relabeling the old turn.
+    _save_state(
+        sid, record_git_branches=record_git_branches,
+        pending_pr_urls=pending_pr_urls,
+        accepted_pr_urls=accepted_pr_urls,
+    )
     sendable = redact_records(records)
     if not sendable:
         # Nothing to send. Empty is normal for a rollout with no user turns
@@ -518,6 +543,10 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             arguments["org_id"] = room["org_id"]
     if namespace:
         arguments["namespace"] = namespace
+    provenance = pr_provenance.import_provenance(
+        pending_pr_urls, meta.get("git"))
+    if provenance:
+        arguments["provenance"] = provenance
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         # Bound a semi-trusted session title (store content, like cwd): a
@@ -553,10 +582,19 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _note_failure(sid, "unconfirmed_import")
         return
 
+    ack = mcp_http.ack_of(res, f"codex-{sid}")
+    accepted_now = pr_provenance.accepted_urls(ack)
+    accepted_pr_urls = pr_provenance.merge_urls(
+        accepted_pr_urls, accepted_now)
+    accepted_set = set(accepted_pr_urls)
+    pending_pr_urls = [url for url in pending_pr_urls
+                       if url not in accepted_set]
     _save_state(sid, rollout_size=size, last_ok_at=time.time(),
                 last_error=None, last_error_at=0,
                 # The re-probe worked: this server confirms after all.
                 unsupported=False, unsupported_at=0,
+                pending_pr_urls=pending_pr_urls,
+                accepted_pr_urls=accepted_pr_urls,
                 fail_streak=0)
     _log(f"flushed {len(sendable)} records → codex-{sid}"
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))

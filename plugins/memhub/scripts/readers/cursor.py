@@ -59,6 +59,8 @@ import sqlite3
 import uuid as _uuid
 from pathlib import Path
 
+import git_provenance
+
 HOST = "cursor"
 
 _CHATS = Path.home() / ".cursor" / "chats"
@@ -372,7 +374,9 @@ def _model_of(obj) -> str | None:
 
 def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                   session_id: str, cwd: str | None, model_hint: str | None,
-                  created_ts: str | None) -> tuple[list[dict], dict]:
+                  created_ts: str | None,
+                  provenance: dict[str, str] | None = None
+                  ) -> tuple[list[dict], dict]:
     """Transform either native source after it has yielded ordered messages.
 
     Each message's ``ts`` is a clock the artifact carries FOR IT (or None —
@@ -380,10 +384,14 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
     """
     ts_holder: dict = {"ts": None}
     out: list[dict] = []
+    provenance = provenance or {}
+    branch = provenance.get("branch")
 
     def rec(record: dict) -> dict:
         if cwd:
             record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
         # uuid is the server's per-record replay-dedup key — records without
         # one are SKIPPED by the agentic parser (imported as nothing).
         # Deterministic over (session, output index) so re-flushes fold.
@@ -493,6 +501,8 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 
     meta = {"session_id": session_id, "cwd": cwd, "model": model,
             "title": title, "host": HOST}
+    if provenance:
+        meta["git"] = provenance
     return out, meta
 
 
@@ -561,7 +571,7 @@ def to_canonical(path, *, session_id: str | None = None,
         created_ts = next((ts for _, ts in messages if ts), None)
         return _canonicalize(
             messages, session_id=sid, cwd=cwd, model_hint=model,
-            created_ts=created_ts)
+            created_ts=created_ts, provenance=git_provenance.resolve(cwd))
 
     session_dir = source.parent
     mj = _read_meta_json(session_dir) or {}
@@ -580,4 +590,5 @@ def to_canonical(path, *, session_id: str | None = None,
                 for message, node_ts in _load_messages(source)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))
+        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")),
+        provenance=git_provenance.resolve(store_cwd))

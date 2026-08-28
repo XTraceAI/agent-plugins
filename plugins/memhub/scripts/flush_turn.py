@@ -64,7 +64,9 @@ from transcript_filter import drop_command_wrappers  # noqa: E402
 # logic, where the silent failures live, be tested without the dependency.
 # Nothing here needs the SDK any more, so the indirection went with it.
 import atomic_write  # noqa: E402
+import git_provenance  # noqa: E402
 import mcp_http  # noqa: E402
+import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
@@ -391,6 +393,29 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # Remembered, so this is a dict lookup rather than re-running git.
         namespace = state.get("namespace") or None
 
+    accepted_pr_urls = pr_provenance.merge_urls(
+        state.get("accepted_pr_urls") or [])
+    accepted_pr_url_set = set(accepted_pr_urls)
+    pending_pr_urls = [
+        url for url in pr_provenance.merge_urls(
+            state.get("pending_pr_urls") or [],
+            pr_provenance.urls_from_tool_results(records),
+        )
+        if url not in accepted_pr_url_set
+    ]
+    # The transcript cursor cannot advance until the import commits, but PR URL
+    # evidence has its own lifetime: an auth or transport failure must not make
+    # a trusted `gh pr create` result disappear when this delta is retried later.
+    # Persist the queue before any credential, room, or network work.
+    if pending_pr_urls or accepted_pr_urls:
+        _save_state(
+            session_id,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
+
+    git_meta = git_provenance.resolve(cwd)
+
     # This delta's title if it carries one, else whatever we last saw.
     title, custom = _titles(records, state)
     # In a THREAD, because resolving can renew the token — two blocking urllib
@@ -452,6 +477,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # conversation rather than sticking at whatever the first
         # turn happened to be called.
         arguments["title"] = title
+    provenance = pr_provenance.import_provenance(pending_pr_urls, git_meta)
+    if provenance:
+        arguments["provenance"] = provenance
     # Transport failures are CLASSIFIED here, not left to the catch-all in
     # main(). Falling through to it recorded every one as reason="error" — a
     # permanent-looking breadcrumb — which is actively wrong for the two cases
@@ -624,9 +652,16 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # delta must not be able to override, and merging a None over it
     # would let the next ``ai-title`` — which the client keeps
     # emitting with the pre-rename value — take the name back.
+    accepted_pr_urls = pr_provenance.merge_urls(
+        accepted_pr_urls, pr_provenance.accepted_urls(out))
+    accepted_pr_url_set = set(accepted_pr_urls)
+    pending_pr_urls = [
+        url for url in pending_pr_urls if url not in accepted_pr_url_set]
     _mark_success(session_id, offset=consumed,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,
+                  pending_pr_urls=pending_pr_urls,
+                  accepted_pr_urls=accepted_pr_urls,
                   **({"custom_title": custom} if custom else {}))
     # Sent count, not read count — and the byte span stays the READ
     # span, because that is what the cursor just advanced past. The

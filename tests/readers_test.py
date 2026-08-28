@@ -20,6 +20,7 @@ Run: python3 readers_test.py   (stdlib only)
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -110,6 +111,26 @@ def _write_jsonl(path: Path, records) -> Path:
     return path
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True,
+        text=True, encoding="utf-8").stdout.strip()
+
+
+def _git_repo(root: Path) -> Path:
+    repo = root / "git-repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "tests@example.com")
+    _git(repo, "config", "user.name", "MemHub Tests")
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-m", "initial")
+    _git(repo, "checkout", "-b", "feature/reader-fallback")
+    _git(repo, "remote", "add", "origin", "https://github.com/XTraceAI/demo.git")
+    return repo
+
+
 def test_codex_transform():
     recs, meta = codex.rollout_to_claude_records(CODEX_SYNTH)
     assert meta["session_id"] == "sess-abc" and meta["cwd"] == "/repo/proj", meta
@@ -140,6 +161,61 @@ def test_codex_transform():
         "cache_creation_input_tokens": 10,
     }, recs[3]
     print("PASS test_codex_transform")
+
+
+def test_codex_native_git_provenance_is_emitted_without_identity_changes():
+    rollout = [dict(record) for record in CODEX_SYNTH]
+    rollout[0] = _line("session_meta", {
+        **CODEX_SYNTH[0]["payload"],
+        "git": {
+            "branch": "feature/native-codex",
+            "commit_hash": "a" * 40,
+            "repository_url": "https://github.com/XTraceAI/agent-plugins.git",
+        },
+    })
+    baseline, _ = codex.rollout_to_claude_records(CODEX_SYNTH)
+    records, meta = codex.rollout_to_claude_records(rollout)
+    assert meta["git"] == rollout[0]["payload"]["git"]
+    assert all(record["gitBranch"] == "feature/native-codex"
+               for record in records)
+    assert [record["uuid"] for record in records] == [
+        record["uuid"] for record in baseline]
+    print("PASS test_codex_native_git_provenance_is_emitted_without_identity_changes")
+
+
+def test_codex_and_cursor_readers_fallback_to_local_git_without_guessing():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo = _git_repo(root)
+        rollout = [
+            _line("session_meta", {"id": "git-fallback", "cwd": str(repo)}),
+            _line("response_item", {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Fallback"}],
+            }),
+        ]
+        codex_records, codex_meta = codex.rollout_to_claude_records(rollout)
+
+        sid = "11111111-2222-4333-8444-555555555555"
+        transcript = _write_jsonl(root / f"{sid}.jsonl", [{
+            "role": "user", "message": {"content": "Fallback"},
+        }])
+        cursor_records, cursor_meta = cursor.to_canonical(
+            transcript, session_id=sid, cwd=str(repo))
+
+        for records, meta in ((codex_records, codex_meta),
+                              (cursor_records, cursor_meta)):
+            assert meta["git"]["branch"] == "feature/reader-fallback", meta
+            assert meta["git"]["repository_url"].endswith("XTraceAI/demo.git")
+            assert all(record["gitBranch"] == "feature/reader-fallback"
+                       for record in records)
+
+        _git(repo, "checkout", "--detach", "HEAD")
+        detached, detached_meta = cursor.to_canonical(
+            transcript, session_id=sid, cwd=str(repo))
+        assert "branch" not in detached_meta["git"], detached_meta
+        assert all("gitBranch" not in record for record in detached)
+    print("PASS test_codex_and_cursor_readers_fallback_to_local_git_without_guessing")
 
 
 def test_codex_usage_uses_cumulative_deltas():

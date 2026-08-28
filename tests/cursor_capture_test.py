@@ -117,7 +117,8 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         (ROOT / "plugins" / "memhub" / "hooks" / "cursor-hooks.json")
         .read_text(encoding="utf-8"))
     assert set(document["hooks"]) == {
-        "beforeShellExecution", "afterFileEdit", "afterAgentResponse",
+        "beforeShellExecution", "afterShellExecution", "afterFileEdit",
+        "afterAgentResponse",
         "stop", "beforeSubmitPrompt", "sessionEnd"
     }
     for event, handlers in document["hooks"].items():
@@ -221,6 +222,91 @@ def test_no_new_blobs_never_flushes():
         assert not should_flush(event, {"command": "git commit -m x"},
                                 SHIPPED, FRESH, NOW), event
     print("PASS test_no_new_blobs_never_flushes")
+
+
+def test_after_shell_flushes_only_exact_host_output_pr_urls():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    payload = {"output": f"Created pull request {url}"}
+    assert cursor_flush._event_can_flush("afterShellExecution", payload)
+    assert should_flush(
+        "afterShellExecution", payload, SHIPPED, FRESH, NOW,
+        provenance_pending=True)
+    # Command/user text is not trusted evidence, and arbitrary shell output is
+    # too chatty to justify reading and uploading the transcript.
+    assert not cursor_flush._event_can_flush(
+        "afterShellExecution", {"command": f"echo {url}"})
+    assert not cursor_flush._event_can_flush(
+        "afterShellExecution", {"output": "git status is clean"})
+    print("PASS test_after_shell_flushes_only_exact_host_output_pr_urls")
+
+
+def test_cursor_pr_url_ack_clears_only_server_accepted_evidence():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    state = {"pending_pr_urls": [url], "accepted_pr_urls": []}
+    seen: list[dict] = []
+    originals = {
+        "redact_records": cursor_flush.redact_records,
+        "resolve_bearer": cursor_flush.resolve_bearer,
+        "session": cursor_flush.mcp_http.Session,
+        "read_state": cursor_flush._read_state,
+        "save_state": cursor_flush._save_state,
+        "log": cursor_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": "cursor-session-1",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": [url]},
+                },
+                content=[], isError=False)
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        cursor_flush.mcp_http.Session = Session
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=[{
+                "type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "hello"},
+            }],
+            meta={
+                "cwd": None, "title": None,
+                "git": {"repository_url":
+                        "https://github.com/XTraceAI/agent-plugins.git"},
+            },
+            pending_pr_urls=[url]))
+    finally:
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert seen[0]["provenance"] == {
+        "github_pr_urls": [url],
+        "git": {"repository_url":
+                "https://github.com/XTraceAI/agent-plugins.git"},
+    }
+    assert state["pending_pr_urls"] == []
+    assert state["accepted_pr_urls"] == [url]
+    print("PASS test_cursor_pr_url_ack_clears_only_server_accepted_evidence")
 
 
 def test_milestone_gates_shell_events():

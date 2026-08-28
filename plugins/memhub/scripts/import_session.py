@@ -39,6 +39,8 @@ from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
+import git_provenance  # noqa: E402
+import pr_provenance  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly, read_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
@@ -57,15 +59,19 @@ SOURCE_PLATFORMS = ("claude", "codex", "cursor")
 
 
 def import_call_args(messages: list[dict], conversation_id: str,
-                     source_platform: str) -> dict:
+                     source_platform: str,
+                     provenance: dict | None = None) -> dict:
     """Build the provenance-bearing core of an import request."""
     if source_platform not in SOURCE_PLATFORMS:
         raise ValueError(f"unsupported source platform: {source_platform}")
-    return {
+    arguments = {
         "messages": messages,
         "conversation_id": conversation_id,
         "source_platform": source_platform,
     }
+    if provenance:
+        arguments["provenance"] = provenance
+    return arguments
 
 
 def load_transcript(path: Path) -> tuple[list[dict], int]:
@@ -352,6 +358,15 @@ async def main() -> int:
     # guarantee that holds on two paths out of three is not one.
     records = redact_records(records)
 
+    # Manual imports are also the backstop for automatic capture. Extract exact
+    # PR URLs from canonical tool results once, before slicing, and send the same
+    # idempotent evidence with every slice so a retry or partial import cannot
+    # strand the link on a slice that did not reach the server.
+    provenance = pr_provenance.import_provenance(
+        pr_provenance.urls_from_tool_results(records),
+        git_provenance.resolve(_cwd_from_records(records)),
+    )
+
     # An explicit --title always wins; otherwise take the name the transcript
     # itself carries, the same way per-turn capture does. Without this a plain
     # `--session X` import lands unnamed even when the client wrote a perfectly
@@ -395,6 +410,9 @@ async def main() -> int:
         print(f"agent brain     : {args.agent_brain_id}{src}")
     if namespace:
         print(f"namespace       : {namespace}")
+    if provenance:
+        print("PR provenance   : "
+              f"{len(provenance['github_pr_urls'])} exact GitHub URL(s)")
     print("-" * 56)
 
     if len(slices) > 1:
@@ -410,7 +428,7 @@ async def main() -> int:
                 s, args.agent_brain_id, args.org_id)
             for i, sl in enumerate(slices, 1):
                 call_args = import_call_args(
-                    sl, conv_id, args.source_platform)
+                    sl, conv_id, args.source_platform, provenance)
                 if args.org_id:
                     # Brains are looked up inside ONE org. Without this, an
                     # --agent-brain-id belonging to a non-default org fails

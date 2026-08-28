@@ -47,6 +47,8 @@ import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
+import git_provenance
+
 HOST = "codex"
 
 _SESSIONS = Path.home() / ".codex" / "sessions"
@@ -284,6 +286,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     synthetic user turn, keeping titles and turn counts faithful."""
     sm = _session_meta(rollout)
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
+    provenance = git_provenance.resolve(cwd, sm.get("git"))
+    branch = provenance.get("branch")
     model = None
     for r in rollout:
         pl = r.get("payload")
@@ -299,6 +303,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         "title": _title(rollout),
         "host": HOST,
     }
+    if provenance:
+        meta["git"] = provenance
 
     out: list[dict] = []
     sid_key = sm.get("id") or "unknown"
@@ -312,6 +318,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         nonlocal identity_index
         if cwd:
             record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
         # The server's agentic parser SKIPS records without a ``uuid`` (it is
         # the per-record replay-dedup key) and lifts ``event_date`` from
         # ``timestamp`` — records missing them import as nothing, silently.
@@ -343,6 +351,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         record = {"type": "user", "message": {"role": "user", "content": content}}
         if cwd:
             record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
         record["uuid"] = str(_uuid.uuid5(
             _uuid.NAMESPACE_URL,
             f"memhub:codex:{sid_key}:recovered-user:{source_index}",
