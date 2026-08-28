@@ -45,6 +45,12 @@ ERR_INVALID = -32600
 ERR_PARSE = -32700
 
 _stdout_lock = threading.Lock()
+# Credential resolution is serialized: on an install still on the OAuth cache
+# (no access key yet), resolving refreshes a stale token, and two threads
+# refreshing at once with the same refresh token would have Auth0 revoke the
+# whole token family under rotation. The second caller waits and finds the
+# refreshed cache instead.
+_auth_lock = threading.Lock()
 
 
 def _error(msg_id, code: int, message: str) -> dict:
@@ -61,7 +67,8 @@ def handle(envelope: dict, resolve=resolve_bearer,
     """
     msg_id = envelope.get("id")
     is_notification = "id" not in envelope
-    url, bearer = resolve()
+    with _auth_lock:
+        url, bearer = resolve()
     if not bearer:
         # A notification carries no id, so there is nothing to answer it with;
         # the next request will say why.
