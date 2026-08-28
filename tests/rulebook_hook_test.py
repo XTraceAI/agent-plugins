@@ -10,7 +10,7 @@ Covers the properties that make this safe to ship in everyone's harness:
 * the pre lane matches the shell-only segment (heredoc bodies stripped,
   shell after terminators kept), honors not_rx, and dedupes per
   fire_scope=session (the habituation guard);
-* `shell_only` + `evaluate()` are pure and importable — the backtest replays
+* `shell_only` + `evaluate()` are pure and importable — the tests replay
   them, so what is tested is what runs;
 * ordering rules arm on edits, discharge on a GREEN receipt only, gate the
   push, and keep state per (worktree, branch) — shared by sibling sessions and
@@ -140,7 +140,7 @@ def main() -> int:
         base = {"cwd": repo, "session_id": "s2", "tool_name": "Bash"}
         rc, out = run("pre", dict(base, tool_input={"command": "run forbidden-cmd now"}), env)
         check("pre: bash rule fires", "[bash-rule]" in ctx(out))
-        check("pre: a status=draft rule never fires (unbacktested = unarmed)", "[draft-rule]" not in ctx(out))
+        check("pre: a status=draft rule never fires (not activated = unarmed)", "[draft-rule]" not in ctx(out))
 
         rc, out = run("pre", dict(base, tool_input={"command": "run forbidden-cmd now"}), env)
         check("pre: fire_scope=session dedupes the second call", out.strip() == "")
@@ -231,7 +231,7 @@ def main() -> int:
         check("converted_rx: follow-up command writes a conversion for that fire_id",
               [c["fire_id"] for c in convs] == [fid0] and convs[0]["how"] == "converted_rx", str(convs))
 
-        # --- shell_only + evaluate(): the pure engine the backtest imports ---
+        # --- shell_only + evaluate(): the pure engine ---
         sys.path.insert(0, os.path.dirname(HOOK))
         import rulebook_hook as H  # noqa: E402
         so = H.shell_only
