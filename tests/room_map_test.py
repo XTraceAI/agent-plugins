@@ -325,6 +325,21 @@ def test_cli() -> None:
             capture_output=True, text=True)
         check("name", out.stdout.strip(), "Repo: XTraceAI/agent-plugins")
 
+        # `set --org-id` records the owning org, so the entry is complete
+        # (no re-probe) and captures carry the org the brain lives in.
+        subprocess.run(
+            [sys.executable, str(script), "set", "--brain-id", PROD,
+             "--org-id", "org-123", "--cwd", str(repo), "--env", "production"],
+            capture_output=True, text=True, check=True)
+        out = subprocess.run(
+            [sys.executable, str(script), "show", "--json", "--cwd", str(repo),
+             "--env", "production"],
+            capture_output=True, text=True)
+        entry = json.loads(out.stdout)
+        check("set --org-id brain", entry["brain_id"], PROD)
+        check("set --org-id org", entry.get("org_id"), "org-123")
+        check("set --org-id not due", rm.resolve_due(repo, "production"), False)
+
 
 def test_forget_room() -> None:
     """A cached id the server disowns must be droppable.

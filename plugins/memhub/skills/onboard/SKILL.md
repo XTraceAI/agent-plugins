@@ -1,7 +1,7 @@
 ---
 description: Use when a new user wants to set up MemHub / an agent brain for their repo, or asks to "onboard", "get started", "set up my brain", or "seed a brain from my work". Crosses the empty-brain cold start — creates the repo's agent brain, seeds it from a real Claude Code session, shows the compiled overview, and proves proactive recall on the repo's own symbols — then reports an activation funnel.
 argument-hint: [session-id-or-path]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__refresh_brain_overview, mcp__plugin_memhub_memhub__recall_directives, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__refresh_brain_overview, mcp__plugin_memhub-staging_memhub__recall_directives, mcp__plugin_memhub-staging_memhub__search_brains
+allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__refresh_brain_overview, mcp__plugin_memhub_memhub__recall_directives, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub_memhub__ingest_document_from_url, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__refresh_brain_overview, mcp__plugin_memhub-staging_memhub__recall_directives, mcp__plugin_memhub-staging_memhub__search_brains, mcp__plugin_memhub-staging_memhub__ingest_document_from_url, mcp__plugin_memhub-staging_memhub__list_orgs
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -52,24 +52,33 @@ browser to refresh an expiring token. See `/memhub:login` for the full story.
   the full create-time rules are in
   `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
   above doesn't apply cleanly.
-- Record the `agent_brain_id`; call it `ROOM`.
-- **Cache it — this is the step that turns on automatic capture:**
+- Record the `agent_brain_id`; call it `ROOM`. Also note the org the brain
+  lives in: the `org_id` you passed to `list_agent_brains` / `create_agent_brain`,
+  or — if you passed none — the default org's `org_id` from `list_orgs` (the
+  response's `scope` only carries `org_name`, not the id). Accounts in a single
+  org can skip this.
+- **Cache it — so capture routes to this room from the very next turn:**
 
   ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>"
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" --org-id "<ORG_ID>"
   ```
 
-  Until this runs, none of the capture paths can resolve the room — the per-turn
-  `Stop` flush, the commit/PR flush, and the `SessionEnd` backstop all land in
-  personal memory instead of the brain being onboarded. It writes to
-  `~/.config/memhub-plugin/rooms.json` — the user's own config, never the repo —
-  and covers every worktree of this repo. Teammates run `/memhub:onboard` once
-  themselves.
+  The capture paths — the per-turn `Stop` flush, the commit/PR flush, and the
+  `SessionEnd` backstop — also resolve the room themselves on a cache miss
+  (exact-name lookup, then cached), so they only fall back to personal memory
+  when no brain of this exact name exists yet. Caching here is still what
+  makes the FIRST capture after onboarding route without a lookup, and
+  `--org-id` is what lets captures reach a room outside the caller's default
+  org (a brain lives in exactly one org; without it the write fails with
+  "Agent brain not found" in multi-org accounts, and the entry gets re-probed).
+  It writes to `~/.config/memhub-plugin/rooms.json` — the user's own config,
+  never the repo — and covers every worktree of this repo. Teammates run
+  `/memhub:onboard` once themselves.
 
-  Automatic capture needs **both** halves: this cache says *where* to write, and
-  the key from §0 is *what* authenticates the write. Neither alone is enough, and
-  each fails differently — a missing room writes to the wrong place, a missing
-  key writes nowhere.
+  Automatic capture needs **both** halves: the room (cached here, or resolved
+  by the hooks) says *where* to write, and the key from §0 is *what*
+  authenticates the write. Neither alone is enough, and each fails differently
+  — a missing room writes to the wrong place, a missing key writes nowhere.
 
 ## 2. Seed it — ONE substantive session (cross the cold start)
 Seed from **exactly one** session, not many. One is enough to fire recall + get a
@@ -152,18 +161,7 @@ before explaining an empty result, because the two causes need opposite answers:
   symbols yet. Capture may still be running (§3 latency), or the seed did not
   touch them. Say so; it is not a failure.
 - **`scope.brains` is empty** → the room was never resolved, so recall never
-  looked in it. Nothing will ever fire, however long you wait. Re-check §1, and
-  see the server requirement below.
-
-**Server requirement.** Reading a brain's directives at all needs the
-brain-partition fix (MemHub-Backend #932). Directives the plugin captures are
-written into the ROOM's partition, while recall used to read only the caller's
-personal one — disjoint by construction, so on a server without that fix this
-step returns nothing no matter how good the seed was. It is live on **staging**;
-on **production** it is not, until #932 promotes. On a prod install, say plainly
-that proactive recall of brain directives is pending that rollout rather than
-blaming extraction latency — a false "still running" sends the user off to wait
-for something that is not coming.
+  looked in it. Nothing will ever fire, however long you wait. Re-check §1.
 
 ## 5. Route — confirm discoverability
 `search_brains("<a topic from the seed>")` → confirm `ROOM` appears, so the agent
@@ -174,8 +172,7 @@ Print a compact funnel with real values:
 - **Seeded** — records imported, `path`.
 - **Digest** — rendered? version.
 - **Directives fired** — count + one example (the aha); else "capture still
-  running" or "pending the #932 rollout on this backend", whichever
-  `scope.brains` says it is (§4).
+  running" or "room not resolved", whichever `scope.brains` says it is (§4).
 - **Routed** — did `search_brains` surface the room?
 - **Time-to-first-recall** — wall-clock from create → first directive fired (or
   "pending").

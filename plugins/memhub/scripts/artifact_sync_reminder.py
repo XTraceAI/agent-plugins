@@ -7,19 +7,29 @@ Why this exists: retrieval is semantic, so a stale artifact can rank ABOVE its
 own correction. Observed 2026-07-20 — an over-read "AppWorld ON tripled partial
 progress" artifact scored 0.596 for "does memory help?" while its correction
 ("within the noise floor") scored 0.466, so a fresh agent read the wrong
-conclusion first. `save_artifact` already supports supersession (same `name`,
-or `parent_id`); what was missing is a prompt to use it when the underlying
-code moves.
+conclusion first. `save_artifact` already versions by canonical `name`; what
+was missing is a prompt to use it when the underlying code moves.
 
-Hooks cannot call MCP tools, so this only REMINDS — the agent performs the
-`save_artifact` itself. That is deliberate: the version bump stays visible and
-auditable instead of team memory being rewritten on every keystroke.
+Hooks cannot call MCP tools, so this only REMINDS — the agent runs the
+`save_artifact.py` upload itself. That is deliberate: the version bump stays
+visible and auditable instead of team memory being rewritten on every
+keystroke. The reminder names the SCRIPT, not a raw `save_artifact` call:
+the server rejects any `parent_id` that is not the lineage's current head
+(`parent_stale`), and the skill forbids re-emitting file contents — so the
+right move is "re-upload the spec FILE under the same name" and let the
+server chain it onto the latest version.
 
 The links live in the edited file's repo at `.claude/artifact-map.json`:
 
     {"version": 1, "links": [
       {"glob": "appworld/{run,agent,worker}.py",
-       "brain_id": "...", "artifact_id": "...", "artifact_name": "..."}]}
+       "artifact_id": "...", "artifact_name": "...",
+       "path": "docs/specs/appworld-harness.md"}]}
+
+`path` is the repo-relative location of the artifact's own file (the spec),
+which is what the upload command takes. No brain id lives in the map: a brain
+id is account state, not project state (see `room_map.py`), and the upload
+script resolves the repo's room itself.
 
 Any failure (no map, bad JSON, bad glob, unreadable state) exits 0 with no
 output — a reminder hook must never block an edit.
@@ -155,16 +165,44 @@ def _record(state: Path, seen: set[str]) -> None:
         print(f"[artifact-sync] could not persist debounce state: {exc}", file=sys.stderr)
 
 
-def _reminder(relpath: str, link: dict) -> str:
+def link_for_path(root: Path, relpath: str) -> dict | None:
+    """The link whose own `path` IS this file (the artifact's source file),
+    or None. Used by the markdown auto-capture to leave a hand-saved lineage
+    alone. Never raises."""
+    for link in _load_links(root):
+        if isinstance(link.get("path"), str) and link["path"] == relpath:
+            return link
+    return None
+
+
+def _room_hint(root: Path) -> str:
+    """Best-effort name of the edited repo's cached room, for the reminder
+    text. The brain is resolved HERE, at reminder time, from the user's own
+    room cache — never read from the repo tree."""
+    try:
+        from room_map import read_room
+        room = read_room(root)
+    except Exception:  # noqa: BLE001 — a hint, never a reason to fail an edit
+        return ""
+    if not room:
+        return ""
+    return f' (it routes to the repo room "{room["name"]}" automatically)'
+
+
+def _reminder(relpath: str, link: dict, root: Path) -> str:
     name = link.get("artifact_name") or "(unnamed artifact)"
+    spec_path = link.get("path") if isinstance(link.get("path"), str) else "<the artifact's file>"
     return (
-        f'⚠️ Artifact-sync: you edited {relpath}, linked to canonical artifact\n'
-        f'   "{name}" (id {link["artifact_id"]}) in brain {link["brain_id"]}.\n'
-        "   If this change alters anything that artifact asserts, UPDATE IT by versioning:\n"
-        f'     save_artifact(name="{name}", parent_id="{link["artifact_id"]}",\n'
-        f'                   agent_brain_id="{link["brain_id"]}", content=<full corrected doc>)\n'
-        "   Do NOT create a new artifact. If a prior conclusion is now wrong, state the\n"
-        "   correction explicitly so the new version supersedes it in retrieval."
+        f'⚠️ Artifact-sync: you edited {relpath}, governed by canonical artifact\n'
+        f'   "{name}" (id {link["artifact_id"]}).\n'
+        "   If this change alters anything that artifact asserts, edit its file and\n"
+        "   re-upload it under the SAME name — the server versions by name, so no\n"
+        "   parent id is needed (and a stale one is rejected):\n"
+        "     uv run --with 'mcp<2' python \"$CLAUDE_PLUGIN_ROOT/scripts/save_artifact.py\" \\\n"
+        f'       --file "{spec_path}" --name "{name}" --rationale "<why this version>"\n'
+        f"   Do NOT create a new artifact and do NOT re-emit the file's contents{_room_hint(root)}.\n"
+        "   If a prior conclusion is now wrong, state the correction explicitly so the\n"
+        "   new version supersedes it in retrieval."
     )
 
 
@@ -192,7 +230,6 @@ def main() -> None:
         for link in _load_links(root)
         if isinstance(link.get("glob"), str)
         and isinstance(link.get("artifact_id"), str)
-        and isinstance(link.get("brain_id"), str)
         and _matches(link["glob"], relpath)
     ]
     if not links:
@@ -224,7 +261,7 @@ def main() -> None:
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": "\n\n".join(
-                        _reminder(relpath, link) for link in fresh
+                        _reminder(relpath, link, root) for link in fresh
                     ),
                 }
             }

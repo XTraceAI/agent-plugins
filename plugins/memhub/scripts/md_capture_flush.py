@@ -13,6 +13,9 @@ the ``auto-captured`` tag and a rationale naming the session. Re-saving the
 same ``name`` versions it (server behaviour), so an agent or human publishing
 the file later with ``save_artifact.py`` supersedes the draft in place rather
 than sitting beside it — the failure the artifact-sync reminder exists for.
+A file already linked in the repo's ``.claude/artifact-map.json`` (by its
+``path``) is SKIPPED outright: that lineage is hand-saved via ``/memhub:spec``
+under its own name, and a draft named from the H1 would open a second one.
 
 Name = frontmatter ``title:`` > first ``# H1`` > filename stem. The agent keeps
 titles stable across rewrites (the Artifact tool asks it to), so the name is
@@ -38,6 +41,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from artifact_sync_reminder import MAP_RELPATH, link_for_path  # noqa: E402
+from brain_resolve import resolve_repo_brain  # noqa: E402
 from md_capture import MAX_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
 from room_map import env_for_url, read_room, repo_root  # noqa: E402
@@ -215,6 +220,10 @@ async def flush(session_id: str) -> None:
                     # (which stays dirty), never the rest of the turn.
                     try:
                         root = repo_root(p.parent)
+                        if root is not None and _hand_saved(root, p):
+                            _log(f"skip {p.name}: linked in {MAP_RELPATH} — its lineage is hand-saved")
+                            processed.add(raw)
+                            continue
                         name = derive_name(p, text, root)
                         body = redact_text(text)
                         call_args: dict = {
@@ -225,7 +234,14 @@ async def flush(session_id: str) -> None:
                             "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
                                          f"re-save with save_artifact.py to publish",
                         }
-                        room = read_room(p.parent, env) if root is not None else None
+                        room = None
+                        if root is not None:
+                            # Cache first; on a miss, resolve from the server
+                            # over the session already open (same as the
+                            # transcript capture hooks) so an auto-captured
+                            # spec lands in the repo room when one exists.
+                            room = read_room(p.parent, env) or \
+                                await resolve_repo_brain(s, p.parent, env)
                         if room:
                             call_args["agent_brain_id"] = room["brain_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
@@ -254,6 +270,15 @@ async def flush(session_id: str) -> None:
         # non-candidates drop out, successes record their digest, everything
         # else remains dirty for the next Stop.
         _persist(session_id, processed, saved, _changed(attempts0, attempts))
+
+
+def _hand_saved(root: Path, p: Path) -> bool:
+    """True when the repo's artifact map links this file by ``path`` — a
+    lineage ``/memhub:spec`` owns under its own name. Never raises."""
+    try:
+        return link_for_path(root, p.relative_to(root).as_posix()) is not None
+    except Exception:  # noqa: BLE001 — a lookup must not cost a capture
+        return False
 
 
 def _bump(attempts: dict, raw: str, processed: set, why: str) -> None:

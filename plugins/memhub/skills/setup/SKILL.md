@@ -66,8 +66,11 @@ python3 "$ROOT/scripts/setup_codex_hooks.py" remove
 After an install, check the hook credential without opening a browser:
 
 ```bash
-CLAUDE_PLUGIN_ROOT="$ROOT" python3 "$ROOT/scripts/login.py" --status
+CLAUDE_PLUGIN_ROOT="$ROOT" uv run --with 'mcp<2' python "$ROOT/scripts/login.py" --status
 ```
+
+(`login.py` imports the `mcp` SDK, so a bare `python3` prints FAILED even when
+the credential is fine.)
 
 If it reports `NOT LOGGED IN`, explain that the hook credential is separate
 from the MCP connector login and run `/memhub:login` before calling setup
@@ -76,8 +79,10 @@ complete. Do not silently start a browser login.
 Then run the local health check:
 
 ```bash
-CLAUDE_PLUGIN_ROOT="$ROOT" python3 "$ROOT/scripts/capture_health.py"
+echo '{}' | CLAUDE_PLUGIN_ROOT="$ROOT" python3 "$ROOT/scripts/capture_health.py"
 ```
+
+(It reads a hook payload from stdin; without the pipe it blocks on the tty.)
 
 No output is healthy. Relay any warning exactly enough that the user knows the
 remedy. Finish with a compact status: hook bridge installed/current, hook trust
