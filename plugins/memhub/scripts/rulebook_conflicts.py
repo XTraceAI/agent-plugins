@@ -109,15 +109,14 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
             for r in active:
                 rid = str(r.get("rule_id"))
                 if csig and matcher_signature(r) == csig:
-                    h = hits.setdefault(rid, _hit(r, []))
-                    h["reasons"].append("same_matcher")
-                    h["status"] = "active"
+                    # a rule in the hook view is active by definition; _hit
+                    # already records that for rows list_rules didn't cover
+                    hits.setdefault(rid, _hit(r, []))["reasons"].append("same_matcher")
                 shared = canch & anchor_set(r)
                 if shared:
                     h = hits.setdefault(rid, _hit(r, [], shared))
                     h["reasons"].append("anchors_overlap")
                     h["anchors_shared"] = sorted(shared)
-                    h["status"] = "active"
         hit_ids.update(hits)
         out.append({"title": cand.get("title"), "delivery": cand.get("delivery"),
                     "hits": list(hits.values())})
