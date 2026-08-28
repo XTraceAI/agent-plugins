@@ -134,13 +134,48 @@ def mentions(text, key):
 
 
 def is_negated(sentence, token):
-    """Does the text immediately before `token` disown it?"""
-    return bool(re.search(_NEGATED, sentence[: sentence.index(token)], re.S))
+    """Does the text before EVERY occurrence of `token` disown it?
+
+    Per occurrence, not just the first. `sentence.index(token)` looked only at
+    the text before the earliest one, so a sentence that disowns the token and
+    then teaches it — "there is no `result_rx` key, so use `result_rx`" — was
+    waived wholesale on the strength of the disavowal. That is the same hole as
+    the paragraph-wide waiver this replaced, one scope down.
+    """
+    prev_end = 0
+    for m in re.finditer(re.escape(token), sentence):
+        # Each occurrence is judged only on the text since the PREVIOUS one.
+        # Without that bound the 60-character window simply reaches back to the
+        # earlier disavowal and waives the teaching occurrence anyway — which is
+        # the paragraph-wide bug all over again, just at a shorter range.
+        if not re.search(_NEGATED, sentence[prev_end:m.start()], re.S):
+            return False
+        prev_end = m.end()
+    return True
+
+
+def test_the_waiver() -> None:
+    """Guard the guard: the negation waiver is the one place this suite can be
+    talked out of a finding, so its own edge cases are asserted here."""
+    check(is_negated("There is no `result_rx` key", "result_rx"),
+          "a disowned token must be waived")
+    check(not is_negated("Use `result_rx` for failing commands", "result_rx"),
+          "a taught token must be flagged")
+    check(not is_negated(
+              "There is no `result_rx` key, so always use `result_rx` here",
+              "result_rx"),
+          "a token taught AFTER being disowned in the same sentence must still "
+          "be flagged — the waiver is per occurrence, not per sentence")
+    check(not is_negated(
+              "Use `result_rx`, though there is no `result_rx` key", "result_rx"),
+          "a token taught BEFORE the disavowal must be flagged")
 
 
 def main() -> int:
     create, imp = read(CREATE), read(IMPORT)
     both = (("create-rule", create), ("import-claude-md", imp))
+
+    test_the_waiver()
 
     # 1. Nothing the server refuses, or no longer has, is taught anywhere.
     for name, text in both:
