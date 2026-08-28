@@ -154,9 +154,17 @@ def is_negated(sentence, token):
     return True
 
 
-def test_the_waiver() -> None:
+def _check_waiver_semantics() -> None:
     """Guard the guard: the negation waiver is the one place this suite can be
-    talked out of a finding, so its own edge cases are asserted here."""
+    talked out of a finding, so its own edge cases are asserted here.
+
+    Not named ``test_*`` on purpose — this suite runs as one ``main()`` (the
+    house's other single-entry suite, ``rulebook_conflicts_test.py``, does the
+    same), and ``registration_test.py`` reads the ``if __name__`` block to find
+    which ``test_*`` functions are actually wired. A ``test_*`` helper called
+    from inside ``main()`` reads to that checker as an orphan, and it is right
+    to say so rather than guess.
+    """
     check(is_negated("There is no `result_rx` key", "result_rx"),
           "a disowned token must be waived")
     check(not is_negated("Use `result_rx` for failing commands", "result_rx"),
@@ -175,7 +183,7 @@ def main() -> int:
     create, imp = read(CREATE), read(IMPORT)
     both = (("create-rule", create), ("import-claude-md", imp))
 
-    test_the_waiver()
+    _check_waiver_semantics()
 
     # 1. Nothing the server refuses, or no longer has, is taught anywhere.
     for name, text in both:
