@@ -522,15 +522,15 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
         pending=True, new_urls=True, event="afterShellExecution",
         state=state, now=later)
 
-    # The retry budget gates only unchanged-content sends. A later server
-    # upgrade still receives the queued URL with the next genuine transcript
-    # write and may acknowledge it normally.
+    # A real content write to the same older server must not reset the spent
+    # unchanged-content budget. Resetting here would grant another full batch
+    # of background retries after every turn and make the bound unbounded over
+    # an active conversation.
     grown_blobs = {"blob-1", "blob-2"}
     assert should_flush(
         "stop", {}, state, grown_blobs, later,
         provenance_pending=False)
     try:
-        accept_provenance = True
         cursor_flush.current_blob_ids = lambda _path: grown_blobs
         cursor_flush.redact_records = lambda records: records
         cursor_flush.resolve_bearer = lambda: (
@@ -544,6 +544,46 @@ def test_unchanged_store_pr_retries_stop_after_bounded_unconfirmed_acks():
             source_kind="store", records=[{
                 "type": "user", "uuid": "u1",
                 "message": {"role": "user", "content": "new content"},
+            }], meta={"cwd": None, "title": None},
+            pending_pr_urls=[url]))
+    finally:
+        cursor_flush.current_blob_ids = originals["current_blob_ids"]
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert calls[-1]["provenance"]["github_pr_urls"] == [url]
+    assert state["pending_pr_urls"] == [url]
+    assert state["pr_url_unconfirmed"] == MAX_PR_URL_UNCONFIRMED
+    assert not _pr_url_retry_due(
+        pending=True, new_urls=False, event="stop", state=state,
+        now=later + DORMANT_RETRY_S + 1)
+
+    # The retry budget gates only unchanged-content sends. A later server
+    # upgrade still receives the queued URL with the next genuine transcript
+    # write and may acknowledge it normally.
+    upgraded_blobs = grown_blobs | {"blob-3"}
+    assert should_flush(
+        "stop", {}, state, upgraded_blobs, later,
+        provenance_pending=False)
+    try:
+        accept_provenance = True
+        cursor_flush.current_blob_ids = lambda _path: upgraded_blobs
+        cursor_flush.redact_records = lambda records: records
+        cursor_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        cursor_flush.mcp_http.Session = OlderServer
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/store.db"), upgraded_blobs,
+            source_kind="store", records=[{
+                "type": "user", "uuid": "u1",
+                "message": {"role": "user", "content": "newer content"},
             }], meta={"cwd": None, "title": None},
             pending_pr_urls=[url]))
     finally:
