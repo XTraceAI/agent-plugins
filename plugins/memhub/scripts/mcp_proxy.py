@@ -73,7 +73,12 @@ def handle(envelope: dict, resolve=resolve_bearer,
     url, bearer = resolve(refresh=False)
     if not bearer:
         with _auth_lock:
-            url, bearer = resolve()
+            # Re-check under the lock: a thread that waited here finds the
+            # token the previous holder just refreshed and must not refresh
+            # again with a refresh token that has already been rotated.
+            url, bearer = resolve(refresh=False)
+            if not bearer:
+                url, bearer = resolve()
     if not bearer:
         # A notification carries no id, so there is nothing to answer it with;
         # the next request will say why.

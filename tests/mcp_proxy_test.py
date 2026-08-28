@@ -89,7 +89,8 @@ def test_lock_only_on_refresh():
         return (URL, "oauth" if refresh else None)
     reply = proxy.handle({"jsonrpc": "2.0", "id": 6, "method": "ping"},
                          resolve=resolve_oauth_only, forward=_forward_ok)
-    check("OAuth-cache install falls through to the refreshing path", calls, [False, True])
+    check("OAuth-cache install re-checks under the lock, then refreshes",
+          calls, [False, False, True])
     check("and is served", "result" in reply, True)
 
 
