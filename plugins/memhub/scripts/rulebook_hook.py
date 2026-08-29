@@ -521,9 +521,12 @@ def _api():
 
 
 def fetch_book(repo):
-    """GET /rules?status=eq.active&repo=<repo>&view=hook with If-None-Match.
+    """GET /rules?repo=<repo>&view=hook with If-None-Match.
 
-    The filter form is `op.value` (`eq.active`); a bare value is a 400.
+    No `status=` param: `view=hook` serves ACTIVE rules on its own, and the
+    server's filter grammar changed under us once already (a bare
+    `status=active` became a 400), taking every book fetch down silently.
+    Not sending the parameter is the one form no grammar change can break.
     200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
     current, which is what §5.3 gate freshness measures); anything else →
     the cache is left exactly as it was."""
@@ -533,7 +536,7 @@ def fetch_book(repo):
     base, bearer, http = api
     old = load_book(repo) or {}
     hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
-    q = "status=eq.active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
                           timeout=FETCH_TIMEOUT_S)
