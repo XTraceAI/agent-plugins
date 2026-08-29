@@ -934,6 +934,19 @@ def _now():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+# Records that ARE messages. A transcript interleaves many other kinds —
+# `attachment` alone outnumbers real messages in a long session, and
+# `system` / `file-history-snapshot` / meta rows appear throughout. Several
+# carry their own `uuid`, so "the last record with a uuid" is usually not the
+# message the tool call belongs to.
+_MESSAGE_TYPES = ("user", "assistant")
+# Start at 64 KiB and grow: a single record can exceed it (a large tool result
+# or an assistant turn with embedded content), and a window that lands mid-record
+# would otherwise yield nothing at all.
+_TAIL_START = 64 * 1024
+_TAIL_MAX = 1024 * 1024
+
+
 def message_id_of(data):
     """The transcript record the tool call belongs to — the server resolves it
     to the stored message. Reads the tail of the JSONL rather than the whole
@@ -946,22 +959,31 @@ def message_id_of(data):
         with open(tp, "rb") as f:
             f.seek(0, os.SEEK_END)
             end = f.tell()
-            start = max(0, end - 65536)
-            f.seek(start)
-            tail = f.read(end - start).splitlines()
-        for raw in reversed(tail):
-            if not raw.strip():
-                continue
-            try:
-                rec = json.loads(raw)
-            except Exception:
-                continue            # a partial first line after the seek
-            uid = rec.get("uuid")
-            if isinstance(uid, str) and uid:
-                return uid
+            window = _TAIL_START
+            while True:
+                start = max(0, end - window)
+                f.seek(start)
+                lines = f.read(end - start).splitlines()
+                # A non-zero start almost certainly cut the first line in half.
+                if start:
+                    lines = lines[1:]
+                for raw in reversed(lines):
+                    if not raw.strip():
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    if rec.get("type") not in _MESSAGE_TYPES:
+                        continue
+                    uid = rec.get("uuid")
+                    if isinstance(uid, str) and uid:
+                        return uid
+                if start == 0 or window >= _TAIL_MAX:
+                    return None
+                window *= 4
     except Exception:
         return None
-    return None
 
 
 def agent_id_of(data):

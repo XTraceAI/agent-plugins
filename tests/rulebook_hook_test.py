@@ -354,9 +354,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tp = os.path.join(td, "t.jsonl")
         with open(tp, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"uuid": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"}) + "\n")
-            f.write(json.dumps({"uuid": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"}) + "\n")
-        check("message_id_of: the LAST record's uuid",
+            f.write(json.dumps({"type": "user", "uuid": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"}) + "\n")
+        check("message_id_of: the LAST message record's uuid",
               rb.message_id_of({"transcript_path": tp}) == "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
         check("message_id_of: no transcript_path -> None",
               rb.message_id_of({}) is None)
@@ -368,10 +368,38 @@ def main() -> int:
               rb.message_id_of({"transcript_path": tp}) == "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
         big = os.path.join(td, "big.jsonl")
         with open(big, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"uuid": "cccccccc-3333-4333-8333-cccccccccccc", "pad": "x" * 200000}) + "\n")
-            f.write(json.dumps({"uuid": "dddddddd-4444-4444-8444-dddddddddddd"}) + "\n")
+            f.write(json.dumps({"type": "user", "uuid": "cccccccc-3333-4333-8333-cccccccccccc", "pad": "x" * 200000}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "dddddddd-4444-4444-8444-dddddddddddd"}) + "\n")
         check("message_id_of: reads only the tail of a large transcript",
               rb.message_id_of({"transcript_path": big}) == "dddddddd-4444-4444-8444-dddddddddddd")
+
+    # A transcript interleaves non-message records that carry their own uuid —
+    # `attachment` outnumbers real messages in a long session. Picking one of
+    # those links the fire to something that is not a message.
+    with tempfile.TemporaryDirectory() as td:
+        tp = os.path.join(td, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "uuid": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"}) + "\n")
+            f.write(json.dumps({"type": "file-history-snapshot", "uuid": "ffffffff-6666-4666-8666-ffffffffffff"}) + "\n")
+        check("message_id_of: skips attachment / meta records that carry a uuid",
+              rb.message_id_of({"transcript_path": tp}) == "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
+
+        # A single record can exceed the initial tail window; the read grows
+        # rather than returning nothing.
+        huge = os.path.join(td, "huge.jsonl")
+        with open(huge, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "99999999-7777-4777-8777-999999999999"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "uuid": "88888888-8888-4888-8888-888888888888",
+                                "pad": "x" * 300000}) + "\n")
+        check("message_id_of: grows the window past a >64 KiB record",
+              rb.message_id_of({"transcript_path": huge}) == "99999999-7777-4777-8777-999999999999")
+
+        none_f = os.path.join(td, "none.jsonl")
+        with open(none_f, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "attachment", "uuid": "77777777-9999-4999-8999-777777777777"}) + "\n")
+        check("message_id_of: no message record anywhere -> None",
+              rb.message_id_of({"transcript_path": none_f}) is None)
 
     check("WIRE_KEYS carries source_message_id (server links the fire to its message)",
           "source_message_id" in rb.WIRE_KEYS)
