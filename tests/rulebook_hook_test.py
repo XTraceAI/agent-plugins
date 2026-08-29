@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 HOOK = os.path.join(os.path.dirname(__file__), "..",
                     "plugins", "memhub", "scripts", "rulebook_hook.py")
@@ -400,6 +401,32 @@ def main() -> int:
             f.write(json.dumps({"type": "attachment", "uuid": "77777777-9999-4999-8999-777777777777"}) + "\n")
         check("message_id_of: no message record anywhere -> None",
               rb.message_id_of({"transcript_path": none_f}) is None)
+
+        # The growing window is bounded: `window >= _TAIL_MAX` is checked
+        # BEFORE the multiply, so the read stops at 1 MiB (64K -> 256K -> 1M)
+        # for a file of any size. A hook on a 5 s budget must never walk a
+        # multi-megabyte transcript.
+        def _windows(end):
+            w, out = rb._TAIL_START, []
+            while True:
+                out.append(w)
+                if max(0, end - w) == 0 or w >= rb._TAIL_MAX:
+                    return out
+                w *= 4
+        check("message_id_of: at most 3 windows, capped at _TAIL_MAX, for any file size",
+              all(len(_windows(n)) <= 3 and max(_windows(n)) <= rb._TAIL_MAX
+                  for n in (300_000, 5_400_000, 50_000_000, 5_000_000_000)))
+
+        early = os.path.join(td, "early.jsonl")
+        with open(early, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "msg-at-the-very-start"}) + "\n")
+            for i in range(40):
+                f.write(json.dumps({"type": "attachment", "uuid": "a%d" % i, "pad": "x" * 90000}) + "\n")
+        t0 = time.time()
+        got = rb.message_id_of({"transcript_path": early})
+        check("message_id_of: a >1 MiB file whose only message is at the start "
+              "gives up quickly rather than reading it all",
+              got is None and (time.time() - t0) < 1.0)
 
     check("WIRE_KEYS carries source_message_id (server links the fire to its message)",
           "source_message_id" in rb.WIRE_KEYS)
