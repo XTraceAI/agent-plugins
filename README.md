@@ -242,11 +242,21 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   multiplayer view — repo overview with no topic, per-spec activity with one.
   Sharing is read-only, so the room's creator owns revisions; teammates
   propose spec changes through the normal repo/PR flow.
-- `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
-  failure, correction, or procedure and checks for conflicts before saving it.
-- `/memhub:import-claude-md` — imports reusable instructions from a
-  `CLAUDE.md` file into Rulebook without turning generic prose into noisy
-  directives.
+- `/memhub:create-rule` — turns a concrete failure, correction, or procedure
+  into a situated Rulebook rule: a when-X-then-Y sentence plus a deterministic
+  check (a bash/edit/output matcher, an ordering, or recall anchors), checked
+  for conflicts against the book before anything is filed. Rules always
+  **advise**, never block. Where the rule lands is the server's decision, not
+  the skill's: at one confirmation turn you choose "file for review" or "put it
+  in the book now", and only an org admin picking the second gets a live rule —
+  everyone else's waits for a reviewer, and the reply says so.
+- `/memhub:import-claude-md` — imports reusable instructions from a `CLAUDE.md`
+  file into Rulebook without turning generic prose into noisy directives. It
+  decomposes the doc here in the repo (so a rule can be scoped to real paths
+  and its patterns checked against real commands), runs the same conflict pass
+  over every candidate, and files each row against its `path@sha#heading` so a
+  re-import replaces rules instead of duplicating them. Nothing imported ever
+  goes live on its own — a person activates it in MemHub.
 - `/memhub:pr-babysit [pr-number-or-url]` — usually **auto-armed**, not typed:
   a hook offers to start this as a self-paced loop right after `gh pr
   create` (see PR babysitting below). One pass polls the PR's review bots and
