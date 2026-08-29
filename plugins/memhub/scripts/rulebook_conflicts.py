@@ -134,7 +134,7 @@ def fetch_active(repo: str) -> list[dict] | None:
     if not api:
         return None
     base, bearer, http = api
-    q = "status=active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", timeout=FETCH_TIMEOUT_S)
     except Exception:

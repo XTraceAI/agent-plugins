@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 HOOK = os.path.join(os.path.dirname(__file__), "..",
                     "plugins", "memhub", "scripts", "rulebook_hook.py")
@@ -347,6 +348,88 @@ def main() -> int:
         statefiles = [n for n in os.listdir(os.path.join(td, "state")) if n.startswith("wt-") and n.endswith(".json")]
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
+
+    # --- message_id_of: the fire's link back to the transcript record ---
+    sys.path.insert(0, os.path.dirname(HOOK))
+    import rulebook_hook as rb  # noqa: E402
+    with tempfile.TemporaryDirectory() as td:
+        tp = os.path.join(td, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "uuid": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"}) + "\n")
+        check("message_id_of: the LAST message record's uuid",
+              rb.message_id_of({"transcript_path": tp}) == "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+        check("message_id_of: no transcript_path -> None",
+              rb.message_id_of({}) is None)
+        check("message_id_of: missing file -> None (never raises)",
+              rb.message_id_of({"transcript_path": os.path.join(td, "nope.jsonl")}) is None)
+        with open(tp, "a", encoding="utf-8") as f:
+            f.write("{not json\n")
+        check("message_id_of: skips an unparseable tail line",
+              rb.message_id_of({"transcript_path": tp}) == "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+        big = os.path.join(td, "big.jsonl")
+        with open(big, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "uuid": "cccccccc-3333-4333-8333-cccccccccccc", "pad": "x" * 200000}) + "\n")
+            f.write(json.dumps({"type": "assistant", "uuid": "dddddddd-4444-4444-8444-dddddddddddd"}) + "\n")
+        check("message_id_of: reads only the tail of a large transcript",
+              rb.message_id_of({"transcript_path": big}) == "dddddddd-4444-4444-8444-dddddddddddd")
+
+    # A transcript interleaves non-message records that carry their own uuid —
+    # `attachment` outnumbers real messages in a long session. Picking one of
+    # those links the fire to something that is not a message.
+    with tempfile.TemporaryDirectory() as td:
+        tp = os.path.join(td, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "uuid": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"}) + "\n")
+            f.write(json.dumps({"type": "file-history-snapshot", "uuid": "ffffffff-6666-4666-8666-ffffffffffff"}) + "\n")
+        check("message_id_of: skips attachment / meta records that carry a uuid",
+              rb.message_id_of({"transcript_path": tp}) == "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
+
+        # A single record can exceed the initial tail window; the read grows
+        # rather than returning nothing.
+        huge = os.path.join(td, "huge.jsonl")
+        with open(huge, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "99999999-7777-4777-8777-999999999999"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "uuid": "88888888-8888-4888-8888-888888888888",
+                                "pad": "x" * 300000}) + "\n")
+        check("message_id_of: grows the window past a >64 KiB record",
+              rb.message_id_of({"transcript_path": huge}) == "99999999-7777-4777-8777-999999999999")
+
+        none_f = os.path.join(td, "none.jsonl")
+        with open(none_f, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "attachment", "uuid": "77777777-9999-4999-8999-777777777777"}) + "\n")
+        check("message_id_of: no message record anywhere -> None",
+              rb.message_id_of({"transcript_path": none_f}) is None)
+
+        # The growing window is bounded: `window >= _TAIL_MAX` is checked
+        # BEFORE the multiply, so the read stops at 1 MiB (64K -> 256K -> 1M)
+        # for a file of any size. A hook on a 5 s budget must never walk a
+        # multi-megabyte transcript.
+        def _windows(end):
+            w, out = rb._TAIL_START, []
+            while True:
+                out.append(w)
+                if max(0, end - w) == 0 or w >= rb._TAIL_MAX:
+                    return out
+                w *= 4
+        check("message_id_of: at most 3 windows, capped at _TAIL_MAX, for any file size",
+              all(len(_windows(n)) <= 3 and max(_windows(n)) <= rb._TAIL_MAX
+                  for n in (300_000, 5_400_000, 50_000_000, 5_000_000_000)))
+
+        early = os.path.join(td, "early.jsonl")
+        with open(early, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "uuid": "msg-at-the-very-start"}) + "\n")
+            for i in range(40):
+                f.write(json.dumps({"type": "attachment", "uuid": "a%d" % i, "pad": "x" * 90000}) + "\n")
+        t0 = time.time()
+        got = rb.message_id_of({"transcript_path": early})
+        check("message_id_of: a >1 MiB file whose only message is at the start "
+              "gives up quickly rather than reading it all",
+              got is None and (time.time() - t0) < 1.0)
+
+    check("WIRE_KEYS carries source_message_id (server links the fire to its message)",
+          "source_message_id" in rb.WIRE_KEYS)
 
     print()
     if FAILURES:

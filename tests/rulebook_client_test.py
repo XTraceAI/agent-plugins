@@ -223,9 +223,15 @@ def main():
         rc, out = run("fetch", {"cwd": repo}, env)
         check("fetch: silent exit-0", rc == 0 and out == "")
         req = fake.requests[-1]
-        check("fetch: GET /v1/team/rulebook/rules?status=active&repo=xmem&view=hook",
+        # `view=hook` serves ACTIVE on its own. The hook sends no `status=` at
+        # all: a bare `status=active` became a 400 when the filter grammar
+        # changed, and the hook swallows that, leaving every client on a stale
+        # book. Sending no status is the form no grammar change can break.
+        check("fetch: GET /v1/team/rulebook/rules?repo=xmem&view=hook",
               req["method"] == "GET" and req["path"].startswith("/v1/team/rulebook/rules?")
-              and all(k in req["path"] for k in ("status=active", "repo=xmem", "view=hook")), req["path"])
+              and all(k in req["path"] for k in ("repo=xmem", "view=hook")), req["path"])
+        check("fetch: sends no status= filter at all",
+              "status=" not in req["path"], req["path"])
         check("fetch: bearer from the plugin's credential path",
               req["headers"].get("Authorization") == "Bearer tok-123")
         b = json.load(open(cache, encoding="utf-8"))
