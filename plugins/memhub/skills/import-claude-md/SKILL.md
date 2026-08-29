@@ -31,7 +31,7 @@ Read the file. Build `source_ref = "<path relative to repo root>@<sha>#<heading-
 for each rule you derive. Keep the path stable across runs (no absolute
 paths): the server treats a retried import with the same path and title and
 identical content as a no-op (`unchanged`) — that is the key's only job. Repo name = the basename of
-the toplevel (e.g. `xmem`) → `scope_repos: ["<repo>"]`.
+the toplevel (e.g. `payments-api`) → `scope_repos: ["<repo>"]`.
 
 ### 2. Decompose — in your own reading, no model call
 
@@ -51,6 +51,11 @@ delivery, per the table in `/memhub:create-rule` step 3:
 Title = the heading or a short noun phrase (aim for under 60 chars); **one rule
 per title** within a run. Statement = the full sentence including the nuance a
 reviewer needs (sanctioned forms, exemptions); keep it to a few sentences.
+
+Verify every `agent_hook` candidate with
+`scripts/rulebook_verify.py` exactly as `/memhub:create-rule` step 4 describes —
+a rule that fails LOAD never fires for anyone, and one that fires on the
+complied-with form is a nag. Drop a candidate you cannot get to a clean run.
 
 Apply the matcher-authoring rules from `/memhub:create-rule` step 3
 (pre-heredoc matching, shape-specific patterns, exemptions in `command_not_rx`

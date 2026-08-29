@@ -27,13 +27,13 @@ Get to a **when-X-then-Y** sentence with a **why**. A conditional shape is what
 makes a rule actionable; a bare observation is not a rule. If the user gave a
 war story, extract the conditional from it and confirm your reading.
 
-### 2. Duplicate check — by eye now, deterministically in step 4
+### 2. Duplicate check — by eye now, deterministically in step 5
 
 Call the memhub `list_rules` tool for the target rulebook (every status) and
 read the new rule against every title and statement. Same subject → plan to
 replace the existing rule instead of adding a twin: note its `rule_id` for
-`supersedes_rule_id` in step 4. The server does no title matching — you
-decide what a rule replaces. Keep the `list_rules` reply: step 4 runs the
+`supersedes_rule_id` in step 5. The server does no title matching — you
+decide what a rule replaces. Keep the `list_rules` reply: step 5 runs the
 deterministic check over it.
 
 ### 3. Draft the rule — one delivery, one engine block
@@ -65,11 +65,53 @@ reviewer needs: sanctioned forms, exemptions), `scope_repos` (`["<repo>"]` or
 - Default `warn_once_per: "session"` — a rule that nags every call gets ignored.
   `turn` is for rules where each occurrence matters (e.g. force-push).
 
-Sanity-check every regex against two or three real commands from this repo's
-history (`git log`, your own shell history) — one that should fire and one
-that should not — before filing.
+### 4. Prove it fires — and prove it stops
 
-### 4. Conflict check, confirm, then file
+A rule that matches the command you had in mind can still be wrong in three
+ways that only show up once the whole team has it. Run the candidate through
+the engine that will actually run it:
+
+```bash
+cat > /tmp/cand.json <<'JSON'
+{"title": "...", "statement": "...", "delivery": "agent_hook",
+ "matcher": {"event": "bash", "command_rx": "...", "command_not_rx": "..."}}
+JSON
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires 'the real command that should trigger it' \
+  --silent 'the same situation once someone has complied'
+```
+
+For an `edit` / `write` rule a case is `path::content`:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires '/repo/src/db.py::conn = connect(url, verify=False)' \
+  --silent '/repo/src/db.py::conn = connect(url)'
+```
+
+It exits non-zero until every case behaves. **Do not file a rule while it
+exits non-zero, and show the table to the user.** What each line means:
+
+- **LOAD** — whether the hook would load the rule at all. A pattern over 400
+  characters, one that does not compile, or one that backtracks is dropped
+  *silently* on every teammate's machine: the rule exists, is active, and
+  never fires. This line is the only warning you get.
+- **FIRES** — your `--fires` cases. At least one is required; without it
+  nothing has shown the rule can trigger.
+- **SILENT** — your `--silent` cases, plus two generated for you: `grep` and
+  `python -c` quoting the rule's own trigger. Searching for a rule's trigger
+  is how people investigate it, and firing there is the largest false-fire
+  class we have measured. If those two fail, add a `command_not_rx`.
+
+**Always give at least one `--silent` case for the complied-with form** — the
+code *after* someone does what the rule asks. This is the check authors skip
+and the one that matters most: a rule that keeps firing once you have fixed
+the problem cannot tell a violation from a fix, so people learn to ignore it.
+If you cannot write a `--silent` case that the rule passes, the rule is not
+expressible as a pattern — make it `anchor_recall` or a `session_context`
+note instead of shipping a nag.
+
+### 5. Conflict check, confirm, then file
 
 Before showing the rule, check it against the book — the server files a
 colliding title or matcher as a silent second draft unless you name what it
@@ -96,7 +138,7 @@ retires one side before activating the other.
 Show the user: the rule sentence, the delivery + engine block, the sample
 commands it does and doesn't match, and the conflict verdict. On approval call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
-block, `scope_repos`, `source_ref` (e.g. `xmem/CLAUDE.md@<sha>#<heading>` or
+block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
 `user correction, session <id>`), `supersedes_rule_id` when it replaces a
 rule, and `agent_brain_id` when `--brain` was given. Read the reply:
 
@@ -114,7 +156,7 @@ want to write a detector — file it the same way with
 `source="nomination"` and no engine block; it lands as `proposed` for a
 reviewer.
 
-### 5. Report
+### 6. Report
 
 Tell the user: the rule is filed as a draft — or as `proposed`, naming the
 rule it replaces by title — and what happens next: the rule's owner or an
