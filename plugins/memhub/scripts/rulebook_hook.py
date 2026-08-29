@@ -337,7 +337,7 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
-_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
+_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label", "on", "repo_scope", "_scope_repos", "_scope_paths", "_scope_exclude_paths", "anchors", "ordering"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -420,6 +420,15 @@ def to_hook_rule(row):
         r["repo_scope"] = "any"
         if scopes:
             r["_scope_repos"] = scopes
+        # Path scope applies to every delivery shape, so it is read BEFORE the
+        # session/anchor/ordering early returns. The skills have advertised
+        # these globs since v0.29.5; without this the narrowing is a no-op.
+        for src, dest in (("scope_paths", "_scope_paths"),
+                          ("scope_exclude_paths", "_scope_exclude_paths")):
+            globs = [g.strip() for g in (row.get(src) or [])
+                     if isinstance(g, str) and g.strip()]
+            if globs:
+                r[dest] = globs[:64]
         # v2.4: anchor rules carry their own identifiers; session rules carry nothing
         if row.get("delivery") == "session_context":
             r["on"] = "session"
@@ -495,7 +504,155 @@ def effective_mode(rule, fetched_at, now=None):
         return "advise"
 
 
-def scope_ok(rule, repo, gitdir):
+_GLOB_CACHE = {}
+GLOB_MAX_LEN = 256      # a scope glob longer than this is malformed, not clever
+
+
+def _seg_match(pat, seg):
+    """One glob segment against one path segment. `*` spans any run of
+    non-separator characters, `?` exactly one.
+
+    Deliberately NOT a regex. Every other wire pattern in this file is linted
+    by `rx_ok` before it reaches `re`; a glob has no such lint, and the obvious
+    translation (`*` → `[^/]*`) backtracks catastrophically — `*a*a*a*a*a*b`
+    against a 120-character path took over five seconds, which is the whole
+    `pre` budget, on a pattern any teammate can put in a rule. This is the
+    classic two-pointer wildcard match instead: one backtrack point, advanced
+    monotonically, so the worst case is O(len(pat) × len(seg)) and a scope
+    glob can no longer stall a tool call."""
+    p = s = mark = 0
+    star = -1
+    lp, ls = len(pat), len(seg)
+    while s < ls:
+        if p < lp and pat[p] == "*":
+            star, mark = p, s
+            p += 1
+        elif p < lp and (pat[p] == "?" or pat[p] == seg[s]):
+            p += 1
+            s += 1
+        elif star != -1:            # re-spend the last `*` on one more character
+            mark += 1
+            p, s = star + 1, mark
+        else:
+            return False
+    while p < lp and pat[p] == "*":
+        p += 1
+    return p == lp
+
+
+def _glob_match(pats, segs):
+    """Glob segments against path segments. A `**` segment spans zero or more
+    path segments; the same two-pointer shape one level up, for the same
+    reason. A pattern that runs out while path segments remain still matches —
+    that is what makes a bare directory (`src`) mean everything beneath it."""
+    p = s = mark = 0
+    star = -1
+    lp, ls = len(pats), len(segs)
+    while s < ls:
+        if p == lp:
+            return True             # pattern exhausted → everything beneath it
+        if pats[p] == "**":
+            star, mark = p, s
+            p += 1
+        elif _seg_match(pats[p], segs[s]):
+            p += 1
+            s += 1
+        elif star != -1:
+            mark += 1
+            p, s = star + 1, mark
+        else:
+            return False
+    while p < lp and pats[p] == "**":
+        p += 1
+    return p == lp
+
+
+def _glob_segments(pat):
+    """One scope glob → its segment list, cached. `None` for a pattern that
+    cannot be used at all; the caller skips it rather than dying."""
+    if not isinstance(pat, str):    # an unhashable element would raise on the
+        return None                 # cache lookup itself, before any try block
+    if pat in _GLOB_CACHE:
+        return _GLOB_CACHE[pat]
+    segs = None
+    try:
+        p = pat.strip().replace("\\", "/").strip("/")
+        if p and len(p) <= GLOB_MAX_LEN:
+            segs = [seg for seg in p.split("/") if seg and seg != "."]
+            # gitignore: a pattern with no separator matches at ANY depth
+            if segs and "/" not in p:
+                segs.insert(0, "**")
+            segs = segs or None
+    except (ValueError, TypeError, AttributeError):
+        segs = None
+    if len(_GLOB_CACHE) < 512:      # a book is small; the bound is for safety
+        _GLOB_CACHE[pat] = segs
+    return segs
+
+
+def rel_path(path, root, cwd=""):
+    """`file_path` → worktree-relative POSIX path. "" when the call carries no
+    path at all; None when the path lies OUTSIDE the worktree, which a
+    repo-relative glob must not claim."""
+    if not path:
+        return ""
+    p = str(path).replace("\\", "/")
+    if not os.path.isabs(p) and cwd:
+        p = os.path.join(str(cwd).replace("\\", "/"), p)
+    p = os.path.normpath(p).replace("\\", "/")
+    r = os.path.normpath(str(root).replace("\\", "/")).replace("\\", "/") if root else ""
+    if not r:
+        return p.lstrip("/")
+    if p == r:
+        return ""
+    if p.startswith(r + "/"):
+        return p[len(r) + 1:]
+    try:        # /tmp → /private/tmp and friends: cwd and file_path can name
+        rp = os.path.realpath(p)      # the same worktree through different
+        rr = os.path.realpath(r)      # links, and disagreeing would silence
+        if rp == rr:                  # every include-scoped rule for the session
+            return ""
+        if rp.startswith(rr + os.sep):
+            return rp[len(rr) + 1:].replace("\\", "/")
+    except OSError:
+        pass
+    return None
+
+
+def path_in_scope(rule, path):
+    """`scope_paths` / `scope_exclude_paths` against a worktree-relative path.
+
+    A scope the hook CANNOT evaluate never silences a rule: a call with no path
+    (Bash, an `output` result, the session digest, an anchor handle) stays in
+    scope. Exclusion wins over inclusion."""
+    inc = rule.get("_scope_paths")
+    exc = rule.get("_scope_exclude_paths")
+    if not inc and not exc:
+        return True
+    if path is None:            # outside the worktree: no repo-relative glob owns it
+        return not inc
+    if not path:                # no path on this call — nothing to narrow on
+        return True
+    segs = [seg for seg in path.split("/") if seg and seg != "."]
+    for pat in exc or ():
+        g = _glob_segments(pat)
+        if g is not None and _glob_match(g, segs):
+            return False
+    if not inc:
+        return True
+    usable = [g for pat in inc if (g := _glob_segments(pat)) is not None]
+    if not usable:      # every include glob was unusable: that is a scope the
+        return True     # hook cannot evaluate, and those never silence a rule
+    return any(_glob_match(g, segs) for g in usable)
+
+
+def scope_ok(rule, repo, gitdir, path=""):
+    if not _repo_ok(rule, repo, gitdir):   # cheapest test first: a rule for
+        return False                       # another repo pays nothing for paths
+    return path_in_scope(rule, path)
+
+
+def _repo_ok(rule, repo, gitdir):
     scope = rule.get("repo_scope", "any")
     if rule.get("_scope_repos"):        # server list: this checkout's name or its main
         parts = gitdir.split("/") if gitdir else []   # checkout's (…/<main>/.git/worktrees/x)
@@ -521,7 +678,7 @@ def _api():
 
 
 def fetch_book(repo):
-    """GET /rules?status=active&repo=<repo>&view=hook with If-None-Match.
+    """GET /rules?view=hook&repo=<repo> with If-None-Match.
     200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
     current, which is what §5.3 gate freshness measures); anything else →
     the cache is left exactly as it was."""
@@ -531,7 +688,13 @@ def fetch_book(repo):
     base, bearer, http = api
     old = load_book(repo) or {}
     hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
-    q = "status=active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    # No status filter: C5 made list filters PostgREST-style (`status=eq.active`)
+    # and the old `status=active` is now a 400 that this function would swallow
+    # as "keep the cache" — i.e. the book silently never refreshes. The hook
+    # view is active-only server-side (its rows carry no `status` at all) and
+    # every delivery site re-checks status client-side, so sending no status
+    # filter is the one form BOTH server generations accept.
+    q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
                           timeout=FETCH_TIMEOUT_S)
@@ -583,13 +746,22 @@ def spawn_fetch(repo):
 
 WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "repo",
              "branch", "tool", "hook_phase", "mode", "dedup_key",
-             "raw_matches_before_fire", "fired_at", "converted", "converted_at")
+             "raw_matches_before_fire", "fired_at", "converted", "converted_at",
+             "message_ref", "source_message_id")
 
 
 def wire_row(row):
     """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
-    opt-in for excerpts is a server setting the hook does not consult)."""
-    return {k: row.get(k) for k in WIRE_KEYS}
+    opt-in for excerpts is a server setting the hook does not consult).
+
+    The transcript marker travels under BOTH names. C3 froze it as
+    `message_ref`; the shipped ledger ingest reads `source_message_id` and
+    accepts a row naming only the other one — storing null, with a 202 and no
+    error, so a mismatch is invisible from here. One value, two keys, until
+    the two halves agree on one."""
+    out = {k: row.get(k) for k in WIRE_KEYS}
+    out["source_message_id"] = out["source_message_id"] or out["message_ref"]
+    return out
 
 
 def _read_rows(path, start=0, offsets=None):
@@ -937,6 +1109,75 @@ def agent_id_of(data):
     return None
 
 
+MSG_REF_TAIL = 64 * 1024        # first pass: enough for any ordinary turn
+MSG_REF_TAIL_MAX = 1024 * 1024  # one escalation: a big Write's tool_use record
+
+
+def _scan_tail(chunk, whole, tool, tool_input=None):
+    """Newest-first over the COMPLETE lines of a transcript tail. Returns, in
+    order of preference: the assistant record whose `tool_use` matches this
+    call by NAME AND INPUT (the only exact answer when one turn fans out
+    several calls to the same tool), the newest one matching by name, else the
+    newest assistant record's uuid — turn granularity, which is what the server
+    resolves at anyway. None if nothing parsed.
+
+    One malformed record must never cost the whole scan, so every field access
+    here is defensive: `message` has been seen as a list."""
+    lines = chunk.split(b"\n")
+    if not whole and lines:
+        lines.pop(0)                  # the window cut this one in half
+    newest = by_name = None
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            rec = json.loads(raw)
+        except Exception:             # a truncated or non-JSON line is not an error
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        uid = rec.get("uuid")
+        if not isinstance(uid, str) or not uid:
+            continue
+        if newest is None:
+            newest = uid
+        msg = rec.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_use" \
+                    or b.get("name") != tool:
+                continue
+            if tool_input is not None and b.get("input") == tool_input:
+                return uid            # exact: this call, not a sibling of it
+            if by_name is None:
+                by_name = uid
+    return by_name or newest
+
+
+def message_ref(data, tool, tool_input=None):
+    """C3's transcript marker: the bare entry uuid of the turn this fire
+    belongs to. Claude Code's payload carries no message id, so read the TAIL
+    of the transcript — the record carrying the tool call is already written
+    when either lane runs. Bounded, and silent about every failure: a missing,
+    unreadable, empty or truncated transcript is null, never an exception."""
+    path = str(data.get("transcript_path") or "")
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            for budget in (MSG_REF_TAIL, MSG_REF_TAIL_MAX):
+                f.seek(max(0, size - budget))
+                found = _scan_tail(f.read(budget), size <= budget, tool, tool_input)
+                if found or size <= budget:
+                    return found      # escalate ONLY when the cheap pass saw nothing
+    except Exception:
+        return None
+    return None
+
+
 def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
@@ -958,6 +1199,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
                     "fired_at": _now(),
                     "converted": None, "converted_at": None,
+                    "message_ref": ctx.get("message_ref"),
                     "excerpt": excerpt[:160],
                 }) + "\n")
     except Exception:
@@ -1039,7 +1281,8 @@ def main():
     rules, rule_version, fetched_at, sources = load_rules(repo)
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
-           "branch": branch, "tool": tool, "rule_version": rule_version}
+           "branch": branch, "tool": tool, "rule_version": rule_version,
+           "message_ref": None}   # session lane: no tool call, often no transcript
 
     if mode == "session":
         try:        # which source each rule came from — the pilot's merge audit
@@ -1055,6 +1298,8 @@ def main():
         return 0
 
     inp = data.get("tool_input") or {}
+    fp_raw = inp.get("file_path")     # present-but-null is NO path; str() would
+    rel = rel_path(fp_raw if isinstance(fp_raw, str) else "", root, cwd)  # make it "None"
     sp = state_path(session)
     st = load_state(sp)
     fired_now = []
@@ -1092,7 +1337,8 @@ def main():
     # an active anchor rule in scope and the call carries a handle. The server
     # matches anchors AND judges relevance; the hook just injects what it kept.
     anchor_rules = {r["id"]: r for r in rules if r.get("on") == "anchor"
-                    and r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
+                    and r.get("status", "active") == "active"
+                    and scope_ok(r, repo, gitdir, rel)
                     and r["id"] not in st["fired"]}
     handles = {}
     if tool == "Bash" and cmd:
@@ -1109,7 +1355,7 @@ def main():
                 fired_now.append(r)
 
     for r in rules:
-        if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
+        if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir, rel) \
                 or r.get("status", "active") != "active":   # draft = not armed (§6)
             continue
         rid = r["id"]
@@ -1155,6 +1401,10 @@ def main():
     if not fired_now:
         save_state(sp, st)
         return 0
+
+    # C3: read the transcript only once we know there is a row to mark, so a
+    # call that fires nothing — the overwhelming majority — pays nothing.
+    ctx["message_ref"] = message_ref(data, tool, inp or None)
 
     shown, cut = fired_now[:MAX_ADVISE], fired_now[MAX_ADVISE:]
     lines = ["## 📏 Rulebook (team rules — advisory, not blocking)"]

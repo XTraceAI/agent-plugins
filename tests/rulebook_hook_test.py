@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import io
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,256 @@ def main() -> int:
         statefiles = [n for n in os.listdir(os.path.join(td, "state")) if n.startswith("wt-") and n.endswith(".json")]
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
+
+        # --- C3: the transcript marker (message_ref) ------------------------
+        # The hook's payload carries no message id, so the marker is read from
+        # the TAIL of transcript_path. It must be exact where it can be, and
+        # null — never an exception — where it cannot.
+        mbase = os.path.join(td, "msgref")
+        seed_book(mbase, "xmem", [
+            {"id": "mark-rule", "on": "bash", "rx": "marker-cmd", "fire_scope": "call",
+             "repo_scope": "any", "text": "Marker advisory", "version": 1},
+            {"id": "mark-result", "on": "result", "rx": "MARK-BOOM", "fire_scope": "call",
+             "repo_scope": "any", "text": "Marker result advisory", "version": 1},
+            {"id": "mark-posture", "on": "session", "repo_scope": "any",
+             "text": "Marker posture", "version": 1},
+        ])
+        menv = {"MEMHUB_RULEBOOK_BASE": mbase}
+        mledger = os.path.join(mbase, "ledger", "fires.jsonl")
+
+        def transcript(name, records):
+            path = os.path.join(td, name)
+            with open(path, "w", encoding="utf-8") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+            return path
+
+        def asst(uid, blocks):
+            return {"type": "assistant", "uuid": uid, "message": {"content": blocks}}
+
+        def refs(session):
+            if not os.path.isfile(mledger):
+                return []
+            with open(mledger, encoding="utf-8") as f:
+                return [json.loads(l)["message_ref"] for l in f
+                        if l.strip() and json.loads(l)["session_id"] == session]
+
+        U1 = "11111111-1111-1111-1111-111111111111"
+        U2 = "22222222-2222-2222-2222-222222222222"
+        U3 = "33333333-3333-3333-3333-333333333333"
+        tp = transcript("t-exact.jsonl", [
+            asst(U1, [{"type": "thinking", "thinking": "…"}]),
+            asst(U2, [{"type": "tool_use", "name": "Bash", "input": {"command": "marker-cmd"}}]),
+            asst(U3, [{"type": "text", "text": "trailing turn"}]),
+        ])
+        mev = {"cwd": repo, "tool_name": "Bash", "transcript_path": tp,
+               "tool_input": {"command": "marker-cmd"}}
+        run("pre", dict(mev, session_id="m1"), menv)
+        check("message_ref: the tool_use record for THIS tool wins over a newer turn",
+              refs("m1") == [U2], str(refs("m1")))
+
+        tp2 = transcript("t-fallback.jsonl", [
+            asst(U1, [{"type": "tool_use", "name": "Read", "input": {}}]),
+            asst(U2, [{"type": "text", "text": "no tool_use for Bash here"}]),
+        ])
+        run("pre", dict(mev, session_id="m2", transcript_path=tp2), menv)
+        check("message_ref: no name match falls back to the newest assistant record",
+              refs("m2") == [U2], str(refs("m2")))
+
+        run("post", dict(mev, session_id="m3",
+                         tool_input={"command": "marker-cmd"},
+                         tool_response={"stdout": "MARK-BOOM"}), menv)
+        check("message_ref: pre and post resolve the SAME uuid for one call",
+              refs("m3") == [U2], str(refs("m3")))
+
+        # a single Write's tool_use record can exceed the 64 KiB first pass —
+        # exactly the calls most likely to fire an edit rule
+        big = transcript("t-big.jsonl", [
+            asst(U1, [{"type": "text", "text": "small earlier turn"}]),
+            asst(U3, [{"type": "tool_use", "name": "Bash",
+                       "input": {"command": "marker-cmd " + "y" * 90000}}]),
+        ])
+        check("message_ref: the oversize record really does exceed the first window",
+              os.path.getsize(big) > 64 * 1024)
+        run("pre", dict(mev, session_id="m4", transcript_path=big), menv)
+        check("message_ref: a tool_use record larger than 64 KiB is still found (1 MiB escalation)",
+              refs("m4") == [U3], str(refs("m4")))
+
+        degraded = {
+            "m5": None,                                          # no transcript_path at all
+            "m6": os.path.join(td, "does-not-exist.jsonl"),      # missing file
+            "m7": transcript("t-empty.jsonl", []),               # empty file
+        }
+        with open(os.path.join(td, "t-garbage.jsonl"), "w", encoding="utf-8") as f:
+            f.write("not json at all\n{\"type\": \"assistant\", trunc")
+        degraded["m8"] = os.path.join(td, "t-garbage.jsonl")
+        ok_silent = True
+        for sid, path in degraded.items():
+            ev = dict(mev, session_id=sid)
+            ev["transcript_path"] = path
+            if path is None:
+                ev.pop("transcript_path")
+            rc, out = run("pre", ev, menv)
+            ok_silent = ok_silent and rc == 0 and "[mark-rule]" in ctx(out) and refs(sid) == [None]
+        check("message_ref: missing/unreadable/empty/truncated transcript → null, rule still fires, exit 0",
+              ok_silent)
+
+        rc, out = run("session", {"cwd": repo, "session_id": "m9", "transcript_path": tp}, menv)
+        check("message_ref: the session lane has no tool call, so no marker",
+              "Marker posture" in ctx(out) and refs("m9") == [None], str(refs("m9")))
+
+        check("message_ref: on the wire (C3), and a pre-existing row without it reads null",
+              "message_ref" in H.WIRE_KEYS and H.wire_row({"fire_id": "f"})["message_ref"] is None)
+        # C3 froze `message_ref`; the shipped ingest reads `source_message_id`
+        # and silently stores null for the other name. The wire carries both.
+        w = H.wire_row({"fire_id": "f", "message_ref": "u-1"})
+        check("message_ref: the marker goes out under BOTH contract names, same value",
+              w["message_ref"] == "u-1" and w["source_message_id"] == "u-1", str(w))
+        check("message_ref: a legacy ledger row without the marker sends null under both",
+              H.wire_row({"fire_id": "f"})["source_message_id"] is None)
+
+        # --- fetch: the query C5 turned into a 400 -------------------------
+        seen = {}
+
+        class _Reply:
+            status, data, etag = 200, {"rules": []}, "etag-1"
+
+        class _Http:
+            @staticmethod
+            def rest(url, bearer, method, headers=None, timeout=None, body=None):
+                seen["url"] = url
+                return _Reply()
+
+        fbase = os.path.join(td, "fetch")
+        H.BASE, H.BOOK_DIR = fbase, os.path.join(fbase, "book")
+        H._api = lambda: ("https://example.invalid", "tok", _Http)
+        H.fetch_book("xmem")
+        check("fetch: the hook view is requested with NO status filter "
+              "(`status=active` is a 400 since C5, swallowed as 'keep the cache')",
+              "view=hook" in seen.get("url", "") and "status=" not in seen.get("url", ""),
+              seen.get("url", "<not called>"))
+
+        # --- scope_paths / scope_exclude_paths (server shape → hook shape) --
+        pbase = os.path.join(td, "pathscope")
+        seed_book(pbase, "xmem", [
+            {"rule_id": "scoped", "title": "Scoped", "statement": "Scoped advisory",
+             "delivery": "agent_hook", "version": 1,
+             "matcher": {"event": "edit", "path_rx": r"\.py$", "warn_once_per": "turn"},
+             "scope_paths": ["src/**", "tests/*.py"],
+             "scope_exclude_paths": ["**/vendor/**"]},
+            {"rule_id": "scoped-bash", "title": "Scoped bash", "statement": "Scoped bash advisory",
+             "delivery": "agent_hook", "version": 1,
+             "matcher": {"event": "bash", "command_rx": "scoped-cmd", "warn_once_per": "turn"},
+             "scope_paths": ["src/**"]},
+            {"rule_id": "scoped-posture", "title": "Scoped posture",
+             "statement": "Scoped posture advisory", "delivery": "session_context",
+             "version": 1, "scope_paths": ["src/**"]},
+        ])
+        penv = {"MEMHUB_RULEBOOK_BASE": pbase}
+
+        def edits(rel_target, sid):
+            rc, out = run("pre", {"cwd": repo, "session_id": sid, "tool_name": "Write",
+                                  "tool_input": {"file_path": os.path.join(repo, rel_target),
+                                                 "content": "x = 1\n"}}, penv)
+            return "Scoped advisory" in ctx(out)
+
+        check("scope_paths: an included path fires", edits("src/a.py", "p1"))
+        check("scope_paths: `src/**` crosses directories", edits("src/deep/b.py", "p2"))
+        check("scope_paths: a path outside every glob is silent — the bug this fixes",
+              not edits("docs/a.py", "p3"))
+        check("scope_paths: `tests/*.py` does NOT cross a directory",
+              not edits("tests/sub/b.py", "p4") and edits("tests/a.py", "p5"))
+        check("scope_exclude_paths: exclusion wins over inclusion",
+              not edits("src/vendor/x.py", "p6"))
+
+        rc, out = run("pre", {"cwd": repo, "session_id": "p7", "tool_name": "Write",
+                              "tool_input": {"file_path": os.path.join(td, "elsewhere", "a.py"),
+                                             "content": "x = 1\n"}}, penv)
+        check("scope_paths: a path outside the worktree matches no repo-relative glob",
+              "Scoped advisory" not in ctx(out))
+
+        rc, out = run("pre", {"cwd": repo, "session_id": "p8", "tool_name": "Bash",
+                              "tool_input": {"command": "scoped-cmd now"}}, penv)
+        check("scope_paths: a call with NO path is in scope (a scope the hook cannot "
+              "evaluate never silences a rule)", "Scoped bash advisory" in ctx(out))
+
+        rc, out = run("session", {"cwd": repo, "session_id": "p9"}, penv)
+        check("scope_paths: the session digest has no path, so a path-scoped posture rule shows",
+              "Scoped posture advisory" in ctx(out))
+
+        check("scope_paths: absent from a rule → nothing changes",
+              H.scope_ok({"repo_scope": "any"}, "xmem", "", "docs/a.py"))
+        # a scope the hook cannot evaluate must never silence a rule, and a
+        # malformed one must not raise where the caller is not wrapped
+        check("scope_paths: an unusable glob list is ignored, not fatal, not silencing",
+              H.path_in_scope({"_scope_paths": [["unhashable"]]}, "src/a.py")
+              and H.path_in_scope({"_scope_paths": ["/", ""]}, "src/a.py"))
+        check("scope_paths: one usable glob among junk still narrows",
+              H.path_in_scope({"_scope_paths": ["/", "src/**"]}, "src/a.py")
+              and not H.path_in_scope({"_scope_paths": ["/", "src/**"]}, "docs/a.py"))
+
+        # A scope glob is wire data any teammate can author, and the pre lane
+        # has a 5 s budget. The obvious `*` → `[^/]*` regex translation took
+        # >6 s on `*a*a*a…b` against a long path; the matcher is deliberately
+        # not a regex so no pattern can backtrack. This is that regression gate.
+        import time as _t
+        worst = "src/" + "a" * 255 + "/x.py"
+        t0 = _t.perf_counter()
+        for _ in range(50):
+            H.path_in_scope({"_scope_paths": ["*" + "a*" * 19 + "b",
+                                              "**/**/**/**/**/**/**/**/zzz"]}, worst)
+        span = (_t.perf_counter() - t0) * 1000 / 50
+        check("scope_paths: a pathological glob stays linear (no catastrophic backtracking)",
+              span < 5.0, f"{span:.3f} ms per call")
+
+        check("scope_paths: a symlinked worktree root still resolves (macOS /tmp)",
+              H.rel_path(os.path.join(os.path.realpath(td), "xmem", "src", "a.py"),
+                         os.path.join(td, "xmem"), td) == "src/a.py")
+
+        # decision 8, on the wire this time: a null file_path is NO path, not
+        # the literal string "None", which would look in-worktree and exclude
+        rc, out = run("pre", {"cwd": repo, "session_id": "p10", "tool_name": "Bash",
+                              "tool_input": {"command": "scoped-cmd", "file_path": None}}, penv)
+        check("scope_paths: a null file_path is no path at all, and never silences a rule",
+              "Scoped bash advisory" in ctx(out), ctx(out))
+
+        # --- message_ref: the cases the adversarial review found -------------
+        tp_bad = transcript("t-badmsg.jsonl", [
+            asst(U1, [{"type": "tool_use", "name": "Bash", "input": {}}]),
+            {"type": "assistant", "uuid": U2, "message": ["not a dict"]},
+        ])
+        check("message_ref: one malformed record does not discard the whole scan",
+              H.message_ref({"transcript_path": tp_bad}, "Bash") == U1)
+
+        tp_par = transcript("t-parallel.jsonl", [
+            asst(U1, [{"type": "tool_use", "name": "Bash", "input": {"command": "first"}}]),
+            asst(U2, [{"type": "tool_use", "name": "Bash", "input": {"command": "second"}}]),
+        ])
+        check("message_ref: parallel calls to the SAME tool resolve by input, not by recency",
+              H.message_ref({"transcript_path": tp_par}, "Bash", {"command": "first"}) == U1
+              and H.message_ref({"transcript_path": tp_par}, "Bash", {"command": "second"}) == U2)
+        check("message_ref: an unmatched input still falls back to the newest same-tool record",
+              H.message_ref({"transcript_path": tp_par}, "Bash", {"command": "third"}) == U2)
+
+        # The whole latency argument is that a call which fires nothing never
+        # touches the transcript. Assert it, rather than trusting the ordering.
+        reads = []
+        real_ref = H.message_ref
+        H.message_ref = lambda *a, **k: (reads.append(1), real_ref(*a, **k))[1]
+        H.BASE, H.BOOK_DIR = mbase, os.path.join(mbase, "book")
+        for cmd, label in (("nothing here matches", "quiet"), ("marker-cmd", "fires")):
+            sys.stdin = io.StringIO(json.dumps(
+                {"cwd": repo, "session_id": f"lat-{label}", "transcript_path": tp,
+                 "tool_name": "Bash", "tool_input": {"command": cmd}}))
+            out_buf, sys.stdout = sys.stdout, io.StringIO()
+            try:
+                H.main()
+            finally:
+                sys.stdout = out_buf
+        H.message_ref = real_ref
+        sys.stdin = sys.__stdin__
+        check("message_ref: a call that fires nothing never reads the transcript",
+              len(reads) == 1, f"{len(reads)} reads for 1 quiet + 1 firing call")
 
     print()
     if FAILURES:
