@@ -348,6 +348,34 @@ def main() -> int:
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
 
+    # --- message_id_of: the fire's link back to the transcript record ---
+    sys.path.insert(0, os.path.dirname(HOOK))
+    import rulebook_hook as rb  # noqa: E402
+    with tempfile.TemporaryDirectory() as td:
+        tp = os.path.join(td, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"uuid": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"}) + "\n")
+            f.write(json.dumps({"uuid": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"}) + "\n")
+        check("message_id_of: the LAST record's uuid",
+              rb.message_id_of({"transcript_path": tp}) == "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+        check("message_id_of: no transcript_path -> None",
+              rb.message_id_of({}) is None)
+        check("message_id_of: missing file -> None (never raises)",
+              rb.message_id_of({"transcript_path": os.path.join(td, "nope.jsonl")}) is None)
+        with open(tp, "a", encoding="utf-8") as f:
+            f.write("{not json\n")
+        check("message_id_of: skips an unparseable tail line",
+              rb.message_id_of({"transcript_path": tp}) == "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+        big = os.path.join(td, "big.jsonl")
+        with open(big, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"uuid": "cccccccc-3333-4333-8333-cccccccccccc", "pad": "x" * 200000}) + "\n")
+            f.write(json.dumps({"uuid": "dddddddd-4444-4444-8444-dddddddddddd"}) + "\n")
+        check("message_id_of: reads only the tail of a large transcript",
+              rb.message_id_of({"transcript_path": big}) == "dddddddd-4444-4444-8444-dddddddddddd")
+
+    check("WIRE_KEYS carries source_message_id (server links the fire to its message)",
+          "source_message_id" in rb.WIRE_KEYS)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

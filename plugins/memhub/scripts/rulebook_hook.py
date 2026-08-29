@@ -521,7 +521,9 @@ def _api():
 
 
 def fetch_book(repo):
-    """GET /rules?status=active&repo=<repo>&view=hook with If-None-Match.
+    """GET /rules?status=eq.active&repo=<repo>&view=hook with If-None-Match.
+
+    The filter form is `op.value` (`eq.active`); a bare value is a 400.
     200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
     current, which is what §5.3 gate freshness measures); anything else →
     the cache is left exactly as it was."""
@@ -531,7 +533,7 @@ def fetch_book(repo):
     base, bearer, http = api
     old = load_book(repo) or {}
     hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
-    q = "status=active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    q = "status=eq.active&view=hook&repo=" + urllib.parse.quote(repo, safe="")
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
                           timeout=FETCH_TIMEOUT_S)
@@ -583,7 +585,8 @@ def spawn_fetch(repo):
 
 WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "repo",
              "branch", "tool", "hook_phase", "mode", "dedup_key",
-             "raw_matches_before_fire", "fired_at", "converted", "converted_at")
+             "raw_matches_before_fire", "fired_at", "converted", "converted_at",
+             "source_message_id")
 
 
 def wire_row(row):
@@ -928,6 +931,36 @@ def _now():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def message_id_of(data):
+    """The transcript record the tool call belongs to — the server resolves it
+    to the stored message. Reads the tail of the JSONL rather than the whole
+    file: these grow to megabytes and this runs on a 5 s hook budget. Any
+    problem returns None; the link is optional and never blocks a fire."""
+    tp = str(data.get("transcript_path") or "")
+    if not tp:
+        return None
+    try:
+        with open(tp, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            start = max(0, end - 65536)
+            f.seek(start)
+            tail = f.read(end - start).splitlines()
+        for raw in reversed(tail):
+            if not raw.strip():
+                continue
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue            # a partial first line after the seek
+            uid = rec.get("uuid")
+            if isinstance(uid, str) and uid:
+                return uid
+    except Exception:
+        return None
+    return None
+
+
 def agent_id_of(data):
     """Subagent transcripts live at <session>/subagents/agent-<id>.jsonl;
     the main agent's do not. NULL = main agent."""
@@ -952,6 +985,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "fire_id": fid, "rule_id": r["id"],
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
+                    "source_message_id": ctx.get("source_message_id"),
                     "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
                     "dedup_key": (dedup_keys or {}).get(r["id"]),
@@ -1039,7 +1073,8 @@ def main():
     rules, rule_version, fetched_at, sources = load_rules(repo)
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
-           "branch": branch, "tool": tool, "rule_version": rule_version}
+           "branch": branch, "tool": tool, "rule_version": rule_version,
+           "source_message_id": message_id_of(data)}
 
     if mode == "session":
         try:        # which source each rule came from — the pilot's merge audit

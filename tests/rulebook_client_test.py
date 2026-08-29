@@ -223,9 +223,14 @@ def main():
         rc, out = run("fetch", {"cwd": repo}, env)
         check("fetch: silent exit-0", rc == 0 and out == "")
         req = fake.requests[-1]
-        check("fetch: GET /v1/team/rulebook/rules?status=active&repo=xmem&view=hook",
+        # The server parses `status` as an `op.value` filter; a bare
+        # `status=active` is a 400 that the hook swallows, leaving every
+        # client on a stale book. Assert the operator form explicitly.
+        check("fetch: GET /v1/team/rulebook/rules?status=eq.active&repo=xmem&view=hook",
               req["method"] == "GET" and req["path"].startswith("/v1/team/rulebook/rules?")
-              and all(k in req["path"] for k in ("status=active", "repo=xmem", "view=hook")), req["path"])
+              and all(k in req["path"] for k in ("status=eq.active", "repo=xmem", "view=hook")), req["path"])
+        check("fetch: never sends a bare status= value (400 on the real server)",
+              "status=active" not in req["path"], req["path"])
         check("fetch: bearer from the plugin's credential path",
               req["headers"].get("Authorization") == "Bearer tok-123")
         b = json.load(open(cache, encoding="utf-8"))
