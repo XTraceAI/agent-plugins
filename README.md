@@ -187,6 +187,31 @@ refresh`, async) fetches `get_brain_overview` and writes the cache `brief`
 reads, throttled to once per 6 hours since the digest moves on the order of
 days, not turns.
 
+### Rulebook delivery
+
+The other half of `/memhub:create-rule`: filed rules reach teammates through
+`SessionStart` / `PreToolUse` / `PostToolUse` hooks (`rulebook_hook.py`). The
+team's active rulebook for the repo is fetched once per session into a local
+ETag-cached book, and a matching rule is injected as an **advisory** at the
+moment of the call — proactively before a command or edit, reactively on a
+failing result, and once at session start for rules that carry no trigger.
+Rules always advise; nothing the hook does can refuse a tool call.
+
+What a rule fires on is narrowed by its own scope: `scope_repos`, and
+`scope_paths` / `scope_exclude_paths` as **gitignore-style globs** matched
+against the repo-relative path (`src/**` crosses directories, `tests/*.py`
+does not, a pattern with no `/` matches at any depth, and an exclude beats an
+include). A call that carries no path — a bash command, a failing result, the
+session digest — is never silenced by a path scope the hook cannot evaluate.
+
+Every fire is appended to a local ledger (under `~/.config/memhub-plugin/`,
+never in your repo) and flushed to the backend in batches, so a team can see
+which advice actually fires and how often. A row from a tool call names the
+transcript entry it fired on, which is what lets a rule's history point back at
+the turn that triggered it (a session-start row has no tool call, so it carries
+none). The whole path is stdlib-only, bounded, and silent on every
+failure: a broken hook exits 0 and never touches your tool call.
+
 ## Skills
 
 Eleven skills ship in `plugins/memhub/skills/` (the deprecated `commands/`

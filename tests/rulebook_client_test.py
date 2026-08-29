@@ -5,8 +5,10 @@ canned replies (200+ETag, 304, 500, slow, or nothing at all — connection
 refused). What is asserted is the client contract from the spec (§4.1, §4.3,
 §5.3, §5.4):
 
-* fetch sends ``status=active&repo=<repo>&view=hook`` with the bearer, caches
-  ``{etag, fetched_at, rules}``, and revalidates with ``If-None-Match``;
+* fetch sends ``view=hook&repo=<repo>`` with the bearer — and NO status filter,
+  which C5 turned into a 400 that ``fetch_book`` would swallow as "keep the
+  cache" — caches ``{etag, fetched_at, rules}``, and revalidates with
+  ``If-None-Match``;
 * server rules are the only rules (no local book), and the
   merge audit names each rule's source;
 * offline / 500 / slow keep the LAST book; no book at all → silent;
@@ -223,9 +225,10 @@ def main():
         rc, out = run("fetch", {"cwd": repo}, env)
         check("fetch: silent exit-0", rc == 0 and out == "")
         req = fake.requests[-1]
-        check("fetch: GET /v1/team/rulebook/rules?status=active&repo=xmem&view=hook",
+        check("fetch: GET /v1/team/rulebook/rules?view=hook&repo=xmem, with NO status filter",
               req["method"] == "GET" and req["path"].startswith("/v1/team/rulebook/rules?")
-              and all(k in req["path"] for k in ("status=active", "repo=xmem", "view=hook")), req["path"])
+              and all(k in req["path"] for k in ("repo=xmem", "view=hook"))
+              and "status=" not in req["path"], req["path"])
         check("fetch: bearer from the plugin's credential path",
               req["headers"].get("Authorization") == "Bearer tok-123")
         b = json.load(open(cache, encoding="utf-8"))
