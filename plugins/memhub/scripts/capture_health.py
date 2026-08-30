@@ -36,11 +36,16 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 STATE_DIR = CACHE_DIR / "turnflush"
+# The rulebook keeps its own tree, relocatable together for tests (the hook
+# reads the same variable).
+RULEBOOK_DIR = Path(os.environ.get("MEMHUB_RULEBOOK_BASE")
+                    or os.path.expanduser("~/.config/memhub-plugin/rulebook"))
 
 # How far back a recorded failure still counts as news. A breadcrumb from last
 # week describes a problem that has probably already been fixed (or a machine
@@ -327,8 +332,60 @@ def _succeeded_since(path: Path, when: float) -> bool:
     return False
 
 
+def _rulebook_problem() -> tuple[str, float] | None:
+    """``(what, when)`` for a rulebook lane that is failing right now.
+
+    The rulebook fails SILENTLY by construction: every lane exits 0 and the
+    cache is left as it was, so a book frozen weeks ago is indistinguishable
+    from a current one, and a client that has never fetched at all looks
+    exactly like an org with nothing to say. `ledger/.last_error` is the only
+    trace, and nobody reads a file they do not know exists.
+
+    Deliberately NOT reported: no book, or a book with no rules. A team whose
+    rulebook is empty is not broken, and warning there would train people to
+    ignore this line — the one thing a health check cannot afford.
+    """
+    try:
+        raw = (RULEBOOK_DIR / "ledger" / ".last_error").read_text(encoding="utf-8")
+        crumb = json.loads(raw)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(crumb, dict):
+        return None
+    what, at = crumb.get("what"), crumb.get("at")
+    if what not in ("fetch", "flush", "recall") or not isinstance(at, str):
+        return None
+    try:                       # the hook writes a local-offset ISO stamp
+        when = datetime.fromisoformat(at).timestamp()
+    except ValueError:
+        return None
+    if when < time.time() - _STALE_AFTER_S:
+        return None
+    # A later success retracts it: every book carries the time it was last
+    # confirmed, and any book newer than the error means fetching works now.
+    # Without this a single blip would warn for a day.
+    try:
+        for book in (RULEBOOK_DIR / "book").glob("*.json"):
+            try:
+                got = json.loads(book.read_text(encoding="utf-8")).get("fetched_at")
+                if isinstance(got, str) and datetime.fromisoformat(got).timestamp() >= when:
+                    return None
+            except (OSError, ValueError, TypeError):
+                continue
+    except OSError:
+        pass
+    # The known shape worth naming separately: without a personal access key the
+    # client falls back to an OAuth token and no lane sends an org header, so
+    # every rulebook call is refused. Minting a key is the fix, and it works.
+    text = str(crumb.get("error") or "")
+    if "X-Org-Id" in text or ("401" in text and "key" in text.lower()):
+        return "auth", when
+    return str(what), when
+
+
 def _message(host: str, token_problem: str | None,
-             failure: tuple[str, float] | None) -> str | None:
+             failure: tuple[str, float] | None,
+             rulebook: tuple[str, float] | None = None) -> str | None:
     """The warning to show, or None when there is nothing worth saying.
 
     The token check leads when it fires, because it names a cause the user can
@@ -387,6 +444,31 @@ def _message(host: str, token_problem: str | None,
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")
         return (f"MemHub capture last failed {when_txt} — {detail}. {tail}")
+
+    # Last, and only when capture itself is healthy: capture failing is the
+    # bigger loss, and two warnings in one banner get read as none.
+    if rulebook:
+        what, when = rulebook
+        ago = max(0, int((time.time() - when) / 60))
+        when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
+        if what == "auth":
+            return ("Your team's rules are not reaching this session — the "
+                    f"rulebook was refused {when_txt} because the plugin has no "
+                    "access key of its own. Any rules already cached keep "
+                    f"showing, but new or retired ones will not. {fix}")
+        if what == "fetch":
+            return ("Your team's rules are not refreshing — the last check "
+                    f"failed {when_txt}, so this session is using a cached copy. "
+                    "Rules activated or retired since then are not reflected. "
+                    "Run /memhub:login --status to check.")
+        if what == "flush":
+            return ("Your team's rules are showing normally, but which ones "
+                    f"fired is not reaching the server (last attempt {when_txt}), "
+                    "so the team cannot see whether they are useful. "
+                    "Run /memhub:login --status to check.")
+        return ("A team-rule lookup failed "
+                f"{when_txt}; advice tied to specific files or commands may be "
+                "missing from this session. Run /memhub:login --status to check.")
     return None
 
 
@@ -436,7 +518,8 @@ def main() -> int:
 
     token_problem = _token_problem(host)
     failure = _recent_failure()
-    message = _message(host, token_problem, failure)
+    rulebook = _rulebook_problem()
+    message = _message(host, token_problem, failure, rulebook)
     if not message:
         return 0
 
@@ -445,7 +528,8 @@ def main() -> int:
     # — and SessionStart fires again on resume and /clear. The cause is what
     # should be shown once; only a genuinely DIFFERENT problem should interrupt
     # again.
-    signature = f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
+    signature = (f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
+                 f"|{rulebook[0] if rulebook else ''}")
     if _already_warned(session_id, signature):
         return 0
 

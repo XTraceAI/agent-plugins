@@ -414,10 +414,93 @@ def test_never_raises() -> None:
     check("garbage stdin exits clean", _run({}) is not None, True)
 
 
+def _rulebook_crumb(what: str, *, ago_min: float, error: str = "boom") -> None:
+    """Write `ledger/.last_error` the way the rulebook hook writes it."""
+    from datetime import datetime, timedelta
+    d = ch.RULEBOOK_DIR / "ledger"
+    d.mkdir(parents=True, exist_ok=True)
+    when = datetime.now().astimezone() - timedelta(minutes=ago_min)
+    (d / ".last_error").write_text(json.dumps({
+        "at": when.isoformat(timespec="seconds"), "what": what, "error": error,
+    }), encoding="utf-8")
+
+
+def _rulebook_book(*, fetched_ago_min: float, rules: int = 3) -> None:
+    from datetime import datetime, timedelta
+    d = ch.RULEBOOK_DIR / "book"
+    d.mkdir(parents=True, exist_ok=True)
+    when = datetime.now().astimezone() - timedelta(minutes=fetched_ago_min)
+    (d / "repo-abcd1234.json").write_text(json.dumps({
+        "etag": "e", "fetched_at": when.isoformat(timespec="seconds"),
+        "rules": [{"rule_id": str(i)} for i in range(rules)],
+    }), encoding="utf-8")
+
+
+def _clear_rulebook() -> None:
+    import shutil
+    shutil.rmtree(ch.RULEBOOK_DIR, ignore_errors=True)
+
+
+def test_rulebook_health() -> None:
+    print("rulebook")
+    _clear_rulebook()
+
+    # The silence cases matter most: a health line people learn to ignore is
+    # worse than no line, and most installs legitimately have no rulebook.
+    check("no rulebook tree at all is silent", ch._rulebook_problem(), None)
+    _rulebook_book(fetched_ago_min=5, rules=0)
+    check("a book with zero rules is not a fault", ch._rulebook_problem(), None)
+    _rulebook_book(fetched_ago_min=60 * 24 * 30)
+    check("an old book with no error is silent", ch._rulebook_problem(), None)
+    _clear_rulebook()
+
+    _rulebook_crumb("fetch", ago_min=10)
+    got = ch._rulebook_problem()
+    check("a recent fetch failure is reported", got and got[0], "fetch")
+    _rulebook_crumb("fetch", ago_min=60 * 30)
+    check("a failure older than the staleness window is dropped",
+          ch._rulebook_problem(), None)
+
+    # A later success retracts it — otherwise one blip warns for a day.
+    _rulebook_crumb("fetch", ago_min=30)
+    _rulebook_book(fetched_ago_min=5)
+    check("a book fetched AFTER the error retracts it", ch._rulebook_problem(), None)
+    _rulebook_book(fetched_ago_min=90)
+    got = ch._rulebook_problem()
+    check("a book fetched BEFORE the error does not retract it", got and got[0], "fetch")
+    _clear_rulebook()
+
+    # The known failure shape gets its own, actionable wording.
+    _rulebook_crumb("fetch", ago_min=5, error='400 {"msg":"Missing X-Org-Id header"}')
+    got = ch._rulebook_problem()
+    check("a missing-org-header refusal is classified as auth", got and got[0], "auth")
+
+    _rulebook_crumb("flush", ago_min=5)
+    check("a flush failure is reported", (ch._rulebook_problem() or ("",))[0], "flush")
+    _rulebook_crumb("nonsense", ago_min=5)
+    check("an unknown lane is ignored", ch._rulebook_problem(), None)
+    (ch.RULEBOOK_DIR / "ledger" / ".last_error").write_text("{not json", encoding="utf-8")
+    check("a corrupt breadcrumb never raises", ch._rulebook_problem(), None)
+    _clear_rulebook()
+
+    # Wording: names the consequence, and capture outranks it.
+    msg = ch._message(HOST, None, None, ("auth", time.time() - 300))
+    check("the auth wording says rules are not arriving", "rules are not reaching" in msg, True)
+    check("the auth wording names the fix", "/memhub:login" in msg, True)
+    msg = ch._message(HOST, None, None, ("fetch", time.time() - 300))
+    check("the fetch wording says the copy is cached", "cached copy" in msg, True)
+    msg = ch._message(HOST, None, None, ("flush", time.time() - 300))
+    check("the flush wording says rules still show", "showing normally" in msg, True)
+    both = ch._message(HOST, "never", None, ("fetch", time.time() - 300))
+    check("a capture problem outranks a rulebook one", "capture is not authenticated" in both, True)
+
+
+
 if __name__ == "__main__":
     for test in (test_token_states, test_stored_key_outranks_the_oauth_cache,
                  test_breadcrumbs, test_messages,
-                 test_debounce, test_end_to_end, test_never_raises):
+                 test_debounce, test_rulebook_health, test_end_to_end,
+                 test_never_raises):
         test()
     if failures:
         print("\nFAILED:")
