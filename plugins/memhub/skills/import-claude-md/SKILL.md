@@ -69,7 +69,7 @@ often it is actually violated. Replay every `agent_hook` candidate over the
 local sessions (Claude Code, Codex, Cursor) before filing:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/mine-proposals/scripts/mine_sessions.py" \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" \
   --rule-file <cand1.json> --rule-file <cand2.json> … --out /tmp/mine
 ```
 
@@ -79,7 +79,7 @@ row's `source_ref` (`<path>@<sha>#<heading>|applies N/M`). Two things this
 tells the reviewer that the document cannot: which declared rules are
 violated often (activate first) and which never fire (posture, or already
 enforced elsewhere). The reverse direction — findings in the transcripts
-with no sentence in the document — is `/memhub:mine-proposals`; report
+with no sentence in the document — is `/memhub:rules-from-sessions`; report
 those as CLAUDE.md gaps, never edit the document from this skill.
 
 ### 3. Conflict check against the book — before anything is filed

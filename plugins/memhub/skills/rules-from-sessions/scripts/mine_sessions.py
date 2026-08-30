@@ -30,7 +30,7 @@ os.makedirs(args.out, exist_ok=True)
 def _plugin_scripts():
     here = os.path.dirname(os.path.abspath(__file__))
     for c in (os.environ.get("MEMHUB_PLUGIN_SCRIPTS"), os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts"),
-              os.path.normpath(os.path.join(here, "..", "..", "..", "scripts"))):   # shipped inside the plugin: skills/mine-proposals/scripts -> plugin scripts
+              os.path.normpath(os.path.join(here, "..", "..", "..", "scripts"))):   # shipped inside the plugin: skills/rules-from-sessions/scripts -> plugin scripts
         if c and os.path.isfile(os.path.join(c, "rulebook_hook.py")): return c
     cands = glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/memhub*/*/scripts/rulebook_hook.py")) + \
             glob.glob(os.path.expanduser("~/.claude/plugins/*/plugins/memhub*/scripts/rulebook_hook.py")) + \
@@ -261,7 +261,7 @@ SKILL_INTENTS = [   # intent in a USER turn; `skill` = the name that would serve
  {"skill": "pr-babysit",     "intent_rx": r"babysit|watch (the |this )?pr|drive .* to green|until (it'?s )?green"},
  {"skill": "handoff-session","intent_rx": r"hand ?off|hand (this|it) (off|over) to"},
  {"skill": "search-memory",  "intent_rx": r"what do we know|did we decide|search (memhub|memory|the brain)|check (the )?(agent|repo) brain"},
- {"skill": "mine-proposals", "intent_rx": r"mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
+ {"skill": "rules-from-sessions", "intent_rx": r"mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
 ]
 def invoked(s, name): return any(f"skills/{name}" in u or f"/{name}" in u for u in s["users"])
 print(f"\n=== LANE 2 · SKILLS — intent in user turns vs. skill invoked (installed skills found: {len(installed)})")

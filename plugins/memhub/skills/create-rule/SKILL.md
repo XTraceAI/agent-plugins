@@ -34,7 +34,7 @@ situation actually occurs. Write the candidate `create_rule` body to a file
 and replay it over the local transcripts (Claude Code, Codex, Cursor):
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/mine-proposals/scripts/mine_sessions.py" \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" \
   --rule-file /tmp/cand.json --out /tmp/mine
 ```
 
@@ -46,7 +46,7 @@ below ~50 % the matcher would nag people who already complied, so use the
 into `source_ref` in step 5 (`…|applies N/M|precision P`). If N is 0 across
 all hosts, say so to the user before filing — it may still be right
 (insurance for a new teammate) but it is not lift. For deriving many rules
-at once from sessions, use `/memhub:mine-proposals` instead.
+at once from sessions, use `/memhub:rules-from-sessions` instead.
 
 ### 2. Duplicate check — by eye now, deterministically in step 5
 

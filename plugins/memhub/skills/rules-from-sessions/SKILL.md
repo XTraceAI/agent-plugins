@@ -1,10 +1,10 @@
 ---
-description: Use when the user wants to derive team rules, skills, or hooks from past coding sessions — "/memhub:mine-proposals", "mine our sessions for rules", "what should be in the rulebook", "propose skills from what we keep doing", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. Reads local Claude Code, Codex, and Cursor transcripts plus CLAUDE.md, scores every candidate against the transcripts (applies-in N/M, precision, samples), and files survivors as proposed rules / skills; hooks land as settings snippets. Never activates anything.
+description: Use when the user wants rules proposed from what their coding agents actually did — "/memhub:rules-from-sessions", "mine our sessions for rules", "mine rules from sessions", "what should be in the rulebook", "propose skills from what we keep doing", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. Reads local Claude Code, Codex, and Cursor transcripts plus CLAUDE.md, scores every candidate against the transcripts (applies-in N/M, precision, samples), and files survivors as proposed rules / skills; hooks land as settings snippets. Never activates anything.
 argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--brain "<rulebook brain name>"]
 allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
 ---
 
-# Mine proposals from past sessions
+# Rules from sessions
 
 ```
 transcripts (local: Claude Code · Codex · Cursor, via the memhub plugin readers)
@@ -13,7 +13,7 @@ transcripts (local: Claude Code · Codex · Cursor, via the memhub plugin reader
    │              (what went wrong — no other tool to run first; works in every host)
    ├─ CLAUDE.md ──► declared imperative sentences (what we SAY we do)
    ▼
-proposal miner (scripts/mine_sessions.py) ──► three lanes, each with a checkable "would-apply" predicate
+rules-from-sessions (scripts/mine_sessions.py) ──► three lanes, each with a checkable "would-apply" predicate
    │   rule   → matcher over tool calls           (replayed with the real hook evaluate())
    │            or ordering: green X after edits, before Y  (violation rate per session)
    │   skill  → user-intent pattern over turns    (intent N / invoked K → propose or adoption gap)
@@ -35,7 +35,7 @@ filed. Every filed row carries the sessions that justify it.
 
 ## 0. Prerequisites
 
-- Script path: `${CLAUDE_PLUGIN_ROOT}/skills/mine-proposals/scripts/mine_sessions.py`
+- Script path: `${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py`
   in Claude Code; in Codex / Cursor the same file relative to this skill's
   directory (`scripts/mine_sessions.py`). It finds the plugin's `scripts/`
   next to it, so no env var is needed when shipped inside the plugin.
@@ -94,7 +94,7 @@ a session with no correction, error or revert is `friction: []` — do not
 invent one. Then re-run with the facets:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/mine-proposals/scripts/mine_sessions.py" --out mine-out \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" --out mine-out \
   --facets mine-out/facets.json --skills-file skills.json --claude-md ./CLAUDE.md
 ```
 
