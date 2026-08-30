@@ -118,7 +118,16 @@ if args.facets:   # the facets YOU wrote from the digests (fixed schema; see SKI
 for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):   # optional extra seed if Claude Code /insights was ever run
     try: d = json.load(open(f)); d.setdefault("source", "insights"); facets.append(d)
     except Exception: pass
-start_of = {s["id"]: s["start"] for s in corpus}
+_start_full = {s["id"]: s["start"] for s in corpus}
+def start_of_id(sid):
+    """facets.json may carry short ids (the digests print 8/12-char prefixes); match by prefix."""
+    sid = str(sid or "")
+    if sid in _start_full: return _start_full[sid]
+    hits = [v for k, v in _start_full.items() if k.startswith(sid)] if len(sid) >= 6 else []
+    return hits[0] if len(hits) == 1 else None
+class _StartOf(dict):
+    def get(self, k, default=None): return start_of_id(k) or default
+start_of = _StartOf()
 if facets:
     print(f"\n=== FACETS SEED — {len(facets)} sessions ({sum(1 for d in facets if d.get('source') != 'insights')} from your facets.json, {sum(1 for d in facets if d.get('source') == 'insights')} from /insights); friction_detail by category (cluster these by eye into candidates)")
     cat = collections.Counter(); 
