@@ -24,9 +24,13 @@ def main() -> int:
         cand = Path(home) / "cand.json"
         cand.write_text(json.dumps({"title": "probe-rule", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}}))
         md = Path(home) / "CLAUDE.md"; md.write_text("# Rules\n\n- Never pipe pytest into tail when deciding pass/fail.\n")
-        p = _run("--out", str(out), "--rule-file", str(cand), "--claude-md", str(md), home=home)
-        ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "CLAUDE.MD SEED" in p.stdout
-        print(("ok  " if ok else "FAIL"), "empty HOME: runs to completion, backtests --rule-file, seeds from --claude-md"); fails += not ok
+        facets = Path(home) / "facets.json"
+        facets.write_text(json.dumps([{"session_id": "abc", "host": "codex", "repo": "r", "underlying_goal": "g", "outcome": "mostly",
+                                       "friction": [{"category": "wrong_source", "detail": "answered from README", "evidence_turn": 2}, {"category": "bogus_label", "detail": "x"}],
+                                       "corrections": ["read the code"]}]))
+        p = _run("--out", str(out), "--rule-file", str(cand), "--claude-md", str(md), "--facets", str(facets), home=home)
+        ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "CLAUDE.MD SEED" in p.stdout and "FACETS SEED" in p.stdout and "wrong_source" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and (out / "digests").is_dir()
+        print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md and --facets (fixed vocab enforced), writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
         ok = (out / "proposals.json").is_file() and any(r.get("title") == "probe-rule" for r in json.load(open(out / "proposals.json")))
         print(("ok  " if ok else "FAIL"), "proposals.json carries the --rule-file candidate"); fails += not ok

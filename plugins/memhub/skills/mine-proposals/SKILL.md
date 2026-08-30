@@ -9,8 +9,9 @@ allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rule
 ```
 transcripts (local: Claude Code · Codex · Cursor, via the memhub plugin readers)
    │
-   ├─ /insights facets ──► friction sentences per session   (seed: what went wrong)
-   ├─ CLAUDE.md          ──► declared imperative sentences    (seed: what we SAY we do)
+   ├─ digests ──► YOU write facets.json: goal, outcome, friction, corrections per session
+   │              (what went wrong — no other tool to run first; works in every host)
+   ├─ CLAUDE.md ──► declared imperative sentences (what we SAY we do)
    ▼
 proposal miner (scripts/mine_sessions.py) ──► three lanes, each with a checkable "would-apply" predicate
    │   rule   → matcher over tool calls           (replayed with the real hook evaluate())
@@ -25,7 +26,8 @@ file as proposed, source_ref = <seed>@<date>#<cluster>|applies N/M|precision P
    │   skill → create_skill (repo brain, host-agnostic SKILL.md)
    │   hook  → settings snippet in proposals.json / plugin PR
    ▼
-reviewer activates ──► next /insights run + --baseline-date measures whether friction shrank
+reviewer activates ──► next run with --baseline-date measures whether friction shrank
+facets.json ──► saved to the repo brain as an artifact, so the team's friction accrues in one place
 ```
 
 A proposal without a would-apply predicate cannot be backtested and is not
@@ -47,10 +49,10 @@ filed. Every filed row carries the sessions that justify it.
   `$MEMHUB_PLUGIN_SCRIPTS`, `$CLAUDE_PLUGIN_ROOT/scripts`, or the installed
   plugin cache; several copies → newest, with a stderr warning.
 - memhub tools `list_rules`, `create_rule`, `list_skills`, `create_skill`.
-- Optional seed: run `/insights` first (Claude Code) — its
-  `~/.claude/usage-data/facets/*.json` carry `friction_detail` + `session_id`.
+- Nothing else to run first. (If Claude Code's `/insights` was ever run, its
+  facets under `~/.claude/usage-data/facets/` are picked up as an extra seed.)
 
-## 1. Run the miner
+## 1. Deterministic pass — every session, no model call
 
 ```bash
 # save list_skills (all statuses) to skills.json for skill-lane dedup, then:
@@ -63,10 +65,43 @@ lane, title, predicate, sessions by host, precision/rate, 3 samples,
 suggested `source_ref`, suggested action, and for hooks a PreToolUse
 settings snippet) plus `mine-out/corpus.json`.
 
+It also writes `mine-out/digests/<session>.json` for the top sessions
+(`--digest-top`, default 30) ranked by correction turns, errors, and
+reverts — the sessions worth a model's attention.
+
+## 2. Facet pass — you read the digests, you write facets.json
+
+This is the step Claude Code's `/insights` does with a hidden model call;
+here YOU are the model, so it works the same in Codex and Cursor and costs
+the user nothing beyond this session. Read each digest (first prompt,
+user turns with corrections marked, errors, reverts — not the transcript)
+and write one object per session to `mine-out/facets.json`:
+
+```json
+[{"session_id": "…", "host": "claude", "repo": "…",
+  "underlying_goal": "one sentence",
+  "outcome": "achieved | mostly | partial | not",
+  "friction": [{"category": "wrong_approach | misunderstood_request | buggy_code | unverified_claim | wrong_environment | wrong_source | autonomy_overreach | environment_issue | tool_failure",
+                "detail": "one sentence: what happened and what the agent should have done",
+                "evidence_turn": 4}],
+  "corrections": ["the user's own words, verbatim, ≤120 chars"]}]
+```
+
+Rules: the friction vocabulary is FIXED (the script rejects other labels —
+free labels are why `/insights` ends up with both `environment_issue` and
+`environment_issues`); `detail` must be a conditional a rule could enforce;
+a session with no correction, error or revert is `friction: []` — do not
+invent one. Then re-run with the facets:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/mine-proposals/scripts/mine_sessions.py" --out mine-out \
+  --facets mine-out/facets.json --skills-file skills.json --claude-md ./CLAUDE.md
+```
+
 Sections, in order:
-- **INSIGHTS SEED** — friction counts + every facet's `friction_detail`.
-  Cluster these by eye (no model call) into candidate sentences; each
-  cluster needs a predicate before it can enter a lane.
+- **FACETS SEED** — friction counts + every session's `friction_detail`.
+  Cluster these by eye into candidate sentences; each cluster needs a
+  predicate before it can enter a lane.
 - **CLAUDE.MD SEED** (with `--claude-md`) — every imperative sentence
   (never / always / must / before …) with its heading. Two directions:
   (1) declared → measured: map a sentence to a predicate in `RULE_CANDS` /
@@ -99,7 +134,7 @@ Sections, in order:
 Add hypotheses by editing the three lists at the top of each lane; each
 entry is a predicate, so it is backtested the same way.
 
-## 2. Verify, dedup, file
+## 3. Verify, dedup, file
 
 1. Rules: every `agent_hook` candidate through the plugin's
    `rulebook_verify.py --rule-file … --fires … --silent …` using real
@@ -116,12 +151,28 @@ entry is a predicate, so it is backtested the same way.
    skill), `create_skill` into the repo brain, hook snippets left in
    `proposals.json` for a settings/plugin PR.
 
-## 3. Report and close the loop
+## 4. Send the facets to the team, then report
+
+Save `mine-out/facets.json` to the repo's brain as an artifact (one command,
+same as the save-artifact skill; re-upload under the same name to version
+it, never a second name):
+
+```bash
+uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+  --file mine-out/facets.json --name "session-facets" --agent-brain-id <repo brain id>
+```
+
+That is what makes friction a TEAM number rather than one laptop's: the
+next run (yours or a teammate's) can pull the artifact, and the fires
+ledger shares `session_id` with it, so "rule fired, friction still
+happened" is a join.
+
+## 5. Report and close the loop
 
 Per row: filed / superseded-what / skipped-why. Then: live rules with zero
 historical fires (retire candidates); skills with intent ≫ invoked
 (adoption work); hooks with a high bad-outcome rate (block-tier
 candidates). Note the activation date — the next run with
-`--baseline-date <that date>` after `/insights` has sampled new sessions is
-the measurement of whether the friction shrank. Identical re-files are
+`--baseline-date <that date>` over fresh sessions (with a new facet pass)
+is the measurement of whether the friction shrank. Identical re-files are
 no-ops on the server, so re-running is safe.

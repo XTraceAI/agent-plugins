@@ -22,6 +22,8 @@ ap.add_argument("--skills-file", help="memhub list_skills JSON reply, for skill-
 ap.add_argument("--repo", help="only sessions whose cwd basename matches")
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
 ap.add_argument("--rule-file", action="append", default=[], help="a create_rule body (matcher or ordering) to backtest as a candidate (repeatable) — used by create-rule / import-claude-md")
+ap.add_argument("--facets", help="facets.json YOU wrote from the digests (see SKILL.md step 2) — replaces the need to run /insights")
+ap.add_argument("--digest-top", type=int, default=30, help="how many sessions to digest for the facet pass (ranked by corrections, errors, reverts)")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 
@@ -75,19 +77,50 @@ for host, path in sessions():
     if args.repo and repo != args.repo: continue
     sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
     corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results})
+CORRECTION = re.compile(r"^(no|nope|wrong|wait|stop)\b|\b(not what i|why did (u|you)|did (u|you) (just )?|actually (read|test|run|check|do)|i said|i meant|revert that|undo that|is (all )?stale|u should|you should|read the (actual|real)|check the (live|actual|latest|agent|other)|this is (prod|staging)|not (prod|staging)|don'?t (code|merge|push|delete|guess)|plan first)\b", re.I)
+PASTED = re.compile(r"^(Base directory for this skill|Approach this as|<command-message>|<task-notification>|This session is being continued)", re.I)
+ERROR = re.compile(r"Traceback \(most recent call last\)|^Exit code [1-9]|\bexit code [1-9]\b|ModuleNotFoundError|FAILED \(|\d+ failed\b|Permission denied|command not found|<tool_use_error>", re.M)
+REVERT = re.compile(r"git\s+(revert|reset|checkout\s+--|restore)\b|--force-with-lease|commit\s+--amend")
+def digest(s):
+    """Compact, LLM-readable summary of one session — user turns (corrections marked), errors, reverts. ~1-2k chars."""
+    turns = [u.strip().replace("\n", " ") for u in s["users"] if u.strip() and not PASTED.search(u.strip()) and len(u) < 1500]   # skip skill preambles / pasted docs
+    corr = [t for t in turns if CORRECTION.search(t[:200])]
+    errs = [t.replace("\n", " ")[:160] for t in s["results"] if ERROR.search(t)]
+    rev = [c["cmd"].replace("\n", " ")[:120] for c in s["calls"] if c["cmd"] and REVERT.search(c["cmd"])]
+    tools = collections.Counter(c["tool"] for c in s["calls"])
+    score = 3 * len(corr) + min(len(errs), 10) + 2 * len(rev)
+    return {"session_id": s["id"], "host": s["host"], "repo": s["repo"], "start": s["start"], "score": score,
+            "first_prompt": (turns[0] if turns else "")[:300],
+            "user_turns": [{"i": i, "correction": bool(CORRECTION.search(t[:200])), "text": t[:220]} for i, t in enumerate(turns[:25])],
+            "tool_counts": dict(tools), "errors": errs[:4], "reverts": rev[:4]}
+digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
+os.makedirs(os.path.join(args.out, "digests"), exist_ok=True)
+for d in digests[:args.digest_top]: json.dump(d, open(os.path.join(args.out, "digests", d["session_id"][:12] + ".json"), "w"), indent=1)
+print(f"digests: top {min(args.digest_top, len(digests))} of {len(corpus)} sessions written to {args.out}/digests/ (ranked by corrections/errors/reverts; read these and write facets.json — SKILL.md step 2)")
 M = len(corpus); by_host = collections.Counter(s["host"] for s in corpus)
 print(f"sessions read: {dict(by_host)} (M={M})  read errors: {dict(errs)}  ({time.time()-t0:.0f}s)")
 print("tool calls per host:", {h: sum(len(s['calls']) for s in corpus if s['host'] == h) for h in R})
 def sample(s, text): return {"session": s["id"][:8], "host": s["host"], "repo": s["repo"], "text": text.replace("\n", " ")[:110]}
 
 # ---------------------------------------------------------------- seed: /insights facets
+FRICTION_VOCAB = ("wrong_approach", "misunderstood_request", "buggy_code", "unverified_claim", "wrong_environment", "wrong_source", "autonomy_overreach", "environment_issue", "tool_failure")
 facets = []
-for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):
-    try: d = json.load(open(f)); facets.append(d)
+if args.facets:   # the facets YOU wrote from the digests (fixed schema; see SKILL.md)
+    try:
+        for d in json.load(open(args.facets)):
+            fr = d.get("friction") or []
+            bad = [x.get("category") for x in fr if x.get("category") not in FRICTION_VOCAB]
+            if bad: print(f"[warn] facets.json {d.get('session_id','?')[:8]}: unknown friction category {bad} (allowed: {', '.join(FRICTION_VOCAB)})", file=sys.stderr)
+            d["friction_counts"] = dict(collections.Counter(x.get("category") for x in fr if x.get("category") in FRICTION_VOCAB))
+            d["friction_detail"] = d.get("friction_detail") or "; ".join(x.get("detail", "") for x in fr)
+            facets.append(d)
+    except Exception as e: print(f"[warn] --facets unreadable: {e}", file=sys.stderr)
+for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):   # optional extra seed if Claude Code /insights was ever run
+    try: d = json.load(open(f)); d.setdefault("source", "insights"); facets.append(d)
     except Exception: pass
 start_of = {s["id"]: s["start"] for s in corpus}
 if facets:
-    print(f"\n=== INSIGHTS SEED — {len(facets)} facets; friction_detail by category (cluster these by eye into candidates)")
+    print(f"\n=== FACETS SEED — {len(facets)} sessions ({sum(1 for d in facets if d.get('source') != 'insights')} from your facets.json, {sum(1 for d in facets if d.get('source') == 'insights')} from /insights); friction_detail by category (cluster these by eye into candidates)")
     cat = collections.Counter(); 
     for d in facets: cat.update(d.get("friction_counts") or {})
     print("  friction_counts:", cat.most_common(8))
