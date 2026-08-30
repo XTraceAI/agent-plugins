@@ -27,6 +27,27 @@ Get to a **when-X-then-Y** sentence with a **why**. A conditional shape is what
 makes a rule actionable; a bare observation is not a rule. If the user gave a
 war story, extract the conditional from it and confirm your reading.
 
+### 1b. Evidence: how often would it have applied?
+
+A rule is worth the team's attention in proportion to how often the
+situation actually occurs. Write the candidate `create_rule` body to a file
+and replay it over the local transcripts (Claude Code, Codex, Cursor):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/mine-proposals/scripts/mine_sessions.py" \
+  --rule-file /tmp/cand.json --out /tmp/mine
+```
+
+Read the candidate's line: `applies-in N/M sessions` (by host) and 3 sample
+commands. For a "do X before Y" rule add `"requires_prior_rx": "<X>"` to the
+body — the line then shows `precision = fired-with-no-prior-X / fired`;
+below ~50 % the matcher would nag people who already complied, so use the
+`ordering` shape (step 3) or make it `session_context`. Carry the numbers
+into `source_ref` in step 5 (`…|applies N/M|precision P`). If N is 0 across
+all hosts, say so to the user before filing — it may still be right
+(insurance for a new teammate) but it is not lift. For deriving many rules
+at once from sessions, use `/memhub:mine-proposals` instead.
+
 ### 2. Duplicate check — by eye now, deterministically in step 5
 
 Call the memhub `list_rules` tool for the target rulebook (every status) and
@@ -99,7 +120,10 @@ exits non-zero, and show the table to the user.** What each line means:
 - **FIRES** — your `--fires` cases. At least one is required; without it
   nothing has shown the rule can trigger.
 - **SILENT** — your `--silent` cases, plus two generated for you: `grep` and
-  `python -c` quoting the rule's own trigger. Searching for a rule's trigger
+  `python -c` quoting the rule's own trigger. Add one more yourself: the
+  trigger inside a quoted argument (`--allowedTools 'Bash(git push:*)'`,
+  `echo "…"`, a commit message) — measured live, this mention-in-args form
+  is the largest false-fire class after `grep`. Searching for a rule's trigger
   is how people investigate it, and firing there is the largest false-fire
   class we have measured. If those two fail, add a `command_not_rx`.
 
@@ -139,7 +163,8 @@ Show the user: the rule sentence, the delivery + engine block, the sample
 commands it does and doesn't match, and the conflict verdict. On approval call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
-`user correction, session <id>`), `supersedes_rule_id` when it replaces a
+`user correction, session <id>`, with the step-1b numbers appended:
+`|applies N/M|precision P`), `supersedes_rule_id` when it replaces a
 rule, and `agent_brain_id` when `--brain` was given. Read the reply:
 
 - `unchanged: true` → identical content is already in the book (a retried

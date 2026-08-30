@@ -1,7 +1,7 @@
 {
   "name": "memhub",
-  "description": "XTrace MemHub team memory in Codex: automatic session capture, situated directive recall, artifact sync, plus skills for setup, login, onboarding, artifact upload, session import, search, handoff, spec-driven development, Rulebook rule authoring (create-rule, import-claude-md), and PR babysitting. Run the memhub:setup skill once to install the compatibility hooks bridge on Codex 0.148-0.149.",
-  "version": "0.30.0",
+  "description": "XTrace MemHub team memory in Codex: automatic session capture, situated directive recall, artifact sync, plus skills for setup, login, onboarding, artifact upload, session import, search, handoff, spec-driven development, Rulebook rule authoring (create-rule, import-claude-md), session mining into proposed rules/skills/hooks (mine-proposals), kickoff briefs, grounded audits, and PR babysitting. Run the memhub:setup skill once to install the compatibility hooks bridge on Codex 0.148-0.149.",
+  "version": "0.32.0",
   "author": {
     "name": "XTrace",
     "email": "felixmeng@xtrace.ai"

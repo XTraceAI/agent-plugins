@@ -1,8 +1,8 @@
 {
   "name": "memhub",
   "displayName": "MemHub",
-  "description": "XTrace MemHub team memory in Cursor: search_memory / save_artifact / import_conversation tools plus skills for setup, login, onboarding, artifact upload, session import, recall, handoff, spec-driven development, Rulebook rule authoring (create-rule, import-claude-md), and PR babysitting. Sessions are captured automatically.",
-  "version": "0.30.0",
+  "description": "XTrace MemHub team memory in Cursor: search_memory / save_artifact / import_conversation tools plus skills for setup, login, onboarding, artifact upload, session import, recall, handoff, spec-driven development, Rulebook rule authoring (create-rule, import-claude-md), session mining into proposed rules/skills/hooks (mine-proposals), kickoff briefs, grounded audits, and PR babysitting. Sessions are captured automatically.",
+  "version": "0.32.0",
   "author": {
     "name": "XTrace"
   },
