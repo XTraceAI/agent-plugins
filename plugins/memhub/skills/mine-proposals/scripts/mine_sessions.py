@@ -6,7 +6,7 @@ each with a checkable would-apply predicate, backtested over the same traces.
   skill lane: user-intent pattern over turns    -> create_skill stub (+ adoption gap if the skill exists)
   hook  lane: trigger + later OUTCOME in-session -> PreToolUse settings snippet / plugin PR note
 
-Seeds: /insights facets (~/.claude/usage-data/facets) when present.
+Seeds: Claude Code /insights facets (~/.claude/usage-data/facets) when present; CLAUDE.md via --claude-md.
 Numbers per candidate: applies-in N/M sessions (by host), precision, sample sessions.
 Friction delta: --baseline-date splits facet friction before/after a rulebook change.
 
@@ -126,8 +126,6 @@ EDIT = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 RULE_CANDS = [   # each: matcher (+ optional requires_prior_rx for "do X before Y" precision)
  {"title": "fetch-before-origin-read", "matcher": {"event": "bash", "command_rx": r"git\s+(log|diff|show|branch|merge-base|rev-list)\b[^\n]*\borigin/", "command_not_rx": r"git\s+fetch|python3?\s+-c\b|\brulebook\b", "warn_once_per": "session"}, "requires_prior_rx": r"git\s+(fetch|pull)\b"},
  {"title": "no-sed-range-delete", "matcher": {"event": "bash", "command_rx": r"sed\s+-i\b[^\n]*'?\s*\d+(,\d+)?d\b", "command_not_rx": r"python3?\s+-c\b|\brulebook\b", "warn_once_per": "session"}},
- {"title": "tests-touch-real-ledger", "matcher": {"event": "edit", "path_rx": r"/tests?/[^\n]*\.py$", "content_rx": r"\.config/memhub-plugin", "warn_once_per": "session"}},
- {"title": "marketplace-add-check-names", "matcher": {"event": "bash", "command_rx": r"claude\s+plugin\s+marketplace\s+add\b", "command_not_rx": r"\bgrep\b[^\n|;&]*marketplace", "warn_once_per": "session"}, "requires_prior_rx": r"claude\s+plugin\s+marketplace\s+list"},
 ]
 OUTPUT_CANDS = [{"title": "missing-module-fresh-venv", "content_rx": r"ModuleNotFoundError: No module named|MissingGreenlet"}]
 for path in args.rule_file:   # a candidate from create-rule / import-claude-md joins the lane it belongs to
@@ -219,8 +217,6 @@ if args.skills_file:
     except Exception as e: print(f"[warn] --skills-file unreadable: {e}", file=sys.stderr)
 SKILL_INTENTS = [   # intent in a USER turn; `skill` = the name that would serve it (checked against installed)
  {"skill": "pr-babysit",     "intent_rx": r"babysit|watch (the |this )?pr|drive .* to green|until (it'?s )?green"},
- {"skill": "kickoff-brief",  "intent_rx": r"kickoff|kick-off|\bbrief\b"},
- {"skill": "grounded-audit", "intent_rx": r"\b(honest|grounded|e2e|end.to.end) (audit|critique|assessment)|actually (read|test|run)|can (you|u) really|read (the|their) (actual )?(code|source|repo)"},
  {"skill": "handoff-session","intent_rx": r"hand ?off|hand (this|it) (off|over) to"},
  {"skill": "search-memory",  "intent_rx": r"what do we know|did we decide|search (memhub|memory|the brain)|check (the )?(agent|repo) brain"},
  {"skill": "mine-proposals", "intent_rx": r"mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
@@ -241,7 +237,6 @@ for c in SKILL_INTENTS:
 HOOK_CANDS = [   # trigger -> outcome (-> optional repair): all later in the SAME session; repair makes "bad" mean "had to be undone"
  {"title": "pytest-piped-then-push-then-repair", "trigger_rx": r"(pytest|npm\s+test)\b[^\n|&;]*\|", "outcome_rx": r"git\s+push\b", "repair_rx": r"git\s+(revert|commit\s+--amend|push\s+--force)|--force-with-lease|\bfix(es|ed)?\b.*\btest", "block_msg": "test output piped — exit code lost; run the suite unpiped before pushing"},
  {"title": "sed-range-delete-then-revert", "trigger_rx": r"sed\s+-i\b[^\n]*\d+(,\d+)?d\b", "outcome_rx": r"git\s+(checkout|restore|reset)\b", "block_msg": "sed range-delete — use an anchored Edit"},
- {"title": "marketplace-add-then-redo", "trigger_rx": r"claude\s+plugin\s+marketplace\s+add\b", "outcome_rx": r"claude\s+plugin\s+marketplace\s+(remove|add)\b", "block_msg": "list marketplaces before adding — a reused name clobbers the registration"},
  {"title": "merge-then-user-pushback", "trigger_rx": r"gh\s+pr\s+merge\b", "outcome_rx": None, "user_rx": r"did (u|you) (just )?merge|why did (u|you) merge", "block_msg": "ask before merging"},
 ]
 print("\n=== LANE 3 · HOOKS — trigger followed by a bad outcome in the same session")
