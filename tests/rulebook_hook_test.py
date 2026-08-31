@@ -428,6 +428,36 @@ def main() -> int:
               "gives up quickly rather than reading it all",
               got is None and (time.time() - t0) < 1.0)
 
+    # --- what the recall lane sends ---------------------------------------
+    # /recall is the one lane that carries content: the relevance judge needs
+    # the call itself. A command line is also where credentials live, and they
+    # are worth nothing to the judge.
+    for label, cmd in [
+        ("Authorization header", 'curl -H "Authorization: Bearer sk-live-abcdefghij1234567890" https://x'),
+        ("credentials in a URL", 'psql "postgres://admin:hunter2@db.internal/prod"'),
+        ("--flag=value", "gh auth login --with-token=ghp_AAAABBBBCCCCDDDDEEEEFFFF1111"),
+        ("KEY value (space form)", "aws configure set aws_secret_access_key AKIAIOSFODNN7EXAMPLE"),
+        ("KEY=value", "export API_KEY=super-secret-value && ./deploy.sh"),
+        ("curl -u user:pass", "curl -u user:p4ssw0rd https://x.com"),
+        ("a JWT", 'echo "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcdefghijk"'),
+        ("our own access key", 'curl -H "x: mhk_AbCdEf123456789" https://x'),
+    ]:
+        out = rb.redact_secrets(cmd)
+        check("recall redacts: %s" % label,
+              "<redacted>" in out and "hunter2" not in out and "p4ssw0rd" not in out
+              and "super-secret-value" not in out and "ghp_AAAABBBBCCCCDDDDEEEEFFFF1111" not in out
+              and "AKIAIOSFODNN7EXAMPLE" not in out, out)
+
+    # Over-redaction is not free: it costs the judge the verb of the command.
+    for cmd in ["git push --force origin main", "gh auth login", "kubectl get secrets",
+                "npm run build -- --token-budget 500", "pytest tests/ -k rulebook",
+                "ls -la ~/.ssh"]:
+        check("recall leaves an innocent command intact: %s" % cmd[:34],
+              rb.redact_secrets(cmd) == cmd, rb.redact_secrets(cmd))
+
+    check("redaction never raises on empty or None",
+          rb.redact_secrets("") == "" and rb.redact_secrets(None) is None)
+
     check("WIRE_KEYS carries source_message_id (server links the fire to its message)",
           "source_message_id" in rb.WIRE_KEYS)
 

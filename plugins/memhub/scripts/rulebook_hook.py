@@ -20,8 +20,18 @@ Lanes (the mode argument):
 Book = the server book, fetched once per session and cached with its ETag.
 Offline → the cached book; no cache → no rules. There is no local rule file:
 rules are authored through the memhub `create_rule` tool. A `mode: gate` rule is honoured only from a book fetched within 24 h —
-older caches run it as `advise` (spec §5.3). Wire rows carry identifiers, never
-payloads: `excerpt` is stripped before POST.
+older caches run it as `advise` (spec §5.3).
+
+What leaves the machine, exactly:
+  * fetch  — the repo directory name, nothing else.
+  * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps.
+             The matched `excerpt` is written to the LOCAL ledger and is
+             stripped before the POST.
+  * recall — the anchor lane, and the one exception: the server's relevance
+             judge needs the call itself, so it gets the file path, or the
+             command line (heredoc bodies dropped, credential shapes redacted,
+             truncated to 400 chars). Redaction is a denylist, not a guarantee.
+             `MEMHUB_RULEBOOK_RECALL=0` turns this lane off and keeps the rest.
 
 Usage (wired in hooks.json): printf %s "$IN" | python3 rulebook_hook.py {session|pre|post}
 
@@ -549,6 +559,69 @@ def fetch_book(repo):
             and isinstance(reply.data.get("rules"), list):
         _atomic_json(book_path(repo), {"etag": reply.etag, "fetched_at": _now(),
                                        "rules": reply.data["rules"]})
+
+
+# ── what leaves the machine on the recall path ─────────────────────────────
+#
+# `/recall` is the one lane that sends content rather than identifiers: the
+# server's relevance judge decides whether an anchor rule applies to THIS call,
+# and it cannot do that from a rule id. So the command line goes with it.
+#
+# A command line is also where credentials live — `curl -H "Authorization:
+# Bearer …"`, `psql postgres://user:pw@host`, `--token=…`. Those are worth
+# nothing to the judge and must not reach a model, so they are replaced before
+# the POST. `shell_only` has already dropped heredoc bodies by this point, so
+# what remains is the shell line itself.
+#
+# This is a denylist and cannot be complete — the docstring and the README say
+# so, and `MEMHUB_RULEBOOK_RECALL=0` turns the lane off entirely for anyone who
+# would rather not send command text at all. It is a floor, not a guarantee.
+_REDACTIONS = (
+    # `--token=x`, `--password x`, `API_KEY=x` — the value, not the flag, so the
+    # judge still sees that a credential was passed.
+    #
+    # `auth` is deliberately NOT in this list even though it names plenty of
+    # real secrets: it also names `gh auth login`, `--auth-mode`, `auth0_sub`,
+    # and eating the word after those costs the judge the verb of the command
+    # for nothing. The `Authorization:` header has its own rule below, which is
+    # where `auth` actually carries a credential.
+    # The key must END with the credential word. Allowing a trailing suffix
+    # matched `--token-budget 500` and ate the number, which is not a secret and
+    # is exactly the kind of over-redaction that degrades the judge on ordinary
+    # commands. `aws_secret_access_key`, `--with-token` and `API_KEY` all still
+    # match, because each ends with one.
+    (re.compile(r"(?i)\b([a-z0-9_-]*(?:secret|passwd|password|token|api[_-]?key|"
+                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)([^\s\"']+)"),
+     r"\1\2<redacted>"),
+    # `curl -u user:password`, `-U user:password`.
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):([^\s\"']+)"), r"\1\2:<redacted>"),
+    # Authorization / Proxy-Authorization headers, with or without a scheme.
+    (re.compile(r"(?i)(authorization\s*:\s*)(?:bearer|basic|token)?\s*[^\s\"']+"),
+     r"\1<redacted>"),
+    # Credentials inline in a URL: scheme://user:pw@host
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s:/@]+):([^\s@]+)@"), r"\1\2:<redacted>@"),
+    # Vendor-shaped keys, which are recognisable on their own.
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "<redacted>"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}"), "<redacted>"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted>"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "<redacted>"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+"), "<redacted>"),
+    (re.compile(r"\bmhk_[A-Za-z0-9_-]{8,}"), "<redacted>"),
+)
+
+
+def redact_secrets(text):
+    """Strip credential-shaped values from a command before it is sent.
+
+    Order matters: the URL rule must run before the vendor-key rules, or a
+    password that happens to look like a key is rewritten first and the
+    surrounding `user:…@host` shape no longer matches.
+    """
+    if not text:
+        return text
+    for pattern, repl in _REDACTIONS:
+        text = pattern.sub(repl, text)
+    return text
 
 
 RECALL_TIMEOUT_S = _timeout(1.5)   # inside the PreToolUse hook budget; fail open past it
@@ -1156,7 +1229,7 @@ def main():
                     and r["id"] not in st["fired"]}
     handles = {}
     if tool == "Bash" and cmd:
-        handles["command"] = shell_only(cmd)[:400]
+        handles["command"] = redact_secrets(shell_only(cmd))[:400]
     elif tool in EDIT_TOOLS and fp:
         handles["file_path"] = fp
     if mode == "pre" and anchor_rules and handles \
