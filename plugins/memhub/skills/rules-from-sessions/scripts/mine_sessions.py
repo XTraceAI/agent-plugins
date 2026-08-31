@@ -195,6 +195,10 @@ OUTPUT_CANDS = [   # fires on the error: a signature in the tool result. Anchor 
   "did": "Claude hit a missing-module import (wrong venv or extras not installed)", "what": "Claude is told to run inside the repo venv (`uv run`) and install the extras before debugging the import", "claude_md_rx": r"uv pip install -e|install (the )?(dev )?extras|wrong venv", "quote_rx": r"\bvenv\b|ModuleNotFound|missing module|uv run"},
  {"title": "timeout-not-on-macos", "content_rx": r"^(\(eval\)|zsh|bash|sh)(:\d+)?: command not found: timeout\s*$|^timeout: command not found",
   "did": "Claude called GNU `timeout`, which isn't installed on macOS", "what": "Claude is told to use a Python-side timeout instead of the missing binary", "claude_md_rx": r"\btimeout\b", "quote_rx": r"timeout"},
+ {"title": "rg-not-installed", "content_rx": r"^[^\n]{0,40}command not found: rg\s*$|^rg: command not found|^/bin/sh: rg: not found",
+  "did": "Claude called `rg` on a host without ripgrep (and often retried it)", "what": "Claude is told to use `grep -rn` for the rest of the session", "claude_md_rx": r"\bripgrep\b|\brg\b", "quote_rx": r"\brg\b|ripgrep"},
+ {"title": "db-tool-not-available", "content_rx": r"^[^\n]{0,40}command not found: (psql|pg_isready|redis-cli|pg_dump)\s*$|^(psql|pg_isready|redis-cli): command not found|ConnectionRefusedError: \[Errno 61\]|redis\.exceptions\.ConnectionError",
+  "did": "Claude assumed a local psql / pg_isready / redis-cli, or a running Redis, that wasn't there", "what": "Claude is told to use the project's own DB client (asyncpg / SQLAlchemy) or start the service before retrying", "claude_md_rx": r"\bpsql\b|pg_isready|redis-cli", "quote_rx": r"psql|redis|postgres"},
  {"title": "kwarg-signature-mismatch", "content_rx": r"TypeError: [^\n]*unexpected keyword argument",
   "did": "Claude called a function with a keyword it no longer accepts", "what": "Claude is told to re-read the signature in-file before retrying", "claude_md_rx": r"signature mismatch|re-read its signature|kwarg names", "quote_rx": r"signature|kwarg|argument"},
 ]
