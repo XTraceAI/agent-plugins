@@ -58,6 +58,12 @@ def main() -> int:
         ok = "ordering needs required_command_rx" in p.stderr and "partial-ordering" not in p.stdout and "ok-rule" in p.stdout
         print(("ok  " if ok else "FAIL"), "partial ordering body → [warn] + skipped; cache row without title skipped; non-numeric version tolerated"); fails += not ok
         if not ok: print(p.stdout[-600:], p.stderr[-400:])
+        hooks = [r for r in rows if r.get("lane") == "hook"]
+        sed_hook = next((r for r in hooks if r.get("title") == "sed-range-delete-then-revert"), None)
+        cmd = ((sed_hook or {}).get("settings_snippet") or {}).get("hooks", {}).get("PreToolUse", [{}])[0].get("hooks", [{}])[0].get("command", "")
+        ok = sed_hook is not None and "[0-9]+" in cmd and "\\d" not in cmd and "[[:space:]]" in cmd
+        print(("ok  " if ok else "FAIL"), "emitted PreToolUse snippet is POSIX ERE (\\d -> [0-9], \\s -> [[:space:]]), not a Python regex grep -E cannot run"); fails += not ok
+        if not ok: print(cmd)
         ok = "several memhub plugin copies" not in p.stderr and "not found" not in p.stderr
         print(("ok  " if ok else "FAIL"), "plugin scripts resolved relative to the skill (no env var, no cache lookup)"); fails += not ok
         if not ok: print("stderr:", p.stderr[-400:])
