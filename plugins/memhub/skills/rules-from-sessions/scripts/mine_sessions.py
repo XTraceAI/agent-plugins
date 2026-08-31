@@ -318,7 +318,8 @@ proposals = []
 def add(row):
     row["delivery"] = TRIGGERS[row["trigger"]][1]; row["sessions_total"] = M
     row.setdefault("what", "Claude is warned at the matching command or edit")
-    row["evidence"] = evidence(row.get("fired_ids", []), row.pop("quote_rx", None))
+    row["topic_rx"] = row.pop("quote_rx", None)   # kept: coverage asks whether a friction item is on this rule's topic
+    row["evidence"] = evidence(row.get("fired_ids", []), row.get("topic_rx"))
     given = row.pop("claude_md_given", None)
     d = given or declared_for(row.pop("claude_md_rx", None), row["title"])
     row["claude_md"] = {"heading": str(d.get("heading", "")), "text": str(d.get("text", "")).lstrip("# ").strip()[:140]} if d else None
@@ -441,11 +442,17 @@ if len(notes) > NOTE_CAP: print(f"  !! {len(notes)} session-start notes is more 
 # coverage: of the friction the facets recorded, how much sits in a session at least one proposed rule would have fired in — and what is left over (the next candidates)
 own = [d for d in facets if d.get("source") != "insights" and d.get("friction")]
 if own:
-    touched = {sid for r in on + notes for sid in r.get("fired_ids", [])}
     items = [(d, fr) for d in own for fr in d["friction"] if isinstance(fr, dict) and fr.get("category") in FRICTION_VOCAB]
-    cov = [(d, fr) for d, fr in items if any(k in touched for k in (d.get("session_id"), *[t for t in touched if str(t).startswith(str(d.get("session_id"))[:12])]))]
+    def fired_in(r, sid):
+        sid = str(sid or "")
+        return any(str(t) == sid or str(t).startswith(sid[:12]) or sid.startswith(str(t)[:12]) for t in r.get("fired_ids", []))
+    def covers(r, d, fr):   # per ITEM: the rule would have fired in that session AND the item is on the rule's topic
+        rx = _safe_rx(r.get("topic_rx"), "topic_rx")
+        return fired_in(r, d.get("session_id")) and bool(rx and rx.search(str(fr.get("detail", ""))))
+    cov = [(d, fr) for d, fr in items if any(covers(r, d, fr) for r in on + notes)]
+    sess_cov = [(d, fr) for d, fr in items if any(fired_in(r, d.get("session_id")) for r in on + notes)]
     left = [(d, fr) for d, fr in items if (d, fr) not in cov]
-    print(f"  Coverage: {len(cov)} of {len(items)} friction items in your facets sit in a session where one of these rules would have fired; {len(left)} do not.")
+    print(f"  Coverage: {len(cov)} of {len(items)} friction items in your facets are on the topic of a rule that would have fired in that session; {len(left)} are not. (Session-level, the looser number: {len(sess_cov)} sit in a session where some rule would have fired.)")
     if left:
         lc = collections.Counter(fr["category"] for _, fr in left)
         print(f"  Not covered, by kind: {', '.join(f'{k} ×{v}' for k, v in lc.most_common(5))} — the next candidates (give each a command / error / identifier shape, or accept it as a one-off):")
