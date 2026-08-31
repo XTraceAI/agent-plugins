@@ -1,117 +1,134 @@
 ---
-description: Use when the user wants rules proposed from what their coding agents actually did — "/memhub:rules-from-sessions", "mine our sessions for rules", "mine rules from sessions", "what should be in the rulebook", "propose skills from what we keep doing", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. Reads local Claude Code, Codex, and Cursor transcripts plus CLAUDE.md, scores every candidate against the transcripts (applies-in N/M, precision, samples), and files survivors as proposed rules / skills; hooks land as settings snippets. Never activates anything.
-argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--brain "<rulebook brain name>"]
+description: Use when the user wants rules for the Rulebook from what their team actually does — "/memhub:rules-from-sessions", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. One run reads the repo's CLAUDE.md AND the local Claude Code / Codex / Cursor transcripts, replays every candidate through the real hook, and proposes rules that each state why they exist (the CLAUDE.md sentence, or the sessions and the user's own words), what they cost, and what changes with them on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.
+argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--brain "<rulebook brain name>"] [--dry-run]
 allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
 ---
 
-# Rules from sessions
+# Rules from sessions (and CLAUDE.md) — one run
 
-Every rule this skill proposes answers three questions in the user's own
-terms, in this order — and a candidate that cannot answer the first is not
-proposed:
+The user runs this once. Two inputs, one table, one yes:
 
-1. **Why does it exist?** One of two origins, nothing else: *your CLAUDE.md
-   already says this* (the sentence is quoted, with how often it was broken
-   anyway), or *your past sessions* (how many, plus the user's own words from
-   a session where it bit).
-2. **What did it cost?** In the sessions it would have fired in: how many had
-   the user correcting Claude, how many had a revert, and the friction the
+```
+CLAUDE.md sentences ──┐
+                      ├─► every candidate gets a check ─► replayed over the user's sessions ─► one table ─► yes ─► create_rule (proposed)
+past sessions ────────┘   (at the command · on the error · when a name comes up · note last)
+```
+
+Every proposed rule answers three questions, in this order — a candidate
+that cannot answer the first is not proposed:
+
+1. **Why does it exist?** One of two origins, nothing else:
+   - **declared** — *your CLAUDE.md says "…"* (the sentence quoted, its
+     heading, and how often it was broken anyway), or
+   - **observed** — *from your sessions* (how many, plus the user's own
+     on-topic words from a session where it bit).
+2. **What did it cost?** In the sessions it would have fired in: how many
+   had the user correcting Claude, how many had a revert, the friction the
    facets recorded there.
-3. **What changes with it on?** One sentence, plus *when* it fires — one of
-   the rulebook's four triggers, in plain words:
+3. **What changes with it on?** One sentence, plus *when* it fires.
+
+## The four ways a rule fires — try them in this order
 
 | fires… | rulebook `delivery` | what the rule needs |
 |---|---|---|
 | **fires at the command** | `agent_hook` + `matcher {event: bash \| edit}` or `ordering` | a pattern over the command / edit, or "green X after edits, before Y" |
 | **fires on the error** | `agent_hook` + `matcher {event: output}` | a pattern over the tool result |
+| **fires when the name comes up** | `anchor_recall` + `anchors: [...]` | identifiers (a repo name, `arxiv.org`, `README.md`); the server matches and judges relevance — not replayable |
 | **shown at session start** | `session_context` | nothing checkable — a sentence Claude sees once |
-| **fires when the name comes up** | `anchor_recall` + `anchors: [...]` | identifiers; the server matches and judges relevance — not replayable |
+
+**Hook lanes first, notes last — this is the rule of the skill, not a
+preference.** A session-start note is what CLAUDE.md already is: read once,
+forgotten by the time it matters. For every candidate — from CLAUDE.md or
+from a friction cluster — ask in order: is there a command shape (`git`,
+`pytest`, `sed`, a URL fetch)? an error signature? an identifier? Only when
+all three are "no" does it become a note, and the report caps notes at 5;
+past the cap, find a shape or drop it.
 
 Each row ends in a decision: **Turn on** · **Turn on as a session-start
 note** (a hook would nag, or the engine can't fire it yet) · **Skip** (too
-rare, or never seen). Session-start is the fallback, not the goal: advice
-shown 40 turns before it matters is acted on far less than advice at the
-violating command.
+rare, or never seen) · **Declared in CLAUDE.md, not broken here** (0–2
+fires — offered in bulk at the end, default no, so they don't dilute the
+table).
 
 Words that never reach the user: *precision, applies-in, gated, receipt,
 demoted, matcher, ordering, predicate, delivery*. They live in
 `proposals.json` and on the one `evidence:` line per row that `create-rule`
-and `import-claude-md` parse.
-
-```
-transcripts (local: Claude Code · Codex · Cursor, via the memhub plugin readers)
-   │
-   ├─ digests ──► YOU write facets.json: goal, outcome, friction, corrections per session
-   │              (what went wrong — no other tool to run first; works in every host)
-   ├─ CLAUDE.md ──► the imperative sentences (what we SAY we do)
-   ▼
-mine_sessions.py ──► one row per candidate, replayed with the real hook evaluate()
-   │   Why   — CLAUDE.md sentence quoted (broken N×) | past sessions (N, user's words)
-   │   Cost  — corrections / reverts / facet friction in the sessions it would have fired in
-   │   With it on — one sentence + when it fires (at the command · on the error · at session start)
-   │   → Turn on | Turn on as a session-start note | Skip
-   │   + skills users retype by hand, + block candidates (a command later undone / questioned)
-   ▼
-file as proposed, source_ref = sessions@<date>#<title>|applies N/M|precision K/N
-   │   rule  → create_rule  (rulebook brain)  — never activated here
-   │   skill → create_skill (repo brain, host-agnostic SKILL.md)
-   │   block → settings snippet in proposals.json / plugin PR
-   ▼
-reviewer activates ──► next run with --baseline-date measures whether friction shrank
-facets.json ──► saved to the repo brain as an artifact, so the team's friction accrues in one place
-```
-
-A proposal without a checkable predicate cannot be backtested and is not
-filed as a hook rule. Every filed row carries the sessions that justify it.
+parses.
 
 ## 0. Prerequisites
 
-- Script path: `${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py`
-  in Claude Code; in Codex / Cursor the same file relative to this skill's
-  directory (`scripts/mine_sessions.py`). It finds the plugin's `scripts/`
-  next to it, so no env var is needed when shipped inside the plugin.
-- `--rule-file <create_rule body>` (repeatable) backtests ONE candidate —
-  this is what `create-rule` and `import-claude-md` call to get
-  `applies-in N/M` before filing. A body with `matcher` joins "before a
-  command / edit" or "after an error"; one with `ordering` is replayed with
-  the engine's receipt semantics; one with `anchors` is listed unmeasured.
-- The memhub plugin installed (any host). The script reuses its
-  `scripts/readers/` (Claude/Codex/Cursor → one record shape) and
-  `scripts/rulebook_hook.py` (`to_hook_rule`, `evaluate`, `shell_only`).
+- Script: `${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py`
+  (in Codex / Cursor: `scripts/mine_sessions.py` relative to this skill). It
+  finds the plugin's `scripts/` next to it — no env var.
+- Inputs it takes: `--claude-md <path>` (repeatable), `--candidates <json
+  list>` (repeatable: the checks you derive in step 2), `--rule-file <body>`
+  (one check — what `create-rule` calls for its backtest), `--facets`,
+  `--skills-file`, `--repo`, `--baseline-date`, `--digest-top`.
+- The memhub plugin installed (any host): the script reuses its
+  `scripts/readers/` and `scripts/rulebook_hook.py` (`to_hook_rule`,
+  `evaluate`, `shell_only`) — the real hook, never a re-implementation.
 - memhub tools `list_rules`, `create_rule`, `list_skills`, `create_skill`.
-- Nothing else to run first. (If Claude Code's `/insights` was ever run, its
-  facets under `~/.claude/usage-data/facets/` are picked up as an extra seed.)
+- Arguments: `--brain "<name>"` → `agent_brain_id` on `create_rule`;
+  `--dry-run` → everything except the `create_rule` calls.
 
-## 1. Deterministic pass — every session, no model call
+## 1. First pass — every session, no model call
 
 ```bash
+git rev-parse --show-toplevel; git rev-parse --short HEAD     # provenance for the CLAUDE.md rows
 # save list_skills (all statuses) to skills.json for skill dedup, then:
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" --out mine-out \
   --skills-file skills.json --claude-md ./CLAUDE.md [--claude-md <workspace>/CLAUDE.md] \
   [--repo <name>] [--baseline-date YYYY-MM-DD]
 ```
 
-It prints the report (sections in §2) and writes `mine-out/proposals.json`
-— one row per candidate with `trigger` (`session_start` / `before_action` /
-`after_error` / `on_identifier`), `delivery`, `predicate`, `why` (the origin
-sentence), `claude_md` (the quoted sentence, or null), `evidence`
-(corrections / reverts / friction in the fired sessions, on-topic quotes),
-`what`, a ready `statement` ("<what>. Why: <why>") for `create_rule`, fired
-sessions by host, samples, `verdict`, `source_ref`
-(`claude_md@…` or `sessions@…`), and for block candidates a PreToolUse
-settings snippet — plus `mine-out/corpus.json`.
+It prints the report (§4) with the built-in checks replayed, writes
+`mine-out/proposals.json` and `mine-out/corpus.json`, and writes
+`mine-out/digests/<session>.json` for the top sessions (`--digest-top`,
+default 30) ranked by correction turns, errors and reverts. Its
+**WHAT CLAUDE.MD DECLARES** section lists every imperative sentence with
+its heading — the input to step 2.
 
-It also writes `mine-out/digests/<session>.json` for the top sessions
-(`--digest-top`, default 30) ranked by correction turns, errors, and
-reverts — the sessions worth a model's attention.
+## 2. Give CLAUDE.md its checks — in your own reading, no model call
 
-## 2. Facet pass — you read the digests, you write facets.json
+Walk the declared sentences. A **rule** is a conditional a teammate can
+violate: *when X, do / never Y, because Z*. Skip narrative, architecture
+description, and anything a linter or CI already enforces (say "already
+enforced by <what>" in the report). For each rule pick ONE delivery, hook
+lanes first (table above), and write a `create_rule` body into a JSON list:
 
-This is the step Claude Code's `/insights` does with a hidden model call;
-here YOU are the model, so it works the same in Codex and Cursor and costs
-the user nothing beyond this session. Read each digest (first prompt,
-user turns with corrections marked, errors, reverts — not the transcript)
-and write one object per session to `mine-out/facets.json`:
+```json
+[{"title": "dotenv-not-source",
+  "delivery": "agent_hook",
+  "matcher": {"event": "bash", "command_rx": "(^|[;&|(]\\s*)(source|\\.)\\s+\\S*\\.env\\b",
+              "command_not_rx": "python3?\\s+-c\\b|\\brulebook\\b", "warn_once_per": "session"},
+  "claude_md": {"heading": "Loading environment variables", "text": "`source .env` will mis-parse it and leak secrets into stderr. Always load it via python-dotenv."},
+  "did": "Claude sourced .env", "what": "Claude is warned at `source .env` and pointed to python-dotenv",
+  "quote_rx": "\\.env|secret|dotenv",
+  "scope_repos": ["<repo>"], "source": "claude_md_import",
+  "source_ref": "CLAUDE.md@<sha>#loading-environment-variables"}]
+```
+
+- `claude_md` is the origin sentence itself — pass it, don't make the
+  script guess. `did` = what Claude did (past tense); `what` = what changes
+  with the rule on; `quote_rx` = which user corrections count as on-topic.
+- `source_ref = "<path relative to repo root>@<sha>#<heading-slug>"`. The
+  identity of a CLAUDE.md rule is **(path, title)**: a re-run with the same
+  path and title and identical content is a server no-op (`unchanged`), and
+  a changed one is filed with `supersedes_rule_id` (step 5) — so a re-run
+  replaces, never twins. Keep the path stable (no absolute paths).
+- Title = the heading or a short noun phrase (under 60 chars); one rule per
+  title. Statement is composed by the script ("<what>. Why: <origin>").
+- Apply the matcher rules from `/memhub:create-rule` step 3: match the
+  pre-heredoc segment, shape-specific patterns, exemptions in
+  `command_not_rx` up front (`python -c`, `grep`), `warn_once_per:
+  "session"` by default. Output rules must be anchored to the line start —
+  prose that merely mentions the error is the main false hit.
+
+## 3. Facet pass — you read the digests, you write facets.json
+
+Read each digest (first prompt, user turns with corrections marked, errors,
+reverts — not the transcript) and write one object per session to
+`mine-out/facets.json`:
 
 ```json
 [{"session_id": "…", "host": "claude", "repo": "…",
@@ -123,124 +140,118 @@ and write one object per session to `mine-out/facets.json`:
   "corrections": ["the user's own words, verbatim, ≤120 chars"]}]
 ```
 
-Rules: the friction vocabulary is FIXED (the script rejects other labels —
-free labels are why `/insights` ends up with both `environment_issue` and
-`environment_issues`); `detail` must be a conditional a rule could enforce;
-a session with no correction, error or revert is `friction: []` — do not
-invent one. Then re-run with the facets:
+The friction vocabulary is FIXED (the script rejects other labels); `detail`
+must be a conditional a rule could enforce; a session with no correction,
+error or revert is `friction: []` — do not invent one. Then cluster the
+details by eye and give each cluster a check the same way as step 2 (hook
+lanes first): a `git` / `pytest` / `sed` form → `matcher`; an error
+signature → `matcher {event: output}`; an identifier (a repo name,
+`arxiv.org`, `README.md`) → `anchors`; none of those → a session-start
+note, written by hand with the session count and the user's words as its
+origin. Add the checkable ones to the same candidates list.
+
+## 4. Second pass — everything replayed, one report
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" --out mine-out \
-  --facets mine-out/facets.json --skills-file skills.json --claude-md ./CLAUDE.md
+  --candidates mine-out/candidates.json --facets mine-out/facets.json \
+  --skills-file skills.json --claude-md ./CLAUDE.md
 ```
 
 The report, in order:
 
 - **WHAT WENT WRONG** — friction counts and every session's details.
-  Cluster them by eye into candidate sentences. A cluster with a command
-  shape (a `git`, `pytest`, `sed` form; an error signature) gets a
-  predicate and enters the replay; one without (reasoning from a README,
-  claiming "done" without a live run, guessing which repo was meant) becomes
-  a session-start note, with the session count as its evidence.
-- **WHAT CLAUDE.MD DECLARES** (with `--claude-md`) — every imperative
-  sentence with its heading. Two directions: (1) declared → measured: give
-  a sentence a predicate (`RULE_CANDS` / `OUTPUT_CANDS` / `ORDERING_CANDS`,
-  or a `--rule-file`), re-run, and the replay says how often the declared
-  rule is actually broken — that number goes into the `source_ref` when you
-  file it through `import-claude-md` (identity stays `(path, title)`, so a
-  re-import replaces, never twins); (2) measured → declared: a transcript
-  finding with no CLAUDE.md sentence is a CLAUDE.md gap — propose the
-  sentence in the report (a PR, never a direct edit).
+- **WHAT CLAUDE.MD DECLARES** — the sentences (already used in step 2).
 - **DID FRICTION SHRINK?** (with `--baseline-date`) — facet friction per
   session before vs after the date a rule set went live. The outcome metric.
-- **RULES ALREADY ON** — the cached active book replayed. A rule that
-  never fired across the corpus is a retire candidate.
+- **RULES ALREADY ON** — the cached active book replayed; a rule that never
+  fired across the corpus is a retire candidate.
 - **WHAT THESE RULES WOULD HAVE CHANGED** — the summary the user reads
   first: how many rules would have caught a mistake and in how many
   session-moments; how many are already in CLAUDE.md *and were still
-  broken* (CLAUDE.md is read once; a rule fires at the command); how many
-  guard things CLAUDE.md never mentions; in how many of those sessions the
-  user had to correct Claude; what was skipped as too rare.
-- **PROPOSED RULES**, grouped by when they fire (session start · at the
-  command · on the error · when the name comes up). Every row is the same
-  five lines: `Why:` (origin), `Cost:` (corrections / reverts / friction in
-  those sessions, plus the user's on-topic words), `With it on:`, `→`
-  decision, and one `evidence:` line with the machine tokens. A "do X
-  before Y" matcher whose fires were mostly in sessions that had already
-  done X is moved to session start with its numbers. A session-armed
-  ordering (`armed_by_events: ["session"]`, e.g. fetch before reading
-  `origin/*`) is replayed but the shipped engine is edit-armed only — its
-  decision says so; file it as a note and carry the number as evidence for
-  the plugin change. Output rules must be anchored to the line start, or
-  prose that merely mentions the error becomes the main false hit.
-  Session-start rows from the facet clusters (reasoning from a README,
-  claiming "done" without a live run, guessing which repo) are written by
-  hand with the same five lines: the session count and the user's words are
-  the origin.
+  broken*; how many guard things CLAUDE.md never mentions; in how many
+  sessions the user had to correct Claude; what was skipped; how many are
+  declared-but-unbroken; and a warning if session-start notes exceed the
+  cap.
+- **PROPOSED RULES**, grouped by when they fire. Every row is the same five
+  lines: `Why:` (origin), `Cost:`, `With it on:`, `→` decision, and one
+  `evidence:` line with the machine tokens. A "do X before Y" matcher whose
+  fires were mostly in sessions that had already done X is moved to session
+  start with its numbers. A session-armed ordering (`armed_by_events:
+  ["session"]`, e.g. fetch before reading `origin/*`) is replayed but the
+  shipped engine is edit-armed only — its decision says so; the
+  fires-at-the-command form (once per session) is the alternative to offer.
+- **DECLARED IN CLAUDE.MD, NOT BROKEN HERE** — the 0–2-fire declared checks,
+  with their sentences. Offer them in bulk ("also file these as declared
+  rules?"), default no.
 - **SKILLS** — sessions whose user turns match an intent vs sessions where
-  that skill was invoked: `PROPOSE this skill` (none exists), `skill exists
-  but was retyped by hand` (adoption gap), `covered`.
+  that skill was invoked: `PROPOSE this skill` / `retyped by hand` /
+  `covered`.
 - **BLOCK CANDIDATES** — a command followed, in the same session, by an
-  undo or by the user questioning it. Rate = sessions where it went bad.
-  Advise-tier → a rule above; block-tier → the emitted PreToolUse snippet
-  (Claude `settings.json`; Codex/Cursor via the plugin's hook bridges) or a
-  plugin PR.
+  undo or by the user questioning it. Block-tier → the emitted PreToolUse
+  snippet (Claude `settings.json`; Codex/Cursor via the plugin's hook
+  bridges) or a plugin PR.
 
-Add hypotheses by editing `RULE_CANDS`, `OUTPUT_CANDS`, `ORDERING_CANDS`,
-`SKILL_INTENTS`, `HOOK_CANDS` at the top of each section, or pass them as
-`--rule-file` bodies. Give each one `did` (what Claude did, past tense),
-`what` (what changes with it on), `claude_md_rx` (how to find the CLAUDE.md
-sentence that declares it — explicit, never guessed) and `quote_rx` (which
-user corrections count as on-topic). Every entry is a predicate, so it is
-backtested the same way.
+Built-in hypotheses live in `RULE_CANDS`, `OUTPUT_CANDS`, `ORDERING_CANDS`,
+`SKILL_INTENTS`, `HOOK_CANDS` at the top of each section; each carries
+`did`, `what`, `claude_md_rx` (explicit — the script never guesses an
+origin) and `quote_rx`.
 
-## 3. Verify, dedup, file
+## 5. Verify, check conflicts, show the table, file
 
-1. Hook rules: every candidate through the plugin's
-   `rulebook_verify.py --rule-file … --fires … --silent …` using real
-   commands from `corpus.json`; always include a `--silent` case that merely
-   MENTIONS the trigger (`grep "…"`, quoted args) — the largest measured
-   false-fire class. Then `rulebook_conflicts.py --candidates … --existing
-   <list_rules.json> --repo <repo>`; judge `same_title`/`same_matcher`, set
-   `supersedes_rule_id` when it replaces a rule.
-2. Skills: only `PROPOSE this skill` rows. Write the SKILL.md host-agnostic —
-   shell + files, no host-only tools — and cite the session counts in it.
-3. Show the user the summary block, then one entry per proposal in the
-   report's own five-line shape (Why · Cost · With it on · decision), grouped
-   by when it fires, plus *already in the book?* and the `source_ref`. A
-   proposal with no origin line is not shown. Get a yes.
-4. File: `create_rule` with the row's `delivery` (`agent_hook` +
-   `matcher`/`ordering`, `session_context`, or `anchor_recall` + `anchors`)
-   and the row's `statement` — it already carries the origin
-   ("… Why: your CLAUDE.md says …, broken anyway in N sessions" or "… Why:
-   from your sessions, N of M, e.g. <session>"), so a reviewer opening the
-   rulebook later sees the reason without this report. Lands `proposed`;
-   never pass `activate` from this skill. `create_skill` into the repo
-   brain; block snippets left in `proposals.json` for a settings/plugin PR.
+1. Every `agent_hook` candidate through `rulebook_verify.py --rule-file …
+   --fires … --silent …` using real commands from `corpus.json`; always a
+   `--silent` case that merely MENTIONS the trigger (`grep "…"`) — the
+   largest measured false-fire class. Drop a candidate you cannot get to a
+   clean run.
+2. Conflicts, before anything is filed — the server does no title
+   matching, so a collision lands as a second draft silently. Save
+   `list_rules` (target brain, every status) to a file, the candidate bodies
+   to another, and run:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
+     --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>"
+   ```
+   `same_title` / `same_matcher` / `anchors_overlap` hits print the exact
+   `supersedes_rule_id` to copy. Then the semantic pass in your own reading
+   over `judge_by_statement`: `duplicate` → file with `supersedes_rule_id`;
+   `same_matcher` against an active rule that is NOT the same rule → do not
+   file, tell the user; `contradicts` → file without `supersedes_rule_id`
+   and name the rule it fights in the report.
+3. Skills: only `PROPOSE this skill` rows; host-agnostic SKILL.md citing
+   the session counts.
+4. Show the user the summary block, then one entry per proposal in the
+   report's five-line shape, grouped by when it fires, plus *conflicts* and
+   the `source_ref`; then the declared-but-unbroken list as one bulk
+   question. A proposal with no origin line is not shown. Get a yes. With
+   `--dry-run`, stop here.
+5. File: `create_rule` once per row with the row's `delivery` and engine
+   block, the row's `statement` (it carries the origin, so a reviewer
+   opening the rulebook later sees the reason without this report),
+   `scope_repos`, `source` (`claude_md_import` for declared rows, `authored`
+   for observed), `source_ref`, `supersedes_rule_id` where step 2 said so,
+   `agent_brain_id` when `--brain` was given. Read each reply: `unchanged`
+   (a retried identical import), `proposed` + `supersedes_rule_id`, or new.
+   Everything lands `proposed`, advise — never pass `activate` from this
+   skill. `create_skill` into the repo brain; block snippets stay in
+   `proposals.json` for a settings / plugin PR.
 
-## 4. Send the facets to the team, then report
-
-Save `mine-out/facets.json` to the repo's brain as an artifact (one command,
-same as the save-artifact skill; re-upload under the same name to version
-it, never a second name):
+## 6. Send the facets to the team, then report
 
 ```bash
 uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
   --file mine-out/facets.json --name "session-facets" --agent-brain-id <repo brain id>
 ```
 
-That is what makes friction a TEAM number rather than one laptop's: the
-next run (yours or a teammate's) can pull the artifact, and the fires
-ledger shares `session_id` with it, so "rule fired, friction still
-happened" is a join.
+Same name every time, so it versions. That is what makes friction a TEAM
+number: the next run (anyone's) can pull it, and the fires ledger shares
+`session_id` with it, so "rule fired, friction still happened" is a join.
 
-## 5. Report and close the loop
-
-Per row: filed (with its trigger) / superseded-what / skipped-why. Then:
-rules in the book with zero historical fires (retire candidates); skills
-with intent ≫ invoked (adoption work); block candidates with a high
-bad-outcome rate; session-armed orderings waiting on the engine mode.
-Note the activation date — the next run with `--baseline-date <that date>`
-over fresh sessions (with a new facet pass) is the measurement of whether
-the friction shrank. Identical re-files are no-ops on the server, so
-re-running is safe.
+Report per row: filed (with its trigger) / replaces which rule / unchanged /
+skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
+already on with zero historical fires (retire candidates); skills with
+intent ≫ invoked; block candidates with a high bad-outcome rate;
+session-armed orderings waiting on the engine mode. Note the activation
+date — the next run with `--baseline-date <that date>` over fresh sessions
+(with a new facet pass) measures whether the friction shrank. Identical
+re-files are no-ops on the server, so re-running is safe.
