@@ -62,6 +62,26 @@ Apply the matcher-authoring rules from `/memhub:create-rule` step 3
 up front, `warn_once_per: "session"` by default), and sanity-check each regex
 against a real command from this repo that should fire and one that should not.
 
+### 2b. Backtest each checkable candidate — declared vs. measured
+
+A CLAUDE.md sentence says what the team intends; the transcripts say how
+often it is actually violated. Replay every `agent_hook` candidate over the
+local sessions (Claude Code, Codex, Cursor) before filing:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" \
+  --rule-file <cand1.json> --rule-file <cand2.json> … --out /tmp/mine
+```
+
+Put each candidate's `applies-in N/M` (and `precision` for "do X before Y"
+rules, via `"requires_prior_rx"`) in the step-4 table and append it to the
+row's `source_ref` (`<path>@<sha>#<heading>|applies N/M`). Two things this
+tells the reviewer that the document cannot: which declared rules are
+violated often (activate first) and which never fire (posture, or already
+enforced elsewhere). The reverse direction — findings in the transcripts
+with no sentence in the document — is `/memhub:rules-from-sessions`; report
+those as CLAUDE.md gaps, never edit the document from this skill.
+
 ### 3. Conflict check against the book — before anything is filed
 
 The server does no title matching: a candidate that collides with an
@@ -105,8 +125,9 @@ replaces; the server never guesses:
 
 ### 4. Show the table, then file
 
-Show the user one table: title · delivery · engine · **conflicts** (rule
-title + reason + your verdict, or "none") · source_ref. Get a yes (or drop
+Show the user one table: title · delivery · engine · **applies-in N/M**
+(step 2b) · **conflicts** (rule title + reason + your verdict, or "none") ·
+source_ref. Get a yes (or drop
 rows). With `--dry-run`, stop here.
 
 On approval call the memhub **`create_rule`** tool once per row:
