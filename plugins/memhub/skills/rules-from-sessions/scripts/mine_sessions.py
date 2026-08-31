@@ -450,9 +450,14 @@ if own:
         rx = _safe_rx(r.get("topic_rx"), "topic_rx")
         return fired_in(r, d.get("session_id")) and bool(rx and rx.search(str(fr.get("detail", ""))))
     cov = [(d, fr) for d, fr in items if any(covers(r, d, fr) for r in on + notes)]
-    sess_cov = [(d, fr) for d, fr in items if any(fired_in(r, d.get("session_id")) for r in on + notes)]
-    left = [(d, fr) for d, fr in items if (d, fr) not in cov]
-    print(f"  Coverage: {len(cov)} of {len(items)} friction items in your facets are on the topic of a rule that would have fired in that session; {len(left)} are not. (Session-level, the looser number: {len(sess_cov)} sit in a session where some rule would have fired.)")
+    # a rule with no (or a bad) topic regex can't say which items are its topic — its fires count as a LOOSE middle
+    # bucket, visibly, rather than silently dropping (understates) or covering the whole session (inflates)
+    untyped = [r for r in on + notes if not _safe_rx(r.get("topic_rx"), "topic_rx")]
+    loose = [(d, fr) for d, fr in items if (d, fr) not in cov and any(fired_in(r, d.get("session_id")) for r in untyped)]
+    left = [(d, fr) for d, fr in items if (d, fr) not in cov and (d, fr) not in loose]
+    print(f"  Coverage: {len(cov)} of {len(items)} friction items are on the topic of a rule that would have fired in that session"
+          + (f"; {len(loose)} more sit in a session reached only by a rule with no topic regex (counted loosely)" if loose else "")
+          + f"; {len(left)} are untouched.")
     if left:
         lc = collections.Counter(fr["category"] for _, fr in left)
         print(f"  Not covered, by kind: {', '.join(f'{k} ×{v}' for k, v in lc.most_common(5))} — the next candidates (give each a command / error / identifier shape, or accept it as a one-off):")
