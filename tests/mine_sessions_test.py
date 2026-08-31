@@ -27,6 +27,8 @@ def main() -> int:
         facets = Path(home) / "facets.json"
         facets.write_text(json.dumps([{"session_id": "abc", "host": "codex", "repo": "r", "underlying_goal": "g", "outcome": "mostly",
                                        "friction": [{"category": "wrong_source", "detail": "answered from README", "evidence_turn": 2}, {"category": "bogus_label", "detail": "x"}],
+                                       "standards": [{"statement": "always TTL new tables", "quote": "always ttl these", "scope": "org"}],
+                                       "worked_well": "kickoff brief landed clean",
                                        "corrections": ["read the code"]}]))
         partial = Path(home) / "partial.json"; partial.write_text(json.dumps({"title": "partial-ordering", "ordering": {"gated_command_rx": "git push"}}))
         anchor = Path(home) / "anchor.json"; anchor.write_text(json.dumps({"title": "probe-anchor", "delivery": "anchor_recall", "anchors": ["ContextBusConfig"]}))
@@ -70,6 +72,13 @@ def main() -> int:
         ok = sed_hook is not None and "[0-9]+" in cmd and "\\d" not in cmd and "[[:space:]]" in cmd and "test)\\b" in pcmd
         print(("ok  " if ok else "FAIL"), "emitted PreToolUse snippet is grep -E syntax (\\d -> [0-9], \\s -> [[:space:]], \\b kept — GNU and BSD grep honour it)"); fails += not ok
         if not ok: print(cmd)
+        ok = "ENGINEERING STANDARDS ASSERTED" in p.stdout and "always TTL new tables" in p.stdout and "WHAT WORKED" in p.stdout and "REPEATED WORKFLOWS" in p.stdout
+        print(("ok  " if ok else "FAIL"), "asserted standards and worked_well are surfaced; the workflows lane prints"); fails += not ok
+        g = out / "grabs"
+        ok = (g / "claude-md-additions.md").is_file() and (g / "hooks.settings.json").is_file() and (g / "Makefile.suggested").is_file()
+        print(("ok  " if ok else "FAIL"), "grabs/ holds claude-md-additions.md, hooks.settings.json, Makefile.suggested"); fails += not ok
+        ok = all("audience" in r for r in rows if r.get("lane") not in ("hook", "skill", "workflow", "claude_md"))
+        print(("ok  " if ok else "FAIL"), "every rule row carries an audience (org / repo / machine)"); fails += not ok
         ok = "several memhub plugin copies" not in p.stderr and "not found" not in p.stderr
         print(("ok  " if ok else "FAIL"), "plugin scripts resolved relative to the skill (no env var, no cache lookup)"); fails += not ok
         if not ok: print("stderr:", p.stderr[-400:])
