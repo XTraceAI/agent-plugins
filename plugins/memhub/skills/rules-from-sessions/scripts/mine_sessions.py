@@ -351,7 +351,8 @@ def add(row):
     proposals.append(row); return row
 def show(row):
     n = row["fired_n"]; ev = row["evidence"]
-    aud = f" · {row['audience']}" + ("-local" if row.get("audience") == "machine" else "-wide" if row.get("audience") == "org" else "") if row.get("audience") else ""
+    aud_names = {"org": " · org-wide", "repo": " · repo-scoped", "machine": " · machine-local"}
+    aud = aud_names.get(row.get("audience"), "")   # explicit map — no precedence-fragile chained conditionals
     print(f"\n  {row['title']}   [{TRIGGERS[row['trigger']][0]}{aud}]")
     print(f"     Why: {row['why']}")
     if n:
@@ -484,7 +485,7 @@ for k, (head, deliv, meaning) in TRIGGERS.items():
     print(f"\n--- {head}  ({deliv}: {meaning})")
     if k == "session_start":
         print("  Also here: the friction clusters from WHAT WENT WRONG that have no command shape (reasoning from a README, claiming 'done' without a live run, guessing which repo was meant) — you write those by hand, with the session count and the user's words as the reason.")
-    for r in sorted(group, key=lambda r: {"org": 0, "repo": 1, "machine": 2}.get(r.get("audience"), 1)):
+    for r in sorted(group, key=lambda r: {"org": 0, "repo": 1, "machine": 2}.get(r.get("audience"), 0)):   # audience-less rows (none today) lead rather than hide mid-list
         if r["bucket"] == "declared_unbroken": continue   # shown in their own section below
         show(r)
     if not group: print("  (none from the replay)")
