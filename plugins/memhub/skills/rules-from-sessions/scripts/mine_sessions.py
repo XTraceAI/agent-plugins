@@ -174,7 +174,13 @@ for path in args.rule_file:   # a candidate from create-rule / import-claude-md 
     try: body = json.load(open(os.path.expanduser(path)))
     except Exception as e: print(f"[warn] --rule-file {path}: {e}", file=sys.stderr); continue
     m = body.get("matcher") or {}
-    if body.get("ordering"): ORDERING_CANDS_EXTRA = globals().setdefault("ORDERING_CANDS_EXTRA", []); ORDERING_CANDS_EXTRA.append({"title": body.get("title", path), "required_rx": body["ordering"]["required_command_rx"], "gated_rx": body["ordering"]["gated_command_rx"], "min_edits": int(body["ordering"].get("min_edits", 1))})
+    if body.get("ordering"):
+        o = body["ordering"] if isinstance(body["ordering"], dict) else {}
+        if not (o.get("required_command_rx") and o.get("gated_command_rx")):   # a partial draft must not take the whole run down
+            print(f"[warn] --rule-file {path}: ordering needs required_command_rx and gated_command_rx — skipped", file=sys.stderr); continue
+        try: min_edits = int(o.get("min_edits", 1))
+        except (TypeError, ValueError): min_edits = 1
+        globals().setdefault("ORDERING_CANDS_EXTRA", []).append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits})
     elif m.get("event") == "output": OUTPUT_CANDS.append({"title": body.get("title", path), "content_rx": m["content_rx"]})
     elif m: RULE_CANDS.append({"title": body.get("title", path), "matcher": m, "requires_prior_rx": body.get("requires_prior_rx")})
 def hook_rule(title, matcher):
@@ -204,9 +210,12 @@ for f in glob.glob(os.path.expanduser("~/.config/memhub-plugin/rulebook/book/*.j
     except Exception: pass
 seen = {}; live = []
 for r in book:   # several cached books (one per repo) can hold different versions of one rule: keep the newest per title
-    if r.get("delivery") != "agent_hook": continue
-    if r["title"] in seen and seen[r["title"]] >= int(r.get("version") or 0): continue
-    seen[r["title"]] = int(r.get("version") or 0); live = [x for x in live if x["title"] != r["title"]] + [r]
+    title = r.get("title") if isinstance(r, dict) else None
+    if not title or r.get("delivery") != "agent_hook": continue   # a partial/corrupt cache row is skipped, not fatal
+    try: ver = int(r.get("version") or 0)
+    except (TypeError, ValueError): ver = 0
+    if title in seen and seen[title] >= ver: continue
+    seen[title] = ver; live = [x for x in live if x.get("title") != title] + [r]
 print(f"\n=== LANE 1 · RULES — live book replay ({len(live)} hook rules)")
 for r in live:
     res = replay(rh.to_hook_rule(r)); flag = "  <- ZERO historical fires: retire candidate" if not res["sessions"] else ""

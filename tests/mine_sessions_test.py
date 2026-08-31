@@ -28,12 +28,19 @@ def main() -> int:
         facets.write_text(json.dumps([{"session_id": "abc", "host": "codex", "repo": "r", "underlying_goal": "g", "outcome": "mostly",
                                        "friction": [{"category": "wrong_source", "detail": "answered from README", "evidence_turn": 2}, {"category": "bogus_label", "detail": "x"}],
                                        "corrections": ["read the code"]}]))
-        p = _run("--out", str(out), "--rule-file", str(cand), "--claude-md", str(md), "--facets", str(facets), home=home)
+        partial = Path(home) / "partial.json"; partial.write_text(json.dumps({"title": "partial-ordering", "ordering": {"gated_command_rx": "git push"}}))
+        book = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; book.mkdir(parents=True)
+        (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
+                                                            {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
+        p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--claude-md", str(md), "--facets", str(facets), home=home)
         ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "CLAUDE.MD SEED" in p.stdout and "FACETS SEED" in p.stdout and "wrong_source" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and (out / "digests").is_dir()
         print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md and --facets (fixed vocab enforced), writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
         ok = (out / "proposals.json").is_file() and any(r.get("title") == "probe-rule" for r in json.load(open(out / "proposals.json")))
         print(("ok  " if ok else "FAIL"), "proposals.json carries the --rule-file candidate"); fails += not ok
+        ok = "ordering needs required_command_rx" in p.stderr and "partial-ordering" not in p.stdout and "ok-rule" in p.stdout
+        print(("ok  " if ok else "FAIL"), "partial ordering body → [warn] + skipped; cache row without title skipped; non-numeric version tolerated"); fails += not ok
+        if not ok: print(p.stdout[-600:], p.stderr[-400:])
         ok = "several memhub plugin copies" not in p.stderr and "not found" not in p.stderr
         print(("ok  " if ok else "FAIL"), "plugin scripts resolved relative to the skill (no env var, no cache lookup)"); fails += not ok
         if not ok: print("stderr:", p.stderr[-400:])
