@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Redirect HOME before importing, so the module's import-time CACHE_DIR /
@@ -436,6 +437,14 @@ def _rulebook_book(*, fetched_ago_min: float, rules: int = 3) -> None:
     }), encoding="utf-8")
 
 
+def _rulebook_sent(*, flushed_ago_min: float) -> None:
+    """Write `ledger/.sent` the way the hook writes it after an ACCEPTED batch."""
+    d = ch.RULEBOOK_DIR / "ledger"
+    d.mkdir(parents=True, exist_ok=True)
+    at = datetime.fromtimestamp(time.time() - flushed_ago_min * 60).astimezone().isoformat()
+    (d / ".sent").write_text(json.dumps({"fires_offset": 1, "conversions_offset": 0, "last_flush_at": at}), encoding="utf-8")
+
+
 def _clear_rulebook() -> None:
     import shutil
     shutil.rmtree(ch.RULEBOOK_DIR, ignore_errors=True)
@@ -508,3 +517,31 @@ if __name__ == "__main__":
             print(f"  - {f}")
         sys.exit(1)
     print("\nall capture_health checks passed")
+
+    # --- review findings on #129: auth wording, and per-lane retraction
+    _clear_rulebook()
+    _rulebook_crumb("fetch", ago_min=5, error="401 {\"error\":\"missing key 'foo'\"}")
+    got = ch._rulebook_problem()
+    check("a 401 that merely mentions 'key' is NOT the auth lane", got and got[0], "fetch")
+    _rulebook_crumb("fetch", ago_min=5, error="401 refused: the plugin has no access key")
+    got = ch._rulebook_problem()
+    check("the server's access-key wording IS the auth lane", got and got[0], "auth")
+    _clear_rulebook()
+    _rulebook_crumb("flush", ago_min=30)
+    _rulebook_book(fetched_ago_min=5)
+    got = ch._rulebook_problem()
+    check("a later FETCH does not retract a flush failure", got and got[0], "flush")
+    _rulebook_sent(flushed_ago_min=5)
+    check("a later accepted flush retracts it", ch._rulebook_problem(), None)
+    _clear_rulebook()
+    _rulebook_crumb("flush", ago_min=30)
+    _rulebook_sent(flushed_ago_min=60)
+    got = ch._rulebook_problem()
+    check("a flush success BEFORE the error does not retract it", got and got[0], "flush")
+    _clear_rulebook()
+    _rulebook_crumb("recall", ago_min=30)
+    _rulebook_book(fetched_ago_min=5)
+    check("recall rides the fetch path: a later confirmed book retracts it", ch._rulebook_problem(), None)
+    _clear_rulebook()
+
+

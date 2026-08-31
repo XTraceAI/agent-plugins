@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import os
 import sys
 import time
@@ -361,26 +362,46 @@ def _rulebook_problem() -> tuple[str, float] | None:
         return None
     if when < time.time() - _STALE_AFTER_S:
         return None
-    # A later success retracts it: every book carries the time it was last
-    # confirmed, and any book newer than the error means fetching works now.
-    # Without this a single blip would warn for a day.
-    try:
-        for book in (RULEBOOK_DIR / "book").glob("*.json"):
-            try:
-                got = json.loads(book.read_text(encoding="utf-8")).get("fetched_at")
-                if isinstance(got, str) and datetime.fromisoformat(got).timestamp() >= when:
-                    return None
-            except (OSError, ValueError, TypeError):
-                continue
-    except OSError:
-        pass
+    # A later success on the SAME lane retracts it. Without this a single blip
+    # would warn for a day; with a fetch-only check a recovered flush would too.
+    if _lane_recovered(str(what), when):
+        return None
     # The known shape worth naming separately: without a personal access key the
     # client falls back to an OAuth token and no lane sends an org header, so
     # every rulebook call is refused. Minting a key is the fix, and it works.
+    # Keyed on the server's own wording, never on a bare "401" + "key" (the word
+    # "key" is in half of all JSON error bodies).
     text = str(crumb.get("error") or "")
-    if "X-Org-Id" in text or ("401" in text and "key" in text.lower()):
+    if _AUTH_REFUSAL.search(text):
         return "auth", when
     return str(what), when
+
+
+_AUTH_REFUSAL = re.compile(r"X-Org-Id|access key|no key configured", re.I)
+
+
+def _lane_recovered(what: str, when: float) -> bool:
+    """Has the lane that failed at ``when`` succeeded since?
+
+    fetch  — a book confirmed after the error (`book/*.json:fetched_at`).
+    flush  — an accepted batch after the error (`ledger/.sent:last_flush_at`,
+             written by the hook only when the server accepted rows).
+    recall — records no success of its own; it rides the same client and
+             server as fetch, so a later confirmed book is the evidence that
+             the path works again.
+    """
+    def _stamp_after(path: Path, key: str) -> bool:
+        try:
+            got = json.loads(path.read_text(encoding="utf-8")).get(key)
+            return isinstance(got, str) and datetime.fromisoformat(got).timestamp() >= when
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+    if what == "flush":
+        return _stamp_after(RULEBOOK_DIR / "ledger" / ".sent", "last_flush_at")
+    try:
+        return any(_stamp_after(b, "fetched_at") for b in (RULEBOOK_DIR / "book").glob("*.json"))
+    except OSError:
+        return False
 
 
 def _message(host: str, token_problem: str | None,
