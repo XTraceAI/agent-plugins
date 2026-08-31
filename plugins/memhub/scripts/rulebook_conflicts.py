@@ -6,7 +6,7 @@ Why this lives in the skill and not on the server: the server's re-import
 identity is (rulebook, source_ref path, title) and it deliberately never
 adopts a rule owned by another document — so a candidate whose title or
 matcher collides with an existing rule is filed as a second draft, silently.
-The agent running `/memhub:create-rule` or `/memhub:import-claude-md` is the
+The agent running `/memhub:create-rule` or `/memhub:rules-from-sessions` is the
 right place to notice: it is already holding the candidates and the book, and
 it can read two statements and say "same rule" better than any key can.
 

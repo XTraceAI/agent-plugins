@@ -244,9 +244,13 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   propose spec changes through the normal repo/PR flow.
 - `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
   failure, correction, or procedure and checks for conflicts before saving it.
-- `/memhub:import-claude-md` — imports reusable instructions from a
-  `CLAUDE.md` file into Rulebook without turning generic prose into noisy
-  directives.
+- `/memhub:rules-from-sessions` — one run over your CLAUDE.md **and** your
+  past coding sessions (Claude Code, Codex, Cursor): every candidate rule is
+  replayed through the real hook, and each proposal says why it exists (the
+  CLAUDE.md sentence, or the sessions and your own words), what it cost you,
+  and what changes with it on. Hook rules first — at the command, on the
+  error, when a name comes up — session-start notes last. Files survivors as
+  `proposed`; never activates anything.
 - `/memhub:pr-babysit [pr-number-or-url]` — usually **auto-armed**, not typed:
   a hook offers to start this as a self-paced loop right after `gh pr
   create` (see PR babysitting below). One pass polls the PR's review bots and
