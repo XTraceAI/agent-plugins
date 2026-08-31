@@ -195,6 +195,10 @@ OUTPUT_CANDS = [   # fires on the error: a signature in the tool result. Anchor 
   "did": "Claude hit a missing-module import (wrong venv or extras not installed)", "what": "Claude is told to run inside the repo venv (`uv run`) and install the extras before debugging the import", "claude_md_rx": r"uv pip install -e|install (the )?(dev )?extras|wrong venv", "quote_rx": r"\bvenv\b|ModuleNotFound|missing module|uv run"},
  {"title": "timeout-not-on-macos", "content_rx": r"^(\(eval\)|zsh|bash|sh)(:\d+)?: command not found: timeout\s*$|^timeout: command not found",
   "did": "Claude called GNU `timeout`, which isn't installed on macOS", "what": "Claude is told to use a Python-side timeout instead of the missing binary", "claude_md_rx": r"\btimeout\b", "quote_rx": r"timeout"},
+ {"title": "rg-not-installed", "content_rx": r"^[^\n]{0,40}command not found: rg\s*$|^rg: command not found|^/bin/sh: rg: not found",
+  "did": "Claude called `rg` on a host without ripgrep (and often retried it)", "what": "Claude is told to use `grep -rn` for the rest of the session", "claude_md_rx": r"\bripgrep\b|\brg\b", "quote_rx": r"\brg\b|ripgrep"},
+ {"title": "db-tool-not-available", "content_rx": r"^[^\n]{0,40}command not found: (psql|pg_isready|redis-cli|pg_dump)\s*$|^(psql|pg_isready|redis-cli): command not found|^ConnectionRefusedError: \[Errno \d+\]|redis\.exceptions\.ConnectionError",
+  "did": "Claude assumed a local psql / pg_isready / redis-cli, or a running Redis, that wasn't there", "what": "Claude is told to use the project's own DB client (asyncpg / SQLAlchemy) or start the service before retrying", "claude_md_rx": r"\bpsql\b|pg_isready|redis-cli", "quote_rx": r"psql|redis|postgres"},
  {"title": "kwarg-signature-mismatch", "content_rx": r"TypeError: [^\n]*unexpected keyword argument",
   "did": "Claude called a function with a keyword it no longer accepts", "what": "Claude is told to re-read the signature in-file before retrying", "claude_md_rx": r"signature mismatch|re-read its signature|kwarg names", "quote_rx": r"signature|kwarg|argument"},
 ]
@@ -314,7 +318,8 @@ proposals = []
 def add(row):
     row["delivery"] = TRIGGERS[row["trigger"]][1]; row["sessions_total"] = M
     row.setdefault("what", "Claude is warned at the matching command or edit")
-    row["evidence"] = evidence(row.get("fired_ids", []), row.pop("quote_rx", None))
+    row["topic_rx"] = row.pop("quote_rx", None)   # kept: coverage asks whether a friction item is on this rule's topic
+    row["evidence"] = evidence(row.get("fired_ids", []), row.get("topic_rx"))
     given = row.pop("claude_md_given", None)
     d = given or declared_for(row.pop("claude_md_rx", None), row["title"])
     row["claude_md"] = {"heading": str(d.get("heading", "")), "text": str(d.get("text", "")).lstrip("# ").strip()[:140]} if d else None
@@ -326,7 +331,8 @@ def add(row):
     # a session-armed ordering that is ALSO declared-and-unbroken is listed with the declared ones (its verdict still says the engine can't run it)
     if row["verdict"].startswith("Turn on as a session-start note"): row["trigger"] = "session_start"; row["delivery"] = "session_context"
     row["why"] = why_text(row)   # after the flip: a session-start note's reason must not describe command-level misses
-    row["statement"] = f"{row['what']}. Why: {row['why']}"
+    stmt = f"{row['what']}. Why: {row['why']}"
+    row["statement"] = stmt if len(stmt) <= 400 else stmt[:397].rstrip() + "…"   # the server caps a statement at 400 chars (MAX_STATEMENT); a longer one is refused, not truncated
     row["action"] = f"create_rule(delivery={row['delivery']}" + (", matcher/ordering=predicate)" if row["delivery"] == "agent_hook" else ", anchors=predicate)" if row["delivery"] == "anchor_recall" else ")")
     row.setdefault("source_ref", (f"claude_md@{today}#{row['title']}" if d else f"sessions@{today}#{row['title']}") + f"|applies {row['fired_n']}/{M}" + (f"|precision {row['real_misses']}/{row['fired_n']}" if row.get("real_misses") is not None else ""))
     proposals.append(row); return row
@@ -433,6 +439,29 @@ declared_unbroken = [r for r in rows if r["bucket"] == "declared_unbroken"]
 if declared_unbroken: print(f"  Declared in CLAUDE.md but not (or barely) broken here: {len(declared_unbroken)} — listed at the end; file them only if you want CLAUDE.md fully in the book.")
 NOTE_CAP = 5
 if len(notes) > NOTE_CAP: print(f"  !! {len(notes)} session-start notes is more than the cap of {NOTE_CAP}. A note is what CLAUDE.md already is — give the rest a command, error, or identifier shape, or drop them.")
+# coverage: of the friction the facets recorded, how much sits in a session at least one proposed rule would have fired in — and what is left over (the next candidates)
+own = [d for d in facets if d.get("source") != "insights" and d.get("friction")]
+if own:
+    items = [(d, fr) for d in own for fr in d["friction"] if isinstance(fr, dict) and fr.get("category") in FRICTION_VOCAB]
+    def fired_in(r, sid):
+        sid = str(sid or "")
+        return any(str(t) == sid or str(t).startswith(sid[:12]) or sid.startswith(str(t)[:12]) for t in r.get("fired_ids", []))
+    def covers(r, d, fr):   # per ITEM: the rule would have fired in that session AND the item is on the rule's topic
+        rx = _safe_rx(r.get("topic_rx"), "topic_rx")
+        return fired_in(r, d.get("session_id")) and bool(rx and rx.search(str(fr.get("detail", ""))))
+    cov = [(d, fr) for d, fr in items if any(covers(r, d, fr) for r in on + notes)]
+    # a rule with no (or a bad) topic regex can't say which items are its topic — its fires count as a LOOSE middle
+    # bucket, visibly, rather than silently dropping (understates) or covering the whole session (inflates)
+    untyped = [r for r in on + notes if not _safe_rx(r.get("topic_rx"), "topic_rx")]
+    loose = [(d, fr) for d, fr in items if (d, fr) not in cov and any(fired_in(r, d.get("session_id")) for r in untyped)]
+    left = [(d, fr) for d, fr in items if (d, fr) not in cov and (d, fr) not in loose]
+    print(f"  Coverage: {len(cov)} of {len(items)} friction items are on the topic of a rule that would have fired in that session"
+          + (f"; {len(loose)} more sit in a session reached only by a rule with no topic regex (counted loosely)" if loose else "")
+          + f"; {len(left)} are untouched.")
+    if left:
+        lc = collections.Counter(fr["category"] for _, fr in left)
+        print(f"  Not covered, by kind: {', '.join(f'{k} ×{v}' for k, v in lc.most_common(5))} — the next candidates (give each a command / error / identifier shape, or accept it as a one-off):")
+        for d, fr in left[:6]: print(f"     [{str(d.get('session_id',''))[:8]}] {fr.get('detail','')[:150]}")
 
 print(f"\n=== PROPOSED RULES — each with why it exists, what it cost you, and what changes with it on")
 for k, (head, deliv, meaning) in TRIGGERS.items():
