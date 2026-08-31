@@ -330,7 +330,8 @@ def add(row):
     # a session-armed ordering that is ALSO declared-and-unbroken is listed with the declared ones (its verdict still says the engine can't run it)
     if row["verdict"].startswith("Turn on as a session-start note"): row["trigger"] = "session_start"; row["delivery"] = "session_context"
     row["why"] = why_text(row)   # after the flip: a session-start note's reason must not describe command-level misses
-    row["statement"] = f"{row['what']}. Why: {row['why']}"
+    stmt = f"{row['what']}. Why: {row['why']}"
+    row["statement"] = stmt if len(stmt) <= 400 else stmt[:397].rstrip() + "…"   # the server caps a statement at 400 chars (MAX_STATEMENT); a longer one is refused, not truncated
     row["action"] = f"create_rule(delivery={row['delivery']}" + (", matcher/ordering=predicate)" if row["delivery"] == "agent_hook" else ", anchors=predicate)" if row["delivery"] == "anchor_recall" else ")")
     row.setdefault("source_ref", (f"claude_md@{today}#{row['title']}" if d else f"sessions@{today}#{row['title']}") + f"|applies {row['fired_n']}/{M}" + (f"|precision {row['real_misses']}/{row['fired_n']}" if row.get("real_misses") is not None else ""))
     proposals.append(row); return row
