@@ -219,7 +219,7 @@ for path in args.candidates:   # a JSON list of bodies (the CLAUDE.md checks you
     except Exception as e: print(f"[warn] --candidates {path}: {e}", file=sys.stderr)
 for path, body in bodies:   # each joins the trigger it belongs to
     m = body.get("matcher") or {}
-    cm = body.get("claude_md") if isinstance(body.get("claude_md"), dict) else None   # the origin sentence, when the author already knows it
+    cm = body.get("claude_md") if isinstance(body.get("claude_md"), dict) and str(body["claude_md"].get("text", "")).strip() else None   # the origin sentence, when the author knows it; an empty dict is no origin
     extra = {"did": body.get("did") or "Claude did this", "what": body.get("what") or (body.get("statement") or "").split(" Why:")[0][:160] or "Claude is warned at the matching command or edit",
              "claude_md_rx": body.get("claude_md_rx"), "quote_rx": body.get("quote_rx"), "claude_md_given": cm, "source_ref": body.get("source_ref")}
     if body.get("ordering"):

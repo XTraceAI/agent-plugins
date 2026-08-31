@@ -33,6 +33,7 @@ def main() -> int:
         sess_ord = Path(home) / "sess.json"; sess_ord.write_text(json.dumps({"title": "probe-session-ordering", "ordering": {"required_command_rx": "git\\s+fetch\\b", "gated_command_rx": "git\\s+log\\b[^\\n]*origin/", "armed_by_events": ["session"]}}))
         cands = Path(home) / "cands.json"; cands.write_text(json.dumps([
             {"title": "declared-probe", "matcher": {"event": "bash", "command_rx": "never-happens-xyz\\b"}, "claude_md": {"heading": "Rules", "text": "Never pipe pytest into tail when deciding pass/fail."}, "source_ref": "CLAUDE.md@abc#rules", "did": "Claude did the declared thing", "what": "Claude is warned"},
+            {"title": "empty-origin-probe", "matcher": {"event": "bash", "command_rx": "never-happens-abc\\b"}, "claude_md": {}},
             "not-a-dict"]))
         book = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; book.mkdir(parents=True)
         (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
@@ -54,6 +55,9 @@ def main() -> int:
         decl = next((r for r in rows if r.get("title") == "declared-probe"), None)
         ok = decl is not None and decl.get("bucket") == "declared_unbroken" and decl.get("origin") == "claude_md" and decl["claude_md"]["text"].startswith("Never pipe pytest") and decl["source_ref"] == "CLAUDE.md@abc#rules" and decl["verdict"].startswith("Declared in CLAUDE.md") and "DECLARED IN CLAUDE.MD, NOT BROKEN HERE" in p.stdout
         print(("ok  " if ok else "FAIL"), "--candidates list: a body carrying its CLAUDE.md sentence is origin=claude_md, keeps its source_ref, and lands in the declared-not-broken section"); fails += not ok
+        emp = next((r for r in rows if r.get("title") == "empty-origin-probe"), None)
+        ok = emp is not None and emp.get("origin") == "sessions" and emp.get("claude_md") is None and emp.get("bucket") == "skip"
+        print(("ok  " if ok else "FAIL"), "an empty claude_md dict is no origin: the row stays origin=sessions and is skipped, not filed as declared"); fails += not ok
         if not ok: print(decl, p.stdout[-600:])
         ok = "ordering needs required_command_rx" in p.stderr and "partial-ordering" not in p.stdout and "ok-rule" in p.stdout
         print(("ok  " if ok else "FAIL"), "partial ordering body → [warn] + skipped; cache row without title skipped; non-numeric version tolerated"); fails += not ok
