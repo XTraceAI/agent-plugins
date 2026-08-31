@@ -320,6 +320,10 @@ def add(row):
     row["claude_md"] = {"heading": str(d.get("heading", "")), "text": str(d.get("text", "")).lstrip("# ").strip()[:140]} if d else None
     row["origin"] = "claude_md" if d else "sessions"
     row["verdict"] = verdict(row)
+    n = row["fired_n"]
+    row["bucket"] = ("unmeasured" if row["trigger"] == "on_identifier" else "declared_unbroken" if row.get("claude_md") and n < 3
+                     else "note" if row["verdict"].startswith("Turn on as a session-start note") else "skip" if row["verdict"].startswith("Skip") else "on")
+    # a session-armed ordering that is ALSO declared-and-unbroken is listed with the declared ones (its verdict still says the engine can't run it)
     if row["verdict"].startswith("Turn on as a session-start note"): row["trigger"] = "session_start"; row["delivery"] = "session_context"
     row["why"] = why_text(row)   # after the flip: a session-start note's reason must not describe command-level misses
     row["statement"] = f"{row['what']}. Why: {row['why']}"
@@ -411,8 +415,8 @@ for c in OUTPUT_CANDS:
 for c in ANCHOR_CANDS:
     rows.append(add({"trigger": "on_identifier", "title": c["title"], "predicate": {"anchors": c["anchors"]}, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), "fired": {}, "fired_n": 0, "fired_ids": [], "real_misses": None, "samples": []}))
 
-on = [r for r in rows if r["verdict"] == "Turn on"]                    # fires at the command / on the error: catches it before it lands
-notes = [r for r in rows if r["verdict"].startswith("Turn on as a session-start note")]   # a note is read once; it does not catch anything at the moment
+on = [r for r in rows if r["bucket"] == "on"]        # fires at the command / on the error: catches it before it lands
+notes = [r for r in rows if r["bucket"] == "note"]   # a note is read once; it does not catch anything at the moment
 in_md = [r for r in on + notes if r.get("claude_md")]
 corrected = len({sid for r in on + notes for sid in r.get("fired_ids", []) if (facet_of(sid) or {}).get("corrections") or sid in _corr_by})
 print(f"\n=== WHAT THESE RULES WOULD HAVE CHANGED IN YOUR LAST {M} SESSIONS")
@@ -423,9 +427,9 @@ if declared:
     print(f"  {len(on) + len(notes) - len(in_md)} guard things CLAUDE.md never mentions.")
 else: print("  (pass --claude-md to see which of these your CLAUDE.md already declares)")
 print(f"  You corrected Claude afterwards in {corrected} of the sessions where they would have fired.")
-skipped = [r for r in rows if r["verdict"].startswith("Skip")]
+skipped = [r for r in rows if r["bucket"] == "skip"]
 if skipped: print(f"  Skipped as too rare or unseen: {', '.join(r['title'] + ' (' + str(r['fired_n']) + ')' for r in skipped)}.")
-declared_unbroken = [r for r in rows if r["verdict"].startswith("Declared in CLAUDE.md")]
+declared_unbroken = [r for r in rows if r["bucket"] == "declared_unbroken"]
 if declared_unbroken: print(f"  Declared in CLAUDE.md but not (or barely) broken here: {len(declared_unbroken)} — listed at the end; file them only if you want CLAUDE.md fully in the book.")
 NOTE_CAP = 5
 if len(notes) > NOTE_CAP: print(f"  !! {len(notes)} session-start notes is more than the cap of {NOTE_CAP}. A note is what CLAUDE.md already is — give the rest a command, error, or identifier shape, or drop them.")
@@ -438,12 +442,12 @@ for k, (head, deliv, meaning) in TRIGGERS.items():
     if k == "session_start":
         print("  Also here: the friction clusters from WHAT WENT WRONG that have no command shape (reasoning from a README, claiming 'done' without a live run, guessing which repo was meant) — you write those by hand, with the session count and the user's words as the reason.")
     for r in group:
-        if r["verdict"].startswith("Declared in CLAUDE.md"): continue   # shown in their own section below
+        if r["bucket"] == "declared_unbroken": continue   # shown in their own section below
         show(r)
     if not group: print("  (none from the replay)")
 if declared_unbroken:
     print(f"\n=== DECLARED IN CLAUDE.MD, NOT BROKEN HERE — {len(declared_unbroken)} checks with 0–2 fires in {M} sessions (a sentence in a file, not a problem in your sessions; file as declared rules only if you want CLAUDE.md fully in the book)")
-    for r in declared_unbroken: print(f"  {r['title']:28s} {r['fired_n']} fires · CLAUDE.md § {r['claude_md']['heading'][:50]}: \"{r['claude_md']['text'][:90]}\"")
+    for r in declared_unbroken: print(f"  {r['title']:28s} {r['fired_n']} fires · CLAUDE.md § {r['claude_md']['heading'][:50]}: \"{r['claude_md']['text'][:90]}\"" + ("  (ordering: the engine cannot run it yet)" if r.get("needs_engine") else ""))
 
 # ---------------------------------------------------------------- skills your team keeps retyping
 installed = set()
@@ -506,6 +510,7 @@ for c in HOOK_CANDS:
     ere = to_ere(c["trigger_rx"])   # Python re -> POSIX ERE for grep -E; None when the pattern has no faithful ERE form
     snippet = ({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": f"cmd=$(jq -r .tool_input.command); printf '%s' \"$cmd\" | grep -Eq {shlex.quote(ere)} && {{ echo {shlex.quote(c['block_msg'])} >&2; exit 2; }}; exit 0"}]}]}}   # every interpolated value is shell-quoted
                if ere else {"note": f"no PreToolUse snippet: the pattern {c['trigger_rx']!r} uses constructs POSIX ERE cannot express; file it as a rulebook rule instead"})
+    if ere and "\\b" in ere: snippet["requires"] = "GNU or BSD grep (-E with \\b word boundaries) — the developer machine's grep, not busybox"
     proposals.append({"lane": "hook", "title": c["title"], "predicate": {"trigger_rx": c["trigger_rx"], "outcome_rx": c.get("outcome_rx") or c.get("user_rx"), "repair_rx": c.get("repair_rx")}, "sessions": {"trigger": T, "bad_outcome": B}, "sessions_total": M, "rate": rate, "samples": ex, "source_ref": f"sessions@{today}#{c['title']}|trigger {T}/{M}|bad-outcome {B}", "action": "advise: rulebook rule; block: PreToolUse hook (settings snippet) or plugin PR", "settings_snippet": snippet})
 
 json.dump([{k: v for k, v in s.items() if k != "results"} for s in corpus], open(os.path.join(args.out, "corpus.json"), "w"))

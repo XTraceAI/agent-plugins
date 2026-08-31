@@ -49,10 +49,10 @@ def main() -> int:
         ok = anchor is not None and anchor.get("trigger") == "on_identifier" and anchor.get("delivery") == "anchor_recall" and "when the name comes up" in p.stdout
         print(("ok  " if ok else "FAIL"), "an anchors body lands under 'When a name comes up' (anchor_recall), unmeasured"); fails += not ok
         sess = next((r for r in rows if r.get("title") == "probe-session-ordering"), None)
-        ok = sess is not None and sess.get("needs_engine") is True and "session-armed" in sess.get("verdict", "") and sess["predicate"]["ordering"]["armed_by_events"] == ["session"]
+        ok = sess is not None and sess.get("needs_engine") is True and "session-armed" in sess.get("verdict", "") and sess["predicate"]["ordering"]["armed_by_events"] == ["session"] and sess.get("bucket") in ("note", "declared_unbroken")
         print(("ok  " if ok else "FAIL"), "a session-armed ordering body is replayed and flagged as needing the engine mode"); fails += not ok
         decl = next((r for r in rows if r.get("title") == "declared-probe"), None)
-        ok = decl is not None and decl.get("origin") == "claude_md" and decl["claude_md"]["text"].startswith("Never pipe pytest") and decl["source_ref"] == "CLAUDE.md@abc#rules" and decl["verdict"].startswith("Declared in CLAUDE.md") and "DECLARED IN CLAUDE.MD, NOT BROKEN HERE" in p.stdout
+        ok = decl is not None and decl.get("bucket") == "declared_unbroken" and decl.get("origin") == "claude_md" and decl["claude_md"]["text"].startswith("Never pipe pytest") and decl["source_ref"] == "CLAUDE.md@abc#rules" and decl["verdict"].startswith("Declared in CLAUDE.md") and "DECLARED IN CLAUDE.MD, NOT BROKEN HERE" in p.stdout
         print(("ok  " if ok else "FAIL"), "--candidates list: a body carrying its CLAUDE.md sentence is origin=claude_md, keeps its source_ref, and lands in the declared-not-broken section"); fails += not ok
         if not ok: print(decl, p.stdout[-600:])
         ok = "ordering needs required_command_rx" in p.stderr and "partial-ordering" not in p.stdout and "ok-rule" in p.stdout
