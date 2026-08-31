@@ -43,7 +43,7 @@ def main() -> int:
         ok = probe is not None and probe.get("trigger") == "before_action" and probe.get("delivery") == "agent_hook" and "verdict" in probe
         print(("ok  " if ok else "FAIL"), "proposals.json carries the --rule-file candidate with trigger / delivery / verdict"); fails += not ok
         anchor = next((r for r in rows if r.get("title") == "probe-anchor"), None)
-        ok = anchor is not None and anchor.get("trigger") == "on_identifier" and anchor.get("delivery") == "anchor_recall" and "When a name comes up" in p.stdout
+        ok = anchor is not None and anchor.get("trigger") == "on_identifier" and anchor.get("delivery") == "anchor_recall" and "when the name comes up" in p.stdout
         print(("ok  " if ok else "FAIL"), "an anchors body lands under 'When a name comes up' (anchor_recall), unmeasured"); fails += not ok
         sess = next((r for r in rows if r.get("title") == "probe-session-ordering"), None)
         ok = sess is not None and sess.get("needs_engine") is True and "session-armed" in sess.get("verdict", "") and sess["predicate"]["ordering"]["armed_by_events"] == ["session"]
