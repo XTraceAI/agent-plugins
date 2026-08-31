@@ -15,7 +15,7 @@ Friction delta: --baseline-date splits facet friction before/after a rulebook ch
 Stdlib + the memhub plugin's readers + the real hook evaluate() (never re-implemented).
 Usage: mine_sessions.py [--out DIR] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
 """
-import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime
+import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="mine-out")
@@ -252,23 +252,28 @@ _rev = {s["id"] for s in corpus if any(c["cmd"] and REVERT.search(c["cmd"]) for 
 _facet_by = {str(d.get("session_id", "")): d for d in facets if d.get("session_id")}
 def facet_of(sid):
     if sid in _facet_by: return _facet_by[sid]
-    for k, v in _facet_by.items():
-        if len(k) >= 6 and (sid.startswith(k) or k.startswith(sid)): return v
-    return None
+    hits = [v for k, v in _facet_by.items() if len(k) >= 6 and (sid.startswith(k) or k.startswith(sid))]
+    return hits[0] if len(hits) == 1 else None   # an ambiguous prefix attaches nothing rather than the wrong session
+def _safe_rx(rx, what):
+    """--rule-file bodies carry their own regexes; a malformed one is reported once and ignored, never a crash."""
+    if not rx: return None
+    try: return re.compile(rx, re.I)
+    except re.error as e: print(f"[warn] {what}: bad regex {rx!r} ({e}) — ignored", file=sys.stderr); return None
 def evidence(ids, quote_rx=None):
     """Counts are per session (any topic — a correction there is not necessarily about this rule); quotes are only kept when they mention the rule's topic."""
-    quotes = []; nc = nr = 0; fr = collections.Counter()
+    quotes = []; nc = nr = 0; fr = collections.Counter(); qrx = _safe_rx(quote_rx, "quote_rx")
     for i in ids:
         f = facet_of(i); q = list((f or {}).get("corrections") or []) + list(_corr_by.get(i) or [])
         if q: nc += 1
-        on_topic = [x for x in q if quote_rx and re.search(quote_rx, str(x), re.I)]
+        on_topic = [x for x in q if qrx and qrx.search(str(x))]
         if on_topic: quotes.append({"session": i[:8], "text": str(on_topic[0])[:110]})
         if i in _rev: nr += 1
         for k, v in ((f or {}).get("friction_counts") or {}).items(): fr[k] += v
     return {"corrected_in": nc, "reverted_in": nr, "quotes": quotes[:2], "friction": dict(fr.most_common(3))}
 def declared_for(rx, title):
     """The CLAUDE.md sentence that already says this, if any — matched by the candidate's own `claude_md_rx`, never by guesswork."""
-    hits = [d for d in declared if rx and re.search(rx, d["text"], re.I)]   # explicit regex only — a loose match names the wrong sentence as the origin
+    crx = _safe_rx(rx, "claude_md_rx")
+    hits = [d for d in declared if crx and crx.search(d["text"])]   # explicit regex only — a loose match names the wrong sentence as the origin
     return hits[0] if hits else None
 
 def verdict(row):
@@ -298,8 +303,9 @@ def add(row):
     row["evidence"] = evidence(row.get("fired_ids", []), row.pop("quote_rx", None))
     d = declared_for(row.pop("claude_md_rx", None), row["title"])
     row["claude_md"] = {"heading": d["heading"], "text": d["text"].lstrip("# ").strip()[:140]} if d else None
-    row["verdict"] = verdict(row); row["why"] = why_text(row)
+    row["verdict"] = verdict(row)
     if row["verdict"].startswith("Turn on as a session-start note"): row["trigger"] = "session_start"; row["delivery"] = "session_context"
+    row["why"] = why_text(row)   # after the flip: a session-start note's reason must not describe command-level misses
     row["statement"] = f"{row['what']}. Why: {row['why']}"
     row["action"] = f"create_rule(delivery={row['delivery']}" + (", matcher/ordering=predicate)" if row["delivery"] == "agent_hook" else ", anchors=predicate)" if row["delivery"] == "anchor_recall" else ")")
     row.setdefault("source_ref", (f"claude_md@{today}#{row['title']}" if d else f"sessions@{today}#{row['title']}") + f"|applies {row['fired_n']}/{M}" + (f"|precision {row['real_misses']}/{row['fired_n']}" if row.get("real_misses") is not None else ""))
@@ -389,14 +395,16 @@ for c in OUTPUT_CANDS:
 for c in ANCHOR_CANDS:
     rows.append(add({"trigger": "on_identifier", "title": c["title"], "predicate": {"anchors": c["anchors"]}, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "fired": {}, "fired_n": 0, "fired_ids": [], "real_misses": None, "samples": []}))
 
-on = [r for r in rows if r["verdict"].startswith("Turn on")]
-in_md = [r for r in on if r.get("claude_md")]
-corrected = len({sid for r in on for sid in r.get("fired_ids", []) if facet_of(sid) and (facet_of(sid).get("corrections")) or sid in _corr_by})
+on = [r for r in rows if r["verdict"] == "Turn on"]                    # fires at the command / on the error: catches it before it lands
+notes = [r for r in rows if r["verdict"].startswith("Turn on as a session-start note")]   # a note is read once; it does not catch anything at the moment
+in_md = [r for r in on + notes if r.get("claude_md")]
+corrected = len({sid for r in on + notes for sid in r.get("fired_ids", []) if (facet_of(sid) or {}).get("corrections") or sid in _corr_by})
 print(f"\n=== WHAT THESE RULES WOULD HAVE CHANGED IN YOUR LAST {M} SESSIONS")
 print(f"  {len(on)} rules would have caught a mistake before it happened — {sum(r['fired_n'] for r in on)} session-moments in total.")
+if notes: print(f"  {len(notes)} more would be session-start notes (read once; they do not fire at the moment): {', '.join(r['title'] + ' (' + str(r['fired_n']) + ')' for r in notes)}.")
 if declared:
     print(f"  {len(in_md)} of them are already written in your CLAUDE.md — and were still broken {sum(r['fired_n'] for r in in_md)} times. CLAUDE.md is read once; a rule fires at the command.")
-    print(f"  {len(on) - len(in_md)} guard things CLAUDE.md never mentions.")
+    print(f"  {len(on) + len(notes) - len(in_md)} guard things CLAUDE.md never mentions.")
 else: print("  (pass --claude-md to see which of these your CLAUDE.md already declares)")
 print(f"  You corrected Claude afterwards in {corrected} of the sessions where they would have fired.")
 skipped = [r for r in rows if r["verdict"].startswith("Skip")]
@@ -462,7 +470,8 @@ for c in HOOK_CANDS:
     rate = f"{B}/{T}" if T else "0/0"
     print(f"  {c['title']:34s} happened in {T}/{M} sessions; went bad afterwards in {B}  (rate {rate})")
     for e in ex[:2]: print(f"     e.g. [{e['host']}/{e['repo']} {e['session']}] {e['text']}")
-    snippet = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": f"cmd=$(jq -r .tool_input.command); echo \"$cmd\" | grep -Eq '{c['trigger_rx'].replace(chr(92)+'s','[[:space:]]').replace(chr(92)+'b','')}' && {{ echo '{c['block_msg']}' >&2; exit 2; }}; exit 0"}]}]}}
+    ere = c["trigger_rx"].replace(chr(92) + "s", "[[:space:]]").replace(chr(92) + "b", "")   # Python re -> POSIX ERE for grep -E
+    snippet = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": f"cmd=$(jq -r .tool_input.command); printf '%s' \"$cmd\" | grep -Eq {shlex.quote(ere)} && {{ echo {shlex.quote(c['block_msg'])} >&2; exit 2; }}; exit 0"}]}]}}   # every interpolated value is shell-quoted
     proposals.append({"lane": "hook", "title": c["title"], "predicate": {"trigger_rx": c["trigger_rx"], "outcome_rx": c.get("outcome_rx") or c.get("user_rx"), "repair_rx": c.get("repair_rx")}, "sessions": {"trigger": T, "bad_outcome": B}, "sessions_total": M, "rate": rate, "samples": ex, "source_ref": f"sessions@{today}#{c['title']}|trigger {T}/{M}|bad-outcome {B}", "action": "advise: rulebook rule; block: PreToolUse hook (settings snippet) or plugin PR", "settings_snippet": snippet})
 
 json.dump([{k: v for k, v in s.items() if k != "results"} for s in corpus], open(os.path.join(args.out, "corpus.json"), "w"))
