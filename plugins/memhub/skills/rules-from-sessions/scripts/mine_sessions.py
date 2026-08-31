@@ -291,9 +291,10 @@ def verdict(row):
     """One decision a user can act on. Thresholds are what the team measured: <3 sessions is noise, <50 % genuine is a nag."""
     n = row["fired_n"]
     if row["trigger"] == "on_identifier": return "Unmeasured — anchor rules are matched and judged on the server; turn on only with a stated reason"
+    if row.get("needs_engine"):   # before the declared checks: a session-armed ordering must never be filed as a plain rule the engine cannot run
+        return f"Turn on as a session-start note — firing at the command needs a plugin change (session-armed ordering); it would then catch {n} sessions" + (" (declared in CLAUDE.md, not broken here)" if row.get("claude_md") and n < 3 else "")
     if row.get("claude_md") and n == 0: return "Declared in CLAUDE.md, not broken here — 0 fires in these sessions; file it only if you want CLAUDE.md fully in the book"
     if row.get("claude_md") and n < 3: return f"Declared in CLAUDE.md, rarely broken here — {n} session{'s' if n != 1 else ''}; file it as a declared rule if you want it in the book"
-    if row.get("needs_engine"): return f"Turn on as a session-start note — firing at the command needs a plugin change (session-armed ordering); it would then catch {n} sessions"
     if n == 0: return "Skip — never would have fired in these sessions"
     if n < 3: return f"Skip — too rare ({n} session{'s' if n != 1 else ''}); revisit if one miss is expensive"
     if row.get("real_misses") is not None and row["real_misses"] < n / 2:
@@ -471,12 +472,13 @@ for c in SKILL_INTENTS:
 
 # ---------------------------------------------------------------- block candidates: a command that was later undone or questioned
 def to_ere(rx):
-    """Python `re` -> POSIX ERE for `grep -E`, or None. Only the classes grep understands are translated; a pattern with
-    inline flags, lazy quantifiers or lookarounds has no faithful ERE form and must not become a silently-broken hook."""
+    """Python `re` -> the ERE `grep -E` runs, or None. Classes are translated; `\\b` is KEPT — both GNU grep and the
+    macOS stock BSD grep (2.6.0-FreeBSD) honour it in -E mode, and dropping it would make `npm test\\b` match `npm testing`.
+    A pattern with inline flags, lazy quantifiers or lookarounds has no faithful ERE form and must not become a
+    silently-broken hook."""
     if re.search(r"\(\?|\*\?|\+\?|\\[AZzGpP]", rx): return None
-    out = rx.replace("\\s", "[[:space:]]").replace("\\S", "[^[:space:]]").replace("\\d", "[0-9]").replace("\\D", "[^0-9]") \
-            .replace("\\w", "[[:alnum:]_]").replace("\\W", "[^[:alnum:]_]").replace("\\b", "")
-    return out
+    return rx.replace("\\s", "[[:space:]]").replace("\\S", "[^[:space:]]").replace("\\d", "[0-9]").replace("\\D", "[^0-9]") \
+             .replace("\\w", "[[:alnum:]_]").replace("\\W", "[^[:alnum:]_]")
 HOOK_CANDS = [   # trigger -> outcome (-> optional repair): all later in the SAME session; repair makes "bad" mean "had to be undone"
  {"title": "pytest-piped-then-push-then-repair", "trigger_rx": r"(pytest|npm\s+test)\b[^\n|&;]*\|", "outcome_rx": r"git\s+push\b", "repair_rx": r"git\s+(revert|commit\s+--amend|push\s+--force)|--force-with-lease|\bfix(es|ed)?\b.*\btest", "block_msg": "test output piped — exit code lost; run the suite unpiped before pushing"},
  {"title": "sed-range-delete-then-revert", "trigger_rx": r"sed\s+-i\b[^\n]*\d+(,\d+)?d\b", "outcome_rx": r"git\s+(checkout|restore|reset)\b", "block_msg": "sed range-delete — use an anchored Edit"},

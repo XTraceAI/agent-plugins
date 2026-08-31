@@ -61,8 +61,10 @@ def main() -> int:
         hooks = [r for r in rows if r.get("lane") == "hook"]
         sed_hook = next((r for r in hooks if r.get("title") == "sed-range-delete-then-revert"), None)
         cmd = ((sed_hook or {}).get("settings_snippet") or {}).get("hooks", {}).get("PreToolUse", [{}])[0].get("hooks", [{}])[0].get("command", "")
-        ok = sed_hook is not None and "[0-9]+" in cmd and "\\d" not in cmd and "[[:space:]]" in cmd
-        print(("ok  " if ok else "FAIL"), "emitted PreToolUse snippet is POSIX ERE (\\d -> [0-9], \\s -> [[:space:]]), not a Python regex grep -E cannot run"); fails += not ok
+        py_hook = next((r for r in hooks if r.get("title") == "pytest-piped-then-push-then-repair"), None)
+        pcmd = ((py_hook or {}).get("settings_snippet") or {}).get("hooks", {}).get("PreToolUse", [{}])[0].get("hooks", [{}])[0].get("command", "")
+        ok = sed_hook is not None and "[0-9]+" in cmd and "\\d" not in cmd and "[[:space:]]" in cmd and "test)\\b" in pcmd
+        print(("ok  " if ok else "FAIL"), "emitted PreToolUse snippet is grep -E syntax (\\d -> [0-9], \\s -> [[:space:]], \\b kept — GNU and BSD grep honour it)"); fails += not ok
         if not ok: print(cmd)
         ok = "several memhub plugin copies" not in p.stderr and "not found" not in p.stderr
         print(("ok  " if ok else "FAIL"), "plugin scripts resolved relative to the skill (no env var, no cache lookup)"); fails += not ok
