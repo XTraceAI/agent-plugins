@@ -17,11 +17,35 @@ past sessions ────────┘   (at the command · on the error · w
 Every proposed rule answers three questions, in this order — a candidate
 that cannot answer the first is not proposed:
 
-1. **Why does it exist?** One of two origins, nothing else:
+1. **Why does it exist?** One of three origins, nothing else:
    - **declared** — *your CLAUDE.md says "…"* (the sentence quoted, its
-     heading, and how often it was broken anyway), or
+     heading, and how often it was broken anyway),
    - **observed** — *from your sessions* (how many, plus the user's own
-     on-topic words from a session where it bit).
+     on-topic words from a session where it bit), or
+   - **asserted** — *a human stated an engineering standard* ("always TTL
+     new tables", "LLM calls go through the metered path"). The frequency
+     bar does NOT apply to asserted standards: one assertion with blast
+     radius is enough — a standard is usually said once, in a design or
+     review discussion, and then silently violated.
+
+**Two kinds of rules, and the second is the org-valuable one.** Friction
+mining produces *how-the-agent-works* rules (fetch first, don't pipe
+tests). Asserted standards produce *how-we-build* rules — data growth,
+cost paths, scheduling, tenancy — and they are almost always edit- or
+anchor-shaped, firing at the change that violates them:
+
+| standard (as asserted) | rule shape |
+|---|---|
+| "never unbounded growth in tables — always TTL" | edit: migration adds `create_table` with no TTL/retention/partition column |
+| "always make LLM calls through the metered path" | edit: a direct provider client (`AsyncOpenAI(`, `anthropic.`) outside the metered module |
+| "don't schedule nightly crons at the same time — pace them" | edit: a new cron entry at an already-used hour in the schedule file |
+
+When the user says "org-wide", this is what they mean: hunt the digests'
+`standard: true` turns and the facets' `standards` lists, and shape those —
+do not lead with machine-local environment friction. Every row carries an
+`audience` (org / repo / machine); the report prints org-wide first and
+labels machine-local rows so a teammate's run isn't a page of one
+laptop's quirks.
 2. **What did it cost?** In the sessions it would have fired in: how many
    had the user correcting Claude, how many had a revert, the friction the
    facets recorded there.
@@ -139,12 +163,19 @@ reverts — not the transcript) and write one object per session to
   "friction": [{"category": "wrong_approach | misunderstood_request | buggy_code | unverified_claim | wrong_environment | wrong_source | autonomy_overreach | environment_issue | tool_failure",
                 "detail": "one sentence: what happened and what the agent should have done",
                 "evidence_turn": 4}],
+  "standards": [{"statement": "the engineering standard as a sentence a rule could enforce",
+                 "quote": "the human's own words, verbatim", "scope": "org | repo"}],
+  "worked_well": "one sentence on what pattern made this session land, if one did",
   "corrections": ["the user's own words, verbatim, ≤120 chars"]}]
 ```
 
 The friction vocabulary is FIXED (the script rejects other labels); `detail`
 must be a conditional a rule could enforce; a session with no correction,
-error or revert is `friction: []` — do not invent one. Then cluster the
+error or revert is `friction: []` — do not invent one. `standards` is where
+org rules come from: any turn where a human asserts how the system must be
+built (the digests mark candidate turns with `standard: true` — read those
+even in sessions with no friction). `worked_well` is how strengths get
+mined instead of guessed; leave it out rather than flatter. Then cluster the
 details by eye and give each cluster a check the same way as step 2 (hook
 lanes first): a `git` / `pytest` / `sed` form → `matcher`; an error
 signature → `matcher {event: output}`; an identifier (a repo name,
@@ -162,6 +193,8 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.
 
 The report, in order:
 
+- **ENGINEERING STANDARDS ASSERTED** — the org-rule material, first.
+- **WHAT WORKED** — the patterns to keep (skill material).
 - **WHAT WENT WRONG** — friction counts and every session's details.
 - **WHAT CLAUDE.MD DECLARES** — the sentences (already used in step 2).
 - **DID FRICTION SHRINK?** (with `--baseline-date`) — facet friction per
@@ -196,6 +229,15 @@ The report, in order:
   undo or by the user questioning it. Block-tier → the emitted PreToolUse
   snippet (Claude `settings.json`; Codex/Cursor via the plugin's hook
   bridges) or a plugin PR.
+- **REPEATED WORKFLOWS** — the shell chains sessions retype (worktree
+  setup, venv bootstrap, test baseline, PR open/watch, repeated heredoc
+  analysis), counted per session: Makefile / setup-skill material.
+
+The run also writes **`mine-out/grabs/`** — everything copyable, generated
+rather than described: `claude-md-additions.md` (one section per
+sessions-origin rule with its evidence line — the human-readable half of
+each fired rule), `hooks.settings.json` (the verified block-tier hooks),
+and `Makefile.suggested` (targets for workflows used in ≥5 sessions).
 
 Built-in hypotheses live in `RULE_CANDS`, `OUTPUT_CANDS`, `ORDERING_CANDS`,
 `SKILL_INTENTS`, `HOOK_CANDS` at the top of each section; each carries
@@ -230,16 +272,23 @@ origin) and `quote_rx`.
    the `source_ref`; then the declared-but-unbroken list as one bulk
    question. A proposal with no origin line is not shown. Get a yes. With
    `--dry-run`, stop here.
-5. File: `create_rule` once per row with the row's `delivery` and engine
-   block, the row's `statement` (it carries the origin, so a reviewer
-   opening the rulebook later sees the reason without this report),
-   `scope_repos`, `source` (`claude_md_import` for declared rows, `authored`
-   for observed), `source_ref`, `supersedes_rule_id` where step 2 said so,
-   `agent_brain_id` when `--brain` was given. Read each reply: `unchanged`
-   (a retried identical import), `proposed` + `supersedes_rule_id`, or new.
-   Everything lands `proposed`, advise — never pass `activate` from this
-   skill. `create_skill` into the repo brain; block snippets stay in
-   `proposals.json` for a settings / plugin PR.
+5. File — every channel ends as something filed or grabbable, never only
+   described:
+   - **Rules**: `create_rule` once per row with the row's `delivery` and
+     engine block, the row's `statement` (statements are capped at 400
+     chars server-side), `scope_repos`, `source` (`claude_md_import` for
+     declared, `authored` for observed and asserted), `source_ref` (an
+     asserted standard's ref names the asserter's session), and
+     `supersedes_rule_id` where step 2 said so. Everything lands
+     `proposed`, advise — never pass `activate` from this skill.
+   - **CLAUDE.md**: open a PR adding `mine-out/grabs/claude-md-additions.md`'s
+     chosen sections to the repo's CLAUDE.md — a PR, never a direct edit.
+   - **Skills**: write the full SKILL.md for `PROPOSE this skill` rows and
+     for strong `worked_well` patterns, and `create_skill` it into the repo
+     brain — an adoption-gap verdict alone files nothing.
+   - **Hooks / Makefile**: offer `grabs/hooks.settings.json` and
+     `grabs/Makefile.suggested` as a repo PR (`.claude/settings.json`,
+     `Makefile`) or leave them for the user to paste.
 
 ## 6. Send the facets to the team, then report
 

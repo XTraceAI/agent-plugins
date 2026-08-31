@@ -84,6 +84,7 @@ CORRECTION = re.compile(r"^(no|nope|wrong|wait|stop)\b|\b(not what i|why did (u|
 PASTED = re.compile(r"^(Base directory for this skill|Approach this as|<command-message>|<task-notification>|This session is being continued)", re.I)
 ERROR = re.compile(r"Traceback \(most recent call last\)|^Exit code [1-9]|\bexit code [1-9]\b|ModuleNotFoundError|FAILED \(|\d+ failed\b|Permission denied|command not found|<tool_use_error>", re.M)
 REVERT = re.compile(r"git\s+(revert|reset|checkout\s+--|restore)\b|--force-with-lease|commit\s+--amend")
+STANDARD = re.compile(r"\b(always|never|don'?t|should (always|never)|we should|make sure|must)\b[^.?!]{0,80}\b(table|ttl|retention|cron|schedule|worker|queue|cost|meter|token|rate.?limit|llm|api call|migration|index|partition|timeout|budget|secret|auth|tenant|scope)\b", re.I)   # a human asserting an engineering standard — org-rule material regardless of frequency
 def digest(s):
     """Compact, LLM-readable summary of one session — user turns (corrections marked), errors, reverts. ~1-2k chars."""
     turns = [u.strip().replace("\n", " ") for u in s["users"] if u.strip() and not PASTED.search(u.strip()) and len(u) < 1500]   # skip skill preambles / pasted docs
@@ -91,10 +92,11 @@ def digest(s):
     errs = [t.replace("\n", " ")[:160] for t in s["results"] if ERROR.search(t)]
     rev = [c["cmd"].replace("\n", " ")[:120] for c in s["calls"] if c["cmd"] and REVERT.search(c["cmd"])]
     tools = collections.Counter(c["tool"] for c in s["calls"])
-    score = 3 * len(corr) + min(len(errs), 10) + 2 * len(rev)
+    stds = [t for t in turns if STANDARD.search(t[:300])]
+    score = 3 * len(corr) + min(len(errs), 10) + 2 * len(rev) + 2 * min(len(stds), 5)
     return {"session_id": s["id"], "host": s["host"], "repo": s["repo"], "start": s["start"], "score": score,
             "first_prompt": (turns[0] if turns else "")[:300],
-            "user_turns": [{"i": i, "correction": bool(CORRECTION.search(t[:200])), "text": t[:220]} for i, t in enumerate(turns[:25])],
+            "user_turns": [{"i": i, "correction": bool(CORRECTION.search(t[:200])), "standard": bool(STANDARD.search(t[:300])), "text": t[:220]} for i, t in enumerate(turns[:25])],
             "tool_counts": dict(tools), "errors": errs[:4], "reverts": rev[:4]}
 digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
 os.makedirs(os.path.join(args.out, "digests"), exist_ok=True)
@@ -131,6 +133,16 @@ def start_of_id(sid):
 class _StartOf(dict):
     def get(self, k, default=None): return start_of_id(k) or default
 start_of = _StartOf()
+stds = [(d, st) for d in facets for st in (d.get("standards") or []) if isinstance(st, dict) and str(st.get("statement", "")).strip()]
+if stds:
+    print(f"\n=== ENGINEERING STANDARDS ASSERTED — {len(stds)} from your facets. Org-rule material: the frequency bar does NOT apply here — one human assertion with blast radius is enough; shape each as an edit/anchor rule that fires at the violating change")
+    for d, st in stds[:10]:
+        q = f' — "{str(st.get("quote",""))[:90]}"' if st.get("quote") else ""
+        print(f"  [{str(d.get('session_id',''))[:8]} {st.get('scope','org')}] {str(st['statement'])[:140]}{q}")
+worked = [d for d in facets if str(d.get("worked_well", "")).strip()]
+if worked:
+    print(f"\n=== WHAT WORKED — {len(worked)} sessions carry a worked_well line (patterns to keep, and skill material)")
+    for d in worked[:8]: print(f"  [{str(d.get('session_id',''))[:8]}] {str(d['worked_well'])[:150]}")
 if facets:
     print(f"\n=== WHAT WENT WRONG — {len(facets)} sessions with facets ({sum(1 for d in facets if d.get('source') != 'insights')} from your facets.json, {sum(1 for d in facets if d.get('source') == 'insights')} from /insights). Cluster the details into candidate sentences; a cluster with no command shape becomes a session-start note")
     cat = collections.Counter(); 
@@ -325,6 +337,7 @@ def add(row):
     row["claude_md"] = {"heading": str(d.get("heading", "")), "text": str(d.get("text", "")).lstrip("# ").strip()[:140]} if d else None
     row["origin"] = "claude_md" if d else "sessions"
     row["verdict"] = verdict(row)
+    row.setdefault("audience", "machine" if row["title"] in ("timeout-not-on-macos", "rg-not-installed", "db-tool-not-available", "missing-module-fresh-venv") else ("repo" if row.get("scope_repos") else "org"))
     n = row["fired_n"]
     row["bucket"] = ("unmeasured" if row["trigger"] == "on_identifier" else "declared_unbroken" if row.get("claude_md") and n < 3
                      else "note" if row["verdict"].startswith("Turn on as a session-start note") else "skip" if row["verdict"].startswith("Skip") else "on")
@@ -338,7 +351,8 @@ def add(row):
     proposals.append(row); return row
 def show(row):
     n = row["fired_n"]; ev = row["evidence"]
-    print(f"\n  {row['title']}   [{TRIGGERS[row['trigger']][0]}]")
+    aud = f" · {row['audience']}" + ("-local" if row.get("audience") == "machine" else "-wide" if row.get("audience") == "org" else "") if row.get("audience") else ""
+    print(f"\n  {row['title']}   [{TRIGGERS[row['trigger']][0]}{aud}]")
     print(f"     Why: {row['why']}")
     if n:
         cost = f"of those sessions, {ev['corrected_in']} had you correcting Claude and {ev['reverted_in']} had a revert (any topic)"
@@ -470,7 +484,7 @@ for k, (head, deliv, meaning) in TRIGGERS.items():
     print(f"\n--- {head}  ({deliv}: {meaning})")
     if k == "session_start":
         print("  Also here: the friction clusters from WHAT WENT WRONG that have no command shape (reasoning from a README, claiming 'done' without a live run, guessing which repo was meant) — you write those by hand, with the session count and the user's words as the reason.")
-    for r in group:
+    for r in sorted(group, key=lambda r: {"org": 0, "repo": 1, "machine": 2}.get(r.get("audience"), 1)):
         if r["bucket"] == "declared_unbroken": continue   # shown in their own section below
         show(r)
     if not group: print("  (none from the replay)")
@@ -541,6 +555,49 @@ for c in HOOK_CANDS:
                if ere else {"note": f"no PreToolUse snippet: the pattern {c['trigger_rx']!r} uses constructs POSIX ERE cannot express; file it as a rulebook rule instead"})
     if ere and "\\b" in ere: snippet["requires"] = "GNU or BSD grep (-E with \\b word boundaries) — the developer machine's grep, not busybox"
     proposals.append({"lane": "hook", "title": c["title"], "predicate": {"trigger_rx": c["trigger_rx"], "outcome_rx": c.get("outcome_rx") or c.get("user_rx"), "repair_rx": c.get("repair_rx")}, "sessions": {"trigger": T, "bad_outcome": B}, "sessions_total": M, "rate": rate, "samples": ex, "source_ref": f"sessions@{today}#{c['title']}|trigger {T}/{M}|bad-outcome {B}", "action": "advise: rulebook rule; block: PreToolUse hook (settings snippet) or plugin PR", "settings_snippet": snippet})
+
+# ---------------------------------------------------------------- repeated workflows: Makefile / setup-skill material
+WORKFLOW_CANDS = [   # curated and counted — raw n-gram mining only surfaces ad-hoc analysis commands
+ {"name": "worktree-setup", "rx": r"git\s+worktree\s+add", "make": "worktree: ## fresh worktree off the base branch\n\tgit fetch origin && git worktree add -b $(BRANCH) ../$(NAME) origin/$(BASE)"},
+ {"name": "venv-bootstrap", "rx": r"(uv\s+)?pip3?\s+install\s+-e|uv\s+sync\b", "make": "venv: ## project venv with dev extras\n\tuv pip install -e '.[dev,all]'"},
+ {"name": "test-baseline", "rx": r"(uv\s+run\s+)?pytest\b", "make": "test: ## full suite, exit code intact — never piped\n\tuv run pytest tests/"},
+ {"name": "pr-open", "rx": r"gh\s+pr\s+create\b", "make": "pr: ## open a PR against the base branch\n\tgh pr create --base $(BASE) --fill"},
+ {"name": "pr-watch", "rx": r"gh\s+pr\s+(checks|view)\b", "make": "checks: ## watch PR checks\n\tgh pr checks --watch"},
+ {"name": "heredoc-analysis", "rx": r"python3?\s+-\s*<<", "min_per_session": 3, "make": None,
+  "note": "3+ inline python heredocs in one session — repeated analysis belongs in a checked-in script, not retyped"},
+]
+print(f"\n=== REPEATED WORKFLOWS — shell chains your sessions retype (Makefile / setup-skill material)")
+wf_rows = []
+for c in WORKFLOW_CANDS:
+    k = 0
+    for s_ in corpus:
+        hits = sum(1 for cl in s_["calls"] if cl["cmd"] and re.search(c["rx"], rh.shell_only(cl["cmd"])))
+        if hits >= c.get("min_per_session", 1): k += 1
+    wf_rows.append({"lane": "workflow", "title": c["name"], "predicate": c["rx"], "sessions": {"used": k}, "sessions_total": M,
+                    "make_target": c.get("make"), "note": c.get("note"), "source_ref": f"sessions@{today}#{c['name']}|used {k}/{M}"})
+    print(f"  {c['name']:18s} in {k}/{M} sessions" + (f"  ({c['note'][:90]})" if c.get("note") else ""))
+proposals += wf_rows
+
+# ---------------------------------------------------------------- grabs/: everything a user can copy, generated — not described
+grabs_dir = os.path.join(args.out, "grabs"); os.makedirs(grabs_dir, exist_ok=True)
+md = ["# CLAUDE.md additions proposed from your sessions", "",
+      "Copy the sections you want (or let the skill open the PR). These complement the filed rules:",
+      "a rule fires at the moment; this is the human-readable half.", ""]
+for r in rows:
+    if r.get("bucket") not in ("on", "note") or r.get("origin") == "claude_md": continue   # already in CLAUDE.md
+    md += [f"## {r['title']}", "", str(r.get("what", "")).rstrip(".") + ".", "",
+           f"_Evidence: {str(r.get('why', '')).replace('not in CLAUDE.md. ', '')}_", ""]
+open(os.path.join(grabs_dir, "claude-md-additions.md"), "w").write("\n".join(md))
+hooks_all = {"hooks": {"PreToolUse": []}}
+for pr_ in proposals:
+    sn = pr_.get("settings_snippet")
+    if isinstance(sn, dict) and sn.get("hooks"): hooks_all["hooks"]["PreToolUse"] += sn["hooks"]["PreToolUse"]
+json.dump(hooks_all, open(os.path.join(grabs_dir, "hooks.settings.json"), "w"), indent=1)
+mk = ["# Makefile targets proposed from your sessions (session counts in the report)", "BASE ?= staging", ""]
+for w in wf_rows:
+    if w.get("make_target") and w["sessions"]["used"] >= 5: mk += [w["make_target"], ""]
+open(os.path.join(grabs_dir, "Makefile.suggested"), "w").write("\n".join(mk))
+print(f"\ngrabs written to {grabs_dir}/: claude-md-additions.md, hooks.settings.json, Makefile.suggested — copyable now, filable in the report step")
 
 json.dump([{k: v for k, v in s.items() if k != "results"} for s in corpus], open(os.path.join(args.out, "corpus.json"), "w"))
 json.dump(proposals + proposals_seed, open(os.path.join(args.out, "proposals.json"), "w"), indent=1)
