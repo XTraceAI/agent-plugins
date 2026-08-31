@@ -117,7 +117,9 @@ lanes first (table above), and write a `create_rule` body into a JSON list:
   a changed one is filed with `supersedes_rule_id` (step 5) — so a re-run
   replaces, never twins. Keep the path stable (no absolute paths).
 - Title = the heading or a short noun phrase (under 60 chars); one rule per
-  title. Statement is composed by the script ("<what>. Why: <origin>").
+  title. Statement is composed by the script ("<what>. Why: <origin>") and
+  kept under the server's 400-character cap — a longer statement is refused
+  by `create_rule`, not truncated, so tighten `what` rather than pad it.
 - Apply the matcher rules from `/memhub:create-rule` step 3: match the
   pre-heredoc segment, shape-specific patterns, exemptions in
   `command_not_rx` up front (`python -c`, `grep`), `warn_once_per:
