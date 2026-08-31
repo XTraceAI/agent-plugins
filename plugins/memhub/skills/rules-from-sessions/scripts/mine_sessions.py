@@ -433,6 +433,18 @@ declared_unbroken = [r for r in rows if r["bucket"] == "declared_unbroken"]
 if declared_unbroken: print(f"  Declared in CLAUDE.md but not (or barely) broken here: {len(declared_unbroken)} — listed at the end; file them only if you want CLAUDE.md fully in the book.")
 NOTE_CAP = 5
 if len(notes) > NOTE_CAP: print(f"  !! {len(notes)} session-start notes is more than the cap of {NOTE_CAP}. A note is what CLAUDE.md already is — give the rest a command, error, or identifier shape, or drop them.")
+# coverage: of the friction the facets recorded, how much sits in a session at least one proposed rule would have fired in — and what is left over (the next candidates)
+own = [d for d in facets if d.get("source") != "insights" and d.get("friction")]
+if own:
+    touched = {sid for r in on + notes for sid in r.get("fired_ids", [])}
+    items = [(d, fr) for d in own for fr in d["friction"] if isinstance(fr, dict) and fr.get("category") in FRICTION_VOCAB]
+    cov = [(d, fr) for d, fr in items if any(k in touched for k in (d.get("session_id"), *[t for t in touched if str(t).startswith(str(d.get("session_id"))[:12])]))]
+    left = [(d, fr) for d, fr in items if (d, fr) not in cov]
+    print(f"  Coverage: {len(cov)} of {len(items)} friction items in your facets sit in a session where one of these rules would have fired; {len(left)} do not.")
+    if left:
+        lc = collections.Counter(fr["category"] for _, fr in left)
+        print(f"  Not covered, by kind: {', '.join(f'{k} ×{v}' for k, v in lc.most_common(5))} — the next candidates (give each a command / error / identifier shape, or accept it as a one-off):")
+        for d, fr in left[:6]: print(f"     [{str(d.get('session_id',''))[:8]}] {fr.get('detail','')[:150]}")
 
 print(f"\n=== PROPOSED RULES — each with why it exists, what it cost you, and what changes with it on")
 for k, (head, deliv, meaning) in TRIGGERS.items():
