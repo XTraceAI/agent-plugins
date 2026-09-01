@@ -99,7 +99,9 @@ def main() -> int:
             r["version"] = 1
         seed_book(td, "xmem", rules["rules"])
         seed_book(td, "otherrepo", rules["rules"])
-        env = {"MEMHUB_RULEBOOK_BASE": td}
+        # FETCH=0: the session lane otherwise spawns a DETACHED network fetch
+        # that races the test and overwrites the seeded book with an empty one.
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
 
         # --- fail-open properties -----------------------------------------
         rc, out = run("pre", {"cwd": "/", "tool_name": "Bash",
@@ -460,6 +462,100 @@ def main() -> int:
 
     check("WIRE_KEYS carries source_message_id (server links the fire to its message)",
           "source_message_id" in rb.WIRE_KEYS)
+    check("WIRE_KEYS carries override_reason (a gate override is a fact about the fire)",
+          "override_reason" in rb.WIRE_KEYS)
+
+    # --- delivery: the user sees a fire; a gate blocks (§5.3) ------------------
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "gaterepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "gaterepo", [
+            {"id": "adv", "on": "bash", "rx": r"advisory-cmd", "fire_scope": "session",
+             "repo_scope": "any", "text": "Advisory text", "why": "w", "version": 1},
+            {"id": "no-force-push", "on": "bash", "rx": r"git\s+push\s+--force", "mode": "gate",
+             "fire_scope": "session", "repo_scope": "any", "text": "Never force-push", "why": "w",
+             "version": 1},
+            {"id": "result-gate", "on": "result", "rx": r"BOOM", "mode": "gate",
+             "fire_scope": "session", "repo_scope": "any", "text": "Result rule", "why": "w",
+             "version": 1},
+        ])
+        genv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        base = {"cwd": repo, "session_id": "g1", "tool_name": "Bash"}
+
+        def outj(out):
+            return json.loads(out) if out.strip() else {}
+
+        rc, out = run("pre", dict(base, tool_input={"command": "advisory-cmd"}), genv)
+        j = outj(out)
+        check("advisory: user sees an XTrace line naming the rule (systemMessage)",
+              j.get("systemMessage", "").startswith("XTrace") and "[adv]" in j.get("systemMessage", "")
+              and "Advisory text" in j["systemMessage"], out)
+        check("advisory: agent context header is branded, no ruler",
+              "XTrace Rulebook" in ctx(out) and "📏" not in ctx(out), ctx(out))
+        check("advisory: never blocks", "permissionDecision" not in j["hookSpecificOutput"])
+
+        push = dict(base, tool_input={"command": "git push --force origin main"})
+        rc, out = run("pre", push, genv)
+        j = outj(out)
+        hso = j.get("hookSpecificOutput", {})
+        check("gate: pre Bash call is DENIED", rc == 0 and hso.get("permissionDecision") == "deny", out)
+        check("gate: deny reason carries the statement and the override line",
+              "Never force-push" in hso.get("permissionDecisionReason", "")
+              and "RULEBOOK_OVERRIDE=" in hso.get("permissionDecisionReason", ""), out)
+        check("gate: user line says blocked, branded",
+              j.get("systemMessage", "").startswith("XTrace") and "blocked" in j["systemMessage"]
+              and "[no-force-push]" in j["systemMessage"], out)
+        rc, out = run("pre", push, genv)
+        check("gate: the SAME call is gated again — gates are never deduped",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "RULEBOOK_OVERRIDE='hotfix, approved by lead' git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: the prefixed call is ALLOWED",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+        check("override: user line records the override reason",
+              "overridden" in j.get("systemMessage", "") and "approved by lead" in j["systemMessage"], out)
+
+        rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
+        check("override: the variable name inside an argument is not an override, and matches no gate",
+              out.strip() == "", out)
+
+        rc, out = run("post", dict(base, tool_input={"command": "git push --force origin main"},
+                                   tool_response={"stdout": "BOOM", "exit_code": 1}), genv)
+        j = outj(out)
+        check("gate: a result (post) rule marked gate can only advise — nothing to block after the fact",
+              "[result-gate]" in ctx(out) and "permissionDecision" not in j["hookSpecificOutput"], out)
+
+        with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
+        check("ledger: blocked and overridden calls are all mode=gate fires",
+              len(gate_rows) == 3 and all(r["mode"] == "gate" for r in gate_rows), str(gate_rows))
+        check("ledger: override_reason on the overridden fire only",
+              [r.get("override_reason") for r in gate_rows] == [None, None, "hotfix, approved by lead"],
+              str([r.get("override_reason") for r in gate_rows]))
+        check("ledger: advisory fire stays mode=advise",
+              [r["mode"] for r in rows if r["rule_id"] == "adv"] == ["advise"])
+        check("ledger: override_reason crosses the wire",
+              rb.wire_row(gate_rows[2]).get("override_reason") == "hotfix, approved by lead")
+
+        # a stale book (>24 h) degrades the gate to advise and says so once
+        import datetime as _dt
+        bdir = os.path.join(td, "book")
+        bp = os.path.join(bdir, [n for n in os.listdir(bdir) if n.startswith("gaterepo-")][0])
+        with open(bp, encoding="utf-8") as f:
+            book = json.load(f)
+        book["fetched_at"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=25)).isoformat()
+        with open(bp, "w", encoding="utf-8") as f:
+            json.dump(book, f)
+        rc, out = run("pre", dict(push, session_id="g-stale"), genv)
+        j = outj(out)
+        check("gate: a book older than 24 h runs the gate as advise (no deny) and says so",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "refreshed >24 h ago" in ctx(out), out)
 
     print()
     if FAILURES:

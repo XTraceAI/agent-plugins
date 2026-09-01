@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rulebook hook — three delivery lanes for team engineering rules. ADVISE-ONLY.
+"""Rulebook hook — three delivery lanes for team engineering rules.
 
 Lanes (the mode argument):
   session  SessionStart: posture rules (on="session") in full, everything else
@@ -19,8 +19,21 @@ Lanes (the mode argument):
 
 Book = the server book, fetched once per session and cached with its ETag.
 Offline → the cached book; no cache → no rules. There is no local rule file:
-rules are authored through the memhub `create_rule` tool. A `mode: gate` rule is honoured only from a book fetched within 24 h —
-older caches run it as `advise` (spec §5.3).
+rules are authored through the memhub `create_rule` tool.
+
+How a fire reaches people (spec §5.3):
+  * The agent gets `additionalContext` — the rule text under an XTrace Rulebook
+    header — and the USER gets a `systemMessage` line per rule (`XTrace ▸ …`),
+    the one hook field the terminal renders. Without it a fire is invisible to
+    the person the rule was written for.
+  * `mode: gate` rules BLOCK: a pre-hook Bash call matching a gate rule is
+    denied (`permissionDecision: deny`) with the statement and the override
+    line. `RULEBOOK_OVERRIDE='<why>' <command>` allows exactly that call and
+    records the fire with `override_reason`; the next matching call is gated
+    again. Gates are never deduped and never cut by the advisory cap. Only a
+    Bash rule can gate (an edit already happened; a result rule runs after the
+    fact), and only from a book fetched within 24 h — older caches run it as
+    `advise` and say so once per session.
 
 What leaves the machine, exactly:
   * fetch  — the repo directory name, nothing else.
@@ -662,7 +675,7 @@ def spawn_fetch(repo):
 WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "repo",
              "branch", "tool", "hook_phase", "mode", "dedup_key",
              "raw_matches_before_fire", "fired_at", "converted", "converted_at",
-             "source_message_id")
+             "source_message_id", "override_reason")
 
 
 def wire_row(row):
@@ -988,9 +1001,28 @@ def result_text(resp):
     return str(resp)
 
 
-def emit(event_name, text):
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": event_name, "additionalContext": text}}))
+BRAND = "XTrace"
+# `RULEBOOK_OVERRIDE='<why>' <command>` — a shell env-assignment prefix, so the
+# command still runs as typed; the hook only reads the reason and strips it
+# before matching. Anchored at the start: a grep whose ARGUMENT mentions the
+# variable is not an override.
+_OVERRIDE_RX = re.compile(r"^\s*RULEBOOK_OVERRIDE=(?:'([^']*)'|\"([^\"]*)\"|(\S*))\s+")
+
+
+def emit(event_name, text, *, user_line=None, deny=None):
+    """One JSON document on stdout. `text` reaches the agent (additionalContext);
+    `user_line` reaches the USER (systemMessage — the one field the terminal
+    shows); `deny` blocks the call (PreToolUse permissionDecision) with that
+    reason. Callers pass all three at once for a gate, the first two for an
+    advisory."""
+    hso = {"hookEventName": event_name, "additionalContext": text}
+    if deny:
+        hso["permissionDecision"] = "deny"
+        hso["permissionDecisionReason"] = deny
+    out = {"hookSpecificOutput": hso}
+    if user_line:
+        out["systemMessage"] = user_line
+    print(json.dumps(out))
 
 
 def _ledger_dir():
@@ -1068,10 +1100,12 @@ def agent_id_of(data):
     return None
 
 
-def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None):
+def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None,
+              override_reason=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
-    org opt-in. Returns {rule_id: fire_id} so conversions can point back."""
+    org opt-in. `override_reason` is set on a `mode='gate'` fire the caller
+    overrode (§5.3). Returns {rule_id: fire_id} so conversions can point back."""
     ids = {}
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
@@ -1090,6 +1124,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
                     "fired_at": _now(),
                     "converted": None, "converted_at": None,
+                    "override_reason": override_reason,
                     "excerpt": excerpt[:160],
                 }) + "\n")
     except Exception:
@@ -1126,7 +1161,7 @@ def session_digest(rules, repo, gitdir, ctx):
         else:
             cut.append(r)
     active = [r for r in in_scope if r.get("on") != "session"]
-    lines = ["## 📏 Rulebook (team rules — advisory)"]
+    lines = [f"## {BRAND} Rulebook (team rules — advisory)"]
     for r in posture:
         lines.append(f"- {r['text']}{_why(r)}")
     if active:
@@ -1193,6 +1228,12 @@ def main():
     fired_now = []
 
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
+    override_reason = None            # §5.3: set only by the RULEBOOK_OVERRIDE prefix
+    if cmd:
+        m = _OVERRIDE_RX.match(cmd)
+        if m:
+            override_reason = (m.group(1) or m.group(2) or m.group(3) or "").strip()[:2000]
+            cmd = cmd[m.end():]       # rules match the command, not the prefix
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
@@ -1263,6 +1304,9 @@ def main():
             continue
 
         scope = r.get("fire_scope", "session")
+        if mode == "pre" and tool == "Bash" and r.get("on") == "bash" \
+                and effective_mode(r, fetched_at) == "gate":
+            scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
         key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
         if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
             if evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
@@ -1289,11 +1333,41 @@ def main():
         save_state(sp, st)
         return 0
 
-    shown, cut = fired_now[:MAX_ADVISE], fired_now[MAX_ADVISE:]
-    lines = ["## 📏 Rulebook (team rules — advisory, not blocking)"]
+    # §5.3: which of this call's fires are GATES. Only a pre-hook Bash call can
+    # be blocked, and only by a rule the fresh book says is a gate.
+    gate_ids = {r["id"] for r in fired_now
+                if mode == "pre" and tool == "Bash" and r.get("on") in ("bash", "ordering")
+                and effective_mode(r, fetched_at) == "gate"}
+    gates = [r for r in fired_now if r["id"] in gate_ids]
+    advisories = [r for r in fired_now if r["id"] not in gate_ids]
+    # the advisory cap never cuts a gate — a silently un-gated push is the one
+    # failure a gate exists to prevent
+    shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]
+    blocked = bool(gates) and override_reason is None
+    lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
+             else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
+    user_lines, deny_lines = [], []
     for r in shown:
+        label = r.get("_label") or r["id"]
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
-        lines.append(f"- **[{r.get('_label') or r['id']}]** {r['text']}{detail}{_why(r)}")
+        if r["id"] not in gate_ids:
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)}")
+            user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}")
+        elif override_reason is not None:
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)} "
+                         f"_(gate overridden: {override_reason})_")
+            user_lines.append(f"{BRAND} ⚠ gate overridden — [{label}] {override_reason}")
+        else:
+            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_why(r)}")
+            user_lines.append(f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}")
+            deny_lines.append(f"[{label}] {r['text']}{detail}")
+    deny = None
+    if blocked:
+        deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
+                + "\nIf this is a legitimate exception, re-run the same command prefixed "
+                  "RULEBOOK_OVERRIDE='<why>' — that allows exactly that call and records why.")
+        lines.append("_This call was blocked. If it is a legitimate exception, re-run the "
+                     "same command prefixed `RULEBOOK_OVERRIDE='<why>'`._")
     # §5.3: a gate from a stale book runs as advise and says so once per session.
     degraded = [r["id"] for r in shown if r.get("mode") == "gate"
                 and effective_mode(r, fetched_at) == "advise"]
@@ -1302,14 +1376,20 @@ def main():
         lines.append("- _(team rulebook last refreshed >24 h ago — gate rules "
                      "run as advisories until the next successful fetch)_")
     try:
-        emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines))
+        emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines),
+             user_line="\n".join(user_lines), deny=deny)
     except Exception:
         pass
     raw = {r["id"]: st["raw"].get(r["id"]) for r in fired_now}
-    ids = log_fires(ctx, shown, hook_phase=mode, mode="advise", excerpt=cmd or fp or "",
-                    raw_counts=raw, dedup_keys=dedup_keys)
+    excerpt = cmd or fp or ""
+    ids = log_fires(ctx, [r for r in shown if r["id"] not in gate_ids], hook_phase=mode,
+                    mode="advise", excerpt=excerpt, raw_counts=raw, dedup_keys=dedup_keys)
+    if gates:      # a blocked call and an overridden one are both delivered gate fires
+        ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=excerpt,
+                             raw_counts=raw, dedup_keys=dedup_keys,
+                             override_reason=override_reason))
     if cut:   # the per-call cap has a cost; make it visible, never silent
-        log_fires(ctx, cut, hook_phase=mode, mode="suppressed", excerpt=cmd or fp or "",
+        log_fires(ctx, cut, hook_phase=mode, mode="suppressed", excerpt=excerpt,
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
