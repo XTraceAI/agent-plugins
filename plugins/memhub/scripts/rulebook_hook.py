@@ -1005,7 +1005,10 @@ BRAND = "XTrace"
 # `RULEBOOK_OVERRIDE='<why>' <command>` — a shell env-assignment prefix, so the
 # command still runs as typed; the hook only reads the reason and strips it
 # before matching. Anchored at the start: a grep whose ARGUMENT mentions the
-# variable is not an override.
+# variable is not an override. An EMPTY reason is not an override either
+# (`RULEBOOK_OVERRIDE= git push --force` stays gated): the reason is the
+# whole price of passing a gate, and it crosses the wire, so it is run
+# through `redact_secrets` like everything else that leaves the machine.
 _OVERRIDE_RX = re.compile(r"^\s*RULEBOOK_OVERRIDE=(?:'([^']*)'|\"([^\"]*)\"|(\S*))\s+")
 
 
@@ -1231,8 +1234,9 @@ def main():
     override_reason = None            # §5.3: set only by the RULEBOOK_OVERRIDE prefix
     if cmd:
         m = _OVERRIDE_RX.match(cmd)
-        if m:
-            override_reason = (m.group(1) or m.group(2) or m.group(3) or "").strip()[:2000]
+        reason = (m.group(1) or m.group(2) or m.group(3) or "").strip() if m else ""
+        if reason:                    # an empty reason is no override — the gate stands
+            override_reason = redact_secrets(reason)[:2000]
             cmd = cmd[m.end():]       # rules match the command, not the prefix
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
