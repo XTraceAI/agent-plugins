@@ -407,6 +407,30 @@ for script in ("flush_turn.py", "flush_session.py", "import_session.py",
     check(f"{script} applies elide_oversized_tool_results before sending",
           "elide_oversized_tool_results(" in body.split("import", 1)[1]
           and body.count("elide_oversized_tool_results") >= 2)
+    # Order is load-bearing: the secret scan must run over what elision
+    # KEPT (the 64 KB head of a trimmed paste included), so redaction is
+    # applied to the elided output, never the other way around. These
+    # scripts are straight-line at the call sites, so source order is
+    # execution order.
+    e = body.rindex("elide_oversized_tool_results(")
+    # Two accepted shapes, both meaning "redaction sees the elided output":
+    # nested — redact_records( opens before the elide call with no paren
+    # closing between them, so elide is its argument; or sequential — a
+    # redact_records( call follows the elide line.
+    wrap = body.rfind("redact_records(", 0, e)
+    nested = wrap != -1 and ")" not in body[wrap + len("redact_records("):e]
+    sequential = body.find("redact_records(", e) != -1
+    check(f"{script} redacts AFTER eliding", nested or sequential)
+
+# And the kept head of a hard-trimmed block is real input to that scan: a
+# credential inside the head survives elision, then redaction scrubs it.
+from redact import contains_secret, redact_records
+leaky = user("mhk_" + "a" * 24 + HUGE, content_blocks=True)
+elided = elide_oversized_tool_results([leaky])
+check("the secret survives into the kept head (elision does not redact)",
+      contains_secret(elided))
+check("redaction scrubs the kept head of a hard-trimmed block",
+      not contains_secret(redact_records(elided)))
 
 print(f"{'FAIL' if FAILURES else 'PASS'}: transcript_filter")
 for f in FAILURES:
