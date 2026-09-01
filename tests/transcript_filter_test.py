@@ -245,7 +245,7 @@ huge = tool_result_record(BIG, is_error=True)
 out = elide_oversized_tool_results([huge], max_bytes=CAP)
 blk = out[0]["message"]["content"][0]
 check("an oversized string result is elided", size(out[0]) <= CAP)
-check("the note says it was elided", blk["content"].startswith("[memhub: tool result elided"))
+check("the note says it was elided", blk["content"].startswith("[memhub: elided"))
 check("the note names the byte count", f"{size(BIG):,} bytes" in blk["content"])
 check("the note names the tool_use_id", "toolu_01XZcpo566U8g1r8mGbFHXzL" in blk["content"])
 check("is_error survives elision", blk.get("is_error") is True)
@@ -339,6 +339,44 @@ check("non-dict records pass through", out == ["not a dict", None, 3])
 check("an empty list is fine", elide_oversized_tool_results([]) == [])
 check("the default ceiling is the documented one",
       MAX_TOOL_RESULT_BYTES == 200_000)
+
+# --- the unsendable tier ----------------------------------------------------
+# Above HARD_MAX_RECORD_BYTES the record can never be sent, so prose IS
+# trimmed there — refusing would lose the record and the session tail alike.
+from transcript_filter import HARD_MAX_RECORD_BYTES
+
+HUGE = "y" * (HARD_MAX_RECORD_BYTES + 500_000)
+paste = user(HUGE, content_blocks=True)
+out = elide_oversized_tool_results([paste])
+blk = out[0]["message"]["content"][0]
+check("an unsendable text block is trimmed under the hard ceiling",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES)
+check("the trimmed text keeps its head and says what happened",
+      blk["text"].startswith("yyy") and "[memhub: elided" in blk["text"])
+check("the unsendable-paste input is not mutated",
+      len(paste["message"]["content"][0]["text"]) == len(HUGE))
+
+bare = user(HUGE)
+out = elide_oversized_tool_results([bare])
+check("an unsendable bare-string message is trimmed too",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES
+      and out[0]["message"]["content"].startswith("yyy")
+      and "[memhub: elided" in out[0]["message"]["content"])
+
+call = {"type": "assistant", "uuid": "a9",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_w", "name": "Write",
+             "input": {"file_path": "/tmp/x", "content": HUGE}}]}}
+out = elide_oversized_tool_results([call])
+blk = out[0]["message"]["content"][0]
+check("an unsendable tool_use keeps its name with the input summarized",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES and blk["name"] == "Write"
+      and "elided" in blk["input"])
+
+# Between the soft and hard ceilings prose still ships whole.
+mid = user("z" * 400_000, content_blocks=True)
+out = elide_oversized_tool_results([mid])
+check("prose between the ceilings is untouched", out[0] is mid)
 
 # Applied on EVERY upload path, or a session is capturable on one and stuck
 # on another. Source-level, the same way registration_test checks breadcrumbs.

@@ -119,15 +119,31 @@ MAX_TOOL_RESULT_BYTES = 200_000
 # only — a record under the ceiling is shipped byte-for-byte as before.
 _TOOL_RESULT_MIRRORS = ("mcpMeta", "toolUseResult")
 
+# The ceiling above which a record is UNSENDABLE, not merely big: one record
+# over the upload slice (3.5 MB, itself under the server's 4 MiB request
+# limit) rides alone in a request the server always rejects, and because the
+# cursor never advances past a failed send, it pins capture for the rest of
+# the session. Below this line the module refuses to touch prose — a big
+# record that CAN ship, ships whole. Above it that refusal protects nothing:
+# the record cannot be sent, so leaving it intact loses it AND every record
+# after it. Kept just under the slice so a trimmed record still fits one.
+HARD_MAX_RECORD_BYTES = 3_400_000
+
+# What survives of an oversized text when the record is unsendable: enough to
+# read what the turn was about, not the pasted payload that made it huge.
+_HARD_TRIM_KEEP_CHARS = 64_000
+
 
 def _size(value) -> int:
     return len(json.dumps(value, separators=(",", ":"), default=str))
 
 
-def _elision_note(nbytes: int, tool_use_id) -> str:
-    return (f"[memhub: tool result elided — {nbytes:,} bytes exceeded the "
-            f"{MAX_TOOL_RESULT_BYTES:,}-byte capture limit; "
-            f"tool_use_id={tool_use_id or '?'}]")
+def _elision_note(nbytes: int, tool_use_id=None) -> str:
+    """One line saying what was cut and how big it was — truthful for any
+    block type, so a trimmed text block is not labeled a tool result."""
+    ref = f"; tool_use_id={tool_use_id}" if tool_use_id else ""
+    return (f"[memhub: elided — {nbytes:,} bytes exceeded the "
+            f"{MAX_TOOL_RESULT_BYTES:,}-byte capture limit{ref}]")
 
 
 def elide_oversized_tool_results(
@@ -173,6 +189,13 @@ def _elide_record(record, max_bytes: int):
     out = {k: v for k, v in record.items() if k not in _TOOL_RESULT_MIRRORS}
     content = message.get("content")
     if not isinstance(content, list):
+        if isinstance(content, str) and _size(out) > HARD_MAX_RECORD_BYTES:
+            # Unsendable prose: keep the head, say what happened. Below the
+            # hard ceiling a bare-string message is never touched.
+            out["message"] = {**message, "content":
+                              content[:_HARD_TRIM_KEEP_CHARS] + "\n"
+                              + _elision_note(_size(content), None)}
+            return out
         # A bare-string message carries no tool result; only the mirrors
         # (if any) came off.
         return out if len(out) != len(record) else record
@@ -209,6 +232,43 @@ def _elide_record(record, max_bytes: int):
             break
         total -= saved
         blocks[i] = note
+    if total > HARD_MAX_RECORD_BYTES:
+        # Still unsendable: the bulk is outside the tool results — pasted
+        # prose, a giant tool_use input. From here every byte kept costs the
+        # whole rest of the session, so trim ANY block, largest first, until
+        # one upload slice can carry the record.
+        for i in sorted(range(len(blocks)), key=lambda i: _size(blocks[i]),
+                        reverse=True):
+            if total <= HARD_MAX_RECORD_BYTES:
+                break
+            trimmed = _hard_trim_block(blocks[i])
+            total += _size(trimmed) - _size(blocks[i])
+            blocks[i] = trimmed
     if blocks == content and len(out) == len(record):
         return record  # nothing elided and no mirror to drop: untouched
     return out
+
+
+def _hard_trim_block(block):
+    """``block`` reduced enough to ship, whatever type it is.
+
+    Only reached for a record over ``HARD_MAX_RECORD_BYTES`` — the tier where
+    the alternative to trimming is losing the record and the session tail
+    behind it. Text keeps its head; a tool result becomes the standard note;
+    a tool call keeps its name with its input summarized; anything else is
+    replaced by a note naming its size.
+    """
+    if isinstance(block, dict):
+        if isinstance(block.get("text"), str):
+            if len(block["text"]) <= _HARD_TRIM_KEEP_CHARS:
+                return block
+            return {**block, "text":
+                    block["text"][:_HARD_TRIM_KEEP_CHARS] + "\n"
+                    + _elision_note(_size(block["text"]), None)}
+        if block.get("type") == "tool_result":
+            return {**block, "content": _elision_note(
+                _size(block.get("content")), block.get("tool_use_id"))}
+        if "input" in block:
+            return {**block, "input": {"elided": _elision_note(
+                _size(block.get("input")), block.get("id"))}}
+    return {"type": "text", "text": _elision_note(_size(block), None)}
