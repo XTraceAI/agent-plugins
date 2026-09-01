@@ -301,6 +301,17 @@ check("one byte under the boundary elides the next-largest result",
       [b["tool_use_id"] for b in under["message"]["content"]
        if b["content"].startswith("[memhub")] == ["toolu_6k", "toolu_5k"])
 
+# A bare-string message with a giant mirror beside it: the mirror still
+# comes off, and the text is untouched.
+strmsg = {"type": "user", "uuid": "u10",
+          "message": {"role": "user", "content": "plain text"},
+          "mcpMeta": {"raw": BIG}}
+out = elide_oversized_tool_results([strmsg], max_bytes=CAP)
+check("a string-content message loses its oversized mirror",
+      "mcpMeta" not in out[0] and out[0]["message"]["content"] == "plain text"
+      and size(out[0]) <= CAP)
+check("the string-content input is not mutated", "mcpMeta" in strmsg)
+
 # Under the ceiling nothing is touched — not even the mirrors.
 small = tool_result_record("fine", mcp_meta={"result": "fine"}, tool_use_result="fine")
 out = elide_oversized_tool_results([small], max_bytes=CAP)

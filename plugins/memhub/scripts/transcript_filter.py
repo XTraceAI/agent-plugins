@@ -167,11 +167,16 @@ def _elide_record(record, max_bytes: int):
     message = record.get("message")
     if not isinstance(message, dict):
         return record  # oversized, but not a message — nothing to elide
+    # Mirrors go first, whatever shape the message content takes: they are
+    # where the 5 MB lived, and a bare-string message with a giant mirror
+    # beside it must not slip past the block handling below untouched.
+    out = {k: v for k, v in record.items() if k not in _TOOL_RESULT_MIRRORS}
     content = message.get("content")
     if not isinstance(content, list):
-        return record  # a bare-string message carries no tool result
+        # A bare-string message carries no tool result; only the mirrors
+        # (if any) came off.
+        return out if len(out) != len(record) else record
     blocks = list(content)
-    out = {k: v for k, v in record.items() if k not in _TOOL_RESULT_MIRRORS}
     out["message"] = {**message, "content": blocks}
     # Largest tool result first, until the record fits — not just the blocks
     # that are over the ceiling on their own. A parallel-tool turn lands as ONE
