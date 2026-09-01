@@ -62,6 +62,7 @@ from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from redact import redact_records  # noqa: E402
+from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
@@ -901,7 +902,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
              f"held; if this repeats every flush, the store schema has moved "
              f"and readers/cursor.py needs updating")
         shipped = None
-    sendable = redact_records(records)
+    sendable = redact_records(elide_oversized_tool_results(records))
     if not sendable:
         if records:
             _log(f"all {len(records)} record(s) redacted away — nothing to "

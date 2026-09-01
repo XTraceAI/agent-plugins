@@ -19,7 +19,10 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from transcript_filter import (  # noqa: E402
+    MAX_TOOL_RESULT_BYTES,
+    _elision_note,
     drop_command_wrappers,
+    elide_oversized_tool_results,
     is_command_wrapper,
     record_text,
 )
@@ -181,6 +184,253 @@ if real:
 else:
     print("real transcripts: none found, skipped")
 
+
+
+# --- oversized tool results -------------------------------------------------
+#
+# Shape taken VERBATIM from the record that stalled session 20869cb5 on
+# 2026-08-31: the model saw a 1.4 KB "exceeds maximum allowed tokens" error,
+# while ``mcpMeta`` carried the full 5.26 MB MCP reply. Scaled down here.
+import copy
+import json
+
+
+def tool_result_record(content, *, mcp_meta=None, tool_use_result=None,
+                       is_error=False) -> dict:
+    rec = {
+        "parentUuid": "a1", "isSidechain": False, "type": "user",
+        "message": {"role": "user", "content": [{
+            "tool_use_id": "toolu_01XZcpo566U8g1r8mGbFHXzL",
+            "type": "tool_result", "content": content,
+            **({"is_error": True} if is_error else {}),
+        }]},
+        "uuid": "u9", "timestamp": "2026-08-31T23:30:54.058Z",
+        "cwd": "/Users/dev/xtrace/xmem", "sessionId": "s1", "version": "2.1.0",
+    }
+    if mcp_meta is not None:
+        rec["mcpMeta"] = mcp_meta
+    if tool_use_result is not None:
+        rec["toolUseResult"] = tool_use_result
+    return rec
+
+
+def size(v) -> int:
+    return len(json.dumps(v, separators=(",", ":")))
+
+
+CAP = 10_000
+BIG = "x" * (CAP * 3)
+
+# The real failure: small visible result, huge mirror.
+err = "Error: result (5,263,099 characters) exceeds maximum allowed tokens."
+stalled = tool_result_record(err, mcp_meta={"result": {"items": [BIG]}},
+                             tool_use_result=err)
+before = copy.deepcopy(stalled)
+out = elide_oversized_tool_results([stalled], max_bytes=CAP)
+check("the stalled record now fits", size(out[0]) <= CAP)
+check("mcpMeta is dropped from an oversized record", "mcpMeta" not in out[0])
+check("toolUseResult is dropped from an oversized record",
+      "toolUseResult" not in out[0])
+blk = out[0]["message"]["content"][0]
+check("the visible tool result the model saw is untouched", blk["content"] == err)
+check("tool_use_id survives", blk["tool_use_id"] == "toolu_01XZcpo566U8g1r8mGbFHXzL")
+check("every other field survives",
+      {k: v for k, v in out[0].items() if k != "message"}
+      == {k: v for k, v in before.items() if k not in ("message", "mcpMeta", "toolUseResult")})
+check("the input record is not mutated", stalled == before)
+
+# An oversized visible result (string content) becomes a note that names
+# the size and the call it belongs to.
+huge = tool_result_record(BIG, is_error=True)
+out = elide_oversized_tool_results([huge], max_bytes=CAP)
+blk = out[0]["message"]["content"][0]
+check("an oversized string result is elided", size(out[0]) <= CAP)
+check("the note says it was elided", blk["content"].startswith("[memhub: elided"))
+check("the note names the byte count", f"{size(BIG):,} bytes" in blk["content"])
+check("the note names the tool_use_id", "toolu_01XZcpo566U8g1r8mGbFHXzL" in blk["content"])
+check("is_error survives elision", blk.get("is_error") is True)
+
+# Block-list content (the shape an MCP tool returns) is handled the same way.
+huge_blocks = tool_result_record([{"type": "text", "text": BIG}])
+out = elide_oversized_tool_results([huge_blocks], max_bytes=CAP)
+check("an oversized block-list result is elided",
+      isinstance(out[0]["message"]["content"][0]["content"], str)
+      and size(out[0]) <= CAP)
+
+# Mixed record: the big result goes, the small one beside it stays verbatim.
+mixed = tool_result_record(BIG)
+mixed["message"]["content"].append(
+    {"tool_use_id": "toolu_small", "type": "tool_result", "content": "ok"})
+mixed["message"]["content"].append({"type": "text", "text": "and a note"})
+out = elide_oversized_tool_results([mixed], max_bytes=CAP)
+blocks = out[0]["message"]["content"]
+check("only the oversized block is elided",
+      blocks[1]["content"] == "ok" and blocks[2] == {"type": "text", "text": "and a note"})
+check("block order is preserved", [b.get("tool_use_id") for b in blocks[:2]]
+      == ["toolu_01XZcpo566U8g1r8mGbFHXzL", "toolu_small"])
+
+# A parallel-tool turn: several results, none over the ceiling alone, the
+# record over it together. Largest go first, and only as many as it takes.
+many = tool_result_record("a" * 4000)
+many["message"]["content"][0]["tool_use_id"] = "toolu_4k"
+for tid, n in (("toolu_6k", 6000), ("toolu_1k", 1000), ("toolu_5k", 5000)):
+    many["message"]["content"].append(
+        {"tool_use_id": tid, "type": "tool_result", "content": "a" * n})
+before = copy.deepcopy(many)
+out = elide_oversized_tool_results([many], max_bytes=CAP)
+blocks = out[0]["message"]["content"]
+elided = [b["tool_use_id"] for b in blocks if b["content"].startswith("[memhub")]
+check("a record of several mid-size results is brought under the ceiling",
+      size(out[0]) <= CAP)
+check("the largest results are elided first, and only as many as needed",
+      elided == ["toolu_6k", "toolu_5k"])
+check("the smaller results survive verbatim",
+      blocks[0]["content"] == "a" * 4000 and blocks[2]["content"] == "a" * 1000)
+check("the multi-result input is not mutated", many == before)
+# The fit check keeps a running total instead of re-serializing. Prove it
+# agrees with a real serialization to the byte: a ceiling of exactly the size
+# of "6k elided alone" must stop there, and one byte less must take 5k too.
+one = copy.deepcopy(before)
+one["message"]["content"][1]["content"] = _elision_note(size("a" * 6000), "toolu_6k")
+exact = size(one)
+at = elide_oversized_tool_results([many], max_bytes=exact)[0]
+under = elide_oversized_tool_results([many], max_bytes=exact - 1)[0]
+check("the running total matches a real serialization at the boundary",
+      at == one and size(at) == exact)
+check("one byte under the boundary elides the next-largest result",
+      [b["tool_use_id"] for b in under["message"]["content"]
+       if b["content"].startswith("[memhub")] == ["toolu_6k", "toolu_5k"])
+
+# A bare-string message with a giant mirror beside it: the mirror still
+# comes off, and the text is untouched.
+strmsg = {"type": "user", "uuid": "u10",
+          "message": {"role": "user", "content": "plain text"},
+          "mcpMeta": {"raw": BIG}}
+out = elide_oversized_tool_results([strmsg], max_bytes=CAP)
+check("a string-content message loses its oversized mirror",
+      "mcpMeta" not in out[0] and out[0]["message"]["content"] == "plain text"
+      and size(out[0]) <= CAP)
+check("the string-content input is not mutated", "mcpMeta" in strmsg)
+
+# Over the ceiling because of PROSE, with a tiny tool result beside it: the
+# note would be larger than the result, so nothing is swapped and the record
+# comes back untouched rather than bigger.
+prosey = tool_result_record("ok")
+prosey["message"]["content"].append({"type": "text", "text": BIG})
+out = elide_oversized_tool_results([prosey], max_bytes=CAP)
+check("a tiny tool result is never replaced by a larger note", out[0] is prosey)
+
+# Under the ceiling nothing is touched — not even the mirrors.
+small = tool_result_record("fine", mcp_meta={"result": "fine"}, tool_use_result="fine")
+out = elide_oversized_tool_results([small], max_bytes=CAP)
+check("a record under the ceiling is the same object", out[0] is small)
+
+# Oversized things that are NOT tool results pass through unchanged: the
+# filter's scope is tool output, and dropping a user's own long message would
+# be the asymmetric failure the slash-command filter also refuses.
+prose = user(BIG, content_blocks=True)
+out = elide_oversized_tool_results([prose], max_bytes=CAP)
+check("an oversized user text record is left alone", out[0] is prose)
+sidecar = {"type": "ai-title", "title": BIG}
+out = elide_oversized_tool_results([sidecar], max_bytes=CAP)
+check("an oversized non-message record is left alone", out[0] is sidecar)
+out = elide_oversized_tool_results(["not a dict", None, 3], max_bytes=CAP)
+check("non-dict records pass through", out == ["not a dict", None, 3])
+check("an empty list is fine", elide_oversized_tool_results([]) == [])
+check("the default ceiling is the documented one",
+      MAX_TOOL_RESULT_BYTES == 200_000)
+
+# --- the unsendable tier ----------------------------------------------------
+# Above HARD_MAX_RECORD_BYTES the record can never be sent, so prose IS
+# trimmed there — refusing would lose the record and the session tail alike.
+from transcript_filter import HARD_MAX_RECORD_BYTES
+
+HUGE = "y" * (HARD_MAX_RECORD_BYTES + 500_000)
+paste = user(HUGE, content_blocks=True)
+out = elide_oversized_tool_results([paste])
+blk = out[0]["message"]["content"][0]
+check("an unsendable text block is trimmed under the hard ceiling",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES)
+check("the trimmed text keeps its head and says what happened",
+      blk["text"].startswith("yyy") and "[memhub: elided" in blk["text"])
+check("the unsendable-paste input is not mutated",
+      len(paste["message"]["content"][0]["text"]) == len(HUGE))
+
+bare = user(HUGE)
+out = elide_oversized_tool_results([bare])
+check("an unsendable bare-string message is trimmed too",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES
+      and out[0]["message"]["content"].startswith("yyy")
+      and "[memhub: elided" in out[0]["message"]["content"])
+
+call = {"type": "assistant", "uuid": "a9",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_w", "name": "Write",
+             "input": {"file_path": "/tmp/x", "content": HUGE}}]}}
+out = elide_oversized_tool_results([call])
+blk = out[0]["message"]["content"][0]
+check("an unsendable tool_use keeps its name with the input summarized",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES and blk["name"] == "Write"
+      and "elided" in blk["input"])
+
+# Many text blocks, each just over the per-block head: the keep-budget is
+# divided so the summed heads cannot land back over the ceiling.
+crowd = {"type": "user", "uuid": "u11",
+         "message": {"role": "user", "content": [
+             {"type": "text", "text": "w" * 70_000} for _ in range(60)]}}
+out = elide_oversized_tool_results([crowd])
+check("sixty trimmed heads still fit under the hard ceiling",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES)
+check("each kept head is still real content",
+      out[0]["message"]["content"][0]["text"].startswith("www"))
+
+# The note on a hard-trimmed block names the ceiling that cut it, not the
+# 200 KB tool-result cap.
+out = elide_oversized_tool_results([user(HUGE, content_blocks=True)])
+check("a hard-trim note names the hard ceiling",
+      f"{HARD_MAX_RECORD_BYTES:,}-byte" in out[0]["message"]["content"][0]["text"])
+out = elide_oversized_tool_results([tool_result_record(BIG)], max_bytes=CAP)
+check("a soft-elision note still names the soft cap",
+      f"{200_000:,}-byte" in out[0]["message"]["content"][0]["content"]
+      or "200,000-byte" in out[0]["message"]["content"][0]["content"])
+
+# Between the soft and hard ceilings prose still ships whole.
+mid = user("z" * 400_000, content_blocks=True)
+out = elide_oversized_tool_results([mid])
+check("prose between the ceilings is untouched", out[0] is mid)
+
+# Applied on EVERY upload path, or a session is capturable on one and stuck
+# on another. Source-level, the same way registration_test checks breadcrumbs.
+for script in ("flush_turn.py", "flush_session.py", "import_session.py",
+               "codex_flush.py", "cursor_flush.py"):
+    body = (SCRIPTS / script).read_text(encoding="utf-8")
+    check(f"{script} applies elide_oversized_tool_results before sending",
+          "elide_oversized_tool_results(" in body.split("import", 1)[1]
+          and body.count("elide_oversized_tool_results") >= 2)
+    # Order is load-bearing: the secret scan must run over what elision
+    # KEPT (the 64 KB head of a trimmed paste included), so redaction is
+    # applied to the elided output, never the other way around. These
+    # scripts are straight-line at the call sites, so source order is
+    # execution order.
+    e = body.rindex("elide_oversized_tool_results(")
+    # Two accepted shapes, both meaning "redaction sees the elided output":
+    # nested — redact_records( opens before the elide call with no paren
+    # closing between them, so elide is its argument; or sequential — a
+    # redact_records( call follows the elide line.
+    wrap = body.rfind("redact_records(", 0, e)
+    nested = wrap != -1 and ")" not in body[wrap + len("redact_records("):e]
+    sequential = body.find("redact_records(", e) != -1
+    check(f"{script} redacts AFTER eliding", nested or sequential)
+
+# And the kept head of a hard-trimmed block is real input to that scan: a
+# credential inside the head survives elision, then redaction scrubs it.
+from redact import contains_secret, redact_records
+leaky = user("mhk_" + "a" * 24 + HUGE, content_blocks=True)
+elided = elide_oversized_tool_results([leaky])
+check("the secret survives into the kept head (elision does not redact)",
+      contains_secret(elided))
+check("redaction scrubs the kept head of a hard-trimmed block",
+      not contains_secret(redact_records(elided)))
 
 print(f"{'FAIL' if FAILURES else 'PASS'}: transcript_filter")
 for f in FAILURES:
