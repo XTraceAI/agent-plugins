@@ -16,7 +16,8 @@ Run spec-driven development on top of MemHub. The model:
   stripped — e.g. `Repo: XTraceAI/agent-plugins`). Resolve it once with
   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show`; when that prints
   nothing, match the name EXACTLY in `list_agent_brains` and reuse what you
-  find — a teammate may have created it — then cache it with `room_map.py set
+  find — a teammate may have created it and shared it with you, and a miss
+  proves nothing — then cache it with `room_map.py set
   --brain-id <id>`. Edge cases (SSH remotes, no remote, worktrees, not a git
   repo) and the create-time rules — resolve before create, required
   description, report where it landed — are in
@@ -52,10 +53,11 @@ Run spec-driven development on top of MemHub. The model:
   index is a byproduct of spec-driven development, not a second chore. The
   map holds **no brain id** (a brain id is account state, not project state):
   the upload script resolves the repo's room itself.
-- Sharing is **read-only**: teammates can search/check/status the room, but
-  uploads into it work only for its creator. The intended flow: the spec
-  owner runs `init`/`revise`; read-only members propose changes by editing
-  the repo file (PR), and the owner lands them as a revision.
+- **What a teammate can do depends on their grant.** A `viewer` can
+  search/check/status the room but not upload into it; a `contributor` can
+  revise. `share_agent_brain` defaults to `viewer`, so assume read-only unless
+  you know otherwise. The intended flow for read-only members: propose changes
+  by editing the repo file (PR), and the owner lands them as a revision.
 
 File uploads ALWAYS go through the helper script (never call the
 `save_artifact` MCP tool directly, never re-emit file contents):
@@ -102,9 +104,13 @@ we" → status) and treat all of `$ARGUMENTS` as its arguments.
 Every subcommand starts by **resolving the repo's room**: derive the name as
 above, then match it EXACTLY in `list_agent_brains` — it may be one a
 teammate created and shared with you; use theirs rather than creating a
-duplicate. Only `init` creates it when missing (`create_agent_brain`, omit
-`workspace_id` — you need creator access to share it); the other subcommands
-stop and point at init if no room exists. Not a git repo → ask which agent
+duplicate — a miss means only that no room of that name is shared with YOU,
+not that none exists. Only `init` creates it when missing
+(`create_agent_brain`, omit `workspace_id` — that chooses where the brain
+lives, not who can read it; you are its creator either way). A room you create
+here is readable by you alone until it is shared, so say so and point at
+`/memhub:onboard` for the team-wide share. The other subcommands stop and
+point at init if no room exists. Not a git repo → ask which agent
 brain to use.
 
 ## init `[file-path | title...] [for <teammates>]`

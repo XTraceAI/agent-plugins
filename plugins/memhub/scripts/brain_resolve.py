@@ -10,8 +10,10 @@ On a cache miss the capture path asks the server once, matches the repo's
 canonical room name, and writes the id back. Every later flush is a local
 lookup again.
 
-**Resolve, never create.** A brain is team-visible — teammates see it appear and
-it shapes where memory lands. A background hook firing after a turn is the wrong
+**Resolve, never create.** A brain is a routing decision teammates inherit, and
+a created one is readable by its creator ALONE until it is explicitly shared —
+so a hook that created one would mint exactly the private duplicate room that
+splits a repo's memory. A background hook firing after a turn is the wrong
 place to make that decision on someone's behalf, so an absent brain stays absent
 and capture continues to personal memory exactly as before. Creating one remains
 an explicit ``/memhub:onboard``.
@@ -19,7 +21,7 @@ an explicit ``/memhub:onboard``.
 **Exact name match only.** The room name is ``Repo: <org>/<name>`` (see
 ``room_map.room_name``), derived from the git remote. Fuzzy matching here would
 silently route a session into a brain that merely looked similar — worse than
-not routing at all, because it is invisible and lands teammate-visible content
+not routing at all, because it is invisible and lands the session's memory
 somewhere nobody expects.
 """
 from __future__ import annotations

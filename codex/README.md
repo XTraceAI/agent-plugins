@@ -97,7 +97,7 @@ From the repository you want MemHub to remember, ask Codex:
 Onboard MemHub for this repo
 ```
 
-The `onboard` skill creates or selects the repository's shared agent brain,
+The `onboard` skill creates or selects the repository's agent brain — and when it creates one, offers to share it with your org's default workspace, because a new brain is readable by its creator alone until it is shared —
 stores the routing choice in the user's MemHub configuration, seeds the brain
 from one substantive session, and verifies recall. Until a repository brain
 exists, authenticated capture can still write to personal memory.
