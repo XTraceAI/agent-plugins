@@ -56,7 +56,10 @@ from session_title import (  # noqa: E402
     prompt_title,
 )
 from redact import redact_records, redact_text  # noqa: E402
-from transcript_filter import drop_command_wrappers  # noqa: E402
+from transcript_filter import (  # noqa: E402
+    drop_command_wrappers,
+    elide_oversized_tool_results,
+)
 
 # All at module scope now. These used to be deferred into :func:`_flush`
 # because ``_memhub_auth`` dragged in the mcp SDK and this module has to stay
@@ -352,7 +355,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # what is SENT rather than what is read, so the cursor still advances past
     # a record whose secret was stripped — the alternative would pin the cursor
     # on any turn that mentioned a key and stall capture permanently.
-    sendable = redact_records(drop_command_wrappers(records))
+    # Oversized tool results are elided BEFORE redaction, so the secret scan
+    # runs over what will actually be sent, and before slicing would matter:
+    # a single record the server can never accept would otherwise pin the
+    # cursor and stall this session's capture for good.
+    sendable = redact_records(
+        elide_oversized_tool_results(drop_command_wrappers(records))
+    )
 
     if not sendable or all(
         isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES

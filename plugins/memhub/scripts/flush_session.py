@@ -61,7 +61,10 @@ from session_title import (  # noqa: E402
 )
 from transcript_chunks import slices as make_slices  # noqa: E402
 from redact import redact_records  # noqa: E402
-from transcript_filter import drop_command_wrappers  # noqa: E402
+from transcript_filter import (  # noqa: E402
+    drop_command_wrappers,
+    elide_oversized_tool_results,
+)
 
 
 
@@ -211,6 +214,10 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if not records:
         _log("transcript holds only slash-command records; nothing to flush")
         return
+
+    # A tool result too large for any request the server accepts would
+    # otherwise ride alone in its own slice and fail the whole backstop.
+    records = elide_oversized_tool_results(records)
 
     # Same reasoning as the filter above: a session must not come out with
     # credentials in it depending on which path captured it. Every upload path

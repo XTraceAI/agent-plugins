@@ -19,7 +19,9 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from transcript_filter import (  # noqa: E402
+    MAX_TOOL_RESULT_BYTES,
     drop_command_wrappers,
+    elide_oversized_tool_results,
     is_command_wrapper,
     record_text,
 )
@@ -181,6 +183,119 @@ if real:
 else:
     print("real transcripts: none found, skipped")
 
+
+
+# --- oversized tool results -------------------------------------------------
+#
+# Shape taken VERBATIM from the record that stalled session 20869cb5 on
+# 2026-08-31: the model saw a 1.4 KB "exceeds maximum allowed tokens" error,
+# while ``mcpMeta`` carried the full 5.26 MB MCP reply. Scaled down here.
+import copy
+import json
+
+
+def tool_result_record(content, *, mcp_meta=None, tool_use_result=None,
+                       is_error=False) -> dict:
+    rec = {
+        "parentUuid": "a1", "isSidechain": False, "type": "user",
+        "message": {"role": "user", "content": [{
+            "tool_use_id": "toolu_01XZcpo566U8g1r8mGbFHXzL",
+            "type": "tool_result", "content": content,
+            **({"is_error": True} if is_error else {}),
+        }]},
+        "uuid": "u9", "timestamp": "2026-08-31T23:30:54.058Z",
+        "cwd": "/Users/dev/xtrace/xmem", "sessionId": "s1", "version": "2.1.0",
+    }
+    if mcp_meta is not None:
+        rec["mcpMeta"] = mcp_meta
+    if tool_use_result is not None:
+        rec["toolUseResult"] = tool_use_result
+    return rec
+
+
+def size(v) -> int:
+    return len(json.dumps(v, separators=(",", ":")))
+
+
+CAP = 10_000
+BIG = "x" * (CAP * 3)
+
+# The real failure: small visible result, huge mirror.
+err = "Error: result (5,263,099 characters) exceeds maximum allowed tokens."
+stalled = tool_result_record(err, mcp_meta={"result": {"items": [BIG]}},
+                             tool_use_result=err)
+before = copy.deepcopy(stalled)
+out = elide_oversized_tool_results([stalled], max_bytes=CAP)
+check("the stalled record now fits", size(out[0]) <= CAP)
+check("mcpMeta is dropped from an oversized record", "mcpMeta" not in out[0])
+check("toolUseResult is dropped from an oversized record",
+      "toolUseResult" not in out[0])
+blk = out[0]["message"]["content"][0]
+check("the visible tool result the model saw is untouched", blk["content"] == err)
+check("tool_use_id survives", blk["tool_use_id"] == "toolu_01XZcpo566U8g1r8mGbFHXzL")
+check("every other field survives",
+      {k: v for k, v in out[0].items() if k != "message"}
+      == {k: v for k, v in before.items() if k not in ("message", "mcpMeta", "toolUseResult")})
+check("the input record is not mutated", stalled == before)
+
+# An oversized visible result (string content) becomes a note that names
+# the size and the call it belongs to.
+huge = tool_result_record(BIG, is_error=True)
+out = elide_oversized_tool_results([huge], max_bytes=CAP)
+blk = out[0]["message"]["content"][0]
+check("an oversized string result is elided", size(out[0]) <= CAP)
+check("the note says it was elided", blk["content"].startswith("[memhub: tool result elided"))
+check("the note names the byte count", f"{size(BIG):,} bytes" in blk["content"])
+check("the note names the tool_use_id", "toolu_01XZcpo566U8g1r8mGbFHXzL" in blk["content"])
+check("is_error survives elision", blk.get("is_error") is True)
+
+# Block-list content (the shape an MCP tool returns) is handled the same way.
+huge_blocks = tool_result_record([{"type": "text", "text": BIG}])
+out = elide_oversized_tool_results([huge_blocks], max_bytes=CAP)
+check("an oversized block-list result is elided",
+      isinstance(out[0]["message"]["content"][0]["content"], str)
+      and size(out[0]) <= CAP)
+
+# Mixed record: the big result goes, the small one beside it stays verbatim.
+mixed = tool_result_record(BIG)
+mixed["message"]["content"].append(
+    {"tool_use_id": "toolu_small", "type": "tool_result", "content": "ok"})
+mixed["message"]["content"].append({"type": "text", "text": "and a note"})
+out = elide_oversized_tool_results([mixed], max_bytes=CAP)
+blocks = out[0]["message"]["content"]
+check("only the oversized block is elided",
+      blocks[1]["content"] == "ok" and blocks[2] == {"type": "text", "text": "and a note"})
+check("block order is preserved", [b.get("tool_use_id") for b in blocks[:2]]
+      == ["toolu_01XZcpo566U8g1r8mGbFHXzL", "toolu_small"])
+
+# Under the ceiling nothing is touched — not even the mirrors.
+small = tool_result_record("fine", mcp_meta={"result": "fine"}, tool_use_result="fine")
+out = elide_oversized_tool_results([small], max_bytes=CAP)
+check("a record under the ceiling is the same object", out[0] is small)
+
+# Oversized things that are NOT tool results pass through unchanged: the
+# filter's scope is tool output, and dropping a user's own long message would
+# be the asymmetric failure the slash-command filter also refuses.
+prose = user(BIG, content_blocks=True)
+out = elide_oversized_tool_results([prose], max_bytes=CAP)
+check("an oversized user text record is left alone", out[0] is prose)
+sidecar = {"type": "ai-title", "title": BIG}
+out = elide_oversized_tool_results([sidecar], max_bytes=CAP)
+check("an oversized non-message record is left alone", out[0] is sidecar)
+out = elide_oversized_tool_results(["not a dict", None, 3], max_bytes=CAP)
+check("non-dict records pass through", out == ["not a dict", None, 3])
+check("an empty list is fine", elide_oversized_tool_results([]) == [])
+check("the default ceiling is the documented one",
+      MAX_TOOL_RESULT_BYTES == 200_000)
+
+# Applied on EVERY upload path, or a session is capturable on one and stuck
+# on another. Source-level, the same way registration_test checks breadcrumbs.
+for script in ("flush_turn.py", "flush_session.py", "import_session.py",
+               "codex_flush.py", "cursor_flush.py"):
+    body = (SCRIPTS / script).read_text(encoding="utf-8")
+    check(f"{script} applies elide_oversized_tool_results before sending",
+          "elide_oversized_tool_results(" in body.split("import", 1)[1]
+          and body.count("elide_oversized_tool_results") >= 2)
 
 print(f"{'FAIL' if FAILURES else 'PASS'}: transcript_filter")
 for f in FAILURES:

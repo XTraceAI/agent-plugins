@@ -22,6 +22,7 @@ session.
 """
 from __future__ import annotations
 
+import json
 import re
 
 # The wrappers the client emits around a slash command: the invocation, the
@@ -90,3 +91,98 @@ def is_command_wrapper(record: object) -> bool:
 def drop_command_wrappers(records: list) -> list:
     """``records`` minus the slash-command bookkeeping."""
     return [r for r in records if not is_command_wrapper(r)]
+
+
+# Ceiling on the serialized size of one tool result before it is elided.
+#
+# Sized against what the MODEL was allowed to see. Claude Code spills any tool
+# result over ~25k tokens (~100 KB) to a file and shows the model a one-line
+# pointer, so nothing above that was ever part of the conversation — it is
+# bytes the transcript carries that no one read. 200 KB is that ceiling with
+# headroom for older clients that inlined more, and it sits far below the
+# 3.5 MB upload slice and the server's 4 MiB request limit.
+#
+# Why this exists: an MCP ``search_memory`` reply of 5.26 MB (two HTML
+# artifacts with screenshots inlined) was rejected by the client as too large
+# — the model saw a 1.4 KB error — but the client stored the WHOLE reply in the
+# record's ``mcpMeta``. One 5.27 MB transcript line can never fit a request the
+# server accepts, and because the cursor rightly never advances past a failed
+# send, every later turn of that session re-sent it, got a 413, and captured
+# nothing. The session was silently uncapturable from that turn on.
+MAX_TOOL_RESULT_BYTES = 200_000
+
+# Record fields that are a second copy of a tool result rather than
+# conversation: ``mcpMeta`` is the raw MCP response Claude Code keeps beside
+# the ``tool_result`` block (and is where the 5 MB above lived), and
+# ``toolUseResult`` is the client's structured mirror of the same content.
+# Neither is read by the server. Both are dropped from an OVERSIZED record
+# only — a record under the ceiling is shipped byte-for-byte as before.
+_TOOL_RESULT_MIRRORS = ("mcpMeta", "toolUseResult")
+
+
+def _size(value) -> int:
+    return len(json.dumps(value, separators=(",", ":"), default=str))
+
+
+def _elision_note(nbytes: int, tool_use_id) -> str:
+    return (f"[memhub: tool result elided — {nbytes:,} bytes exceeded the "
+            f"{MAX_TOOL_RESULT_BYTES:,}-byte capture limit; "
+            f"tool_use_id={tool_use_id or '?'}]")
+
+
+def elide_oversized_tool_results(
+    records: list, max_bytes: int = MAX_TOOL_RESULT_BYTES,
+) -> list:
+    """``records`` with any tool result larger than ``max_bytes`` replaced by
+    a note saying so.
+
+    Only a record that is itself over the ceiling is touched, and within it
+    only the tool-result payloads: the ``tool_result`` blocks whose content is
+    over the ceiling become a one-line note that names the size and the
+    ``tool_use_id`` (so the call stays linkable to its ``tool_use``), and the
+    client's mirror copies of the result are dropped. Text blocks, the user's
+    own prose, and every other field are left exactly as they were. The input
+    list and its records are never mutated.
+
+    A note rather than a silent drop, on purpose: a transcript where a tool
+    call has no result reads as a call that never returned, and an extractor
+    will happily build a fact on that. The note says what happened and how
+    big it was, which is all anyone downstream can use.
+
+    Applied on every upload path — per-turn, session-end, on-demand import,
+    Codex, Cursor — for the same reason the slash-command filter is: a session
+    must not be capturable or stuck depending on which path reached it.
+    Never raises; on an unexpected failure the records are returned untouched,
+    because capture stopping is worse than this pass not running.
+    """
+    try:
+        return [_elide_record(r, max_bytes) for r in records]
+    except Exception:  # noqa: BLE001 — never break capture over a size cap
+        return records
+
+
+def _elide_record(record, max_bytes: int):
+    if not isinstance(record, dict) or _size(record) <= max_bytes:
+        return record
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return record  # oversized, but not a message — nothing to elide
+    content = message.get("content")
+    if not isinstance(content, list):
+        return record  # a bare-string message carries no tool result
+    new_blocks = []
+    changed = False
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "tool_result"
+                and _size(block.get("content")) > max_bytes):
+            nbytes = _size(block.get("content"))
+            block = dict(block)
+            block["content"] = _elision_note(nbytes, block.get("tool_use_id"))
+            changed = True
+        new_blocks.append(block)
+    mirrors = [k for k in _TOOL_RESULT_MIRRORS if k in record]
+    if not changed and not mirrors:
+        return record
+    out = {k: v for k, v in record.items() if k not in _TOOL_RESULT_MIRRORS}
+    out["message"] = {**message, "content": new_blocks}
+    return out

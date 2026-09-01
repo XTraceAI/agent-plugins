@@ -50,7 +50,10 @@ from transcript_chunks import (  # noqa: E402
     slices as make_slices,
 )
 from redact import redact_records  # noqa: E402
-from transcript_filter import drop_command_wrappers  # noqa: E402
+from transcript_filter import (  # noqa: E402
+    drop_command_wrappers,
+    elide_oversized_tool_results,
+)
 
 
 SOURCE_PLATFORMS = ("claude", "codex", "cursor")
@@ -346,6 +349,10 @@ async def main() -> int:
     if not records:
         print(f"ERROR: {f} holds only slash-command records", file=sys.stderr)
         return 2
+
+    # An oversized tool result is elided here too — the slicer sends a single
+    # record that exceeds the chunk size on its own, and the server rejects it.
+    records = elide_oversized_tool_results(records)
 
     # Third and last upload path, redacting for the same reason it filters: the
     # guarantee is that a captured session never carries a MemHub key, and a

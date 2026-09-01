@@ -43,6 +43,7 @@ from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
 from redact import redact_records  # noqa: E402
+from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
@@ -440,7 +441,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
     records, meta = codex_reader.to_canonical(rollout)
-    sendable = redact_records(records)
+    sendable = redact_records(elide_oversized_tool_results(records))
     if not sendable:
         # Nothing to send. Empty is normal for a rollout with no user turns
         # yet — but records>0 with sendable==0 means EVERYTHING redacted
