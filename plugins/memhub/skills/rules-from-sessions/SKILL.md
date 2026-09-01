@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants rules for the Rulebook from what their team actually does — "/memhub:rules-from-sessions", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. One run reads the repo's CLAUDE.md AND the local Claude Code / Codex / Cursor transcripts, replays every candidate through the real hook, and proposes rules that each state why they exist (the CLAUDE.md sentence, or the sessions and the user's own words), what they cost, and what changes with them on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.
-argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--brain "<rulebook brain name>"] [--dry-run]
-allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
+argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--rulebook "<name or id>"] [--dry-run]
+allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
 ---
 
 # Rules from sessions (and CLAUDE.md) — one run
@@ -91,9 +91,25 @@ parses.
 - The memhub plugin installed (any host): the script reuses its
   `scripts/readers/` and `scripts/rulebook_hook.py` (`to_hook_rule`,
   `evaluate`, `shell_only`) — the real hook, never a re-implementation.
-- memhub tools `list_rules`, `create_rule`, `list_skills`, `create_skill`.
-- Arguments: `--brain "<name>"` → `agent_brain_id` on `create_rule`;
-  `--dry-run` → everything except the `create_rule` calls.
+- memhub tools `list_rulebooks`, `list_rules`, `create_rule`, `create_rulebook`,
+  `list_skills`, `create_skill`.
+- Arguments: `--rulebook "<name or id>"` → the destination `rulebook_id`
+  (`--brain` is still accepted for it); `--dry-run` → everything except the
+  `create_rule` calls.
+
+**Resolve the rulebook before you file anything.** A rulebook is a container
+with its own membership — every member's agent is bound by its rules — and one
+person can be in several. Call `list_rulebooks` (rows carry `rulebook_id`,
+`name`, `scope`, `member_count`, `rule_count`, `bound`, `is_admin`). Match
+`--rulebook` by id then by name; with it omitted, one visible book is the
+destination and several means **ask** (AskUserQuestion, one option per book
+labelled with who it binds) rather than guess. No books at all → offer
+`create_rulebook(name: "<repo> rules", scope: "explicit")`, which binds only
+the user, and create it only on a yes; never pass `scope: "all_org"` or name
+another member — both are org-admin acts. Every proposal you show the user
+names the book it would land in, because that is who the rule would reach.
+If the server has no `list_rulebooks`, it predates rulebook containers: fall
+back to `agent_brain_id` and carry on.
 
 ## 1. First pass — every session, no model call
 
@@ -253,18 +269,22 @@ origin) and `quote_rx`.
    clean run.
 2. Conflicts, before anything is filed — the server does no title
    matching, so a collision lands as a second draft silently. Save
-   `list_rules` (target brain, every status) to a file, the candidate bodies
-   to another, and run:
+   `list_rules` (every status, **no `rulebook_id`**, so it spans every book
+   the user can see) to a file, the candidate bodies to another, and run:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
-     --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>"
+     --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>" \
+     --rulebook-id <the destination rulebook_id>
    ```
    `same_title` / `same_matcher` / `anchors_overlap` hits print the exact
    `supersedes_rule_id` to copy. Then the semantic pass in your own reading
    over `judge_by_statement`: `duplicate` → file with `supersedes_rule_id`;
    `same_matcher` against an active rule that is NOT the same rule → do not
    file, tell the user; `contradicts` → file without `supersedes_rule_id`
-   and name the rule it fights in the report.
+   and name the rule it fights in the report. A hit marked **`cross_book`**
+   is in another rulebook: `supersedes_rule_id` cannot reach it and both
+   rules will fire on the same call, so it goes to the user as a decision,
+   never absorbed silently.
 3. Skills: only `PROPOSE this skill` rows; host-agnostic SKILL.md citing
    the session counts.
 4. Show the user the summary block, then one entry per proposal in the
@@ -274,13 +294,14 @@ origin) and `quote_rx`.
    `--dry-run`, stop here.
 5. File — every channel ends as something filed or grabbable, never only
    described:
-   - **Rules**: `create_rule` once per row with the row's `delivery` and
-     engine block, the row's `statement` (statements are capped at 400
-     chars server-side), `scope_repos`, `source` (`claude_md_import` for
-     declared, `authored` for observed and asserted), `source_ref` (an
-     asserted standard's ref names the asserter's session), and
-     `supersedes_rule_id` where step 2 said so. Everything lands
-     `proposed`, advise — never pass `activate` from this skill.
+   - **Rules**: `create_rule` once per row with the destination `rulebook_id`,
+     the row's `delivery` and engine block, the row's `statement` (statements
+     are capped at 400 chars server-side), `scope_repos`, `source`
+     (`claude_md_import` for declared, `authored` for observed and asserted),
+     `source_ref` (an asserted standard's ref names the asserter's session),
+     and `supersedes_rule_id` where step 2 said so. Everything lands
+     `proposed`, advise — never pass `activate` from this skill, not even on
+     a book that binds only the user.
    - **CLAUDE.md**: open a PR adding `mine-out/grabs/claude-md-additions.md`'s
      chosen sections to the repo's CLAUDE.md — a PR, never a direct edit.
    - **Skills**: write the full SKILL.md for `PROPOSE this skill` rows and
@@ -301,8 +322,8 @@ Same name every time, so it versions. That is what makes friction a TEAM
 number: the next run (anyone's) can pull it, and the fires ledger shares
 `session_id` with it, so "rule fired, friction still happened" is a join.
 
-Report per row: filed (with its trigger) / replaces which rule / unchanged /
-skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
+Report per row: filed (with its trigger, and into which rulebook — name who
+that book binds) / replaces which rule / unchanged / skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
 already on with zero historical fires (retire candidates); skills with
 intent ≫ invoked; block candidates with a high bad-outcome rate;
 session-armed orderings waiting on the engine mode. Note the activation

@@ -21,6 +21,21 @@ Book = the server book, fetched once per session and cached with its ETag.
 Offline → the cached book; no cache → no rules. There is no local rule file:
 rules are authored through the memhub `create_rule` tool.
 
+One book, several rulebooks. A rulebook is a container with its own membership
+(container spec §3, §4), and one person can be bound by more than one — an
+org-wide book plus their team's. The fetched book is the union of the rules
+that bind them, and each rule carries `rulebook_id` and a `rulebook` block
+with the book's `name`, `scope` and `member_count`. The server computes no
+precedence and stores no conflict edges (D14): it ships those facts and the
+hook decides. Here, "wider wins" is an ORDERING and never a suppression —
+`book_rank` puts org-wide rules ahead of a three-person book's so that the
+per-call MAX_ADVISE cap and the session-start posture budget spend on the
+policy that binds the most people first. A rule cut by a cap is logged
+`mode="suppressed"`, exactly as before. A backend that predates the container
+change sends no book facts at all; every rule then ranks alike, both sorts are
+stable, and this build behaves as it did — which is what lets one plugin serve
+a migrated and an unmigrated backend.
+
 How a fire reaches people (spec §5.3):
   * The agent gets `additionalContext` — the rule text under an XTrace Rulebook
     header — and the USER gets a `systemMessage` line per rule (`XTrace ▸ …`),
@@ -361,7 +376,9 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
-_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
+_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
+                                 "on", "repo_scope", "_scope_repos", "anchors", "ordering",
+                                 "_rulebook_id", "_book_name", "_book_scope", "_book_members"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -416,10 +433,58 @@ def _why(r):
     return f"  _(why: {r['why']})_" if r.get("why") else ""
 
 
+_BOOK_SCOPES = ("all_org", "explicit")
+_BOOK_NAME_MAX = 120
+
+
+def _book_facts(row):
+    """The precedence facts the server puts on the wire (container spec §6.4a):
+    which rulebook a rule came from, how wide that book's membership is, and
+    what the book is called. The server computes NO precedence and stores no
+    conflict edges — it ships `scope` and `member_count` and the hook decides
+    what "wider" means (D14).
+
+    A backend that predates the rulebook container sends neither key. Every
+    rule then carries the same absent facts, `book_rank` returns one value for
+    all of them, and the stable sorts below leave book order exactly as it is
+    today — which is what makes one plugin build work against both backends."""
+    b = row.get("rulebook")
+    b = b if isinstance(b, dict) else {}
+    out = {}
+    rid = row.get("rulebook_id") or b.get("rulebook_id")
+    if isinstance(rid, str) and rid.strip():
+        out["_rulebook_id"] = rid.strip()[:64]
+    name = _clean_text(b.get("name"))[:_BOOK_NAME_MAX]
+    if name:
+        out["_book_name"] = name
+    if b.get("scope") in _BOOK_SCOPES:
+        out["_book_scope"] = b["scope"]
+    mc = b.get("member_count")
+    if isinstance(mc, int) and not isinstance(mc, bool) and mc >= 0:
+        out["_book_members"] = mc
+    return out
+
+
+def book_rank(rule):
+    """Precedence between books, and nothing else: a rule from a book that
+    binds the whole org outranks one from a book of three (§11 — "wider member
+    scope wins" is the hook's call to make, not the server's).
+
+    It orders; it never suppresses. Two rules that both fire both fire — the
+    rank only decides which one the MAX_ADVISE cap keeps, and the cut ones are
+    already logged `mode="suppressed"` to the ledger. Every sort using it is
+    STABLE, so rules within one book — and every rule from a backend that
+    sends no book facts — keep the order the book gave them."""
+    return (0 if rule.get("_book_scope") == "all_org" else 1,
+            -int(rule.get("_book_members") or 0))
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
-    Rows already in the pilot shape (an `on` key) pass through. Never raises
-    on a malformed row: returns None and the row is skipped."""
+    Rows already in the pilot shape (an `on` key) pass through. The book facts
+    (`_rulebook_id`, `_book_name`, `_book_scope`, `_book_members`) ride along
+    on both paths; they are absent, harmlessly, on a pre-container backend.
+    Never raises on a malformed row: returns None and the row is skipped."""
     try:
         if not isinstance(row, dict):
             return None
@@ -427,6 +492,7 @@ def to_hook_rule(row):
             r = dict(row)
             r.setdefault("id", row.get("rule_id"))
             r.setdefault("_version", _version_of(row.get("version")))
+            r.update(_book_facts(row))   # the server's block is authoritative
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
             if isinstance(r.get("ordering"), dict) and not all(
@@ -438,6 +504,7 @@ def to_hook_rule(row):
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
              "_label": _clean_text(row.get("title")) or None,
              "mode": row.get("mode", "advise"), "_version": _version_of(row.get("version"))}
+        r.update(_book_facts(row))
         if not r["id"]:
             return None
         scopes = [str(x) for x in (row.get("scope_repos") or []) if x]
@@ -1187,7 +1254,10 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
     org opt-in. `override_reason` is set on a `mode='gate'` fire the caller
-    overrode (§5.3). Returns {rule_id: fire_id} so conversions can point back."""
+    overrode (§5.3). `rulebook_id` is local too — POST /fires carries no book
+    dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
+    it is here so a local reader can tell which book a fire came from.
+    Returns {rule_id: fire_id} so conversions can point back."""
     ids = {}
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
@@ -1197,6 +1267,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                 ids[r["id"]] = fid
                 f.write(json.dumps({
                     "fire_id": fid, "rule_id": r["id"],
+                    "rulebook_id": r.get("_rulebook_id"),
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
                     "source_message_id": ctx.get("source_message_id"),
@@ -1226,15 +1297,59 @@ def log_conversion(fire_id, how):
         pass
 
 
+MAX_BOOKS_NAMED = 6     # session-start roster: bounded, like every other context spend
+
+
+def books_line(in_scope):
+    """"Which policies bind me?" — answered once, at session start, and only
+    when more than one book is in play. A single-book team sees exactly what
+    it saw before; in-flight fires never carry the book name, because the
+    name is not what makes the advice actionable and that slot is the scarce
+    one. Books are listed widest first, the same order precedence uses."""
+    books, order = {}, []
+    for r in in_scope:
+        rid = r.get("_rulebook_id")
+        if not rid:
+            continue
+        if rid not in books:
+            books[rid] = {"name": r.get("_book_name"), "n": 0, "rank": book_rank(r),
+                          "scope": r.get("_book_scope"), "members": r.get("_book_members")}
+            order.append(rid)
+        books[rid]["n"] += 1
+    if len(books) < 2:
+        return None
+    parts = []
+    for rid in sorted(order, key=lambda i: (books[i]["rank"], (books[i]["name"] or "").casefold())):
+        b = books[rid]
+        if b["scope"] == "all_org":
+            who = "org-wide"
+        elif isinstance(b["members"], int):
+            who = f"{b['members']} member{'s' if b['members'] != 1 else ''}"
+        else:
+            who = None
+        bits = ", ".join([x for x in (who, f"{b['n']} rule{'s' if b['n'] != 1 else ''}") if x])
+        parts.append(f"{b['name'] or 'unnamed rulebook'} ({bits})")
+    extra = len(parts) - MAX_BOOKS_NAMED
+    shown = parts[:MAX_BOOKS_NAMED]
+    if extra > 0:
+        shown.append(f"and {extra} more")
+    return "- _From " + " · ".join(shown) + "._"
+
+
 def session_digest(rules, repo, gitdir, ctx):
     in_scope = [r for r in rules if scope_ok(r, repo, gitdir) and r.get("status", "active") == "active"]
     if not in_scope:
         return
     # Spec §2: at most MAX_POSTURE session rules and ~2k tokens per scope.
-    # Deterministic (by title, then id) rather than book order, and every rule
-    # past either limit is logged SUPPRESSED so the ledger sees it.
+    # ONE budget across every book the caller is in (container spec §13.1) —
+    # books do not know about each other, so four of them could otherwise blow
+    # a cap each of them believes it is under. The wider book spends first
+    # (§11), then title, then id: deterministic rather than book order, and
+    # every rule past either limit is logged SUPPRESSED so the ledger sees it.
     posture_all = sorted((r for r in in_scope if r.get("on") == "session"),
-                         key=lambda r: (str(r.get("_label") or r.get("title") or r["id"]).casefold(), str(r["id"])))
+                         key=lambda r: (book_rank(r),
+                                        str(r.get("_label") or r.get("title") or r["id"]).casefold(),
+                                        str(r["id"])))
     posture, cut, used = [], [], 0
     for r in posture_all:
         cost = len(r.get("text") or "") + len(r.get("why") or "")
@@ -1252,6 +1367,9 @@ def session_digest(rules, repo, gitdir, ctx):
             f"this repo — they fire inline as you work (proactive on tool "
             f"calls, reactive on errors). Treat a fire as a teammate's note, "
             f"not boilerplate.")
+    roster = books_line(in_scope)
+    if roster:
+        lines.append(roster)
     emit("SessionStart", "\n".join(lines))
     if posture:
         log_fires(ctx, posture, hook_phase="session", mode="advise", excerpt="")
@@ -1421,7 +1539,11 @@ def main():
                 if mode == "pre" and tool == "Bash" and r.get("on") in ("bash", "ordering")
                 and effective_mode(r, fetched_at) == "gate"}
     gates = [r for r in fired_now if r["id"] in gate_ids]
-    advisories = [r for r in fired_now if r["id"] not in gate_ids]
+    # §11: precedence between books is the hook's, and it is an ORDERING —
+    # the wider book's rule is what MAX_ADVISE keeps when two books both fire
+    # on one call. Stable, so one book's rules keep their order and a backend
+    # with no book facts ranks every rule alike and is unaffected.
+    advisories = sorted((r for r in fired_now if r["id"] not in gate_ids), key=book_rank)
     # the advisory cap never cuts a gate — a silently un-gated push is the one
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]

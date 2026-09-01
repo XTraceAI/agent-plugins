@@ -1,0 +1,277 @@
+"""Self-test for the rulebook CONTAINER client (backend spec `rulebook_container`).
+
+A rulebook stopped being a brain: it is its own object with its own membership,
+one person can be bound by several, and every `?view=hook` rule now carries
+`rulebook_id` plus a `rulebook` block with the book's `name`, `scope` and
+`member_count`. The server computes NO precedence and stores no conflict edges
+(spec D14 / §11) — it ships those facts and the client decides.
+
+What must hold here:
+
+* the book facts survive `to_hook_rule` on BOTH row shapes (server rows and
+  cached pilot-shape rows), and a matcher block can never forge them;
+* `book_rank` puts a wider book first — `all_org` ahead of everything, then
+  higher `member_count` — and returns ONE value for rules that carry no facts;
+* the per-call MAX_ADVISE cap keeps the wider book's rule and suppresses the
+  narrower one (an ORDERING, never a suppression of one rule by another: both
+  still fire, both still reach the ledger);
+* the session-start posture budget is ONE budget across every book, spent
+  widest-first (§13.1), and the roster line names the books only when more
+  than one is in play;
+* the fire ledger records `rulebook_id` LOCALLY while the /fires wire shape
+  (WIRE_KEYS) stays free of any book dimension — §6.4 puts none on that wire;
+* a book with no rulebook facts at all — an unmigrated backend — produces
+  byte-identical output to the same book with the keys stripped, which is the
+  property that lets one plugin build serve both backends;
+* `rulebook_conflicts.py` names the book on every hit and marks a hit outside
+  the destination book `cross_book`, because `supersedes_rule_id` cannot
+  reach it.
+
+Run: python3 rulebook_container_test.py  (stdlib only, no network, tmpdir only).
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS = os.path.join(HERE, "..", "plugins", "memhub", "scripts")
+HOOK = os.path.join(SCRIPTS, "rulebook_hook.py")
+sys.path.insert(0, os.path.abspath(SCRIPTS))
+
+import rulebook_conflicts as rc_mod      # noqa: E402
+import rulebook_hook as hook             # noqa: E402
+
+FAILURES: list[str] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    print(("PASS  " if ok else "FAIL  ") + name + (f" — {detail}" if detail and not ok else ""))
+    if not ok:
+        FAILURES.append(name)
+
+
+def run(mode: str, payload: dict, env_extra: dict) -> tuple[int, str]:
+    env = dict(os.environ, **env_extra)
+    p = subprocess.run([sys.executable, HOOK, mode], input=json.dumps(payload),
+                       capture_output=True, text=True, env=env, timeout=30)
+    return p.returncode, p.stdout
+
+
+def seed_book(base: str, repo_name: str, rules: list) -> None:
+    d = os.path.join(base, "book")
+    os.makedirs(d, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo_name)[:60]
+    h = hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:8]
+    with open(os.path.join(d, f"{safe}-{h}.json"), "w", encoding="utf-8") as f:
+        json.dump({"etag": "seed", "fetched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                   "rules": rules}, f)
+
+
+def ctx(out: str) -> str:
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else ""
+
+
+def book(rid, name, scope, members):
+    return {"rulebook_id": rid,
+            "rulebook": {"rulebook_id": rid, "name": name, "scope": scope,
+                         "member_count": members}}
+
+
+def server_rule(rid, rx, text, bk, **extra):
+    """A `?view=hook` row in the server's own shape — matcher nested, book block
+    attached — so to_hook_rule does the real translation the hook does live."""
+    row = {"rule_id": rid, "title": text, "statement": text, "status": "active",
+           "delivery": "agent_hook", "version": 1,
+           "matcher": {"event": "bash", "command_rx": rx, "warn_once_per": "turn"}}
+    row.update(bk)
+    row.update(extra)
+    return row
+
+
+def strip_books(rows: list) -> list:
+    """The same book as an unmigrated backend would serve it."""
+    return [{k: v for k, v in r.items() if k not in ("rulebook_id", "rulebook")} for r in rows]
+
+
+ORG = book("bk-org", "XTrace org policy", "all_org", 12)
+TEAM = book("bk-team", "Backend Rulebook", "explicit", 3)
+PAIR = book("bk-pair", "Pairing notes", "explicit", 2)
+
+
+def test_to_hook_rule_carries_the_facts() -> None:
+    r = hook.to_hook_rule(server_rule("r1", "danger", "no", TEAM))
+    check("server row keeps rulebook_id", r["_rulebook_id"] == "bk-team")
+    check("server row keeps book name", r["_book_name"] == "Backend Rulebook")
+    check("server row keeps scope + member_count",
+          r["_book_scope"] == "explicit" and r["_book_members"] == 3)
+
+    # the pilot shape (an `on` key) is what a cached/test book holds
+    flat = dict({"id": "r2", "on": "bash", "rx": "x", "text": "t"}, **ORG)
+    r2 = hook.to_hook_rule(flat)
+    check("pilot-shape row keeps the facts",
+          r2["_rulebook_id"] == "bk-org" and r2["_book_scope"] == "all_org"
+          and r2["_book_members"] == 12)
+
+    plain = hook.to_hook_rule({"rule_id": "r3", "statement": "s", "delivery": "agent_hook",
+                               "matcher": {"event": "bash", "command_rx": "y"}})
+    check("a pre-container row carries no facts",
+          not any(k.startswith(("_rulebook", "_book")) for k in plain))
+
+    # a matcher key must never be able to forge a wider book
+    forged = server_rule("r4", "danger", "no", PAIR)
+    forged["matcher"]["_book_scope"] = "all_org"
+    forged["matcher"]["_book_members"] = 999
+    f = hook.to_hook_rule(forged)
+    check("a matcher block cannot forge the book facts",
+          f["_book_scope"] == "explicit" and f["_book_members"] == 2)
+
+    junk = hook.to_hook_rule(server_rule("r5", "d", "n", {
+        "rulebook_id": 7, "rulebook": {"scope": "everyone", "member_count": True,
+                                       "name": "bad\x00name"}}))
+    check("junk book facts are dropped, not trusted",
+          "_rulebook_id" not in junk and "_book_scope" not in junk
+          and "_book_members" not in junk and "\x00" not in (junk.get("_book_name") or ""))
+
+
+def test_book_rank() -> None:
+    org = hook.to_hook_rule(server_rule("a", "x", "t", ORG))
+    team = hook.to_hook_rule(server_rule("b", "x", "t", TEAM))
+    pair = hook.to_hook_rule(server_rule("c", "x", "t", PAIR))
+    none_ = hook.to_hook_rule({"rule_id": "d", "statement": "t", "delivery": "agent_hook",
+                               "matcher": {"event": "bash", "command_rx": "x"}})
+    ranked = [r["id"] for r in sorted([pair, team, org], key=hook.book_rank)]
+    check("all_org outranks explicit, then member_count", ranked == ["a", "b", "c"])
+    check("no facts ranks all alike",
+          hook.book_rank(none_) == hook.book_rank(
+              hook.to_hook_rule({"rule_id": "e", "statement": "t", "delivery": "agent_hook",
+                                 "matcher": {"event": "bash", "command_rx": "x"}})))
+    check("no facts is not mistaken for all_org", hook.book_rank(none_) != hook.book_rank(org))
+
+
+def test_wire_shape_has_no_book_dimension() -> None:
+    check("WIRE_KEYS carries no book dimension",
+          not any("rulebook" in k or "book" in k for k in hook.WIRE_KEYS))
+
+
+def test_conflicts_names_the_book() -> None:
+    cand = [{"title": "Never force-push", "delivery": "agent_hook",
+             "matcher": {"event": "bash", "command_rx": "git push --force"}}]
+    existing = [
+        dict({"rule_id": "e1", "title": "Never force-push", "status": "active",
+              "statement": "s"}, **TEAM),
+        dict({"rule_id": "e2", "title": "Something else", "status": "active",
+              "statement": "s"}, **ORG),
+    ]
+    rep = rc_mod.find_conflicts(cand, existing, None, target_rulebook_id="bk-team")
+    hits = rep["candidates"][0]["hits"]
+    check("a title hit names its rulebook",
+          len(hits) == 1 and hits[0]["rulebook"]["name"] == "Backend Rulebook")
+    check("a hit inside the destination book is not cross_book", hits[0]["cross_book"] is False)
+
+    rep2 = rc_mod.find_conflicts(cand, existing, None, target_rulebook_id="bk-org")
+    check("a hit in another book is cross_book",
+          rep2["candidates"][0]["hits"][0]["cross_book"] is True)
+    check("the summary offers no copyable supersede across books",
+          'create_rule supersedes_rule_id=' not in rc_mod._summary(rep2)
+          and 'create_rule supersedes_rule_id="e1"' in rc_mod._summary(rep))
+    check("judge_by_statement rows name their book",
+          any(u.get("rulebook", {}).get("name") == "XTrace org policy"
+              for u in rep2["judge_by_statement"]))
+    check("the report enumerates the books it spans",
+          sorted(b["rulebook_id"] for b in rep["rulebooks"]) == ["bk-org", "bk-team"])
+
+    rep3 = rc_mod.find_conflicts(cand, strip_books(existing), None)
+    check("a pre-container reply still reports hits",
+          len(rep3["candidates"][0]["hits"]) == 1
+          and "rulebook" not in rep3["candidates"][0]["hits"][0]
+          and rep3["rulebooks"] == [])
+
+
+def test_delivery_lanes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "xmem")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/test-branch\n")
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0",
+               "MEMHUB_RULEBOOK_RECALL": "0"}
+
+        # --- the per-call cap spends on the wider book first ---------------
+        # Three books, one command, MAX_ADVISE=2: the pair's rule is the one cut.
+        rows = [server_rule("from-pair", "deploy-now", "Pair advisory", PAIR),
+                server_rule("from-team", "deploy-now", "Team advisory", TEAM),
+                server_rule("from-org", "deploy-now", "Org advisory", ORG)]
+        seed_book(td, "xmem", rows)
+        rc, out = run("pre", {"cwd": repo, "session_id": "s-cap", "tool_name": "Bash",
+                              "tool_input": {"command": "deploy-now"}}, env)
+        text = ctx(out)
+        check("wider books are shown first", rc == 0
+              and text.index("Org advisory") < text.index("Team advisory"), text)
+        check("the narrowest book's rule is the one cut", "Pair advisory" not in text, text)
+
+        ledger = os.path.join(td, "ledger", "fires.jsonl")
+        fires = [json.loads(l) for l in open(ledger, encoding="utf-8")]
+        by_rule = {f["rule_id"]: f for f in fires}
+        check("the cut rule is still ledgered, as suppressed",
+              by_rule["from-pair"]["mode"] == "suppressed", json.dumps(fires))
+        check("a fire records its rulebook locally",
+              by_rule["from-org"]["rulebook_id"] == "bk-org")
+        check("the wire row drops the book dimension",
+              "rulebook_id" not in hook.wire_row(by_rule["from-org"]))
+
+        # --- an unmigrated backend behaves exactly as before ---------------
+        os.makedirs(os.path.join(td, "old"), exist_ok=True)
+        seed_book(td, "xmem", strip_books(rows))
+        env_old = dict(env, MEMHUB_RULEBOOK_BASE=td)
+        _, out_old = run("pre", {"cwd": repo, "session_id": "s-old", "tool_name": "Bash",
+                                 "tool_input": {"command": "deploy-now"}}, env_old)
+        old_text = ctx(out_old)
+        check("no book facts → book order is untouched",
+              old_text.index("Pair advisory") < old_text.index("Team advisory")
+              and "Org advisory" not in old_text, old_text)
+
+        # --- session start: one budget across books, widest first ----------
+        posture = []
+        for i, bk in ((1, PAIR), (2, TEAM), (3, ORG)):
+            for j in range(hook.MAX_POSTURE):
+                posture.append(dict(
+                    {"rule_id": f"p{i}-{j}", "title": f"{i}-{j}", "statement": f"note {i}-{j}",
+                     "status": "active", "delivery": "session_context", "version": 1}, **bk))
+        seed_book(td, "xmem", posture)
+        _, out_s = run("session", {"cwd": repo, "session_id": "s-post"}, env)
+        stext = ctx(out_s)
+        shown = [l for l in stext.splitlines() if l.startswith("- note ")]
+        check("the posture budget is ONE budget across books",
+              len(shown) <= hook.MAX_POSTURE, f"{len(shown)} lines")
+        check("the widest book spends it first",
+              all(l.startswith("- note 3-") for l in shown), "\n".join(shown))
+        check("the roster names each book once",
+              "XTrace org policy (org-wide" in stext and "Backend Rulebook (3 members"
+              in stext and stext.count("Pairing notes") == 1, stext)
+
+        # one book → no roster line, exactly the output a single-book team had
+        seed_book(td, "xmem", [dict(r, **ORG) for r in strip_books(posture[:2])])
+        _, out_one = run("session", {"cwd": repo, "session_id": "s-one"}, env)
+        check("a single book adds no roster line", "- _From " not in ctx(out_one), ctx(out_one))
+
+
+def report() -> int:
+    print()
+    if FAILURES:
+        print(f"{len(FAILURES)} check(s) FAILED: {', '.join(FAILURES)}")
+        return 1
+    print("rulebook container client: all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    for _name in sorted(n for n in dict(globals()) if n.startswith("test_")):
+        globals()[_name]()
+    raise SystemExit(report())

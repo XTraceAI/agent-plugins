@@ -187,6 +187,34 @@ refresh`, async) fetches `get_brain_overview` and writes the cache `brief`
 reads, throttled to once per 6 hours since the digest moves on the order of
 days, not turns.
 
+### Rulebooks
+
+A team rule lives in a **rulebook** — a container with its own membership, not
+a brain and not a document. Whoever is a member of a rulebook has their coding
+agent bound by its active rules; a rulebook can bind an explicit list of people
+or every member of the org, and one person can be in several (their org's book
+plus their team's). Membership is managed in MemHub, not from here: the plugin
+reads it, and the only container it ever creates is one you say yes to.
+
+The `SessionStart` / `PreToolUse` / `PostToolUse` hooks
+(`scripts/rulebook_hook.py`) cache every book that binds you, per repo, and
+inject a matching rule as an advisory at the moment of the call. Two books can
+both fire on one call. When they do, the plugin does **not** pick a winner and
+hide the loser — both fire and both reach the local ledger — but the per-call
+advisory cap and the session-start note budget are spent **widest book first**,
+so an org-wide policy is never crowded out by a two-person book's note. Session
+start names the books in play when there is more than one; in-flight advisories
+stay as short as they were. The server takes no position on any of this: it
+puts each rule's book, scope and member count on the wire and the client
+decides.
+
+Authoring (`/memhub:create-rule`, `/memhub:rules-from-sessions`) resolves which
+book a rule lands in before drafting anything — one visible book is the answer,
+several is a question for you, none is an offer to create one that binds only
+you. The conflict check spans every book you can see, and flags a collision in
+a book you are *not* filing into: nothing you file can supersede that rule, and
+both will fire, so it goes to you as a decision.
+
 ## Skills
 
 Eleven skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
@@ -243,14 +271,16 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   Sharing is read-only, so the room's creator owns revisions; teammates
   propose spec changes through the normal repo/PR flow.
 - `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
-  failure, correction, or procedure and checks for conflicts before saving it.
+  failure, correction, or procedure, resolves which rulebook it lands in (and
+  offers to create one when you have none), and checks it for conflicts across
+  every rulebook you can see before saving it.
 - `/memhub:rules-from-sessions` — one run over your CLAUDE.md **and** your
   past coding sessions (Claude Code, Codex, Cursor): every candidate rule is
   replayed through the real hook, and each proposal says why it exists (the
   CLAUDE.md sentence, or the sessions and your own words), what it cost you,
   and what changes with it on. Hook rules first — at the command, on the
   error, when a name comes up — session-start notes last. Files survivors as
-  `proposed`; never activates anything.
+  `proposed` into the rulebook you pick; never activates anything.
 - `/memhub:pr-babysit [pr-number-or-url]` — usually **auto-armed**, not typed:
   a hook offers to start this as a self-paced loop right after `gh pr
   create` (see PR babysitting below). One pass polls the PR's review bots and
