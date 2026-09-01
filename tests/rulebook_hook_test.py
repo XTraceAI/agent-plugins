@@ -531,6 +531,53 @@ def main() -> int:
         check("override: the reason is redacted before it is recorded or shown",
               "permissionDecision" not in j.get("hookSpecificOutput", {})
               and "ghp_ABCDEFGHIJ" not in json.dumps(j), out)
+        for seg in ("cd /tmp && RULEBOOK_OVERRIDE='cd first' git push --force origin main",
+                    "git fetch origin; RULEBOOK_OVERRIDE='after semicolon' git push --force origin main",
+                    "echo a\nRULEBOOK_OVERRIDE='on line two' git push --force origin main"):
+            rc, out = run("pre", dict(base, tool_input={"command": seg}), genv)
+            j = outj(out)
+            check("override: recognised at the start of the blocked SEGMENT, not only the command: %s" % seg[:22],
+                  "permissionDecision" not in j.get("hookSpecificOutput", {})
+                  and "overridden" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={"command": "echo \"RULEBOOK_OVERRIDE='x' git push --force origin main\""}), genv)
+        j = outj(out)
+        check("override: the variable inside a quoted ARGUMENT is not an override (the gate still denies)",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+              and "overridden" not in j.get("systemMessage", ""), out)
+        for quoted in ("echo 'a|RULEBOOK_OVERRIDE=x git push --force origin main'",
+                       "echo \"(RULEBOOK_OVERRIDE='x' git push --force origin main)\"",
+                       "printf '%s' \"x;RULEBOOK_OVERRIDE=\\\"why\\\" git push --force origin main\""):
+            rc, out = run("pre", dict(base, tool_input={"command": quoted}), genv)
+            j = outj(out)
+            check("override: a segment boundary INSIDE quotes is data, not an override — still denied: %s" % quoted[:20],
+                  j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+                  and "overridden" not in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "true|RULEBOOK_OVERRIDE= x; RULEBOOK_OVERRIDE='the real one' git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: an earlier EMPTY override does not shadow the real one",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "the real one" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "cat > note.txt <<'EOF'\nit's got an apostrophe\nEOF\nRULEBOOK_OVERRIDE='after heredoc' git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: an apostrophe inside a HEREDOC body cannot hide a later real override",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "after heredoc" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={"command": "echo it's | RULEBOOK_OVERRIDE='x' git push --force origin main"}), genv)
+        check("override: an unbalanced quote is a parse error → no override, gate stands (fail closed)",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "RULEBOOK_OVERRIDE='why' git commit -m 'note about RULEBOOK_OVERRIDE=secret handling' && git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: only the validated token is stripped — a look-alike inside a quoted argument stays",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}) and "[why]" not in j.get("systemMessage", "")
+              and "overridden" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "git fetch origin \\\n  && RULEBOOK_OVERRIDE='cont' git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: on a backslash-continued line it is honoured AND the token is still stripped",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}) and "overridden" in j.get("systemMessage", ""), out)
         rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
         check("override: the variable name inside an argument is not an override, and matches no gate",
               out.strip() == "", out)
@@ -545,11 +592,20 @@ def main() -> int:
             rows = [json.loads(l) for l in f if l.strip()]
         gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
         check("ledger: blocked, overridden and empty-override calls are all mode=gate fires",
-              len(gate_rows) == 7 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
+              len(gate_rows) == 19 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
         reasons = [r.get("override_reason") for r in gate_rows]
         check("ledger: override_reason only on the overridden fires, secrets redacted",
               reasons[:3] == [None, None, "hotfix, approved by lead"] and reasons[3:6] == [None] * 3
-              and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6], str(reasons))
+              and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6]
+              and reasons[7:] == ["cd first", "after semicolon", "on line two", None,
+                                  None, None, None, "the real one", "after heredoc", None, "why", "cont"], str(reasons))
+        cont = [r for r in gate_rows if r.get("override_reason") == "cont"][0]
+        check("ledger: the continued-line token was stripped before rules matched (excerpt has no assignment)",
+              "RULEBOOK_OVERRIDE=" not in cont["excerpt"], cont["excerpt"])
+        look_alike = [r for r in gate_rows if r.get("override_reason") == "why"][0]
+        check("ledger: the excerpt rules matched kept the quoted look-alike intact and lost only the real token",
+              "RULEBOOK_OVERRIDE=secret handling" in look_alike["excerpt"]
+              and "RULEBOOK_OVERRIDE='why'" not in look_alike["excerpt"], look_alike["excerpt"])
         check("ledger: advisory fire stays mode=advise",
               [r["mode"] for r in rows if r["rule_id"] == "adv"] == ["advise"])
         check("ledger: override_reason crosses the wire",
