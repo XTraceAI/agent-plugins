@@ -544,6 +544,20 @@ def main() -> int:
         check("override: the variable inside a quoted ARGUMENT is not an override (the gate still denies)",
               j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
               and "overridden" not in j.get("systemMessage", ""), out)
+        for quoted in ("echo 'a|RULEBOOK_OVERRIDE=x git push --force origin main'",
+                       "echo \"(RULEBOOK_OVERRIDE='x' git push --force origin main)\"",
+                       "printf '%s' \"x;RULEBOOK_OVERRIDE=\\\"why\\\" git push --force origin main\""):
+            rc, out = run("pre", dict(base, tool_input={"command": quoted}), genv)
+            j = outj(out)
+            check("override: a segment boundary INSIDE quotes is data, not an override — still denied: %s" % quoted[:20],
+                  j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+                  and "overridden" not in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "true|RULEBOOK_OVERRIDE= x; RULEBOOK_OVERRIDE='the real one' git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: an earlier EMPTY override does not shadow the real one",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "the real one" in j.get("systemMessage", ""), out)
         rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
         check("override: the variable name inside an argument is not an override, and matches no gate",
               out.strip() == "", out)
@@ -558,12 +572,13 @@ def main() -> int:
             rows = [json.loads(l) for l in f if l.strip()]
         gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
         check("ledger: blocked, overridden and empty-override calls are all mode=gate fires",
-              len(gate_rows) == 11 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
+              len(gate_rows) == 15 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
         reasons = [r.get("override_reason") for r in gate_rows]
         check("ledger: override_reason only on the overridden fires, secrets redacted",
               reasons[:3] == [None, None, "hotfix, approved by lead"] and reasons[3:6] == [None] * 3
               and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6]
-              and reasons[7:] == ["cd first", "after semicolon", "on line two", None], str(reasons))
+              and reasons[7:] == ["cd first", "after semicolon", "on line two", None,
+                                  None, None, None, "the real one"], str(reasons))
         check("ledger: advisory fire stays mode=advise",
               [r["mode"] for r in rows if r["rule_id"] == "adv"] == ["advise"])
         check("ledger: override_reason crosses the wire",

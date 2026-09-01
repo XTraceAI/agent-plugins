@@ -1019,6 +1019,40 @@ _OVERRIDE_RX = re.compile(
     re.M)
 
 
+def _in_quotes(text, pos):
+    """Is `pos` inside a single- or double-quoted region of `text`? A `|` or
+    `(` inside a quoted argument is data, not a segment boundary — without
+    this, `echo 'a|RULEBOOK_OVERRIDE=x git push --force'` would read as an
+    override and pass the gate."""
+    sq = dq = False
+    i = 0
+    while i < pos:
+        c = text[i]
+        if c == "\\" and not sq:
+            i += 2
+            continue
+        if c == "'" and not dq:
+            sq = not sq
+        elif c == '"' and not sq:
+            dq = not dq
+        i += 1
+    return sq or dq
+
+
+def find_override(cmd):
+    """The first RULEBOOK_OVERRIDE assignment that starts a shell segment
+    OUTSIDE quotes and carries a non-empty reason → (reason, start, end);
+    else None. Every candidate is tried, so an earlier empty or quoted one
+    cannot shadow the real override further along."""
+    for m in _OVERRIDE_RX.finditer(cmd):
+        if _in_quotes(cmd, m.start("assign")):
+            continue
+        reason = (m.group("a") or m.group("b") or m.group("c") or "").strip()
+        if reason:
+            return reason, m.start("assign"), m.end("assign")
+    return None
+
+
 def emit(event_name, text, *, user_line=None, deny=None):
     """One JSON document on stdout. `text` reaches the agent (additionalContext);
     `user_line` reaches the USER (systemMessage — the one field the terminal
@@ -1240,12 +1274,11 @@ def main():
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
     override_reason = None            # §5.3: set only by the RULEBOOK_OVERRIDE prefix
     if cmd:
-        m = _OVERRIDE_RX.search(cmd)
-        reason = (m.group("a") or m.group("b") or m.group("c") or "").strip() if m else ""
-        if reason:                    # an empty reason is no override — the gate stands
+        found = find_override(cmd)    # an empty or quoted one is no override — the gate stands
+        if found:
+            reason, start, end = found
             override_reason = redact_secrets(reason)[:2000]
-            # rules match the command, not the assignment: drop just that token
-            cmd = cmd[:m.start("assign")] + cmd[m.end("assign"):]
+            cmd = cmd[:start] + cmd[end:]   # rules match the command, not the assignment
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
