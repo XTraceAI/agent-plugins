@@ -199,11 +199,25 @@ def test_a_skill_that_shares_can_call_every_tool_that_takes() -> None:
         "list_teammates",    # fallback: resolve each teammate
         "share_agent_brain", # fallback: grant them one at a time
     }
-    sharers = [p for p in SKILLS
-               if BULK_SHARE in p.read_text(encoding="utf-8").split("\n---\n", 1)[-1]]
-    check("some skill actually performs the workspace share", bool(sharers))
-    for path in sharers:
+
+    # A skill counts as a sharer from EITHER direction, because each catches a
+    # different way the path breaks:
+    #   body-only  → prose instructs a call the allowlist forbids (a silent
+    #                no-op at runtime — the trap this whole test exists for);
+    #   allowlist  → the tool is reachable, so the skill can share whether or
+    #                not today's prose says so, and the rest of the path
+    #                (workspace lookup, per-person fallback) must be reachable
+    #                too. Detecting on the body alone would let a skill that
+    #                allowlists the tool without body prose skip the check.
+    sharers = []
+    for path in SKILLS:
+        body = path.read_text(encoding="utf-8").split("\n---\n", 1)[-1]
         listed = {tool for _, tool in _allowed_tools(path)}
+        if BULK_SHARE in body or BULK_SHARE in listed:
+            sharers.append((path, body, listed))
+
+    check("some skill actually performs the workspace share", bool(sharers))
+    for path, body, listed in sharers:
         for tool in sorted(needed):
             check(f"{path.parent.name} can call {tool}", tool in listed)
 
