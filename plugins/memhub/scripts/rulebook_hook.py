@@ -1003,13 +1003,20 @@ def result_text(resp):
 
 BRAND = "XTrace"
 # `RULEBOOK_OVERRIDE='<why>' <command>` — a shell env-assignment prefix, so the
-# command still runs as typed; the hook only reads the reason and strips it
-# before matching. Anchored at the start: a grep whose ARGUMENT mentions the
-# variable is not an override. An EMPTY reason is not an override either
-# (`RULEBOOK_OVERRIDE= git push --force` stays gated): the reason is the
-# whole price of passing a gate, and it crosses the wire, so it is run
+# command still runs as typed; the hook only reads the reason and strips the
+# assignment before matching. Recognised at the start of the command OR of
+# any shell segment (after `&&`, `;`, `|`, `(`, a newline): the agent writes
+# `cd repo && RULEBOOK_OVERRIDE='why' git push`, and the gate it is
+# answering fired on that segment (found live, e2e 2026-09-01 — the
+# start-only anchor left the override unread and the call blocked). A grep
+# whose ARGUMENT mentions the variable is still not an override: the token
+# after `grep` is not at a segment start. An EMPTY reason is not an override
+# either (`RULEBOOK_OVERRIDE= git push --force` stays gated): the reason is
+# the whole price of passing a gate, and it crosses the wire, so it is run
 # through `redact_secrets` like everything else that leaves the machine.
-_OVERRIDE_RX = re.compile(r"^\s*RULEBOOK_OVERRIDE=(?:'([^']*)'|\"([^\"]*)\"|(\S*))\s+")
+_OVERRIDE_RX = re.compile(
+    r"(?:^|[;&|(]\s*)(?P<assign>RULEBOOK_OVERRIDE=(?:'(?P<a>[^']*)'|\"(?P<b>[^\"]*)\"|(?P<c>\S*))\s+)",
+    re.M)
 
 
 def emit(event_name, text, *, user_line=None, deny=None):
@@ -1233,11 +1240,12 @@ def main():
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
     override_reason = None            # §5.3: set only by the RULEBOOK_OVERRIDE prefix
     if cmd:
-        m = _OVERRIDE_RX.match(cmd)
-        reason = (m.group(1) or m.group(2) or m.group(3) or "").strip() if m else ""
+        m = _OVERRIDE_RX.search(cmd)
+        reason = (m.group("a") or m.group("b") or m.group("c") or "").strip() if m else ""
         if reason:                    # an empty reason is no override — the gate stands
             override_reason = redact_secrets(reason)[:2000]
-            cmd = cmd[m.end():]       # rules match the command, not the prefix
+            # rules match the command, not the assignment: drop just that token
+            cmd = cmd[:m.start("assign")] + cmd[m.end("assign"):]
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
