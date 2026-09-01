@@ -1045,14 +1045,26 @@ def _raw_token(line, reason):
 
 
 def strip_override(cmd, found):
-    """`cmd` with exactly the validated assignment removed — the token on the
-    line find_override read it from, nothing else. A look-alike inside a
-    quoted argument elsewhere (`-m 'about RULEBOOK_OVERRIDE=…'`) is data the
-    rules must still see intact."""
-    _, line, raw = found
-    if not raw or line not in cmd:
-        return cmd
-    return cmd.replace(line, line.replace(raw, "", 1), 1)
+    """`cmd` with exactly the validated assignment removed — nothing else. A
+    look-alike inside a quoted argument elsewhere (`-m 'about
+    RULEBOOK_OVERRIDE=…'`) is data the rules must still see intact.
+
+    Preferred: the token on the line find_override read it from, when that
+    line occurs verbatim in `cmd`. Otherwise (the line was a joined `\\`
+    continuation, so it differs from the raw text) the first raw token whose
+    shlex value IS the validated reason — a look-alike with a different value
+    is never touched. Either way, one occurrence."""
+    reason, line, raw = found
+    if raw and line in cmd:
+        return cmd.replace(line, line.replace(raw, "", 1), 1)
+    for m in _OVERRIDE_TOKEN_RX.finditer(cmd):
+        try:
+            val = shlex.split(m.group(0))[0][len(_OVERRIDE_PREFIX):]
+        except (ValueError, IndexError):
+            continue
+        if val.strip() == reason:
+            return cmd[:m.start()] + cmd[m.end():]
+    return cmd
 
 
 def find_override(cmd):
