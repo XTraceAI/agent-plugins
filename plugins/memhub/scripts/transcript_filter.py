@@ -185,12 +185,19 @@ def _elide_record(record, max_bytes: int):
          if isinstance(b, dict) and b.get("type") == "tool_result"),
         key=lambda i: _size(blocks[i].get("content")), reverse=True,
     )
+    # Running total, not re-serialized per block: swapping one block for its
+    # note changes the record's size by exactly the difference between the two
+    # (the delimiters around it are unchanged), so the arithmetic is exact and
+    # the 5 MB record is serialized once instead of once per result.
+    total = _size(out)
     for i in results:
-        if _size(out) <= max_bytes:
+        if total <= max_bytes:
             break
         block = blocks[i]
-        blocks[i] = {**block, "content": _elision_note(
+        note = {**block, "content": _elision_note(
             _size(block.get("content")), block.get("tool_use_id"))}
+        total += _size(note) - _size(block)
+        blocks[i] = note
     if blocks == content and len(out) == len(record):
         return record  # nothing elided and no mirror to drop: untouched
     return out

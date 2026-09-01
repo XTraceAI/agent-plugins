@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from transcript_filter import (  # noqa: E402
     MAX_TOOL_RESULT_BYTES,
+    _elision_note,
     drop_command_wrappers,
     elide_oversized_tool_results,
     is_command_wrapper,
@@ -286,6 +287,19 @@ check("the largest results are elided first, and only as many as needed",
 check("the smaller results survive verbatim",
       blocks[0]["content"] == "a" * 4000 and blocks[2]["content"] == "a" * 1000)
 check("the multi-result input is not mutated", many == before)
+# The fit check keeps a running total instead of re-serializing. Prove it
+# agrees with a real serialization to the byte: a ceiling of exactly the size
+# of "6k elided alone" must stop there, and one byte less must take 5k too.
+one = copy.deepcopy(before)
+one["message"]["content"][1]["content"] = _elision_note(size("a" * 6000), "toolu_6k")
+exact = size(one)
+at = elide_oversized_tool_results([many], max_bytes=exact)[0]
+under = elide_oversized_tool_results([many], max_bytes=exact - 1)[0]
+check("the running total matches a real serialization at the boundary",
+      at == one and size(at) == exact)
+check("one byte under the boundary elides the next-largest result",
+      [b["tool_use_id"] for b in under["message"]["content"]
+       if b["content"].startswith("[memhub")] == ["toolu_6k", "toolu_5k"])
 
 # Under the ceiling nothing is touched — not even the mirrors.
 small = tool_result_record("fine", mcp_meta={"result": "fine"}, tool_use_result="fine")
