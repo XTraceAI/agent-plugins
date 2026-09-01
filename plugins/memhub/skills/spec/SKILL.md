@@ -16,7 +16,8 @@ Run spec-driven development on top of MemHub. The model:
   stripped — e.g. `Repo: XTraceAI/agent-plugins`). Resolve it once with
   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show`; when that prints
   nothing, match the name EXACTLY in `list_agent_brains` and reuse what you
-  find — a teammate may have created it — then cache it with `room_map.py set
+  find — a teammate may have created it and shared it with you, and a miss
+  proves nothing — then cache it with `room_map.py set
   --brain-id <id>`. Edge cases (SSH remotes, no remote, worktrees, not a git
   repo) and the create-time rules — resolve before create, required
   description, report where it landed — are in
@@ -52,10 +53,11 @@ Run spec-driven development on top of MemHub. The model:
   index is a byproduct of spec-driven development, not a second chore. The
   map holds **no brain id** (a brain id is account state, not project state):
   the upload script resolves the repo's room itself.
-- Sharing is **read-only**: teammates can search/check/status the room, but
-  uploads into it work only for its creator. The intended flow: the spec
-  owner runs `init`/`revise`; read-only members propose changes by editing
-  the repo file (PR), and the owner lands them as a revision.
+- **What a teammate can do depends on their grant.** A `viewer` can
+  search/check/status the room but not upload into it; a `contributor` can
+  revise. `share_agent_brain` defaults to `viewer`, so assume read-only unless
+  you know otherwise. The intended flow for read-only members: propose changes
+  by editing the repo file (PR), and the owner lands them as a revision.
 
 File uploads ALWAYS go through the helper script (never call the
 `save_artifact` MCP tool directly, never re-emit file contents):

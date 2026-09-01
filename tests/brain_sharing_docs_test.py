@@ -44,9 +44,29 @@ def check(label: str, condition: bool) -> None:
         failures.append(label)
 
 
+MANIFESTS = [
+    ROOT / "plugins" / "memhub" / "plugin.json",
+    ROOT / "plugins" / "memhub" / ".claude-plugin" / "plugin.json",
+    ROOT / "plugins" / "memhub" / ".codex-plugin" / "plugin.json",
+    ROOT / "plugins" / "memhub" / ".cursor-plugin" / "plugin.json",
+    ROOT / "plugins" / "memhub-staging" / ".claude-plugin" / "plugin.json",
+    ROOT / ".claude-plugin" / "marketplace.json",
+]
+
+
 def _prose_files() -> list[Path]:
-    """Everything an agent or a user reads: skills, references, the README."""
-    return SKILLS + sorted((ROOT / "plugins" / "memhub" / "references").glob("*.md")) + [README]
+    """Everything an agent or a user reads.
+
+    The manifests are in here because their `description` is documentation in
+    this repo — one of them carries a paragraph about who can reach a brain —
+    and the Codex guide is what Codex users read instead of the root README.
+    """
+    return (
+        SKILLS
+        + sorted((ROOT / "plugins" / "memhub" / "references").glob("*.md"))
+        + [README, ROOT / "codex" / "README.md"]
+        + [m for m in MANIFESTS if m.exists()]
+    )
 
 
 def _normalized(path: Path) -> str:
@@ -128,6 +148,39 @@ def test_onboard_offers_the_share_and_degrades() -> None:
           "never fail onboarding over this" in text.lower())
 
 
+def test_viewer_is_not_sold_as_a_soft_landing() -> None:
+    """A `viewer` grant does not redirect a teammate's capture — it kills it.
+
+    `flush_turn.py` only strips `agent_brain_id` and retries unrouted when the
+    server says the brain does not exist (`brain_resolve.is_missing_brain`);
+    any other rejection hits `_mark_failure(..., "server_rejected")` and
+    returns. A viewer-shared room is REACHABLE, so the teammate's hooks resolve
+    and cache it, and every flush is then rejected for permission — dropping
+    the turn's memory rather than saving it to personal memory. Docs that call
+    viewer the safe half-measure send users straight into that.
+    """
+    for path in (REPO_BRAIN, next(p for p in SKILLS if p.parent.name == "onboard")):
+        text = _normalized(path)
+        check(f"{path.parent.name}/{path.name} says viewer breaks capture",
+              "breaks their capture" in text)
+        check(f"{path.parent.name}/{path.name} drops the 'lands in personal "
+              f"memory' consolation",
+              "keep landing in personal memory" not in text)
+
+
+def test_the_share_is_scoped_to_the_brains_own_org() -> None:
+    """A brain lives in one org; the caller's default org follows the UI.
+
+    So a bare `list_workspaces` on a multi-org account reads another org's
+    workspaces, and the user approves a workspace name from the wrong org.
+    """
+    for path in (REPO_BRAIN, next(p for p in SKILLS if p.parent.name == "onboard")):
+        text = _normalized(path)
+        check(f"{path.name} threads org_id through the share", "org_id" in text)
+        check(f"{path.name} says why the org must be passed",
+              "last selected in the MemHub app" in text)
+
+
 def test_a_skill_that_shares_can_call_every_tool_that_takes() -> None:
     """The whole sharing path must be reachable, fallback included.
 
@@ -147,7 +200,7 @@ def test_a_skill_that_shares_can_call_every_tool_that_takes() -> None:
         "share_agent_brain", # fallback: grant them one at a time
     }
     sharers = [p for p in SKILLS
-               if BULK_SHARE in p.read_text(encoding="utf-8").split("\n---\n", 2)[-1]]
+               if BULK_SHARE in p.read_text(encoding="utf-8").split("\n---\n", 1)[-1]]
     check("some skill actually performs the workspace share", bool(sharers))
     for path in sharers:
         listed = {tool for _, tool in _allowed_tools(path)}
@@ -171,7 +224,7 @@ def test_only_a_flow_with_a_user_present_performs_the_share() -> None:
 
     for name in ("spec", "pr-babysit"):
         path = next(p for p in SKILLS if p.parent.name == name)
-        body = path.read_text(encoding="utf-8").split("\n---\n", 2)[-1]
+        body = path.read_text(encoding="utf-8").split("\n---\n", 1)[-1]
         check(f"{name} does not perform the workspace share",
               BULK_SHARE not in body)
         check(f"{name} points at onboard for it", "/memhub:onboard" in body)

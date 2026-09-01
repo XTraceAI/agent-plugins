@@ -71,7 +71,8 @@ browser to refresh an expiring token. See `/memhub:login` for the full story.
   The capture paths — the per-turn `Stop` flush, the commit/PR flush, and the
   `SessionEnd` backstop — also resolve the room themselves on a cache miss
   (exact-name lookup, then cached), so they only fall back to personal memory
-  when no brain of this exact name exists yet. Caching here is still what
+  when no brain of this exact name is REACHABLE by that user — a teammate's
+  unshared room is invisible to the hooks just as it is to the lookup above. Caching here is still what
   makes the FIRST capture after onboarding route without a lookup, and
   `--org-id` is what lets captures reach a room outside the caller's default
   org (a brain lives in exactly one org; without it the write fails with
@@ -98,9 +99,16 @@ shares. So an unshared repo room is invisible to every teammate's §1 lookup,
 and the "teammates run `/memhub:onboard` themselves" flow above quietly
 produces N private rooms named `Repo: <org>/<name>` instead of one shared one.
 
-1. `list_workspaces` → take the workspace with `is_default: true` and
+1. `list_workspaces(org_id=<ORG_ID>)` — the `<ORG_ID>` you recorded in §1,
+   the org that owns the brain. Take the workspace with `is_default: true` and
    `is_personal: false`. Every member of the org is in that one, and there is
    exactly one per org. (A personal org has none — jump to the fallback.)
+
+   **Pass the org.** The caller's default org follows whatever was last
+   selected in the MemHub app, so on a multi-org account a bare
+   `list_workspaces` returns a DIFFERENT org's workspaces — and the user would
+   approve a workspace name without realising it belongs to another org.
+   Single-org accounts can omit it.
 2. **Ask before granting.** This hands the whole org access; it is the user's
    call. Name the workspace and get the access level in the same question:
 
@@ -112,8 +120,13 @@ produces N private rooms named `Repo: <org>/<name>` instead of one shared one.
    - **`contributor`** — their capture hooks can write into the room. This is
      what makes it shared team memory, and it is the answer that matches what
      onboarding is for.
-   - **`viewer`** — they can search it, but their own sessions keep landing in
-     personal memory. Say that out loud if they pick it.
+   - **`viewer`** — read-only, and **it breaks their capture**. Say this
+     BEFORE they choose. The room becomes reachable, so their hooks resolve it
+     and cache it as the write target; every flush is then rejected, and
+     because the client only retries unrouted when the server says the brain
+     doesn't exist, the turn's memory is dropped rather than saved to personal
+     memory. Offer it only for someone who should read the room, never for a
+     teammate whose sessions should land in it.
 
    Declined → say the room is private and move on to §2. Never grant anyway.
 3. On yes:
@@ -123,6 +136,7 @@ produces N private rooms named `Repo: <org>/<name>` instead of one shared one.
        agent_brain_id="<ROOM>",
        workspace_id="<default workspace_id>",
        permission="contributor",   # or "viewer", as answered
+       org_id="<ORG_ID>",          # same org as the list_workspaces call
    )
    ```
 
@@ -130,10 +144,11 @@ produces N private rooms named `Repo: <org>/<name>` instead of one shared one.
    later needs a re-run — and it never changes an existing grant, so anyone
    already on the room comes back under `skipped`, which is not a failure.
 
-**Fallback — never fail onboarding over this.** No default workspace, or the
-tool isn't available (a backend older than the release that added it): say the
-room is private in plain words, name the per-person path (`list_teammates`,
-then `share_agent_brain` per teammate), and continue to §2. A wrong or missing
+**Fallback — never fail onboarding over this.** No default workspace, the tool
+isn't available (a backend older than the release that added it), **or the call
+returns any error at all**: say the room is private in plain words, name the
+per-person path (`list_teammates`, then `share_agent_brain` per teammate), and
+continue to §2. Never retry the share. A wrong or missing
 share costs a duplicate room; a failed onboarding costs the user everything.
 
 ## 2. Seed it — ONE substantive session (cross the cold start)

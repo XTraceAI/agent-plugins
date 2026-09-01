@@ -138,17 +138,22 @@ that makes step 2 work for the next person.
 
 ### 3.1 Where a new brain lives
 
-Omit `workspace_id`, so the brain lands in your own personal workspace.
+Omit `workspace_id` and let the server choose the home.
 
-The reason is *not* that this preserves your access — it is that a repo room
-is yours until you decide who else gets it, and the personal workspace is the
-neutral default. **Where a brain lives has nothing to do with who can read
-it.** You are its creator, which makes you admin on it wherever it is homed,
-so nothing about sharing depends on this choice either way.
+Do NOT assume which one that is: with no `workspace_id` the backend resolves a
+tier-aware default — the org's default team workspace on some plans, your
+active teamspace on others, your personal workspace only as a fallback. So
+never tell the user the brain "went to your personal workspace"; say the name
+the create call returns.
 
-Homing it personally costs nothing at share time: only the *target* of a share
-has to be a team workspace. A brain in your personal workspace can be shared
-with the org's shared workspace exactly like any other.
+None of that affects access. **Where a brain lives has nothing to do with who
+can read it.** You are its creator, which makes you admin on it wherever it is
+homed, so nothing about sharing depends on this choice either way — which is
+why omitting is safe rather than merely conventional.
+
+It costs nothing at share time either: only the *target* of a share has to be
+a team workspace. A brain homed anywhere, personal included, can be shared
+with the org's default workspace exactly like any other.
 
 ### 3.2 A brain you just created is readable by you and NOBODY else
 
@@ -176,15 +181,24 @@ in the same breath — this hands a whole org access, which is the user's call,
 not yours:
 
 > Created `Repo: XTraceAI/xmem` — right now only you can read it. Share it
-> with **Shared Workspace** (7 members) so your teammates' rooms resolve to
-> this one? `contributor` lets their sessions capture into it; `viewer` is
-> read-only.
+> with **Shared Workspace** (everyone in the org) so your teammates' rooms
+> resolve to this one? `contributor` lets their sessions capture into it;
+> `viewer` only lets them read.
+
+Name the workspace, not a headcount — `list_workspaces` returns no member
+count, and inventing one is a number the user may act on.
 
 - **`contributor`** — teammates' capture hooks can WRITE into the room. This
-  is what makes it shared team memory rather than a room they can only watch.
-- **`viewer`** — read-only. Their own sessions keep landing in personal
-  memory, so the duplicate-room problem is solved but the shared-capture one
-  is not. Say that when they pick it.
+  is what makes it shared team memory rather than a room they can only watch,
+  and it is the right answer for a repo room.
+- **`viewer`** — read-only, and **it breaks their capture**. Say so before
+  they choose it. A viewer grant makes the room *reachable*, so the teammate's
+  hooks resolve it by name and cache it as their write target — and then every
+  flush is rejected. The client only retries unrouted when the server says the
+  brain does not exist; a permission rejection is not that sentence, so the
+  turn's memory is dropped rather than redirected to personal memory. Viewer
+  is for someone who should read the room, never for a teammate whose sessions
+  should land in it.
 
 On yes:
 
@@ -193,8 +207,17 @@ share_agent_brain_with_workspace(
     agent_brain_id="<ROOM>",
     workspace_id="<the default workspace_id>",
     permission="contributor",   # or "viewer", as answered
+    org_id="<ORG_ID>",          # the org that owns the brain — see below
 )
 ```
+
+**Pass the brain's org to BOTH calls** — `list_workspaces(org_id=…)` and the
+share. A brain lives in exactly one org, but the caller's default org follows
+whatever was last selected in the MemHub app, so omitting it on a multi-org
+account reads the workspaces of some *other* org: at best the share fails, at
+worst it names a workspace the user approves without realising it belongs to a
+different org. It is the same `<ORG_ID>` §4 caches. Single-org accounts can
+omit it.
 
 Two properties worth repeating to the user, because both surprise people:
 
@@ -212,8 +235,12 @@ Two properties worth repeating to the user, because both surprise people:
 - `share_agent_brain_with_workspace` is not available at all (a backend older
   than the release that added it) → same fallback, same one line. Do not retry
   it, and do not stop what you were doing.
+- **The call returns any error at all** — a rejected permission, a personal
+  workspace slipping through the selector, a transient failure → report it in
+  one line, say the room is private, and carry on. Do NOT retry it, and do not
+  let it end the task you were actually doing.
 
-In both cases say the room is private in plain words. Silence here is what
+In every case say the room is private in plain words. Silence here is what
 produces a "shared" room that isn't.
 
 ## 4. Cache the resolution — resolve once, route from then on
@@ -255,7 +282,8 @@ the cache they passed only `namespace` and their memories landed in **personal
 memory, never in the room**. Today the hooks resolve the room themselves on a
 cache miss (`brain_resolve.resolve_repo_brain` does the exact-name lookup and
 caches the answer), so capture only falls back to personal memory when no brain
-of the repo's exact name exists on this backend. The cache is what makes that
+of the repo's exact name is REACHABLE by that user on this backend — a
+teammate's unshared room is invisible to the hooks exactly as it is to §3. The cache is what makes that
 resolution a once-per-repo cost, records the org that owns the room
 (`set --org-id`, needed for writes outside the caller's default org), and
 collapses five skills' worth of independent re-derivation into one answer,

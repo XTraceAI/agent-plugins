@@ -82,6 +82,14 @@ Do exactly this:
    Both are readable immediately — the brief because you just wrote it, the
    session's memory because capture extracted it as the session ran.
 
-If `share_agent_brain` fails on permissions, you don't have contributor
-access to the agent brain — this happens when reusing someone else's agent
-brain instead of creating one in step 2; create your own and retry.
+If `share_agent_brain` fails on permissions, you lack contributor access to
+whichever brain you were sharing — and the fix differs by which one:
+
+- **Step 4 (the handoff brain)** — you created it, so this should not happen;
+  if it does, you reused someone else's brain instead of creating one in step
+  2. Create your own and retry.
+- **Step 5 (the repo room)** — expected, and NOT something to work around.
+  The room is usually a teammate's, shared with you read-only. Do not create a
+  second one: minting another `Repo: <org>/<name>` forks the repo's memory.
+  Say you could only share the handoff brain, and tell the user the room's
+  owner (or `/memhub:onboard`) can share the room itself.

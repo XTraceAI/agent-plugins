@@ -239,19 +239,19 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   memory. Each repo gets **one shared agent brain** (`Repo: <org>/<name>`,
   derived from the git remote) holding ALL its specs alongside reviews, ADRs,
   and imported implementation sessions — share it once (per teammate with
-  `share_agent_brain`, or with a whole workspace at once via
-  `share_agent_brain_with_workspace`) and every current and future spec is
-  visible to them. Homing a brain in a shared workspace does not share it;
-  only an explicit grant does. Each spec is a **versioned artifact** in that
-  room (every revision carries a rationale; versions are
+  `share_agent_brain`, or org-wide via `/memhub:onboard`'s workspace share)
+  and every current and future spec is visible to them. Homing a brain in a
+  shared workspace does not share it; only an explicit grant does. Each spec
+  is a **versioned artifact** in that room (every revision carries a
+  rationale; versions are
   diffable via `diff_artifact_versions`), mirrored by a file in the repo
   (`docs/specs/<slug>.md`); a `spec:<slug>` tag picks it out of the shared
   room. `init` drafts/uploads and shares; `revise` versions with a required
   rationale and reports the diff; `check` detects the spec drifting under
   this session's work (local file vs. artifact lineage); `status` is the
   multiplayer view — repo overview with no topic, per-spec activity with one.
-  Sharing is read-only, so the room's creator owns revisions; teammates
-  propose spec changes through the normal repo/PR flow.
+  A `viewer` grant is read-only, so those teammates propose spec changes
+  through the normal repo/PR flow; a `contributor` can revise directly.
 - `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
   failure, correction, or procedure and checks for conflicts before saving it.
 - `/memhub:rules-from-sessions` — one run over your CLAUDE.md **and** your
