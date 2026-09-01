@@ -170,19 +170,27 @@ def _elide_record(record, max_bytes: int):
     content = message.get("content")
     if not isinstance(content, list):
         return record  # a bare-string message carries no tool result
-    new_blocks = []
-    changed = False
-    for block in content:
-        if (isinstance(block, dict) and block.get("type") == "tool_result"
-                and _size(block.get("content")) > max_bytes):
-            nbytes = _size(block.get("content"))
-            block = dict(block)
-            block["content"] = _elision_note(nbytes, block.get("tool_use_id"))
-            changed = True
-        new_blocks.append(block)
-    mirrors = [k for k in _TOOL_RESULT_MIRRORS if k in record]
-    if not changed and not mirrors:
-        return record
+    blocks = list(content)
     out = {k: v for k, v in record.items() if k not in _TOOL_RESULT_MIRRORS}
-    out["message"] = {**message, "content": new_blocks}
+    out["message"] = {**message, "content": blocks}
+    # Largest tool result first, until the record fits — not just the blocks
+    # that are over the ceiling on their own. A parallel-tool turn lands as ONE
+    # user record carrying several results, and five 150 KB results are as
+    # unsendable as one 750 KB one. Only tool results are ever touched: if the
+    # record is still over after every one of them is a note, the bulk is the
+    # user's own prose or the client's metadata, and it is shipped as-is —
+    # dropping a user message is the asymmetric failure this module refuses.
+    results = sorted(
+        (i for i, b in enumerate(blocks)
+         if isinstance(b, dict) and b.get("type") == "tool_result"),
+        key=lambda i: _size(blocks[i].get("content")), reverse=True,
+    )
+    for i in results:
+        if _size(out) <= max_bytes:
+            break
+        block = blocks[i]
+        blocks[i] = {**block, "content": _elision_note(
+            _size(block.get("content")), block.get("tool_use_id"))}
+    if blocks == content and len(out) == len(record):
+        return record  # nothing elided and no mirror to drop: untouched
     return out

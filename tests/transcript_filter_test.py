@@ -268,6 +268,25 @@ check("only the oversized block is elided",
 check("block order is preserved", [b.get("tool_use_id") for b in blocks[:2]]
       == ["toolu_01XZcpo566U8g1r8mGbFHXzL", "toolu_small"])
 
+# A parallel-tool turn: several results, none over the ceiling alone, the
+# record over it together. Largest go first, and only as many as it takes.
+many = tool_result_record("a" * 4000)
+many["message"]["content"][0]["tool_use_id"] = "toolu_4k"
+for tid, n in (("toolu_6k", 6000), ("toolu_1k", 1000), ("toolu_5k", 5000)):
+    many["message"]["content"].append(
+        {"tool_use_id": tid, "type": "tool_result", "content": "a" * n})
+before = copy.deepcopy(many)
+out = elide_oversized_tool_results([many], max_bytes=CAP)
+blocks = out[0]["message"]["content"]
+elided = [b["tool_use_id"] for b in blocks if b["content"].startswith("[memhub")]
+check("a record of several mid-size results is brought under the ceiling",
+      size(out[0]) <= CAP)
+check("the largest results are elided first, and only as many as needed",
+      elided == ["toolu_6k", "toolu_5k"])
+check("the smaller results survive verbatim",
+      blocks[0]["content"] == "a" * 4000 and blocks[2]["content"] == "a" * 1000)
+check("the multi-result input is not mutated", many == before)
+
 # Under the ceiling nothing is touched — not even the mirrors.
 small = tool_result_record("fine", mcp_meta={"result": "fine"}, tool_use_result="fine")
 out = elide_oversized_tool_results([small], max_bytes=CAP)
