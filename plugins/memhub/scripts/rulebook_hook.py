@@ -65,6 +65,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -1007,49 +1008,49 @@ BRAND = "XTrace"
 # assignment before matching. Recognised at the start of the command OR of
 # any shell segment (after `&&`, `;`, `|`, `(`, a newline): the agent writes
 # `cd repo && RULEBOOK_OVERRIDE='why' git push`, and the gate it is
-# answering fired on that segment (found live, e2e 2026-09-01 — the
-# start-only anchor left the override unread and the call blocked). A grep
-# whose ARGUMENT mentions the variable is still not an override: the token
-# after `grep` is not at a segment start. An EMPTY reason is not an override
-# either (`RULEBOOK_OVERRIDE= git push --force` stays gated): the reason is
-# the whole price of passing a gate, and it crosses the wire, so it is run
+# answering fired on that segment (found live, e2e 2026-09-01 — a start-only
+# anchor left the override unread and the call blocked).
+#
+# Quoting is the SHELL's, not a regex's: the shell-only text (heredoc bodies
+# are data) is tokenised with `shlex` in POSIX mode, so `echo 'a|RULEBOOK_
+# OVERRIDE=x git push'` is one quoted word, an apostrophe in an earlier
+# heredoc cannot flip the state of a later line, and an unbalanced quote is a
+# parse error → no override → the gate stands (fail closed). A grep whose
+# ARGUMENT mentions the variable is not an override: the token after `grep`
+# is not at a segment start. An EMPTY reason is not an override either
+# (`RULEBOOK_OVERRIDE= git push --force` stays gated): the reason is the
+# whole price of passing a gate, and it crosses the wire, so it is run
 # through `redact_secrets` like everything else that leaves the machine.
-_OVERRIDE_RX = re.compile(
-    r"(?:^|[;&|(]\s*)(?P<assign>RULEBOOK_OVERRIDE=(?:'(?P<a>[^']*)'|\"(?P<b>[^\"]*)\"|(?P<c>\S*))\s+)",
-    re.M)
+_OVERRIDE_PREFIX = "RULEBOOK_OVERRIDE="
+# the raw assignment token, for stripping before rules match (quotes intact)
+_OVERRIDE_TOKEN_RX = re.compile(r"RULEBOOK_OVERRIDE=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
 
 
-def _in_quotes(text, pos):
-    """Is `pos` inside a single- or double-quoted region of `text`? A `|` or
-    `(` inside a quoted argument is data, not a segment boundary — without
-    this, `echo 'a|RULEBOOK_OVERRIDE=x git push --force'` would read as an
-    override and pass the gate."""
-    sq = dq = False
-    i = 0
-    while i < pos:
-        c = text[i]
-        if c == "\\" and not sq:
-            i += 2
-            continue
-        if c == "'" and not dq:
-            sq = not sq
-        elif c == '"' and not sq:
-            dq = not dq
-        i += 1
-    return sq or dq
+def _segment_op(tok):
+    return bool(tok) and all(ch in ";&|(" for ch in tok)
 
 
 def find_override(cmd):
-    """The first RULEBOOK_OVERRIDE assignment that starts a shell segment
-    OUTSIDE quotes and carries a non-empty reason → (reason, start, end);
-    else None. Every candidate is tried, so an earlier empty or quoted one
-    cannot shadow the real override further along."""
-    for m in _OVERRIDE_RX.finditer(cmd):
-        if _in_quotes(cmd, m.start("assign")):
+    """The reason of the first `RULEBOOK_OVERRIDE=<why>` that begins a shell
+    segment and is non-empty, else None. Tokenised per line of the shell-only
+    text with shlex (POSIX quoting, operators as their own tokens); a line
+    shlex cannot parse contributes nothing. Every candidate is tried, so an
+    earlier empty or quoted one cannot shadow the real override."""
+    text = re.sub(r"\\\n", " ", shell_only(cmd))        # join continuation lines
+    for line in text.split("\n"):
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            toks = list(lex)
+        except ValueError:                             # unbalanced quoting
             continue
-        reason = (m.group("a") or m.group("b") or m.group("c") or "").strip()
-        if reason:
-            return reason, m.start("assign"), m.end("assign")
+        at_start = True
+        for tok in toks:
+            if at_start and tok.startswith(_OVERRIDE_PREFIX):
+                reason = tok[len(_OVERRIDE_PREFIX):].strip()
+                if reason:
+                    return reason
+            at_start = _segment_op(tok)
     return None
 
 
@@ -1274,11 +1275,10 @@ def main():
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
     override_reason = None            # §5.3: set only by the RULEBOOK_OVERRIDE prefix
     if cmd:
-        found = find_override(cmd)    # an empty or quoted one is no override — the gate stands
-        if found:
-            reason, start, end = found
+        reason = find_override(cmd)   # an empty or quoted one is no override — the gate stands
+        if reason:
             override_reason = redact_secrets(reason)[:2000]
-            cmd = cmd[:start] + cmd[end:]   # rules match the command, not the assignment
+            cmd = _OVERRIDE_TOKEN_RX.sub("", cmd)   # rules match the command, not the assignment
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))

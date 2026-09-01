@@ -558,6 +558,15 @@ def main() -> int:
         check("override: an earlier EMPTY override does not shadow the real one",
               "permissionDecision" not in j.get("hookSpecificOutput", {})
               and "the real one" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "cat > note.txt <<'EOF'\nit's got an apostrophe\nEOF\nRULEBOOK_OVERRIDE='after heredoc' git push --force origin main"}), genv)
+        j = outj(out)
+        check("override: an apostrophe inside a HEREDOC body cannot hide a later real override",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "after heredoc" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={"command": "echo it's | RULEBOOK_OVERRIDE='x' git push --force origin main"}), genv)
+        check("override: an unbalanced quote is a parse error → no override, gate stands (fail closed)",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
         rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
         check("override: the variable name inside an argument is not an override, and matches no gate",
               out.strip() == "", out)
@@ -572,13 +581,13 @@ def main() -> int:
             rows = [json.loads(l) for l in f if l.strip()]
         gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
         check("ledger: blocked, overridden and empty-override calls are all mode=gate fires",
-              len(gate_rows) == 15 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
+              len(gate_rows) == 17 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
         reasons = [r.get("override_reason") for r in gate_rows]
         check("ledger: override_reason only on the overridden fires, secrets redacted",
               reasons[:3] == [None, None, "hotfix, approved by lead"] and reasons[3:6] == [None] * 3
               and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6]
               and reasons[7:] == ["cd first", "after semicolon", "on line two", None,
-                                  None, None, None, "the real one"], str(reasons))
+                                  None, None, None, "the real one", "after heredoc", None], str(reasons))
         check("ledger: advisory fire stays mode=advise",
               [r["mode"] for r in rows if r["rule_id"] == "adv"] == ["advise"])
         check("ledger: override_reason crosses the wire",
