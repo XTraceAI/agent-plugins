@@ -114,18 +114,107 @@ Creating a brain is the last resort, never the first move.
 
 1. Derive the name (§1).
 2. `list_agent_brains` → look for an **exact-name match**. Reuse that
-   `agent_brain_id` if found — a teammate may have created the room, and
-   theirs is the right one.
+   `agent_brain_id` if found — a teammate may have created the room and
+   shared it with you, and theirs is the right one.
 3. No exact match → before creating, run `search_brains` with the repo or
    topic in natural language. An existing brain may hold this subject under
    a different name; prefer it over minting a near-duplicate.
-4. Only when both come back empty: `create_agent_brain` (omit
-   `workspace_id` so it lands in your own workspace and you keep the
-   contributor access that sharing requires).
+4. Only when both come back empty: `create_agent_brain` (omit `workspace_id`
+   — §3.1), and then **share it** (§3.2), or you have just created the
+   duplicate the next step warns about.
 
 Duplicate brains are the main way a MemHub org degrades: cross-brain routing
 ranks brains by their overview, so several near-identical rooms on one
 subject make the right one harder to find for every future search.
+
+**Two lookups coming back empty does NOT prove the room doesn't exist.** Both
+of them see only brains you can already reach — ones you created, and ones
+explicitly shared with you. Being in the workspace a brain lives in reaches
+nothing. So a teammate's repo room that was never shared is invisible to step
+2 AND step 3, and every teammate in turn falls through to step 4 and mints
+their own copy of the same room, each capturing into a room the others cannot
+read. That is why §3.2 is not optional politeness — it is the half of creation
+that makes step 2 work for the next person.
+
+### 3.1 Where a new brain lives
+
+Omit `workspace_id`, so the brain lands in your own personal workspace.
+
+The reason is *not* that this preserves your access — it is that a repo room
+is yours until you decide who else gets it, and the personal workspace is the
+neutral default. **Where a brain lives has nothing to do with who can read
+it.** You are its creator, which makes you admin on it wherever it is homed,
+so nothing about sharing depends on this choice either way.
+
+Homing it personally costs nothing at share time: only the *target* of a share
+has to be a team workspace. A brain in your personal workspace can be shared
+with the org's shared workspace exactly like any other.
+
+### 3.2 A brain you just created is readable by you and NOBODY else
+
+Not by the workspace it lives in. Not by your org. Access is the creator plus
+explicit shares, and nothing else. If you report a new repo room as "set up
+for the team" without sharing it, that statement is false in the direction
+nobody notices — everything looks fine and exactly one person can read it.
+
+A repo room is meant to be the team's, so share it with the org's **default
+workspace** — every member of the org is in it, and it is the one
+`list_workspaces` returns with `is_default: true` and `is_personal: false`
+(there is exactly one per org, fixed when the org was created).
+
+**Who actually performs the share.** Granting a whole org access needs a user
+present to approve it, so it belongs to `/memhub:onboard`, which is a
+deliberate setup flow with someone reading the answer. A skill that creates a
+room in the MIDDLE of another task — `/memhub:spec`, `/memhub:pr-babysit`, and
+any automatic capture path — must NOT share on its own: nobody is there to
+consent, and a grant is not a side effect to slip into a babysit pass. Those
+callers do the other half instead: say in one line that the room is private
+and point at `/memhub:onboard`. Everything below is for the flow that shares.
+
+**Confirm before granting.** Name the workspace and ask for the access level
+in the same breath — this hands a whole org access, which is the user's call,
+not yours:
+
+> Created `Repo: XTraceAI/xmem` — right now only you can read it. Share it
+> with **Shared Workspace** (7 members) so your teammates' rooms resolve to
+> this one? `contributor` lets their sessions capture into it; `viewer` is
+> read-only.
+
+- **`contributor`** — teammates' capture hooks can WRITE into the room. This
+  is what makes it shared team memory rather than a room they can only watch.
+- **`viewer`** — read-only. Their own sessions keep landing in personal
+  memory, so the duplicate-room problem is solved but the shared-capture one
+  is not. Say that when they pick it.
+
+On yes:
+
+```
+share_agent_brain_with_workspace(
+    agent_brain_id="<ROOM>",
+    workspace_id="<the default workspace_id>",
+    permission="contributor",   # or "viewer", as answered
+)
+```
+
+Two properties worth repeating to the user, because both surprise people:
+
+- **It is a snapshot, not a live link.** Whoever joins the org afterwards gets
+  nothing; the tool has to be run again to include them.
+- **It never changes an existing grant.** Someone already at `admin` stays at
+  `admin`; the response reports them under `skipped` with a reason rather than
+  failing.
+
+**When it can't be done, degrade — never fail the caller's task over it:**
+
+- No workspace with `is_default: true` comes back (a personal org has none) →
+  say the room is private and name the per-person path: `list_teammates`, then
+  `share_agent_brain` for each teammate.
+- `share_agent_brain_with_workspace` is not available at all (a backend older
+  than the release that added it) → same fallback, same one line. Do not retry
+  it, and do not stop what you were doing.
+
+In both cases say the room is private in plain words. Silence here is what
+produces a "shared" room that isn't.
 
 ## 4. Cache the resolution — resolve once, route from then on
 

@@ -145,7 +145,9 @@ Capture runs on independent paths that all feed one server-side watermark
    repo's own agent brain via a per-user cache at
    `~/.config/memhub-plugin/rooms.json` — resolved once by `/memhub:onboard`
    and read by every writer, capture included; until then, everything lands
-   in personal memory instead of the repo's room.
+   in personal memory instead of the repo's room. A teammate resolves to the
+   SAME room only if it was shared with them — being in the workspace it lives
+   in reaches nothing — which is what `/memhub:onboard` offers at create time.
 
 All of the above authenticate with the plugin's own credential — separate
 from `/mcp`, provisioned by `/memhub:login` (see Install) — because they run
@@ -206,7 +208,12 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   start for a repo: resolves or creates its agent brain, caches the room so
   automatic capture routes there, seeds it from one real session, and proves
   proactive directive recall on the repo's own symbols before reporting an
-  activation funnel.
+  activation funnel. When it CREATES the room it also offers to share it with
+  the org's default workspace (`share_agent_brain_with_workspace`, after
+  confirming the workspace and the access level) — a new brain is readable by
+  its creator alone, and workspace membership grants nothing, so an unshared
+  repo room is invisible to every teammate's lookup and each of them would
+  create a private room of the same name.
 - `/memhub:import-session <id-or-path> [title]` — terminal upload of a past
   session transcript; auto-chunks very large sessions. The ONLY skill that
   imports: live sessions are captured per turn, so importing is for backfill —
@@ -231,9 +238,12 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 - `/memhub:spec <init|revise|check|status>` — spec-driven development on team
   memory. Each repo gets **one shared agent brain** (`Repo: <org>/<name>`,
   derived from the git remote) holding ALL its specs alongside reviews, ADRs,
-  and imported implementation sessions — share it once per teammate and every
-  current and future spec is visible to them. Each spec is a **versioned
-  artifact** in that room (every revision carries a rationale; versions are
+  and imported implementation sessions — share it once (per teammate with
+  `share_agent_brain`, or with a whole workspace at once via
+  `share_agent_brain_with_workspace`) and every current and future spec is
+  visible to them. Homing a brain in a shared workspace does not share it;
+  only an explicit grant does. Each spec is a **versioned artifact** in that
+  room (every revision carries a rationale; versions are
   diffable via `diff_artifact_versions`), mirrored by a file in the repo
   (`docs/specs/<slug>.md`); a `spec:<slug>` tag picks it out of the shared
   room. `init` drafts/uploads and shares; `revise` versions with a required

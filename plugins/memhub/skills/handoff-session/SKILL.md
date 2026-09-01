@@ -29,8 +29,10 @@ Do exactly this:
 
 2. Create the handoff container: `create_agent_brain` with
    `name: "Handoff: <title>"` and a one-line `description` naming who it's
-   from, who it's for, and the topic. Omit `workspace_id` (your own workspace
-   — as creator you keep the contributor access that sharing requires).
+   from, who it's for, and the topic. Omit `workspace_id` — that chooses where
+   the brain lives, not who can read it, and you are its creator (so admin on
+   it) wherever it is homed. Either way it is readable by you alone until
+   step 4 shares it; putting it in a shared workspace would NOT share it.
 
 3. Write the handoff brief and save it with `save_artifact` into that agent
    brain (`agent_brain_id` from step 2, `artifact_type: "document"`,

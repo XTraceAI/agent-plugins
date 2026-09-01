@@ -1,7 +1,7 @@
 ---
 description: Use when a new user wants to set up MemHub / an agent brain for their repo, or asks to "onboard", "get started", "set up my brain", or "seed a brain from my work". Crosses the empty-brain cold start — creates the repo's agent brain, seeds it from a real Claude Code session, shows the compiled overview, and proves proactive recall on the repo's own symbols — then reports an activation funnel.
 argument-hint: [session-id-or-path]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__refresh_brain_overview, mcp__plugin_memhub_memhub__recall_directives, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub_memhub__ingest_document_from_url, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__refresh_brain_overview, mcp__plugin_memhub-staging_memhub__recall_directives, mcp__plugin_memhub-staging_memhub__search_brains, mcp__plugin_memhub-staging_memhub__ingest_document_from_url, mcp__plugin_memhub-staging_memhub__list_orgs
+allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__refresh_brain_overview, mcp__plugin_memhub_memhub__recall_directives, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub_memhub__ingest_document_from_url, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub_memhub__list_workspaces, mcp__plugin_memhub_memhub__share_agent_brain_with_workspace, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__refresh_brain_overview, mcp__plugin_memhub-staging_memhub__recall_directives, mcp__plugin_memhub-staging_memhub__search_brains, mcp__plugin_memhub-staging_memhub__ingest_document_from_url, mcp__plugin_memhub-staging_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_workspaces, mcp__plugin_memhub-staging_memhub__share_agent_brain_with_workspace, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__share_agent_brain
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -45,9 +45,14 @@ browser to refresh an expiring token. See `/memhub:login` for the full story.
 - Derive the room name from the repo: `Repo: <org>/<name>` from
   `git remote get-url origin` (host + `.git` stripped).
 - `list_agent_brains` → **exact-name match**. Reuse the existing id if found (a
-  teammate may have created it). **Only** `create_agent_brain` when there is no
-  exact match — do NOT mint a second room for a repo that already has one, and
-  give it a real one-line description.
+  teammate may have created it and shared it with you). **Only**
+  `create_agent_brain` when there is no exact match — do NOT mint a second room
+  for a repo that already has one, and give it a real one-line description.
+- **A miss is not proof the room doesn't exist.** That listing shows only
+  brains you created or were explicitly shared on — workspace membership
+  reaches nothing — so a teammate's unshared room is invisible here. That cuts
+  both ways, which is why §1.5 exists: sharing what you create is what makes
+  the NEXT teammate's lookup find it instead of minting a third room.
 - Edge cases (SSH remotes, no remote, worktrees, **not a git repo at all**) and
   the full create-time rules are in
   `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
@@ -73,12 +78,63 @@ browser to refresh an expiring token. See `/memhub:login` for the full story.
   "Agent brain not found" in multi-org accounts, and the entry gets re-probed).
   It writes to `~/.config/memhub-plugin/rooms.json` — the user's own config,
   never the repo — and covers every worktree of this repo. Teammates run
-  `/memhub:onboard` once themselves.
+  `/memhub:onboard` once themselves — which lands them in THIS room only if
+  §1.5 shared it; otherwise their exact-name lookup misses and each of them
+  creates a private room of the same name.
 
   Automatic capture needs **both** halves: the room (cached here, or resolved
   by the hooks) says *where* to write, and the key from §0 is *what*
   authenticates the write. Neither alone is enough, and each fails differently
   — a missing room writes to the wrong place, a missing key writes nowhere.
+
+## 1.5 Share the room, or every teammate creates their own
+
+**Only do this when you CREATED the room in §1.** Reused an existing one →
+skip; it is already shared with you, and re-sharing it is not yours to decide.
+
+A brain you just created is readable by you and nobody else. Not by the
+workspace it lives in, not by your org — access is the creator plus explicit
+shares. So an unshared repo room is invisible to every teammate's §1 lookup,
+and the "teammates run `/memhub:onboard` themselves" flow above quietly
+produces N private rooms named `Repo: <org>/<name>` instead of one shared one.
+
+1. `list_workspaces` → take the workspace with `is_default: true` and
+   `is_personal: false`. Every member of the org is in that one, and there is
+   exactly one per org. (A personal org has none — jump to the fallback.)
+2. **Ask before granting.** This hands the whole org access; it is the user's
+   call. Name the workspace and get the access level in the same question:
+
+   > `Repo: XTraceAI/xmem` is created, and right now only you can read it.
+   > Share it with **Shared Workspace** so your teammates' onboarding finds
+   > this room instead of making their own? `contributor` lets their sessions
+   > capture into it — `viewer` is read-only.
+
+   - **`contributor`** — their capture hooks can write into the room. This is
+     what makes it shared team memory, and it is the answer that matches what
+     onboarding is for.
+   - **`viewer`** — they can search it, but their own sessions keep landing in
+     personal memory. Say that out loud if they pick it.
+
+   Declined → say the room is private and move on to §2. Never grant anyway.
+3. On yes:
+
+   ```
+   share_agent_brain_with_workspace(
+       agent_brain_id="<ROOM>",
+       workspace_id="<default workspace_id>",
+       permission="contributor",   # or "viewer", as answered
+   )
+   ```
+
+   Report `granted_count` by name. It is a **snapshot** — whoever joins the org
+   later needs a re-run — and it never changes an existing grant, so anyone
+   already on the room comes back under `skipped`, which is not a failure.
+
+**Fallback — never fail onboarding over this.** No default workspace, or the
+tool isn't available (a backend older than the release that added it): say the
+room is private in plain words, name the per-person path (`list_teammates`,
+then `share_agent_brain` per teammate), and continue to §2. A wrong or missing
+share costs a duplicate room; a failed onboarding costs the user everything.
 
 ## 2. Seed it — ONE substantive session (cross the cold start)
 Seed from **exactly one** session, not many. One is enough to fire recall + get a

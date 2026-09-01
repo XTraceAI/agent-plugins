@@ -102,9 +102,13 @@ we" → status) and treat all of `$ARGUMENTS` as its arguments.
 Every subcommand starts by **resolving the repo's room**: derive the name as
 above, then match it EXACTLY in `list_agent_brains` — it may be one a
 teammate created and shared with you; use theirs rather than creating a
-duplicate. Only `init` creates it when missing (`create_agent_brain`, omit
-`workspace_id` — you need creator access to share it); the other subcommands
-stop and point at init if no room exists. Not a git repo → ask which agent
+duplicate — a miss means only that no room of that name is shared with YOU,
+not that none exists. Only `init` creates it when missing
+(`create_agent_brain`, omit `workspace_id` — that chooses where the brain
+lives, not who can read it; you are its creator either way). A room you create
+here is readable by you alone until it is shared, so say so and point at
+`/memhub:onboard` for the team-wide share. The other subcommands stop and
+point at init if no room exists. Not a git repo → ask which agent
 brain to use.
 
 ## init `[file-path | title...] [for <teammates>]`
