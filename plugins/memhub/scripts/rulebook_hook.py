@@ -1022,7 +1022,8 @@ BRAND = "XTrace"
 # whole price of passing a gate, and it crosses the wire, so it is run
 # through `redact_secrets` like everything else that leaves the machine.
 _OVERRIDE_PREFIX = "RULEBOOK_OVERRIDE="
-# the raw assignment token, for stripping before rules match (quotes intact)
+# the raw assignment token (quotes intact), used to strip exactly the one
+# token find_override validated — never every look-alike in the command
 _OVERRIDE_TOKEN_RX = re.compile(r"RULEBOOK_OVERRIDE=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
 
 
@@ -1030,12 +1031,36 @@ def _segment_op(tok):
     return bool(tok) and all(ch in ";&|(" for ch in tok)
 
 
+def _raw_token(line, reason):
+    """The raw text of the assignment on `line` whose shlex value is `reason`
+    (quotes intact, trailing space included), or None."""
+    for m in _OVERRIDE_TOKEN_RX.finditer(line):
+        try:
+            val = shlex.split(m.group(0))[0][len(_OVERRIDE_PREFIX):]
+        except (ValueError, IndexError):
+            continue
+        if val.strip() == reason:
+            return m.group(0)
+    return None
+
+
+def strip_override(cmd, found):
+    """`cmd` with exactly the validated assignment removed — the token on the
+    line find_override read it from, nothing else. A look-alike inside a
+    quoted argument elsewhere (`-m 'about RULEBOOK_OVERRIDE=…'`) is data the
+    rules must still see intact."""
+    _, line, raw = found
+    if not raw or line not in cmd:
+        return cmd
+    return cmd.replace(line, line.replace(raw, "", 1), 1)
+
+
 def find_override(cmd):
-    """The reason of the first `RULEBOOK_OVERRIDE=<why>` that begins a shell
-    segment and is non-empty, else None. Tokenised per line of the shell-only
-    text with shlex (POSIX quoting, operators as their own tokens); a line
-    shlex cannot parse contributes nothing. Every candidate is tried, so an
-    earlier empty or quoted one cannot shadow the real override."""
+    """(reason, line, raw_token) for the first `RULEBOOK_OVERRIDE=<why>` that
+    begins a shell segment and is non-empty, else None. Tokenised per line of
+    the shell-only text with shlex (POSIX quoting, operators as their own
+    tokens); a line shlex cannot parse contributes nothing. Every candidate is
+    tried, so an earlier empty or quoted one cannot shadow the real override."""
     text = re.sub(r"\\\n", " ", shell_only(cmd))        # join continuation lines
     for line in text.split("\n"):
         try:
@@ -1049,7 +1074,7 @@ def find_override(cmd):
             if at_start and tok.startswith(_OVERRIDE_PREFIX):
                 reason = tok[len(_OVERRIDE_PREFIX):].strip()
                 if reason:
-                    return reason
+                    return reason, line, _raw_token(line, reason)
             at_start = _segment_op(tok)
     return None
 
@@ -1275,10 +1300,10 @@ def main():
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
     override_reason = None            # §5.3: set only by the RULEBOOK_OVERRIDE prefix
     if cmd:
-        reason = find_override(cmd)   # an empty or quoted one is no override — the gate stands
-        if reason:
-            override_reason = redact_secrets(reason)[:2000]
-            cmd = _OVERRIDE_TOKEN_RX.sub("", cmd)   # rules match the command, not the assignment
+        found = find_override(cmd)    # an empty or quoted one is no override — the gate stands
+        if found:
+            override_reason = redact_secrets(found[0])[:2000]
+            cmd = strip_override(cmd, found)   # rules match the command, not the assignment
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
