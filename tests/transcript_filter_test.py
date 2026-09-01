@@ -373,6 +373,27 @@ check("an unsendable tool_use keeps its name with the input summarized",
       size(out[0]) <= HARD_MAX_RECORD_BYTES and blk["name"] == "Write"
       and "elided" in blk["input"])
 
+# Many text blocks, each just over the per-block head: the keep-budget is
+# divided so the summed heads cannot land back over the ceiling.
+crowd = {"type": "user", "uuid": "u11",
+         "message": {"role": "user", "content": [
+             {"type": "text", "text": "w" * 70_000} for _ in range(60)]}}
+out = elide_oversized_tool_results([crowd])
+check("sixty trimmed heads still fit under the hard ceiling",
+      size(out[0]) <= HARD_MAX_RECORD_BYTES)
+check("each kept head is still real content",
+      out[0]["message"]["content"][0]["text"].startswith("www"))
+
+# The note on a hard-trimmed block names the ceiling that cut it, not the
+# 200 KB tool-result cap.
+out = elide_oversized_tool_results([user(HUGE, content_blocks=True)])
+check("a hard-trim note names the hard ceiling",
+      f"{HARD_MAX_RECORD_BYTES:,}-byte" in out[0]["message"]["content"][0]["text"])
+out = elide_oversized_tool_results([tool_result_record(BIG)], max_bytes=CAP)
+check("a soft-elision note still names the soft cap",
+      f"{200_000:,}-byte" in out[0]["message"]["content"][0]["content"]
+      or "200,000-byte" in out[0]["message"]["content"][0]["content"])
+
 # Between the soft and hard ceilings prose still ships whole.
 mid = user("z" * 400_000, content_blocks=True)
 out = elide_oversized_tool_results([mid])
