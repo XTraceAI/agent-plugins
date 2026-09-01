@@ -201,7 +201,13 @@ def _elide_record(record, max_bytes: int):
         block = blocks[i]
         note = {**block, "content": _elision_note(
             _size(block.get("content")), block.get("tool_use_id"))}
-        total += _size(note) - _size(block)
+        saved = _size(block) - _size(note)
+        if saved <= 0:
+            # The note would be no smaller than the result it replaces, and
+            # every remaining result is smaller still: the bulk is elsewhere
+            # (prose), and swapping notes in would only grow the record.
+            break
+        total -= saved
         blocks[i] = note
     if blocks == content and len(out) == len(record):
         return record  # nothing elided and no mirror to drop: untouched

@@ -312,6 +312,14 @@ check("a string-content message loses its oversized mirror",
       and size(out[0]) <= CAP)
 check("the string-content input is not mutated", "mcpMeta" in strmsg)
 
+# Over the ceiling because of PROSE, with a tiny tool result beside it: the
+# note would be larger than the result, so nothing is swapped and the record
+# comes back untouched rather than bigger.
+prosey = tool_result_record("ok")
+prosey["message"]["content"].append({"type": "text", "text": BIG})
+out = elide_oversized_tool_results([prosey], max_bytes=CAP)
+check("a tiny tool result is never replaced by a larger note", out[0] is prosey)
+
 # Under the ceiling nothing is touched — not even the mirrors.
 small = tool_result_record("fine", mcp_meta={"result": "fine"}, tool_use_result="fine")
 out = elide_oversized_tool_results([small], max_bytes=CAP)
