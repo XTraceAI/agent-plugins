@@ -250,6 +250,150 @@ def given_and_scope_checks() -> None:
         check("given.repo.dirty: a clean tree is not dirty", "[pr-dirty]" not in c, c)
 
 
+def bash_edit_checks() -> None:
+    """A Bash call that writes files is an edit. The post lane reads what the
+    command left on disk since the pre lane stamped it and feeds each file
+    through the edit matcher and the ordering engine as a Write — so a
+    `cat > f <<EOF`, a `python - <<PY … write_text()` and a `sed -i` reach
+    an `event: edit` rule, which until 0.43 only the Edit/Write tools did
+    (and in auto mode the model is told not to use them)."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "bashrepo")
+        os.makedirs(os.path.join(repo, "alembic", "versions"))
+        os.makedirs(os.path.join(repo, "src"))
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        with open(os.path.join(repo, "src", "old.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write(".venv/\n")
+        _git(repo, "add", "-A")
+        assert _git(repo, "commit", "-q", "-m", "base").returncode == 0
+        seed_book(td, "bashrepo", [
+            _row("new-table-retention", {"event": "edit", "path_rx": r"alembic/versions/[^/]*\.py$",
+                                         "content_rx": r"create_table\("}),
+            _row("no-bare-ignore", {"event": "edit", "path_rx": r"\.py$",
+                                    "content_rx": r"type:\s*ignore(?!\[)"}),
+            {"id": "tests-before-push", "on": "ordering", "repo_scope": "any",
+             "ordering": {"required_command_rx": r"pytest", "gated_command_rx": r"git\s+push",
+                          "armed_by_events": ["edit", "write"], "min_edits": 1,
+                          "display_name": "the suite"},
+             "text": "Run the suite before pushing", "why": "w"},
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def bash(command, *, session="b1", run_it=True, pre=True, resp=None):
+            """pre → actually run the command → post, the way a session does."""
+            n[0] += 1
+            tid = f"tu{n[0]}"
+            ev = {"cwd": repo, "session_id": session, "tool_name": "Bash", "tool_use_id": tid,
+                  "tool_input": {"command": command}}
+            if pre:
+                run("pre", ev, env)
+            if run_it:
+                r = subprocess.run(command, shell=True, cwd=repo, capture_output=True, text=True)
+                resp = resp or {"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.returncode}
+            return ctx(run("post", dict(ev, tool_response=resp or {"stdout": "", "exit_code": 0}), env)[1])
+
+        mig = "alembic/versions/20260902_user_logins.py"
+        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('user_logins')\nEOF")
+        check("bash-edit: a heredoc-created migration reaches the edit rule",
+              "[new-table-retention]" in c, c)
+        check("bash-edit: the fire names the file the command wrote", mig in c, c)
+
+        c = bash("python3 - <<'PY'\nimport pathlib\np = pathlib.Path('src/old.py')\n"
+                 "p.write_text(p.read_text() + 'y = f()  # type: ignore\\n')\nPY")
+        check("bash-edit: a python write_text() edit reaches the edit rule",
+              "[no-bare-ignore]" in c, c)
+
+        c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && rm -f src/old.py.bak", session="b2")
+        check("bash-edit: sed -i is an edit too — and the complied-with form does not fire",
+              "[no-bare-ignore]" not in c and "[new-table-retention]" not in c, c)
+        c = bash("sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak", session="b2")
+        check("bash-edit: sed -i that reintroduces the pattern fires", "[no-bare-ignore]" in c, c)
+        # git decides what is a candidate, so a write that leaves the file byte-identical
+        # to HEAD is not an edit — nothing changed, nothing to advise on
+        _git(repo, "commit", "-qam", "committed bare ignore")
+        c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak",
+                 session="b2b")
+        check("bash-edit: a write that leaves the file identical to HEAD is not an edit", c.strip() == "", c)
+
+        # a modified file is read as its ADDED lines, a new file whole — what the
+        # Edit and Write tools hand the matcher respectively
+        with open(os.path.join(repo, "src", "big.py"), "w", encoding="utf-8") as f:
+            f.write("a = 1  # type: ignore\nb = 2\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "big has a pre-existing hit")
+        c = bash("printf 'c = 3\\n' >> src/big.py", session="b2c")
+        check("bash-edit: a modified file is read as its added lines — a pre-existing hit does not fire",
+              "[no-bare-ignore]" not in c, c)
+        c = bash("printf 'd = 4  # type: ignore\\n' >> src/big.py", session="b2c")
+        check("bash-edit: an added line that hits does fire", "[no-bare-ignore]" in c, c)
+        c = bash("printf 'e = 5  # type: ignore\\n' > src/fresh.py", session="b2d")
+        check("bash-edit: a new file is read whole", "[no-bare-ignore]" in c, c)
+
+        c = bash("echo hello && ls src", session="b3")
+        check("bash-edit: a command that wrote nothing is silent", c.strip() == "", c)
+
+        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('again')\nEOF")
+        check("bash-edit: the second write of a session-scoped rule is deduped like a Write",
+              "[new-table-retention]" not in c, c)
+
+        # no pre stamp (a host that only wires the post lane) → silent, never a crash
+        c = bash("printf 'z = 1  # type: ignore\\n' > src/nopre.py", session="b4", pre=False)
+        check("bash-edit: without a pre stamp the post lane reads nothing", c.strip() == "", c)
+
+        # a tree rewrite touches files nobody edited
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "wip")
+        _git(repo, "checkout", "-qb", "other")
+        with open(os.path.join(repo, "src", "theirs.py"), "w", encoding="utf-8") as f:
+            f.write("q = 1  # type: ignore\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "theirs")
+        _git(repo, "checkout", "-q", "main")
+        c = bash("git checkout -q other", session="b5")
+        check("bash-edit: a checkout is not an edit (files change, nobody wrote them)",
+              "[no-bare-ignore]" not in c, c)
+
+        # ordering: a Bash-written file arms the obligation, like a Write would
+        wt2 = os.path.join(td, "orepo")
+        os.makedirs(os.path.join(wt2, "src"))
+        assert _git(wt2, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        _git(wt2, "commit", "-q", "--allow-empty", "-m", "base")
+        seed_book(td, "orepo", [
+            {"id": "tests-before-push", "on": "ordering", "repo_scope": "any",
+             "ordering": {"required_command_rx": r"pytest", "gated_command_rx": r"git\s+push",
+                          "armed_by_events": ["edit", "write"], "min_edits": 1,
+                          "display_name": "the suite"},
+             "text": "Run the suite before pushing", "why": "w"}])
+        push = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}}
+        rc, out = run("pre", push, env)
+        check("bash-edit ordering: nothing armed → push silent", out.strip() == "", out)
+        ev = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash", "tool_use_id": "w1",
+              "tool_input": {"command": "cat > src/gate.py <<'EOF'\nx=1\nEOF"}}
+        run("pre", ev, env)
+        subprocess.run(ev["tool_input"]["command"], shell=True, cwd=wt2)
+        run("post", dict(ev, tool_response={"stdout": "", "exit_code": 0}), env)
+        rc, out = run("pre", push, env)
+        check("bash-edit ordering: a heredoc write arms the obligation and the gate names the file",
+              "[tests-before-push]" in ctx(out) and "gate.py" in ctx(out), ctx(out))
+        ev2 = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash", "tool_use_id": "w2",
+               "tool_input": {"command": "printf 'y=2\\n' > src/gate.py && pytest -q"}}
+        run("pre", ev2, env)
+        subprocess.run("printf 'y=2\\n' > src/gate.py", shell=True, cwd=wt2)
+        run("post", dict(ev2, tool_response={"stdout": "1 passed", "exit_code": 0}), env)
+        rc, out = run("pre", push, env)
+        check("bash-edit ordering: edit-then-green-receipt in ONE call discharges (edits are read first)",
+              out.strip() == "", ctx(out))
+
+        # a sibling worktree named in the command is scanned; one that is not, is not
+        sib = os.path.join(td, "sibling-wt")
+        assert _git(repo, "worktree", "add", "-q", "-b", "sib", sib).returncode == 0
+        c = bash(f"cat > {sib}/{mig} <<'EOF'\ndef upgrade():\n    op.create_table('t')\nEOF",
+                 session="b6")
+        check("bash-edit: a write into a sibling worktree the command names is seen",
+              "[new-table-retention]" in c, c)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
@@ -810,6 +954,7 @@ def main() -> int:
               and "24 h" not in ctx(out), out)
 
     given_and_scope_checks()
+    bash_edit_checks()
 
     print()
     if FAILURES:

@@ -198,8 +198,15 @@ reads it, and the only container it ever creates is one you say yes to.
 
 The `SessionStart` / `PreToolUse` / `PostToolUse` hooks
 (`scripts/rulebook_hook.py`) cache every book that binds you, per repo, and
-inject a matching rule as an advisory at the moment of the call. Two books can
-both fire on one call. When they do, the plugin does **not** pick a winner and
+inject a matching rule as an advisory at the moment of the call. An edit rule
+(`event: edit`) sees a file however it was written: through the Edit/Write
+tools before the write, and through a Bash command — `cat > f <<EOF`, a
+`python - <<PY … write_text()`, `sed -i` — right after it, because the
+post-call hook reads what the command left changed on disk (git decides what
+is a candidate, the file's mtime decides what that call touched) and runs the
+same matcher on it. In auto mode the agent is told to write through Bash, so
+without this an edit rule would be silent exactly where it is needed. Two
+books can both fire on one call. When they do, the plugin does **not** pick a winner and
 hide the loser — both fire and both reach the local ledger — but the per-call
 advisory cap and the session-start note budget are spent **widest book first**,
 so an org-wide policy is never crowded out by a two-person book's note. Session
