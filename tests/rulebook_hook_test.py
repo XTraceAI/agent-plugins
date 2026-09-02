@@ -63,7 +63,7 @@ def portability_check() -> None:
             imports.add(node.module.split(".", 1)[0])
     check(
         "portability: rulebook hook uses the shared lock shim, never fcntl directly",
-        "portable_lock" in imports and "fcntl" not in imports,
+        "fcntl" not in imports,
         str(sorted(imports)),
     )
 
@@ -74,7 +74,8 @@ def portability_check() -> None:
             "import importlib.util; "
             f"spec = importlib.util.spec_from_file_location('rulebook_probe', {HOOK!r}); "
             "module = importlib.util.module_from_spec(spec); "
-            "spec.loader.exec_module(module)"
+            "spec.loader.exec_module(module); "
+            "print(module.portable_lock.__file__)"
         )
         imported = subprocess.run(
             [sys.executable, "-c", probe],
@@ -85,8 +86,10 @@ def portability_check() -> None:
         )
         check(
             "portability: embedded import pins the packaged portable_lock",
-            imported.returncode == 0,
-            imported.stderr,
+            imported.returncode == 0
+            and os.path.realpath(imported.stdout.strip())
+            == os.path.realpath(os.path.join(os.path.dirname(HOOK), "portable_lock.py")),
+            imported.stderr or imported.stdout,
         )
 
 

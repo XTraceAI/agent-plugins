@@ -90,6 +90,7 @@ is pure over a Probes, which is how the verifier feeds it fixtures.
 import fnmatch
 import hashlib
 import datetime as _dt
+import importlib.util
 import json
 import os
 import re
@@ -103,11 +104,18 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
-# Hooks execute this file directly, but rules-from-sessions also embeds it via
-# spec_from_file_location. Pin sibling imports to this packaged scripts tree in
-# both modes rather than allowing an ambient working directory to supply them.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import portable_lock  # noqa: E402
+def _load_portable_lock():
+    """Load only the packaged lock shim without broadening module search."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portable_lock.py")
+    spec = importlib.util.spec_from_file_location("_memhub_rulebook_portable_lock", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load portable lock shim from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+portable_lock = _load_portable_lock()
 
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
