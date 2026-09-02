@@ -144,10 +144,16 @@ def frontmatter(text: str) -> str:
 
 def is_candidate(path: Path, size: int | None = None, text: str | None = None) -> tuple[bool, str]:
     """(capture?, reason). Pure so the flush can re-check the on-disk state."""
-    s = str(path)
+    # Match semantic path segments on every host. ``str(WindowsPath)`` uses
+    # backslashes, while the denylist is intentionally slash-delimited.
+    s = str(path).replace("\\", "/")
+    if os.name == "nt":
+        s = s.casefold()
     if path.suffix.lower() != ".md":
         return False, "not markdown"
-    if path.name in VETO_NAMES:
+    name = path.name.casefold() if os.name == "nt" else path.name
+    veto_names = {item.casefold() for item in VETO_NAMES} if os.name == "nt" else VETO_NAMES
+    if name in veto_names:
         return False, f"veto name {path.name}"
     for part in VETO_PARTS:
         if part in s:
