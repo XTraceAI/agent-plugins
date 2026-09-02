@@ -112,7 +112,9 @@ with tempfile.TemporaryDirectory() as td:
         mc.save_state("sess-pre", {"dirty": []})
         check((pre.stat().st_mode & 0o777) == 0o700, "pre-existing wider leaf dir is tightened to 0700")
         mc.STATE_DIR = Path(td) / ".config" / "memhub-plugin" / "mdcapture"
-    check(state["dirty"] == [spec], f"state holds the spec exactly once: {state['dirty']}")
+    canonical_spec = str(Path(spec).resolve())
+    check(state["dirty"] == [canonical_spec],
+          f"state holds the canonical spec exactly once: {state['dirty']}")
     # create-then-edit through a symlinked dir must map to ONE canonical key
     real = Path(td) / "realrepo" / "docs"; real.mkdir(parents=True)
     link = Path(td) / "linkrepo"; link.symlink_to(Path(td) / "realrepo")
