@@ -106,8 +106,13 @@ def book_of(rule: dict) -> dict:
     out: dict = {}
     if isinstance(rid, str) and rid.strip():
         out["rulebook_id"] = rid.strip()
-    if b.get("name"):
-        out["name"] = str(b["name"])[:120]
+    # A book name is typed by a teammate and lands in the agent's context via
+    # this report: one line, no control characters, capped — the same handling
+    # rulebook_hook.py gives server prose. A newline here would let a name
+    # forge a line of the summary below.
+    name = _WS.sub(" ", re.sub(r"[\x00-\x1f\x7f]+", " ", str(b.get("name") or ""))).strip()
+    if name:
+        out["name"] = name[:120]
     return out
 
 
