@@ -137,8 +137,10 @@ def unit_checks() -> None:
 
         repo, root, gitdir, branch = call(container,
                                           file_path=os.path.join(wt, "app", "svc.py"))
+        # repo is the CANONICAL name (the main checkout's) while root stays the
+        # worktree's own path — the split the naming fix introduced.
         check("a file in a worktree decides the checkout from a container cwd",
-              repo == "MainRepo-feature" and root == wt, f"{repo} {root}")
+              repo == "MainRepo" and root == wt, f"{repo} {root}")
         check("the worktree's gitdir points into the MAIN checkout",
               gitdir == os.path.join(main, ".git", "worktrees", "MainRepo-feature"), gitdir)
         check("branch is read from the worktree's own HEAD, not the main one",
@@ -155,8 +157,11 @@ def unit_checks() -> None:
               call(container, command="git push") == ("", "", "", ""))
         check("no tool_input at all (SessionStart) still resolves nothing",
               rb.repo_of_call({"cwd": container}) == ("", "", "", ""))
+        # Assert the PAIR: main and the worktree now share a repo NAME, so a
+        # name-only assertion can no longer tell "resolved into the worktree"
+        # from "resolved into the main checkout".
         check("a cwd inside a checkout is unaffected when no file is named",
-              rb.repo_of_call({"cwd": wt})[0] == "MainRepo-feature")
+              rb.repo_of_call({"cwd": wt})[:2] == ("MainRepo", wt))
 
         # --- the trust boundary ---------------------------------------------
         check("an absolute path OUTSIDE the session cwd is ignored",
@@ -213,7 +218,7 @@ def unit_checks() -> None:
         # process's cwd instead, the answer would depend on where the test ran.
         check("a relative path resolves against the session cwd, not ours",
               call(container, file_path=os.path.join("MainRepo-feature", "app", "svc.py"))[0]
-              == "MainRepo-feature")
+              == "MainRepo")
 
         # --- root stays in the session's path space (OrderingEngine key) -----
         alias = os.path.join(td, "alias")
@@ -223,14 +228,14 @@ def unit_checks() -> None:
             check("root is returned unresolved, so one worktree keys ordering state once",
                   r_alias[1] == os.path.join(alias, "MainRepo-feature"), r_alias[1])
             check("…and it still resolves to the same repo through the alias",
-                  r_alias[0] == "MainRepo-feature", r_alias[0])
+                  r_alias[0] == "MainRepo", r_alias[0])
         except (OSError, NotImplementedError):
             print("SKIP  unresolved-root check (symlinks unavailable)")
 
         # --- untrusted payload strings degrade, never raise -----------------
         newdir = os.path.join(wt, "app", "does", "not", "exist", "yet.py")
         check("a Write naming a directory that does not exist yet walks up to it",
-              call(container, file_path=newdir)[0] == "MainRepo-feature")
+              call(container, file_path=newdir)[:2] == ("MainRepo", wt))
 
         # Judged from INSIDE a checkout, so "degrades to the cwd answer" is a
         # real claim: were the junk to be honoured, or to abort the call, the
@@ -239,18 +244,18 @@ def unit_checks() -> None:
         for bad in ("", "\x00/etc/passwd", "   ", "../" * 40 + "etc/passwd"):
             check(f"a junk file_path degrades to the cwd answer ({bad[:18]!r})",
                   rb.repo_of_call({"cwd": wt, "tool_input": {"file_path": bad}})[0]
-                  == "MainRepo-feature")
+                  == "MainRepo")
         for bad in (None, 123, ["/a/b"], {"p": 1}):
             check(f"a non-string file_path degrades to the cwd answer ({type(bad).__name__})",
                   rb.repo_of_call({"cwd": wt, "tool_input": {"file_path": bad}})[0]
-                  == "MainRepo-feature")
+                  == "MainRepo")
         for bad in ("a string", ["a", "list"], 7, 0, False):
             check(f"a tool_input that is not a dict cannot raise ({type(bad).__name__})",
-                  rb.repo_of_call({"cwd": wt, "tool_input": bad})[0] == "MainRepo-feature")
+                  rb.repo_of_call({"cwd": wt, "tool_input": bad})[0] == "MainRepo")
 
         check("notebook_path is honoured like file_path",
-              call(container, notebook_path=os.path.join(wt, "app", "n.ipynb"))[0]
-              == "MainRepo-feature")
+              call(container, notebook_path=os.path.join(wt, "app", "n.ipynb"))[:2]
+              == ("MainRepo", wt))
         check("a junk file_path does not shadow a good notebook_path",
               rb._acted_on_dir(container, {"file_path": 123,
                                            "notebook_path": os.path.join(wt, "app", "n.ipynb")})
@@ -258,7 +263,7 @@ def unit_checks() -> None:
         check("a file that resolves nowhere falls back to the cwd's checkout",
               rb.repo_of_call({"cwd": wt, "tool_input":
                                {"file_path": os.path.join(outside, "a.py")}})[0]
-              == "MainRepo-feature")
+              == "MainRepo")
 
 
 def hook_checks() -> None:
@@ -283,8 +288,7 @@ def hook_checks() -> None:
         # NAMING layer, not the seeding layer this file covers; these rows
         # prove the call resolves the right checkout, not that the right rules
         # were fetched for it.
-        for name in ("MainRepo", "MainRepo-feature"):
-            seed_book(base, name, [RULE])
+        seed_book(base, "MainRepo", [RULE])   # canonical: one book for the repo
         env = {"MEMHUB_RULEBOOK_BASE": base, "MEMHUB_RULEBOOK_FETCH": "0",
                "MEMHUB_RULEBOOK_RECALL": "0"}
         fp = os.path.join(wt, "app", "message_intent.py")
@@ -327,7 +331,7 @@ def hook_checks() -> None:
 
         # Scope still bites: a rule naming another repo must not fire here.
         base2 = os.path.join(td, "state2")
-        seed_book(base2, "MainRepo-feature", [dict(RULE, _scope_repos=["SomeOtherRepo"])])
+        seed_book(base2, "MainRepo", [dict(RULE, _scope_repos=["SomeOtherRepo"])])
         rc, out = run("pre", {"session_id": "s9", "cwd": container, "tool_name": "Write",
                               "tool_input": {"file_path": fp, "content": BODY}},
                       dict(env, MEMHUB_RULEBOOK_BASE=base2))
