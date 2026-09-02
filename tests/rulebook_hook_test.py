@@ -611,20 +611,24 @@ def main() -> int:
         check("ledger: override_reason crosses the wire",
               rb.wire_row(gate_rows[2]).get("override_reason") == "hotfix, approved by lead")
 
-        # a stale book (>24 h) degrades the gate to advise and says so once
+        # there is no freshness timer: the cached book is the book, however old.
+        # A rule the server retired disappears at the next successful fetch (a
+        # session refreshes its own book once it is an hour old); a stale gate
+        # costs one RULEBOOK_OVERRIDE, a gate that stopped enforcing because the
+        # server was unreachable for a day is the failure a gate exists to prevent.
         import datetime as _dt
         bdir = os.path.join(td, "book")
         bp = os.path.join(bdir, [n for n in os.listdir(bdir) if n.startswith("gaterepo-")][0])
         with open(bp, encoding="utf-8") as f:
             book = json.load(f)
-        book["fetched_at"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=25)).isoformat()
+        book["fetched_at"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)).isoformat()
         with open(bp, "w", encoding="utf-8") as f:
             json.dump(book, f)
-        rc, out = run("pre", dict(push, session_id="g-stale"), genv)
+        rc, out = run("pre", dict(push, session_id="g-stale"), dict(genv, MEMHUB_RULEBOOK_FETCH="0"))
         j = outj(out)
-        check("gate: a book older than 24 h runs the gate as advise (no deny) and says so",
-              "permissionDecision" not in j.get("hookSpecificOutput", {})
-              and "refreshed >24 h ago" in ctx(out), out)
+        check("gate: a month-old cached book still denies — no freshness timer, no degrade note",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+              and "24 h" not in ctx(out), out)
 
     print()
     if FAILURES:
