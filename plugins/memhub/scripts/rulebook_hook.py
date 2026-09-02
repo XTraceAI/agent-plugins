@@ -115,7 +115,12 @@ def _load_portable_lock():
     return module
 
 
-portable_lock = _load_portable_lock()
+try:
+    portable_lock = _load_portable_lock()
+    _PORTABLE_LOCK_LOAD_ERROR = None
+except BaseException as exc:
+    portable_lock = None
+    _PORTABLE_LOCK_LOAD_ERROR = exc
 
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
@@ -1900,6 +1905,10 @@ def session_digest(rules, repo, gitdir, ctx):
 
 
 def main():
+    if portable_lock is None:
+        if os.environ.get("MEMHUB_RULEBOOK_DEBUG"):
+            print(f"portable lock unavailable: {_PORTABLE_LOCK_LOAD_ERROR!r}", file=sys.stderr)
+        return 0
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
         fetch_book(sys.argv[2])

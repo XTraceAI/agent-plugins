@@ -28,6 +28,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,26 @@ def portability_check() -> None:
             and os.path.realpath(imported.stdout.strip())
             == os.path.realpath(os.path.join(os.path.dirname(HOOK), "portable_lock.py")),
             imported.stderr or imported.stdout,
+        )
+
+        incomplete = os.path.join(td, "incomplete")
+        os.mkdir(incomplete)
+        incomplete_hook = os.path.join(incomplete, "rulebook_hook.py")
+        shutil.copy2(HOOK, incomplete_hook)
+        missing_shim = subprocess.run(
+            [sys.executable, incomplete_hook, "pre"],
+            input="{}",
+            cwd=td,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        check(
+            "portability: a missing lock shim fails open and stays silent",
+            missing_shim.returncode == 0
+            and missing_shim.stdout == ""
+            and missing_shim.stderr == "",
+            missing_shim.stderr or missing_shim.stdout,
         )
 
 
