@@ -24,6 +24,7 @@ Run: python3 rulebook_hook_test.py  (stdlib only).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -48,6 +49,23 @@ def run(mode: str, payload: dict, env_extra: dict) -> tuple[int, str]:
     p = subprocess.run([sys.executable, HOOK, mode], input=json.dumps(payload),
                        capture_output=True, text=True, env=env, timeout=30)
     return p.returncode, p.stdout
+
+
+def portability_check() -> None:
+    """The hook must import on native Windows, where ``fcntl`` is absent."""
+    with open(HOOK, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".", 1)[0])
+    check(
+        "portability: rulebook hook uses the shared lock shim, never fcntl directly",
+        "portable_lock" in imports and "fcntl" not in imports,
+        str(sorted(imports)),
+    )
 
 
 def seed_book(base, repo_name, rules):
@@ -251,6 +269,7 @@ def given_and_scope_checks() -> None:
 
 
 def main() -> int:
+    portability_check()
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
         os.makedirs(os.path.join(repo, ".git"))

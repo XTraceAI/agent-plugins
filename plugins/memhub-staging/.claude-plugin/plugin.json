@@ -1,7 +1,7 @@
 {
   "name": "memhub-staging",
   "description": "STAGING build of the MemHub plugin — identical behavior to `memhub` but pointed at the staging backend (api.staging.memhub.xtrace.ai) for MemHub developers iterating on the service. Skills, hooks, and scripts are shared with `memhub` (symlinked), so the two never drift; only the backend URL and OAuth client differ. Install this instead of `memhub` — never both (both register an MCP server named `memhub`).",
-  "version": "0.42.0",
+  "version": "0.42.1",
   "hooks": "./hooks/claude-hooks.json",
   "author": {
     "name": "XTrace",

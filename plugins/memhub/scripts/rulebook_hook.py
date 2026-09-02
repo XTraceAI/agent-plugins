@@ -87,7 +87,6 @@ call, from read-only git and the local transcript; a fact that cannot be
 established never satisfies a predicate, so the rule stays silent. `given_ok()`
 is pure over a Probes, which is how the verifier feeds it fixtures.
 """
-import fcntl
 import fnmatch
 import hashlib
 import datetime as _dt
@@ -101,6 +100,8 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
+
+import portable_lock
 
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
@@ -249,7 +250,7 @@ class OrderingEngine:
         deadline = time.monotonic() + LOCK_WAIT_S
         while True:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                portable_lock.lock_exclusive(lock.fileno(), blocking=False)
                 return lock
             except OSError:
                 if time.monotonic() >= deadline:
@@ -282,7 +283,7 @@ class OrderingEngine:
                 rule_id, {"count": 0, "last_edit": None})["open_fire"] = fire_id
             self._write(st)
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            portable_lock.unlock(lock.fileno())
             lock.close()
 
     def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None):
@@ -339,7 +340,7 @@ class OrderingEngine:
                 return "fired"
             return "allowed"
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            portable_lock.unlock(lock.fileno())
             lock.close()
 
 
@@ -1287,7 +1288,7 @@ def flush_fires(final=False):
     ldir = _ledger_dir()
     lock = open(os.path.join(ldir, ".flush.lock"), "a+", encoding="utf-8")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portable_lock.lock_exclusive(lock.fileno(), blocking=False)
     except OSError:
         lock.close()
         return
@@ -1353,7 +1354,7 @@ def flush_fires(final=False):
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
     finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        portable_lock.unlock(lock.fileno())
         lock.close()
 
 

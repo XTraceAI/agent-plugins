@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -371,6 +372,7 @@ def test_delivery_lanes() -> None:
                     server_rule("org-b", "deploy-now", "Org B", ORG)]
         seed_book(td, "xmem", anchored)
         stub = os.path.join(td, "stub_hook.py")
+        shutil.copy2(os.path.join(SCRIPTS, "portable_lock.py"), td)
         with open(HOOK, encoding="utf-8") as f, open(stub, "w", encoding="utf-8") as g:
             g.write(f.read().replace(          # keep the anchor without a network call
                 "def recall_anchor_rules(repo, tool, handles, already_fired):",
