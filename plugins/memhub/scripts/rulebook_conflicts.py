@@ -183,11 +183,6 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
         hit_ids.update(hits)
         out.append({"title": cand.get("title"), "delivery": cand.get("delivery"),
                     "hits": list(hits.values())})
-    if target_rulebook_id:
-        for c in out:
-            for h in c["hits"]:
-                h["cross_book"] = bool(h.get("rulebook", {}).get("rulebook_id")) and \
-                    h["rulebook"]["rulebook_id"] != target_rulebook_id
     unmatched = [dict({"rule_id": str(r.get("rule_id")), "title": r.get("title"),
                        "status": r.get("status") or "active", "statement": r.get("statement")},
                       **({"rulebook": book_of(r)} if book_of(r) else {}))
@@ -195,6 +190,21 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
     books = sorted({b["rulebook_id"]: b for b in
                     (book_of(r) for r in list(existing) + list(active or []))
                     if b.get("rulebook_id")}.values(), key=lambda b: b.get("name") or "")
+    # Three states, not two. `False` must mean "same book, CONFIRMED", because
+    # it is what licenses the copyable supersede line — so a report that cannot
+    # know says `None` and gets a question instead of an answer. The case that
+    # matters: a migrated backend where the caller forgot --rulebook-id. The
+    # rows carry their books, the hit is very possibly cross-book, and treating
+    # unknown as same-book would hand out the one instruction §7 forbids.
+    for c in out:
+        for h in c["hits"]:
+            rid = h.get("rulebook", {}).get("rulebook_id")
+            if target_rulebook_id and rid:
+                h["cross_book"] = rid != target_rulebook_id
+            elif not books:          # no book anywhere: one implicit book, as before
+                h["cross_book"] = False
+            else:
+                h["cross_book"] = None
     return {"candidates": out, "judge_by_statement": unmatched, "rulebooks": books,
             "target_rulebook_id": target_rulebook_id,
             "active_book": "checked" if active is not None else "unavailable"}
@@ -245,6 +255,10 @@ def _summary(report: dict) -> str:
                 lines.append("    ANOTHER RULEBOOK — supersedes_rule_id cannot reach it. Both books "
                              "bind you, so both rules fire on the same call: tell the user and let a "
                              "human retire one side or narrow its scope.")
+            elif h.get("cross_book") is None:
+                lines.append("    WHICH RULEBOOK? — re-run with --rulebook-id <destination> before "
+                             "superseding anything. supersedes_rule_id reaches a rule in the SAME "
+                             "book only, and this report cannot tell whether it is the same book.")
             elif h["rule_id"]:
                 lines.append(f"    if this is the same rule: create_rule supersedes_rule_id=\"{h['rule_id']}\"")
     if len(report.get("rulebooks") or []) > 1:

@@ -225,6 +225,25 @@ def test_conflicts_names_the_book() -> None:
           "create_rule supersedes_rule_id=" not in rc_mod._summary(rep4))
     check("a non-dict row is data, not a crash", rc_mod.book_of("junk") == {})
 
+    # `False` licenses the copyable supersede line, so it must mean "same book,
+    # CONFIRMED" — never "nobody told me the destination". The live case is a
+    # migrated backend where the caller forgot --rulebook-id.
+    states = {}
+    for label, ex, tgt in (("no target", existing, None),
+                           ("target=same", existing, "bk-team"),
+                           ("target=other", existing, "bk-org"),
+                           ("pre-container", strip_books(existing), None)):
+        r = rc_mod.find_conflicts(cand, ex, None, tgt)
+        states[label] = (r["candidates"][0]["hits"][0]["cross_book"],
+                         "create_rule supersedes_rule_id=" in rc_mod._summary(r))
+    check("an unknown destination is not silently treated as the same book",
+          states["no target"] == (None, False), str(states))
+    check("a confirmed same-book hit still gets its supersede",
+          states["target=same"] == (False, True), str(states))
+    check("a confirmed other-book hit does not", states["target=other"] == (True, False), str(states))
+    check("a pre-container report is unchanged — one implicit book",
+          states["pre-container"] == (False, True), str(states))
+
     rep3 = rc_mod.find_conflicts(cand, strip_books(existing), None)
     check("a pre-container reply still reports hits",
           len(rep3["candidates"][0]["hits"]) == 1
