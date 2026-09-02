@@ -1,23 +1,70 @@
 ---
 description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it as a draft through the memhub `create_rule` tool — always advisory; a reviewer activates it.
-argument-hint: [--brain "<rulebook brain name>"] [the rule, in your own words]
-allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule
+argument-hint: [--rulebook "<name or id>"] [the rule, in your own words]
+allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
 ---
 
 You are creating a **Rulebook rule**: a human-authored, team-owned rule stored
-in MemHub, fetched by every teammate's coding agent once per session, and
-measured on every fire. Rules are data, not prose in a doc — and a rule with a
-loose check fires on innocent commands more often than not, so the check is
-where the care goes.
+in MemHub, fetched once per session by the coding agent of everyone the rule's
+**rulebook** binds, and measured on every fire. Rules are data, not prose in a
+doc — and a rule with a loose check fires on innocent commands more often than
+not, so the check is where the care goes.
 
 There is no local rule file. The write path is the memhub **`create_rule`**
-MCP tool; the rule reaches teammates when a reviewer activates it.
+MCP tool; the rule reaches the rulebook's members once a reviewer activates it
+(on a book that binds only its creator, that reviewer is the user themselves).
 
 Arguments: `$ARGUMENTS`
-- `--brain "<name>"` (optional) → the rulebook to write into (`agent_brain_id`
-  on `create_rule`). Omit to use the repo's own rulebook.
+- `--rulebook "<name or id>"` (optional) → the rulebook to write into
+  (`rulebook_id` on `create_rule`). Omit and step 0 resolves it.
+  `--brain "<name>"` is still accepted and means the same thing — a rulebook
+  used to be a brain and people still type it — but say "rulebook" back.
 - Remaining text = the rule in the user's words. If absent, ask for it — one
   sentence, ideally already conditional ("when X, do/never Y").
+
+## 0. Which rulebook — resolve it first
+
+A **rulebook** is a container with its own membership: whoever is a member has
+their agent bound by its rules. One person can be in several (an org-wide book
+plus their team's), and a rule is filed into exactly one. So the destination is
+a decision, not a default — settle it before drafting anything.
+
+Call `list_rulebooks`. Each row has `rulebook_id`, `name`, `scope`
+(`all_org` | `explicit`), `member_count`, `rule_count`, `bound` (does it govern
+me?) and `is_admin`. Then:
+
+- `--rulebook` given → match it against `rulebook_id` first, then `name`
+  (case-insensitive). No match → show the list and ask; never file into a
+  book the user did not name.
+- Omitted, exactly one book → use it, and say which one in step 6.
+- Omitted, several books → **ask** with AskUserQuestion, one option per book
+  labelled with its name and who it binds ("org-wide" / "N members"). Do not
+  guess: filing into the wrong book binds the wrong people. (This mirrors the
+  server's own `TOOL_MANY_RULEBOOKS` — it refuses to guess too.)
+- **No books at all** (an empty list, or `TOOL_NO_RULEBOOK` from a write) →
+  nothing is auto-provisioned. Offer to create one: propose
+  `create_rulebook(name: "<repo> rules", scope: "explicit")` — a book that
+  binds only the user, which is the only shape a non-admin may create — and
+  ask. On yes, create it and file into it. On no, stop and report; there is
+  nowhere to put the rule.
+
+Never call `create_rulebook` with `scope: "all_org"`, and never name another
+user in `member_user_ids`. Both are org-admin acts (`rulebook_scope_needs_admin`
+/ `rulebook_members_need_admin`), and widening who a rulebook binds is a
+governance decision this skill does not make. Membership changes are not MCP
+tools at all — they are done in MemHub.
+
+**When the create is refused.** `create_rulebook` validates the creator as an
+active org member, so it can answer `rulebook_member_not_in_org` naming *the
+user themselves* — even though you named nobody. That is not a bug to retry:
+their org membership is inactive, and no rulebook can be created until someone
+fixes it in MemHub. Say that plainly and stop. (`rulebook_name_too_long` means
+the name exceeded 200 characters — shorten it and retry once.)
+
+**Older backend:** if `list_rulebooks` / `create_rulebook` are not present, or
+`create_rule` rejects `rulebook_id`, the server predates rulebook containers.
+Fall back to today's behaviour — `agent_brain_id` from `--brain`, omitted
+otherwise — and carry on; the rest of this skill is unchanged.
 
 ## The flow — every step is mandatory
 
@@ -50,12 +97,17 @@ at once from sessions, use `/memhub:rules-from-sessions` instead.
 
 ### 2. Duplicate check — by eye now, deterministically in step 5
 
-Call the memhub `list_rules` tool for the target rulebook (every status) and
-read the new rule against every title and statement. Same subject → plan to
-replace the existing rule instead of adding a twin: note its `rule_id` for
-`supersedes_rule_id` in step 5. The server does no title matching — you
-decide what a rule replaces. Keep the `list_rules` reply: step 5 runs the
-deterministic check over it.
+Call the memhub `list_rules` tool with **no `rulebook_id`** (every status) so
+the reply spans every rulebook the user can see, and read the new rule against
+every title and statement. Same subject → plan to replace the existing rule
+instead of adding a twin: note its `rule_id` for `supersedes_rule_id` in step 5.
+The server does no title matching — you decide what a rule replaces. Keep the
+`list_rules` reply: step 5 runs the deterministic check over it.
+
+A twin in **another** rulebook is a different problem: `supersedes_rule_id`
+only retires a rule inside one book, so nothing you file can absorb it, and
+both rules reach the same call if both books bind the user. Say so and let
+them decide — step 5 flags these as `cross_book`.
 
 ### 3. Draft the rule — one delivery, one engine block
 
@@ -139,13 +191,19 @@ note instead of shipping a nag.
 
 Before showing the rule, check it against the book — the server files a
 colliding title or matcher as a silent second draft unless you name what it
-replaces, so this is the only place it gets caught. Call `list_rules` (every status),
-save the reply, write the candidate `create_rule` body to a file, and run:
+replaces, so this is the only place it gets caught. Call `list_rules` (every
+status, no `rulebook_id`), save the reply, write the candidate `create_rule`
+body to a file, and run:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
-  --candidates <candidate.json> --existing <list_rules.json> --repo "<repo>"
+  --candidates <candidate.json> --existing <list_rules.json> --repo "<repo>" \
+  --rulebook-id <the step-0 rulebook_id>
 ```
+
+Omit `--rulebook-id` entirely on an older backend, where step 0 resolved no
+id — passing the flag with nothing after it is an argparse error and you get
+no report at all.
 
 `same_title` / `same_matcher` (an **active** rule fires on the same call) /
 `anchors_overlap` are deterministic; then read the `judge_by_statement` list
@@ -159,13 +217,20 @@ file; tell the user. `contradicts` → file as a draft WITHOUT
 `supersedes_rule_id`, but name the rule it fights in the report; a reviewer
 retires one side before activating the other.
 
+A hit marked **`cross_book`** is in a rulebook you are not filing into.
+`supersedes_rule_id` cannot reach it — whatever you file, both rules stay live
+and both fire on the same call. Do not file over it silently: name the book and
+the rule to the user and let them choose (retire one side in MemHub, narrow one
+rule's `scope_repos` / `scope_paths`, or file anyway and accept the double
+fire).
+
 Show the user: the rule sentence, the delivery + engine block, the sample
 commands it does and doesn't match, and the conflict verdict. On approval call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
 `user correction, session <id>`, with the step-1b numbers appended:
 `|applies N/M|precision P`), `supersedes_rule_id` when it replaces a
-rule, and `agent_brain_id` when `--brain` was given. Read the reply:
+rule, and `rulebook_id` from step 0. Read the reply:
 
 - `unchanged: true` → identical content is already in the book (a retried
   call with the same `source_ref` path and title); nothing written.
@@ -174,7 +239,10 @@ rule, and `agent_brain_id` when `--brain` was given. Read the reply:
 - `status: "draft"` → new.
 
 **New rules always land draft / advise.** Activation and any blocking tier are
-reviewer decisions this skill never makes. Never call an activation path.
+reviewer decisions this skill never makes — never pass `activate`, never call
+an activation path. That holds even on a book that binds only the user, where
+the server would now let them arm their own rule: the point of the review step
+is that somebody reads the rule after the excitement of writing it.
 
 If the rule is better as a plain suggestion than a check — the user doesn't
 want to write a detector — file it the same way with
@@ -183,8 +251,11 @@ reviewer.
 
 ### 6. Report
 
-Tell the user: the rule is filed as a draft — or as `proposed`, naming the
-rule it replaces by title — and what happens next: the rule's owner or an
-admin activates it in MemHub (a `proposed` rule retires the one it replaces), every teammate's coding agent picks
-it up on their next session, and its firing history accrues in MemHub as the
-evidence that later decides whether to keep, narrow, or retire it.
+Tell the user: which **rulebook** it went into and who that book binds
+("org-wide" or "N members" — that is the set of people this rule will reach);
+that it is filed as a draft — or as `proposed`, naming the rule it replaces by
+title; and what happens next: the rule's owner or an admin activates it in
+MemHub (a `proposed` rule retires the one it replaces), every **member of that
+rulebook** picks it up on their next session, and its firing history accrues in
+MemHub as the evidence that later decides whether to keep, narrow, or retire
+it. Name any `cross_book` collision here too, under **Conflicts to resolve**.
