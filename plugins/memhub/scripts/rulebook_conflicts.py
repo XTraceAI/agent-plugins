@@ -60,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rulebook_hook import API_PATH, FETCH_TIMEOUT_S, _api, load_book  # noqa: E402
 
 _NON_WORD = re.compile(r"[^\w]+")
+_ID_OK = re.compile(r"[^\x00-\x1f\x7f]{1,64}")   # a UUID is 36; no control bytes, ever
 _WS = re.compile(r"\s+")
 RETIRED = ("deprecated", "superseded")
 PRIMARY_RX = ("command_rx", "path_rx", "content_rx")
@@ -106,7 +107,12 @@ def book_of(rule: dict) -> dict:
     b = b if isinstance(b, dict) else {}
     rid = rule.get("rulebook_id") or b.get("rulebook_id")
     out: dict = {}
-    if isinstance(rid, str) and rid.strip():
+    # An id is REJECTED rather than cleaned. It renders (the summary falls back
+    # to it when a book has no name), so a newline in it forges a line just as
+    # a newline in the name would — but it is also compared against
+    # `--rulebook-id` and used as a dedup key, so rewriting it would corrupt
+    # the equality the whole cross_book decision rests on. A real one is a UUID.
+    if isinstance(rid, str) and rid.strip() and _ID_OK.fullmatch(rid.strip()):
         out["rulebook_id"] = rid.strip()
     # A book name is typed by a teammate and lands in the agent's context via
     # this report: one line, no control characters, capped — the same handling
@@ -196,12 +202,18 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
     # matters: a migrated backend where the caller forgot --rulebook-id. The
     # rows carry their books, the hit is very possibly cross-book, and treating
     # unknown as same-book would hand out the one instruction §7 forbids.
+    # Whether a book dimension EXISTS is decided by the key being present, not
+    # by it parsing. Otherwise rejecting a malformed id downgrades the report
+    # to "pre-container, one implicit book" — and hands back the supersede line
+    # that rejecting it was meant to withhold.
+    book_dimension = any(isinstance(r, dict) and (r.get("rulebook") or r.get("rulebook_id"))
+                         for r in list(existing) + list(active or []))
     for c in out:
         for h in c["hits"]:
             rid = h.get("rulebook", {}).get("rulebook_id")
             if target_rulebook_id and rid:
                 h["cross_book"] = rid != target_rulebook_id
-            elif not books:          # no book anywhere: one implicit book, as before
+            elif not book_dimension:   # no book anywhere: one implicit book, as before
                 h["cross_book"] = False
             else:
                 h["cross_book"] = None

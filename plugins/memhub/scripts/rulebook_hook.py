@@ -441,6 +441,9 @@ def _why(r):
 _BOOK_SCOPES = ("all_org", "explicit")
 _BOOK_NAME_MAX = 120
 _BOOK_ID_MAX = 64            # a UUID is 36; longer is rejected, never truncated
+# An id is rejected, not repaired: it is a dedup key and a ledger column, so a
+# cleaned one would silently be a different book.
+_ID_OK = re.compile(r"[^\x00-\x1f\x7f]{1,%d}" % _BOOK_ID_MAX)
 _BOOK_MEMBERS_MAX = 10 ** 9  # an org, not a number the server chose to render
 # Hook-internal, and derivable ONLY from the server's `rulebook` block. A row
 # is server data: left alone, a row that simply spells these keys itself would
@@ -464,7 +467,7 @@ def _book_facts(row):
     b = b if isinstance(b, dict) else {}
     out = {}
     rid = row.get("rulebook_id") or b.get("rulebook_id")
-    if isinstance(rid, str) and rid.strip() and len(rid.strip()) <= _BOOK_ID_MAX:
+    if isinstance(rid, str) and _ID_OK.fullmatch(rid.strip() or " "):
         out["_rulebook_id"] = rid.strip()
     name = _clean_text(b.get("name"))[:_BOOK_NAME_MAX]
     if name:
