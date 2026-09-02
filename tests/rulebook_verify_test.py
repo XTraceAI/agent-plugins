@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "plugins", "memhub", "scripts")
@@ -101,6 +102,61 @@ def main() -> int:
                   "--fires", "python3 - <<'PY'\nDROP TABLE users\nPY",
                   "--silent", "python3 - <<'PY'\nprint(1)\nPY", "--no-self-mention")
     check("heredoc body rules are evaluated the way the live hook evaluates them", rc == 0, out)
+
+    # --- given fixtures: the fixture IS the repo ---------------------------
+    given = bash(command_rx=r"^git\s+push\b", command_not_rx=r"\bgrep\b|python3?\s+-c",
+                 given={"repo": {"branch_rx": r"^(main|master)$"}})
+    rc, out = run(given, "--fires", "git push origin main", "--branch", "main")
+    check("given.repo.branch_rx: --branch main makes the push case fire", rc == 0, out)
+    rc, out = run(given, "--fires", "git push origin main", "--branch", "feat/x")
+    check("given.repo.branch_rx: --branch feat/x keeps it silent (FIRES FAIL)",
+          rc == 1 and "FIRES  FAIL" in out, out)
+    rc, out = run(given, "--fires", "git push origin main")
+    check("given: no fixture = no fact = the rule cannot fire", rc == 1 and "FIRES  FAIL" in out, out)
+
+    needs_test = bash(command_rx=r"gh\s+pr\s+create", command_not_rx=r"\bgrep\b|python3?\s+-c",
+                      given={"repo": {"diff_paths_rx": r"^src/", "diff_paths_none_rx": r"^tests/"}})
+    cases = {"fires": [{"case": "gh pr create --fill", "diff_paths": ["src/a.py"]}],
+             "silent": [{"case": "gh pr create --fill", "diff_paths": ["src/a.py", "tests/test_a.py"]},
+                        {"case": "gh pr create --fill"}]}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(cases, f)
+    rc, out = run(needs_test, "--cases", f.name)
+    os.unlink(f.name)
+    check("given.repo.diff_paths: per-case objects in --cases carry their own facts",
+          rc == 0 and out.count("ok") >= 3, out)
+    rc, out = run(needs_test, "--fires", "gh pr create", "--diff-path", "src/a.py",
+                  "--silent", "gh pr create", "--diff-path", "tests/test_a.py")
+    check("given: global --diff-path facts apply to EVERY case — both paths reach the fires "
+          "case too, so it cannot fire", rc == 1 and "FIRES  FAIL" in out and "SILENT ok" in out, out)
+
+    unasked = bash(command_rx=r"^git\s+commit\b", command_not_rx=r"\bgrep\b|python3?\s+-c",
+                   given={"user": {"not_said_rx": r"\b(commit|push)\b"}})
+    rc, out = run(unasked, "--fires", "git commit -m x", "--user-said", "fix the bug")
+    check("given.user.not_said_rx: fires when the user turns never said it", rc == 0, out)
+    rc, out = run(unasked, "--silent", "git commit -m x", "--user-said", "fix it then commit",
+                  "--no-self-mention")
+    check("given.user.not_said_rx: silent once a user turn said it",
+          "SILENT ok" in out and "SILENT FAIL" not in out, out)
+
+    rc, out = run(bash(command_rx="x", given={"repo": {"nope": 1}}), "--fires", "x")
+    check("given: an unknown key is a LOAD failure that names the known keys",
+          rc == 1 and "LOAD   FAIL" in out and "repo.diff_paths_rx" in out, out)
+
+    # --- ordering rules: a sequence of steps, judged at the gate ------------
+    ordering = {"title": "t", "statement": "s", "delivery": "agent_hook",
+                "ordering": {"required_command_rx": r"\bpytest\b", "gated_command_rx": r"^git\s+push\b",
+                             "armed_by_events": ["edit"], "min_edits": 1, "display_name": "pytest"}}
+    rc, out = run(ordering,
+                  "--fires", "edit:src/a.py >> gate:git push",
+                  "--fires", "edit:src/a.py >> red:pytest tests >> gate:git push",
+                  "--silent", "edit:src/a.py >> ok:pytest tests >> gate:git push",
+                  "--silent", "gate:git push")
+    check("ordering: armed by an edit, not discharged by a red receipt, discharged by a green one",
+          rc == 0 and out.count("ok") >= 5, out)
+    rc, out = run(ordering, "--fires", "edit:src/a.py >> bogus:x >> gate:git push")
+    check("ordering: an unknown step is reported, not swallowed",
+          rc == 1 and "unknown ordering step" in out, out)
 
     # --- usability guards --------------------------------------------------
     rc, out = run(bash(command_rx="terraform apply"))

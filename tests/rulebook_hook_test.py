@@ -71,6 +71,185 @@ def ctx(out: str) -> str:
     return json.loads(out)["hookSpecificOutput"]["additionalContext"]
 
 
+def _row(rid, matcher=None, **extra):
+    """A server-shape (`?view=hook`) row — the shape a `given` block and path
+    scope arrive in; pilot-shape rows (an `on` key) never carry either."""
+    row = {"rule_id": rid, "title": rid, "statement": f"{rid} text", "delivery": "agent_hook",
+           "mode": "advise", "version": 1, "status": "active", "scope_repos": []}
+    if matcher is not None:
+        row["matcher"] = matcher
+    row.update(extra)
+    return row
+
+
+def _git(cwd, *args):
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@x", HOME=cwd, GIT_CONFIG_NOSYSTEM="1")
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env, timeout=30)
+
+
+def given_and_scope_checks() -> None:
+    """The two exemption keys the pre-0.42 hook parsed and never read, the
+    §3.1 path scope it dropped on load, and the `given` block: facts a matched
+    rule must also satisfy, answered by read-only git and the local transcript."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "scoperepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/test-branch\n")
+        seed_book(td, "scoperepo", [
+            _row("no-bare-ignore", {"event": "edit", "path_rx": r"\.py$",
+                                    "content_rx": r"type:\s*ignore",
+                                    "content_not_rx": r"type:\s*ignore\[[^\]]+\]\s*#"}),
+            _row("post-exempt", {"event": "output", "command_rx": r"\bpytest\b",
+                                 "command_not_rx": r"--collect-only", "content_rx": r"FAILED"}),
+            _row("src-only", {"event": "edit", "path_rx": r".*"},
+                 scope_paths=["src/*"], scope_exclude_paths=["src/vendor/*"]),
+            _row("bash-path-scoped", {"event": "bash", "command_rx": r"scoped-cmd"},
+                 scope_paths=["src/*"]),
+            _row("push-from-main", {"event": "bash", "command_rx": r"^git\s+push\b",
+                                    "given": {"repo": {"branch_rx": r"^test-branch$"}}}),
+            _row("push-from-other", {"event": "bash", "command_rx": r"^git\s+push\b",
+                                     "given": {"repo": {"branch_rx": r"^main$"}}}),
+            _row("commit-unasked", {"event": "bash", "command_rx": r"^git\s+commit\b",
+                                    "given": {"user": {"not_said_rx": r"\bcommit\b"}}}),
+            _row("bad-given", {"event": "bash", "command_rx": r"bad-given-cmd",
+                               "given": {"repo": {"nope": 1}}}),
+            _row("bad-given-kind", {"event": "bash", "command_rx": r"bad-given-cmd",
+                                    "given": {"repo": {"diff_lines_gt": "500"}}}),
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def pre(tool, inp, **kw):
+            n[0] += 1
+            payload = {"cwd": repo, "session_id": f"gs{n[0]}", "tool_name": tool, "tool_input": inp}
+            payload.update(kw)
+            return ctx(run("pre", payload, env)[1])
+
+        def post(inp, resp):
+            n[0] += 1
+            return ctx(run("post", {"cwd": repo, "session_id": f"gs{n[0]}", "tool_name": "Bash",
+                                    "tool_input": inp, "tool_response": resp}, env)[1])
+
+        # --- content_not_rx on an edit rule (was parsed, never read) ---------
+        c = pre("Edit", {"file_path": f"{repo}/src/a.py", "new_string": "x = f()  # type: ignore"})
+        check("edit: content_rx fires on the bare suppression", "[no-bare-ignore]" in c, c)
+        c = pre("Edit", {"file_path": f"{repo}/src/a.py",
+                         "new_string": "x = f()  # type: ignore[attr-defined]  # stub lacks it"})
+        check("edit: content_not_rx exempts the complied-with form", "[no-bare-ignore]" not in c, c)
+
+        # --- command_not_rx on an output rule (was mapped to cmd_not_rx, never read)
+        c = post({"command": "pytest -x tests/"}, {"stdout": "FAILED tests/a.py::t", "exit_code": 1})
+        check("output: fires on a failing run", "[post-exempt]" in c, c)
+        c = post({"command": "pytest --collect-only -q"}, {"stdout": "FAILED to import", "exit_code": 1})
+        check("output: command_not_rx exempts the named form", "[post-exempt]" not in c, c)
+
+        # --- scope_paths / scope_exclude_paths (were dropped on load) --------
+        c = pre("Edit", {"file_path": f"{repo}/src/a.py", "new_string": "x"})
+        check("scope_paths: an edit inside the scope fires", "[src-only]" in c, c)
+        c = pre("Edit", {"file_path": f"{repo}/docs/a.md", "new_string": "x"})
+        check("scope_paths: an edit outside the scope is silent", "[src-only]" not in c, c)
+        c = pre("Edit", {"file_path": f"{repo}/src/vendor/x.py", "new_string": "x"})
+        check("scope_exclude_paths: an excluded path is silent", "[src-only]" not in c, c)
+        c = pre("Bash", {"command": "scoped-cmd"})
+        check("scope_paths: a Bash call carries no path, so an include-scoped rule never fires there",
+              "[bash-path-scoped]" not in c, c)
+
+        # --- given.repo.branch_rx: from .git/HEAD, no git needed --------------
+        c = pre("Bash", {"command": "git push origin HEAD"})
+        check("given.repo.branch_rx: fires when the checked-out branch matches",
+              "[push-from-main]" in c, c)
+        check("given.repo.branch_rx: silent when it does not", "[push-from-other]" not in c, c)
+
+        # --- given.user: only what the person typed counts -------------------
+        def transcript(name, records):
+            p = os.path.join(td, name)
+            with open(p, "w", encoding="utf-8") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+            return p
+        prompt = lambda t: {"type": "user", "message": {"role": "user", "content": t}}
+        tool_result = {"type": "user", "toolUseResult": {"stdout": "x"},
+                       "message": {"role": "user", "content": [
+                           {"type": "tool_result", "content": "please commit this"}]}}
+        meta = {"type": "user", "isMeta": True, "message": {"role": "user", "content": [
+            {"type": "text", "text": "injected: commit now"}]}}
+        assistant = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "I will commit"}]}}
+        t_unasked = transcript("t1.jsonl", [prompt("fix the bug in foo"), tool_result, meta, assistant])
+        t_asked = transcript("t2.jsonl", [prompt("fix it"), tool_result,
+                                          prompt([{"type": "text", "text": "then commit it"}])])
+        c = pre("Bash", {"command": "git commit -m x"}, transcript_path=t_unasked)
+        check("given.user.not_said_rx: fires when no user turn said it — tool results, meta rows "
+              "and assistant turns do not count", "[commit-unasked]" in c, c)
+        c = pre("Bash", {"command": "git commit -m x"}, transcript_path=t_asked)
+        check("given.user.not_said_rx: silent once the user asked (text-block prompt)",
+              "[commit-unasked]" not in c, c)
+        c = pre("Bash", {"command": "git commit -m x"})
+        check("given.user: no transcript = no fact = silent", "[commit-unasked]" not in c, c)
+
+        # --- a bad given drops the RULE at load, never the hook --------------
+        c = pre("Bash", {"command": "bad-given-cmd"})
+        check("given: an unknown key drops the rule", "[bad-given]" not in c, c)
+        check("given: a wrong value kind drops the rule", "[bad-given-kind]" not in c, c)
+
+        # --- given.repo diff probes against a real repository ----------------
+        gr = os.path.join(td, "gitrepo")
+        os.makedirs(os.path.join(gr, "src"))
+        ok = _git(gr, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        if ok:
+            with open(os.path.join(gr, "src", "a.py"), "w", encoding="utf-8") as f:
+                f.write("a = 1\n")
+            ok = _git(gr, "add", ".").returncode == 0 and _git(gr, "commit", "-qm", "base").returncode == 0 \
+                and _git(gr, "checkout", "-qb", "feat").returncode == 0
+        if not ok:
+            check("given.repo diff probes (git unavailable here — skipped)", True)
+            return
+        seed_book(td, "gitrepo", [
+            _row("pr-needs-test", {"event": "bash", "command_rx": r"gh\s+pr\s+create",
+                                   "given": {"repo": {"diff_paths_rx": r"^src/",
+                                                      "diff_paths_none_rx": r"^tests/"}}}),
+            _row("pr-too-big", {"event": "bash", "command_rx": r"gh\s+pr\s+create",
+                                "given": {"repo": {"diff_lines_gt": 3}}}),
+            # its own trigger: three fires on one call would meet the per-call
+            # advisory cap (MAX_ADVISE) and the third would be cut, not silent
+            _row("pr-dirty", {"event": "bash", "command_rx": r"gh\s+pr\s+ready",
+                              "given": {"repo": {"dirty": True}}}),
+        ])
+        genv = dict(env)
+
+        def gpre(sid, command="gh pr create --fill"):
+            return ctx(run("pre", {"cwd": gr, "session_id": sid, "tool_name": "Bash",
+                                   "tool_input": {"command": command}}, genv)[1])
+
+        c = gpre("d0")
+        check("given.repo: nothing changed against main → diff_paths_rx unmet, silent",
+              "[pr-needs-test]" not in c and "[pr-too-big]" not in c, c)
+        check("given.repo.dirty: a fresh checkout is not dirty", "[pr-dirty]" not in gpre("d0r", "gh pr ready"))
+        with open(os.path.join(gr, "src", "a.py"), "a", encoding="utf-8") as f:
+            f.write("b = 2\nc = 3\nd = 4\ne = 5\n")          # uncommitted: the working tree counts
+        c = gpre("d1")
+        check("given.repo.diff_paths_rx: an uncommitted source change fires the needs-a-test rule",
+              "[pr-needs-test]" in c, c)
+        check("given.repo.diff_lines_gt: four added lines exceed 3", "[pr-too-big]" in c, c)
+        c = gpre("d1r", "gh pr ready")
+        check("given.repo.dirty: an uncommitted change is dirty", "[pr-dirty]" in c, c)
+        os.makedirs(os.path.join(gr, "tests"))
+        with open(os.path.join(gr, "tests", "test_a.py"), "w", encoding="utf-8") as f:
+            f.write("def test_a(): pass\n")                     # untracked: still a changed path
+        c = gpre("d2")
+        check("given.repo.diff_paths_none_rx: an UNTRACKED test file satisfies the rule",
+              "[pr-needs-test]" not in c, c)
+        _git(gr, "add", ".")
+        _git(gr, "commit", "-qm", "feat")
+        c = gpre("d3")
+        check("given.repo: committed changes still count against the merge-base",
+              "[pr-too-big]" in c and "[pr-needs-test]" not in c, c)
+        c = gpre("d3r", "gh pr ready")
+        check("given.repo.dirty: a clean tree is not dirty", "[pr-dirty]" not in c, c)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
@@ -629,6 +808,8 @@ def main() -> int:
         check("gate: a month-old cached book still denies — no freshness timer, no degrade note",
               j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
               and "24 h" not in ctx(out), out)
+
+    given_and_scope_checks()
 
     print()
     if FAILURES:
