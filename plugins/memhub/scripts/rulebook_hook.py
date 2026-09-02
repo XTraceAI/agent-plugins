@@ -513,14 +513,17 @@ def to_hook_rule(row):
             r.setdefault("_version", _version_of(row.get("version")))
             r.update(_book_facts(row))   # the block is the only source of these
             # Prose off the wire, on either shape: no control bytes reach a
-            # terminal. `text`/`why` keep their length, because on this shape
-            # POSTURE_BUDGET_CHARS is what drops an oversized rule and
-            # truncating would serve it instead. `_label` and `_gate_msg` are
-            # measured by no budget at all — a gate is never cut by the
-            # advisory cap — so they take the same cap the server shape gets.
+            # terminal. Length is capped too — EXCEPT `text`/`why` on a session
+            # rule, the one field pair POSTURE_BUDGET_CHARS actually measures,
+            # where truncating would serve an oversized rule the budget exists
+            # to drop. Every other field is measured by no budget at all: an
+            # advisory's text is rendered straight into the pre/post lane, a
+            # gate is never cut by the advisory cap, and a label is never
+            # measured — so they take the cap the server shape already gets.
+            _cap = _one_line if r.get("on") == "session" else _clean_text
             for k in ("text", "why"):
                 if k in r:
-                    r[k] = _one_line(r[k])
+                    r[k] = _cap(r[k])
             for k in ("_label", "_gate_msg"):
                 if k in r:
                     r[k] = _clean_text(r[k])

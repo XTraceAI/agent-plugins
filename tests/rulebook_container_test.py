@@ -173,8 +173,16 @@ def test_to_hook_rule_carries_the_facts() -> None:
     check("gate prose and labels are capped on the pilot shape",
           len(gated["_gate_msg"]) == hook._TEXT_MAX == len(gated["_label"]),
           f"{len(gated['_gate_msg'])}/{len(gated['_label'])}")
-    check("…while text keeps its length for the posture budget to judge",
-          len(gated["text"]) == 5000)
+    check("…while a SESSION rule's text keeps its length for the budget to judge",
+          len(hook.to_hook_rule({"rule_id": "r4h", "on": "session",
+                                 "text": "P" * 5000})["text"]) == 5000)
+    # An advisory's text is rendered straight into the pre/post lane, which has
+    # no budget at all — only session rules are policed by POSTURE_BUDGET_CHARS.
+    adv = hook.to_hook_rule({"rule_id": "r4i", "on": "bash", "rx": "a",
+                             "text": "T" * 50000, "why": "W" * 50000})
+    check("an advisory rule's prose is capped, budget or no budget",
+          len(adv["text"]) == len(adv["why"]) == hook._TEXT_MAX,
+          f"{len(adv['text'])}/{len(adv['why'])}")
 
     junk = hook.to_hook_rule(server_rule("r5", "d", "n", {
         "rulebook_id": 7, "rulebook": {"scope": "everyone", "member_count": True,
