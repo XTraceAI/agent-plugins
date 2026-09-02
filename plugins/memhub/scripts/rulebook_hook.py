@@ -467,8 +467,9 @@ def _book_facts(row):
     b = b if isinstance(b, dict) else {}
     out = {}
     rid = row.get("rulebook_id") or b.get("rulebook_id")
-    if isinstance(rid, str) and _ID_OK.fullmatch(rid.strip() or " "):
-        out["_rulebook_id"] = rid.strip()
+    rid = rid.strip() if isinstance(rid, str) else ""
+    if _ID_OK.fullmatch(rid):        # `{1,64}` rejects the empty string itself
+        out["_rulebook_id"] = rid
     name = _clean_text(b.get("name"))[:_BOOK_NAME_MAX]
     if name:
         out["_book_name"] = name
@@ -511,12 +512,18 @@ def to_hook_rule(row):
             r.setdefault("id", row.get("rule_id"))
             r.setdefault("_version", _version_of(row.get("version")))
             r.update(_book_facts(row))   # the block is the only source of these
-            for k in ("text", "why", "_label", "_gate_msg"):
-                if k in r:            # prose off the wire, on either shape: no
-                    r[k] = _one_line(r[k])   # control bytes reach a terminal.
-            # Length is deliberately NOT capped here: the server shape caps at
-            # _TEXT_MAX, but on this shape POSTURE_BUDGET_CHARS is what drops
-            # an oversized rule, and truncating would serve it instead.
+            # Prose off the wire, on either shape: no control bytes reach a
+            # terminal. `text`/`why` keep their length, because on this shape
+            # POSTURE_BUDGET_CHARS is what drops an oversized rule and
+            # truncating would serve it instead. `_label` and `_gate_msg` are
+            # measured by no budget at all — a gate is never cut by the
+            # advisory cap — so they take the same cap the server shape gets.
+            for k in ("text", "why"):
+                if k in r:
+                    r[k] = _one_line(r[k])
+            for k in ("_label", "_gate_msg"):
+                if k in r:
+                    r[k] = _clean_text(r[k])
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
             if isinstance(r.get("ordering"), dict) and not all(

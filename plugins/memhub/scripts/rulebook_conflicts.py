@@ -208,6 +208,12 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
     # that rejecting it was meant to withhold.
     book_dimension = any(isinstance(r, dict) and (r.get("rulebook") or r.get("rulebook_id"))
                          for r in list(existing) + list(active or []))
+    # A hit whose own book has no usable id stays `None` even when a
+    # destination WAS given: it is unknown, and the two unknowns differ only in
+    # what the reader should do about it, which is the summary's job to say.
+    # It is not marked cross-book — that asserts "another book" on no evidence
+    # — and books are not matched by name: §3.1 puts no uniqueness on names, so
+    # two teams may both call theirs "Backend".
     for c in out:
         for h in c["hits"]:
             rid = h.get("rulebook", {}).get("rulebook_id")
@@ -268,7 +274,11 @@ def _summary(report: dict) -> str:
                              "bind you, so both rules fire on the same call: tell the user and let a "
                              "human retire one side or narrow its scope.")
             elif h.get("cross_book") is None:
-                lines.append("    WHICH RULEBOOK? — re-run with --rulebook-id <destination> before "
+                lines.append("    WHICH RULEBOOK? — this rule's own book could not be identified, "
+                             "so it cannot be compared to your destination. Ask the user before "
+                             "superseding it."
+                             if report.get("target_rulebook_id") else
+                             "    WHICH RULEBOOK? — re-run with --rulebook-id <destination> before "
                              "superseding anything. supersedes_rule_id reaches a rule in the SAME "
                              "book only, and this report cannot tell whether it is the same book.")
             elif h["rule_id"]:

@@ -155,6 +155,27 @@ def test_to_hook_rule_carries_the_facts() -> None:
           hook.to_hook_rule({"rule_id": "r4d", "on": "session",
                              "text": "x" * 5000})["text"] == "x" * 5000)
 
+    # An id must be non-empty to exist: a whitespace-only one would otherwise
+    # become "", which groups every such book together as one.
+    check("a whitespace-only rulebook_id is not an id",
+          "_rulebook_id" not in hook.to_hook_rule(
+              {"rule_id": "r4e", "statement": "s", "delivery": "session_context",
+               "rulebook_id": "   "}))
+    check("…and a real one is still taken, trimmed",
+          hook.to_hook_rule({"rule_id": "r4f", "statement": "s", "delivery": "session_context",
+                             "rulebook_id": " bk-1 "})["_rulebook_id"] == "bk-1")
+
+    # A gate is never cut by the advisory cap, so no budget bounds its prose —
+    # unlike text/why, whose length POSTURE_BUDGET_CHARS is there to police.
+    gated = hook.to_hook_rule({"rule_id": "r4g", "on": "bash", "rx": "a",
+                               "text": "t" * 5000, "_gate_msg": "B" * 50000,
+                               "_label": "L" * 9000})
+    check("gate prose and labels are capped on the pilot shape",
+          len(gated["_gate_msg"]) == hook._TEXT_MAX == len(gated["_label"]),
+          f"{len(gated['_gate_msg'])}/{len(gated['_label'])}")
+    check("…while text keeps its length for the posture budget to judge",
+          len(gated["text"]) == 5000)
+
     junk = hook.to_hook_rule(server_rule("r5", "d", "n", {
         "rulebook_id": 7, "rulebook": {"scope": "everyone", "member_count": True,
                                        "name": "bad\x00name"}}))
@@ -262,6 +283,20 @@ def test_conflicts_names_the_book() -> None:
     check("a confirmed same-book hit still gets its supersede",
           states["target=same"] == (False, True), str(states))
     check("a confirmed other-book hit does not", states["target=other"] == (True, False), str(states))
+    # Two different unknowns: no destination given, vs a hit whose own book has
+    # no usable id. Telling someone who passed --rulebook-id to pass it is wrong.
+    named_only = [{"rule_id": "e1", "title": "Never force-push", "status": "active",
+                   "statement": "s", "rulebook": {"name": "Backend Rulebook"}}]
+    with_t = rc_mod._summary(rc_mod.find_conflicts(cand, named_only, None, "bk-team"))
+    without_t = rc_mod._summary(rc_mod.find_conflicts(cand, named_only, None))
+    check("an unidentifiable book is not blamed on a missing flag",
+          "re-run with --rulebook-id" not in with_t
+          and "could not be identified" in with_t, with_t)
+    check("…but a genuinely missing destination still asks for one",
+          "re-run with --rulebook-id" in without_t, without_t)
+    check("neither offers a supersede",
+          "create_rule supersedes_rule_id=" not in with_t + without_t)
+
     check("a pre-container report is unchanged — one implicit book",
           states["pre-container"] == (False, True), str(states))
 
