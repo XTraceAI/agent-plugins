@@ -204,7 +204,10 @@ directory second — so working from a folder that merely *contains* your
 checkouts still applies each one's own rules to the calls that touch it. A
 path is followed only while it stays inside the session's directory, so what
 the agent edits can never point the hook at a checkout you did not open.
-Session-start rules
+A repo and every linked worktree of it resolve to ONE name — the main
+checkout's — so they share a single cached book, a rule scoped to the repo
+applies in all of them, and a fire is attributed to the repo rather than to
+whichever worktree directory it happened in. Session-start rules
 are the exception, since that event names no file: they resolve from the
 session's directory alone, and a session rooted *above* your checkouts still
 gets none. Two books can

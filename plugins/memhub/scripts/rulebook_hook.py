@@ -937,8 +937,7 @@ def path_in_scope(rule, path, root=""):
 def scope_ok(rule, repo, gitdir):
     scope = rule.get("repo_scope", "any")
     if rule.get("_scope_repos"):        # server list: this checkout's name or its main
-        parts = gitdir.split("/") if gitdir else []   # checkout's (…/<main>/.git/worktrees/x)
-        main = parts[parts.index(".git") - 1] if ".git" in parts and parts.index(".git") > 0 else ""
+        main = main_checkout(gitdir)    # redundant since repo_info canonicalizes, kept
         return any(s == repo or (main and s == main) for s in rule["_scope_repos"])
     if scope == "any":
         return True
@@ -1357,8 +1356,48 @@ def flush_fires(final=False):
         lock.close()
 
 
+def main_checkout(gitdir):
+    """The MAIN checkout's directory name behind a linked worktree's gitdir
+    (`…/<main>/.git/worktrees/<x>` -> `<main>`), or "" for a main checkout.
+
+    Anchored on the `worktrees` segment rather than the first `.git` in the
+    path: a repo living under a literal `.git` directory (`~/.git/backup/Repo`)
+    makes a first-match scan answer with a directory several levels too high.
+
+    Scanned from the END, because git APPENDS `/.git/worktrees/<x>` to the main
+    worktree's path — so when the path contains more than one such segment, the
+    LAST is the authoritative one and an earlier one names a different repo.
+
+    The caller must pass an ABSOLUTE gitdir: git writes a relative one
+    (`../.git/worktrees/x`) under `worktree.useRelativePaths`, and every such
+    worktree on the machine would otherwise answer `".."` — one name, one book,
+    shared across unrelated repositories."""
+    parts = (gitdir or "").replace("\\", "/").split("/")
+    for i in range(len(parts) - 1, 1, -1):
+        if parts[i] == "worktrees" and parts[i - 1] == ".git":
+            return parts[i - 2]
+    return ""
+
+
 def repo_info(cwd):
-    """(repo_basename, worktree_root, gitdir_path, branch) via file reads only."""
+    """(repo_name, worktree_root, gitdir_path, branch) via file reads only.
+
+    `repo_name` is CANONICAL: every linked worktree of a repo reports the main
+    checkout's name, not its own directory name. That name is the cache key,
+    the `?repo=` the server filters `scope_repos` on, and the `repo` on every
+    fire — and the server compares it by exact string membership, so a worktree
+    asking under its own name was served only the rules nobody scoped.
+
+    `root` stays the WORKTREE's own path: it is where git runs and what keys
+    ordering state, and both must stay per-worktree.
+
+    Note the widened reach of the `.git` FILE's contents. Its text was already
+    trusted verbatim, but it only fed `scope_ok`'s extra match term; now it
+    also decides the cache filename, the `?repo=` sent to the server, and the
+    `repo` recorded on every fire. That is not an escalation — the same user
+    could `git init` a directory of any name to the same effect, `book_path`
+    sanitizes and `?repo=` is quoted — but it does mean fire ATTRIBUTION is
+    derived from a file an agent can write."""
     d = cwd
     while d and d != "/":
         g = os.path.join(d, ".git")
@@ -1369,7 +1408,16 @@ def repo_info(cwd):
                 gitdir = open(g, encoding="utf-8").read().split(":", 1)[1].strip()
             except Exception:
                 gitdir = ""
-            return os.path.basename(d), d, gitdir, _branch(os.path.join(gitdir, "HEAD"))
+            # git writes a RELATIVE gitdir under `worktree.useRelativePaths`
+            # (and `git worktree add --relative-paths`), resolved against the
+            # worktree directory. Left relative, the name parse answers ".."
+            # for every such worktree on the machine — unrelated repos sharing
+            # one book, one fetch and one `repo` on every fire — and the HEAD
+            # read below would resolve against the HOOK PROCESS's cwd instead.
+            if gitdir and not os.path.isabs(gitdir):
+                gitdir = os.path.normpath(os.path.join(d, gitdir))
+            return (main_checkout(gitdir) or os.path.basename(d), d, gitdir,
+                    _branch(os.path.join(gitdir, "HEAD")))
         d = os.path.dirname(d)
     return "", "", "", ""
 
