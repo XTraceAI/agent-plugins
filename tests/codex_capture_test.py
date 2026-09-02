@@ -284,6 +284,77 @@ def test_real_platform_is_unconditional():
     print("PASS test_real_platform_is_unconditional")
 
 
+def test_pr_url_is_queued_before_send_and_cleared_on_ack():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    state: dict = {}
+    seen: list[dict] = []
+    originals = {
+        "to_canonical": codex_flush.codex_reader.to_canonical,
+        "read_state": codex_flush._read_state,
+        "save_state": codex_flush._save_state,
+        "redact_records": codex_flush.redact_records,
+        "resolve_bearer": codex_flush.resolve_bearer,
+        "session": codex_flush.mcp_http.Session,
+        "log": codex_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            assert state["pending_pr_urls"] == [url]
+            return types.SimpleNamespace(
+                structuredContent={
+                    "conversation_id": "codex-session-1",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": [url]},
+                },
+                content=[],
+                isError=False,
+            )
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        codex_flush.codex_reader.to_canonical = lambda _path: ([
+            {"type": "assistant", "uuid": "u0", "message": {
+                "role": "assistant", "content": [{
+                    "type": "tool_use", "id": "create", "name": "exec",
+                    "input": {"cmd": "gh pr create --fill"},
+                }]}},
+            {"type": "user", "uuid": "u1", "message": {
+                "role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "create",
+                    "content": f"Created {url}",
+                }]}},
+        ], {"cwd": None, "title": None})
+        codex_flush._read_state = lambda _sid: dict(state)
+        codex_flush._save_state = save_state
+        codex_flush.redact_records = lambda records: records
+        codex_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        codex_flush.mcp_http.Session = Session
+        codex_flush._log = lambda _message: None
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+    finally:
+        codex_flush.codex_reader.to_canonical = originals["to_canonical"]
+        codex_flush._read_state = originals["read_state"]
+        codex_flush._save_state = originals["save_state"]
+        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.resolve_bearer = originals["resolve_bearer"]
+        codex_flush.mcp_http.Session = originals["session"]
+        codex_flush._log = originals["log"]
+
+    assert seen[0]["provenance"] == {"github_pr_urls": [url]}
+    assert state["pending_pr_urls"] == []
+    assert state["accepted_pr_urls"] == [url]
+    print("PASS test_pr_url_is_queued_before_send_and_cleared_on_ack")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

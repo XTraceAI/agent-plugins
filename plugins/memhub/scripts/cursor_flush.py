@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
+import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
@@ -902,6 +903,19 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
              f"held; if this repeats every flush, the store schema has moved "
              f"and readers/cursor.py needs updating")
         shipped = None
+    state = _read_state(uuid)
+    pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
+        pr_provenance.queued_urls(state, records)
+    )
+    if missing_pr_urls:
+        _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
+             "canonical GitHub PR URL")
+    if pending_pr_urls or accepted_pr_urls:
+        _save_state(
+            uuid,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
     sendable = redact_records(elide_oversized_tool_results(records))
     if not sendable:
         if records:
@@ -1003,6 +1017,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # Same scope stamp flush_turn sends: directives extracted from this
         # session must recall in this repo's context, not everywhere.
         arguments["namespace"] = namespace
+    provenance = pr_provenance.import_provenance(pending_pr_urls)
+    if provenance:
+        arguments["provenance"] = provenance
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         # Bound a semi-trusted session title (store content, like cwd): a
@@ -1051,11 +1068,18 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     # re-read here: a post-send read would span the whole network round trip.
     # The timestamps land either way — the debounce must still hold after a
     # successful send — but blob_ids only when we could actually verify it.
+    pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge(
+        pending_pr_urls,
+        accepted_pr_urls,
+        mcp_http.ack_of(res, f"cursor-{uuid}"),
+    )
     fields = {"last_flush_at": time.time(), "last_ok_at": time.time(),
               "last_error": None,
               # The re-probe worked: this server confirms after all, so the
               # session re-arms instead of staying dormant on old evidence.
               "unsupported": False, "unsupported_at": 0,
+              "pending_pr_urls": pending_pr_urls,
+              "accepted_pr_urls": accepted_pr_urls,
               "fail_streak": 0}
     if source_kind == "store":
         # On a CONFIRMED import, advance the watermark even when the post-read

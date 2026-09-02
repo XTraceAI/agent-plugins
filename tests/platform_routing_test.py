@@ -46,6 +46,10 @@ def test_import_request_uses_requested_platform() -> None:
         pass
     else:
         raise AssertionError("unknown platform was accepted")
+    evidence = {"github_pr_urls": ["https://github.com/x/r/pull/1"]}
+    args = import_session.import_call_args(
+        [], "conversation", "cursor", evidence)
+    assert args["provenance"] == evidence
     print("PASS test_import_request_uses_requested_platform")
 
 

@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
+import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
@@ -441,6 +442,19 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
     records, meta = codex_reader.to_canonical(rollout)
+    state = _read_state(sid)
+    pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
+        pr_provenance.queued_urls(state, records)
+    )
+    if missing_pr_urls:
+        _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
+             "canonical GitHub PR URL")
+    if pending_pr_urls or accepted_pr_urls:
+        _save_state(
+            sid,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
     sendable = redact_records(elide_oversized_tool_results(records))
     if not sendable:
         # Nothing to send. Empty is normal for a rollout with no user turns
@@ -519,6 +533,9 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             arguments["org_id"] = room["org_id"]
     if namespace:
         arguments["namespace"] = namespace
+    provenance = pr_provenance.import_provenance(pending_pr_urls)
+    if provenance:
+        arguments["provenance"] = provenance
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         # Bound a semi-trusted session title (store content, like cwd): a
@@ -554,10 +571,17 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _note_failure(sid, "unconfirmed_import")
         return
 
+    pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge(
+        pending_pr_urls,
+        accepted_pr_urls,
+        mcp_http.ack_of(res, f"codex-{sid}"),
+    )
     _save_state(sid, rollout_size=size, last_ok_at=time.time(),
                 last_error=None, last_error_at=0,
                 # The re-probe worked: this server confirms after all.
                 unsupported=False, unsupported_at=0,
+                pending_pr_urls=pending_pr_urls,
+                accepted_pr_urls=accepted_pr_urls,
                 fail_streak=0)
     _log(f"flushed {len(sendable)} records → codex-{sid}"
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
