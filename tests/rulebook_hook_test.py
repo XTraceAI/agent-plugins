@@ -318,6 +318,19 @@ def bash_edit_checks() -> None:
                  session="b2b")
         check("bash-edit: a write that leaves the file identical to HEAD is not an edit", c.strip() == "", c)
 
+        # a modified file is read as its ADDED lines, a new file whole — what the
+        # Edit and Write tools hand the matcher respectively
+        with open(os.path.join(repo, "src", "big.py"), "w", encoding="utf-8") as f:
+            f.write("a = 1  # type: ignore\nb = 2\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "big has a pre-existing hit")
+        c = bash("printf 'c = 3\\n' >> src/big.py", session="b2c")
+        check("bash-edit: a modified file is read as its added lines — a pre-existing hit does not fire",
+              "[no-bare-ignore]" not in c, c)
+        c = bash("printf 'd = 4  # type: ignore\\n' >> src/big.py", session="b2c")
+        check("bash-edit: an added line that hits does fire", "[no-bare-ignore]" in c, c)
+        c = bash("printf 'e = 5  # type: ignore\\n' > src/fresh.py", session="b2d")
+        check("bash-edit: a new file is read whole", "[no-bare-ignore]" in c, c)
+
         c = bash("echo hello && ls src", session="b3")
         check("bash-edit: a command that wrote nothing is silent", c.strip() == "", c)
 

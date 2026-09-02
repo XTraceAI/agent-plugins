@@ -228,7 +228,7 @@ def _names_of(path):
 
 
 def bash_written_files(root, cmd, since):
-    """Absolute paths of regular files a Bash call left modified or new.
+    """(path, is_new) for each regular file a Bash call left modified or new.
 
     Scanned: the session's worktree, plus any sibling worktree the command
     names — a `cat > /tmp/wt-x/app/m.py <<EOF` into a scratch worktree is
@@ -270,6 +270,7 @@ def bash_written_files(root, cmd, since):
             skip_next = code[0:1] in (b"R", b"C")
             if b"D" in code:
                 continue
+            is_new = code == b"??" or code[0:1] == b"A"
             path = os.path.join(wt, rel.decode("utf-8", "replace"))
             try:
                 st = os.stat(path)
@@ -282,15 +283,20 @@ def bash_written_files(root, cmd, since):
             # under-count, the safe direction.
             if not stat.S_ISREG(st.st_mode) or st.st_mtime < since:
                 continue
-            out.append(path)
+            out.append((path, is_new))
             if len(out) > BASH_EDIT_MAX_FILES:
                 return []
     return out
 
 
-def read_edit_body(path):
-    """The file's text, or None when it is not something an edit rule should
-    read: binary (a NUL byte), or past BASH_EDIT_MAX_BYTES."""
+def read_edit_body(path, is_new=True):
+    """What an edit rule reads for a Bash-written file, matching what it
+    reads for the tools: a NEW file is the whole file (a Write), a MODIFIED
+    file is the lines this change added (an Edit's new_string) — not the
+    file it landed in. Read whole, a one-line comment dropped into
+    config.py fired the camelCase rule on every snake_case name already
+    there. None when the file is binary (a NUL byte) or past
+    BASH_EDIT_MAX_BYTES, or when a modified file's diff cannot be read."""
     try:
         with open(path, "rb") as f:
             raw = f.read(BASH_EDIT_MAX_BYTES + 1)
@@ -298,7 +304,19 @@ def read_edit_body(path):
         return None
     if len(raw) > BASH_EDIT_MAX_BYTES or b"\0" in raw:
         return None
-    return raw.decode("utf-8", "replace")
+    if is_new:
+        return raw.decode("utf-8", "replace")
+    try:      # against HEAD, so a `git add` inside the same call changes nothing
+        p = subprocess.run(["git", "-C", os.path.dirname(path), "diff", "HEAD", "--no-color",
+                            "--no-ext-diff", "-U0", "--", path],
+                           capture_output=True, timeout=5)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    added = [l[1:] for l in p.stdout.decode("utf-8", "replace").split("\n")
+             if l.startswith("+") and not l.startswith("+++")]
+    return "\n".join(added)
 
 
 # ── matcher engine: pure ────────────────────────────────────────────────────
@@ -1961,8 +1979,8 @@ def main():
             wants_edits = any(r.get("on") in ("edit", "ordering") and r.get("status", "active") == "active"
                               for r in rules)
             if t0 is not None and wants_edits:
-                for path in bash_written_files(root, cmd, t0):
-                    text = read_edit_body(path)
+                for path, is_new in bash_written_files(root, cmd, t0):
+                    text = read_edit_body(path, is_new)
                     if text is None:
                         continue
                     events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
