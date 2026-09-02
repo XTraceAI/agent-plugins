@@ -198,20 +198,25 @@ reads it, and the only container it ever creates is one you say yes to.
 
 The `SessionStart` / `PreToolUse` / `PostToolUse` hooks
 (`scripts/rulebook_hook.py`) cache every book that binds you, per repo, and
-inject a matching rule as an advisory at the moment of the call. The repo is
-the one the **call** works in — the edited file's checkout first, the session's
-directory second — so working from a folder that merely *contains* your
-checkouts still applies each one's own rules to the calls that touch it. A
-path is followed only while it stays inside the session's directory, so what
-the agent edits can never point the hook at a checkout you did not open.
-A repo and every linked worktree of it resolve to ONE name — the main
-checkout's — so they share a single cached book, a rule scoped to the repo
-applies in all of them, and a fire is attributed to the repo rather than to
-whichever worktree directory it happened in. Session-start rules
-are the exception, since that event names no file: they resolve from the
-session's directory alone, and a session rooted *above* your checkouts still
-gets none. Two books can
-both fire on one call. When they do, the plugin does **not** pick a winner and
+inject a matching rule as an advisory at the moment of the call. An edit rule
+(`event: edit`) sees a file however it was written: through the Edit/Write
+tools before the write, and through a Bash command — `cat > f <<EOF`, a
+`python - <<PY … write_text()`, `sed -i` — right after it, because the
+post-call hook reads what the command left changed on disk (git decides what
+is a candidate, the file's mtime decides what that call touched) and runs the
+same matcher on it. In auto mode the agent is told to write through Bash, so
+without this an edit rule would be silent exactly where it is needed.
+
+Which repo a call belongs to is decided the same way: it is the checkout the
+**call** works in — the edited file's first, the session's directory second —
+so working from a folder that merely *contains* your checkouts still applies
+each one's own rules to the calls that touch it. A path is followed only while
+it stays inside the session's directory, so what the agent edits can never
+point the hook at a checkout you did not open. Session-start rules are the
+exception, since that event names no file: they resolve from the session's
+directory alone, and a session rooted *above* your checkouts still gets none.
+
+Two books can both fire on one call. When they do, the plugin does **not** pick a winner and
 hide the loser — both fire and both reach the local ledger — but the per-call
 advisory cap and the session-start note budget are spent **widest book first**,
 so an org-wide policy is never crowded out by a two-person book's note. Session
