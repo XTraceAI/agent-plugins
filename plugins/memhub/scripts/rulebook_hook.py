@@ -639,8 +639,11 @@ def maybe_refresh(repo, fetched_at):
     except Exception:
         pass
     try:
-        _atomic_json(stamp, {"at": _now()})
         spawn_fetch(repo)
+        # stamp AFTER the spawn: a spawn that raises must not buy ten minutes
+        # of silence. Two hooks racing here can both spawn — harmless, the
+        # child's write is atomic and idempotent.
+        _atomic_json(stamp, {"at": _now()})
     except Exception:
         pass
 
