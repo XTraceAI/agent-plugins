@@ -47,8 +47,13 @@ How a fire reaches people (spec §5.3):
     records the fire with `override_reason`; the next matching call is gated
     again. Gates are never deduped and never cut by the advisory cap. Only a
     Bash rule can gate (an edit already happened; a result rule runs after the
-    fact), and only from a book fetched within 24 h — older caches run it as
-    `advise` and say so once per session.
+    fact).
+  * A gate is honoured from whatever book is cached, however old. There is no
+    timer that turns a gate off: a rule retired on the server disappears at
+    the next successful fetch, and a running session refreshes its own book
+    once it is an hour old (pre lane, detached, throttled). A stale gate costs
+    one `RULEBOOK_OVERRIDE`; a gate that silently stops enforcing because the
+    server was unreachable for a day is the failure a gate exists to prevent.
 
 What leaves the machine, exactly:
   * fetch  — the repo directory name, nothing else.
@@ -96,7 +101,8 @@ POSTURE_BUDGET_CHARS = 8000   # ~2k tokens at ~4 chars/token
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
-BOOK_MAX_AGE_S = 24 * 3600   # §5.3: a gate from an older cache degrades to advise
+REFRESH_AFTER_S = 3600       # pre lane: refresh a book this old in the background…
+REFRESH_RETRY_S = 600        # …and retry no more than this often while the server is down
 API_PATH = "/v1/team/rulebook"
 
 
@@ -604,20 +610,39 @@ def load_rules(repo):
     return rules, "", (book or {}).get("fetched_at"), sources
 
 
-def effective_mode(rule, fetched_at, now=None):
-    """`gate` is honoured only from a book fetched (200 or 304) within the last
-    24 h (§5.3); anything else is `advise`. """
-    mode = rule.get("mode", "advise")
-    if mode != "gate":
-        return "advise"
+def _age_s(iso):
+    """Seconds since a stamp written by `_now()`; unparseable or missing → inf."""
     try:
-        ts = datetime.fromisoformat(str(fetched_at))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        now = now or datetime.now(timezone.utc)
-        return "gate" if (now - ts).total_seconds() <= BOOK_MAX_AGE_S else "advise"
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(str(iso))).total_seconds()
     except Exception:
-        return "advise"
+        return float("inf")
+
+
+def maybe_refresh(repo, fetched_at):
+    """A session outlives its SessionStart fetch — a /loop or an overnight
+    babysit runs for days on the book it started with, and a gate flipped
+    back to advise on the server would keep blocking it until restart. Once
+    the cache is an hour old, refresh it in the background: the child is
+    detached, so the lane never waits, and the stamp file keeps a dead server
+    from being probed more than once every ten minutes. No cache at all
+    counts as infinitely old, so a session whose start-up fetch failed gets
+    retried here too."""
+    if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0":
+        return
+    if _age_s(fetched_at) < REFRESH_AFTER_S:
+        return
+    stamp = book_path(repo) + ".refresh"
+    try:
+        with open(stamp, encoding="utf-8") as f:
+            if _age_s(json.load(f).get("at")) < REFRESH_RETRY_S:
+                return
+    except Exception:
+        pass
+    try:
+        _atomic_json(stamp, {"at": _now()})
+        spawn_fetch(repo)
+    except Exception:
+        pass
 
 
 def scope_ok(rule, repo, gitdir):
@@ -674,6 +699,8 @@ def fetch_book(repo):
             and isinstance(reply.data.get("rules"), list):
         _atomic_json(book_path(repo), {"etag": reply.etag, "fetched_at": _now(),
                                        "rules": reply.data["rules"]})
+    else:                             # a 2xx with the wrong shape is a failure too — say so
+        _breadcrumb("fetch", f"HTTP {reply.status}: unexpected reply shape")
 
 
 # ── what leaves the machine on the recall path ─────────────────────────────
@@ -1464,6 +1491,8 @@ def main():
             except Exception:
                 pass
         return 0
+    if mode == "pre":
+        maybe_refresh(repo, fetched_at)
 
     inp = data.get("tool_input") or {}
     sp = state_path(session)
@@ -1548,7 +1577,7 @@ def main():
 
         scope = r.get("fire_scope", "session")
         if mode == "pre" and tool == "Bash" and r.get("on") == "bash" \
-                and effective_mode(r, fetched_at) == "gate":
+                and r.get("mode") == "gate":
             scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
         key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
         if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
@@ -1577,10 +1606,10 @@ def main():
         return 0
 
     # §5.3: which of this call's fires are GATES. Only a pre-hook Bash call can
-    # be blocked, and only by a rule the fresh book says is a gate.
+    # be blocked, and only by a rule the cached book says is a gate.
     gate_ids = {r["id"] for r in fired_now
                 if mode == "pre" and tool == "Bash" and r.get("on") in ("bash", "ordering")
-                and effective_mode(r, fetched_at) == "gate"}
+                and r.get("mode") == "gate"}
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -1623,13 +1652,6 @@ def main():
                   "RULEBOOK_OVERRIDE='<why>' — that allows exactly that call and records why.")
         lines.append("_This call was blocked. If it is a legitimate exception, re-run the "
                      "same command prefixed `RULEBOOK_OVERRIDE='<why>'`._")
-    # §5.3: a gate from a stale book runs as advise and says so once per session.
-    degraded = [r["id"] for r in shown if r.get("mode") == "gate"
-                and effective_mode(r, fetched_at) == "advise"]
-    if degraded and not st.get("degrade_noted"):
-        st["degrade_noted"] = True
-        lines.append("- _(team rulebook last refreshed >24 h ago — gate rules "
-                     "run as advisories until the next successful fetch)_")
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines),
              user_line="\n".join(user_lines), deny=deny)
