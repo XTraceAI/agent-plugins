@@ -103,7 +103,11 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
-import portable_lock
+# Hooks execute this file directly, but rules-from-sessions also embeds it via
+# spec_from_file_location. Pin sibling imports to this packaged scripts tree in
+# both modes rather than allowing an ambient working directory to supply them.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import portable_lock  # noqa: E402
 
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")

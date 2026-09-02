@@ -67,6 +67,28 @@ def portability_check() -> None:
         str(sorted(imports)),
     )
 
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "portable_lock.py"), "w", encoding="utf-8") as f:
+            f.write("raise RuntimeError('loaded untrusted cwd module')\n")
+        probe = (
+            "import importlib.util; "
+            f"spec = importlib.util.spec_from_file_location('rulebook_probe', {HOOK!r}); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module)"
+        )
+        imported = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=td,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        check(
+            "portability: embedded import pins the packaged portable_lock",
+            imported.returncode == 0,
+            imported.stderr,
+        )
+
 
 def seed_book(base, repo_name, rules):
     """Write a cached server book for `repo_name` under `base` (what the fetch
