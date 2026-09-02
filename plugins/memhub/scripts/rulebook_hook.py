@@ -94,6 +94,8 @@ import json
 import os
 import re
 import shlex
+import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -131,6 +133,16 @@ FLUSH_EVERY_FIRES = 10       # Stop-hook throttle: flush when this many rows wai
 FLUSH_EVERY_S = 300          # …or this long has passed since the last flush
 FLUSH_BATCH = 200
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# A Bash call that wrote files is an edit too (see `bash_written_files`).
+BASH_EDIT_MAX_FILES = 40            # more than this in one call is a generator, not an edit
+BASH_EDIT_MAX_BYTES = 512 * 1024    # per file; bigger is data, not source
+BASH_EDIT_MAX_STATUS = 4000         # `git status` entries; past that the tree is too noisy to read
+BASH_EDIT_MARKS_KEPT = 8            # pre-call timestamps kept per session (parallel calls)
+# Tree rewrites: every touched file has a new mtime but nobody EDITED it, and an
+# edit rule read against a checked-out file is a fire about someone else's code.
+_TREE_REWRITE_RX = re.compile(
+    r"(?:^|[;&|(]\s*)git\s+(?:-C\s+\S+\s+)?(?:checkout|switch|stash|merge|rebase|pull|reset"
+    r"|cherry-pick|revert|apply|am|restore|worktree)\b", re.M)
 STDLIB = set(getattr(sys, "stdlib_module_names", ())) or {
     "abc", "argparse", "ast", "asyncio", "base64", "collections", "contextlib",
     "csv", "dataclasses", "datetime", "enum", "functools", "glob", "hashlib",
@@ -170,6 +182,142 @@ def last_segment(shell):
     """The final command segment of a shell string (split on ;, &&, ||, newline)."""
     parts = [x.strip() for x in re.split(r"&&|\|\||;|\n", shell) if x.strip()]
     return parts[-1] if parts else ""
+
+
+# ── files a Bash call wrote ─────────────────────────────────────────────────
+#
+# An edit rule says `event: edit`, and until now that meant the Edit/Write
+# tools only. But a model writes files through Bash all the time — `cat > f
+# <<EOF` to create, a `python - <<PY … write_text()` to modify, `sed -i` —
+# and in auto mode it is TOLD to. Measured on 302 local sessions: 1464 Bash
+# writes against 3035 Write/Edit calls; 6 of 22 alembic migrations were
+# created with a heredoc. None of those reached an edit rule.
+#
+# Reading the command line back cannot recover the write (the path lives
+# inside the Python program, not the shell), so this reads the DISK instead:
+# the pre lane stamps the call, the post lane asks git what changed since and
+# feeds each file through the same matcher a Write goes through. One
+# mechanism for every shape, including the ones not seen yet. It lands
+# AFTER the write, which is the only lane edit rules use anyway (they are
+# advise-only by decision; only shell rules gate).
+
+def _worktrees(root):
+    """Every worktree of `root`'s repository, `root` first. Empty on any failure."""
+    try:
+        p = subprocess.run(["git", "-C", root, "worktree", "list", "--porcelain"],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return [root]
+    if p.returncode != 0:
+        return [root]
+    seen, real = [root], {os.path.realpath(root)}
+    for line in p.stdout.splitlines():
+        if line.startswith("worktree ") and os.path.realpath(line[9:]) not in real:
+            seen.append(line[9:])
+            real.add(os.path.realpath(line[9:]))
+    return seen
+
+
+def _names_of(path):
+    """The spellings a command might use for `path`: as given, resolved, and —
+    macOS — with or without the `/private` prefix git resolves /tmp and /var to."""
+    names = {path, os.path.realpath(path)}
+    for n in list(names):
+        if n.startswith("/private/"):
+            names.add(n[len("/private"):])
+    return names
+
+
+def bash_written_files(root, cmd, since):
+    """(path, is_new) for each regular file a Bash call left modified or new.
+
+    Scanned: the session's worktree, plus any sibling worktree the command
+    names — a `cat > /tmp/wt-x/app/m.py <<EOF` into a scratch worktree is
+    the case that motivated this (the file was 30 directories away from
+    the session's cwd and in the same repository). Not every worktree: the
+    repos this serves carry twenty-odd, and one `git status` each per Bash
+    call is a cost nobody asked for.
+
+    `git status` decides what is a candidate (so .gitignore does the
+    exclusion — a `.venv` refresh or `node_modules` install is invisible),
+    the mtime decides what THIS call touched. Returns [] rather than a
+    partial list past BASH_EDIT_MAX_FILES: forty files in one call is a
+    generator or a tree rewrite, and forty fires is noise, not advice.
+    """
+    if not root or since is None or _TREE_REWRITE_RX.search(shell_only(cmd or "")):
+        return []
+    roots = [w for w in _worktrees(root)
+             if w == root or any(n in (cmd or "") for n in _names_of(w))]
+    out = []
+    for wt in roots:
+        try:
+            p = subprocess.run(["git", "-C", wt, "status", "--porcelain=v1", "-z",
+                                "--untracked-files=all"], capture_output=True, timeout=5)
+        except Exception:
+            continue
+        if p.returncode != 0:
+            continue
+        entries = p.stdout.split(b"\0")
+        if len(entries) > BASH_EDIT_MAX_STATUS:
+            continue
+        skip_next = False
+        for e in entries:
+            if skip_next:              # the OLD name of a rename/copy: a bare path, no code
+                skip_next = False
+                continue
+            if len(e) < 4:
+                continue
+            code, rel = e[:2], e[3:]
+            skip_next = code[0:1] in (b"R", b"C")
+            if b"D" in code:
+                continue
+            is_new = code == b"??" or code[0:1] == b"A"
+            path = os.path.join(wt, rel.decode("utf-8", "replace"))
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            # No slack on the stamp: mtimes are sub-second on APFS/ext4, and a
+            # slack would let the PREVIOUS tool call's file count as this one's
+            # (the two are often within a second). A coarse filesystem (HFS+,
+            # FAT) can miss a write that lands in the stamp's own second —
+            # under-count, the safe direction.
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime < since:
+                continue
+            out.append((path, is_new))
+            if len(out) > BASH_EDIT_MAX_FILES:
+                return []
+    return out
+
+
+def read_edit_body(path, is_new=True):
+    """What an edit rule reads for a Bash-written file, matching what it
+    reads for the tools: a NEW file is the whole file (a Write), a MODIFIED
+    file is the lines this change added (an Edit's new_string) — not the
+    file it landed in. Read whole, a one-line comment dropped into
+    config.py fired the camelCase rule on every snake_case name already
+    there. None when the file is binary (a NUL byte) or past
+    BASH_EDIT_MAX_BYTES, or when a modified file's diff cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(BASH_EDIT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > BASH_EDIT_MAX_BYTES or b"\0" in raw:
+        return None
+    if is_new:
+        return raw.decode("utf-8", "replace")
+    try:      # against HEAD, so a `git add` inside the same call changes nothing
+        p = subprocess.run(["git", "-C", os.path.dirname(path), "diff", "HEAD", "--no-color",
+                            "--no-ext-diff", "-U0", "--", path],
+                           capture_output=True, timeout=5)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    added = [l[1:] for l in p.stdout.decode("utf-8", "replace").split("\n")
+             if l.startswith("+") and not l.startswith("+++")]
+    return "\n".join(added)
 
 
 # ── matcher engine: pure ────────────────────────────────────────────────────
@@ -1806,6 +1954,41 @@ def main():
     dedup_keys = {}
     by_id = {r["id"]: r for r in rules}
 
+    # The events this call is. The tool call itself, always; and for a Bash
+    # call that wrote files, one synthetic Write per file, so an edit rule sees
+    # a heredoc / write_text() / sed -i the way it sees the Write tool. The
+    # edit lane of `evaluate` is a pre-phase lane and the ordering engine arms
+    # on a post-phase edit, so a synthetic event carries both phases.
+    # Synthetic edits go FIRST: inside the command the writes happened before
+    # its final segment, so a `python fix.py && pytest` must read as edit,
+    # then receipt — the other order would arm an obligation the same call
+    # already discharged.
+    real = {"tool": tool, "phase": mode, "order_phase": mode, "cmd": cmd, "fp": fp,
+            "body": body, "rtext": rtext, "resp": resp, "via": None}
+    events = []
+    if tool == "Bash":
+        marks = st.setdefault("bash_t0", {})
+        call_key = str(data.get("tool_use_id") or "last")
+        if mode == "pre":
+            marks[call_key] = time.time()
+            for k in list(marks)[:-BASH_EDIT_MARKS_KEPT]:
+                marks.pop(k, None)
+        else:
+            t0 = marks.pop(call_key, None)
+            if t0 is None and call_key != "last":
+                t0 = marks.pop("last", None)
+            wants_edits = any(r.get("on") in ("edit", "ordering") and r.get("status", "active") == "active"
+                              for r in rules)
+            if t0 is not None and wants_edits:
+                for path, is_new in bash_written_files(root, cmd, t0):
+                    text = read_edit_body(path, is_new)
+                    if text is None:
+                        continue
+                    events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
+                                   "cmd": "", "fp": path, "body": text, "rtext": "",
+                                   "resp": None, "via": "bash"})
+    events.append(real)
+
     # Conversions: did this call perform the action an earlier fire asked for?
     # Deterministic, under-counts, never over-counts (spec §5.1).
     for rid, fid in list(st["open"].items()):
@@ -1818,12 +2001,18 @@ def main():
             log_conversion(fid, "converted_rx")
             del st["open"][rid]
             st.get("open_file", {}).pop(rid, None)
-        elif mode == "pre" and r.get("on") == "edit" and "content_rx" in r \
-                and tool in EDIT_TOOLS and fp == st.get("open_file", {}).get(rid) \
-                and not evaluate(r, hook_phase="pre", tool=tool, file_path=fp, body=body):
-            log_conversion(fid, "re-edit-clears")
-            del st["open"][rid]
-            st.get("open_file", {}).pop(rid, None)
+            continue
+        if r.get("on") != "edit" or "content_rx" not in r:
+            continue
+        for ev in events:
+            if ev["phase"] == "pre" and ev["tool"] in EDIT_TOOLS \
+                    and ev["fp"] == st.get("open_file", {}).get(rid) \
+                    and not evaluate(r, hook_phase="pre", tool=ev["tool"], file_path=ev["fp"],
+                                     body=ev["body"]):
+                log_conversion(fid, "re-edit-clears")
+                del st["open"][rid]
+                st.get("open_file", {}).pop(rid, None)
+                break
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -1845,55 +2034,63 @@ def main():
                 dedup_keys[rid] = rid
                 fired_now.append(r)
 
-    for r in rules:
-        if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
-                or r.get("status", "active") != "active":   # draft = not armed (§6)
-            continue
-        rid = r["id"]
-
-        if r.get("on") == "ordering":
-            try:
-                ordering = ordering or OrderingEngine(root, branch)
-                ok = bash_ok(resp, strict=r.get("mode") == "gate") if resp is not None else None
-                outcome = ordering.feed(r, hook_phase=mode, tool=tool, cmd=cmd,
-                                        file_path=fp, ok=ok)
-            except Exception:
-                outcome = None
-            if outcome == "discharged" and r.get("_converted_fire"):
-                log_conversion(r["_converted_fire"], "discharged")
-            elif outcome == "fired":
-                dedup_keys[rid] = f"{rid}@{root}:{branch}"
-                fired_now.append(r)
-            continue
-
-        if not path_in_scope(r, fp if tool in EDIT_TOOLS else "", root):
-            continue
-        scope = r.get("fire_scope", "session")
-        if mode == "pre" and tool == "Bash" and r.get("on") == "bash" \
-                and r.get("mode") == "gate":
-            scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
-        key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
-        # the regex first (pure, cheap), the given second (probes run only now)
-        matched = evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
-                           body=body, result_text=rtext) and given_ok(r, probes)
-        if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
-            if matched:
-                st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
-            continue
-        if not matched:
-            continue
-        st["raw"][rid] = st["raw"].get(rid, 0) + 1
-        if scope.startswith("counter"):
-            try:
-                threshold = int(scope.split(":", 1)[1])
-            except (IndexError, ValueError):
-                threshold = 1               # a malformed scope must not silence the whole call
-            st["counts"][rid] = st["counts"].get(rid, 0) + 1
-            if st["counts"][rid] != threshold:   # fire exactly once, at the Nth hit
+    fired_on = {}          # rule id → the event that fired it (its path, for the ledger and the line)
+    for ev in events:
+        etool, ephase, ecmd, efp, ebody = ev["tool"], ev["phase"], ev["cmd"], ev["fp"], ev["body"]
+        for r in rules:
+            if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
+                    or r.get("status", "active") != "active":   # draft = not armed (§6)
                 continue
-        st["fired"].append(key)
-        dedup_keys[rid] = key
-        fired_now.append(r)
+            rid = r["id"]
+            if rid in fired_on:
+                continue
+
+            if r.get("on") == "ordering":
+                try:
+                    ordering = ordering or OrderingEngine(root, branch)
+                    ok = bash_ok(ev["resp"], strict=r.get("mode") == "gate") \
+                        if ev["resp"] is not None else None
+                    outcome = ordering.feed(r, hook_phase=ev["order_phase"], tool=etool, cmd=ecmd,
+                                            file_path=efp, ok=ok)
+                except Exception:
+                    outcome = None
+                if outcome == "discharged" and r.get("_converted_fire"):
+                    log_conversion(r["_converted_fire"], "discharged")
+                elif outcome == "fired":
+                    dedup_keys[rid] = f"{rid}@{root}:{branch}"
+                    fired_now.append(r)
+                    fired_on[rid] = ev
+                continue
+
+            if not path_in_scope(r, efp if etool in EDIT_TOOLS else "", root):
+                continue
+            scope = r.get("fire_scope", "session")
+            if ephase == "pre" and etool == "Bash" and r.get("on") == "bash" \
+                    and r.get("mode") == "gate":
+                scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
+            key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
+            # the regex first (pure, cheap), the given second (probes run only now)
+            matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
+                               body=ebody, result_text=ev["rtext"]) and given_ok(r, probes)
+            if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
+                if matched:
+                    st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
+                continue
+            if not matched:
+                continue
+            st["raw"][rid] = st["raw"].get(rid, 0) + 1
+            if scope.startswith("counter"):
+                try:
+                    threshold = int(scope.split(":", 1)[1])
+                except (IndexError, ValueError):
+                    threshold = 1               # a malformed scope must not silence the whole call
+                st["counts"][rid] = st["counts"].get(rid, 0) + 1
+                if st["counts"][rid] != threshold:   # fire exactly once, at the Nth hit
+                    continue
+            st["fired"].append(key)
+            dedup_keys[rid] = key
+            fired_now.append(r)
+            fired_on[rid] = ev
 
     if not fired_now:
         save_state(sp, st)
@@ -1925,12 +2122,25 @@ def main():
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
     user_lines, deny_lines = [], []
+
+    def _where(r):
+        """A fire from a file the Bash call wrote names the file: the model
+        knows which file a Write was, but a heredoc's target is buried in
+        the command it just ran."""
+        ev = fired_on.get(r["id"])
+        if not ev or ev.get("via") != "bash":
+            return ""
+        path = ev["fp"]
+        if root and path.startswith(root.rstrip("/") + "/"):
+            path = os.path.relpath(path, root)
+        return f" _(in `{path}`, written by that command)_"
+
     for r in shown:
         label = r.get("_label") or r["id"]
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
         if r["id"] not in gate_ids:
-            lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)}")
-            user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}")
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
+            user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}")
         elif override_reason is not None:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)} "
                          f"_(gate overridden: {override_reason})_")
@@ -1952,15 +2162,26 @@ def main():
     except Exception:
         pass
     raw = {r["id"]: st["raw"].get(r["id"]) for r in fired_now}
-    excerpt = cmd or fp or ""
-    ids = log_fires(ctx, [r for r in shown if r["id"] not in gate_ids], hook_phase=mode,
-                    mode="advise", excerpt=excerpt, raw_counts=raw, dedup_keys=dedup_keys)
+
+    def _excerpt(r):
+        """Local-only (never on the wire). A fire from a Bash-written file
+        records the file, prefixed so a reader can count how many edits
+        arrive through Bash versus the Write tool."""
+        ev = fired_on.get(r["id"])
+        if ev and ev.get("via") == "bash":
+            return f"bash-edit {ev['fp']}"
+        return cmd or fp or ""
+
+    ids = {}
+    for r in (r for r in shown if r["id"] not in gate_ids):
+        ids.update(log_fires(ctx, [r], hook_phase=mode, mode="advise", excerpt=_excerpt(r),
+                             raw_counts=raw, dedup_keys=dedup_keys))
     if gates:      # a blocked call and an overridden one are both delivered gate fires
-        ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=excerpt,
+        ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
                              override_reason=override_reason))
-    if cut:   # the per-call cap has a cost; make it visible, never silent
-        log_fires(ctx, cut, hook_phase=mode, mode="suppressed", excerpt=excerpt,
+    for r in cut:   # the per-call cap has a cost; make it visible, never silent
+        log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
@@ -1969,10 +2190,10 @@ def main():
         elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
             st["open"][r["id"]] = ids.get(r["id"])
             if r.get("on") == "edit":
-                st.setdefault("open_file", {})[r["id"]] = fp
+                ev = fired_on.get(r["id"])
+                st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
     save_state(sp, st)
     return 0
-
 
 if __name__ == "__main__":
     try:
