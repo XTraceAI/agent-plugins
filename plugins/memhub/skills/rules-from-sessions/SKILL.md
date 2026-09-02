@@ -276,6 +276,8 @@ origin) and `quote_rx`.
      --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>" \
      --rulebook-id <the destination rulebook_id>
    ```
+   Omit `--rulebook-id` entirely when there is no id (an older backend);
+   passing it empty is an argparse error and you get no report at all.
    `same_title` / `same_matcher` / `anchors_overlap` hits print the exact
    `supersedes_rule_id` to copy. Then the semantic pass in your own reading
    over `judge_by_statement`: `duplicate` → file with `supersedes_rule_id`;

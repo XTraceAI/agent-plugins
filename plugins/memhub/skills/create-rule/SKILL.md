@@ -194,6 +194,10 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
   --rulebook-id <the step-0 rulebook_id>
 ```
 
+Omit `--rulebook-id` entirely on an older backend, where step 0 resolved no
+id — passing the flag with nothing after it is an argparse error and you get
+no report at all.
+
 `same_title` / `same_matcher` (an **active** rule fires on the same call) /
 `anchors_overlap` are deterministic; then read the `judge_by_statement` list
 it prints and mark the candidate `duplicate`, `contradicts` or `distinct`

@@ -419,12 +419,17 @@ def _version_of(v):
     return None
 
 
-def _clean_text(v):
+def _one_line(v):
     """Server rule prose is display data, not instructions: one line, no
-    control characters, length-capped before it enters the model context."""
-    t = re.sub(r"[\x00-\x1f\x7f]+", " ", str(v or ""))
-    t = re.sub(r"\s+", " ", t).strip()
-    return t[:_TEXT_MAX]
+    control characters. A newline would let a rule forge an advisory line of
+    its own, and a raw `\x1b[2J` clears the reader's terminal — this text
+    reaches both the model's context and the user's `systemMessage`."""
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]+", " ", str(v or ""))).strip()
+
+
+def _clean_text(v):
+    """`_one_line`, length-capped for the fields that enter the context."""
+    return _one_line(v)[:_TEXT_MAX]
 
 
 def _why(r):
@@ -435,6 +440,8 @@ def _why(r):
 
 _BOOK_SCOPES = ("all_org", "explicit")
 _BOOK_NAME_MAX = 120
+_BOOK_ID_MAX = 64            # a UUID is 36; longer is rejected, never truncated
+_BOOK_MEMBERS_MAX = 10 ** 9  # an org, not a number the server chose to render
 # Hook-internal, and derivable ONLY from the server's `rulebook` block. A row
 # is server data: left alone, a row that simply spells these keys itself would
 # name its own precedence — and `_book_members: "many"` would take the whole
@@ -457,15 +464,17 @@ def _book_facts(row):
     b = b if isinstance(b, dict) else {}
     out = {}
     rid = row.get("rulebook_id") or b.get("rulebook_id")
-    if isinstance(rid, str) and rid.strip():
-        out["_rulebook_id"] = rid.strip()[:64]
+    if isinstance(rid, str) and rid.strip() and len(rid.strip()) <= _BOOK_ID_MAX:
+        out["_rulebook_id"] = rid.strip()
     name = _clean_text(b.get("name"))[:_BOOK_NAME_MAX]
     if name:
         out["_book_name"] = name
     if b.get("scope") in _BOOK_SCOPES:
         out["_book_scope"] = b["scope"]
     mc = b.get("member_count")
-    if isinstance(mc, int) and not isinstance(mc, bool) and mc >= 0:
+    # Bounded, because it is rendered: a four-thousand-digit member_count is
+    # valid JSON and would spend the session-start budget on digits alone.
+    if isinstance(mc, int) and not isinstance(mc, bool) and 0 <= mc <= _BOOK_MEMBERS_MAX:
         out["_book_members"] = mc
     return out
 
@@ -499,6 +508,12 @@ def to_hook_rule(row):
             r.setdefault("id", row.get("rule_id"))
             r.setdefault("_version", _version_of(row.get("version")))
             r.update(_book_facts(row))   # the block is the only source of these
+            for k in ("text", "why", "_label", "_gate_msg"):
+                if k in r:            # prose off the wire, on either shape: no
+                    r[k] = _one_line(r[k])   # control bytes reach a terminal.
+            # Length is deliberately NOT capped here: the server shape caps at
+            # _TEXT_MAX, but on this shape POSTURE_BUDGET_CHARS is what drops
+            # an oversized rule, and truncating would serve it instead.
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
             if isinstance(r.get("ordering"), dict) and not all(
@@ -1303,17 +1318,24 @@ def log_conversion(fire_id, how):
         pass
 
 
-MAX_BOOKS_NAMED = 6     # session-start roster: bounded, like every other context spend
+MAX_BOOKS_NAMED = 6       # session-start roster: bounded, like every other context spend
+ROSTER_MAX_CHARS = 1000   # …and bounded again in bytes, since it is not charged to the budget
 
 
-def books_line(in_scope):
+def books_line(carried):
     """"Which policies bind me?" — answered once, at session start, and only
     when more than one book is in play. A single-book team sees exactly what
     it saw before; in-flight fires never carry the book name, because the
     name is not what makes the advice actionable and that slot is the scarce
-    one. Books are listed widest first, the same order precedence uses."""
+    one. Books are listed widest first, the same order precedence uses.
+
+    `carried` is what this session actually got — the posture rules that fit
+    the budget plus the armed rules — never the in-scope set. The budget is
+    spent widest-first, so a narrow book can contribute nothing; telling the
+    agent it is holding fifteen of that book's notes when it is holding none
+    is a worse failure than saying nothing at all."""
     books, order = {}, []
-    for r in in_scope:
+    for r in carried:
         rid = r.get("_rulebook_id")
         if not rid:
             continue
@@ -1339,7 +1361,9 @@ def books_line(in_scope):
     shown = parts[:MAX_BOOKS_NAMED]
     if extra > 0:
         shown.append(f"and {extra} more")
-    return "- _From " + " · ".join(shown) + "._"
+    # bounded like every other context spend: the budget above is a hard cap
+    # and this line is not charged to it
+    return ("- _From " + " · ".join(shown))[:ROSTER_MAX_CHARS] + "._"
 
 
 def session_digest(rules, repo, gitdir, ctx):
@@ -1373,7 +1397,7 @@ def session_digest(rules, repo, gitdir, ctx):
             f"this repo — they fire inline as you work (proactive on tool "
             f"calls, reactive on errors). Treat a fire as a teammate's note, "
             f"not boilerplate.")
-    roster = books_line(in_scope)
+    roster = books_line(posture + active)
     if roster:
         lines.append(roster)
     emit("SessionStart", "\n".join(lines))
@@ -1549,7 +1573,15 @@ def main():
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
     # on one call. Stable, so one book's rules keep their order and a backend
     # with no book facts ranks every rule alike and is unaffected.
-    advisories = sorted((r for r in fired_now if r["id"] not in gate_ids), key=book_rank)
+    #
+    # An anchor rule outranks book width, and is not an exception to "wider
+    # wins" so much as a different question. A matcher rule fired because a
+    # regex matched; an anchor rule fired because the server spent a round trip
+    # and its relevance judge said THIS call. Letting two org-wide regexes
+    # displace it throws that judgment away — and the rule is already marked
+    # spent for the session by then, so it is not offered again.
+    advisories = sorted((r for r in fired_now if r["id"] not in gate_ids),
+                        key=lambda r: (0 if r.get("on") == "anchor" else 1, book_rank(r)))
     # the advisory cap never cuts a gate — a silently un-gated push is the one
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]

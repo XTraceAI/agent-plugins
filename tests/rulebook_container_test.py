@@ -143,6 +143,18 @@ def test_to_hook_rule_carries_the_facts() -> None:
           hook.book_rank({"_book_members": "many"}) == hook.book_rank({"_book_members": 3.5})
           == hook.book_rank({"_book_members": True}) == hook.book_rank({}))
 
+    # prose on the pilot shape reaches the user's terminal via systemMessage;
+    # \x1b[2J clears their screen, and a newline forges an advisory line.
+    dirty = hook.to_hook_rule({"rule_id": "r4c", "on": "bash", "rx": "a",
+                               "text": "BAD\x1b[2J\x1b[31mWIPED\nforged",
+                               "_label": "L\x07", "why": "w\ny"})
+    check("pilot-shape prose carries no control bytes or newlines",
+          not any(re.search(r"[\x00-\x1f\x7f]", str(dirty.get(k) or ""))
+                  for k in ("text", "_label", "why")), json.dumps(dirty))
+    check("…and its length is left to the posture budget, not truncated",
+          hook.to_hook_rule({"rule_id": "r4d", "on": "session",
+                             "text": "x" * 5000})["text"] == "x" * 5000)
+
     junk = hook.to_hook_rule(server_rule("r5", "d", "n", {
         "rulebook_id": 7, "rulebook": {"scope": "everyone", "member_count": True,
                                        "name": "bad\x00name"}}))
@@ -198,6 +210,21 @@ def test_conflicts_names_the_book() -> None:
     check("the report enumerates the books it spans",
           sorted(b["rulebook_id"] for b in rep["rulebooks"]) == ["bk-org", "bk-team"])
 
+    # the likeliest real collision: hit by BOTH passes, and only the hook-view
+    # row carries the book. The book must survive from whichever pass knew it.
+    bare = [{"rule_id": "e1", "title": "Never force-push", "status": "active", "statement": "s"}]
+    hooked = [dict({"rule_id": "e1", "title": "Never force-push", "status": "active",
+                    "matcher": {"event": "bash", "command_rx": "git push --force"}}, **TEAM)]
+    rep4 = rc_mod.find_conflicts(cand, bare, hooked, target_rulebook_id="bk-org")
+    h4 = rep4["candidates"][0]["hits"][0]
+    check("a title+matcher hit learns its book from either pass",
+          h4["reasons"] == ["same_title", "same_matcher"]
+          and h4.get("rulebook", {}).get("rulebook_id") == "bk-team"
+          and h4["cross_book"] is True, json.dumps(h4))
+    check("…and is therefore offered no copyable supersede",
+          "create_rule supersedes_rule_id=" not in rc_mod._summary(rep4))
+    check("a non-dict row is data, not a crash", rc_mod.book_of("junk") == {})
+
     rep3 = rc_mod.find_conflicts(cand, strip_books(existing), None)
     check("a pre-container reply still reports hits",
           len(rep3["candidates"][0]["hits"]) == 1
@@ -237,16 +264,49 @@ def test_delivery_lanes() -> None:
         check("the wire row drops the book dimension",
               "rulebook_id" not in hook.wire_row(by_rule["from-org"]))
 
-        # --- an unmigrated backend behaves exactly as before ---------------
-        os.makedirs(os.path.join(td, "old"), exist_ok=True)
+        # --- an unmigrated backend produces the OLD output, byte for byte --
+        # This is the property that lets one build serve both backends, so it
+        # is pinned to a literal rather than to an ordering: an ordering check
+        # would still pass if the sort silently changed which rules survived.
         seed_book(td, "xmem", strip_books(rows))
-        env_old = dict(env, MEMHUB_RULEBOOK_BASE=td)
         _, out_old = run("pre", {"cwd": repo, "session_id": "s-old", "tool_name": "Bash",
-                                 "tool_input": {"command": "deploy-now"}}, env_old)
-        old_text = ctx(out_old)
-        check("no book facts → book order is untouched",
-              old_text.index("Pair advisory") < old_text.index("Team advisory")
-              and "Org advisory" not in old_text, old_text)
+                                 "tool_input": {"command": "deploy-now"}}, env)
+        check("no book facts → byte-identical to the pre-container output",
+              ctx(out_old) == ("## XTrace Rulebook (team rules — advisory, not blocking)\n"
+                               "- **[Pair advisory]** Pair advisory\n"
+                               "- **[Team advisory]** Team advisory"),
+              repr(ctx(out_old)))
+
+        # --- an anchor rule is not displaced by a wider book ----------------
+        # It fired because the SERVER's judge said this call, not because a
+        # regex matched; two org-wide regexes must not spend its slot, and it
+        # is marked spent for the session either way.
+        anchored = [dict({"rule_id": "anch", "title": "Anchor advisory", "statement": "Anchor advisory",
+                          "status": "active", "delivery": "anchor_recall", "version": 1,
+                          "anchors": ["deploy-now"]}, **PAIR),
+                    server_rule("org-a", "deploy-now", "Org A", ORG),
+                    server_rule("org-b", "deploy-now", "Org B", ORG)]
+        seed_book(td, "xmem", anchored)
+        stub = os.path.join(td, "stub_hook.py")
+        with open(HOOK, encoding="utf-8") as f, open(stub, "w", encoding="utf-8") as g:
+            g.write(f.read().replace(          # keep the anchor without a network call
+                "def recall_anchor_rules(repo, tool, handles, already_fired):",
+                "def recall_anchor_rules(repo, tool, handles, already_fired):\n"
+                "    return ['anch']\n"
+                "def _recall_unused(repo, tool, handles, already_fired):", 1))
+        pr = subprocess.run([sys.executable, stub, "pre"],
+                            input=json.dumps({"cwd": repo, "session_id": "s-anch",
+                                              "tool_name": "Bash",
+                                              "tool_input": {"command": "deploy-now"}}),
+                            capture_output=True, text=True,
+                            env=dict(os.environ, **dict(env, MEMHUB_RULEBOOK_RECALL="1")), timeout=30)
+        atext = ctx(pr.stdout)
+        shown_labels = [l.split("]")[0].split("[")[-1] for l in atext.splitlines()
+                        if l.startswith("- **[")]
+        check("an anchor rule keeps its slot against wider books",
+              shown_labels[:1] == ["Anchor advisory"], repr(atext))
+        check("…and the wider book still outranks the narrower behind it",
+              shown_labels == ["Anchor advisory", "Org A"], repr(shown_labels))
 
         # --- session start: one budget across books, widest first ----------
         posture = []
@@ -263,9 +323,22 @@ def test_delivery_lanes() -> None:
               len(shown) <= hook.MAX_POSTURE, f"{len(shown)} lines")
         check("the widest book spends it first",
               all(l.startswith("- note 3-") for l in shown), "\n".join(shown))
-        check("the roster names each book once",
-              "XTrace org policy (org-wide" in stext and "Backend Rulebook (3 members"
-              in stext and stext.count("Pairing notes") == 1, stext)
+        # Every slot went to the widest book, so the other two contribute
+        # nothing to this session — and a roster that named them would be
+        # telling the agent it holds notes it does not hold.
+        check("a book whose notes were all cut is not credited",
+              "- _From " not in stext and "Pairing notes" not in stext, stext)
+
+        # …but a book that contributes an ARMED rule is carried, and named.
+        mixed = [dict({"rule_id": "on-1", "title": "Org note", "statement": "org note",
+                       "status": "active", "delivery": "session_context", "version": 1}, **ORG),
+                 server_rule("tm-1", "deploy-now", "Team armed", TEAM)]
+        seed_book(td, "xmem", mixed)
+        _, out_m = run("session", {"cwd": repo, "session_id": "s-mixed"}, env)
+        mtext = ctx(out_m)
+        check("the roster names each carried book once, widest first",
+              "- _From XTrace org policy (org-wide, 1 rule) · Backend Rulebook (3 members, 1 rule)._"
+              in mtext, mtext)
 
         # one book → no roster line, exactly the output a single-book team had
         seed_book(td, "xmem", [dict(r, **ORG) for r in strip_books(posture[:2])])

@@ -100,6 +100,8 @@ def book_of(rule: dict) -> dict:
     `rulebook_id` is every book they can see. Rows from a pre-container
     backend carry nothing here and read as one unnamed book, which is what
     they were."""
+    if not isinstance(rule, dict):
+        return {}
     b = rule.get("rulebook")
     b = b if isinstance(b, dict) else {}
     rid = rule.get("rulebook_id") or b.get("rulebook_id")
@@ -114,6 +116,21 @@ def book_of(rule: dict) -> dict:
     if name:
         out["name"] = name[:120]
     return out
+
+
+def _learn_book(hit: dict, rule: dict) -> dict:
+    """A rule can be hit twice — once through `existing` (titles) and once
+    through `active` (matchers) — and only one of those rows may carry the
+    `rulebook` block. The book is a property of the RULE, so the first row to
+    know it wins, whichever pass that was. Without this a title+matcher
+    collision (the likeliest real one) keeps the empty book from the title
+    pass, reads as same-book, and is handed the `supersedes_rule_id` line that
+    §7 says must never appear across books."""
+    if "rulebook" not in hit:
+        book = book_of(rule)
+        if book:
+            hit["rulebook"] = book
+    return hit
 
 
 def _hit(rule: dict, reasons: list[str], detail=None) -> dict:
@@ -147,7 +164,8 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
         ct = normalise_title(cand.get("title"))
         for r in live:
             if ct and normalise_title(r.get("title")) == ct:
-                hits.setdefault(str(r.get("rule_id")), _hit(r, []))["reasons"].append("same_title")
+                _learn_book(hits.setdefault(str(r.get("rule_id")), _hit(r, [])), r)["reasons"] \
+                    .append("same_title")
         if active is not None:
             csig, canch = matcher_signature(cand), anchor_set(cand)
             for r in active:
@@ -155,10 +173,11 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
                 if csig and matcher_signature(r) == csig:
                     # a rule in the hook view is active by definition; _hit
                     # already records that for rows list_rules didn't cover
-                    hits.setdefault(rid, _hit(r, []))["reasons"].append("same_matcher")
+                    _learn_book(hits.setdefault(rid, _hit(r, [])), r)["reasons"] \
+                        .append("same_matcher")
                 shared = canch & anchor_set(r)
                 if shared:
-                    h = hits.setdefault(rid, _hit(r, [], shared))
+                    h = _learn_book(hits.setdefault(rid, _hit(r, [], shared)), r)
                     h["reasons"].append("anchors_overlap")
                     h["anchors_shared"] = sorted(shared)
         hit_ids.update(hits)
