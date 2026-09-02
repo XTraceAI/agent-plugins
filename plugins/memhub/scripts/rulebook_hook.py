@@ -435,6 +435,11 @@ def _why(r):
 
 _BOOK_SCOPES = ("all_org", "explicit")
 _BOOK_NAME_MAX = 120
+# Hook-internal, and derivable ONLY from the server's `rulebook` block. A row
+# is server data: left alone, a row that simply spells these keys itself would
+# name its own precedence — and `_book_members: "many"` would take the whole
+# lane down through book_rank. They are stripped on the way in.
+_BOOK_KEYS = ("_rulebook_id", "_book_name", "_book_scope", "_book_members")
 
 
 def _book_facts(row):
@@ -475,8 +480,9 @@ def book_rank(rule):
     already logged `mode="suppressed"` to the ledger. Every sort using it is
     STABLE, so rules within one book — and every rule from a backend that
     sends no book facts — keep the order the book gave them."""
+    members = rule.get("_book_members")
     return (0 if rule.get("_book_scope") == "all_org" else 1,
-            -int(rule.get("_book_members") or 0))
+            -members if isinstance(members, int) and not isinstance(members, bool) else 0)
 
 
 def to_hook_rule(row):
@@ -489,10 +495,10 @@ def to_hook_rule(row):
         if not isinstance(row, dict):
             return None
         if "on" in row:
-            r = dict(row)
+            r = {k: v for k, v in row.items() if k not in _BOOK_KEYS}
             r.setdefault("id", row.get("rule_id"))
             r.setdefault("_version", _version_of(row.get("version")))
-            r.update(_book_facts(row))   # the server's block is authoritative
+            r.update(_book_facts(row))   # the block is the only source of these
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
             if isinstance(r.get("ordering"), dict) and not all(
@@ -504,7 +510,7 @@ def to_hook_rule(row):
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
              "_label": _clean_text(row.get("title")) or None,
              "mode": row.get("mode", "advise"), "_version": _version_of(row.get("version"))}
-        r.update(_book_facts(row))
+        r.update(_book_facts(row))   # built from scratch here, so nothing to strip
         if not r["id"]:
             return None
         scopes = [str(x) for x in (row.get("scope_repos") or []) if x]

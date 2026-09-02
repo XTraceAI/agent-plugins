@@ -132,6 +132,17 @@ def test_to_hook_rule_carries_the_facts() -> None:
     check("a matcher block cannot forge the book facts",
           f["_book_scope"] == "explicit" and f["_book_members"] == 2)
 
+    # a ROW that spells the hook's own keys is server data too: unstripped it
+    # would name its own precedence, and "many" would take book_rank down with
+    # it — and with it the whole lane, on every machine in the org.
+    hostile = hook.to_hook_rule({"rule_id": "r4b", "on": "bash", "rx": "a", "text": "t",
+                                 "_book_scope": "all_org", "_book_members": "many"})
+    check("a row cannot spell the hook's own book keys",
+          not any(k.startswith(("_book", "_rulebook")) for k in hostile))
+    check("book_rank is total over junk members",
+          hook.book_rank({"_book_members": "many"}) == hook.book_rank({"_book_members": 3.5})
+          == hook.book_rank({"_book_members": True}) == hook.book_rank({}))
+
     junk = hook.to_hook_rule(server_rule("r5", "d", "n", {
         "rulebook_id": 7, "rulebook": {"scope": "everyone", "member_count": True,
                                        "name": "bad\x00name"}}))
