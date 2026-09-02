@@ -271,8 +271,18 @@ def hook_checks() -> None:
         wt = mkworktree(container, main, "MainRepo-feature", "feat/x")
 
         # The book is cached under the checkout the call resolves to — the
-        # worktree's own name — which is what a worktree-rooted session has
-        # always fetched. Seed both so the 2x2 varies only cwd and tool.
+        # worktree's own name. Seed both so the 2x2 varies only cwd and tool.
+        #
+        # NOTE, so this suite is not read as more than it proves: seeding by
+        # hand is what lets the worktree rows pass. In production the book is
+        # FETCHED under that same worktree name, and the server filters
+        # `scope_repos` by exact string membership — so a rule scoped to the
+        # repo is dropped before it ever reaches the book. Measured against
+        # staging: `MemHub-Backend` returns 5 rules, `MemHub-Backend-msg-buckets`
+        # returns 2 (only the unscoped ones). That is a separate defect in the
+        # NAMING layer, not the seeding layer this file covers; these rows
+        # prove the call resolves the right checkout, not that the right rules
+        # were fetched for it.
         for name in ("MainRepo", "MainRepo-feature"):
             seed_book(base, name, [RULE])
         env = {"MEMHUB_RULEBOOK_BASE": base, "MEMHUB_RULEBOOK_FETCH": "0",

@@ -201,10 +201,10 @@ The `SessionStart` / `PreToolUse` / `PostToolUse` hooks
 inject a matching rule as an advisory at the moment of the call. The repo is
 the one the **call** works in — the edited file's checkout first, the session's
 directory second — so working from a folder that merely *contains* your
-checkouts still applies each one's own rules to the calls that touch it, and a
-rule scoped to a repo matches from any of its worktrees. A path is followed
-only while it stays inside the session's directory, so what the agent edits
-can never point the hook at a checkout you did not open. Session-start rules
+checkouts still applies each one's own rules to the calls that touch it. A
+path is followed only while it stays inside the session's directory, so what
+the agent edits can never point the hook at a checkout you did not open.
+Session-start rules
 are the exception, since that event names no file: they resolve from the
 session's directory alone, and a session rooted *above* your checkouts still
 gets none. Two books can
