@@ -97,20 +97,79 @@ def portability_check() -> None:
         os.mkdir(incomplete)
         incomplete_hook = os.path.join(incomplete, "rulebook_hook.py")
         shutil.copy2(HOOK, incomplete_hook)
+        incomplete_repo = os.path.join(td, "incomplete-repo")
+        os.makedirs(os.path.join(incomplete_repo, ".git"))
+        with open(
+            os.path.join(incomplete_repo, ".git", "HEAD"), "w", encoding="utf-8"
+        ) as f:
+            f.write("ref: refs/heads/main\n")
+        incomplete_base = os.path.join(td, "incomplete-base")
+        seed_book(
+            incomplete_base,
+            "incomplete-repo",
+            [
+                {
+                    "id": "missing-shim-gate",
+                    "on": "bash",
+                    "rx": r"git\s+push",
+                    "mode": "gate",
+                    "fire_scope": "call",
+                    "repo_scope": "any",
+                    "status": "active",
+                    "text": "Do not push yet",
+                    "why": "partial installs must not disable matcher gates",
+                }
+            ],
+        )
         missing_shim = subprocess.run(
             [sys.executable, incomplete_hook, "pre"],
-            input="{}",
+            input=json.dumps(
+                {
+                    "cwd": incomplete_repo,
+                    "session_id": "missing-shim",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git push origin main"},
+                }
+            ),
             cwd=td,
             capture_output=True,
             text=True,
+            env=dict(
+                os.environ,
+                MEMHUB_RULEBOOK_BASE=incomplete_base,
+                MEMHUB_RULEBOOK_FETCH="0",
+            ),
+            timeout=30,
+        )
+        try:
+            missing_output = json.loads(missing_shim.stdout)
+        except Exception:
+            missing_output = {}
+        check(
+            "portability: a missing lock shim preserves matcher gates",
+            missing_shim.returncode == 0
+            and missing_shim.stderr == ""
+            and missing_output.get("hookSpecificOutput", {}).get(
+                "permissionDecision"
+            )
+            == "deny",
+            missing_shim.stderr or missing_shim.stdout,
+        )
+        missing_flush = subprocess.run(
+            [sys.executable, incomplete_hook, "flush"],
+            input="",
+            cwd=td,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, MEMHUB_RULEBOOK_BASE=incomplete_base),
             timeout=30,
         )
         check(
-            "portability: a missing lock shim fails open and stays silent",
-            missing_shim.returncode == 0
-            and missing_shim.stdout == ""
-            and missing_shim.stderr == "",
-            missing_shim.stderr or missing_shim.stdout,
+            "portability: missing lock shim skips the lock-dependent flush",
+            missing_flush.returncode == 0
+            and missing_flush.stdout == ""
+            and missing_flush.stderr == "",
+            missing_flush.stderr or missing_flush.stdout,
         )
 
 

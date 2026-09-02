@@ -117,10 +117,8 @@ def _load_portable_lock():
 
 try:
     portable_lock = _load_portable_lock()
-    _PORTABLE_LOCK_LOAD_ERROR = None
-except BaseException as exc:
+except Exception:
     portable_lock = None
-    _PORTABLE_LOCK_LOAD_ERROR = exc
 
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
@@ -411,6 +409,9 @@ class OrderingEngine:
         self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
+        if portable_lock is None:
+            # Matcher gates need no shared state; only ordering gates fail open.
+            return None
         lock = open(self.path + ".lock", "a+", encoding="utf-8")
         deadline = time.monotonic() + LOCK_WAIT_S
         while True:
@@ -1450,6 +1451,9 @@ def flush_fires(final=False):
     a failed batch is retried, verbatim, on the next flush; `rejected` rows
     are logged locally and never retried (they sit behind the watermark).
     One flusher at a time via flock; a second caller simply leaves."""
+    if portable_lock is None:
+        # Retain the ledger rather than advancing it without process exclusivity.
+        return
     ldir = _ledger_dir()
     lock = open(os.path.join(ldir, ".flush.lock"), "a+", encoding="utf-8")
     try:
@@ -1905,10 +1909,6 @@ def session_digest(rules, repo, gitdir, ctx):
 
 
 def main():
-    if portable_lock is None:
-        if os.environ.get("MEMHUB_RULEBOOK_DEBUG"):
-            print(f"portable lock unavailable: {_PORTABLE_LOCK_LOAD_ERROR!r}", file=sys.stderr)
-        return 0
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
         fetch_book(sys.argv[2])
