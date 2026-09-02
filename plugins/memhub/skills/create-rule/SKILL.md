@@ -123,7 +123,30 @@ them decide — step 5 flags these as `cross_book`.
 Plus on every rule: `title` (short, imperative; the server allows up to 200
 chars but aim for under 60), `statement` (the advisory line and the nuance a
 reviewer needs: sanctioned forms, exemptions), `scope_repos` (`["<repo>"]` or
-`[]` for all), `scope_paths` / `scope_exclude_paths` (globs).
+`[]` for all), `scope_paths` / `scope_exclude_paths` (globs — they constrain
+edit rules by file path; a Bash call carries no path, so an include-scoped
+rule never fires on one).
+
+**`given` — facts the call must also satisfy.** A matcher rule may carry a
+`given` block inside its `matcher`; the regex is checked first, then these,
+and the hook answers them from read-only git and the local transcript, once
+per call. A fact it cannot establish never satisfies a predicate, so the rule
+stays silent rather than firing on a guess.
+
+| the rule says… | `given` |
+|---|---|
+| never push to main | `{"repo": {"branch_rx": "^(main|master)$"}}` on a `git push` matcher |
+| a PR that changes source needs a test | `{"repo": {"diff_paths_rx": "^src/", "diff_paths_none_rx": "(^|/)tests?/"}}` on a `gh pr create` matcher |
+| keep PRs under 500 lines | `{"repo": {"diff_lines_gt": 500}}` |
+| don't commit unless asked | `{"user": {"not_said_rx": "\\b(commit|push|ship)\\b"}}` on a `git commit` matcher |
+
+`repo` keys: `branch_rx`, `branch_not_rx`, `diff_lines_gt`, `diff_files_gt`,
+`diff_paths_rx`, `diff_paths_none_rx` (the branch's changes against its base,
+working tree and untracked files included), `dirty`. `user` keys: `said_rx`,
+`not_said_rx` (what the person typed this session — never a tool result or
+injected context). An unknown key drops the rule at load, exactly as a bad
+pattern does. A backend that predates `given` refuses it at `create_rule`;
+verify locally (step 4) and file once the backend accepts it.
 
 **Matcher-authoring rules:**
 - Bash rules match the **pre-heredoc segment only** by default — heredoc bodies
@@ -160,6 +183,31 @@ For an `edit` / `write` rule a case is `path::content`:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
   --fires '/repo/src/db.py::conn = connect(url, verify=False)' \
   --silent '/repo/src/db.py::conn = connect(url)'
+```
+
+A rule with a `given` block needs the facts it asks about — the fixture IS the
+repo; no git runs and no transcript is read. Give them for every case
+(`--branch`, `--diff-path` (repeatable), `--diff-lines`, `--dirty`,
+`--user-said` (repeatable)) or per case as objects in a `--cases` file:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires 'git push origin HEAD' --branch main
+cat > /tmp/cases.json <<'JSON'
+{"fires":  [{"case": "gh pr create --fill", "diff_paths": ["src/a.py"]}],
+ "silent": [{"case": "gh pr create --fill", "diff_paths": ["src/a.py", "tests/test_a.py"]}]}
+JSON
+```
+
+An `ordering` rule is verified as a sequence of steps joined by ` >> `
+(`edit:<path>`, `ok:<cmd>` a green receipt, `red:<cmd>` a red one, and last
+`gate:<cmd>`); the case fires when that final call is gated:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires  'edit:src/a.py >> gate:git push' \
+  --fires  'edit:src/a.py >> red:pytest tests >> gate:git push' \
+  --silent 'edit:src/a.py >> ok:pytest tests >> gate:git push'
 ```
 
 It exits non-zero until every case behaves. **Do not file a rule while it

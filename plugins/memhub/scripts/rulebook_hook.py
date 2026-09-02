@@ -78,8 +78,17 @@ Two engines, one evaluate():
   * ordering rules — "run X after the last edit, before Y": an obligation
     state machine keyed by (worktree_root, branch, rule), never by session,
     so receipts from subagents and sibling sessions in the same checkout count.
+
+A matcher rule may also carry a `given` block — predicates the call must
+satisfy AFTER its regex matched: `repo` facts (branch, what the branch has
+changed against its base, a dirty tree) and `user` facts (what the person
+typed this session). They are answered by `Probes`, lazily and once per hook
+call, from read-only git and the local transcript; a fact that cannot be
+established never satisfies a predicate, so the rule stays silent. `given_ok()`
+is pure over a Probes, which is how the verifier feeds it fixtures.
 """
 import fcntl
+import fnmatch
 import hashlib
 import datetime as _dt
 import json
@@ -187,7 +196,13 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
         if hook_phase == "pre" and on == "edit" and tool in EDIT_TOOLS:
             if re.search(rule["path_rx"], file_path) and not (
                     rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)):
-                return "content_rx" not in rule or bool(re.search(rule["content_rx"], body, re.M))
+                if "content_rx" in rule and not re.search(rule["content_rx"], body, re.M):
+                    return False
+                # content_not_rx exempts the whole edit — the complied-with
+                # form (a suppression that carries its reason, say) must not
+                # keep firing once the author has done what the rule asked.
+                return not (rule.get("content_not_rx")
+                            and re.search(rule["content_not_rx"], body, re.M))
             return False
         if hook_phase == "pre" and on == "write_stdlib" and tool == "Write" \
                 and file_path.endswith(".py") and "scratchpad" not in file_path \
@@ -198,6 +213,8 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
         if hook_phase == "post" and on == "result" and result_text:
             if rule.get("cmd_rx") and not re.search(rule["cmd_rx"], cmd, re.I):
                 return False
+            if rule.get("cmd_not_rx") and cmd and re.search(rule["cmd_not_rx"], cmd, re.I):
+                return False          # the server's command_not_rx, honoured on the post lane too
             tail = result_text[-8000:]
             m = re.search(rule["rx"], tail, re.M)
             # exclude_rx exempts the whole result (an exempt test name usually
@@ -348,6 +365,240 @@ def bash_ok(resp, *, strict=False):
         r"|(^|\n)npm ERR!|(^|\n)error(\[E\d+\])?:", txt)
 
 
+# ── given: predicates a matched rule must also satisfy ──────────────────────
+PROBE_TIMEOUT_S = 1.0        # per git call; a probe past it answers None, never blocks the call
+_TURNS_MAX_BYTES = 16 * 1024 * 1024   # transcript larger than this: only its tail is read
+_TURNS_KEEP = 200            # most recent user turns kept
+_TURN_CHARS = 2000           # per turn
+# value kinds per key — the same allowlist the server validates at authoring
+_GIVEN = {
+    "repo": {"branch_rx": "rx", "branch_not_rx": "rx", "diff_lines_gt": "int",
+             "diff_files_gt": "int", "diff_paths_rx": "rx", "diff_paths_none_rx": "rx",
+             "dirty": "bool"},
+    "user": {"said_rx": "rx", "not_said_rx": "rx"},
+}
+
+
+def given_norm(g):
+    """Lint a rule's `given` block off the wire. Returns the block, or None on
+    an unknown sub-block, an unknown key, or a value of the wrong kind — and
+    None drops the RULE, as rx_ok does. A rule that passed the server's
+    allowlist yet fails here must not fire with its predicate silently
+    ignored: that is a rule firing when its author said it should not."""
+    if not isinstance(g, dict) or not g:
+        return None
+    out = {}
+    for block, spec in g.items():
+        kinds = _GIVEN.get(block)
+        if kinds is None or not isinstance(spec, dict) or not spec:
+            return None
+        for k, v in spec.items():
+            kind = kinds.get(k)
+            if kind == "rx":
+                if not rx_ok(v):
+                    return None
+            elif kind == "int":
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    return None
+            elif kind == "bool":
+                if not isinstance(v, bool):
+                    return None
+            else:
+                return None
+        out[block] = dict(spec)
+    return out
+
+
+def user_turns_of(tp):
+    """What the person typed this session, oldest first. A transcript `user`
+    record is also how tool results and injected context arrive, so this keeps
+    only real prompts: no `toolUseResult`, no `tool_result` block, no `isMeta`
+    row, no compaction summary. A substring pre-filter keeps it to one
+    json.loads per candidate line. None when there is no transcript — and
+    None never satisfies a `user` predicate."""
+    if not tp:
+        return None
+    try:
+        size = os.path.getsize(tp)
+        turns = []
+        with open(tp, "rb") as f:
+            if size > _TURNS_MAX_BYTES:
+                f.seek(size - _TURNS_MAX_BYTES)
+                f.readline()                       # the cut line
+            for raw in f:
+                if b'"user"' not in raw or b'"type"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except Exception:
+                    continue
+                if rec.get("type") != "user" or rec.get("isMeta") \
+                        or rec.get("isCompactSummary") or "toolUseResult" in rec:
+                    continue
+                c = (rec.get("message") or {}).get("content")
+                if isinstance(c, str):
+                    text = c
+                elif isinstance(c, list):
+                    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                        continue
+                    text = "\n".join((b.get("text") or "") for b in c
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    continue
+                text = text.strip()
+                if text:
+                    turns.append(text[:_TURN_CHARS])
+        return turns[-_TURNS_KEEP:]
+    except Exception:
+        return None
+
+
+class Probes:
+    """The facts a `given` block asks about, answered lazily and at most once
+    per hook call. Nothing runs unless a rule whose regex already matched
+    carries a `given`, each git call is read-only and bounded by
+    PROBE_TIMEOUT_S, and nothing here leaves the machine. A probe that fails
+    answers None, and None never satisfies a predicate: a rule with a `given`
+    it cannot check stays silent, which is the fail-open direction.
+    `fixture` pre-answers probes by name — the verifier's and the tests' way
+    in, so given_ok() never needs a real repo to be exercised."""
+
+    def __init__(self, root, branch, transcript_path=None, fixture=None):
+        self.root, self._branch, self.tp = root, branch, transcript_path
+        self._fix = dict(fixture or {})
+        self._memo = {}
+
+    def _get(self, key, compute):
+        if key in self._fix:
+            return self._fix[key]
+        if key not in self._memo:
+            try:
+                self._memo[key] = compute()
+            except Exception:
+                self._memo[key] = None
+        return self._memo[key]
+
+    def _git(self, *args):
+        import subprocess
+        p = subprocess.run(["git", "-C", self.root, *args], capture_output=True,
+                           text=True, timeout=PROBE_TIMEOUT_S)
+        return p.stdout if p.returncode == 0 else None
+
+    def branch(self):
+        return self._get("branch", lambda: self._branch)
+
+    def base(self):
+        """Merge-base with the branch this one will be compared against:
+        MEMHUB_RULEBOOK_BASE_BRANCH, else the first of the usual names that
+        exists. None when there is no such branch (a fresh repo) — every diff
+        probe then answers None too."""
+        def compute():
+            env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
+            cands = ([env] if env else []) + ["origin/main", "origin/master", "origin/develop",
+                                              "main", "master", "develop"]
+            for cand in cands:
+                if self._git("rev-parse", "--verify", "-q", cand + "^{commit}") is None:
+                    continue
+                mb = self._git("merge-base", cand, "HEAD")
+                return mb.strip() if mb and mb.strip() else None
+            return None
+        return self._get("base", compute)
+
+    def diff_paths(self):
+        """Paths the branch has changed against its base, working tree
+        included — committed, staged, unstaged, and untracked files (a new
+        test file is usually untracked when the rule asks about it)."""
+        def compute():
+            mb = self.base()
+            if mb is None:
+                return None
+            tracked = self._git("diff", "--name-only", mb)
+            untracked = self._git("ls-files", "--others", "--exclude-standard")
+            if tracked is None or untracked is None:
+                return None
+            return sorted({l.strip() for l in (tracked + "\n" + untracked).split("\n") if l.strip()})
+        return self._get("diff_paths", compute)
+
+    def diff_lines(self):
+        """Added + deleted lines against the base, working tree included;
+        untracked files count their line total (at most 200 files, 1 MiB each)."""
+        def compute():
+            mb = self.base()
+            if mb is None:
+                return None
+            out = self._git("diff", "--numstat", mb)
+            if out is None:
+                return None
+            n = 0
+            for line in out.split("\n"):
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    n += int(parts[0]) + int(parts[1])
+            untracked = self._git("ls-files", "--others", "--exclude-standard") or ""
+            for p in [l.strip() for l in untracked.split("\n") if l.strip()][:200]:
+                try:
+                    with open(os.path.join(self.root, p), "rb") as f:
+                        n += f.read(1 << 20).count(b"\n")
+                except Exception:
+                    pass
+            return n
+        return self._get("diff_lines", compute)
+
+    def dirty(self):
+        def compute():
+            out = self._git("status", "--porcelain")
+            return None if out is None else bool(out.strip())
+        return self._get("dirty", compute)
+
+    def user_turns(self):
+        return self._get("user_turns", lambda: user_turns_of(self.tp))
+
+
+def given_ok(rule, probes):
+    """True when every predicate in the rule's `given` holds. Pure over the
+    Probes (which memoizes); a probe answering None fails its predicate."""
+    g = rule.get("given")
+    if not g:
+        return True
+    for k, v in (g.get("repo") or {}).items():
+        if k == "branch_rx":
+            b = probes.branch()
+            if not b or not re.search(v, b):
+                return False
+        elif k == "branch_not_rx":
+            b = probes.branch()
+            if not b or re.search(v, b):
+                return False
+        elif k == "diff_lines_gt":
+            n = probes.diff_lines()
+            if n is None or not n > v:
+                return False
+        elif k == "diff_files_gt":
+            ps = probes.diff_paths()
+            if ps is None or not len(ps) > v:
+                return False
+        elif k == "diff_paths_rx":
+            ps = probes.diff_paths()
+            if ps is None or not any(re.search(v, p) for p in ps):
+                return False
+        elif k == "diff_paths_none_rx":
+            ps = probes.diff_paths()
+            if ps is None or any(re.search(v, p) for p in ps):
+                return False
+        elif k == "dirty":
+            d = probes.dirty()
+            if d is None or d != v:
+                return False
+    for k, v in (g.get("user") or {}).items():
+        turns = probes.user_turns()
+        if turns is None:
+            return False
+        said = any(re.search(v, t, re.I) for t in turns)
+        if (k == "said_rx" and not said) or (k == "not_said_rx" and said):
+            return False
+    return True
+
+
 # ── plumbing ────────────────────────────────────────────────────────────────
 def book_path(repo):
     """Readable name + a hash of the RAW name, so two repos that sanitise to
@@ -383,7 +634,8 @@ _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_
                     content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
-                                 "on", "repo_scope", "_scope_repos", "anchors", "ordering",
+                                 "on", "repo_scope", "_scope_repos", "_scope_paths",
+                                 "_scope_exclude_paths", "anchors", "ordering",
                                  "_rulebook_id", "_book_name", "_book_scope", "_book_members"})
 
 
@@ -538,6 +790,10 @@ def to_hook_rule(row):
             if isinstance(r.get("ordering"), dict) and not all(
                     rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
                 return None
+            if "given" in r:
+                r["given"] = given_norm(r["given"])
+                if r["given"] is None:
+                    return None
             return r
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
@@ -551,6 +807,10 @@ def to_hook_rule(row):
         r["repo_scope"] = "any"
         if scopes:
             r["_scope_repos"] = scopes
+        for k in ("scope_paths", "scope_exclude_paths"):   # §3.1 globs; see path_in_scope
+            globs = [x for x in (row.get(k) or []) if isinstance(x, str) and x.strip()]
+            if globs:
+                r["_" + k] = globs[:64]
         # v2.4: anchor rules carry their own identifiers; session rules carry nothing
         if row.get("delivery") == "session_context":
             r["on"] = "session"
@@ -592,6 +852,10 @@ def to_hook_rule(row):
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
+        if "given" in r:
+            r["given"] = given_norm(r["given"])
+            if r["given"] is None:      # unknown key or wrong kind: drop the RULE, as rx_ok does
+                return None
         return r
     except Exception:
         return None
@@ -647,6 +911,27 @@ def maybe_refresh(repo, fetched_at):
         spawn_fetch(repo)
     except Exception:
         pass
+
+
+def path_in_scope(rule, path, root=""):
+    """The server's §3.1 path scope, mirrored (crud.path_in_scope): in-scope AND
+    NOT excluded, fnmatch against the path relative to the worktree root and,
+    as the server does, against `*/<glob>`. A path-scoped rule needs a path
+    to match at all — a Bash call carries none, so an include-scoped rule
+    never fires there and an exclude-only one always may."""
+    inc = rule.get("_scope_paths") or []
+    exc = rule.get("_scope_exclude_paths") or []
+    if not inc and not exc:
+        return True
+    if not path:
+        return not inc
+    cands = {path}
+    if root and path.startswith(root.rstrip("/") + "/"):
+        cands.add(os.path.relpath(path, root))
+
+    def hit(g):
+        return any(fnmatch.fnmatch(c, g) or fnmatch.fnmatch(c, f"*/{g}") for c in cands)
+    return ((not inc) or any(hit(g) for g in inc)) and not any(hit(g) for g in exc)
 
 
 def scope_ok(rule, repo, gitdir):
@@ -1482,6 +1767,7 @@ def main():
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data)}
+    probes = Probes(root, branch, transcript_path=data.get("transcript_path"))
 
     if mode == "session":
         try:        # which source each rule came from — the pilot's merge audit
@@ -1579,18 +1865,21 @@ def main():
                 fired_now.append(r)
             continue
 
+        if not path_in_scope(r, fp if tool in EDIT_TOOLS else "", root):
+            continue
         scope = r.get("fire_scope", "session")
         if mode == "pre" and tool == "Bash" and r.get("on") == "bash" \
                 and r.get("mode") == "gate":
             scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
         key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
+        # the regex first (pure, cheap), the given second (probes run only now)
+        matched = evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
+                           body=body, result_text=rtext) and given_ok(r, probes)
         if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
-            if evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
-                        body=body, result_text=rtext):
+            if matched:
                 st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
             continue
-        if not evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
-                        body=body, result_text=rtext):
+        if not matched:
             continue
         st["raw"][rid] = st["raw"].get(rid, 0) + 1
         if scope.startswith("counter"):
