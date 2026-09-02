@@ -639,11 +639,12 @@ def maybe_refresh(repo, fetched_at):
     except Exception:
         pass
     try:
-        spawn_fetch(repo)
-        # stamp AFTER the spawn: a spawn that raises must not buy ten minutes
-        # of silence. Two hooks racing here can both spawn — harmless, the
-        # child's write is atomic and idempotent.
+        # The stamp records the ATTEMPT, so it goes first: a fork that fails
+        # under resource pressure must not be retried on every tool call, and
+        # ten minutes before the next try costs at most one override on a rule
+        # the server has since retired. The other order was tried and reverted.
         _atomic_json(stamp, {"at": _now()})
+        spawn_fetch(repo)
     except Exception:
         pass
 
