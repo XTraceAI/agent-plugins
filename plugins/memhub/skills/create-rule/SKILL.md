@@ -54,6 +54,13 @@ user in `member_user_ids`. Both are org-admin acts (`rulebook_scope_needs_admin`
 governance decision this skill does not make. Membership changes are not MCP
 tools at all — they are done in MemHub.
 
+**When the create is refused.** `create_rulebook` validates the creator as an
+active org member, so it can answer `rulebook_member_not_in_org` naming *the
+user themselves* — even though you named nobody. That is not a bug to retry:
+their org membership is inactive, and no rulebook can be created until someone
+fixes it in MemHub. Say that plainly and stop. (`rulebook_name_too_long` means
+the name exceeded 200 characters — shorten it and retry once.)
+
 **Older backend:** if `list_rulebooks` / `create_rulebook` are not present, or
 `create_rule` rejects `rulebook_id`, the server predates rulebook containers.
 Fall back to today's behaviour — `agent_brain_id` from `--brain`, omitted

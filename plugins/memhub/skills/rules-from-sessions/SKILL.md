@@ -111,6 +111,13 @@ names the book it would land in, because that is who the rule would reach.
 If the server has no `list_rulebooks`, it predates rulebook containers: fall
 back to `agent_brain_id` and carry on.
 
+**When the create is refused.** `create_rulebook` validates the creator as an
+active org member, so it can answer `rulebook_member_not_in_org` naming *the
+user themselves* — even though you named nobody. That is not a bug to retry:
+their org membership is inactive, and no rulebook can be created until someone
+fixes it in MemHub. Say that plainly and stop. (`rulebook_name_too_long` means
+the name exceeded 200 characters — shorten it and retry once.)
+
 ## 1. First pass — every session, no model call
 
 ```bash
