@@ -276,8 +276,9 @@ origin) and `quote_rx`.
    clean run.
 2. Conflicts, before anything is filed — the server does no title
    matching, so a collision lands as a second draft silently. Save
-   `list_rules` (every status, **no `rulebook_id`**, so it spans every book
-   the user can see) to a file, the candidate bodies to another, and run:
+   `list_rules` (**`include_retired=True, limit=200`**, and **no
+   `rulebook_id`**, so it spans every book the user can see in every state) to
+   a file, the candidate bodies to another, and run:
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
      --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>" \
@@ -285,6 +286,11 @@ origin) and `quote_rx`.
    ```
    Omit `--rulebook-id` entirely when there is no id (an older backend);
    passing it empty is an argparse error and you get no report at all.
+   `include_retired=True` matters: a rule someone already
+   dismissed is exactly the twin you must not re-file, and the default view
+   hides retired rules. `limit` is 200 at most — if the reply says `has_more`,
+   ask again with `offset` and concatenate `rules` before running the check, or
+   the comparison silently misses whatever fell off the first page.
    `same_title` / `same_matcher` / `anchors_overlap` hits print the exact
    `supersedes_rule_id` to copy. Then the semantic pass in your own reading
    over `judge_by_statement`: `duplicate` → file with `supersedes_rule_id`;
