@@ -123,7 +123,10 @@ them decide — step 5 flags these as `cross_book`.
 Plus on every rule: `title` (short, imperative; the server allows up to 200
 chars but aim for under 60), `statement` (the advisory line and the nuance a
 reviewer needs: sanctioned forms, exemptions), `scope_repos` (`["<repo>"]` or
-`[]` for all), `scope_paths` / `scope_exclude_paths` (globs — they constrain
+`[]` for all — `<repo>` is the repo's name, `basename $(git remote get-url
+origin)` without `.git`, NEVER the directory you are in: in a worktree that
+is the branch name, and the hook matches `scope_repos` by exact string, so
+the rule would bind nobody), `scope_paths` / `scope_exclude_paths` (globs — they constrain
 edit rules by file path; a Bash call carries no path, so an include-scoped
 rule never fires on one).
 
