@@ -1778,6 +1778,9 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
     it is here so a local reader can tell which book a fire came from.
     Returns {rule_id: fire_id} so conversions can point back."""
+    if portable_lock is None:
+        # Enforcement still runs, but do not create telemetry that cannot drain.
+        return {}
     ids = {}
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
@@ -1808,6 +1811,8 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
 def log_conversion(fire_id, how):
     """Append-only sidecar (the fires file is shared across sessions, so it
     is never rewritten in place). A reader merges by fire_id."""
+    if portable_lock is None:
+        return
     try:
         with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
                   encoding="utf-8") as f:

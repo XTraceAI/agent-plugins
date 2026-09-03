@@ -155,6 +155,12 @@ def portability_check() -> None:
             == "deny",
             missing_shim.stderr or missing_shim.stdout,
         )
+        check(
+            "portability: a missing lock shim does not create undrainable telemetry",
+            not os.path.exists(
+                os.path.join(incomplete_base, "ledger", "fires.jsonl")
+            ),
+        )
         missing_flush = subprocess.run(
             [sys.executable, incomplete_hook, "flush"],
             input="",
