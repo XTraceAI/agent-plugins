@@ -26,6 +26,7 @@ artifact, not nine. The flush reads the file off disk at Stop.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 import sys
@@ -63,6 +64,11 @@ VETO_NAMES = {"CLAUDE.md", "AGENTS.md", "MEMORY.md"}
 FRONTMATTER_OPT_IN = re.compile(r"^memhub:\s*artifact\s*$", re.M)
 
 
+def _is_usable_windows_temp_root(path_key: str) -> bool:
+    drive, tail = ntpath.splitdrive(path_key.replace("/", "\\"))
+    return bool(drive and tail.strip("\\"))
+
+
 def _windows_temp_roots() -> tuple[str, ...]:
     candidates = [os.environ.get("TEMP"), os.environ.get("TMP")]
     try:
@@ -82,7 +88,11 @@ def _windows_temp_roots() -> tuple[str, ...]:
             )
         except (OSError, TypeError, ValueError):
             continue
-        if normalized and normalized not in roots:
+        if (
+            normalized
+            and _is_usable_windows_temp_root(normalized)
+            and normalized not in roots
+        ):
             roots.append(normalized)
     return tuple(roots)
 
@@ -94,6 +104,8 @@ def _is_windows_temp_path(
     path_key: str, roots: tuple[str, ...] | None = None
 ) -> bool:
     for root in WINDOWS_TEMP_ROOTS if roots is None else roots:
+        if not _is_usable_windows_temp_root(root):
+            continue
         if path_key == root or path_key.startswith(root + "/"):
             return True
     return False

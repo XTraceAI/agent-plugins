@@ -74,6 +74,20 @@ windows_temp_roots = (
     "//build-server/share/agent-temp",
 )
 check(
+    not mc._is_usable_windows_temp_root("c:")
+    and not mc._is_usable_windows_temp_root("//build-server/share")
+    and mc._is_usable_windows_temp_root("c:/temp")
+    and mc._is_usable_windows_temp_root("//build-server/share/temp"),
+    "Windows temp roots require a directory below the drive or UNC share",
+)
+check(
+    not mc._is_windows_temp_path("c:/repo/report.md", ("c:",))
+    and not mc._is_windows_temp_path(
+        "//build-server/share/repo/report.md", ("//build-server/share",)
+    ),
+    "bare drive and UNC-share roots cannot suppress the whole volume",
+)
+check(
     mc._is_windows_temp_path(
         "c:/users/alice/appdata/local/temp/run/report.md", windows_temp_roots
     ),
