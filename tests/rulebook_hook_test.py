@@ -989,6 +989,20 @@ def main() -> int:
         j = outj(out)
         check("override: on a backslash-continued line it is honoured AND the token is still stripped",
               "permissionDecision" not in j.get("hookSpecificOutput", {}) and "overridden" in j.get("systemMessage", ""), out)
+        heredoc_pr = ("cd /tmp && RULEBOOK_OVERRIDE='blocked its own fix' gh pr create "
+                      "--base main --title \"t\" --body \"$(cat <<'EOF'\n"
+                      "body\nEOF\n)\" && git push --force origin main")
+        rc, out = run("pre", dict(base, tool_input={"command": heredoc_pr}), genv)
+        j = outj(out)
+        check("override: honoured on a `--body \"$(cat <<EOF\"` line — the quote closes on a LATER "
+              "physical line, and skipping it made the gate unbypassable on the commonest gated command",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "overridden" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "gh pr create --body \"$(cat <<'EOF'\nbody\nEOF\n)\" && git push --force origin main"}), genv)
+        check("override: the same command WITHOUT an override is still denied — rejoining lines "
+              "reads the shell honestly, it does not open a hole",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
         rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
         check("override: the variable name inside an argument is not an override, and matches no gate",
               out.strip() == "", out)
@@ -1003,13 +1017,14 @@ def main() -> int:
             rows = [json.loads(l) for l in f if l.strip()]
         gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
         check("ledger: blocked, overridden and empty-override calls are all mode=gate fires",
-              len(gate_rows) == 19 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
+              len(gate_rows) == 21 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
         reasons = [r.get("override_reason") for r in gate_rows]
         check("ledger: override_reason only on the overridden fires, secrets redacted",
               reasons[:3] == [None, None, "hotfix, approved by lead"] and reasons[3:6] == [None] * 3
               and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6]
               and reasons[7:] == ["cd first", "after semicolon", "on line two", None,
-                                  None, None, None, "the real one", "after heredoc", None, "why", "cont"], str(reasons))
+                                  None, None, None, "the real one", "after heredoc", None, "why", "cont",
+                                  "blocked its own fix", None], str(reasons))
         cont = [r for r in gate_rows if r.get("override_reason") == "cont"][0]
         check("ledger: the continued-line token was stripped before rules matched (excerpt has no assignment)",
               "RULEBOOK_OVERRIDE=" not in cont["excerpt"], cont["excerpt"])

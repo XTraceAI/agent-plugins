@@ -1691,19 +1691,59 @@ def strip_override(cmd, found):
     return cmd
 
 
+def _tokens(text):
+    """shlex tokens for `text`, or None when it does not parse."""
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:                                 # unbalanced quoting
+        return None
+
+
+def _logical_lines(text):
+    """(text, tokens) per line, rejoining lines that only parse together.
+
+    A heredoc inside a command substitution splits one shell line across
+    several physical ones: `--body "$(cat <<'EOF'` leaves its double quote
+    open, and the closing `)"` sits after the body — so neither line parses
+    alone while the two together do. Joining is what the shell does anyway.
+
+    This matters because of what skipping an unparseable line COSTS. It was
+    silently dropping the override on the commonest gated command there is —
+    `gh pr create` with a heredoc body — so the gate denied the call and the
+    documented way past it did nothing. A gate whose override cannot be
+    reached is a wall.
+
+    A line that parses no better joined with everything after it yields
+    ``None`` tokens and the caller skips it: an override we cannot read as
+    shell is still not an override.
+    """
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        for j in range(i, len(lines)):
+            chunk = " ".join(lines[i:j + 1])
+            toks = _tokens(chunk)
+            if toks is not None:
+                yield chunk, toks
+                i = j + 1
+                break
+        else:
+            yield lines[i], None
+            i += 1
+
+
 def find_override(cmd):
     """(reason, line, raw_token) for the first `RULEBOOK_OVERRIDE=<why>` that
     begins a shell segment and is non-empty, else None. Tokenised per line of
     the shell-only text with shlex (POSIX quoting, operators as their own
-    tokens); a line shlex cannot parse contributes nothing. Every candidate is
-    tried, so an earlier empty or quoted one cannot shadow the real override."""
+    tokens); a line that parses nowhere, even joined with what follows it,
+    contributes nothing (see :func:`_logical_lines`). Every candidate is tried,
+    so an earlier empty or quoted one cannot shadow the real override."""
     text = re.sub(r"\\\n", " ", shell_only(cmd))        # join continuation lines
-    for line in text.split("\n"):
-        try:
-            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lex.whitespace_split = True
-            toks = list(lex)
-        except ValueError:                             # unbalanced quoting
+    for line, toks in _logical_lines(text):
+        if toks is None:
             continue
         at_start = True
         for tok in toks:
