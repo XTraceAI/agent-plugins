@@ -11,6 +11,7 @@ SCRIPT = ROOT / "plugins" / "memhub" / "skills" / "rules-from-sessions" / "scrip
 def _run(*extra, home):
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS")}
     env["HOME"] = home
+    env["USERPROFILE"] = home
     return subprocess.run([sys.executable, str(SCRIPT), *extra], capture_output=True, text=True, env=env, cwd=home, timeout=120)
 
 def main() -> int:

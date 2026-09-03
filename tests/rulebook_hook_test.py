@@ -24,9 +24,11 @@ Run: python3 rulebook_hook_test.py  (stdlib only).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,133 @@ def run(mode: str, payload: dict, env_extra: dict) -> tuple[int, str]:
     p = subprocess.run([sys.executable, HOOK, mode], input=json.dumps(payload),
                        capture_output=True, text=True, env=env, timeout=30)
     return p.returncode, p.stdout
+
+
+def portability_check() -> None:
+    """The hook must import on native Windows, where ``fcntl`` is absent."""
+    with open(HOOK, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".", 1)[0])
+    check(
+        "portability: rulebook hook uses the shared lock shim, never fcntl directly",
+        "fcntl" not in imports,
+        str(sorted(imports)),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "portable_lock.py"), "w", encoding="utf-8") as f:
+            f.write("raise RuntimeError('loaded untrusted cwd module')\n")
+        probe = (
+            "import importlib.util; "
+            f"spec = importlib.util.spec_from_file_location('rulebook_probe', {HOOK!r}); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module); "
+            "print(module.portable_lock.__file__)"
+        )
+        imported = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=td,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        check(
+            "portability: embedded import pins the packaged portable_lock",
+            imported.returncode == 0
+            and os.path.realpath(imported.stdout.strip())
+            == os.path.realpath(os.path.join(os.path.dirname(HOOK), "portable_lock.py")),
+            imported.stderr or imported.stdout,
+        )
+
+        incomplete = os.path.join(td, "incomplete")
+        os.mkdir(incomplete)
+        incomplete_hook = os.path.join(incomplete, "rulebook_hook.py")
+        shutil.copy2(HOOK, incomplete_hook)
+        incomplete_repo = os.path.join(td, "incomplete-repo")
+        os.makedirs(os.path.join(incomplete_repo, ".git"))
+        with open(
+            os.path.join(incomplete_repo, ".git", "HEAD"), "w", encoding="utf-8"
+        ) as f:
+            f.write("ref: refs/heads/main\n")
+        incomplete_base = os.path.join(td, "incomplete-base")
+        seed_book(
+            incomplete_base,
+            "incomplete-repo",
+            [
+                {
+                    "id": "missing-shim-gate",
+                    "on": "bash",
+                    "rx": r"git\s+push",
+                    "mode": "gate",
+                    "fire_scope": "call",
+                    "repo_scope": "any",
+                    "status": "active",
+                    "text": "Do not push yet",
+                    "why": "partial installs must not disable matcher gates",
+                }
+            ],
+        )
+        missing_shim = subprocess.run(
+            [sys.executable, incomplete_hook, "pre"],
+            input=json.dumps(
+                {
+                    "cwd": incomplete_repo,
+                    "session_id": "missing-shim",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git push origin main"},
+                }
+            ),
+            cwd=td,
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ,
+                MEMHUB_RULEBOOK_BASE=incomplete_base,
+                MEMHUB_RULEBOOK_FETCH="0",
+            ),
+            timeout=30,
+        )
+        try:
+            missing_output = json.loads(missing_shim.stdout)
+        except Exception:
+            missing_output = {}
+        check(
+            "portability: a missing lock shim preserves matcher gates",
+            missing_shim.returncode == 0
+            and missing_shim.stderr == ""
+            and missing_output.get("hookSpecificOutput", {}).get(
+                "permissionDecision"
+            )
+            == "deny",
+            missing_shim.stderr or missing_shim.stdout,
+        )
+        check(
+            "portability: a missing lock shim does not create undrainable telemetry",
+            not os.path.exists(
+                os.path.join(incomplete_base, "ledger", "fires.jsonl")
+            ),
+        )
+        missing_flush = subprocess.run(
+            [sys.executable, incomplete_hook, "flush"],
+            input="",
+            cwd=td,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, MEMHUB_RULEBOOK_BASE=incomplete_base),
+            timeout=30,
+        )
+        check(
+            "portability: missing lock shim skips the lock-dependent flush",
+            missing_flush.returncode == 0
+            and missing_flush.stdout == ""
+            and missing_flush.stderr == "",
+            missing_flush.stderr or missing_flush.stdout,
+        )
 
 
 def seed_book(base, repo_name, rules):
@@ -312,8 +441,25 @@ def bash_edit_checks() -> None:
         env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
         n = [0]
 
-        def bash(command, *, session="b1", run_it=True, pre=True, resp=None):
-            """pre → actually run the command → post, the way a session does."""
+        def write_file(path, text, *, append=False):
+            target = path if os.path.isabs(path) else os.path.join(repo, path)
+            with open(target, "a" if append else "w", encoding="utf-8") as f:
+                f.write(text)
+
+        def replace_file(path, old, new):
+            target = path if os.path.isabs(path) else os.path.join(repo, path)
+            with open(target, encoding="utf-8") as f:
+                text = f.read()
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(text.replace(old, new))
+
+        def bash(command, *, session="b1", run_it=True, pre=True, resp=None, mutate=None):
+            """pre → apply the command's file effect → post, the way a session does.
+
+            The hook receives the real shell syntax under test. Applying its
+            expected file effect in Python keeps this fixture independent of
+            whether the test host's ``shell=True`` means sh or cmd.exe.
+            """
             n[0] += 1
             tid = f"tu{n[0]}"
             ev = {"cwd": repo, "session_id": session, "tool_name": "Bash", "tool_use_id": tid,
@@ -321,31 +467,41 @@ def bash_edit_checks() -> None:
             if pre:
                 run("pre", ev, env)
             if run_it:
-                r = subprocess.run(command, shell=True, cwd=repo, capture_output=True, text=True)
-                resp = resp or {"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.returncode}
+                if mutate is not None:
+                    mutate()
+                    resp = resp or {"stdout": "", "stderr": "", "exit_code": 0}
+                else:
+                    r = subprocess.run(command, shell=True, cwd=repo, capture_output=True, text=True)
+                    resp = resp or {"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.returncode}
             return ctx(run("post", dict(ev, tool_response=resp or {"stdout": "", "exit_code": 0}), env)[1])
 
         mig = "alembic/versions/20260902_user_logins.py"
-        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('user_logins')\nEOF")
+        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('user_logins')\nEOF",
+                 mutate=lambda: write_file(mig, "def upgrade():\n    op.create_table('user_logins')\n"))
         check("bash-edit: a heredoc-created migration reaches the edit rule",
               "[new-table-retention]" in c, c)
         check("bash-edit: the fire names the file the command wrote", mig in c, c)
 
         c = bash("python3 - <<'PY'\nimport pathlib\np = pathlib.Path('src/old.py')\n"
-                 "p.write_text(p.read_text() + 'y = f()  # type: ignore\\n')\nPY")
+                 "p.write_text(p.read_text() + 'y = f()  # type: ignore\\n')\nPY",
+                 mutate=lambda: write_file("src/old.py", "y = f()  # type: ignore\n", append=True))
         check("bash-edit: a python write_text() edit reaches the edit rule",
               "[no-bare-ignore]" in c, c)
 
-        c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && rm -f src/old.py.bak", session="b2")
+        c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && rm -f src/old.py.bak", session="b2",
+                 mutate=lambda: replace_file("src/old.py", "ignore", "ignore[x]"))
         check("bash-edit: sed -i is an edit too — and the complied-with form does not fire",
               "[no-bare-ignore]" not in c and "[new-table-retention]" not in c, c)
-        c = bash("sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak", session="b2")
+        c = bash("sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak", session="b2",
+                 mutate=lambda: replace_file("src/old.py", "ignore[x]", "ignore"))
         check("bash-edit: sed -i that reintroduces the pattern fires", "[no-bare-ignore]" in c, c)
         # git decides what is a candidate, so a write that leaves the file byte-identical
         # to HEAD is not an edit — nothing changed, nothing to advise on
         _git(repo, "commit", "-qam", "committed bare ignore")
         c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak",
-                 session="b2b")
+                 session="b2b", mutate=lambda: (
+                     replace_file("src/old.py", "ignore", "ignore[x]"),
+                     replace_file("src/old.py", "ignore[x]", "ignore")))
         check("bash-edit: a write that leaves the file identical to HEAD is not an edit", c.strip() == "", c)
 
         # a modified file is read as its ADDED lines, a new file whole — what the
@@ -353,23 +509,28 @@ def bash_edit_checks() -> None:
         with open(os.path.join(repo, "src", "big.py"), "w", encoding="utf-8") as f:
             f.write("a = 1  # type: ignore\nb = 2\n")
         _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "big has a pre-existing hit")
-        c = bash("printf 'c = 3\\n' >> src/big.py", session="b2c")
+        c = bash("printf 'c = 3\\n' >> src/big.py", session="b2c",
+                 mutate=lambda: write_file("src/big.py", "c = 3\n", append=True))
         check("bash-edit: a modified file is read as its added lines — a pre-existing hit does not fire",
               "[no-bare-ignore]" not in c, c)
-        c = bash("printf 'd = 4  # type: ignore\\n' >> src/big.py", session="b2c")
+        c = bash("printf 'd = 4  # type: ignore\\n' >> src/big.py", session="b2c",
+                 mutate=lambda: write_file("src/big.py", "d = 4  # type: ignore\n", append=True))
         check("bash-edit: an added line that hits does fire", "[no-bare-ignore]" in c, c)
-        c = bash("printf 'e = 5  # type: ignore\\n' > src/fresh.py", session="b2d")
+        c = bash("printf 'e = 5  # type: ignore\\n' > src/fresh.py", session="b2d",
+                 mutate=lambda: write_file("src/fresh.py", "e = 5  # type: ignore\n"))
         check("bash-edit: a new file is read whole", "[no-bare-ignore]" in c, c)
 
-        c = bash("echo hello && ls src", session="b3")
+        c = bash("echo hello && ls src", session="b3", mutate=lambda: None)
         check("bash-edit: a command that wrote nothing is silent", c.strip() == "", c)
 
-        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('again')\nEOF")
+        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('again')\nEOF",
+                 mutate=lambda: write_file(mig, "def upgrade():\n    op.create_table('again')\n"))
         check("bash-edit: the second write of a session-scoped rule is deduped like a Write",
               "[new-table-retention]" not in c, c)
 
         # no pre stamp (a host that only wires the post lane) → silent, never a crash
-        c = bash("printf 'z = 1  # type: ignore\\n' > src/nopre.py", session="b4", pre=False)
+        c = bash("printf 'z = 1  # type: ignore\\n' > src/nopre.py", session="b4", pre=False,
+                 mutate=lambda: write_file("src/nopre.py", "z = 1  # type: ignore\n"))
         check("bash-edit: without a pre stamp the post lane reads nothing", c.strip() == "", c)
 
         # a tree rewrite touches files nobody edited
@@ -379,7 +540,8 @@ def bash_edit_checks() -> None:
             f.write("q = 1  # type: ignore\n")
         _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "theirs")
         _git(repo, "checkout", "-q", "main")
-        c = bash("git checkout -q other", session="b5")
+        c = bash("git checkout -q other", session="b5",
+                 mutate=lambda: _git(repo, "checkout", "-q", "other"))
         check("bash-edit: a checkout is not an edit (files change, nobody wrote them)",
               "[no-bare-ignore]" not in c, c)
 
@@ -401,7 +563,8 @@ def bash_edit_checks() -> None:
         ev = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash", "tool_use_id": "w1",
               "tool_input": {"command": "cat > src/gate.py <<'EOF'\nx=1\nEOF"}}
         run("pre", ev, env)
-        subprocess.run(ev["tool_input"]["command"], shell=True, cwd=wt2)
+        with open(os.path.join(wt2, "src", "gate.py"), "w", encoding="utf-8") as f:
+            f.write("x=1\n")
         run("post", dict(ev, tool_response={"stdout": "", "exit_code": 0}), env)
         rc, out = run("pre", push, env)
         check("bash-edit ordering: a heredoc write arms the obligation and the gate names the file",
@@ -409,7 +572,8 @@ def bash_edit_checks() -> None:
         ev2 = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash", "tool_use_id": "w2",
                "tool_input": {"command": "printf 'y=2\\n' > src/gate.py && pytest -q"}}
         run("pre", ev2, env)
-        subprocess.run("printf 'y=2\\n' > src/gate.py", shell=True, cwd=wt2)
+        with open(os.path.join(wt2, "src", "gate.py"), "w", encoding="utf-8") as f:
+            f.write("y=2\n")
         run("post", dict(ev2, tool_response={"stdout": "1 passed", "exit_code": 0}), env)
         rc, out = run("pre", push, env)
         check("bash-edit ordering: edit-then-green-receipt in ONE call discharges (edits are read first)",
@@ -419,7 +583,8 @@ def bash_edit_checks() -> None:
         sib = os.path.join(td, "sibling-wt")
         assert _git(repo, "worktree", "add", "-q", "-b", "sib", sib).returncode == 0
         c = bash(f"cat > {sib}/{mig} <<'EOF'\ndef upgrade():\n    op.create_table('t')\nEOF",
-                 session="b6")
+                 session="b6", mutate=lambda: write_file(
+                     os.path.join(sib, mig), "def upgrade():\n    op.create_table('t')\n"))
         check("bash-edit: a write into a sibling worktree the command names is seen",
               "[new-table-retention]" in c, c)
 
@@ -542,6 +707,7 @@ def diff_base_checks() -> None:
 
 
 def main() -> int:
+    portability_check()
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
         os.makedirs(os.path.join(repo, ".git"))

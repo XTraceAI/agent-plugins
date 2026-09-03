@@ -87,10 +87,10 @@ call, from read-only git and the local transcript; a fact that cannot be
 established never satisfies a predicate, so the rule stays silent. `given_ok()`
 is pure over a Probes, which is how the verifier feeds it fixtures.
 """
-import fcntl
 import fnmatch
 import hashlib
 import datetime as _dt
+import importlib.util
 import json
 import os
 import re
@@ -103,6 +103,22 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
+
+def _load_portable_lock():
+    """Load only the packaged lock shim without broadening module search."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portable_lock.py")
+    spec = importlib.util.spec_from_file_location("_memhub_rulebook_portable_lock", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load portable lock shim from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    portable_lock = _load_portable_lock()
+except Exception:
+    portable_lock = None
 
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
@@ -393,11 +409,14 @@ class OrderingEngine:
         self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
+        if portable_lock is None:
+            # Matcher gates need no shared state; only ordering gates fail open.
+            return None
         lock = open(self.path + ".lock", "a+", encoding="utf-8")
         deadline = time.monotonic() + LOCK_WAIT_S
         while True:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                portable_lock.lock_exclusive(lock.fileno(), blocking=False)
                 return lock
             except OSError:
                 if time.monotonic() >= deadline:
@@ -430,7 +449,7 @@ class OrderingEngine:
                 rule_id, {"count": 0, "last_edit": None})["open_fire"] = fire_id
             self._write(st)
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            portable_lock.unlock(lock.fileno())
             lock.close()
 
     def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None):
@@ -487,7 +506,7 @@ class OrderingEngine:
                 return "fired"
             return "allowed"
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            portable_lock.unlock(lock.fileno())
             lock.close()
 
 
@@ -1530,10 +1549,13 @@ def flush_fires(final=False):
     a failed batch is retried, verbatim, on the next flush; `rejected` rows
     are logged locally and never retried (they sit behind the watermark).
     One flusher at a time via flock; a second caller simply leaves."""
+    if portable_lock is None:
+        # Retain the ledger rather than advancing it without process exclusivity.
+        return
     ldir = _ledger_dir()
     lock = open(os.path.join(ldir, ".flush.lock"), "a+", encoding="utf-8")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portable_lock.lock_exclusive(lock.fileno(), blocking=False)
     except OSError:
         lock.close()
         return
@@ -1599,14 +1621,14 @@ def flush_fires(final=False):
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
     finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        portable_lock.unlock(lock.fileno())
         lock.close()
 
 
 def repo_info(cwd):
     """(repo_basename, worktree_root, gitdir_path, branch) via file reads only."""
-    d = cwd
-    while d and d != "/":
+    d = os.path.abspath(cwd or "")
+    while d:
         g = os.path.join(d, ".git")
         if os.path.isdir(g):
             return os.path.basename(d), d, g, _branch(os.path.join(g, "HEAD"))
@@ -1616,7 +1638,10 @@ def repo_info(cwd):
             except Exception:
                 gitdir = ""
             return os.path.basename(d), d, gitdir, _branch(os.path.join(gitdir, "HEAD"))
-        d = os.path.dirname(d)
+        parent = os.path.dirname(d)
+        if parent == d:  # POSIX, drive, and UNC roots are fixed points.
+            break
+        d = parent
     return "", "", "", ""
 
 
@@ -1907,6 +1932,9 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
     it is here so a local reader can tell which book a fire came from.
     Returns {rule_id: fire_id} so conversions can point back."""
+    if portable_lock is None:
+        # Enforcement still runs, but do not create telemetry that cannot drain.
+        return {}
     ids = {}
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
@@ -1937,6 +1965,8 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
 def log_conversion(fire_id, how):
     """Append-only sidecar (the fires file is shared across sessions, so it
     is never rewritten in place). A reader merges by fire_id."""
+    if portable_lock is None:
+        return
     try:
         with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
                   encoding="utf-8") as f:

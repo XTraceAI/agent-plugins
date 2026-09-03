@@ -79,7 +79,7 @@ def derive_name(path: Path, text: str, root: Path | None = None) -> str:
     m = re.search(r"^#\s+(.+?)\s*$", text, re.M)
     base = m.group(1).strip() if m else path.stem.replace("_", " ").replace("-", " ")
     try:
-        rel = str(path.relative_to(root)) if root else path.name
+        rel = path.relative_to(root).as_posix() if root else path.name
     except ValueError:
         rel = path.name
     return f"{base} ({rel})"[:150]

@@ -69,6 +69,61 @@ for path, size, text, expect, label in cases:
     ok, why = mc.is_candidate(Path(path), size=size, text=text or None)
     check(ok == expect, f"{label}  [{why}]")
 
+windows_temp_roots = (
+    "c:/users/alice/appdata/local/temp",
+    "//build-server/share/agent-temp",
+)
+check(
+    not mc._is_usable_windows_temp_root("c:")
+    and not mc._is_usable_windows_temp_root("//build-server/share")
+    and mc._is_usable_windows_temp_root("c:/temp")
+    and mc._is_usable_windows_temp_root("//build-server/share/temp"),
+    "Windows temp roots require a directory below the drive or UNC share",
+)
+check(
+    not mc._is_windows_temp_path("c:/repo/report.md", ("c:",))
+    and not mc._is_windows_temp_path(
+        "//build-server/share/repo/report.md", ("//build-server/share",)
+    ),
+    "bare drive and UNC-share roots cannot suppress the whole volume",
+)
+check(
+    mc._is_windows_temp_path(
+        "c:/users/alice/appdata/local/temp/run/report.md", windows_temp_roots
+    ),
+    "Windows drive-letter temp root is vetoed",
+)
+check(
+    mc._is_windows_temp_path(
+        "//build-server/share/agent-temp/run/report.md", windows_temp_roots
+    ),
+    "Windows UNC temp root is vetoed",
+)
+check(
+    not mc._is_windows_temp_path(
+        "c:/users/alice/appdata/local/temporary/report.md", windows_temp_roots
+    ),
+    "Windows temp-root matching respects path boundaries",
+)
+real_gettempdir = mc.tempfile.gettempdir
+try:
+    def unavailable_tempdir():
+        raise OSError("no usable temp directory")
+
+    mc.tempfile.gettempdir = unavailable_tempdir
+    surviving_temp_roots = mc._windows_temp_roots()
+finally:
+    mc.tempfile.gettempdir = real_gettempdir
+check(
+    isinstance(surviving_temp_roots, tuple),
+    "Windows temp-root discovery tolerates an unavailable runtime temp directory",
+)
+if os.name == "nt":
+    ok, why = mc.is_candidate(
+        Path(tempfile.gettempdir()) / "memhub-generated-report.md", size=BIG
+    )
+    check(not ok, f"active Windows temp directory is vetoed  [{why}]")
+
 # ---- frontmatter scanner ---------------------------------------------------
 print("frontmatter")
 check(mc.frontmatter("---\na: 1\n---\nbody") == "\na: 1", "extracts block")
@@ -112,7 +167,9 @@ with tempfile.TemporaryDirectory() as td:
         mc.save_state("sess-pre", {"dirty": []})
         check((pre.stat().st_mode & 0o777) == 0o700, "pre-existing wider leaf dir is tightened to 0700")
         mc.STATE_DIR = Path(td) / ".config" / "memhub-plugin" / "mdcapture"
-    check(state["dirty"] == [spec], f"state holds the spec exactly once: {state['dirty']}")
+    canonical_spec = str(Path(spec).resolve())
+    check(state["dirty"] == [canonical_spec],
+          f"state holds the canonical spec exactly once: {state['dirty']}")
     # create-then-edit through a symlinked dir must map to ONE canonical key
     real = Path(td) / "realrepo" / "docs"; real.mkdir(parents=True)
     link = Path(td) / "linkrepo"; link.symlink_to(Path(td) / "realrepo")
@@ -154,10 +211,12 @@ with tempfile.TemporaryDirectory() as td:
         # resolved: the collector stores canonical paths and the flush insists on them
         root = (Path(td) / "r").resolve(); root.mkdir()
         # six real candidates, each above the floor; none under a veto path
-        # (td is /var/folders → vetoed, so build them under a non-temp-looking
-        # symlink-free dir: patch VETO_PARTS for this block only)
+        # The fixture itself lives under the host temp root, so suspend both
+        # temp veto mechanisms for this block of upload/retry behavior tests.
         vp = mc.VETO_PARTS
+        wtr = mc.WINDOWS_TEMP_ROOTS
         mc.VETO_PARTS = tuple(v for v in vp if v not in ("/tmp/", "/private/tmp/", "/var/folders/"))
+        mc.WINDOWS_TEMP_ROOTS = ()
         f.VETO_PARTS = mc.VETO_PARTS
         paths = []
         for i in range(6):
@@ -336,6 +395,7 @@ with tempfile.TemporaryDirectory() as td:
         (root / ".claude" / "artifact-map.json").unlink()
 
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
+        mc.WINDOWS_TEMP_ROOTS = wtr
 
 
 # ---- flush-side derivations (no network) ----------------------------------
