@@ -206,7 +206,17 @@ post-call hook reads what the command left changed on disk (git decides what
 is a candidate, the file's mtime decides what that call touched) and runs the
 same matcher on it. In auto mode the agent is told to write through Bash, so
 without this an edit rule would be silent exactly where it is needed. Two
-books can both fire on one call. When they do, the plugin does **not** pick a winner and
+books can both fire on one call. When they do, the plugin does **not** pick a winner and The repo is
+the one the **call** works in — the edited file's checkout first, the session's
+directory second — so working from a folder that merely *contains* your
+checkouts still applies each one's own rules to the calls that touch it, and a
+rule scoped to a repo matches from any of its worktrees. A path is followed
+only while it stays inside the session's directory, so what the agent edits
+can never point the hook at a checkout you did not open. Session-start rules
+are the exception, since that event names no file: they resolve from the
+session's directory alone, and a session rooted *above* your checkouts still
+gets none.
+Two books can both fire on one call. When they do, the plugin does **not** pick a winner and
 hide the loser — both fire and both reach the local ledger — but the per-call
 advisory cap and the session-start note budget are spent **widest book first**,
 so an org-wide policy is never crowded out by a two-person book's note. Session

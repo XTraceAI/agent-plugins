@@ -1787,6 +1787,88 @@ def _repo_name(root, gitdir):
         return os.path.basename(root)
 
 
+_SEED_MAX_HOPS = 64   # a Write names a new dir a few levels deep, never thousands
+
+
+def _under(path, base):
+    """True when `path` is `base` or sits beneath it. `join(base, "")` is the
+    only spelling of the prefix that is right at a POSIX root ("/"), a Windows
+    drive root ("C:\\") and an ordinary directory alike, and it keeps a sibling
+    that merely shares a name prefix (/a/bc vs /a/b) out."""
+    return path == base or path.startswith(os.path.join(base, ""))
+
+
+def _acted_on_dir(cwd, inp):
+    """The directory of the file this call acts on, in the SESSION's own path
+    space, or "" when the payload names none this session may reach.
+
+    Payload data must not steer where the hook looks, so the session cwd is
+    the trust boundary. Containment is checked TWICE, and both must hold:
+
+    * lexically, on the unresolved path — because that is the path
+      `repo_info` actually walks up from. A symlink OUTSIDE cwd whose target
+      is inside it passes a resolved-only check while its lexical parents
+      still lead somewhere else entirely, which would hand `root` (and so
+      `git -C root`, which honors a repo's local config) to a checkout the
+      session never opened;
+    * and again once symlinks are resolved — so a link UNDER cwd cannot
+      smuggle the lookup out of it.
+
+    Requiring both also pins the value to ONE path space per session: an
+    absolute path spelled differently from cwd (/var vs /private/var, an
+    automounted home) fails the lexical test and falls back to the cwd
+    answer. That matters because `root` keys OrderingEngine state
+    (`{rid}@{root}:{branch}`), and one worktree reached two ways would split
+    into two keys and silently re-arm its ordering rules."""
+    if not (isinstance(inp, dict) and cwd):
+        return ""
+    base = os.path.normpath(cwd)
+    for key in ("file_path", "notebook_path"):      # each judged on its own:
+        fp = inp.get(key)                           # a junk file_path must not
+        if not (isinstance(fp, str) and fp):        # hide a good notebook_path
+            continue
+        try:
+            d = os.path.dirname(fp.replace("\\", "/"))
+            if not os.path.isabs(d):    # relative to the SESSION's cwd, never ours
+                d = os.path.join(cwd, d)
+            d = os.path.normpath(d)
+            if not _under(d, base):
+                continue
+            probe, hops = d, 0          # a Write may name a directory not created yet
+            while not os.path.exists(probe) and os.path.dirname(probe) != probe \
+                    and hops < _SEED_MAX_HOPS:
+                probe, hops = os.path.dirname(probe), hops + 1
+            if _under(os.path.realpath(probe), os.path.realpath(cwd)):
+                return d
+        except (OSError, ValueError):   # payload strings are untrusted (NUL -> ValueError)
+            continue
+    return ""
+
+
+def repo_of_call(data):
+    """(repo, root, gitdir, branch) for the checkout this CALL works in: the
+    acted-on file's first, the session cwd's second, else all empty.
+
+    The acted-on path outranks cwd because of the worktree-parent workflow —
+    an agent running from a directory that CONTAINS many checkouts and editing
+    files inside them. cwd resolves nothing there, and gating the rulebook on
+    it alone left every rule silently inert for the whole session while the
+    edited file sat in a real worktree the entire time. Worktrees themselves
+    were never the problem: `repo_info` reads the `.git` FILE and `scope_ok`
+    maps the gitdir back to the main checkout, so a rule scoped to the repo
+    matches from any of its worktrees once the walk starts in the right place.
+
+    A Bash call carries no path and keeps the cwd answer, so a non-git cwd
+    with nothing acted on stays silent exactly as before."""
+    cwd = data.get("cwd") or os.getcwd()
+    seed = _acted_on_dir(cwd, data.get("tool_input") or {})
+    if seed:
+        info = repo_info(seed)
+        if info[0]:
+            return info
+    return repo_info(cwd)
+
+
 _HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")
 
 
@@ -2225,10 +2307,13 @@ def main():
         data = json.loads(sys.stdin.read() or "{}")
     except Exception:
         return 0
-    cwd = data.get("cwd") or os.getcwd()
     session = data.get("session_id", "")
-    repo, root, gitdir, branch = repo_info(cwd)
-    if not repo:            # not in a git repo → no rules apply
+    # `repo_of_call` derives this too, but the probe root below still needs
+    # the SESSION's directory: a `cd` or `-C` in the command is resolved
+    # against where the terminal is, not against the edited file's checkout.
+    cwd = data.get("cwd") or os.getcwd()
+    repo, root, gitdir, branch = repo_of_call(data)
+    if not repo:            # nothing this call touches is in a git repo → no rules apply
         return 0
     if mode == "fetch":
         fetch_book(repo)
