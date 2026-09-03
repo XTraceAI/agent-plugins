@@ -1391,6 +1391,80 @@ def main() -> int:
               j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
               and "24 h" not in ctx(out), out)
 
+    # --- an anchored rule is not bypassed by a leading env assignment -------
+    #
+    # `FOO=1 git push` execs `git push`: bash strips the assignment before it
+    # looks up the command. A matcher that disagrees lets an ANCHORED gate
+    # through with no deny AND no fire — silently, which is worse than either.
+    for src, want in (("FOO=1 git push", "git push"),
+                      ("FOO=1 BAR=2 git push", "git push"),       # a run goes whole
+                      ("cd /tmp && FOO=1 git push", "cd /tmp && git push"),
+                      ("RULEBOOK_OVERRIDE= git push", "git push"),
+                      ("echo 'A=1 git push'", "echo 'A=1 git push'"),   # quoted: data
+                      ("git commit -m 'A=1'", "git commit -m 'A=1'"),   # not at a start
+                      ("echo 'unbalanced", "echo 'unbalanced")):        # shlex refuses
+        check("normalise: %s" % src, rb.strip_leading_assignments(src) == want,
+              rb.strip_leading_assignments(src))
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "anchrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "anchrepo", [
+            {"id": "anchored-gate", "on": "bash", "rx": r"^git\s+push\s+--force", "mode": "gate",
+             "not_rx": "SKIP_GATE=",
+             "fire_scope": "session", "repo_scope": "any", "text": "Never force-push", "why": "w",
+             "version": 1},
+            {"id": "inline-secret", "on": "bash", "rx": r"AWS_SECRET_ACCESS_KEY=",
+             "fire_scope": "session", "repo_scope": "any", "text": "No inline secret", "why": "w",
+             "version": 1},
+        ])
+        genv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        base = {"cwd": repo, "session_id": "a1", "tool_name": "Bash"}
+
+        def denied(cmd):
+            rc, out = run("pre", dict(base, tool_input={"command": cmd}), genv)
+            return outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out
+
+        for cmd in ("git push --force origin main",
+                    "FOO=1 git push --force origin main",
+                    "FOO=1 BAR=2 git push --force origin main",
+                    "RULEBOOK_OVERRIDE= git push --force origin main",
+                    "RULEBOOK_OVERRIDE='' git push --force origin main"):
+            ok, out = denied(cmd)
+            check("anchored gate: still DENIES behind a prefix — %s" % cmd[:38], ok, out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "RULEBOOK_OVERRIDE='approved by lead' git push --force origin main"}), genv)
+        j = outj(out)
+        check("anchored gate: a real override still passes exactly that call",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "approved by lead" in j.get("systemMessage", ""), out)
+
+        ok, out = denied("echo 'FOO=1 git push --force origin main'")
+        check("anchored gate: an assignment inside a quoted argument is data — no fire", not ok, out)
+
+        # monotonic: the RAW text is tried first, so a rule written to catch the
+        # assignment ITSELF keeps firing. Stripping is an extra form, never a
+        # replacement.
+        rc, out = run("pre", dict(base, session_id="a2", tool_input={
+            "command": "AWS_SECRET_ACCESS_KEY=abc123 aws s3 ls"}), genv)
+        check("anchored gate: a rule ABOUT an assignment still fires on the raw text",
+              "[inline-secret]" in ctx(out), out)
+
+        # not_rx is a VETO over BOTH forms. Stripping must never become a way to
+        # delete the token an author's exemption keys on — that would let
+        # `FOO=1 cmd` defeat an exemption `cmd` itself honours.
+        ok, out = denied("SKIP_GATE=1 git push --force origin main")
+        check("anchored gate: an exemption keyed on the assignment still exempts", not ok, out)
+
+        # KNOWN GAP, tracked separately: `^` is start-of-LINE, not
+        # start-of-segment, so a command after `cd x &&` is still unmatched.
+        # Stripping the assignment does not change that, and this locks it.
+        ok, out = denied("cd /tmp && FOO=1 git push --force origin main")
+        check("anchored gate: `^` is still line-anchored after `&&` (known gap)", not ok, out)
+
     branch_name_checks()
     repo_identity_checks()
     given_and_scope_checks()
