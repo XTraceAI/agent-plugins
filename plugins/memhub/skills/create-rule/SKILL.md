@@ -1,5 +1,5 @@
 ---
-description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it as a draft through the memhub `create_rule` tool — always advisory; a reviewer activates it.
+description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
 argument-hint: [--rulebook "<name or id>"] [the rule, in your own words]
 allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
 ---
@@ -126,6 +126,31 @@ reviewer needs: sanctioned forms, exemptions), `scope_repos` (`["<repo>"]` or
 `[]` for all), `scope_paths` / `scope_exclude_paths` (globs — they constrain
 edit rules by file path; a Bash call carries no path, so an include-scoped
 rule never fires on one).
+
+**Advise, or stop the command?** A rule advises by default: its sentence is
+shown and the call goes through. Pass `mode: "gate"` and the rule DENIES a
+matching command before it runs — the person can still run that exact command
+by prefixing `RULEBOOK_OVERRIDE='<why>'`, and their reason is recorded with the
+fire.
+
+Ask for it when the user's own words ask for it — "block", "stop me", "don't
+let me", "never let it happen again" — and never on your own initiative. Two
+things bound it:
+
+- **Only a command can be stopped.** A `bash` matcher or an `ordering` can
+  block. An `edit` rule fires after the file already changed, `output` after
+  the command already ran, and notes and anchors are advice by construction —
+  the server refuses `gate` on all of those. If the user wants to block an
+  edit, the shape that works is a Bash rule on the command that writes the
+  file, not a gate on the edit rule.
+- **It stops every teammate the book binds, not just the author.** Say that
+  before filing, in those words. A blocking rule with a loose `command_rx` is
+  the worst failure this skill can ship: it stops work, and the person it stops
+  did not write it.
+
+Filing it is not arming it — see step 5. `mode` is the rule's own field, so a
+blocking rule needs the same `command_not_rx` exemptions and the same
+`--fires` / `--silent` proof as any other; if anything, prove it harder.
 
 **`given` — facts the call must also satisfy.** A matcher rule may carry a
 `given` block inside its `matcher`; the regex is checked first, then these,
@@ -278,7 +303,8 @@ commands it does and doesn't match, and the conflict verdict. On approval call t
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
 `user correction, session <id>`, with the step-1b numbers appended:
 `|applies N/M|precision P`), `supersedes_rule_id` when it replaces a
-rule, and `rulebook_id` from step 0. Read the reply:
+rule, `mode: "gate"` if the user asked for a rule that stops the command, and
+`rulebook_id` from step 0. Read the reply:
 
 - `unchanged: true` → identical content is already in the book (a retried
   call with the same `source_ref` path and title); nothing written.
@@ -286,11 +312,19 @@ rule, and `rulebook_id` from step 0. Read the reply:
   the rule you named; it retires that rule when a reviewer activates it.
 - `status: "draft"` → new.
 
-**New rules always land draft / advise.** Activation and any blocking tier are
-reviewer decisions this skill never makes — never pass `activate`, never call
-an activation path. That holds even on a book that binds only the user, where
-the server would now let them arm their own rule: the point of the review step
-is that somebody reads the rule after the excitement of writing it.
+**New rules always land for review — never pass `activate`.** That holds even
+on a book that binds only the user, where the server would let them arm their
+own rule: the point of the review step is that somebody reads the rule after
+the excitement of writing it.
+
+**A blocking rule is filed the same way, and blocks nothing until it is
+turned on.** `mode: "gate"` is stored on the rule and travels with it through
+review; it is the reviewer turning the rule on that puts the block in front of
+anyone. So filing one is safe, and the reply says as much — read the `mode`
+back and report what it says rather than promising the user their command is
+blocked from now on. If the server refuses the mode, the rule is not on a
+command (see step 3): file it advising and tell the user which shape would
+block.
 
 If the rule is better as a plain suggestion than a check — the user doesn't
 want to write a detector — file it the same way with
@@ -307,3 +341,9 @@ MemHub (a `proposed` rule retires the one it replaces), every **member of that
 rulebook** picks it up on their next session, and its firing history accrues in
 MemHub as the evidence that later decides whether to keep, narrow, or retire
 it. Name any `cross_book` collision here too, under **Conflicts to resolve**.
+
+If the rule was filed to stop the command, say so in the same breath as who it
+reaches: once it is turned on, that command stops for everyone the book binds,
+and each of them can still run it by putting `RULEBOOK_OVERRIDE='<why>'` in
+front. Do not report a blocking rule as already blocking — it is waiting for
+the same review as any other.
