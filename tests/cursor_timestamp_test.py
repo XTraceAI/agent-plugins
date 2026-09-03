@@ -318,6 +318,28 @@ def test_main_flow_pins_persist_and_ship():
             state = cursor_flush._read_state(SESSION)
             assert quiet_clock not in state["record_ts"].values()
 
+            # Current Cursor JSONL omits tool results, so the exact PR URL
+            # arrives only on afterShellExecution. A new URL is durable before
+            # the send and forces one resend even though content is unchanged;
+            # duplicate hook delivery is inert until genuine content grows.
+            pr_url = "https://github.com/xtraceai/agent-plugins/pull/456"
+            shell_payload = {
+                "hook_event_name": "afterShellExecution",
+                "session_id": SESSION,
+                "conversation_id": SESSION,
+                "transcript_path": str(path),
+                "workspace_roots": [str(path.parent)],
+                "command": "gh pr create --fill",
+                "output": f"Created {pr_url}",
+            }
+            assert _run_main("afterShellExecution", shell_payload) == 0
+            assert len(calls) == 5
+            assert revisions[4] == revisions[3]
+            state = cursor_flush._read_state(SESSION)
+            assert state["pending_pr_urls"] == [pr_url]
+            assert _run_main("afterShellExecution", shell_payload) == 0
+            assert len(calls) == 5
+
             # apply_session_state restores the same fidelity onto a fresh
             # out-of-band re-read (the capture.py / sweep backstop).
             records, _meta = cursor_reader.to_canonical(
@@ -378,6 +400,13 @@ def test_event_can_flush_seals_quiet_observers():
     assert not can("beforeShellExecution", {})
     assert can("beforeShellExecution", {"command": "git commit -m x"})
     assert can("beforeShellExecution", {"command": "gh pr create -f"})
+    assert can("afterShellExecution", {
+        "command": "gh pr create -f",
+        "output": "https://github.com/x/r/pull/1",
+    })
+    assert not can("afterShellExecution", {
+        "command": "gh pr create -f", "output": "failed",
+    })
     for event in ("afterFileEdit", "afterAgentResponse", "stop",
                   "beforeSubmitPrompt", "sessionEnd"):
         assert can(event, {}), event

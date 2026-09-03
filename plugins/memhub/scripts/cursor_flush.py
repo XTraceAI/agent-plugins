@@ -30,10 +30,11 @@ Cursor Agent CLI 2026.08 emits only ``sessionStart`` / ``sessionEnd`` hooks and
 keeps usage solely in caller-owned stream output. ``sessionEnd`` therefore
 captures CLI content with nullable usage rather than estimating it.
 ``beforeShellExecution`` flushes only on milestone commands (git commit /
-gh pr …) so ordinary shell traffic stays quiet; ``afterFileEdit`` is
-debounced. Whatever the trigger set misses, the next flush or an
-import-session sweep heals — idempotence carries correctness, hooks carry
-latency.
+gh pr …) so ordinary shell traffic stays quiet. ``afterShellExecution``
+captures the exact URL returned by a direct ``gh pr create`` because current
+Cursor JSONL carries tool calls but not their results. ``afterFileEdit`` is
+debounced. Whatever the trigger set misses, the next flush or an import-session
+sweep heals — idempotence carries correctness, hooks carry latency.
 
 Invoked by the portable Cursor launcher, which answers the hook's permission
 contract immediately and re-runs this script detached - a slow server must
@@ -58,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
+import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
@@ -169,6 +171,7 @@ _MILESTONE_SCAN_LIMIT = 16384
 # drain; only mid-turn edits are debounce candidates.
 _FLUSH_MODE = {
     "beforeShellExecution": "now",   # only fires on milestone commands (gate)
+    "afterShellExecution": "now",    # exact direct gh-pr-create evidence
     "afterAgentResponse": "now",     # completed turn + exact usage
     "stop": "now",                   # turn boundary
     "beforeSubmitPrompt": "now",     # previous turn is definitely complete
@@ -695,14 +698,13 @@ def should_flush(event: str, payload: dict, state: dict,
                  blob_ids: set[str], now: float, *,
                  source_kind: str = "store",
                  source_revision: str | None = None,
-                 usage_pending: bool = False) -> bool:
+                 usage_pending: bool = False,
+                 provenance_new: bool = False) -> bool:
     """Pure gate — WHEN a hook invocation becomes a server call.
 
-    New-blobs is a precondition for every event: without new content a flush
-    is a guaranteed no-op round trip. On top of that, each event has its own
-    threshold: milestones always ship (the commit/PR boundary is the whole
-    point of milestone capture), turn boundaries ship, plain edits debounce,
-    and non-milestone shell commands never trigger (too chatty).
+    New content is normally required. A newly observed post-shell PR URL is
+    the one exception: current Cursor transcripts omit tool results, so that
+    evidence must be allowed to ride a deduplicated transcript resend.
     """
     # Dormancy gates EVERY event including the turn boundaries: a
     # persistently-down server is re-probed once per DORMANT_RETRY_S, never
@@ -717,7 +719,7 @@ def should_flush(event: str, payload: dict, state: dict,
     # bypasses the global dormancy gate above or the event-specific debounce
     # below. Failed delivery is therefore bounded by MAX_UNCONFIRMED and then
     # by DORMANT_RETRY_S instead of becoming a per-hook upload loop.
-    if not usage_pending:
+    if not usage_pending and not provenance_new:
         if source_kind == "transcript":
             if not source_revision or source_revision == state.get(
                     "transcript_revision"):
@@ -737,6 +739,8 @@ def should_flush(event: str, payload: dict, state: dict,
         # argument — it is large enough that a real `git commit`/`gh pr` verb,
         # even behind a long wrapper prefix, is never truncated away.
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
+    if event == "afterShellExecution":
+        return provenance_new
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
     if event in ("afterAgentResponse", "stop", "beforeSubmitPrompt",
@@ -767,6 +771,8 @@ def _event_can_flush(event: str, payload: dict) -> bool:
         if not isinstance(cmd, str):
             return False
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
+    if event == "afterShellExecution":
+        return bool(pr_provenance.scan_shell_event(event, payload)[0])
     return event in ("afterFileEdit", "afterAgentResponse", "stop",
                      "beforeSubmitPrompt", "sessionEnd")
 
@@ -902,6 +908,19 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
              f"held; if this repeats every flush, the store schema has moved "
              f"and readers/cursor.py needs updating")
         shipped = None
+    state = _read_state(uuid)
+    pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
+        pr_provenance.queued_urls(state, records)
+    )
+    if missing_pr_urls:
+        _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
+             "canonical GitHub PR URL")
+    if pending_pr_urls or accepted_pr_urls:
+        _save_state(
+            uuid,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
     sendable = redact_records(elide_oversized_tool_results(records))
     if not sendable:
         if records:
@@ -1003,6 +1022,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # Same scope stamp flush_turn sends: directives extracted from this
         # session must recall in this repo's context, not everywhere.
         arguments["namespace"] = namespace
+    provenance = pr_provenance.import_provenance(pending_pr_urls)
+    if provenance:
+        arguments["provenance"] = provenance
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         # Bound a semi-trusted session title (store content, like cwd): a
@@ -1051,11 +1073,18 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     # re-read here: a post-send read would span the whole network round trip.
     # The timestamps land either way — the debounce must still hold after a
     # successful send — but blob_ids only when we could actually verify it.
+    pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge(
+        pending_pr_urls,
+        accepted_pr_urls,
+        mcp_http.ack_of(res, f"cursor-{uuid}"),
+    )
     fields = {"last_flush_at": time.time(), "last_ok_at": time.time(),
               "last_error": None,
               # The re-probe worked: this server confirms after all, so the
               # session re-arms instead of staying dormant on old evidence.
               "unsupported": False, "unsupported_at": 0,
+              "pending_pr_urls": pending_pr_urls,
+              "accepted_pr_urls": accepted_pr_urls,
               "fail_streak": 0}
     if source_kind == "store":
         # On a CONFIRMED import, advance the watermark even when the post-read
@@ -1098,6 +1127,11 @@ def main() -> int:
         _log(f"{event}: session id {uuid!r} is not a uuid — refusing the "
              f"store lookup")
         return 0
+    event_pr_urls, missing_pr_urls = pr_provenance.scan_shell_event(
+        event, payload)
+    if missing_pr_urls:
+        _log(f"{event}: direct gh pr create result had no canonical "
+             "GitHub PR URL")
     if not _event_can_flush(event, payload):
         # A guaranteed non-send (plain shell traffic, unknown event) exits
         # before the lock and the transcript read — no I/O per `ls`, and no
@@ -1115,12 +1149,41 @@ def main() -> int:
     # re-checks new-blobs, so a waited boundary ships only the delta or no-ops.
     lock_fd = _acquire(
         uuid, blocking=(event in ("afterAgentResponse", "stop",
-                                  "beforeSubmitPrompt", "sessionEnd")))
+                                  "beforeSubmitPrompt", "sessionEnd",
+                                  "afterShellExecution")))
     if lock_fd is None:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
         state = _read_state(uuid)
+        accepted_pr_urls = pr_provenance.merge_urls(
+            state.get("accepted_pr_urls") or [])
+        accepted_pr_set = set(accepted_pr_urls)
+        prior_pending = pr_provenance.merge_urls(
+            state.get("pending_pr_urls") or [])
+        pending_pr_urls = [
+            url for url in pr_provenance.merge_urls(
+                prior_pending, event_pr_urls)
+            if url not in accepted_pr_set
+        ]
+        provenance_new = any(
+            url not in accepted_pr_set and url not in prior_pending
+            for url in event_pr_urls
+        )
+        if pending_pr_urls != prior_pending:
+            # Cursor's transcript omits shell results. Persist the hook-only
+            # evidence before source reads and network work so any later event
+            # can retry it after a crash, missing source, or failed send.
+            _save_state(
+                uuid,
+                pending_pr_urls=pending_pr_urls,
+                accepted_pr_urls=accepted_pr_urls,
+            )
+            state = {
+                **state,
+                "pending_pr_urls": pending_pr_urls,
+                "accepted_pr_urls": accepted_pr_urls,
+            }
         source_kind, source_path, err = _source_for(uuid, payload, state)
         if source_kind is None or source_path is None:
             _log(f"{event}: {err or 'no readable Cursor source'}")
@@ -1206,11 +1269,14 @@ def main() -> int:
         # should_flush reads only watermark/backoff state (transcript_revision,
         # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
         # the decision comes FIRST and a quiet event saves only the small
-        # fields, leaving the pin map untouched on disk.
+        # fields, leaving the pin map untouched on disk. A duplicate
+        # afterShellExecution can also reach this point: it re-reads the source
+        # to distinguish new evidence under the session lock, then declines.
         if not should_flush(
                 event, payload, state, blob_ids, time.time(),
                 source_kind=source_kind, source_revision=source_revision,
-                usage_pending=usage_pending):
+                usage_pending=usage_pending,
+                provenance_new=provenance_new):
             _save_state(uuid, **fields)
             return 0
 
