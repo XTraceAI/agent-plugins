@@ -486,6 +486,18 @@ def test_rulebook_health() -> None:
 
     _rulebook_crumb("flush", ago_min=5)
     check("a flush failure is reported", (ch._rulebook_problem() or ("",))[0], "flush")
+    _clear_rulebook()
+
+    # Recall has no book of its own; a stale blip must not outlive the lane's
+    # recovery. The hook clears the crumb on its next 200 — see the client
+    # test — and a book confirmed since is the second witness.
+    _rulebook_crumb("recall", ago_min=5)
+    check("a recent recall failure is reported",
+          (ch._rulebook_problem() or ("",))[0], "recall")
+    _rulebook_book(fetched_ago_min=1)
+    check("a book confirmed after a recall blip retracts it",
+          ch._rulebook_problem(), None)
+    _clear_rulebook()
     _rulebook_crumb("nonsense", ago_min=5)
     check("an unknown lane is ignored", ch._rulebook_problem(), None)
     (ch.RULEBOOK_DIR / "ledger" / ".last_error").write_text("{not json", encoding="utf-8")
@@ -500,8 +512,49 @@ def test_rulebook_health() -> None:
     check("the fetch wording says the copy is cached", "cached copy" in msg, True)
     msg = ch._message(HOST, None, None, ("flush", time.time() - 300))
     check("the flush wording says rules still show", "showing normally" in msg, True)
+
+    # A recall timeout is not a credential problem, and the banner that shipped
+    # for it told people to go check their login. Nothing about that is true.
+    msg = ch._message(HOST, None, None, ("recall", time.time() - 300))
+    check("the recall wording does not send the user to login",
+          "/memhub:login" in msg, False)
+    check("the recall wording says the cached rules still show",
+          "rules are showing" in msg, True)
+    msg = ch._message(HOST, None, None,
+                      ("auth", time.time() - 300))
+    check("an auth-shaped recall refusal still names the fix",
+          "/memhub:login" in msg, True)
     both = ch._message(HOST, "never", None, ("fetch", time.time() - 300))
     check("a capture problem outranks a rulebook one", "capture is not authenticated" in both, True)
+
+    # The guard, not another wording case. `recall` shipped with no branch of
+    # its own and fell through to a line that named no cause and offered a fix
+    # that could not work — the failure this whole file exists to prevent, and
+    # the one a fourth lane would repeat for free. Every declared lane must say
+    # something of its own; adding one to LANES fails here until it does.
+    generic = ch._message(HOST, None, None, ("__unbranched__", time.time() - 300))
+    for lane in ch.LANES:
+        msg = ch._message(HOST, None, None, (lane, time.time() - 300))
+        check(f"lane {lane!r} has a message at all", bool(msg), True)
+        check(f"lane {lane!r} does not fall through to the generic line",
+              msg != generic, True)
+    check("every declared lane is distinctly worded",
+          len({ch._message(HOST, None, None, (l, time.time() - 300))
+               for l in ch.LANES}), len(ch.LANES))
+
+    # And the retraction side: a lane with no way to be retracted warns until
+    # the staleness window closes, which is the same bug wearing a hat.
+    for lane, evidence in (("fetch", lambda: _rulebook_book(fetched_ago_min=1)),
+                           ("flush", lambda: _rulebook_sent(flushed_ago_min=1)),
+                           ("recall", lambda: _rulebook_book(fetched_ago_min=1))):
+        _clear_rulebook()
+        _rulebook_crumb(lane, ago_min=5)
+        check(f"lane {lane!r} is reported before its evidence",
+              (ch._rulebook_problem() or ("",))[0], lane)
+        evidence()
+        check(f"lane {lane!r} has a retraction path that works",
+              ch._rulebook_problem(), None)
+    _clear_rulebook()
 
 
 
