@@ -486,6 +486,18 @@ def test_rulebook_health() -> None:
 
     _rulebook_crumb("flush", ago_min=5)
     check("a flush failure is reported", (ch._rulebook_problem() or ("",))[0], "flush")
+    _clear_rulebook()
+
+    # Recall has no book of its own; a stale blip must not outlive the lane's
+    # recovery. The hook clears the crumb on its next 200 — see the client
+    # test — and a book confirmed since is the second witness.
+    _rulebook_crumb("recall", ago_min=5)
+    check("a recent recall failure is reported",
+          (ch._rulebook_problem() or ("",))[0], "recall")
+    _rulebook_book(fetched_ago_min=1)
+    check("a book confirmed after a recall blip retracts it",
+          ch._rulebook_problem(), None)
+    _clear_rulebook()
     _rulebook_crumb("nonsense", ago_min=5)
     check("an unknown lane is ignored", ch._rulebook_problem(), None)
     (ch.RULEBOOK_DIR / "ledger" / ".last_error").write_text("{not json", encoding="utf-8")
@@ -500,6 +512,18 @@ def test_rulebook_health() -> None:
     check("the fetch wording says the copy is cached", "cached copy" in msg, True)
     msg = ch._message(HOST, None, None, ("flush", time.time() - 300))
     check("the flush wording says rules still show", "showing normally" in msg, True)
+
+    # A recall timeout is not a credential problem, and the banner that shipped
+    # for it told people to go check their login. Nothing about that is true.
+    msg = ch._message(HOST, None, None, ("recall", time.time() - 300))
+    check("the recall wording does not send the user to login",
+          "/memhub:login" in msg, False)
+    check("the recall wording says the cached rules still show",
+          "rules are showing" in msg, True)
+    msg = ch._message(HOST, None, None,
+                      ("auth", time.time() - 300))
+    check("an auth-shaped recall refusal still names the fix",
+          "/memhub:login" in msg, True)
     both = ch._message(HOST, "never", None, ("fetch", time.time() - 300))
     check("a capture problem outranks a rulebook one", "capture is not authenticated" in both, True)
 

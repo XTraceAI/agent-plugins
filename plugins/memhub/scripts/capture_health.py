@@ -386,9 +386,11 @@ def _lane_recovered(what: str, when: float) -> bool:
     fetch  — a book confirmed after the error (`book/*.json:fetched_at`).
     flush  — an accepted batch after the error (`ledger/.sent:last_flush_at`,
              written by the hook only when the server accepted rows).
-    recall — records no success of its own; it rides the same client and
-             server as fetch, so a later confirmed book is the evidence that
-             the path works again.
+    recall — clears its own crumb on the next 200 (`_breadcrumb_clear`), so a
+             surviving crumb already means no recall has succeeded since. The
+             book check below still stands as a second witness: recall only
+             runs on PreToolUse, so a session that has issued none of them
+             would otherwise carry the last one's blip forever.
     """
     def _stamp_after(path: Path, key: str) -> bool:
         try:
@@ -487,6 +489,18 @@ def _message(host: str, token_problem: str | None,
                     f"fired is not reaching the server (last attempt {when_txt}), "
                     "so the team cannot see whether they are useful. "
                     "Run /memhub:login --status to check.")
+        if what == "recall":
+            # NOT told to check login: this lane runs on a 1.5 s budget inside
+            # PreToolUse and the overwhelming majority of its failures are a
+            # slow round trip, not a credential — an auth refusal is caught
+            # above by `_AUTH_REFUSAL` and reported as such. Sending someone to
+            # re-authenticate over a timeout spends their trust proving the
+            # advice was wrong. It also says what is and is not lost, because
+            # the cached rules keep firing normally the whole time.
+            return ("Your team's rules are showing, but the ones tied to "
+                    f"specific files or commands went unanswered {when_txt}, so "
+                    "a few may not have been raised. Nothing needs fixing if "
+                    "the next lookup succeeds.")
         return ("A team-rule lookup failed "
                 f"{when_txt}; advice tied to specific files or commands may be "
                 "missing from this session. Run /memhub:login --status to check.")

@@ -1321,6 +1321,9 @@ def recall_anchor_rules(repo, tool, handles, already_fired):
                           timeout=RECALL_TIMEOUT_S)
         if reply.status != 200 or not isinstance(reply.data, dict):
             return []
+        # The lane's only record of working. Zero kept rules is still a success:
+        # what is being retracted is "recall is failing", not "a rule matched".
+        _breadcrumb_clear("recall")
         return [str(r.get("rule_id")) for r in reply.data.get("rules") or []
                 if isinstance(r, dict) and r.get("rule_id")]
     except Exception as exc:
@@ -1379,6 +1382,29 @@ def _breadcrumb(what, exc):
         _atomic_json(os.path.join(_ledger_dir(), ".last_error"),
                      {"at": _now(), "what": what, "error": str(exc)[:300]})
     except Exception:
+        pass
+
+
+def _breadcrumb_clear(what):
+    """Retract the breadcrumb once ``what``'s own lane has worked again.
+
+    Without this a lane that records no success of its own — recall — leaves a
+    single blip standing until some OTHER lane happens to succeed. Recall runs
+    on PreToolUse and the book is only refetched at SessionStart, so one 1.5 s
+    timeout mid-session reliably produced a health banner at the next session
+    start, long after the lane had recovered. A warning that outlives its cause
+    is the failure mode this file exists to avoid.
+
+    Only clears a crumb this lane wrote: another lane's failure is still real.
+    """
+    path = os.path.join(_ledger_dir(), ".last_error")
+    try:
+        with open(path, encoding="utf-8") as f:
+            crumb = json.load(f)
+        if not isinstance(crumb, dict) or crumb.get("what") != what:
+            return
+        os.unlink(path)
+    except Exception:      # no crumb, unreadable, or already gone — all fine
         pass
 
 
