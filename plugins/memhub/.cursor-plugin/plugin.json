@@ -2,7 +2,7 @@
   "name": "memhub",
   "displayName": "MemHub",
   "description": "XTrace MemHub team memory in Cursor: search_memory / save_artifact / import_conversation tools plus skills for setup, login, onboarding, artifact upload, session import, recall, handoff, spec-driven development, Rulebook rule authoring (create-rule) and rules proposed from CLAUDE.md + past sessions in one run (rules-from-sessions), and PR babysitting. A rule lives in a RULEBOOK — a container with its own membership, so it reaches exactly the people that book binds; the authoring skills resolve which book it lands in and offer to create one when there is none. Sessions are captured automatically.",
-  "version": "0.44.0",
+  "version": "0.45.0",
   "author": {
     "name": "XTrace"
   },
