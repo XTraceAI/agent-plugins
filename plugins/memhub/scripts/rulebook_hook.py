@@ -1298,7 +1298,15 @@ def scope_ok(rule, repo, gitdir):
     if rule.get("_scope_repos"):        # server list: this checkout's name or its main
         parts = gitdir.split("/") if gitdir else []   # checkout's (…/<main>/.git/worktrees/x)
         main = parts[parts.index(".git") - 1] if ".git" in parts and parts.index(".git") > 0 else ""
-        return any(s == repo or (main and s == main) for s in rule["_scope_repos"])
+        # Folded, and folded on the SERVER too (crud._rule_in_repo): the name
+        # in the rule was typed by a person, the name here was resolved from a
+        # remote URL on someone's machine. Matching them exactly makes
+        # "memhub-backend" and "MemHub-Backend" different repositories, and the
+        # rule then just never fires, with nothing anywhere saying why. Folding
+        # on one side only would be worse than neither: the server would ship a
+        # rule this would then discard.
+        here = {repo.casefold(), main.casefold()} - {""}
+        return any(s.casefold() in here for s in rule["_scope_repos"])
     if scope == "any":
         return True
     return scope in repo or (gitdir and f"/{scope}/" in gitdir)
