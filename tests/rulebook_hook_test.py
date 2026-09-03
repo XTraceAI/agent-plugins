@@ -394,6 +394,94 @@ def bash_edit_checks() -> None:
               "[new-table-retention]" in c, c)
 
 
+def diff_base_checks() -> None:
+    """What the diff probes measure: WHICH tree, and against WHICH base.
+
+    Both were guesses once, and both guessed wrong in the same session: the
+    base was `origin/main` in a repo whose PRs target `staging` (so a 260-line
+    PR measured the whole staging-vs-main delta), and the tree was the
+    session's cwd while the command ran in another worktree. Either one alone
+    makes `diff_lines_gt` fire on every PR.
+    """
+    sys.path.insert(0, os.path.dirname(HOOK))
+    import rulebook_hook as H  # noqa: E402
+
+    def git(root, *args):
+        subprocess.run(["git", "-C", root, *args], check=True,
+                       capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        # A repo whose long-lived base is `staging`, far ahead of `main`.
+        repo = os.path.join(td, "svc")
+        os.makedirs(repo)
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "t@t.t")
+        git(repo, "config", "user.name", "t")
+        with open(os.path.join(repo, "seed.txt"), "w") as f:
+            f.write("seed\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "seed")
+        git(repo, "checkout", "-qb", "staging")
+        with open(os.path.join(repo, "big.txt"), "w") as f:
+            f.write("".join(f"line {i}\n" for i in range(900)))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "900 lines of staging")
+        git(repo, "checkout", "-qb", "feature")
+        with open(os.path.join(repo, "small.txt"), "w") as f:
+            f.write("a\nb\nc\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "3 lines")
+
+        def lines(command):
+            return H.Probes(repo, "feature", command=command).diff_lines()
+
+        check("diff base: without the command's --base, the guess is `main` — "
+              "the branch measures the whole staging-vs-main delta",
+              lines("gh pr create") > 500, str(lines("gh pr create")))
+        n = lines("gh pr create --base staging --title x")
+        check("diff base: `--base staging` measures the branch, not the base branch",
+              n == 3, str(n))
+        check("diff base: `--base=staging` (equals form) reads the same",
+              lines("gh pr create --base=staging") == 3)
+        check("diff base: a quoted base reads the same",
+              lines("gh pr create --base 'staging'") == 3)
+
+        # MEMHUB_RULEBOOK_BASE_BRANCH still wins over the command.
+        os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"] = "main"
+        try:
+            check("diff base: the env override still outranks the command",
+                  lines("gh pr create --base staging") > 500)
+        finally:
+            del os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"]
+
+        # --- which tree: a leading `cd` redirects the whole command ----------
+        other = os.path.join(td, "other")
+        os.makedirs(other)
+        git(other, "init", "-q", "-b", "main")
+        git(other, "config", "user.email", "t@t.t")
+        git(other, "config", "user.name", "t")
+        with open(os.path.join(other, "a.txt"), "w") as f:
+            f.write("a\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-qm", "seed")
+
+        check("probe root: a leading `cd <repo> &&` resolves to that worktree",
+              H.command_root(td, f"cd {other} && gh pr create") == other)
+        check("probe root: a relative `cd` resolves against the session cwd",
+              H.command_root(td, "cd other && gh pr create") == other)
+        check("probe root: a quoted path resolves",
+              H.command_root(td, f"cd '{other}' ; gh pr create") == other)
+        check("probe root: no `cd` keeps the session's tree",
+              H.command_root(td, "gh pr create") == "")
+        check("probe root: a `cd` buried mid-pipeline is not honoured — the "
+              "command may never reach it",
+              H.command_root(td, f"ls && cd {other} && gh pr create") == "")
+        check("probe root: a `cd` to somewhere that is not a repo keeps the session's tree",
+              H.command_root(td, f"cd {td} && gh pr create") == "")
+        check("probe root: a `cd` to a missing directory keeps the session's tree",
+              H.command_root(td, "cd /nope/nowhere && gh pr create") == "")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
@@ -955,6 +1043,7 @@ def main() -> int:
 
     given_and_scope_checks()
     bash_edit_checks()
+    diff_base_checks()
 
     print()
     if FAILURES:

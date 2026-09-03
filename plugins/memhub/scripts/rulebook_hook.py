@@ -601,6 +601,36 @@ def user_turns_of(tp):
         return None
 
 
+_ARG = r"(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|]+))"
+_BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
+_CD_PREFIX = re.compile(r"^\s*cd\s+" + _ARG + r"\s*(?:&&|;)")
+
+
+def command_root(cwd, command):
+    """The worktree the command actually runs in, when it says so itself.
+
+    A hook payload carries the SESSION's cwd, but an agent working across
+    worktrees runs `cd <other-repo> && …` in a single call — and then every
+    repo fact answered from the session's cwd describes the wrong tree. Only a
+    leading `cd` counts: it is the form that redirects the whole command, and
+    guessing at one buried mid-pipeline would answer with a directory the
+    command may never reach. Returns "" when there is no such prefix or it
+    does not resolve to a worktree, and the caller keeps the session's root.
+    """
+    m = _CD_PREFIX.match(command or "")
+    if not m:
+        return ""
+    path = next((g for g in m.groups() if g), "")
+    if not path:
+        return ""
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd or "", path)
+    if not os.path.isdir(path):
+        return ""
+    return repo_info(path)[1]
+
+
 class Probes:
     """The facts a `given` block asks about, answered lazily and at most once
     per hook call. Nothing runs unless a rule whose regex already matched
@@ -611,10 +641,11 @@ class Probes:
     `fixture` pre-answers probes by name — the verifier's and the tests' way
     in, so given_ok() never needs a real repo to be exercised."""
 
-    def __init__(self, root, branch, transcript_path=None, fixture=None):
+    def __init__(self, root, branch, transcript_path=None, fixture=None, command=""):
         self.root, self._branch, self.tp = root, branch, transcript_path
         self._fix = dict(fixture or {})
         self._memo = {}
+        self._cmd = command or ""
 
     def _get(self, key, compute):
         if key in self._fix:
@@ -635,15 +666,43 @@ class Probes:
     def branch(self):
         return self._get("branch", lambda: self._branch)
 
+    def _named_base(self):
+        """The base branch the in-flight command names, e.g. `--base staging`.
+        Read off the command rather than guessed, because the command is the
+        only place the answer actually exists."""
+        m = _BASE_ARG.search(self._cmd)
+        return next((g for g in m.groups() if g), "") if m else ""
+
+    def _remote_head(self):
+        """`refs/remotes/origin/HEAD` — the remote's own default branch, set by
+        clone. Absent in plenty of checkouts, hence the name list after it."""
+        out = self._git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        return (out or "").strip()
+
     def base(self):
-        """Merge-base with the branch this one will be compared against:
-        MEMHUB_RULEBOOK_BASE_BRANCH, else the first of the usual names that
-        exists. None when there is no such branch (a fresh repo) — every diff
-        probe then answers None too."""
+        """Merge-base with the branch this one will be compared against, in the
+        order that gets it RIGHT rather than the order that is cheapest:
+        MEMHUB_RULEBOOK_BASE_BRANCH, the base the command itself names
+        (`gh pr create --base staging`), the remote's own default
+        (`refs/remotes/origin/HEAD`), then the usual names as a last guess.
+        None when no candidate exists (a fresh repo) — every diff probe then
+        answers None too.
+
+        Guessing `main` first was wrong wherever a repo merges into something
+        else: against `origin/main`, a PR onto a long-lived `staging` measures
+        the whole staging-vs-main delta instead of the branch, so a
+        `diff_lines_gt` rule fires on every PR in that repo no matter how small.
+        """
         def compute():
             env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
-            cands = ([env] if env else []) + ["origin/main", "origin/master", "origin/develop",
-                                              "main", "master", "develop"]
+            named = self._named_base()
+            cands = ([env] if env else [])
+            # `--base staging` names a branch, not a ref: try the remote's copy
+            # before the local one, which may be stale or absent.
+            cands += [f"origin/{named}", named] if named else []
+            cands += [r for r in [self._remote_head()] if r]
+            cands += ["origin/main", "origin/master", "origin/develop",
+                      "main", "master", "develop"]
             for cand in cands:
                 if self._git("rev-parse", "--verify", "-q", cand + "^{commit}") is None:
                     continue
@@ -1915,7 +1974,16 @@ def main():
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data)}
-    probes = Probes(root, branch, transcript_path=data.get("transcript_path"))
+    # Repo facts answer about the tree the COMMAND runs in; which rules bind
+    # you is still the session's repo, and stays keyed on it.
+    cmd_text = (data.get("tool_input") or {}).get("command") or ""
+    probe_root, probe_branch = root, branch
+    elsewhere = command_root(cwd, cmd_text)
+    if elsewhere and elsewhere != root:
+        probe_root = elsewhere
+        probe_branch = _branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
+    probes = Probes(probe_root, probe_branch, command=cmd_text,
+                    transcript_path=data.get("transcript_path"))
 
     if mode == "session":
         try:        # which source each rule came from — the pilot's merge audit
