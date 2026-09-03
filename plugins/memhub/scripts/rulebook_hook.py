@@ -620,6 +620,39 @@ def user_turns_of(tp):
         return None
 
 
+_ARG = r"(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|]+))"
+_BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
+# A plain branch name, and nothing that reaches elsewhere in history: no rev
+# syntax (`~ ^ : @{…}`), no path traversal, no leading dash.
+_BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
+_CD_PREFIX = re.compile(r"^\s*cd\s+" + _ARG + r"\s*(?:&&|;)")
+
+
+def command_root(cwd, command):
+    """The worktree the command actually runs in, when it says so itself.
+
+    A hook payload carries the SESSION's cwd, but an agent working across
+    worktrees runs `cd <other-repo> && …` in a single call — and then every
+    repo fact answered from the session's cwd describes the wrong tree. Only a
+    leading `cd` counts: it is the form that redirects the whole command, and
+    guessing at one buried mid-pipeline would answer with a directory the
+    command may never reach. Returns "" when there is no such prefix or it
+    does not resolve to a worktree, and the caller keeps the session's root.
+    """
+    m = _CD_PREFIX.match(command or "")
+    if not m:
+        return ""
+    path = next((g for g in m.groups() if g), "")
+    if not path:
+        return ""
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd or "", path)
+    if not os.path.isdir(path):
+        return ""
+    return repo_info(path)[1]
+
+
 class Probes:
     """The facts a `given` block asks about, answered lazily and at most once
     per hook call. Nothing runs unless a rule whose regex already matched
@@ -630,10 +663,11 @@ class Probes:
     `fixture` pre-answers probes by name — the verifier's and the tests' way
     in, so given_ok() never needs a real repo to be exercised."""
 
-    def __init__(self, root, branch, transcript_path=None, fixture=None):
+    def __init__(self, root, branch, transcript_path=None, fixture=None, command=""):
         self.root, self._branch, self.tp = root, branch, transcript_path
         self._fix = dict(fixture or {})
         self._memo = {}
+        self._cmd = command or ""
 
     def _get(self, key, compute):
         if key in self._fix:
@@ -654,15 +688,79 @@ class Probes:
     def branch(self):
         return self._get("branch", lambda: self._branch)
 
+    def _named_base(self):
+        """The base branch the in-flight command names (`--base staging`), when
+        it is a branch this rule may honestly be measured against.
+
+        Read off the command because that is the only place the answer exists —
+        but the command is written by the party the rule gates, so a named base
+        is CHECKED, never taken on trust. Three ways it is refused, each of
+        which falls through to the remote default and so OVER-measures rather
+        than under-measures:
+
+        * **Not a plain remote branch name.** Rev syntax (`HEAD`, `abc123`,
+          `main~40`) is not a base a PR can merge into, and would let the
+          comparison point be moved anywhere in history.
+        * **Nothing to merge into it** — `merge-base(base, HEAD) == HEAD`. This
+          is the bypass that matters: naming your OWN branch, or any descendant
+          of it, makes the diff measure zero and a 5,000-line branch reads as
+          empty. A PR onto such a base would be empty too, so no honest call
+          names one.
+        * **More than one distinct base named.** `… --base <mine> || … --base
+          staging` would probe the first and open the second. If a command
+          cannot say plainly what it merges into, it does not get to choose.
+
+        None of this makes the gate proof against the party running the shell —
+        nothing here could, and `RULEBOOK_OVERRIDE=` is the sanctioned way past
+        it precisely because it is RECORDED. What this closes is the silent
+        version: a bypass that leaves no fire and no reason behind it.
+        """
+        named = {next((g for g in m.groups() if g), "")
+                 for m in _BASE_ARG.finditer(self._cmd)}
+        named.discard("")
+        if len(named) != 1:
+            return ""
+        base = named.pop()
+        if not _BRANCH_NAME.match(base) or base == "HEAD":
+            return ""
+        # A real remote branch, not just any rev that happens to resolve.
+        if self._git("rev-parse", "--verify", "-q",
+                     f"refs/remotes/origin/{base}^{{commit}}") is None:
+            return ""
+        mb = (self._git("merge-base", f"origin/{base}", "HEAD") or "").strip()
+        head = (self._git("rev-parse", "HEAD") or "").strip()
+        return "" if not mb or not head or mb == head else base
+
+    def _remote_head(self):
+        """`refs/remotes/origin/HEAD` — the remote's own default branch, set by
+        clone. Absent in plenty of checkouts, hence the name list after it."""
+        out = self._git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        return (out or "").strip()
+
     def base(self):
-        """Merge-base with the branch this one will be compared against:
-        MEMHUB_RULEBOOK_BASE_BRANCH, else the first of the usual names that
-        exists. None when there is no such branch (a fresh repo) — every diff
-        probe then answers None too."""
+        """Merge-base with the branch this one will be compared against, in the
+        order that gets it RIGHT rather than the order that is cheapest:
+        MEMHUB_RULEBOOK_BASE_BRANCH, the base the command itself names
+        (`gh pr create --base staging`), the remote's own default
+        (`refs/remotes/origin/HEAD`), then the usual names as a last guess.
+        None when no candidate exists (a fresh repo) — every diff probe then
+        answers None too.
+
+        Guessing `main` first was wrong wherever a repo merges into something
+        else: against `origin/main`, a PR onto a long-lived `staging` measures
+        the whole staging-vs-main delta instead of the branch, so a
+        `diff_lines_gt` rule fires on every PR in that repo no matter how small.
+        """
         def compute():
             env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
-            cands = ([env] if env else []) + ["origin/main", "origin/master", "origin/develop",
-                                              "main", "master", "develop"]
+            named = self._named_base()
+            cands = ([env] if env else [])
+            # `--base staging` names a branch, not a ref: try the remote's copy
+            # before the local one, which may be stale or absent.
+            cands += [f"origin/{named}", named] if named else []
+            cands += [r for r in [self._remote_head()] if r]
+            cands += ["origin/main", "origin/master", "origin/develop",
+                      "main", "master", "develop"]
             for cand in cands:
                 if self._git("rev-parse", "--verify", "-q", cand + "^{commit}") is None:
                     continue
@@ -1654,19 +1752,59 @@ def strip_override(cmd, found):
     return cmd
 
 
+def _tokens(text):
+    """shlex tokens for `text`, or None when it does not parse."""
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:                                 # unbalanced quoting
+        return None
+
+
+def _logical_lines(text):
+    """(text, tokens) per line, rejoining lines that only parse together.
+
+    A heredoc inside a command substitution splits one shell line across
+    several physical ones: `--body "$(cat <<'EOF'` leaves its double quote
+    open, and the closing `)"` sits after the body — so neither line parses
+    alone while the two together do. Joining is what the shell does anyway.
+
+    This matters because of what skipping an unparseable line COSTS. It was
+    silently dropping the override on the commonest gated command there is —
+    `gh pr create` with a heredoc body — so the gate denied the call and the
+    documented way past it did nothing. A gate whose override cannot be
+    reached is a wall.
+
+    A line that parses no better joined with everything after it yields
+    ``None`` tokens and the caller skips it: an override we cannot read as
+    shell is still not an override.
+    """
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        for j in range(i, len(lines)):
+            chunk = " ".join(lines[i:j + 1])
+            toks = _tokens(chunk)
+            if toks is not None:
+                yield chunk, toks
+                i = j + 1
+                break
+        else:
+            yield lines[i], None
+            i += 1
+
+
 def find_override(cmd):
     """(reason, line, raw_token) for the first `RULEBOOK_OVERRIDE=<why>` that
     begins a shell segment and is non-empty, else None. Tokenised per line of
     the shell-only text with shlex (POSIX quoting, operators as their own
-    tokens); a line shlex cannot parse contributes nothing. Every candidate is
-    tried, so an earlier empty or quoted one cannot shadow the real override."""
+    tokens); a line that parses nowhere, even joined with what follows it,
+    contributes nothing (see :func:`_logical_lines`). Every candidate is tried,
+    so an earlier empty or quoted one cannot shadow the real override."""
     text = re.sub(r"\\\n", " ", shell_only(cmd))        # join continuation lines
-    for line in text.split("\n"):
-        try:
-            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lex.whitespace_split = True
-            toks = list(lex)
-        except ValueError:                             # unbalanced quoting
+    for line, toks in _logical_lines(text):
+        if toks is None:
             continue
         at_start = True
         for tok in toks:
@@ -1942,7 +2080,23 @@ def main():
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data)}
-    probes = Probes(root, branch, transcript_path=data.get("transcript_path"))
+    # Repo facts answer about the tree the COMMAND runs in; which rules bind
+    # you is still the session's repo, and stays keyed on it.
+    #
+    # Only a Bash call carries a shell command, and only a shell command can
+    # `cd` or name a `--base`. Another tool's input may hold a field called
+    # `command` meaning something else entirely, and reading that one as shell
+    # would point the diff probes at a tree the call never touches. The gate
+    # and override paths below already restrict themselves to Bash; this reads
+    # the same field, so it is restricted the same way.
+    cmd_text = ((data.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
+    probe_root, probe_branch = root, branch
+    elsewhere = command_root(cwd, cmd_text)
+    if elsewhere and elsewhere != root:
+        probe_root = elsewhere
+        probe_branch = _branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
+    probes = Probes(probe_root, probe_branch, command=cmd_text,
+                    transcript_path=data.get("transcript_path"))
 
     if mode == "session":
         try:        # which source each rule came from — the pilot's merge audit

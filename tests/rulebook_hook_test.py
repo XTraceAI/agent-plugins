@@ -559,6 +559,123 @@ def bash_edit_checks() -> None:
               "[new-table-retention]" in c, c)
 
 
+def diff_base_checks() -> None:
+    """What the diff probes measure: WHICH tree, and against WHICH base.
+
+    Both were guesses once, and both guessed wrong in the same session: the
+    base was `origin/main` in a repo whose PRs target `staging` (so a 260-line
+    PR measured the whole staging-vs-main delta), and the tree was the
+    session's cwd while the command ran in another worktree. Either one alone
+    makes `diff_lines_gt` fire on every PR.
+    """
+    sys.path.insert(0, os.path.dirname(HOOK))
+    import rulebook_hook as H  # noqa: E402
+
+    def git(root, *args):
+        subprocess.run(["git", "-C", root, *args], check=True,
+                       capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        # A repo whose long-lived base is `staging`, far ahead of `main`.
+        repo = os.path.join(td, "svc")
+        os.makedirs(repo)
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "t@t.t")
+        git(repo, "config", "user.name", "t")
+        with open(os.path.join(repo, "seed.txt"), "w") as f:
+            f.write("seed\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "seed")
+        git(repo, "checkout", "-qb", "staging")
+        with open(os.path.join(repo, "big.txt"), "w") as f:
+            f.write("".join(f"line {i}\n" for i in range(900)))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "900 lines of staging")
+        git(repo, "checkout", "-qb", "feature")
+        with open(os.path.join(repo, "small.txt"), "w") as f:
+            f.write("a\nb\nc\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "3 lines")
+        # A named base must be a real REMOTE branch, so the fixture has remotes.
+        for br in ("main", "staging", "feature"):
+            sha = subprocess.run(["git", "-C", repo, "rev-parse", br],
+                                 capture_output=True, text=True).stdout.strip()
+            git(repo, "update-ref", f"refs/remotes/origin/{br}", sha)
+
+        def lines(command):
+            return H.Probes(repo, "feature", command=command).diff_lines()
+
+        check("diff base: without the command's --base, the guess is `main` — "
+              "the branch measures the whole staging-vs-main delta",
+              lines("gh pr create") > 500, str(lines("gh pr create")))
+        n = lines("gh pr create --base staging --title x")
+        check("diff base: `--base staging` measures the branch, not the base branch",
+              n == 3, str(n))
+        check("diff base: `--base=staging` (equals form) reads the same",
+              lines("gh pr create --base=staging") == 3)
+        check("diff base: a quoted base reads the same",
+              lines("gh pr create --base 'staging'") == 3)
+
+        # MEMHUB_RULEBOOK_BASE_BRANCH still wins over the command.
+        os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"] = "main"
+        try:
+            check("diff base: the env override still outranks the command",
+                  lines("gh pr create --base staging") > 500)
+        finally:
+            del os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"]
+
+        # --- a named base is CHECKED, because the gated party writes it ------
+        # Every refusal falls through to the remote default, which OVER-measures:
+        # the safe direction for a size gate.
+        check("named base: your own branch is refused — `merge-base(base, HEAD) == HEAD` "
+              "measures zero, and a PR onto it would be empty",
+              lines("gh pr create --base feature") > 500, str(lines("gh pr create --base feature")))
+        for rev, why in [("HEAD", "rev, not a branch"),
+                         ("staging~1", "rev arithmetic reaches elsewhere in history"),
+                         ("../../etc/passwd", "path traversal"),
+                         ("-oProxyCommand=x", "leading dash")]:
+            check(f"named base: `{rev}` is refused ({why})",
+                  lines(f"gh pr create --base {rev}") > 500)
+        check("named base: a branch that is not on the remote is refused",
+              lines("gh pr create --base no-such-branch") > 500)
+        check("named base: two different bases in one command are refused — "
+              "`--base <mine> || --base staging` would probe one and open the other",
+              lines("gh pr create --base staging || gh pr create --base feature") > 500)
+        check("named base: the same base named twice is still honoured",
+              lines("gh pr create --base staging --base staging") == 3)
+
+        # --- which tree: a leading `cd` redirects the whole command ----------
+        other = os.path.join(td, "other")
+        os.makedirs(other)
+        git(other, "init", "-q", "-b", "main")
+        git(other, "config", "user.email", "t@t.t")
+        git(other, "config", "user.name", "t")
+        with open(os.path.join(other, "a.txt"), "w") as f:
+            f.write("a\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-qm", "seed")
+
+        check("probe root: a leading `cd <repo> &&` resolves to that worktree",
+              H.command_root(td, f"cd {other} && gh pr create") == other)
+        check("probe root: a relative `cd` resolves against the session cwd",
+              H.command_root(td, "cd other && gh pr create") == other)
+        check("probe root: a quoted path resolves",
+              H.command_root(td, f"cd '{other}' ; gh pr create") == other)
+        check("probe root: only a Bash call redirects it — another tool's input may hold a "
+              "field called `command` meaning something else, and reading it as shell would "
+              "point the probes at a tree the call never touches",
+              H.command_root(td, "") == "")
+        check("probe root: no `cd` keeps the session's tree",
+              H.command_root(td, "gh pr create") == "")
+        check("probe root: a `cd` buried mid-pipeline is not honoured — the "
+              "command may never reach it",
+              H.command_root(td, f"ls && cd {other} && gh pr create") == "")
+        check("probe root: a `cd` to somewhere that is not a repo keeps the session's tree",
+              H.command_root(td, f"cd {td} && gh pr create") == "")
+        check("probe root: a `cd` to a missing directory keeps the session's tree",
+              H.command_root(td, "cd /nope/nowhere && gh pr create") == "")
+
+
 def main() -> int:
     portability_check()
     with tempfile.TemporaryDirectory() as td:
@@ -1067,6 +1184,20 @@ def main() -> int:
         j = outj(out)
         check("override: on a backslash-continued line it is honoured AND the token is still stripped",
               "permissionDecision" not in j.get("hookSpecificOutput", {}) and "overridden" in j.get("systemMessage", ""), out)
+        heredoc_pr = ("cd /tmp && RULEBOOK_OVERRIDE='blocked its own fix' gh pr create "
+                      "--base main --title \"t\" --body \"$(cat <<'EOF'\n"
+                      "body\nEOF\n)\" && git push --force origin main")
+        rc, out = run("pre", dict(base, tool_input={"command": heredoc_pr}), genv)
+        j = outj(out)
+        check("override: honoured on a `--body \"$(cat <<EOF\"` line — the quote closes on a LATER "
+              "physical line, and skipping it made the gate unbypassable on the commonest gated command",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "overridden" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "gh pr create --body \"$(cat <<'EOF'\nbody\nEOF\n)\" && git push --force origin main"}), genv)
+        check("override: the same command WITHOUT an override is still denied — rejoining lines "
+              "reads the shell honestly, it does not open a hole",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
         rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
         check("override: the variable name inside an argument is not an override, and matches no gate",
               out.strip() == "", out)
@@ -1081,13 +1212,14 @@ def main() -> int:
             rows = [json.loads(l) for l in f if l.strip()]
         gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
         check("ledger: blocked, overridden and empty-override calls are all mode=gate fires",
-              len(gate_rows) == 19 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
+              len(gate_rows) == 21 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
         reasons = [r.get("override_reason") for r in gate_rows]
         check("ledger: override_reason only on the overridden fires, secrets redacted",
               reasons[:3] == [None, None, "hotfix, approved by lead"] and reasons[3:6] == [None] * 3
               and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6]
               and reasons[7:] == ["cd first", "after semicolon", "on line two", None,
-                                  None, None, None, "the real one", "after heredoc", None, "why", "cont"], str(reasons))
+                                  None, None, None, "the real one", "after heredoc", None, "why", "cont",
+                                  "blocked its own fix", None], str(reasons))
         cont = [r for r in gate_rows if r.get("override_reason") == "cont"][0]
         check("ledger: the continued-line token was stripped before rules matched (excerpt has no assignment)",
               "RULEBOOK_OVERRIDE=" not in cont["excerpt"], cont["excerpt"])
@@ -1121,6 +1253,7 @@ def main() -> int:
 
     given_and_scope_checks()
     bash_edit_checks()
+    diff_base_checks()
 
     print()
     if FAILURES:
