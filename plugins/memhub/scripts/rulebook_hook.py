@@ -1620,10 +1620,23 @@ def repo_info(cwd):
     return "", "", "", ""
 
 
+_HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")
+
+
 def _branch(head_path):
+    """The checked-out branch, whole. `refs/heads/feat/x` is the branch
+    `feat/x`, not `x`: splitting on the last slash truncated every branch
+    named with the usual `feat/` / `fix/` / `chore/` prefix. That was
+    invisible while the value only keyed dedup and rode along on fires, and
+    became load-bearing when `given.repo.branch_rx` started deciding whether
+    a rule fires — `^feat/` could never match."""
     try:
         h = open(head_path, encoding="utf-8").read().strip()
-        return h.rsplit("/", 1)[-1] if h.startswith("ref:") else "detached"
+        m = _HEAD_REF.match(h)
+        if m:
+            return m.group(1)
+        # a symbolic ref outside refs/heads (rare) still is not a detached HEAD
+        return h.split(":", 1)[1].strip() if h.startswith("ref:") else "detached"
     except Exception:
         return ""
 

@@ -88,6 +88,36 @@ def _git(cwd, *args):
     return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env, timeout=30)
 
 
+def branch_name_checks() -> None:
+    """A branch name is whatever follows `refs/heads/`, slashes included.
+    `given.repo.branch_rx` decides whether a rule fires, so truncating
+    `feat/x` to `x` silently broke every rule keyed on a branch prefix."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+    with tempfile.TemporaryDirectory() as td:
+        def head(text):
+            p = os.path.join(td, "HEAD")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            return H._branch(p)
+        check("branch: a slashed name survives whole",
+              head("ref: refs/heads/feat/x\n") == "feat/x", head("ref: refs/heads/feat/x\n"))
+        check("branch: a deep name survives whole",
+              head("ref: refs/heads/user/feat/deep-thing\n") == "user/feat/deep-thing")
+        check("branch: a plain name is unchanged", head("ref: refs/heads/main\n") == "main")
+        check("branch: a detached HEAD reads detached",
+              head("9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c\n") == "detached")
+        check("branch: an unreadable HEAD is empty, never an exception",
+              H._branch(os.path.join(td, "nope")) == "")
+        # the predicate that made this load-bearing
+        p = H.Probes("", "feat/x")
+        check("given.repo.branch_rx ^feat/ matches a slashed branch",
+              H.given_ok({"given": {"repo": {"branch_rx": r"^feat/"}}}, p))
+        check("given.repo.branch_rx ^(main|master)$ does not",
+              not H.given_ok({"given": {"repo": {"branch_rx": r"^(main|master)$"}}}, p))
+
+
 def given_and_scope_checks() -> None:
     """The two exemption keys the pre-0.42 hook parsed and never read, the
     §3.1 path scope it dropped on load, and the `given` block: facts a matched
@@ -1085,6 +1115,7 @@ def main() -> int:
               j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
               and "24 h" not in ctx(out), out)
 
+    branch_name_checks()
     given_and_scope_checks()
     bash_edit_checks()
     diff_base_checks()
