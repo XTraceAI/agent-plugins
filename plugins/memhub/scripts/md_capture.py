@@ -63,6 +63,42 @@ VETO_NAMES = {"CLAUDE.md", "AGENTS.md", "MEMORY.md"}
 FRONTMATTER_OPT_IN = re.compile(r"^memhub:\s*artifact\s*$", re.M)
 
 
+def _windows_temp_roots() -> tuple[str, ...]:
+    candidates = [os.environ.get("TEMP"), os.environ.get("TMP")]
+    try:
+        candidates.append(tempfile.gettempdir())
+    except OSError:
+        pass
+    system_root = os.environ.get("SystemRoot")
+    if system_root:
+        candidates.append(os.path.join(system_root, "Temp"))
+    roots = []
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            normalized = (
+                os.path.abspath(raw).replace("\\", "/").rstrip("/").casefold()
+            )
+        except (OSError, TypeError, ValueError):
+            continue
+        if normalized and normalized not in roots:
+            roots.append(normalized)
+    return tuple(roots)
+
+
+WINDOWS_TEMP_ROOTS = _windows_temp_roots() if os.name == "nt" else ()
+
+
+def _is_windows_temp_path(
+    path_key: str, roots: tuple[str, ...] | None = None
+) -> bool:
+    for root in WINDOWS_TEMP_ROOTS if roots is None else roots:
+        if path_key == root or path_key.startswith(root + "/"):
+            return True
+    return False
+
+
 def state_path(session_id: str) -> Path | None:
     sid = UNSAFE.sub("", session_id or "")
     if not sid:
@@ -149,6 +185,8 @@ def is_candidate(path: Path, size: int | None = None, text: str | None = None) -
     s = str(path).replace("\\", "/")
     if os.name == "nt":
         s = s.casefold()
+        if _is_windows_temp_path(s):
+            return False, "veto Windows temp root"
     if path.suffix.lower() != ".md":
         return False, "not markdown"
     name = path.name.casefold() if os.name == "nt" else path.name
