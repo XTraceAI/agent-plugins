@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from collections import deque
 from collections.abc import Iterable
 
 MAX_URLS = 50
@@ -255,10 +256,17 @@ def _result_strings(
 
 def scan_tool_results(records: Iterable[object]) -> tuple[list[str], int]:
     """Return ``(urls, missing_url_results)`` for direct PR-create results."""
-    found: list[str] = []
     calls: set[str] = set()
-    missing = 0
-    matched_results = 0
+    call_order: deque[str] = deque()
+    matched_results: deque[dict] = deque(maxlen=MAX_RESULTS)
+
+    def discard_call(call_id: str) -> None:
+        calls.discard(call_id)
+        try:
+            call_order.remove(call_id)
+        except ValueError:
+            pass
+
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -272,40 +280,42 @@ def scan_tool_results(records: Iterable[object]) -> tuple[list[str], int]:
             if block.get("type") == "tool_use":
                 call_id = block.get("id")
                 if isinstance(call_id, str):
-                    if (
-                        (call_id in calls or len(calls) < MAX_RESULTS)
-                        and is_pr_creation_command(_tool_command(block))
-                    ):
+                    # The newest call owns a reused id. Pending calls are
+                    # bounded too; if a malformed transcript batches more
+                    # than MAX_RESULTS before any result, retain the newest.
+                    discard_call(call_id)
+                    if is_pr_creation_command(_tool_command(block)):
+                        if len(call_order) >= MAX_RESULTS:
+                            calls.discard(call_order.popleft())
+                        call_order.append(call_id)
                         calls.add(call_id)
-                    else:
-                        # A malformed transcript may reuse an id. Its newest
-                        # call owns the result; never inherit an older match.
-                        calls.discard(call_id)
                 continue
             if (
                 block.get("type") != "tool_result"
                 or block.get("tool_use_id") not in calls
             ):
                 continue
-            calls.discard(block.get("tool_use_id"))
-            matched_results += 1
-            budget = [MAX_RESULT_TEXT_BYTES]
-            nodes = [MAX_RESULT_NODES]
-            result_urls: list[str] = []
-            for text in _result_strings(block.get("content"), budget, nodes):
-                for url in urls_from_output_text(text):
-                    if url not in result_urls:
-                        result_urls.append(url)
-            if block.get("is_error") is True or not result_urls:
-                missing += 1
-            else:
-                for url in result_urls:
-                    if url not in found:
-                        found.append(url)
-                        if len(found) >= MAX_URLS:
-                            return found, missing
-            if matched_results >= MAX_RESULTS:
-                return found, missing
+            discard_call(block.get("tool_use_id"))
+            matched_results.append(block)
+
+    found: list[str] = []
+    missing = 0
+    for block in matched_results:
+        budget = [MAX_RESULT_TEXT_BYTES]
+        nodes = [MAX_RESULT_NODES]
+        result_urls: list[str] = []
+        for text in _result_strings(block.get("content"), budget, nodes):
+            for url in urls_from_output_text(text):
+                if url not in result_urls:
+                    result_urls.append(url)
+        if block.get("is_error") is True or not result_urls:
+            missing += 1
+        else:
+            for url in result_urls:
+                if url not in found:
+                    found.append(url)
+                    if len(found) >= MAX_URLS:
+                        return found, missing
     return found, missing
 
 

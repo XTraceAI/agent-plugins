@@ -206,7 +206,7 @@ def test_large_earlier_result_cannot_starve_a_later_result():
     assert p.urls_from_tool_results(records) == [url]
 
 
-def test_only_first_fifty_qualifying_results_are_examined():
+def test_only_newest_fifty_qualifying_results_are_examined():
     url = "https://github.com/x/r/pull/20"
     content = []
     for index in range(p.MAX_RESULTS):
@@ -223,7 +223,23 @@ def test_only_first_fifty_qualifying_results_are_examined():
         {"type": "tool_result", "tool_use_id": "too-late", "content": url},
     ))
     assert p.scan_tool_results([{"message": {"content": content}}]) == (
-        [], p.MAX_RESULTS
+        [url], p.MAX_RESULTS - 1
+    )
+
+
+def test_only_newest_fifty_pending_calls_are_retained():
+    url = "https://github.com/x/r/pull/23"
+    content = [
+        {"type": "tool_use", "id": f"create-{index}", "name": "Bash",
+         "input": {"command": "gh pr create --fill"}}
+        for index in range(p.MAX_RESULTS + 1)
+    ]
+    content.extend({
+        "type": "tool_result", "tool_use_id": f"create-{index}",
+        "content": url if index == p.MAX_RESULTS else "no URL",
+    } for index in range(p.MAX_RESULTS + 1))
+    assert p.scan_tool_results([{"message": {"content": content}}]) == (
+        [url], p.MAX_RESULTS - 1
     )
 
 
