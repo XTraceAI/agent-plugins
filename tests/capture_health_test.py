@@ -527,6 +527,35 @@ def test_rulebook_health() -> None:
     both = ch._message(HOST, "never", None, ("fetch", time.time() - 300))
     check("a capture problem outranks a rulebook one", "capture is not authenticated" in both, True)
 
+    # The guard, not another wording case. `recall` shipped with no branch of
+    # its own and fell through to a line that named no cause and offered a fix
+    # that could not work — the failure this whole file exists to prevent, and
+    # the one a fourth lane would repeat for free. Every declared lane must say
+    # something of its own; adding one to LANES fails here until it does.
+    generic = ch._message(HOST, None, None, ("__unbranched__", time.time() - 300))
+    for lane in ch.LANES:
+        msg = ch._message(HOST, None, None, (lane, time.time() - 300))
+        check(f"lane {lane!r} has a message at all", bool(msg), True)
+        check(f"lane {lane!r} does not fall through to the generic line",
+              msg != generic, True)
+    check("every declared lane is distinctly worded",
+          len({ch._message(HOST, None, None, (l, time.time() - 300))
+               for l in ch.LANES}), len(ch.LANES))
+
+    # And the retraction side: a lane with no way to be retracted warns until
+    # the staleness window closes, which is the same bug wearing a hat.
+    for lane, evidence in (("fetch", lambda: _rulebook_book(fetched_ago_min=1)),
+                           ("flush", lambda: _rulebook_sent(flushed_ago_min=1)),
+                           ("recall", lambda: _rulebook_book(fetched_ago_min=1))):
+        _clear_rulebook()
+        _rulebook_crumb(lane, ago_min=5)
+        check(f"lane {lane!r} is reported before its evidence",
+              (ch._rulebook_problem() or ("",))[0], lane)
+        evidence()
+        check(f"lane {lane!r} has a retraction path that works",
+              ch._rulebook_problem(), None)
+    _clear_rulebook()
+
 
 
 if __name__ == "__main__":

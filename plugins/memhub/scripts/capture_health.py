@@ -333,6 +333,14 @@ def _succeeded_since(path: Path, when: float) -> bool:
     return False
 
 
+# Every rulebook lane that can leave a breadcrumb. Declared once, and asserted
+# in `capture_health_test.py`: a lane added here without its own branch in
+# `_message` falls through to a generic line that names no cause and offers no
+# true fix, which is how a recall timeout came to tell people their login was
+# broken. The test fails until the new lane says something true.
+LANES = ("fetch", "flush", "recall")
+
+
 def _rulebook_problem() -> tuple[str, float] | None:
     """``(what, when)`` for a rulebook lane that is failing right now.
 
@@ -354,7 +362,7 @@ def _rulebook_problem() -> tuple[str, float] | None:
     if not isinstance(crumb, dict):
         return None
     what, at = crumb.get("what"), crumb.get("at")
-    if what not in ("fetch", "flush", "recall") or not isinstance(at, str):
+    if what not in LANES or not isinstance(at, str):
         return None
     try:                       # the hook writes a local-offset ISO stamp
         when = datetime.fromisoformat(at).timestamp()
