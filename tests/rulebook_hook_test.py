@@ -496,6 +496,10 @@ def diff_base_checks() -> None:
               H.command_root(td, "cd other && gh pr create") == other)
         check("probe root: a quoted path resolves",
               H.command_root(td, f"cd '{other}' ; gh pr create") == other)
+        check("probe root: only a Bash call redirects it — another tool's input may hold a "
+              "field called `command` meaning something else, and reading it as shell would "
+              "point the probes at a tree the call never touches",
+              H.command_root(td, "") == "")
         check("probe root: no `cd` keeps the session's tree",
               H.command_root(td, "gh pr create") == "")
         check("probe root: a `cd` buried mid-pipeline is not honoured — the "

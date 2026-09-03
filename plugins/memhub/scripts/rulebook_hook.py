@@ -2055,7 +2055,14 @@ def main():
            "source_message_id": message_id_of(data)}
     # Repo facts answer about the tree the COMMAND runs in; which rules bind
     # you is still the session's repo, and stays keyed on it.
-    cmd_text = (data.get("tool_input") or {}).get("command") or ""
+    #
+    # Only a Bash call carries a shell command, and only a shell command can
+    # `cd` or name a `--base`. Another tool's input may hold a field called
+    # `command` meaning something else entirely, and reading that one as shell
+    # would point the diff probes at a tree the call never touches. The gate
+    # and override paths below already restrict themselves to Bash; this reads
+    # the same field, so it is restricted the same way.
+    cmd_text = ((data.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
     probe_root, probe_branch = root, branch
     elsewhere = command_root(cwd, cmd_text)
     if elsewhere and elsewhere != root:
