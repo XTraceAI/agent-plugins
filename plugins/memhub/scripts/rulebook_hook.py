@@ -1627,8 +1627,8 @@ def flush_fires(final=False):
 
 def repo_info(cwd):
     """(repo_basename, worktree_root, gitdir_path, branch) via file reads only."""
-    d = cwd
-    while d and d != "/":
+    d = os.path.abspath(cwd or "")
+    while d:
         g = os.path.join(d, ".git")
         if os.path.isdir(g):
             return os.path.basename(d), d, g, _branch(os.path.join(g, "HEAD"))
@@ -1638,7 +1638,10 @@ def repo_info(cwd):
             except Exception:
                 gitdir = ""
             return os.path.basename(d), d, gitdir, _branch(os.path.join(gitdir, "HEAD"))
-        d = os.path.dirname(d)
+        parent = os.path.dirname(d)
+        if parent == d:  # POSIX, drive, and UNC roots are fixed points.
+            break
+        d = parent
     return "", "", "", ""
 
 
