@@ -21,7 +21,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="mine-out")
 ap.add_argument("--baseline-date", help="friction before vs after this date (rule activation day)")
 ap.add_argument("--skills-file", help="memhub list_skills JSON reply, for skill-lane dedup")
-ap.add_argument("--repo", help="only sessions whose cwd basename matches")
+ap.add_argument("--repo", help="only sessions in this repo (resolved, so a worktree counts)")
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
 ap.add_argument("--rule-file", action="append", default=[], help="a create_rule body (matcher / ordering / anchors) to backtest as a candidate (repeatable) — used by create-rule")
 ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST of create_rule bodies (repeatable) — the checks you derived from CLAUDE.md in step 2; each may carry `claude_md: {heading, text}` (its origin sentence), `did`, `what`, `quote_rx`, `source_ref`")
@@ -54,6 +54,16 @@ def sessions():
     for p in glob.glob(os.path.expanduser("~/.cursor/projects/*/agent-transcripts/*/*.jsonl")): yield "cursor", p
 R = {"claude": claude, "codex": codex, "cursor": cursor}
 corpus, errs = [], collections.Counter()
+def _repo_name(cwd):
+    """The repo a transcript's cwd belongs to. `repo_identity` lives beside the
+    hook, which this script already imports as `rh`."""
+    try:
+        from repo_identity import repo_name
+        return repo_name(cwd.rstrip("/"))
+    except Exception:
+        return os.path.basename(cwd.rstrip("/"))
+
+
 for host, path in sessions():
     try: recs, meta = R[host].to_canonical(path)
     except Exception: errs[host] += 1; continue
@@ -76,7 +86,10 @@ for host, path in sessions():
                 if b.get("type") == "tool_result":
                     cc = b.get("content"); results.append(cc if isinstance(cc, str) else " ".join(str(x.get("text", "")) for x in cc if isinstance(x, dict)))
     cwd = meta.get("cwd") or (recs[0].get("cwd") if recs else "") or ""
-    repo = os.path.basename(cwd.rstrip("/")) if cwd else "?"
+    # The REPO, not the directory: a session run in a worktree would otherwise
+    # propose rules scoped to the branch name, which bind nobody (the server
+    # matches `scope_repos` by exact string).
+    repo = _repo_name(cwd) if cwd else "?"
     if args.repo and repo != args.repo: continue
     sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
     corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results})

@@ -247,6 +247,116 @@ def branch_name_checks() -> None:
               not H.given_ok({"given": {"repo": {"branch_rx": r"^(main|master)$"}}}, p))
 
 
+def repo_identity_checks() -> None:
+    """The repo a session is IN, not the directory it sits in.
+
+    A worktree directory is named after the branch. Claude Code Desktop makes
+    one per session under `<root>/.claude/worktrees/<name>`, so keying the
+    book on the basename fetched a separate (empty) book per branch and
+    matched `scope_repos: ["<repo>"]` — an exact string on the server — in
+    none of them."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import repo_identity as RI
+    import rulebook_hook as H
+
+    def worktree(root, wt, commondir="../.."):
+        """A linked worktree of `root` at `wt`, laid out as git lays one out."""
+        gitdir = os.path.join(root, ".git", "worktrees", os.path.basename(wt))
+        os.makedirs(gitdir, exist_ok=True)
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(gitdir, "commondir"), "w", encoding="utf-8") as f:
+            f.write(commondir + "\n")
+        with open(os.path.join(gitdir, "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/fm-fix/thing\n")
+        with open(os.path.join(wt, ".git"), "w", encoding="utf-8") as f:
+            f.write(f"gitdir: {gitdir}\n")
+        return gitdir
+
+    with tempfile.TemporaryDirectory() as td:
+        # A repo whose directory name is NOT its remote name.
+        odd = os.path.join(td, "checked-out-as-something-else")
+        os.makedirs(odd)
+        _git(odd, "init", "-q")
+        _git(odd, "remote", "add", "origin", "https://github.com/Org/canonical.git")
+        RI._CACHE.clear()
+        check("repo: the origin remote names the repo, not the directory",
+              RI.repo_name(odd) == "canonical", RI.repo_name(odd))
+
+        # No remote, no worktree: exactly what every caller did before.
+        plain = os.path.join(td, "plainrepo")
+        os.makedirs(os.path.join(plain, ".git"))
+        RI._CACHE.clear()
+        check("repo: a remote-less checkout still reads its own basename",
+              RI.repo_name(plain, os.path.join(plain, ".git")) == "plainrepo")
+
+        # The bug: a linked worktree, offline (no remote to ask).
+        root = os.path.join(td, "myrepo")
+        os.makedirs(os.path.join(root, ".git"))
+        wt = os.path.join(td, "fm-fix-some-branch")
+        gd = worktree(root, wt)
+        RI._CACHE.clear()
+        check("repo: a linked worktree resolves to the repo it belongs to",
+              RI.repo_name(wt, gd) == "myrepo", RI.repo_name(wt, gd))
+
+        # The Desktop shape: the worktree lives INSIDE the project root.
+        dwt = os.path.join(root, ".claude", "worktrees", "session-abc")
+        dgd = worktree(root, dwt, commondir=os.path.join(root, ".git"))
+        RI._CACHE.clear()
+        check("repo: a Desktop `.claude/worktrees/<session>` resolves to the project",
+              RI.repo_name(dwt, dgd) == "myrepo", RI.repo_name(dwt, dgd))
+
+        # A submodule's commondir is `<super>/.git/modules/<sub>`; its parent
+        # is the meaningless `modules`, so the walk must decline it.
+        sub = os.path.join(td, "sub")
+        subgit = os.path.join(root, ".git", "modules", "sub")
+        os.makedirs(subgit)
+        os.makedirs(sub)
+        with open(os.path.join(subgit, "commondir"), "w", encoding="utf-8") as f:
+            f.write(".\n")
+        check("repo: a submodule never resolves to `modules`",
+              RI._main_worktree_basename(subgit) == "",
+              RI._main_worktree_basename(subgit))
+
+        # `git worktree --relative-paths` writes a relative gitdir pointer.
+        rel = os.path.join(td, "relwt")
+        relgd = worktree(root, rel)
+        with open(os.path.join(rel, ".git"), "w", encoding="utf-8") as f:
+            f.write("gitdir: " + os.path.relpath(relgd, rel) + "\n")
+        RI._CACHE.clear()
+        check("repo: a relative gitdir pointer resolves too",
+              H.repo_info(rel)[0] == "myrepo", H.repo_info(rel)[0])
+
+        # Nothing readable at all: the old behaviour, never an exception.
+        RI._CACHE.clear()
+        check("repo: an unresolvable directory falls back to its basename",
+              RI.repo_name(os.path.join(td, "gone", "leaf")) == "leaf")
+
+        # repo_info keeps every other field PHYSICAL: path scope and the diff
+        # probes measure this checkout, and ordering state must not be shared
+        # with the sibling worktree on another branch.
+        name, wroot, wgitdir, branch = H.repo_info(wt)
+        check("repo_info: root stays the worktree, not the main repo",
+              wroot == wt and wgitdir == gd and branch == "fm-fix/thing",
+              f"{wroot} {wgitdir} {branch}")
+
+    # End to end: a repo-scoped rule reaches a session running in a worktree.
+    with tempfile.TemporaryDirectory() as td:
+        root = os.path.join(td, "scopedrepo")
+        os.makedirs(os.path.join(root, ".git"))
+        wt = os.path.join(td, "fm-feat-branch-dir")
+        worktree(root, wt)
+        seed_book(td, "scopedrepo", [
+            _row("repo-scoped", {"event": "bash", "command_rx": r"\bcurl\b"},
+                 scope_repos=["scopedrepo"]),
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        _, out = run("pre", {"session_id": "s-wt", "cwd": wt, "tool_name": "Bash",
+                             "tool_input": {"command": "curl https://example.com"}}, env)
+        check("repo scope: a worktree session gets the main repo's rules",
+              "repo-scoped text" in ctx(out), out[:200])
+
+
 def given_and_scope_checks() -> None:
     """The two exemption keys the pre-0.42 hook parsed and never read, the
     §3.1 path scope it dropped on load, and the `given` block: facts a matched
@@ -1282,6 +1392,7 @@ def main() -> int:
               and "24 h" not in ctx(out), out)
 
     branch_name_checks()
+    repo_identity_checks()
     given_and_scope_checks()
     bash_edit_checks()
     diff_base_checks()

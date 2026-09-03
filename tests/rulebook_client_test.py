@@ -191,6 +191,23 @@ def _anchor_lane_checks(check, run, ctx):
         rc, out = run("pre", dict(ev, session_id="an4"), env)
         check("anchor: slow judge → fail open within the hook budget", rc == 0 and out.strip() == "" and _t.time() - t0 < 4.5)
         fake.mode = "ok"
+
+        # The blip above is exactly the shape that used to warn at the NEXT
+        # session start: recall has no book of its own, so the crumb stood
+        # until an unrelated lane happened to succeed. It clears itself now.
+        crumb = os.path.join(td, "ledger", ".last_error")
+        check("anchor: the timed-out judge leaves a breadcrumb", os.path.exists(crumb))
+        rc, out = run("pre", dict(ev, session_id="an5"), env)
+        check("anchor: the next successful recall retracts its own breadcrumb",
+              not os.path.exists(crumb))
+        with open(crumb, "w", encoding="utf-8") as f:
+            json.dump({"at": "2026-01-01T00:00:00-07:00", "what": "fetch",
+                       "error": "unrelated"}, f)
+        rc, out = run("pre", dict(ev, session_id="an6"), env)
+        check("anchor: a successful recall does NOT clear another lane's failure",
+              os.path.exists(crumb))
+        os.unlink(crumb)
+
         rows = jl(os.path.join(td, "ledger", "fires.jsonl"))
         check("anchor: the kept rule is logged like any other fire",
               any(r["rule_id"] == "a-bus" and r["hook_phase"] == "pre" for r in rows))
