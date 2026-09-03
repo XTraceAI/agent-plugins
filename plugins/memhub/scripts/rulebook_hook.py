@@ -603,6 +603,9 @@ def user_turns_of(tp):
 
 _ARG = r"(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|]+))"
 _BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
+# A plain branch name, and nothing that reaches elsewhere in history: no rev
+# syntax (`~ ^ : @{…}`), no path traversal, no leading dash.
+_BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
 _CD_PREFIX = re.compile(r"^\s*cd\s+" + _ARG + r"\s*(?:&&|;)")
 
 
@@ -667,11 +670,47 @@ class Probes:
         return self._get("branch", lambda: self._branch)
 
     def _named_base(self):
-        """The base branch the in-flight command names, e.g. `--base staging`.
-        Read off the command rather than guessed, because the command is the
-        only place the answer actually exists."""
-        m = _BASE_ARG.search(self._cmd)
-        return next((g for g in m.groups() if g), "") if m else ""
+        """The base branch the in-flight command names (`--base staging`), when
+        it is a branch this rule may honestly be measured against.
+
+        Read off the command because that is the only place the answer exists —
+        but the command is written by the party the rule gates, so a named base
+        is CHECKED, never taken on trust. Three ways it is refused, each of
+        which falls through to the remote default and so OVER-measures rather
+        than under-measures:
+
+        * **Not a plain remote branch name.** Rev syntax (`HEAD`, `abc123`,
+          `main~40`) is not a base a PR can merge into, and would let the
+          comparison point be moved anywhere in history.
+        * **Nothing to merge into it** — `merge-base(base, HEAD) == HEAD`. This
+          is the bypass that matters: naming your OWN branch, or any descendant
+          of it, makes the diff measure zero and a 5,000-line branch reads as
+          empty. A PR onto such a base would be empty too, so no honest call
+          names one.
+        * **More than one distinct base named.** `… --base <mine> || … --base
+          staging` would probe the first and open the second. If a command
+          cannot say plainly what it merges into, it does not get to choose.
+
+        None of this makes the gate proof against the party running the shell —
+        nothing here could, and `RULEBOOK_OVERRIDE=` is the sanctioned way past
+        it precisely because it is RECORDED. What this closes is the silent
+        version: a bypass that leaves no fire and no reason behind it.
+        """
+        named = {next((g for g in m.groups() if g), "")
+                 for m in _BASE_ARG.finditer(self._cmd)}
+        named.discard("")
+        if len(named) != 1:
+            return ""
+        base = named.pop()
+        if not _BRANCH_NAME.match(base) or base == "HEAD":
+            return ""
+        # A real remote branch, not just any rev that happens to resolve.
+        if self._git("rev-parse", "--verify", "-q",
+                     f"refs/remotes/origin/{base}^{{commit}}") is None:
+            return ""
+        mb = (self._git("merge-base", f"origin/{base}", "HEAD") or "").strip()
+        head = (self._git("rev-parse", "HEAD") or "").strip()
+        return "" if not mb or not head or mb == head else base
 
     def _remote_head(self):
         """`refs/remotes/origin/HEAD` — the remote's own default branch, set by

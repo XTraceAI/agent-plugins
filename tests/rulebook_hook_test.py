@@ -431,6 +431,11 @@ def diff_base_checks() -> None:
             f.write("a\nb\nc\n")
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "3 lines")
+        # A named base must be a real REMOTE branch, so the fixture has remotes.
+        for br in ("main", "staging", "feature"):
+            sha = subprocess.run(["git", "-C", repo, "rev-parse", br],
+                                 capture_output=True, text=True).stdout.strip()
+            git(repo, "update-ref", f"refs/remotes/origin/{br}", sha)
 
         def lines(command):
             return H.Probes(repo, "feature", command=command).diff_lines()
@@ -453,6 +458,26 @@ def diff_base_checks() -> None:
                   lines("gh pr create --base staging") > 500)
         finally:
             del os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"]
+
+        # --- a named base is CHECKED, because the gated party writes it ------
+        # Every refusal falls through to the remote default, which OVER-measures:
+        # the safe direction for a size gate.
+        check("named base: your own branch is refused — `merge-base(base, HEAD) == HEAD` "
+              "measures zero, and a PR onto it would be empty",
+              lines("gh pr create --base feature") > 500, str(lines("gh pr create --base feature")))
+        for rev, why in [("HEAD", "rev, not a branch"),
+                         ("staging~1", "rev arithmetic reaches elsewhere in history"),
+                         ("../../etc/passwd", "path traversal"),
+                         ("-oProxyCommand=x", "leading dash")]:
+            check(f"named base: `{rev}` is refused ({why})",
+                  lines(f"gh pr create --base {rev}") > 500)
+        check("named base: a branch that is not on the remote is refused",
+              lines("gh pr create --base no-such-branch") > 500)
+        check("named base: two different bases in one command are refused — "
+              "`--base <mine> || --base staging` would probe one and open the other",
+              lines("gh pr create --base staging || gh pr create --base feature") > 500)
+        check("named base: the same base named twice is still honoured",
+              lines("gh pr create --base staging --base staging") == 3)
 
         # --- which tree: a leading `cd` redirects the whole command ----------
         other = os.path.join(td, "other")
