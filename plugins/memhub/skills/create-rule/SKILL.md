@@ -97,12 +97,19 @@ at once from sessions, use `/memhub:rules-from-sessions` instead.
 
 ### 2. Duplicate check — by eye now, deterministically in step 5
 
-Call the memhub `list_rules` tool with **no `rulebook_id`** (every status) so
-the reply spans every rulebook the user can see, and read the new rule against
-every title and statement. Same subject → plan to replace the existing rule
+Call the memhub `list_rules` tool with **no `rulebook_id`** and
+**`include_retired=True, limit=200`** so the reply spans every rulebook the
+user can see in every state, and read the new rule against every title and
+statement. Same subject → plan to replace the existing rule
 instead of adding a twin: note its `rule_id` for `supersedes_rule_id` in step 5.
 The server does no title matching — you decide what a rule replaces. Keep the
 `list_rules` reply: step 5 runs the deterministic check over it.
+
+`include_retired=True` matters: a rule someone already dismissed is exactly the
+twin you must not re-file, and the default view hides retired rules. `limit` is
+200 at most — if the reply says `has_more`, ask again with `offset` and
+concatenate `rules` before running the check, or the comparison silently misses
+whatever fell off the first page.
 
 A twin in **another** rulebook is a different problem: `supersedes_rule_id`
 only retires a rule inside one book, so nothing you file can absorb it, and

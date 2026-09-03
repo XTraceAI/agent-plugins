@@ -13,9 +13,10 @@ it can read two statements and say "same rule" better than any key can.
 Two inputs, three checks:
 
   --candidates <file|->   the create_rule bodies you are about to send
-  --existing   <file>     the `list_rules` reply (every status; no engine
-                          blocks) — title collisions across every rulebook
-                          you can see, so pass it WITHOUT a rulebook_id
+  --existing   <file>     the `list_rules` reply (include_retired=True, all
+                          pages concatenated; no engine blocks) — title
+                          collisions across every rulebook you can see, so
+                          pass it WITHOUT a rulebook_id
   --repo <name>           the hook view of the ACTIVE book (engine blocks),
                           fetched from the server, or --book <file> to read a
                           cached / test book instead — matcher + anchor
@@ -152,7 +153,7 @@ def _hit(rule: dict, reasons: list[str], detail=None) -> dict:
 
 def find_conflicts(candidates: list[dict], existing: list[dict], active: list[dict] | None,
                    target_rulebook_id: str | None = None) -> dict:
-    """Pure. `existing` = list_rules rows (any status; titles + statements);
+    """Pure. `existing` = list_rules rows (include_retired=True; titles + statements);
     `active` = hook-view rows (engine blocks) or None when unavailable.
 
     `target_rulebook_id` is the book the candidates will be FILED into. A hit
@@ -294,7 +295,7 @@ def _summary(report: dict) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--candidates", required=True, help="create_rule bodies (JSON list, or - for stdin)")
-    ap.add_argument("--existing", help="the list_rules reply (JSON) — all statuses")
+    ap.add_argument("--existing", help="the list_rules reply (JSON) — include_retired=True, all pages")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("--repo", help="fetch the ACTIVE book (hook view) for this repo from the server")
     src.add_argument("--book", help="read a cached / test hook-view book file instead of fetching")
