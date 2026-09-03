@@ -56,7 +56,8 @@ How a fire reaches people (spec §5.3):
     server was unreachable for a day is the failure a gate exists to prevent.
 
 What leaves the machine, exactly:
-  * fetch  — the repo directory name, nothing else.
+  * fetch  — the repo name (the origin remote's basename, else the directory's),
+             nothing else.
   * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps.
              The matched `excerpt` is written to the LOCAL ledger and is
              stripped before the POST.
@@ -1604,20 +1605,44 @@ def flush_fires(final=False):
 
 
 def repo_info(cwd):
-    """(repo_basename, worktree_root, gitdir_path, branch) via file reads only."""
+    """(repo_name, worktree_root, gitdir_path, branch).
+
+    The name is the REPO's, not the directory's: a worktree directory is named
+    after the branch, so keying the book on it fetched one book per branch and
+    matched `scope_repos: ["xmem"]` in none of them (`repo_identity` carries
+    the resolution order). Every other field stays physical — `root` is what
+    path scope and the diff probes measure, and ordering state must key on
+    THIS checkout, not on the repo it belongs to."""
     d = cwd
     while d and d != "/":
         g = os.path.join(d, ".git")
         if os.path.isdir(g):
-            return os.path.basename(d), d, g, _branch(os.path.join(g, "HEAD"))
+            return _repo_name(d, g), d, g, _branch(os.path.join(g, "HEAD"))
         if os.path.isfile(g):   # worktree: "gitdir: /path/to/main/.git/worktrees/x"
             try:
                 gitdir = open(g, encoding="utf-8").read().split(":", 1)[1].strip()
+                if not os.path.isabs(gitdir):    # `git worktree --relative-paths`
+                    gitdir = os.path.normpath(os.path.join(d, gitdir))
             except Exception:
                 gitdir = ""
-            return os.path.basename(d), d, gitdir, _branch(os.path.join(gitdir, "HEAD"))
+            return (_repo_name(d, gitdir), d, gitdir,
+                    _branch(os.path.join(gitdir, "HEAD")))
         d = os.path.dirname(d)
     return "", "", "", ""
+
+
+def _repo_name(root, gitdir):
+    """`repo_identity.repo_name`, degrading to the old basename if the module
+    is missing. A hook that cannot name the repo must still deliver the rules
+    that bind every repo."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:      # repo_info runs once per hook, not per call
+            sys.path.insert(0, here)
+        from repo_identity import repo_name
+        return repo_name(root, gitdir)
+    except Exception:
+        return os.path.basename(root)
 
 
 _HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")

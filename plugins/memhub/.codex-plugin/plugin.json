@@ -1,7 +1,7 @@
 {
   "name": "memhub",
   "description": "XTrace MemHub team memory in Codex: automatic session capture, situated directive recall, artifact sync, plus skills for setup, login, onboarding, artifact upload, session import, search, handoff, spec-driven development, Rulebook rule authoring (create-rule) and rules proposed from CLAUDE.md + past sessions in one run (rules-from-sessions), and PR babysitting. A rule lives in a RULEBOOK — a container with its own membership, so it reaches exactly the people that book binds; the authoring skills resolve which book it lands in and offer to create one when there is none. Run the memhub:setup skill once to install the compatibility hooks bridge on Codex 0.148-0.149.",
-  "version": "0.45.1",
+  "version": "0.46.0",
   "author": {
     "name": "XTrace",
     "email": "felixmeng@xtrace.ai"
