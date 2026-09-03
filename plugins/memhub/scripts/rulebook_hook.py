@@ -217,6 +217,84 @@ def last_segment(shell):
     return parts[-1] if parts else ""
 
 
+# ── a leading assignment is not part of the command ─────────────────────────
+#
+# `FOO=1 git push` execs `git push` — bash strips the assignment before it
+# looks up the command, and a rule has to read it the same way. Otherwise an
+# ANCHORED rule is silently bypassed: `^git\s+push` never sees a command that
+# begins with an assignment, so the call runs with no deny and no fire, which
+# is the one outcome a gate exists to prevent.
+#
+# `strip_override` already makes exactly this statement about the single
+# RULEBOOK_OVERRIDE token ("rules match the command, not the assignment"). It
+# just cannot make it when `find_override` REFUSED the token — and the refused
+# shape is `RULEBOOK_OVERRIDE=` with an empty reason, which is what the deny
+# message invites the caller to type.
+_ASSIGN_TOKEN_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
+_ASSIGN_NAME_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_leading_assignments(shell):
+    """`shell` with the env assignments that BEGIN a segment removed, byte for
+    byte identical everywhere else.
+
+    Tokenised per line by the same shlex walk `find_override` uses, so an
+    assignment inside a quoted argument (`echo 'A=1 git push'`) is data and
+    stays put, and a line shlex cannot parse is handed back untouched. A run is
+    stripped whole (`FOO=1 BAR=2 git push` -> `git push`), because bash treats
+    all of it as the command's environment."""
+    out = []
+    for line in shell.split("\n"):
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            toks = list(lex)
+        except ValueError:                  # unbalanced quoting: not ours to rewrite
+            out.append(line)
+            continue
+        targets, at_start = [], True
+        for tok in toks:
+            if at_start and _ASSIGN_NAME_RX.match(tok):
+                targets.append(tok)         # stay at_start: assignments come in runs
+                continue
+            at_start = _segment_op(tok)
+        stripped = line
+        for val in targets:
+            for m in _ASSIGN_TOKEN_RX.finditer(stripped):
+                try:
+                    if shlex.split(m.group(0))[0] != val:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+                stripped = stripped[:m.start()] + stripped[m.end():]
+                break
+        out.append(stripped)
+    return "\n".join(out)
+
+
+def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
+    """Does `rx` match this command, given that a leading env assignment is not
+    part of it?
+
+    The command is read as BOTH forms — as written, and with the assignments
+    that begin a segment removed. `rx` fires when EITHER matches, so an anchored
+    rule stops being bypassed by a prefix while a rule written to catch the
+    assignment itself (`AWS_SECRET_ACCESS_KEY=`) still fires on the raw text.
+
+    `not_rx` is a VETO across the same pair, checked first: an exemption its
+    author wrote against either shape exempts the call. Testing it per-form
+    instead would let a prefix delete the very token the exemption keys on, so
+    `FOO=1 cmd` would defeat an exemption that `cmd` honours — stripping would
+    become a way to BREAK an exemption, which is the opposite of the point."""
+    forms = [text]
+    bare = strip_leading_assignments(text)
+    if bare != text:
+        forms.append(bare)
+    if not_rx and any(re.search(not_rx, f, re.I) for f in forms):
+        return False
+    return any(re.search(rx, f, flags) for f in forms)
+
+
 # ── files a Bash call wrote ─────────────────────────────────────────────────
 #
 # An edit rule says `event: edit`, and until now that meant the Edit/Write
@@ -366,9 +444,7 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
             # Legacy `match_heredoc_body` without body_rx matches the whole string.
             shell = shell_only(cmd)
             target = cmd if (rule.get("match_heredoc_body") and not rule.get("body_rx")) else shell
-            if not re.search(rule["rx"], target, re.I | re.M):
-                return False
-            if rule.get("not_rx") and re.search(rule["not_rx"], target, re.I):
+            if not command_fires(rule["rx"], target, rule.get("not_rx")):
                 return False
             if rule.get("body_rx"):
                 kept = set(shell.split("\n"))
@@ -490,7 +566,7 @@ class OrderingEngine:
             re.search(spec["required_command_rx"], last) and \
             "|" not in last and not last.rstrip().endswith("&")   # piped / backgrounded: status isn't the suite's
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
-            re.search(spec["gated_command_rx"], seg)
+            command_fires(spec["gated_command_rx"], seg, flags=0)
         if not (is_edit or is_receipt or is_gate):
             return None
 
