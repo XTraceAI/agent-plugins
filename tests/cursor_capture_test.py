@@ -235,13 +235,20 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         async def call_tool(self, _name, arguments):
             seen.append(arguments)
             assert state["pending_pr_urls"] == [url]
-            received = [url] if len(seen) == 2 else []
-            return types.SimpleNamespace(
-                structuredContent={
+            if len(seen) == 3:
+                structured = {
+                    "conversation_id": "cursor-session-1",
+                    "ack_through": "u1",
+                }
+            else:
+                received = [url] if len(seen) == 2 else []
+                structured = {
                     "conversation_id": "cursor-session-1",
                     "ack_through": "u1",
                     "provenance_received": {"github_pr_urls": received},
-                },
+                }
+            return types.SimpleNamespace(
+                structuredContent=structured,
                 content=[],
                 isError=False,
             )
@@ -281,6 +288,14 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
             source_kind="transcript", source_revision="rev-1",
             records=records, meta={"cwd": None, "title": None},
         ))
+        confirmed_state = dict(state)
+        state.clear()
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=records, meta={"cwd": None, "title": None},
+        ))
+        old_server_state = dict(state)
     finally:
         cursor_flush.redact_records = originals["redact_records"]
         cursor_flush.resolve_bearer = originals["resolve_bearer"]
@@ -289,12 +304,16 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         cursor_flush._save_state = originals["save_state"]
         cursor_flush._log = originals["log"]
 
-    assert len(seen) == 2
+    assert len(seen) == 3
     assert all(item["provenance"] == {"github_pr_urls": [url]}
                for item in seen)
-    assert state["transcript_revision"] == "rev-1"
-    assert state["pending_pr_urls"] == []
-    assert state["accepted_pr_urls"] == [url]
+    assert confirmed_state["transcript_revision"] == "rev-1"
+    assert confirmed_state["pending_pr_urls"] == []
+    assert confirmed_state["accepted_pr_urls"] == [url]
+    assert old_server_state["transcript_revision"] == "rev-1"
+    assert old_server_state["pending_pr_urls"] == []
+    assert old_server_state["fail_streak"] == 0
+    assert not old_server_state["unsupported"]
     print("PASS test_pr_url_is_queued_before_send_and_cleared_on_ack")
 
 

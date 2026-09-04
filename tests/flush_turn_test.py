@@ -360,13 +360,21 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
 
         async def call_tool(self, _name, arguments):
             seen.append(arguments)
-            received = [url] if len(seen) == 2 else []
-            return types.SimpleNamespace(
-                structuredContent={
-                    "conversation_id": "session-pr",
+            conversation_id = arguments["conversation_id"]
+            if conversation_id == "session-pr-old":
+                structured = {
+                    "conversation_id": conversation_id,
+                    "ack_through": "u1",
+                }
+            else:
+                received = [url] if len(seen) == 2 else []
+                structured = {
+                    "conversation_id": conversation_id,
                     "ack_through": "u1",
                     "provenance_received": {"github_pr_urls": received},
-                },
+                }
+            return types.SimpleNamespace(
+                structuredContent=structured,
                 content=[],
                 isError=False,
             )
@@ -422,6 +430,17 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
             check("retry sends URL again", seen[1].get("provenance"), {
                 "github_pr_urls": [url],
             })
+
+            # A content-capable backend from before provenance acknowledgement
+            # must not pin the transcript cursor or consume the failure budget.
+            asyncio.run(ft._flush("session-pr-old", str(transcript)))
+            old_state = ft._read_state("session-pr-old")
+            check("old backend advances content cursor",
+                  old_state.get("offset"), transcript.stat().st_size)
+            check("old backend clears pending URL",
+                  old_state.get("pending_pr_urls"), [])
+            check("old backend does not record a capture failure",
+                  old_state.get("last_error"), None)
         finally:
             ft.STATE_DIR = originals["state_dir"]
             ft._namespace = originals["namespace"]

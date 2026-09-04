@@ -313,13 +313,20 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         async def call_tool(self, _name, arguments):
             seen.append(arguments)
             assert state["pending_pr_urls"] == [url]
-            received = [url] if len(seen) == 2 else []
-            return types.SimpleNamespace(
-                structuredContent={
+            if len(seen) == 3:
+                structured = {
+                    "conversation_id": "codex-session-1",
+                    "ack_through": "u1",
+                }
+            else:
+                received = [url] if len(seen) == 2 else []
+                structured = {
                     "conversation_id": "codex-session-1",
                     "ack_through": "u1",
                     "provenance_received": {"github_pr_urls": received},
-                },
+                }
+            return types.SimpleNamespace(
+                structuredContent=structured,
                 content=[],
                 isError=False,
             )
@@ -353,6 +360,11 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         assert "rollout_size" not in state
         asyncio.run(codex_flush._flush(
             "session-1", Path("/tmp/rollout.jsonl"), 100))
+        confirmed_state = dict(state)
+        state.clear()
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+        old_server_state = dict(state)
     finally:
         codex_flush.codex_reader.to_canonical = originals["to_canonical"]
         codex_flush._read_state = originals["read_state"]
@@ -362,12 +374,16 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         codex_flush.mcp_http.Session = originals["session"]
         codex_flush._log = originals["log"]
 
-    assert len(seen) == 2
+    assert len(seen) == 3
     assert all(item["provenance"] == {"github_pr_urls": [url]}
                for item in seen)
-    assert state["rollout_size"] == 100
-    assert state["pending_pr_urls"] == []
-    assert state["accepted_pr_urls"] == [url]
+    assert confirmed_state["rollout_size"] == 100
+    assert confirmed_state["pending_pr_urls"] == []
+    assert confirmed_state["accepted_pr_urls"] == [url]
+    assert old_server_state["rollout_size"] == 100
+    assert old_server_state["pending_pr_urls"] == []
+    assert old_server_state["fail_streak"] == 0
+    assert not old_server_state["unsupported"]
     print("PASS test_pr_url_is_queued_before_send_and_cleared_on_ack")
 
 

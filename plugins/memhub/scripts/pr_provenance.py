@@ -450,6 +450,18 @@ def accepted_urls(ack: object) -> list[str]:
     return merge_urls(values if isinstance(values, list) else [])
 
 
+def has_provenance_ack(ack: object) -> bool:
+    """Whether this backend understands PR provenance acknowledgement.
+
+    Absence is the rolling-deploy compatibility case: transcript persistence
+    was confirmed through ``ack_through``, but an older backend cannot say
+    whether it stored optional PR telemetry. A present but malformed/empty
+    field is different: that backend knows the contract and did not confirm
+    this URL, so callers should retain it for retry.
+    """
+    return isinstance(ack, dict) and "provenance_received" in ack
+
+
 def acknowledge(
     pending: Iterable[object],
     accepted: Iterable[object],
@@ -462,3 +474,19 @@ def acknowledge(
     accepted_set = set(accepted_now)
     pending_now = [url for url in merge_urls(pending) if url not in accepted_set]
     return pending_now, accepted_now
+
+
+def acknowledge_confirmed_import(
+    pending: Iterable[object],
+    accepted: Iterable[object],
+    ack: object,
+) -> tuple[list[str], list[str]]:
+    """Reconcile optional provenance after the transcript was confirmed.
+
+    An older backend has no ``provenance_received`` field. Its confirmed core
+    write must advance normally instead of retrying optional metadata until
+    capture goes dormant. The URL remains discoverable in later full scans.
+    """
+    if pending and not has_provenance_ack(ack):
+        return [], merge_urls(accepted)
+    return acknowledge(pending, accepted, ack)

@@ -652,11 +652,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # delta must not be able to override, and merging a None over it
     # would let the next ``ai-title`` — which the client keeps
     # emitting with the pre-rename value — take the name back.
-    pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge(
+    reconciled = pr_provenance.acknowledge_confirmed_import(
         pending_pr_urls,
         accepted_pr_urls,
         out,
     )
+    pending_pr_urls, accepted_pr_urls = reconciled
     if pending_pr_urls:
         _save_state(session_id, pending_pr_urls=pending_pr_urls,
                     accepted_pr_urls=accepted_pr_urls)

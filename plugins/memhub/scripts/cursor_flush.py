@@ -1073,11 +1073,13 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     # re-read here: a post-send read would span the whole network round trip.
     # The timestamps land either way — the debounce must still hold after a
     # successful send — but blob_ids only when we could actually verify it.
-    pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge(
+    ack = mcp_http.ack_of(res, f"cursor-{uuid}")
+    reconciled = pr_provenance.acknowledge_confirmed_import(
         pending_pr_urls,
         accepted_pr_urls,
-        mcp_http.ack_of(res, f"cursor-{uuid}"),
+        ack,
     )
+    pending_pr_urls, accepted_pr_urls = reconciled
     if pending_pr_urls:
         # The transcript committed, but its optional URL write did not. Keep
         # the source watermark pinned and retry through the existing bounded

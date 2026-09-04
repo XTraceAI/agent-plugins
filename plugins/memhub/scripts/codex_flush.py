@@ -571,11 +571,13 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _note_failure(sid, "unconfirmed_import")
         return
 
-    pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge(
+    ack = mcp_http.ack_of(res, f"codex-{sid}")
+    reconciled = pr_provenance.acknowledge_confirmed_import(
         pending_pr_urls,
         accepted_pr_urls,
-        mcp_http.ack_of(res, f"codex-{sid}"),
+        ack,
     )
+    pending_pr_urls, accepted_pr_urls = reconciled
     if pending_pr_urls:
         # The transcript committed, but its optional URL write did not. Hold
         # the byte watermark so the next Stop can retry the same deduplicated

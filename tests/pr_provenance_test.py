@@ -306,6 +306,13 @@ def test_queue_survives_until_an_explicit_ack():
         "provenance_received": {"github_pr_urls": [url]},
     }) == ([], [url])
 
+    assert not p.has_provenance_ack({"conversation_id": "c"})
+    assert p.has_provenance_ack({"provenance_received": {}})
+    assert p.has_provenance_ack({"provenance_received": None})
+    assert p.acknowledge_confirmed_import(
+        pending, accepted, {"conversation_id": "c", "ack_through": "u1"},
+    ) == ([], [])
+
 
 def test_new_acknowledgement_replaces_oldest_bounded_cache_entry():
     accepted = [f"https://github.com/x/r/pull/{number}"
