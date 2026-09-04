@@ -67,7 +67,8 @@ def _repo_name(cwd):
 for host, path in sessions():
     try: recs, meta = R[host].to_canonical(path)
     except Exception: errs[host] += 1; continue
-    users, calls, results, ts = [], [], [], None
+    users, calls, results, result_cmds, ts = [], [], [], [], None
+    cmd_by_use = {}
     for r in recs:
         ts = ts or r.get("timestamp")
         m = r.get("message") or {}; c = m.get("content")
@@ -83,8 +84,10 @@ for host, path in sessions():
                     elif n == "apply_patch":
                         n = "Write"; patch = str(i.get("input", "")); mm = re.search(r"\*\*\* (?:Update|Add) File: (.+)", patch); fp = mm.group(1).strip() if mm else ""; body = patch
                     calls.append({"tool": n, "cmd": cmd, "path": fp, "body": body, "n": len(calls)})
+                    if b.get("id"): cmd_by_use[b["id"]] = cmd
                 if b.get("type") == "tool_result":
                     cc = b.get("content"); results.append(cc if isinstance(cc, str) else " ".join(str(x.get("text", "")) for x in cc if isinstance(x, dict)))
+                    result_cmds.append(cmd_by_use.get(b.get("tool_use_id"), ""))   # "" where the host does not link them
     cwd = meta.get("cwd") or (recs[0].get("cwd") if recs else "") or ""
     # The REPO, not the directory: a session run in a worktree would otherwise
     # propose rules scoped to the branch name, which bind nobody (the server
@@ -92,7 +95,7 @@ for host, path in sessions():
     repo = _repo_name(cwd) if cwd else "?"
     if args.repo and repo != args.repo: continue
     sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
-    corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results})
+    corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results, "result_cmds": result_cmds})
 CORRECTION = re.compile(r"^(no|nope|wrong|wait|stop)\b|\b(not what i|why did (u|you)|did (u|you) (just )?|actually (read|test|run|check|do)|i said|i meant|revert that|undo that|is (all )?stale|u should|you should|read the (actual|real)|check the (live|actual|latest|agent|other)|this is (prod|staging)|not (prod|staging)|don'?t (code|merge|push|delete|guess)|plan first)\b", re.I)
 PASTED = re.compile(r"^(Base directory for this skill|Approach this as|<command-message>|<task-notification>|This session is being continued)", re.I)
 ERROR = re.compile(r"Traceback \(most recent call last\)|^Exit code [1-9]|\bexit code [1-9]\b|ModuleNotFoundError|FAILED \(|\d+ failed\b|Permission denied|command not found|<tool_use_error>", re.M)
@@ -378,9 +381,69 @@ def show(row):
     extra = f" · precision={row['real_misses']}/{n}" if row.get("real_misses") is not None else ""
     print(f"     evidence: applies-in {n}/{M} sessions ({fmt_hosts(row['fired'])}){extra}" + (f" · e.g. {row['samples'][0]['text'][:90]}" if row.get("samples") else ""))
 
+def chain_receipt(shell, rx):
+    """Session-armed receipt: the required command ran in ANY unpiped segment of an earlier call. Offline the exit status is
+    unknown either way, so this is the same 'an unpiped run counts' assumption the edit-armed replay makes — just not last-segment-only,
+    because in practice X sits first in a chain (`git fetch -q && git log origin/…`) in ~97 % of sessions."""
+    return any(re.search(rx, seg) and "|" not in seg for seg in re.split(r"&&|\|\||;|\n", shell))
+
+
+def replay_ordering(required_rx, gated_rx, armed_by, min_edits=1):
+    """The obligation state machine over the corpus: how many sessions reached the gated
+    command, and in how many of those the receipt was missing. Shared by the ORDERING
+    candidates and by the rules already on, so a rule the book already carries is measured
+    the same way a proposal is."""
+    T = V = Vany = 0; ex = []; ids = []
+    for s_ in corpus:
+        edits = 0 if armed_by == "edit" else 1; receipt_ok = False; ran_any = False; gated = False; viol = False; violany = False
+        for cl in s_["calls"]:
+            if cl["tool"] in EDIT:
+                if armed_by == "edit": edits += 1; receipt_ok = False; ran_any = False
+                continue
+            cmd = cl["cmd"]
+            if not cmd: continue
+            shell = rh.shell_only(cmd); last = rh.last_segment(shell) if hasattr(rh, "last_segment") else shell
+            if re.search(required_rx, shell): ran_any = True
+            ok = (re.search(required_rx, last) and "|" not in last) if armed_by == "edit" else chain_receipt(shell, required_rx)
+            if ok: receipt_ok = True; edits = 0   # exit status unknown offline: an unpiped run counts as the receipt
+            if re.search(gated_rx, shell) and not (armed_by == "session" and re.search(required_rx, shell)):
+                gated = True
+                if edits >= min_edits and not receipt_ok:
+                    viol = True
+                    if len(ex) < 3: ex.append(sample(s_, cmd))
+                if edits >= min_edits and not ran_any: violany = True
+        if gated: T += 1; V += viol; Vany += violany
+        if viol: ids.append(s_["id"])
+    return {"gated": T, "violations": V, "no_run_at_all": Vany, "samples": ex, "fired_ids": ids}
+
+
+def replay_result(rule):
+    """A `result` rule fires on the POST lane against tool OUTPUT, which `replay` never
+    passes it. Scoring it through `replay` returned 0 on every corpus, so a working
+    error-recovery rule read as a retire candidate."""
+    calls = collections.Counter(); sess = collections.Counter(); ids = []; ex = []
+    for s_ in corpus:
+        fired = False; cmds = s_.get("result_cmds") or []
+        for i, t in enumerate(s_["results"]):
+            try: ok = rh.evaluate(rule, hook_phase="post", tool="Bash", cmd=(cmds[i] if i < len(cmds) else ""), result_text=t)
+            except Exception: ok = False
+            if ok:
+                calls[s_["host"]] += 1
+                if not fired:
+                    fired = True; sess[s_["host"]] += 1; ids.append(s_["id"])
+                    if len(ex) < 3: ex.append(sample(s_, t))
+    return {"calls": dict(calls), "fired": dict(sess), "fired_n": sum(sess.values()), "fired_ids": ids, "real_misses": None, "samples": ex}
+
+
 # ---- rules already on: did they fire in your past sessions?
+# With --repo, THIS repo's cached book alone. The cache also holds books for other
+# repos and for e2e fixtures, and unioning them credits this repo with rules that
+# never reach it — a stale fixture book put "Name variables in camelCase" into a
+# Python repo's panel with 112 calls behind it.
+book_files = ([rh.book_path(args.repo)] if args.repo and hasattr(rh, "book_path")
+              else glob.glob(os.path.expanduser("~/.config/memhub-plugin/rulebook/book/*.json")))
 book = []
-for f in glob.glob(os.path.expanduser("~/.config/memhub-plugin/rulebook/book/*.json")):
+for f in book_files:
     try: book += json.load(open(f)).get("rules", [])
     except Exception: pass
 seen = {}; live = []
@@ -393,9 +456,20 @@ for r in book:   # several cached books (one per repo) can hold different versio
     seen[title] = ver; live = [x for x in live if x.get("title") != title] + [r]
 print(f"\n=== RULES ALREADY ON — {len(live)} hook rules in your book, replayed over your {M} past sessions (one that never fired is a retire candidate)")
 for r in live:
-    hr = rh.to_hook_rule(r); res = replay(hr) if hr and hr.get("on") in ("bash", "edit", "write_stdlib") else {"fired": {}, "calls": {}, "fired_n": 0}
-    flag = "  <- never fired: retire candidate" if not res["fired"] else ""
-    print(f"  {r['title']:28s} fired in {res['fired_n']} sessions ({fmt_hosts(res['fired'])}), {sum(res['calls'].values())} calls{flag}")
+    hr = rh.to_hook_rule(r); on = (hr or {}).get("on")
+    if on in ("bash", "edit", "write_stdlib", "result"):
+        res = replay_result(hr) if on == "result" else replay(hr)
+        flag = "  <- never fired: retire candidate" if not res["fired"] else ""
+        print(f"  {r['title']:28s} fired in {res['fired_n']} sessions ({fmt_hosts(res['fired'])}), {sum(res['calls'].values())} calls{flag}")
+    elif on == "ordering" and isinstance(hr.get("ordering"), dict):
+        o = hr["ordering"]
+        res = replay_ordering(o.get("required_command_rx") or "", o.get("gated_command_rx") or "",
+                              (o.get("armed_by_events") or ["edit"])[0], o.get("min_edits", 1))
+        flag = "  <- never fired: retire candidate" if not res["violations"] else ""
+        print(f"  {r['title']:28s} fired in {res['violations']} sessions, of the {res['gated']} that reached the gated command{flag}")
+    else:
+        # Silence is not evidence: saying nothing beats printing a 0 that reads as a retire signal.
+        print(f"  {r['title']:28s} not replayable offline ({on or 'unknown'} lane) — no signal either way")
 if not live: print("  (none)")
 
 # ---- build every proposal first, then print the summary, then the rows by trigger
@@ -405,33 +479,9 @@ for c in RULE_CANDS:
     if not hr: print(f"  [warn] {c['title']}: matcher rejected by the hook (bad regex or shape) — fix before filing", file=sys.stderr); continue
     res = replay(hr, c.get("requires_prior_rx"))
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": c["matcher"], "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), **res}))
-def chain_receipt(shell, rx):
-    """Session-armed receipt: the required command ran in ANY unpiped segment of an earlier call. Offline the exit status is
-    unknown either way, so this is the same 'an unpiped run counts' assumption the edit-armed replay makes — just not last-segment-only,
-    because in practice X sits first in a chain (`git fetch -q && git log origin/…`) in ~97 % of sessions."""
-    return any(re.search(rx, seg) and "|" not in seg for seg in re.split(r"&&|\|\||;|\n", shell))
 for c in ORDERING_CANDS:
-    T = V = Vany = 0; ex = []; ids = []
-    for s_ in corpus:
-        edits = 0 if c["armed_by"] == "edit" else 1; receipt_ok = False; ran_any = False; gated = False; viol = False; violany = False
-        for cl in s_["calls"]:
-            if cl["tool"] in EDIT:
-                if c["armed_by"] == "edit": edits += 1; receipt_ok = False; ran_any = False
-                continue
-            cmd = cl["cmd"]
-            if not cmd: continue
-            shell = rh.shell_only(cmd); last = rh.last_segment(shell) if hasattr(rh, "last_segment") else shell
-            if re.search(c["required_rx"], shell): ran_any = True
-            ok = (re.search(c["required_rx"], last) and "|" not in last) if c["armed_by"] == "edit" else chain_receipt(shell, c["required_rx"])
-            if ok: receipt_ok = True; edits = 0   # exit status unknown offline: an unpiped run counts as the receipt
-            if re.search(c["gated_rx"], shell) and not (c["armed_by"] == "session" and re.search(c["required_rx"], shell)):
-                gated = True
-                if edits >= c.get("min_edits", 1) and not receipt_ok:
-                    viol = True
-                    if len(ex) < 3: ex.append(sample(s_, cmd))
-                if edits >= c.get("min_edits", 1) and not ran_any: violany = True
-        if gated: T += 1; V += viol; Vany += violany
-        if viol: ids.append(s_["id"])
+    _o = replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))
+    T, V, Vany, ex, ids = _o["gated"], _o["violations"], _o["no_run_at_all"], _o["samples"], _o["fired_ids"]
     pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]], "min_edits": c.get("min_edits", 1), "display_name": c["title"]}}
     breakdown = f"{Vany} never ran it, {V - Vany} ran it piped so its exit code was lost" if V else ""
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"),
