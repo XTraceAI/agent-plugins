@@ -67,8 +67,8 @@ def _repo_name(cwd):
 for host, path in sessions():
     try: recs, meta = R[host].to_canonical(path)
     except Exception: errs[host] += 1; continue
-    users, calls, results, result_cmds, ts = [], [], [], [], None
-    cmd_by_use = {}
+    users, calls, results, result_calls, ts = [], [], [], [], None
+    call_by_use = {}
     for r in recs:
         ts = ts or r.get("timestamp")
         m = r.get("message") or {}; c = m.get("content")
@@ -84,10 +84,10 @@ for host, path in sessions():
                     elif n == "apply_patch":
                         n = "Write"; patch = str(i.get("input", "")); mm = re.search(r"\*\*\* (?:Update|Add) File: (.+)", patch); fp = mm.group(1).strip() if mm else ""; body = patch
                     calls.append({"tool": n, "cmd": cmd, "path": fp, "body": body, "n": len(calls)})
-                    if b.get("id"): cmd_by_use[b["id"]] = cmd
+                    if b.get("id"): call_by_use[b["id"]] = (n, cmd)
                 if b.get("type") == "tool_result":
                     cc = b.get("content"); results.append(cc if isinstance(cc, str) else " ".join(str(x.get("text", "")) for x in cc if isinstance(x, dict)))
-                    result_cmds.append(cmd_by_use.get(b.get("tool_use_id"), ""))   # "" where the host does not link them
+                    result_calls.append(call_by_use.get(b.get("tool_use_id")) or ("", ""))   # empty where the host does not link them
     cwd = meta.get("cwd") or (recs[0].get("cwd") if recs else "") or ""
     # The REPO, not the directory: a session run in a worktree would otherwise
     # propose rules scoped to the branch name, which bind nobody (the server
@@ -95,7 +95,7 @@ for host, path in sessions():
     repo = _repo_name(cwd) if cwd else "?"
     if args.repo and repo != args.repo: continue
     sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
-    corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results, "result_cmds": result_cmds})
+    corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results, "result_calls": result_calls})
 CORRECTION = re.compile(r"^(no|nope|wrong|wait|stop)\b|\b(not what i|why did (u|you)|did (u|you) (just )?|actually (read|test|run|check|do)|i said|i meant|revert that|undo that|is (all )?stale|u should|you should|read the (actual|real)|check the (live|actual|latest|agent|other)|this is (prod|staging)|not (prod|staging)|don'?t (code|merge|push|delete|guess)|plan first)\b", re.I)
 PASTED = re.compile(r"^(Base directory for this skill|Approach this as|<command-message>|<task-notification>|This session is being continued)", re.I)
 ERROR = re.compile(r"Traceback \(most recent call last\)|^Exit code [1-9]|\bexit code [1-9]\b|ModuleNotFoundError|FAILED \(|\d+ failed\b|Permission denied|command not found|<tool_use_error>", re.M)
@@ -423,9 +423,12 @@ def replay_result(rule):
     error-recovery rule read as a retire candidate."""
     calls = collections.Counter(); sess = collections.Counter(); ids = []; ex = []
     for s_ in corpus:
-        fired = False; cmds = s_.get("result_cmds") or []
+        fired = False; calls_ = s_.get("result_calls") or []
         for i, t in enumerate(s_["results"]):
-            try: ok = rh.evaluate(rule, hook_phase="post", tool="Bash", cmd=(cmds[i] if i < len(cmds) else ""), result_text=t)
+            # The result lane reads `cmd`, never `tool` — but pass the real tool
+            # anyway rather than assert every result came from Bash.
+            tool, cmd = calls_[i] if i < len(calls_) else ("", "")
+            try: ok = rh.evaluate(rule, hook_phase="post", tool=tool, cmd=cmd, result_text=t)
             except Exception: ok = False
             if ok:
                 calls[s_["host"]] += 1
