@@ -2,7 +2,7 @@
 to its own location (no env var), and run to completion on an empty HOME (zero
 sessions, no book, no facets) — the state a fresh teammate is in."""
 from __future__ import annotations
-import json, os, subprocess, sys, tempfile
+import hashlib, json, os, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +83,44 @@ def main() -> int:
         ok = "several memhub plugin copies" not in p.stderr and "not found" not in p.stderr
         print(("ok  " if ok else "FAIL"), "plugin scripts resolved relative to the skill (no env var, no cache lookup)"); fails += not ok
         if not ok: print("stderr:", p.stderr[-400:])
+
+    # A populated HOME of its own: the empty-HOME block above asserts the cold
+    # start, and a book or a session left in it would break those assertions.
+    with tempfile.TemporaryDirectory() as home:
+        repo = "demo-repo"
+        proj = Path(home) / ".claude" / "projects" / "demo"; proj.mkdir(parents=True)
+        def _a(blocks): return {"type": "assistant", "cwd": f"/w/{repo}", "message": {"content": blocks}}
+        (proj / "s1.jsonl").write_text("\n".join(json.dumps(r) for r in [
+            _a([{"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": f"/w/{repo}/a.py", "new_string": "x = 1"}}]),
+            _a([{"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "uv run foo.py"}}]),
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": "ModuleNotFoundError: No module named 'foo'"}]}},
+            _a([{"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "git push"}}]),
+        ]))
+        bdir = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; bdir.mkdir(parents=True)
+        def _book(name, rules):
+            h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+            (bdir / f"{name}-{h}.json").write_text(json.dumps({"rules": rules}))
+        _book(repo, [
+            {"title": "ordering-lane", "delivery": "agent_hook", "status": "active", "statement": "run the tests first",
+             "ordering": {"required_command_rx": r"\bpytest\b", "gated_command_rx": r"git\s+push\b",
+                          "armed_by_events": ["edit"], "min_edits": 1, "display_name": "test suite"}},
+            {"title": "result-lane", "delivery": "agent_hook", "status": "active", "statement": "run inside the venv",
+             "matcher": {"event": "output", "content_rx": "^ModuleNotFoundError"}},
+        ])
+        _book("other-repo", [{"title": "not-my-repo", "delivery": "agent_hook", "status": "active",
+                              "statement": "unrelated", "matcher": {"event": "bash", "command_rx": r"git\s+push\b"}}])
+        p = _run("--repo", repo, "--out", str(Path(home) / "out"), home=home)
+        panel = p.stdout.split("=== RULES ALREADY ON")[-1].split("\n=== ")[0]
+        retired = [ln.split()[0] for ln in panel.splitlines() if "retire candidate" in ln]
+
+        ok = "not-my-repo" not in panel
+        print(("ok  " if ok else "FAIL"), "--repo replays that repo's book alone, not every cached book"); fails += not ok
+        ok = "ordering-lane" in panel and "ordering-lane" not in retired
+        print(("ok  " if ok else "FAIL"), "an ordering rule already on is replayed, not called a retire candidate"); fails += not ok
+        ok = "result-lane" in panel and "result-lane" not in retired
+        print(("ok  " if ok else "FAIL"), "a result rule already on is replayed against tool output"); fails += not ok
+        if fails: print("panel was:", panel)
     return 1 if fails else 0
 
 if __name__ == "__main__":
