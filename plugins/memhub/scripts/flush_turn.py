@@ -68,6 +68,7 @@ from transcript_filter import (  # noqa: E402
 # Nothing here needs the SDK any more, so the indirection went with it.
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
+import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
@@ -338,6 +339,21 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if not records:
         return
 
+    pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
+        pr_provenance.queued_urls(state, records)
+    )
+    if missing_pr_urls:
+        _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
+             "canonical GitHub PR URL")
+    if pending_pr_urls or accepted_pr_urls:
+        # Persist URL telemetry before network work. Its transcript cursor stays
+        # pinned until the backend explicitly acknowledges the URL below.
+        _save_state(
+            session_id,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
+
     # Only user / assistant / attachment records carry ``cwd`` — the UI sidecar
     # types (mode, last-prompt, ai-title, …) never do. A delta made up solely of
     # sidecars therefore resolves no cwd, and without the remembered one this
@@ -461,6 +477,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # conversation rather than sticking at whatever the first
         # turn happened to be called.
         arguments["title"] = title
+    provenance = pr_provenance.import_provenance(pending_pr_urls)
+    if provenance:
+        arguments["provenance"] = provenance
     # Transport failures are CLASSIFIED here, not left to the catch-all in
     # main(). Falling through to it recorded every one as reason="error" — a
     # permanent-looking breadcrumb — which is actively wrong for the two cases
@@ -633,9 +652,26 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # delta must not be able to override, and merging a None over it
     # would let the next ``ai-title`` — which the client keeps
     # emitting with the pre-rename value — take the name back.
+    reconciled = pr_provenance.acknowledge_confirmed_import(
+        pending_pr_urls,
+        accepted_pr_urls,
+        out,
+    )
+    pending_pr_urls, accepted_pr_urls = reconciled
+    if pending_pr_urls:
+        _save_state(session_id, pending_pr_urls=pending_pr_urls,
+                    accepted_pr_urls=accepted_pr_urls)
+        _mark_failure(
+            session_id,
+            "unconfirmed_provenance",
+            "backend did not acknowledge the captured PR URL",
+        )
+        return
     _mark_success(session_id, offset=consumed,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,
+                  pending_pr_urls=pending_pr_urls,
+                  accepted_pr_urls=accepted_pr_urls,
                   **({"custom_title": custom} if custom else {}))
     # Sent count, not read count — and the byte span stays the READ
     # span, because that is what the cursor just advanced past. The

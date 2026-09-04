@@ -33,6 +33,14 @@ def test_no_growth_never_flushes():
     print("PASS test_no_growth_never_flushes")
 
 
+def test_pending_pr_url_retries_on_stop_without_growth():
+    state = {**SHIPPED, "pending_pr_urls": [
+        "https://github.com/x/r/pull/22",
+    ]}
+    assert codex_flush.should_flush("Stop", {}, state, GROWN)
+    print("PASS test_pending_pr_url_retries_on_stop_without_growth")
+
+
 def test_stop_ships_growth():
     assert codex_flush.should_flush("Stop", {}, STALE, GROWN)
     assert codex_flush.should_flush("Stop", {}, {}, GROWN)   # first flush
@@ -282,6 +290,101 @@ def test_real_platform_is_unconditional():
 
     assert [args["source_platform"] for args in seen] == ["codex", "codex"]
     print("PASS test_real_platform_is_unconditional")
+
+
+def test_pr_url_is_queued_before_send_and_cleared_on_ack():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    state: dict = {}
+    seen: list[dict] = []
+    originals = {
+        "to_canonical": codex_flush.codex_reader.to_canonical,
+        "read_state": codex_flush._read_state,
+        "save_state": codex_flush._save_state,
+        "redact_records": codex_flush.redact_records,
+        "resolve_bearer": codex_flush.resolve_bearer,
+        "session": codex_flush.mcp_http.Session,
+        "log": codex_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            assert state["pending_pr_urls"] == [url]
+            if len(seen) == 3:
+                structured = {
+                    "conversation_id": "codex-session-1",
+                    "ack_through": "u1",
+                }
+            else:
+                received = [url] if len(seen) == 2 else []
+                structured = {
+                    "conversation_id": "codex-session-1",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": received},
+                }
+            return types.SimpleNamespace(
+                structuredContent=structured,
+                content=[],
+                isError=False,
+            )
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    try:
+        codex_flush.codex_reader.to_canonical = lambda _path: ([
+            {"type": "assistant", "uuid": "u0", "message": {
+                "role": "assistant", "content": [{
+                    "type": "tool_use", "id": "create", "name": "exec",
+                    "input": {"cmd": "gh pr create --fill"},
+                }]}},
+            {"type": "user", "uuid": "u1", "message": {
+                "role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "create",
+                    "content": url,
+                }]}},
+        ], {"cwd": None, "title": None})
+        codex_flush._read_state = lambda _sid: dict(state)
+        codex_flush._save_state = save_state
+        codex_flush.redact_records = lambda records: records
+        codex_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        codex_flush.mcp_http.Session = Session
+        codex_flush._log = lambda _message: None
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+        assert state["pending_pr_urls"] == [url]
+        assert "rollout_size" not in state
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+        confirmed_state = dict(state)
+        state.clear()
+        asyncio.run(codex_flush._flush(
+            "session-1", Path("/tmp/rollout.jsonl"), 100))
+        old_server_state = dict(state)
+    finally:
+        codex_flush.codex_reader.to_canonical = originals["to_canonical"]
+        codex_flush._read_state = originals["read_state"]
+        codex_flush._save_state = originals["save_state"]
+        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.resolve_bearer = originals["resolve_bearer"]
+        codex_flush.mcp_http.Session = originals["session"]
+        codex_flush._log = originals["log"]
+
+    assert len(seen) == 3
+    assert all(item["provenance"] == {"github_pr_urls": [url]}
+               for item in seen)
+    assert confirmed_state["rollout_size"] == 100
+    assert confirmed_state["pending_pr_urls"] == []
+    assert confirmed_state["accepted_pr_urls"] == [url]
+    assert old_server_state["rollout_size"] == 100
+    assert old_server_state["pending_pr_urls"] == []
+    assert old_server_state["fail_streak"] == 0
+    assert not old_server_state["unsupported"]
+    print("PASS test_pr_url_is_queued_before_send_and_cleared_on_ack")
 
 
 if __name__ == "__main__":

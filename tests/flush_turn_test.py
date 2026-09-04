@@ -8,12 +8,14 @@ captured correctly — so they are asserted here instead.
 Run: python3 flush_turn_test.py   (stdlib only; the mcp import in flush_turn
 is lazy, inside _flush.)
 """
+import asyncio
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 # The tests live outside the plugin so they are not shipped to users;
@@ -335,6 +337,118 @@ def test_a_title_never_carries_a_credential():
     check("ordinary titles are untouched",
           ft._titles([{"type": "custom-title", "customTitle": "fix the auth bug"}], {})[0],
           "fix the auth bug")
+
+
+def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
+    """Exact URL evidence is durable before auth and cleared only on ack."""
+    print("PR URL evidence retry")
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    originals = {
+        "state_dir": ft.STATE_DIR,
+        "namespace": ft._namespace,
+        "resolve_bearer": ft.resolve_bearer,
+        "resolve_repo_brain": ft.resolve_repo_brain,
+        "env_for_url": ft.env_for_url,
+        "session": ft.mcp_http.Session,
+        "log": ft._log,
+    }
+    seen = []
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            conversation_id = arguments["conversation_id"]
+            if conversation_id == "session-pr-old":
+                structured = {
+                    "conversation_id": conversation_id,
+                    "ack_through": "u1",
+                }
+            else:
+                received = [url] if len(seen) == 2 else []
+                structured = {
+                    "conversation_id": conversation_id,
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": received},
+                }
+            return types.SimpleNamespace(
+                structuredContent=structured,
+                content=[],
+                isError=False,
+            )
+
+    async def no_room(_session, _cwd, _env):
+        return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        transcript = Path(tmp) / "session.jsonl"
+        _write(transcript, [
+            {"type": "assistant", "uuid": "u0", "cwd": "/repo",
+             "message": {"role": "assistant", "content": [{
+                 "type": "tool_use", "id": "create", "name": "Bash",
+                 "input": {"command": "gh pr create --fill"},
+             }]}},
+            {"type": "user", "uuid": "u1", "cwd": "/repo",
+             "message": {"role": "user", "content": [{
+                 "type": "tool_result", "tool_use_id": "create",
+                 "content": url,
+             }]}},
+        ])
+        ft.STATE_DIR = Path(tmp) / "state"
+        ft._namespace = lambda _records: ("/repo", "agent-plugins")
+        ft.resolve_repo_brain = no_room
+        ft.env_for_url = lambda _url: "staging"
+        ft._log = lambda _message: None
+        try:
+            ft.resolve_bearer = lambda: ("https://example.test/mcp", None)
+            try:
+                asyncio.run(ft._flush("session-pr", str(transcript)))
+            except ft._NoCredential:
+                pass
+            state = ft._read_state("session-pr")
+            check("auth failure keeps URL pending",
+                  state.get("pending_pr_urls"), [url])
+            check("auth failure keeps cursor pinned", state.get("offset"), None)
+
+            ft.resolve_bearer = lambda: ("https://example.test/mcp", "token")
+            ft.mcp_http.Session = Session
+            asyncio.run(ft._flush("session-pr", str(transcript)))
+            state = ft._read_state("session-pr")
+            check("missing URL ack keeps pending URL",
+                  state.get("pending_pr_urls"), [url])
+            check("missing URL ack keeps cursor pinned", state.get("offset"), None)
+            asyncio.run(ft._flush("session-pr", str(transcript)))
+            state = ft._read_state("session-pr")
+            check("ack clears pending URL", state.get("pending_pr_urls"), [])
+            check("ack remembers accepted URL",
+                  state.get("accepted_pr_urls"), [url])
+            check("request sends URL only", seen[0].get("provenance"), {
+                "github_pr_urls": [url],
+            })
+            check("retry sends URL again", seen[1].get("provenance"), {
+                "github_pr_urls": [url],
+            })
+
+            # A content-capable backend from before provenance acknowledgement
+            # must not pin the transcript cursor or consume the failure budget.
+            asyncio.run(ft._flush("session-pr-old", str(transcript)))
+            old_state = ft._read_state("session-pr-old")
+            check("old backend advances content cursor",
+                  old_state.get("offset"), transcript.stat().st_size)
+            check("old backend clears pending URL",
+                  old_state.get("pending_pr_urls"), [])
+            check("old backend does not record a capture failure",
+                  old_state.get("last_error"), None)
+        finally:
+            ft.STATE_DIR = originals["state_dir"]
+            ft._namespace = originals["namespace"]
+            ft.resolve_bearer = originals["resolve_bearer"]
+            ft.resolve_repo_brain = originals["resolve_repo_brain"]
+            ft.env_for_url = originals["env_for_url"]
+            ft.mcp_http.Session = originals["session"]
+            ft._log = originals["log"]
 
 
 def test_timeout_override_never_breaks_the_hook():
