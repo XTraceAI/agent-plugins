@@ -699,12 +699,12 @@ def should_flush(event: str, payload: dict, state: dict,
                  source_kind: str = "store",
                  source_revision: str | None = None,
                  usage_pending: bool = False,
-                 provenance_new: bool = False) -> bool:
+                 provenance_pending: bool = False) -> bool:
     """Pure gate — WHEN a hook invocation becomes a server call.
 
-    New content is normally required. A newly observed post-shell PR URL is
-    the one exception: current Cursor transcripts omit tool results, so that
-    evidence must be allowed to ride a deduplicated transcript resend.
+    New content is normally required. Pending post-shell PR telemetry is the
+    exception: current Cursor transcripts omit tool results, so it must be
+    allowed to ride a deduplicated transcript resend until acknowledged.
     """
     # Dormancy gates EVERY event including the turn boundaries: a
     # persistently-down server is re-probed once per DORMANT_RETRY_S, never
@@ -719,7 +719,7 @@ def should_flush(event: str, payload: dict, state: dict,
     # bypasses the global dormancy gate above or the event-specific debounce
     # below. Failed delivery is therefore bounded by MAX_UNCONFIRMED and then
     # by DORMANT_RETRY_S instead of becoming a per-hook upload loop.
-    if not usage_pending and not provenance_new:
+    if not usage_pending and not provenance_pending:
         if source_kind == "transcript":
             if not source_revision or source_revision == state.get(
                     "transcript_revision"):
@@ -740,7 +740,7 @@ def should_flush(event: str, payload: dict, state: dict,
         # even behind a long wrapper prefix, is never truncated away.
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
     if event == "afterShellExecution":
-        return provenance_new
+        return provenance_pending
     if event == "afterFileEdit":
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
     if event in ("afterAgentResponse", "stop", "beforeSubmitPrompt",
@@ -1078,6 +1078,14 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         accepted_pr_urls,
         mcp_http.ack_of(res, f"cursor-{uuid}"),
     )
+    if pending_pr_urls:
+        # The transcript committed, but its optional URL write did not. Keep
+        # the source watermark pinned and retry through the existing bounded
+        # hook failure/dormancy path.
+        _save_state(uuid, pending_pr_urls=pending_pr_urls,
+                    accepted_pr_urls=accepted_pr_urls)
+        _note_failure(uuid, "unconfirmed_provenance")
+        return
     fields = {"last_flush_at": time.time(), "last_ok_at": time.time(),
               "last_error": None,
               # The re-probe worked: this server confirms after all, so the
@@ -1166,10 +1174,6 @@ def main() -> int:
                 prior_pending, event_pr_urls)
             if url not in accepted_pr_set
         ]
-        provenance_new = any(
-            url not in accepted_pr_set and url not in prior_pending
-            for url in event_pr_urls
-        )
         if pending_pr_urls != prior_pending:
             # Cursor's transcript omits shell results. Persist the hook-only
             # evidence before source reads and network work so any later event
@@ -1270,13 +1274,13 @@ def main() -> int:
         # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
         # the decision comes FIRST and a quiet event saves only the small
         # fields, leaving the pin map untouched on disk. A duplicate
-        # afterShellExecution can also reach this point: it re-reads the source
-        # to distinguish new evidence under the session lock, then declines.
+        # afterShellExecution can also reach this point: pending URL telemetry
+        # retries through the same bounded send path until acknowledged.
         if not should_flush(
                 event, payload, state, blob_ids, time.time(),
                 source_kind=source_kind, source_revision=source_revision,
                 usage_pending=usage_pending,
-                provenance_new=provenance_new):
+                provenance_pending=bool(pending_pr_urls)):
             _save_state(uuid, **fields)
             return 0
 

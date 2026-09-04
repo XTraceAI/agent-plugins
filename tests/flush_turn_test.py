@@ -360,11 +360,12 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
 
         async def call_tool(self, _name, arguments):
             seen.append(arguments)
+            received = [url] if len(seen) == 2 else []
             return types.SimpleNamespace(
                 structuredContent={
                     "conversation_id": "session-pr",
                     "ack_through": "u1",
-                    "provenance_received": {"github_pr_urls": [url]},
+                    "provenance_received": {"github_pr_urls": received},
                 },
                 content=[],
                 isError=False,
@@ -384,7 +385,7 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
             {"type": "user", "uuid": "u1", "cwd": "/repo",
              "message": {"role": "user", "content": [{
                  "type": "tool_result", "tool_use_id": "create",
-                 "content": f"Created {url}",
+                 "content": url,
              }]}},
         ])
         ft.STATE_DIR = Path(tmp) / "state"
@@ -407,10 +408,18 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
             ft.mcp_http.Session = Session
             asyncio.run(ft._flush("session-pr", str(transcript)))
             state = ft._read_state("session-pr")
+            check("missing URL ack keeps pending URL",
+                  state.get("pending_pr_urls"), [url])
+            check("missing URL ack keeps cursor pinned", state.get("offset"), None)
+            asyncio.run(ft._flush("session-pr", str(transcript)))
+            state = ft._read_state("session-pr")
             check("ack clears pending URL", state.get("pending_pr_urls"), [])
             check("ack remembers accepted URL",
                   state.get("accepted_pr_urls"), [url])
             check("request sends URL only", seen[0].get("provenance"), {
+                "github_pr_urls": [url],
+            })
+            check("retry sends URL again", seen[1].get("provenance"), {
                 "github_pr_urls": [url],
             })
         finally:

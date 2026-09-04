@@ -320,8 +320,8 @@ def test_main_flow_pins_persist_and_ship():
 
             # Current Cursor JSONL omits tool results, so the exact PR URL
             # arrives only on afterShellExecution. A new URL is durable before
-            # the send and forces one resend even though content is unchanged;
-            # duplicate hook delivery is inert until genuine content grows.
+            # the send and forces a resend even though content is unchanged;
+            # without an acknowledgement, duplicate delivery retries it.
             pr_url = "https://github.com/xtraceai/agent-plugins/pull/456"
             shell_payload = {
                 "hook_event_name": "afterShellExecution",
@@ -330,7 +330,7 @@ def test_main_flow_pins_persist_and_ship():
                 "transcript_path": str(path),
                 "workspace_roots": [str(path.parent)],
                 "command": "gh pr create --fill",
-                "output": f"Created {pr_url}",
+                "output": pr_url,
             }
             assert _run_main("afterShellExecution", shell_payload) == 0
             assert len(calls) == 5
@@ -338,7 +338,7 @@ def test_main_flow_pins_persist_and_ship():
             state = cursor_flush._read_state(SESSION)
             assert state["pending_pr_urls"] == [pr_url]
             assert _run_main("afterShellExecution", shell_payload) == 0
-            assert len(calls) == 5
+            assert len(calls) == 6
 
             # apply_session_state restores the same fidelity onto a fresh
             # out-of-band re-read (the capture.py / sweep backstop).

@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "memhub",
   "description": "XTrace MemHub team memory: search_memory / save_artifact / import_conversation MCP tools plus skills for setup, login, onboarding, artifact upload, session import, team-memory recall, session handoff, spec-driven development, Rulebook rule authoring (create-rule) and rules proposed from CLAUDE.md + past sessions in one run (rules-from-sessions), and PR babysitting. A rule lives in a RULEBOOK — a container with its own membership, so it reaches exactly the people that book binds; the authoring skills resolve which book it lands in and offer to create one when there is none. Session auto-capture ships through the host-native plugin layer (hooks are outside the Agent Plugins spec).",
-  "version": "0.46.1",
+  "version": "0.46.4",
   "author": {
     "name": "XTrace",
     "email": "felixmeng@xtrace.ai"

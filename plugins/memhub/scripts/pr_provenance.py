@@ -3,7 +3,9 @@
 
 This is high-confidence, partial-recall telemetry. It deliberately ignores
 prompts, assistant prose, branch names, cwd, filesystem paths, and Git remotes.
-The backend owns repository authorization and all eventual link policy.
+The backend scopes writes to the authenticated session and counts distinct
+canonical URLs; these caller-observed URLs are not authorization or authorship
+proof.
 """
 from __future__ import annotations
 
@@ -41,6 +43,9 @@ _CODEX_EXEC_PREFIX_RE = re.compile(
     r"const[ \t]+(?P<variable>[A-Za-z_$][A-Za-z0-9_$]*)[ \t]*="
     r"[ \t]*await[ \t]+tools\.exec_command\([ \t]*"
     r"(?P<object>\{)[ \t\r\n]*cmd[ \t]*:[ \t]*"
+)
+_CODEX_RESULT_HEADER_RE = re.compile(
+    r"\AScript completed\r?\nWall time [^\r\n]+\r?\nOutput:\r?\n?\Z"
 )
 
 
@@ -254,6 +259,62 @@ def _result_strings(
                     return
 
 
+def _exact_url_text(value: object) -> list[str]:
+    """Return one URL only when the complete trimmed value is that URL."""
+    if not isinstance(value, str):
+        return []
+    candidate = value.strip()
+    urls = urls_from_output_text(candidate)
+    if (
+        len(urls) == 1
+        and candidate.casefold().rstrip("/") == urls[0]
+    ):
+        return urls
+    return []
+
+
+def _exact_result_urls(value: object) -> list[str]:
+    """Accept one exact result URL, including Codex's encoded output blocks."""
+    root = value
+    if (
+        isinstance(value, str)
+        and len(value) <= MAX_RESULT_TEXT_BYTES
+        and value.lstrip().startswith(("[", "{"))
+    ):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            root = parsed
+    texts = [text.strip() for text in _result_strings(
+        root,
+        [MAX_RESULT_TEXT_BYTES],
+        [MAX_RESULT_NODES],
+    ) if text.strip()]
+    if texts and _CODEX_RESULT_HEADER_RE.fullmatch(texts[0] + "\n"):
+        texts.pop(0)
+    if len(texts) != 1:
+        return []
+    return _exact_url_text(texts[0])
+
+
+def _execution_status(payload: dict) -> str:
+    """Return ``success``, ``failure``, or ``unknown`` from host fields."""
+    failure = payload.get("is_error") is True or payload.get("success") is False
+    success = payload.get("is_error") is False or payload.get("success") is True
+    for key in ("exit_code", "exitCode"):
+        code = payload.get(key)
+        if type(code) is int:
+            if code == 0:
+                success = True
+            else:
+                failure = True
+    if failure:
+        return "failure"
+    return "success" if success else "unknown"
+
+
 def scan_tool_results(records: Iterable[object]) -> tuple[list[str], int]:
     """Return ``(urls, missing_url_results)`` for direct PR-create results."""
     calls: set[str] = set()
@@ -308,7 +369,10 @@ def scan_tool_results(records: Iterable[object]) -> tuple[list[str], int]:
             for url in urls_from_output_text(text):
                 if url not in result_urls:
                     result_urls.append(url)
-        if block.get("is_error") is True or not result_urls:
+        status = _execution_status(block)
+        if status == "unknown":
+            result_urls = _exact_result_urls(block.get("content"))
+        if status == "failure" or len(result_urls) != 1:
             missing += 1
         else:
             for url in result_urls:
@@ -330,13 +394,11 @@ def scan_shell_event(event: str, payload: object) -> tuple[list[str], int]:
         return [], 0
     if not is_pr_creation_command(payload.get("command")):
         return [], 0
-    failed = payload.get("is_error") is True or payload.get("success") is False
-    for key in ("exit_code", "exitCode"):
-        code = payload.get(key)
-        if type(code) is int and code != 0:
-            failed = True
+    status = _execution_status(payload)
     urls = urls_from_output_text(payload.get("output"))
-    if failed or not urls:
+    if status == "unknown":
+        urls = _exact_url_text(payload.get("output"))
+    if status == "failure" or len(urls) != 1:
         return [], 1
     return urls, 0
 

@@ -515,6 +515,17 @@ def main():
               H.scope_ok(scoped, "app", "/w/app/.git") and not H.scope_ok(scoped, "apple", "/w/apple/.git")
               and H.scope_ok(scoped, "wt", "/w/app/.git/worktrees/wt")
               and not H.scope_ok(scoped, "other", "/home/app/projects/other/.git"))
+        cased = H.to_hook_rule({"rule_id": "cs", "statement": "s",
+                                "scope_repos": ["MemHub-Backend"],
+                                "matcher": {"event": "bash", "command_rx": "x"}})
+        check("scope_ok: a repo name matches however either side spelled it",
+              H.scope_ok(cased, "MemHub-Backend", "/w/MemHub-Backend/.git")
+              and H.scope_ok(cased, "memhub-backend", "/w/memhub-backend/.git")
+              and H.scope_ok(cased, "MEMHUB-BACKEND", "/w/MEMHUB-BACKEND/.git")
+              # …and through a worktree, where the name comes from the main checkout
+              and H.scope_ok(cased, "wt", "/w/memhub-backend/.git/worktrees/wt"))
+        check("scope_ok: folding case does not start matching by substring",
+              not H.scope_ok(cased, "memhub-backend-fork", "/w/memhub-backend-fork/.git"))
         # per-batch watermark: batch 1 accepted, batch 2 fails → batch 1 is not re-sent
         H.FLUSH_BATCH = 2
         with open(ledger, "a", encoding="utf-8") as f:

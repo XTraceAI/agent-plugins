@@ -346,9 +346,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
              "canonical GitHub PR URL")
     if pending_pr_urls or accepted_pr_urls:
-        # Keep evidence independent of the transcript cursor. If the transcript
-        # import commits while the optional evidence write does not, a later
-        # normal flush can retry the URL without re-reading the old delta.
+        # Persist URL telemetry before network work. Its transcript cursor stays
+        # pinned until the backend explicitly acknowledges the URL below.
         _save_state(
             session_id,
             pending_pr_urls=pending_pr_urls,
@@ -658,6 +657,15 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         accepted_pr_urls,
         out,
     )
+    if pending_pr_urls:
+        _save_state(session_id, pending_pr_urls=pending_pr_urls,
+                    accepted_pr_urls=accepted_pr_urls)
+        _mark_failure(
+            session_id,
+            "unconfirmed_provenance",
+            "backend did not acknowledge the captured PR URL",
+        )
+        return
     _mark_success(session_id, offset=consumed,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,

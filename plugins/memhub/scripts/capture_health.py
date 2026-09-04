@@ -92,6 +92,8 @@ _REASONS = {
     "forbidden": ("the credential is valid but not permitted to write here "
                   "(check its scopes and org access)"),
     "unrecognized_response": "the server sent a reply the plugin could not read",
+    "unconfirmed_provenance": ("the session reached memory, but its captured "
+                               "pull-request URL was not acknowledged"),
     "timeout": "the server stopped responding",
     # Ran out of its own clock, not a fault of the server or the credential.
     # Named separately because the alternative was reporting whatever error the
@@ -471,6 +473,8 @@ def _message(host: str, token_problem: str | None,
             # partially captured and finishing it is a different command.
             tail = ("Nothing is broken — later flushes continue it; run "
                     "/memhub:import-session to finish that session now.")
+        elif reason == "unconfirmed_provenance":
+            tail = "A later capture hook will retry the URL automatically."
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

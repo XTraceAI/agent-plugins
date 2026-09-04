@@ -235,11 +235,12 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         async def call_tool(self, _name, arguments):
             seen.append(arguments)
             assert state["pending_pr_urls"] == [url]
+            received = [url] if len(seen) == 2 else []
             return types.SimpleNamespace(
                 structuredContent={
                     "conversation_id": "cursor-session-1",
                     "ack_through": "u1",
-                    "provenance_received": {"github_pr_urls": [url]},
+                    "provenance_received": {"github_pr_urls": received},
                 },
                 content=[],
                 isError=False,
@@ -257,7 +258,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         {"type": "user", "uuid": "u1", "message": {
             "role": "user", "content": [{
                 "type": "tool_result", "tool_use_id": "create",
-                "content": f"Created {url}",
+                "content": url,
             }]}},
     ]
     try:
@@ -273,6 +274,13 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
             source_kind="transcript", source_revision="rev-1",
             records=records, meta={"cwd": None, "title": None},
         ))
+        assert state["pending_pr_urls"] == [url]
+        assert "transcript_revision" not in state
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=records, meta={"cwd": None, "title": None},
+        ))
     finally:
         cursor_flush.redact_records = originals["redact_records"]
         cursor_flush.resolve_bearer = originals["resolve_bearer"]
@@ -281,7 +289,10 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         cursor_flush._save_state = originals["save_state"]
         cursor_flush._log = originals["log"]
 
-    assert seen[0]["provenance"] == {"github_pr_urls": [url]}
+    assert len(seen) == 2
+    assert all(item["provenance"] == {"github_pr_urls": [url]}
+               for item in seen)
+    assert state["transcript_revision"] == "rev-1"
     assert state["pending_pr_urls"] == []
     assert state["accepted_pr_urls"] == [url]
     print("PASS test_pr_url_is_queued_before_send_and_cleared_on_ack")
@@ -296,7 +307,7 @@ def test_no_new_blobs_never_flushes():
     print("PASS test_no_new_blobs_never_flushes")
 
 
-def test_new_after_shell_evidence_forces_one_unchanged_transcript_send():
+def test_pending_after_shell_evidence_forces_unchanged_transcript_send():
     payload = {
         "command": "gh pr create --fill",
         "output": "https://github.com/x/r/pull/22",
@@ -304,16 +315,16 @@ def test_new_after_shell_evidence_forces_one_unchanged_transcript_send():
     assert cursor_flush._event_can_flush("afterShellExecution", payload)
     assert should_flush(
         "afterShellExecution", payload, SHIPPED, FRESH, NOW,
-        provenance_new=True,
+        provenance_pending=True,
     )
     assert not should_flush(
         "afterShellExecution", payload, SHIPPED, FRESH, NOW,
-        provenance_new=False,
+        provenance_pending=False,
     )
     assert not cursor_flush._event_can_flush("afterShellExecution", {
         **payload, "output": "command failed",
     })
-    print("PASS test_new_after_shell_evidence_forces_one_unchanged_transcript_send")
+    print("PASS test_pending_after_shell_evidence_forces_unchanged_transcript_send")
 
 
 def test_milestone_gates_shell_events():

@@ -217,6 +217,84 @@ def last_segment(shell):
     return parts[-1] if parts else ""
 
 
+# ── a leading assignment is not part of the command ─────────────────────────
+#
+# `FOO=1 git push` execs `git push` — bash strips the assignment before it
+# looks up the command, and a rule has to read it the same way. Otherwise an
+# ANCHORED rule is silently bypassed: `^git\s+push` never sees a command that
+# begins with an assignment, so the call runs with no deny and no fire, which
+# is the one outcome a gate exists to prevent.
+#
+# `strip_override` already makes exactly this statement about the single
+# RULEBOOK_OVERRIDE token ("rules match the command, not the assignment"). It
+# just cannot make it when `find_override` REFUSED the token — and the refused
+# shape is `RULEBOOK_OVERRIDE=` with an empty reason, which is what the deny
+# message invites the caller to type.
+_ASSIGN_TOKEN_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
+_ASSIGN_NAME_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_leading_assignments(shell):
+    """`shell` with the env assignments that BEGIN a segment removed, byte for
+    byte identical everywhere else.
+
+    Tokenised per line by the same shlex walk `find_override` uses, so an
+    assignment inside a quoted argument (`echo 'A=1 git push'`) is data and
+    stays put, and a line shlex cannot parse is handed back untouched. A run is
+    stripped whole (`FOO=1 BAR=2 git push` -> `git push`), because bash treats
+    all of it as the command's environment."""
+    out = []
+    for line in shell.split("\n"):
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            toks = list(lex)
+        except ValueError:                  # unbalanced quoting: not ours to rewrite
+            out.append(line)
+            continue
+        targets, at_start = [], True
+        for tok in toks:
+            if at_start and _ASSIGN_NAME_RX.match(tok):
+                targets.append(tok)         # stay at_start: assignments come in runs
+                continue
+            at_start = _segment_op(tok)
+        stripped = line
+        for val in targets:
+            for m in _ASSIGN_TOKEN_RX.finditer(stripped):
+                try:
+                    if shlex.split(m.group(0))[0] != val:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+                stripped = stripped[:m.start()] + stripped[m.end():]
+                break
+        out.append(stripped)
+    return "\n".join(out)
+
+
+def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
+    """Does `rx` match this command, given that a leading env assignment is not
+    part of it?
+
+    The command is read as BOTH forms — as written, and with the assignments
+    that begin a segment removed. `rx` fires when EITHER matches, so an anchored
+    rule stops being bypassed by a prefix while a rule written to catch the
+    assignment itself (`AWS_SECRET_ACCESS_KEY=`) still fires on the raw text.
+
+    `not_rx` is a VETO across the same pair, checked first: an exemption its
+    author wrote against either shape exempts the call. Testing it per-form
+    instead would let a prefix delete the very token the exemption keys on, so
+    `FOO=1 cmd` would defeat an exemption that `cmd` honours — stripping would
+    become a way to BREAK an exemption, which is the opposite of the point."""
+    forms = [text]
+    bare = strip_leading_assignments(text)
+    if bare != text:
+        forms.append(bare)
+    if not_rx and any(re.search(not_rx, f, re.I) for f in forms):
+        return False
+    return any(re.search(rx, f, flags) for f in forms)
+
+
 # ── files a Bash call wrote ─────────────────────────────────────────────────
 #
 # An edit rule says `event: edit`, and until now that meant the Edit/Write
@@ -366,9 +444,7 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
             # Legacy `match_heredoc_body` without body_rx matches the whole string.
             shell = shell_only(cmd)
             target = cmd if (rule.get("match_heredoc_body") and not rule.get("body_rx")) else shell
-            if not re.search(rule["rx"], target, re.I | re.M):
-                return False
-            if rule.get("not_rx") and re.search(rule["not_rx"], target, re.I):
+            if not command_fires(rule["rx"], target, rule.get("not_rx")):
                 return False
             if rule.get("body_rx"):
                 kept = set(shell.split("\n"))
@@ -490,7 +566,7 @@ class OrderingEngine:
             re.search(spec["required_command_rx"], last) and \
             "|" not in last and not last.rstrip().endswith("&")   # piped / backgrounded: status isn't the suite's
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
-            re.search(spec["gated_command_rx"], seg)
+            command_fires(spec["gated_command_rx"], seg, flags=0)
         if not (is_edit or is_receipt or is_gate):
             return None
 
@@ -1222,7 +1298,15 @@ def scope_ok(rule, repo, gitdir):
     if rule.get("_scope_repos"):        # server list: this checkout's name or its main
         parts = gitdir.split("/") if gitdir else []   # checkout's (…/<main>/.git/worktrees/x)
         main = parts[parts.index(".git") - 1] if ".git" in parts and parts.index(".git") > 0 else ""
-        return any(s == repo or (main and s == main) for s in rule["_scope_repos"])
+        # Folded, and folded on the SERVER too (crud._rule_in_repo): the name
+        # in the rule was typed by a person, the name here was resolved from a
+        # remote URL on someone's machine. Matching them exactly makes
+        # "memhub-backend" and "MemHub-Backend" different repositories, and the
+        # rule then just never fires, with nothing anywhere saying why. Folding
+        # on one side only would be worse than neither: the server would ship a
+        # rule this would then discard.
+        here = {repo.casefold(), main.casefold()} - {""}
+        return any(s.casefold() in here for s in rule["_scope_repos"])
     if scope == "any":
         return True
     return scope in repo or (gitdir and f"/{scope}/" in gitdir)
@@ -1711,6 +1795,88 @@ def _repo_name(root, gitdir):
         return os.path.basename(root)
 
 
+_SEED_MAX_HOPS = 64   # a Write names a new dir a few levels deep, never thousands
+
+
+def _under(path, base):
+    """True when `path` is `base` or sits beneath it. `join(base, "")` is the
+    only spelling of the prefix that is right at a POSIX root ("/"), a Windows
+    drive root ("C:\\") and an ordinary directory alike, and it keeps a sibling
+    that merely shares a name prefix (/a/bc vs /a/b) out."""
+    return path == base or path.startswith(os.path.join(base, ""))
+
+
+def _acted_on_dir(cwd, inp):
+    """The directory of the file this call acts on, in the SESSION's own path
+    space, or "" when the payload names none this session may reach.
+
+    Payload data must not steer where the hook looks, so the session cwd is
+    the trust boundary. Containment is checked TWICE, and both must hold:
+
+    * lexically, on the unresolved path — because that is the path
+      `repo_info` actually walks up from. A symlink OUTSIDE cwd whose target
+      is inside it passes a resolved-only check while its lexical parents
+      still lead somewhere else entirely, which would hand `root` (and so
+      `git -C root`, which honors a repo's local config) to a checkout the
+      session never opened;
+    * and again once symlinks are resolved — so a link UNDER cwd cannot
+      smuggle the lookup out of it.
+
+    Requiring both also pins the value to ONE path space per session: an
+    absolute path spelled differently from cwd (/var vs /private/var, an
+    automounted home) fails the lexical test and falls back to the cwd
+    answer. That matters because `root` keys OrderingEngine state
+    (`{rid}@{root}:{branch}`), and one worktree reached two ways would split
+    into two keys and silently re-arm its ordering rules."""
+    if not (isinstance(inp, dict) and cwd):
+        return ""
+    base = os.path.normpath(cwd)
+    for key in ("file_path", "notebook_path"):      # each judged on its own:
+        fp = inp.get(key)                           # a junk file_path must not
+        if not (isinstance(fp, str) and fp):        # hide a good notebook_path
+            continue
+        try:
+            d = os.path.dirname(fp.replace("\\", "/"))
+            if not os.path.isabs(d):    # relative to the SESSION's cwd, never ours
+                d = os.path.join(cwd, d)
+            d = os.path.normpath(d)
+            if not _under(d, base):
+                continue
+            probe, hops = d, 0          # a Write may name a directory not created yet
+            while not os.path.exists(probe) and os.path.dirname(probe) != probe \
+                    and hops < _SEED_MAX_HOPS:
+                probe, hops = os.path.dirname(probe), hops + 1
+            if _under(os.path.realpath(probe), os.path.realpath(cwd)):
+                return d
+        except (OSError, ValueError):   # payload strings are untrusted (NUL -> ValueError)
+            continue
+    return ""
+
+
+def repo_of_call(data):
+    """(repo, root, gitdir, branch) for the checkout this CALL works in: the
+    acted-on file's first, the session cwd's second, else all empty.
+
+    The acted-on path outranks cwd because of the worktree-parent workflow —
+    an agent running from a directory that CONTAINS many checkouts and editing
+    files inside them. cwd resolves nothing there, and gating the rulebook on
+    it alone left every rule silently inert for the whole session while the
+    edited file sat in a real worktree the entire time. Worktrees themselves
+    were never the problem: `repo_info` reads the `.git` FILE and `scope_ok`
+    maps the gitdir back to the main checkout, so a rule scoped to the repo
+    matches from any of its worktrees once the walk starts in the right place.
+
+    A Bash call carries no path and keeps the cwd answer, so a non-git cwd
+    with nothing acted on stays silent exactly as before."""
+    cwd = data.get("cwd") or os.getcwd()
+    seed = _acted_on_dir(cwd, data.get("tool_input") or {})
+    if seed:
+        info = repo_info(seed)
+        if info[0]:
+            return info
+    return repo_info(cwd)
+
+
 _HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")
 
 
@@ -2149,10 +2315,13 @@ def main():
         data = json.loads(sys.stdin.read() or "{}")
     except Exception:
         return 0
-    cwd = data.get("cwd") or os.getcwd()
     session = data.get("session_id", "")
-    repo, root, gitdir, branch = repo_info(cwd)
-    if not repo:            # not in a git repo → no rules apply
+    # `repo_of_call` derives this too, but the probe root below still needs
+    # the SESSION's directory: a `cd` or `-C` in the command is resolved
+    # against where the terminal is, not against the edited file's checkout.
+    cwd = data.get("cwd") or os.getcwd()
+    repo, root, gitdir, branch = repo_of_call(data)
+    if not repo:            # nothing this call touches is in a git repo → no rules apply
         return 0
     if mode == "fetch":
         fetch_book(repo)

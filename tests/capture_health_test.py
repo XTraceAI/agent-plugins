@@ -335,6 +335,14 @@ def test_messages() -> None:
     check("budget exhaustion names the finishing command",
           bool(msg and "import-session" in msg), True)
 
+    msg = ch._message(HOST, None, ("unconfirmed_provenance", time.time()))
+    check("unconfirmed PR URL distinguishes saved content",
+          bool(msg and "session reached memory" in msg), True)
+    check("unconfirmed PR URL explains automatic retry",
+          bool(msg and "retry the URL automatically" in msg), True)
+    check("unconfirmed PR URL does not suggest login",
+          bool(msg and "/memhub:login" not in msg), True)
+
 
 def test_debounce() -> None:
     print("\ndebounce")
@@ -596,5 +604,4 @@ if __name__ == "__main__":
     _rulebook_book(fetched_ago_min=5)
     check("recall rides the fetch path: a later confirmed book retracts it", ch._rulebook_problem(), None)
     _clear_rulebook()
-
 

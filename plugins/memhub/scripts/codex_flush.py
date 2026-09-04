@@ -326,8 +326,8 @@ def _command_text(payload: dict) -> str:
 
 
 def should_flush(event: str, payload: dict, state: dict, size: int) -> bool:
-    """Pure gate. Growth is a precondition for every event; Stop is the turn
-    boundary and always ships growth; PostToolUse ships only milestones."""
+    """Pure gate. Growth or pending PR telemetry is required; Stop is the turn
+    boundary and PostToolUse ships only milestones."""
     watermark = state.get("rollout_size") or 0
     if size < watermark:
         # SHRINK: the rollout was truncated, rotated, or a smaller file now
@@ -346,7 +346,7 @@ def should_flush(event: str, payload: dict, state: dict, size: int) -> bool:
     if (state.get("unsupported") and
             time.time() - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
         return False
-    if size <= watermark:
+    if size <= watermark and not state.get("pending_pr_urls"):
         return False
     if event == "Stop":
         return True
@@ -576,6 +576,14 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         accepted_pr_urls,
         mcp_http.ack_of(res, f"codex-{sid}"),
     )
+    if pending_pr_urls:
+        # The transcript committed, but its optional URL write did not. Hold
+        # the byte watermark so the next Stop can retry the same deduplicated
+        # transcript with the still-pending URL.
+        _save_state(sid, pending_pr_urls=pending_pr_urls,
+                    accepted_pr_urls=accepted_pr_urls)
+        _note_failure(sid, "unconfirmed_provenance")
+        return
     _save_state(sid, rollout_size=size, last_ok_at=time.time(),
                 last_error=None, last_error_at=0,
                 # The re-probe worked: this server confirms after all.

@@ -2,6 +2,7 @@
 """Trust-boundary tests for exact pull-request URL evidence."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -54,6 +55,22 @@ def test_error_results_are_not_evidence():
     ]}}]
     assert p.urls_from_tool_results(records) == []
     assert p.scan_tool_results(records) == ([], 1)
+
+    statusless_failure = [{"message": {"content": [
+        {"type": "tool_use", "id": "create", "name": "Bash", "input": {
+            "command": "gh pr create --fill"}},
+        {"type": "tool_result", "tool_use_id": "create",
+         "content": f"a pull request already exists:\n{url}"},
+    ]}}]
+    assert p.scan_tool_results(statusless_failure) == ([], 1)
+
+    explicit_success = [{"message": {"content": [
+        {"type": "tool_use", "id": "create", "name": "Bash", "input": {
+            "command": "gh pr create --fill"}},
+        {"type": "tool_result", "tool_use_id": "create",
+         "content": f"Created {url}", "is_error": False},
+    ]}}]
+    assert p.urls_from_tool_results(explicit_success) == [url]
 
 
 def test_missing_output_is_diagnostic_and_redirection_is_rejected():
@@ -117,6 +134,24 @@ def test_current_codex_exec_envelope_is_narrowly_supported():
     assert all(p.urls_from_tool_results(records(source)) == [url]
                for source in accepted)
 
+    codex_success = [
+        {"type": "input_text",
+         "text": "Script completed\nWall time 0.9 seconds\nOutput:\n"},
+        {"type": "input_text", "text": url + "\n"},
+    ]
+    encoded = records(accepted[0])
+    encoded[0]["message"]["content"][1]["content"] = json.dumps(codex_success)
+    assert p.urls_from_tool_results(encoded) == [url]
+
+    codex_failure = records(accepted[0])
+    codex_failure[0]["message"]["content"][1]["content"] = json.dumps([
+        {"type": "input_text",
+         "text": "Script completed\nWall time 0.9 seconds\nOutput:\n"},
+        {"type": "input_text", "text":
+         f"a pull request already exists:\n{url}\n"},
+    ])
+    assert p.scan_tool_results(codex_failure) == ([], 1)
+
     rejected = (
         "const r = await tools.exec_command({cmd:'gh pr create --fill'}); "
         "text(r.output);",
@@ -157,7 +192,7 @@ def test_only_known_shell_tools_and_the_newest_reused_id_can_match():
 
 def test_cursor_after_shell_event_requires_direct_command_and_successful_url():
     url = "https://github.com/x/r/pull/22"
-    payload = {"command": "gh pr create --fill", "output": f"Created {url}"}
+    payload = {"command": "gh pr create --fill", "output": url + "\n"}
     assert p.scan_shell_event("afterShellExecution", payload) == ([url], 0)
     assert p.scan_shell_event("beforeShellExecution", payload) == ([], 0)
     assert p.scan_shell_event("afterShellExecution", {
@@ -165,6 +200,14 @@ def test_cursor_after_shell_event_requires_direct_command_and_successful_url():
     }) == ([], 0)
     assert p.scan_shell_event("afterShellExecution", {
         **payload, "exit_code": 1,
+    }) == ([], 1)
+    assert p.scan_shell_event("afterShellExecution", {
+        "command": "gh pr create --fill", "output": f"Created {url}",
+        "success": True,
+    }) == ([url], 0)
+    assert p.scan_shell_event("afterShellExecution", {
+        "command": "gh pr create --fill",
+        "output": f"a pull request already exists:\n{url}",
     }) == ([], 1)
     assert p.scan_shell_event("afterShellExecution", {
         "command": "gh pr create --fill", "output": "failed",
