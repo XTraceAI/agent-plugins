@@ -1391,6 +1391,162 @@ def main() -> int:
               j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
               and "24 h" not in ctx(out), out)
 
+    # --- an EDIT gate blocks the write, and the override rides in the content --
+    # The hook matches an edit rule against `tool_input` in PreToolUse, so the
+    # write has not happened and can still be refused. A tool call carries no
+    # shell prefix, so the override is a marker in the content itself.
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "editgate")
+        os.makedirs(os.path.join(repo, "src"))
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "editgate", [
+            {"id": "no-hex", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"#[0-9a-fA-F]{6}\b",
+             "mode": "gate", "fire_scope": "session", "repo_scope": "any",
+             "text": "Never hardcode a colour", "why": "w", "version": 1},
+            {"id": "no-todo", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"TODO",
+             "fire_scope": "session", "repo_scope": "any", "text": "No TODOs", "why": "w",
+             "version": 1},
+            {"id": "no-inline-style", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"style=\{\{",
+             "mode": "gate", "fire_scope": "session", "repo_scope": "any",
+             "text": "No inline styles", "why": "w", "version": 1},
+        ])
+        genv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        tsx = os.path.join(repo, "src", "Swatch.tsx")
+        base = {"cwd": repo, "session_id": "e1", "tool_name": "Write"}
+
+        def outj(out):
+            return json.loads(out) if out.strip() else {}
+
+        rc, out = run("pre", dict(base, tool_input={
+            "file_path": tsx, "content": 'const brand = "#1a1a1a";\n'}), genv)
+        j = outj(out)
+        hso = j.get("hookSpecificOutput", {})
+        check("edit gate: the Write is DENIED before it lands",
+              rc == 0 and hso.get("permissionDecision") == "deny", out)
+        check("edit gate: the deny reason carries the statement and the MARKER instruction, "
+              "not the shell prefix",
+              "Never hardcode a colour" in hso.get("permissionDecisionReason", "")
+              and "rulebook-override[no-hex]:" in hso.get("permissionDecisionReason", "")
+              and "RULEBOOK_OVERRIDE=" not in hso.get("permissionDecisionReason", ""), out)
+        check("edit gate: the user is told the write was blocked",
+              j.get("systemMessage", "").startswith("XTrace") and "blocked" in j["systemMessage"]
+              and "[no-hex]" in j["systemMessage"], out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "file_path": tsx, "content": 'const brand = "#1a1a1a";\n'}), genv)
+        check("edit gate: the same write is gated again — an edit gate is never deduped",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: vendor SVG, palette is fixed upstream\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: the marked write is ALLOWED",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+        check("edit override: the user line records the reason",
+              "overridden" in j.get("systemMessage", "")
+              and "vendor SVG" in j["systemMessage"], out)
+
+        # An UNNAMED marker excuses nothing, even with one gate on the call.
+        # It would mean a different rule the day a second edit gate covers the
+        # line, and it is the form copied content satisfies by accident.
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override: vendor SVG, palette is fixed upstream\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: an UNNAMED marker does not excuse even a LONE gate",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        check("edit override: the deny says an unnamed marker excuses nothing, and why",
+              "excuses nothing" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rulebook-override[no-hex]:"
+              in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+
+        for empty in ("// rulebook-override[no-hex]:\n", "// rulebook-override[no-hex]:    \n"):
+            rc, out = run("pre", dict(base, tool_input={
+                "file_path": tsx, "content": empty + 'const brand = "#1a1a1a";\n'}), genv)
+            check("edit override: an EMPTY reason is not an override — still denied",
+                  outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab rotated\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: the reason is redacted before it is recorded or shown",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "ghp_ABCDEFGHIJ" not in json.dumps(j), out)
+
+        # Two gates on one write: a marker naming one must not excuse the other.
+        two = 'const s = {"#1a1a1a"}; <div style={{color: s}} />\n'
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override: vendor SVG\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: an UNNAMED marker does not excuse a call with two gates on it — "
+              "a marker that LANDS in the file must not silence rules it never named",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        check("edit override: the deny names each still-blocking rule and how to excuse it",
+              "rulebook-override[no-hex]:" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rulebook-override[no-inline-style]:"
+              in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: brand hex is fixed upstream\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: naming ONE rule leaves the other gate standing",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+              and "[no-inline-style]" in j.get("systemMessage", "")
+              and "overridden" in j.get("systemMessage", ""), out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: brand hex is fixed upstream\n"
+            "// rulebook-override[no-inline-style]: measured, one-off\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: naming BOTH lets the write through",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "/* rulebook-override[no-hex]: the palette lives in {tokens} */\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: a comment CLOSER is stripped but a reason that honestly ends "
+              "in one of those characters keeps it",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "lives in {tokens}" in j.get("systemMessage", ""), out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "file_path": tsx, "content": "// TODO: later\n"}), genv)
+        j = outj(out)
+        check("edit advisory: an advise-mode edit rule still only advises",
+              "[no-todo]" in ctx(out)
+              and "permissionDecision" not in j["hookSpecificOutput"], out)
+
+        # The post-hoc lane: a file written BY a shell command is discovered
+        # after the command ran, so the same gate rule can only advise there.
+        with open(os.path.join(repo, "src", "Panel.tsx"), "w", encoding="utf-8") as f:
+            f.write('const bg = "#2b2b2b";\n')
+        rc, out = run("post", {"cwd": repo, "session_id": "e2", "tool_name": "Bash",
+                               "tool_input": {"command": "printf '%s' x > src/Panel.tsx"},
+                               "tool_response": {"stdout": "", "exit_code": 0}}, genv)
+        j = outj(out)
+        check("edit gate: a file written by a SHELL command is post-hoc — it advises, never denies",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+
+        with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        hexr = [r for r in rows if r["rule_id"] == "no-hex"]
+        check("ledger: every blocked and overridden write is a mode=gate fire",
+              len(hexr) >= 6 and all(r["mode"] == "gate" for r in hexr), str(len(hexr)))
+        check("ledger: override_reason is set only on the overridden writes",
+              [r.get("override_reason") for r in hexr][:5]
+              == [None, None, "vendor SVG, palette is fixed upstream", None, None],
+              str([r.get("override_reason") for r in hexr]))
+        styler = [r for r in rows if r["rule_id"] == "no-inline-style"]
+        check("ledger: a row records the reason for ITS rule — one call excused one gate "
+              "and was blocked by the other",
+              [r.get("override_reason") for r in styler]
+              == [None, None, "measured, one-off"], str([r.get("override_reason") for r in styler]))
+
     # --- an anchored rule is not bypassed by a leading env assignment -------
     #
     # `FOO=1 git push` execs `git push`: bash strips the assignment before it

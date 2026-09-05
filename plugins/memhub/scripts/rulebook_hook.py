@@ -41,13 +41,20 @@ How a fire reaches people (spec §5.3):
     header — and the USER gets a `systemMessage` line per rule (`XTrace ▸ …`),
     the one hook field the terminal renders. Without it a fire is invisible to
     the person the rule was written for.
-  * `mode: gate` rules BLOCK: a pre-hook Bash call matching a gate rule is
-    denied (`permissionDecision: deny`) with the statement and the override
-    line. `RULEBOOK_OVERRIDE='<why>' <command>` allows exactly that call and
-    records the fire with `override_reason`; the next matching call is gated
-    again. Gates are never deduped and never cut by the advisory cap. Only a
-    Bash rule can gate (an edit already happened; a result rule runs after the
-    fact).
+  * `mode: gate` rules BLOCK: a pre-hook call matching a gate rule is denied
+    (`permissionDecision: deny`) with the statement and the override its lane
+    accepts. A Bash call takes `RULEBOOK_OVERRIDE='<why>' <command>`, which
+    allows exactly that call; an edit takes a `rulebook-override[<rule>]: <why>`
+    marker in the content, which allows that write and stays in the diff. The
+    edit marker must name its rule BECAUSE it stays: an unnamed one would mean
+    a different thing the day a second edit gate covers that line, and it is
+    the form that content copied from elsewhere satisfies by accident. Either way the fire
+    records its own `override_reason`, and the next matching call is gated
+    again. Gates are never deduped and never cut by the advisory cap. Both
+    lanes gate because the hook sees them BEFORE they run — an edit rule
+    matches `tool_input`, the content the tool is about to write. A result
+    rule runs after the fact and cannot gate, and neither can the synthetic
+    lane that finds files a shell command already wrote.
   * A gate is honoured from whatever book is cached, however old. There is no
     timer that turns a gate off: a rule retired on the server disappears at
     the next successful fetch, and a running session refreshes its own book
@@ -2064,6 +2071,51 @@ def find_override(cmd):
     return None
 
 
+# `rulebook-override: <why>` — the edit lane's override. A tool call has no
+# prefix to carry a reason the way a shell command does, so it travels in the
+# only channel an edit already has: the content. Written as a comment in
+# whatever the file's language uses, anywhere in the new text.
+#
+# Unlike the shell prefix this one is NOT stripped before rules match. The
+# marker is part of the file the author is writing — a reviewer reads it in the
+# diff, and the next edit of that line is already answered. That is the trade:
+# a command override is one-shot, an edit override is a durable annotation.
+# An EMPTY reason is not an override, exactly as for the shell prefix, and the
+# reason is redacted before it is recorded or shown.
+_EDIT_OVERRIDE_RX = re.compile(
+    r"rulebook-override(?:\[([^\]\r\n]*)\])?\s*:[ \t]*(\S[^\r\n]*)", re.I)
+# One comment CLOSER, if the marker ends the line inside a block comment. A
+# blind `rstrip("*/->}")` ate the last character of any reason that honestly
+# ended in one of them ("the palette lives in {tokens}"), which is a silent
+# corruption of the one field a person wrote by hand.
+_COMMENT_CLOSE_RX = re.compile(r"\s*(?:\*/|-->|--\}\}|\}\}|#\}|\*\))\s*$")
+
+
+def find_edit_override(body):
+    """Every `rulebook-override[<rule>]: <why>` marker in the new content, as
+    ``{rule-name-lowered: reason}`` — first marker wins per name. Empty is not
+    an override, and neither is the UNNAMED form: it is returned under ``""``
+    only so the deny can tell the author to name the rule.
+
+    A marker must name its rule. The bare form is not shorthand the hook is
+    being strict about — its meaning is unstable. Excusing "the gate" reads
+    fine the day it is written and silently starts excusing a DIFFERENT rule
+    the day a teammate authors a second edit gate over the same line, and the
+    line it sits on is a standing exemption from then on. It is also the form
+    that content copied from somewhere else can satisfy by accident.
+
+    Deliberately loose about what precedes the word: `//`, `#`, `<!--` and `*`
+    are all comment openers somewhere, and a marker the author meant is worth
+    more than a syntax the hook guessed."""
+    found = {}
+    for m in _EDIT_OVERRIDE_RX.finditer(body or ""):
+        reason = _COMMENT_CLOSE_RX.sub("", m.group(2).strip()).strip()
+        if not reason:
+            continue
+        found.setdefault((m.group(1) or "").strip().lower(), reason)
+    return found
+
+
 def emit(event_name, text, *, user_line=None, deny=None):
     """One JSON document on stdout. `text` reaches the agent (additionalContext);
     `user_line` reaches the USER (systemMessage — the one field the terminal
@@ -2156,11 +2208,12 @@ def agent_id_of(data):
 
 
 def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None,
-              override_reason=None):
+              override_reasons=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
-    org opt-in. `override_reason` is set on a `mode='gate'` fire the caller
-    overrode (§5.3). `rulebook_id` is local too — POST /fires carries no book
+    org opt-in. `override_reasons` is {rule_id: why} for the gates this call
+    excused, so a row records the reason for ITS rule — one call can excuse one
+    gate and be blocked by another (§5.3). `rulebook_id` is local too — POST /fires carries no book
     dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
     it is here so a local reader can tell which book a fire came from.
     Returns {rule_id: fire_id} so conversions can point back."""
@@ -2186,7 +2239,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
                     "fired_at": _now(),
                     "converted": None, "converted_at": None,
-                    "override_reason": override_reason,
+                    "override_reason": (override_reasons or {}).get(r["id"]),
                     "excerpt": excerpt[:160],
                 }) + "\n")
     except Exception:
@@ -2379,6 +2432,11 @@ def main():
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
+    # §5.3: the edit lane's own override. Which gates it actually excuses is
+    # decided once the gates are known — a marker naming a rule excuses that
+    # rule only.
+    edit_markers = ({k: redact_secrets(v)[:2000] for k, v in find_edit_override(body).items()}
+                    if mode == "pre" and tool in EDIT_TOOLS else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
     ordering = None
@@ -2496,9 +2554,15 @@ def main():
             if not path_in_scope(r, efp if etool in EDIT_TOOLS else "", root):
                 continue
             scope = r.get("fire_scope", "session")
-            if ephase == "pre" and etool == "Bash" and r.get("on") == "bash" \
-                    and r.get("mode") == "gate":
-                scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
+            # A gate blocks EVERY matching call — never deduped (§5.3), in
+            # either lane the hook can refuse: a Bash command, or an edit the
+            # tool has not written yet. `via` guards the difference: a
+            # synthetic edit event is a file a command ALREADY wrote, so it
+            # cannot be refused and keeps its rule's ordinary dedup.
+            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") is None \
+                    and ((etool == "Bash" and r.get("on") == "bash")
+                         or (etool in EDIT_TOOLS and r.get("on") == "edit")):
+                scope = "call"
             key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
             # the regex first (pure, cheap), the given second (probes run only now)
             matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
@@ -2527,11 +2591,45 @@ def main():
         save_state(sp, st)
         return 0
 
-    # §5.3: which of this call's fires are GATES. Only a pre-hook Bash call can
-    # be blocked, and only by a rule the cached book says is a gate.
-    gate_ids = {r["id"] for r in fired_now
-                if mode == "pre" and tool == "Bash" and r.get("on") in ("bash", "ordering")
-                and r.get("mode") == "gate"}
+    # §5.3: which of this call's fires are GATES. Only a call the hook sees
+    # BEFORE it runs can be blocked — a pre-hook Bash command, or a pre-hook
+    # edit, which `evaluate` matches against `tool_input`, the content the tool
+    # is about to write. A fire from the synthetic lane (`via == "bash"`, a file
+    # discovered after a command wrote it) is post-hoc whatever its rule says,
+    # so it advises: there is nothing left to refuse.
+    def _gateable(r):
+        if mode != "pre" or r.get("mode") != "gate":
+            return False
+        if (fired_on.get(r["id"]) or {}).get("via") == "bash":
+            return False
+        if tool == "Bash":
+            return r.get("on") in ("bash", "ordering")
+        return tool in EDIT_TOOLS and r.get("on") == "edit"
+
+    gate_ids = {r["id"] for r in fired_now if _gateable(r)}
+
+    # Which gates this call actually excused, and why — per RULE, not per call.
+    # A Bash override is a one-shot prefix on one command: it passes that call,
+    # every gate on it, and is gone. An edit marker LANDS in the file, so the
+    # same generosity would make one line a standing exemption from every edit
+    # gate that ever fires on it — including rules written after the marker,
+    # whose author never saw it. So an edit marker excuses only the rule it
+    # NAMES (`rulebook-override[no-hex]: …`, the label the deny line shows).
+    # The unnamed form never excuses anything, however few gates fired: it
+    # would mean a different thing on the day a second edit gate is authored
+    # over the same line, and it is the form that content copied from
+    # elsewhere satisfies by accident.
+    def _label_of(r):
+        return str(r.get("_label") or r["id"]).lower()
+
+    overridden = {}
+    if override_reason is not None:
+        overridden = {r["id"]: override_reason for r in fired_now if r["id"] in gate_ids}
+    elif edit_markers:
+        for r in (r for r in fired_now if r["id"] in gate_ids):
+            named = edit_markers.get(_label_of(r)) or edit_markers.get(str(r["id"]).lower())
+            if named:
+                overridden[r["id"]] = named
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -2549,7 +2647,7 @@ def main():
     # the advisory cap never cuts a gate — a silently un-gated push is the one
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]
-    blocked = bool(gates) and override_reason is None
+    blocked = any(r["id"] not in overridden for r in gates)
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
     user_lines, deny_lines = [], []
@@ -2572,21 +2670,38 @@ def main():
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
             user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}")
-        elif override_reason is not None:
+        elif r["id"] in overridden:
+            why = overridden[r["id"]]
             lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)} "
-                         f"_(gate overridden: {override_reason})_")
-            user_lines.append(f"{BRAND} ⚠ gate overridden — [{label}] {override_reason}")
+                         f"_(gate overridden: {why})_")
+            user_lines.append(f"{BRAND} ⚠ gate overridden — [{label}] {why}")
         else:
             lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_why(r)}")
             user_lines.append(f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}")
             deny_lines.append(f"[{label}] {r['text']}{detail}")
     deny = None
     if blocked:
+        # Each lane names the override it actually accepts: an Edit tool call
+        # has no shell prefix to carry one, and telling the agent to re-run a
+        # command it never ran would leave the gate with no way past.
+        still = [r for r in gates if r["id"] not in overridden]
+        if tool == "Bash":
+            how = ("re-run the same command prefixed RULEBOOK_OVERRIDE='<why>' — that allows "
+                   "exactly that call and records why")
+        else:
+            # Always the named form: a marker stays in the file, so it has to
+            # say which rule it answers to the reader who finds it later.
+            named = ", ".join(f"`rulebook-override[{r.get('_label') or r['id']}]: <why>`"
+                              for r in still)
+            how = (f"add a comment naming the rule you are excusing ({named}) — each allows "
+                   "that one rule, records why, and stays in the diff for the next reader")
+            if "" in edit_markers:
+                how += (". A `rulebook-override:` with no rule in brackets excuses nothing — "
+                        "it would mean something different as soon as a second edit gate "
+                        "covers this line")
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
-                + "\nIf this is a legitimate exception, re-run the same command prefixed "
-                  "RULEBOOK_OVERRIDE='<why>' — that allows exactly that call and records why.")
-        lines.append("_This call was blocked. If it is a legitimate exception, re-run the "
-                     "same command prefixed `RULEBOOK_OVERRIDE='<why>'`._")
+                + f"\nIf this is a legitimate exception, {how}.")
+        lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines),
              user_line="\n".join(user_lines), deny=deny)
@@ -2610,7 +2725,7 @@ def main():
     if gates:      # a blocked call and an overridden one are both delivered gate fires
         ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
-                             override_reason=override_reason))
+                             override_reasons=overridden))
     for r in cut:   # the per-call cap has a cost; make it visible, never silent
         log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
                   raw_counts=raw, dedup_keys=dedup_keys)
