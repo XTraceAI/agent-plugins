@@ -41,13 +41,17 @@ How a fire reaches people (spec §5.3):
     header — and the USER gets a `systemMessage` line per rule (`XTrace ▸ …`),
     the one hook field the terminal renders. Without it a fire is invisible to
     the person the rule was written for.
-  * `mode: gate` rules BLOCK: a pre-hook Bash call matching a gate rule is
-    denied (`permissionDecision: deny`) with the statement and the override
-    line. `RULEBOOK_OVERRIDE='<why>' <command>` allows exactly that call and
-    records the fire with `override_reason`; the next matching call is gated
-    again. Gates are never deduped and never cut by the advisory cap. Only a
-    Bash rule can gate (an edit already happened; a result rule runs after the
-    fact).
+  * `mode: gate` rules BLOCK: a pre-hook call matching a gate rule is denied
+    (`permissionDecision: deny`) with the statement and the override its lane
+    accepts. A Bash call takes `RULEBOOK_OVERRIDE='<why>' <command>`, which
+    allows exactly that call; an edit takes a `rulebook-override: <why>` marker
+    in the content, which allows that write and stays in the diff. Either way
+    the fire records `override_reason`, and the next matching call is gated
+    again. Gates are never deduped and never cut by the advisory cap. Both
+    lanes gate because the hook sees them BEFORE they run — an edit rule
+    matches `tool_input`, the content the tool is about to write. A result
+    rule runs after the fact and cannot gate, and neither can the synthetic
+    lane that finds files a shell command already wrote.
   * A gate is honoured from whatever book is cached, however old. There is no
     timer that turns a gate off: a rule retired on the server disappears at
     the next successful fetch, and a running session refreshes its own book
@@ -2064,6 +2068,32 @@ def find_override(cmd):
     return None
 
 
+# `rulebook-override: <why>` — the edit lane's override. A tool call has no
+# prefix to carry a reason the way a shell command does, so it travels in the
+# only channel an edit already has: the content. Written as a comment in
+# whatever the file's language uses, anywhere in the new text.
+#
+# Unlike the shell prefix this one is NOT stripped before rules match. The
+# marker is part of the file the author is writing — a reviewer reads it in the
+# diff, and the next edit of that line is already answered. That is the trade:
+# a command override is one-shot, an edit override is a durable annotation.
+# An EMPTY reason is not an override, exactly as for the shell prefix, and the
+# reason is redacted before it is recorded or shown.
+_EDIT_OVERRIDE_RX = re.compile(r"rulebook-override\s*:[ \t]*(\S[^\r\n]*)", re.I)
+
+
+def find_edit_override(body):
+    """The reason from the first non-empty `rulebook-override:` marker in the
+    new content, else None. Deliberately loose about what precedes it: `//`,
+    `#`, `<!--` and `*` are all comment openers somewhere, and a marker the
+    author meant is worth more than a syntax the hook guessed."""
+    m = _EDIT_OVERRIDE_RX.search(body or "")
+    if not m:
+        return None
+    reason = m.group(1).strip().rstrip("*/->}").strip()
+    return reason or None
+
+
 def emit(event_name, text, *, user_line=None, deny=None):
     """One JSON document on stdout. `text` reaches the agent (additionalContext);
     `user_line` reaches the USER (systemMessage — the one field the terminal
@@ -2379,6 +2409,10 @@ def main():
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
+    if override_reason is None and mode == "pre" and tool in EDIT_TOOLS:
+        marker = find_edit_override(body)   # §5.3: the edit lane's own override
+        if marker:
+            override_reason = redact_secrets(marker)[:2000]
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
     ordering = None
@@ -2496,9 +2530,15 @@ def main():
             if not path_in_scope(r, efp if etool in EDIT_TOOLS else "", root):
                 continue
             scope = r.get("fire_scope", "session")
-            if ephase == "pre" and etool == "Bash" and r.get("on") == "bash" \
-                    and r.get("mode") == "gate":
-                scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
+            # A gate blocks EVERY matching call — never deduped (§5.3), in
+            # either lane the hook can refuse: a Bash command, or an edit the
+            # tool has not written yet. `via` guards the difference: a
+            # synthetic edit event is a file a command ALREADY wrote, so it
+            # cannot be refused and keeps its rule's ordinary dedup.
+            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") is None \
+                    and ((etool == "Bash" and r.get("on") == "bash")
+                         or (etool in EDIT_TOOLS and r.get("on") == "edit")):
+                scope = "call"
             key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
             # the regex first (pure, cheap), the given second (probes run only now)
             matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
@@ -2527,11 +2567,22 @@ def main():
         save_state(sp, st)
         return 0
 
-    # §5.3: which of this call's fires are GATES. Only a pre-hook Bash call can
-    # be blocked, and only by a rule the cached book says is a gate.
-    gate_ids = {r["id"] for r in fired_now
-                if mode == "pre" and tool == "Bash" and r.get("on") in ("bash", "ordering")
-                and r.get("mode") == "gate"}
+    # §5.3: which of this call's fires are GATES. Only a call the hook sees
+    # BEFORE it runs can be blocked — a pre-hook Bash command, or a pre-hook
+    # edit, which `evaluate` matches against `tool_input`, the content the tool
+    # is about to write. A fire from the synthetic lane (`via == "bash"`, a file
+    # discovered after a command wrote it) is post-hoc whatever its rule says,
+    # so it advises: there is nothing left to refuse.
+    def _gateable(r):
+        if mode != "pre" or r.get("mode") != "gate":
+            return False
+        if (fired_on.get(r["id"]) or {}).get("via") == "bash":
+            return False
+        if tool == "Bash":
+            return r.get("on") in ("bash", "ordering")
+        return tool in EDIT_TOOLS and r.get("on") == "edit"
+
+    gate_ids = {r["id"] for r in fired_now if _gateable(r)}
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -2582,11 +2633,17 @@ def main():
             deny_lines.append(f"[{label}] {r['text']}{detail}")
     deny = None
     if blocked:
+        # Each lane names the override it actually accepts: an Edit tool call
+        # has no shell prefix to carry one, and telling the agent to re-run a
+        # command it never ran would leave the gate with no way past.
+        how = ("re-run the same command prefixed RULEBOOK_OVERRIDE='<why>' — that allows "
+               "exactly that call and records why"
+               if tool == "Bash" else
+               "add a `rulebook-override: <why>` comment on or beside the line — that allows "
+               "the write, records why, and stays in the diff for the next reader")
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
-                + "\nIf this is a legitimate exception, re-run the same command prefixed "
-                  "RULEBOOK_OVERRIDE='<why>' — that allows exactly that call and records why.")
-        lines.append("_This call was blocked. If it is a legitimate exception, re-run the "
-                     "same command prefixed `RULEBOOK_OVERRIDE='<why>'`._")
+                + f"\nIf this is a legitimate exception, {how}.")
+        lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines),
              user_line="\n".join(user_lines), deny=deny)
