@@ -150,6 +150,7 @@ BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
 MAX_ADVISE = 2          # per tool call — habituation guard
 MAX_POSTURE = 15        # spec §2: session_context is hard-capped at 15 rules / ~2k tokens per scope
 POSTURE_BUDGET_CHARS = 8000   # ~2k tokens at ~4 chars/token
+RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the tail
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
@@ -480,12 +481,24 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
                 return False
             if rule.get("cmd_not_rx") and cmd and re.search(rule["cmd_not_rx"], cmd, re.I):
                 return False          # the server's command_not_rx, honoured on the post lane too
-            tail = result_text[-8000:]
-            m = re.search(rule["rx"], tail, re.M)
+            # A long result puts the two things a rule looks for at OPPOSITE
+            # ends: pytest prints the traceback at the top and the failure
+            # summary at the bottom, so a tail-only window silently misses
+            # every exception in a run long enough to need a window at all.
+            # Scan both ends, as separate spans so no pattern can match across
+            # the gap between them.
+            if len(result_text) <= 2 * RESULT_WINDOW_CHARS:
+                spans = (result_text,)
+            else:
+                spans = (result_text[:RESULT_WINDOW_CHARS],
+                         result_text[-RESULT_WINDOW_CHARS:])
             # exclude_rx exempts the whole result (an exempt test name usually
-            # sits outside the matched span), not just the matched substring
-            return bool(m) and not (
-                rule.get("exclude_rx") and re.search(rule["exclude_rx"], tail, re.M))
+            # sits outside the matched span), not just the matched substring —
+            # so it is checked over the same spans the match is drawn from
+            if rule.get("exclude_rx") and any(
+                    re.search(rule["exclude_rx"], sp, re.M) for sp in spans):
+                return False
+            return any(re.search(rule["rx"], sp, re.M) for sp in spans)
     except Exception:
         return False
     return False
