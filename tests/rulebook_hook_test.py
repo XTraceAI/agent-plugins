@@ -917,6 +917,25 @@ def main() -> int:
                                    tool_response={"stdout": "BOOM-ERROR here"}), env)
         check("post: cmd_rx gates the result rule", out.strip() == "")
 
+        # A result long enough to need a window puts the traceback at the TOP
+        # and the summary at the bottom — pytest's own shape. A tail-only
+        # window silently missed every exception in exactly those runs.
+        head_only = "BOOM-ERROR at the top\n" + ("filler line\n" * 4000)
+        rc, out = run("post", dict(base, session_id="s8",
+                                   tool_input={"command": "uv run pytest tests/"},
+                                   tool_response={"stdout": head_only}), env)
+        check("post: fires when the match is only at the HEAD of a long result",
+              "[post-rule]" in ctx(out))
+
+        # …and the window is still bounded: the middle of a huge result is not
+        # scanned. This is the deliberate cost of not reading the whole thing.
+        buried = ("filler line\n" * 4000) + "BOOM-ERROR buried\n" + ("filler line\n" * 4000)
+        rc, out = run("post", dict(base, session_id="s9",
+                                   tool_input={"command": "uv run pytest tests/"},
+                                   tool_response={"stdout": buried}), env)
+        check("post: the window stays bounded — a match in the middle is still missed",
+              out.strip() == "")
+
         # --- ledger --------------------------------------------------------
         ledger = os.path.join(td, "ledger", "fires.jsonl")
         check("ledger written beside the relocated rulebook", os.path.isfile(ledger))
@@ -932,7 +951,7 @@ def main() -> int:
                   {r["hook_phase"] for r in rows} >= {"pre", "post", "session"} and
                   all(r["mode"] == "advise" for r in rows))
             check("ledger v2: full session_id, rule_version, tz-aware fired_at",
-                  all(r["session_id"] in ("s1", "s2", "s6") for r in rows) and
+                  all(r["session_id"] in ("s1", "s2", "s6", "s8") for r in rows) and
                   all(r["rule_version"] == 1 for r in rows) and
                   all(re.search(r"([+-]\d\d:\d\d|Z)$", r["fired_at"]) for r in rows))
             check("ledger v2: schema_version file stamped",
