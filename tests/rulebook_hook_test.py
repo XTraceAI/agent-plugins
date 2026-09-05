@@ -1408,6 +1408,9 @@ def main() -> int:
             {"id": "no-todo", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"TODO",
              "fire_scope": "session", "repo_scope": "any", "text": "No TODOs", "why": "w",
              "version": 1},
+            {"id": "no-inline-style", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"style=\{\{",
+             "mode": "gate", "fire_scope": "session", "repo_scope": "any",
+             "text": "No inline styles", "why": "w", "version": 1},
         ])
         genv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
         tsx = os.path.join(repo, "src", "Swatch.tsx")
@@ -1460,6 +1463,43 @@ def main() -> int:
               "permissionDecision" not in j.get("hookSpecificOutput", {})
               and "ghp_ABCDEFGHIJ" not in json.dumps(j), out)
 
+        # Two gates on one write: a marker naming one must not excuse the other.
+        two = 'const s = {"#1a1a1a"}; <div style={{color: s}} />\n'
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override: vendor SVG\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: a BARE marker does not excuse a call with two gates on it — "
+              "a marker that LANDS in the file must not silence rules it never named",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        check("edit override: the deny names each still-blocking rule and how to excuse it",
+              "rulebook-override[no-hex]:" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rulebook-override[no-inline-style]:"
+              in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: brand hex is fixed upstream\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: naming ONE rule leaves the other gate standing",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+              and "[no-inline-style]" in j.get("systemMessage", "")
+              and "overridden" in j.get("systemMessage", ""), out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: brand hex is fixed upstream\n"
+            "// rulebook-override[no-inline-style]: measured, one-off\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: naming BOTH lets the write through",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "/* rulebook-override: the palette lives in {tokens} */\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: a comment CLOSER is stripped but a reason that honestly ends "
+              "in one of those characters keeps it",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "lives in {tokens}" in j.get("systemMessage", ""), out)
+
         rc, out = run("pre", dict(base, tool_input={
             "file_path": tsx, "content": "// TODO: later\n"}), genv)
         j = outj(out)
@@ -1487,6 +1527,11 @@ def main() -> int:
               [r.get("override_reason") for r in hexr][:4]
               == [None, None, "vendor SVG, palette is fixed upstream", None],
               str([r.get("override_reason") for r in hexr]))
+        styler = [r for r in rows if r["rule_id"] == "no-inline-style"]
+        check("ledger: a row records the reason for ITS rule — one call excused one gate "
+              "and was blocked by the other",
+              [r.get("override_reason") for r in styler]
+              == [None, None, "measured, one-off"], str([r.get("override_reason") for r in styler]))
 
     # --- an anchored rule is not bypassed by a leading env assignment -------
     #
