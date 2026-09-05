@@ -46,9 +46,9 @@ How a fire reaches people (spec §5.3):
     accepts. A Bash call takes `RULEBOOK_OVERRIDE='<why>' <command>`, which
     allows exactly that call; an edit takes a `rulebook-override[<rule>]: <why>`
     marker in the content, which allows that write and stays in the diff. The
-    edit marker is scoped to the rule it names BECAUSE it stays: the bare form
-    excuses a lone gate, but with two gates on one write it would silence the
-    one it never named, for every future edit of that line. Either way the fire
+    edit marker must name its rule BECAUSE it stays: an unnamed one would mean
+    a different thing the day a second edit gate covers that line, and it is
+    the form that content copied from elsewhere satisfies by accident. Either way the fire
     records its own `override_reason`, and the next matching call is gated
     again. Gates are never deduped and never cut by the advisory cap. Both
     lanes gate because the hook sees them BEFORE they run — an edit rule
@@ -2093,8 +2093,16 @@ _COMMENT_CLOSE_RX = re.compile(r"\s*(?:\*/|-->|--\}\}|\}\}|#\}|\*\))\s*$")
 
 def find_edit_override(body):
     """Every `rulebook-override[<rule>]: <why>` marker in the new content, as
-    ``{rule-name-lowered or "": reason}`` — first marker wins per name, and
-    ``""`` is the bare form that names no rule. Empty is not an override.
+    ``{rule-name-lowered: reason}`` — first marker wins per name. Empty is not
+    an override, and neither is the UNNAMED form: it is returned under ``""``
+    only so the deny can tell the author to name the rule.
+
+    A marker must name its rule. The bare form is not shorthand the hook is
+    being strict about — its meaning is unstable. Excusing "the gate" reads
+    fine the day it is written and silently starts excusing a DIFFERENT rule
+    the day a teammate authors a second edit gate over the same line, and the
+    line it sits on is a standing exemption from then on. It is also the form
+    that content copied from somewhere else can satisfy by accident.
 
     Deliberately loose about what precedes the word: `//`, `#`, `<!--` and `*`
     are all comment openers somewhere, and a marker the author meant is worth
@@ -2605,9 +2613,12 @@ def main():
     # every gate on it, and is gone. An edit marker LANDS in the file, so the
     # same generosity would make one line a standing exemption from every edit
     # gate that ever fires on it — including rules written after the marker,
-    # whose author never saw it. So a marker excuses the rule it names
-    # (`rulebook-override[no-hex]: …`, the label the deny line shows), and the
-    # bare form excuses only when there is exactly one gate to excuse.
+    # whose author never saw it. So an edit marker excuses only the rule it
+    # NAMES (`rulebook-override[no-hex]: …`, the label the deny line shows).
+    # The unnamed form never excuses anything, however few gates fired: it
+    # would mean a different thing on the day a second edit gate is authored
+    # over the same line, and it is the form that content copied from
+    # elsewhere satisfies by accident.
     def _label_of(r):
         return str(r.get("_label") or r["id"]).lower()
 
@@ -2615,13 +2626,10 @@ def main():
     if override_reason is not None:
         overridden = {r["id"]: override_reason for r in fired_now if r["id"] in gate_ids}
     elif edit_markers:
-        gated = [r for r in fired_now if r["id"] in gate_ids]
-        for r in gated:
+        for r in (r for r in fired_now if r["id"] in gate_ids):
             named = edit_markers.get(_label_of(r)) or edit_markers.get(str(r["id"]).lower())
             if named:
                 overridden[r["id"]] = named
-            elif len(gated) == 1 and edit_markers.get(""):
-                overridden[r["id"]] = edit_markers[""]
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -2680,16 +2688,17 @@ def main():
         if tool == "Bash":
             how = ("re-run the same command prefixed RULEBOOK_OVERRIDE='<why>' — that allows "
                    "exactly that call and records why")
-        elif len(still) == 1 and len(gates) == 1:
-            how = ("add a `rulebook-override: <why>` comment on or beside the line — that allows "
-                   "the write, records why, and stays in the diff for the next reader")
         else:
-            # More than one gate fired, so a bare marker would be ambiguous
-            # about which one it answers — and would silence the others.
+            # Always the named form: a marker stays in the file, so it has to
+            # say which rule it answers to the reader who finds it later.
             named = ", ".join(f"`rulebook-override[{r.get('_label') or r['id']}]: <why>`"
                               for r in still)
             how = (f"add a comment naming the rule you are excusing ({named}) — each allows "
                    "that one rule, records why, and stays in the diff for the next reader")
+            if "" in edit_markers:
+                how += (". A `rulebook-override:` with no rule in brackets excuses nothing — "
+                        "it would mean something different as soon as a second edit gate "
+                        "covers this line")
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
                 + f"\nIf this is a legitimate exception, {how}.")
         lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")

@@ -1428,7 +1428,7 @@ def main() -> int:
         check("edit gate: the deny reason carries the statement and the MARKER instruction, "
               "not the shell prefix",
               "Never hardcode a colour" in hso.get("permissionDecisionReason", "")
-              and "rulebook-override:" in hso.get("permissionDecisionReason", "")
+              and "rulebook-override[no-hex]:" in hso.get("permissionDecisionReason", "")
               and "RULEBOOK_OVERRIDE=" not in hso.get("permissionDecisionReason", ""), out)
         check("edit gate: the user is told the write was blocked",
               j.get("systemMessage", "").startswith("XTrace") and "blocked" in j["systemMessage"]
@@ -1440,7 +1440,7 @@ def main() -> int:
               outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
 
         rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
-            "// rulebook-override: vendor SVG, palette is fixed upstream\n"
+            "// rulebook-override[no-hex]: vendor SVG, palette is fixed upstream\n"
             'const brand = "#1a1a1a";\n')}), genv)
         j = outj(out)
         check("edit override: the marked write is ALLOWED",
@@ -1449,14 +1449,28 @@ def main() -> int:
               "overridden" in j.get("systemMessage", "")
               and "vendor SVG" in j["systemMessage"], out)
 
-        for empty in ("// rulebook-override:\n", "// rulebook-override:    \n"):
+        # An UNNAMED marker excuses nothing, even with one gate on the call.
+        # It would mean a different rule the day a second edit gate covers the
+        # line, and it is the form copied content satisfies by accident.
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override: vendor SVG, palette is fixed upstream\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: an UNNAMED marker does not excuse even a LONE gate",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        check("edit override: the deny says an unnamed marker excuses nothing, and why",
+              "excuses nothing" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rulebook-override[no-hex]:"
+              in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+
+        for empty in ("// rulebook-override[no-hex]:\n", "// rulebook-override[no-hex]:    \n"):
             rc, out = run("pre", dict(base, tool_input={
                 "file_path": tsx, "content": empty + 'const brand = "#1a1a1a";\n'}), genv)
             check("edit override: an EMPTY reason is not an override — still denied",
                   outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
 
         rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
-            "// rulebook-override: token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab rotated\n"
+            "// rulebook-override[no-hex]: token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab rotated\n"
             'const brand = "#1a1a1a";\n')}), genv)
         j = outj(out)
         check("edit override: the reason is redacted before it is recorded or shown",
@@ -1468,7 +1482,7 @@ def main() -> int:
         rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
             "// rulebook-override: vendor SVG\n" + two)}), genv)
         j = outj(out)
-        check("edit override: a BARE marker does not excuse a call with two gates on it — "
+        check("edit override: an UNNAMED marker does not excuse a call with two gates on it — "
               "a marker that LANDS in the file must not silence rules it never named",
               j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
         check("edit override: the deny names each still-blocking rule and how to excuse it",
@@ -1492,7 +1506,7 @@ def main() -> int:
               "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
 
         rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
-            "/* rulebook-override: the palette lives in {tokens} */\n"
+            "/* rulebook-override[no-hex]: the palette lives in {tokens} */\n"
             'const brand = "#1a1a1a";\n')}), genv)
         j = outj(out)
         check("edit override: a comment CLOSER is stripped but a reason that honestly ends "
@@ -1524,8 +1538,8 @@ def main() -> int:
         check("ledger: every blocked and overridden write is a mode=gate fire",
               len(hexr) >= 6 and all(r["mode"] == "gate" for r in hexr), str(len(hexr)))
         check("ledger: override_reason is set only on the overridden writes",
-              [r.get("override_reason") for r in hexr][:4]
-              == [None, None, "vendor SVG, palette is fixed upstream", None],
+              [r.get("override_reason") for r in hexr][:5]
+              == [None, None, "vendor SVG, palette is fixed upstream", None, None],
               str([r.get("override_reason") for r in hexr]))
         styler = [r for r in rows if r["rule_id"] == "no-inline-style"]
         check("ledger: a row records the reason for ITS rule — one call excused one gate "
