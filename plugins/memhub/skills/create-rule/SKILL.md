@@ -123,6 +123,7 @@ them decide — step 5 flags these as `cross_book`.
 | a Bash command with a checkable form | `agent_hook` | `matcher: {event: "bash", command_rx, command_not_rx?, warn_once_per}` |
 | an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that wrote the file (heredoc, `write_text()`, `sed -i`) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?}` |
 | a failing or noteworthy tool output | `agent_hook` | `matcher: {event: "output", content_rx, command_rx?, content_not_rx?}` |
+| a file about to be read into the agent's context — the Read tool, OR a `cat`/`head`/`tail`/`less`/`more`/`sed` on a path in a Bash command (not piped, not redirected; `cd`-relative paths resolve) | `agent_hook` | `matcher: {event: "read", path_rx?, path_not_rx?, command_not_rx?, given: {file: {lines_gt}, agent: {main}}}` — needs `path_rx` or `given.file`, or it fires on every file |
 | "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, min_edits, display_name}` |
 | applies when a file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server decides relevance per call |
 | worldview with no trigger at all | `session_context` | none — at most 15 such rules per repo scope are shown at session start; prefer a checkable shape when one exists, because advice shown in-flight is acted on far more often than advice shown at session start |
@@ -147,12 +148,15 @@ Ask for it when the user's own words ask for it — "block", "stop me", "don't
 let me", "never let it happen again" — and never on your own initiative. Two
 things bound it:
 
-- **Only a command can be stopped.** A `bash` matcher or an `ordering` can
-  block. An `edit` rule fires after the file already changed, `output` after
-  the command already ran, and notes and anchors are advice by construction —
-  the server refuses `gate` on all of those. If the user wants to block an
-  edit, the shape that works is a Bash rule on the command that writes the
-  file, not a gate on the edit rule.
+- **Only a call the hook sees BEFORE it runs can be stopped.** A `bash`
+  matcher, an `edit` matcher (matched against the content about to be
+  written), a `read` matcher (the Read tool's call, or the Bash command that
+  would print the file) or an `ordering` can block. `output` fires after the
+  command already ran, and notes and anchors are advice by construction —
+  the server refuses `gate` on those. A blocked Read has no prefix to carry
+  a reason: the deny tells the agent to read narrower (`offset`/`limit`),
+  delegate to a subagent, or run `RULEBOOK_OVERRIDE='<why>' cat <path>` in
+  Bash, which records the override like any other.
 - **It stops every teammate the book binds, not just the author.** Say that
   before filing, in those words. A blocking rule with a loose `command_rx` is
   the worst failure this skill can ship: it stops work, and the person it stops
@@ -174,12 +178,17 @@ stays silent rather than firing on a guess.
 | a PR that changes source needs a test | `{"repo": {"diff_paths_rx": "^src/", "diff_paths_none_rx": "(^|/)tests?/"}}` on a `gh pr create` matcher |
 | keep PRs under 500 lines | `{"repo": {"diff_lines_gt": 500}}` |
 | don't commit unless asked | `{"user": {"not_said_rx": "\\b(commit|push|ship)\\b"}}` on a `git commit` matcher |
+| don't pull a whole big file into the main context — delegate it | `{"file": {"lines_gt": 350}, "agent": {"main": true}}` on a `read` matcher (a subagent's reads pass: delegation is the way past the rule) |
+| subagents may not push | `{"agent": {"main": false}}` on a `git push` matcher |
 
 `repo` keys: `branch_rx`, `branch_not_rx`, `diff_lines_gt`, `diff_files_gt`,
 `diff_paths_rx`, `diff_paths_none_rx` (the branch's changes against its base,
 working tree and untracked files included), `dirty`. `user` keys: `said_rx`,
 `not_said_rx` (what the person typed this session — never a tool result or
-injected context). An unknown key drops the rule at load, exactly as a bad
+injected context). `file` keys (read rules only): `lines_gt`, `bytes_gt` —
+what the call would pull into the context, so a Read with `offset`/`limit`
+or a `head -50` counts only those lines. `agent` keys (any event): `main`
+(`true` = the main agent, `false` = a subagent). An unknown key drops the rule at load, exactly as a bad
 pattern does. A backend that predates `given` refuses it at `create_rule`;
 verify locally (step 4) and file once the backend accepts it.
 
@@ -210,6 +219,22 @@ JSON
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
   --fires 'the real command that should trigger it' \
   --silent 'the same situation once someone has complied'
+```
+
+For a `read` rule a case is the Read tool (`read:<path>`, narrowed with
+`@<offset>,<limit>`) or a shell command run through the hook's own parser
+(`bash:<command>`, relative paths against `--cwd`); `--file-lines N` stands
+in for every named file's length so no real file is needed, and
+`--agent-main false` runs a case as a subagent:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --file-lines 900 --cwd /repo \
+  --fires  'read:/repo/src/service.py' \
+  --fires  'bash:cd /repo && cat src/service.py' \
+  --silent 'read:/repo/src/service.py@1,200' \
+  --silent 'bash:cat src/service.py | head -50' \
+  --silent 'bash:grep -n foo src/service.py'
 ```
 
 For an `edit` / `write` rule a case is `path::content`:

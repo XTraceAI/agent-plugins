@@ -519,6 +519,170 @@ def given_and_scope_checks() -> None:
         check("given.repo.dirty: a clean tree is not dirty", "[pr-dirty]" not in c, c)
 
 
+def read_lane_checks() -> None:
+    """`event: read` (spec §5.1): the Read tool and the shell forms that pull a
+    file into context — cat/head/tail/less/more/sed on a path, not piped, not
+    redirected — measured per file by `given.file`, exempting subagents with
+    `given.agent.main`, and gateable in both lanes because the hook sees the
+    read BEFORE it happens. Modelled on Spotify's shunt hook, which anchors on
+    `^cat` and misses `cd x && cat f`; this one must not."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "readrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        os.makedirs(os.path.join(repo, "src"))
+        os.makedirs(os.path.join(repo, "docs"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/test-branch\n")
+        big = os.path.join(repo, "src", "big.py")
+        small = os.path.join(repo, "src", "small.py")
+        bigdoc = os.path.join(repo, "docs", "big.md")
+        env_file = os.path.join(repo, ".env")
+        for path, n in ((big, 500), (small, 20), (bigdoc, 500), (env_file, 3)):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("".join(f"line {i}\n" for i in range(n)))
+        seed_book(td, "readrepo", [
+            _row("big-read", {"event": "read", "path_not_rx": r"\.md$",
+                              "given": {"file": {"lines_gt": 350}, "agent": {"main": True}}},
+                 mode="gate"),
+            _row("no-env-read", {"event": "read", "path_rx": r"(^|/)\.env(\..*)?$"}),
+            _row("docs-read", {"event": "read", "given": {"file": {"lines_gt": 350}}},
+                 scope_paths=["docs/*"]),
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def pre(tool, inp, **kw):
+            n[0] += 1
+            payload = {"cwd": repo, "session_id": f"rd{n[0]}", "tool_name": tool, "tool_input": inp}
+            payload.update(kw)
+            rc, out = run("pre", payload, env)
+            j = json.loads(out) if out.strip() else {}
+            hso = j.get("hookSpecificOutput", {})
+            return (hso.get("permissionDecision") == "deny", hso.get("additionalContext", ""),
+                    j.get("systemMessage", ""), hso.get("permissionDecisionReason", ""))
+
+        # --- the Read tool ---------------------------------------------------
+        denied, c, user, why = pre("Read", {"file_path": big})
+        check("read: a whole-file Read over the threshold is DENIED", denied and "[big-read]" in c, c)
+        check("read: the deny names the ways past — narrower read, subagent, recorded override",
+              "offset" in why and "subagent" in why and "RULEBOOK_OVERRIDE" in why, why)
+        check("read: the user sees the block", "⛔" in user and "big-read" in user, user)
+        denied, c, _, _ = pre("Read", {"file_path": big, "offset": 1, "limit": 100})
+        check("read: a targeted Read (offset/limit) under the threshold is silent",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big, "offset": 400})
+        check("read: an offset that leaves fewer lines than the threshold is silent",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": small})
+        check("read: a small file is silent", not denied and c == "", c)
+        denied, c, _, _ = pre("Read", {"file_path": bigdoc})
+        check("read: path_not_rx exempts the file (a .md is not gated)",
+              not denied and "[big-read]" not in c, c)
+        check("read: scope_paths is honoured on a Read call (docs/* rule fires on docs/big.md)",
+              "[docs-read]" in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big})
+        check("read: scope_paths keeps the docs/* rule off src/big.py", "[docs-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": os.path.join(repo, "src", "missing.py")})
+        check("read: a file that does not exist is silent (no fact, no fire)",
+              not denied and c == "", c)
+
+        # --- advisory read rule: fires, does not block ------------------------
+        denied, c, _, _ = pre("Read", {"file_path": env_file})
+        check("read: an advisory path rule fires and lets the call through",
+              not denied and "[no-env-read]" in c, c)
+
+        # --- subagents: `given.agent.main` ------------------------------------
+        sub_tp = os.path.join(td, "sess", "subagents", "agent-abc123.jsonl")
+        os.makedirs(os.path.dirname(sub_tp), exist_ok=True)
+        open(sub_tp, "w").close()
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=sub_tp)
+        check("read: a subagent's whole-file read passes a `agent.main: true` gate",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": env_file}, transcript_path=sub_tp)
+        check("read: a rule without `agent.main` still fires inside a subagent",
+              "[no-env-read]" in c, c)
+        # The live payload shape (Claude Code 2026-09): `agent_id` / `agent_type`
+        # at the top level, transcript_path = the PARENT's file. Measured E2E:
+        # without this the subagent the rule points to was gated too.
+        main_tp = os.path.join(td, "sess.jsonl")
+        open(main_tp, "w").close()
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=main_tp,
+                              agent_id="a09250b37f45b254a", agent_type="Explore")
+        check("read: a subagent identified by the payload's agent_id (parent transcript_path) passes",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=main_tp)
+        check("read: the same payload without agent_id is the main agent and is DENIED",
+              denied and "[big-read]" in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": env_file}, transcript_path=main_tp,
+                              agent_id="a09250b37f45b254a", agent_type="Explore")
+        rows = [json.loads(l) for l in open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8")
+                if l.strip()]
+        check("read: a subagent's fire records the payload's agent_id on the ledger",
+              "[no-env-read]" in c and any(r.get("agent_id") == "a09250b37f45b254a"
+                                            and r["rule_id"] == "no-env-read" for r in rows), c)
+
+        # --- the same rule through Bash --------------------------------------
+        def bash(cmd, **kw):
+            return pre("Bash", {"command": cmd}, **kw)
+        rel = os.path.relpath(big, repo)
+        for cmd in (f"cat {big}", f"cat {rel}", f"cd {repo} && cat {rel}",
+                    f"wc -l {rel} && cat {rel}", f"head -400 {rel}", f"head -n 400 {rel}",
+                    f"sed -n '1,400p' {rel}", f"sed 's/a/b/' {rel}", f"less {rel}",
+                    f"FOO=1 cat {rel}", f"cat {small} {rel}", f"cat {rel} 2>/dev/null"):
+            denied, c, _, _ = bash(cmd)
+            check(f"read via bash: DENIED — {cmd.replace(repo, '<repo>')[:50]}",
+                  denied and "[big-read]" in c, c)
+        denied, c, _, _ = bash(f"cat {rel}")
+        check("read via bash: the fire names the file and its line count",
+              "big.py" in c and "500 lines" in c, c)
+        for cmd in (f"cat {rel} | head -50", f"cat {rel} | grep line", f"cat {rel} > /tmp/out.txt",
+                    f"cat {rel} >> /tmp/out.txt", f"head -20 {rel}", f"tail {rel}",
+                    f"sed -n '10,60p' {rel}", f"sed -n 5p {rel}", f"sed -i 's/a/b/' {rel}",
+                    f"grep -n line {rel}", f"cat {small}", f"cat docs/big.md",
+                    f"python3 -c \"print(open('{rel}').read())\"", f"head -c 400 {rel}",
+                    f"cat > {rel} <<'EOF'\nhello\nEOF", "cat missing.py",
+                    f"cat {rel} | wc -l && echo done"):
+            denied, c, _, _ = bash(cmd)
+            check(f"read via bash: silent — {cmd.replace(repo, '<repo>')[:50]}",
+                  not denied and "[big-read]" not in c, c)
+        # the measured shape: a relative path after a cd (the session cwd stays the
+        # trust boundary — a cd OUT of the session's repo is not followed, as for
+        # every other lane)
+        for cmd in ("cd src && cat big.py", f"cd {repo}/src && cat big.py", "cd src; cat ./big.py"):
+            denied, c, _, _ = bash(cmd)
+            check(f"read via bash: a relative path resolves against the cd — {cmd[:40]}",
+                  denied and "[big-read]" in c, c)
+        denied, c, _, _ = bash(f"cat {rel}", transcript_path=sub_tp)
+        check("read via bash: a subagent's cat passes the `agent.main` gate", not denied, c)
+        denied, c, _, _ = bash(f"cat {os.path.relpath(env_file, repo)} | head -1")
+        check("read via bash: a piped read is not a read into context, even for a path rule",
+              "[no-env-read]" not in c, c)
+        denied, c, _, _ = bash(f"cat {os.path.relpath(env_file, repo)}")
+        check("read via bash: a path rule fires on a bare cat of the path", "[no-env-read]" in c, c)
+
+        # --- the recorded override rides the Bash lane ------------------------
+        denied, c, user, _ = bash(f"RULEBOOK_OVERRIDE='need the whole spec in context' cat {rel}")
+        check("read via bash: RULEBOOK_OVERRIDE allows exactly that read",
+              not denied and "gate overridden" in c and "whole spec" in user, c + user)
+        ledger = os.path.join(td, "ledger", "fires.jsonl")
+        rows = [json.loads(l) for l in open(ledger, encoding="utf-8") if l.strip()]
+        gate_rows = [r for r in rows if r["rule_id"] == "big-read" and r["mode"] == "gate"]
+        check("read: every block and the override are gate rows in the ledger",
+              len(gate_rows) >= 14 and any(r["override_reason"] == "need the whole spec in context"
+                                           for r in gate_rows), str(len(gate_rows)))
+        check("read: a Read-tool fire records tool=Read, a shell one tool=Bash",
+              {r["tool"] for r in gate_rows} == {"Read", "Bash"}, str({r["tool"] for r in gate_rows}))
+        check("read: a shell gate's excerpt is the command that would have read the file",
+              any(r["tool"] == "Bash" and r["excerpt"].startswith("cat ") and "big.py" in r["excerpt"]
+                  for r in gate_rows), "")
+
+        # --- no read rule armed: the Read tool costs nothing ------------------
+        seed_book(td, "readrepo", [_row("only-bash", {"event": "bash", "command_rx": r"^git\s+push"})])
+        denied, c, _, _ = pre("Read", {"file_path": big})
+        check("read: with no read rule in the book a Read call is silent exit-0",
+              not denied and c == "", c)
+
+
 def bash_edit_checks() -> None:
     """A Bash call that writes files is an edit. The post lane reads what the
     command left on disk since the pre lane stamped it and feeds each file
@@ -1644,6 +1808,7 @@ def main() -> int:
     repo_identity_checks()
     given_and_scope_checks()
     bash_edit_checks()
+    read_lane_checks()
     diff_base_checks()
 
     print()

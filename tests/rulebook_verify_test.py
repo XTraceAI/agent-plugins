@@ -170,6 +170,27 @@ def main() -> int:
     p = subprocess.run([sys.executable, VERIFY, "--help"], capture_output=True, text=True)
     check("--help works", p.returncode == 0 and "--fires" in p.stdout)
 
+    # --- read rules: the Read tool and the shell parser, no real file needed
+    read_rule = {"title": "r", "statement": "s", "delivery": "agent_hook",
+                 "matcher": {"event": "read", "path_not_rx": r"\.md$",
+                             "given": {"file": {"lines_gt": 350}, "agent": {"main": True}}}}
+    rc, out = run(read_rule, "--file-lines", "900", "--cwd", "/repo",
+                  "--fires", "read:/repo/src/a.py", "--fires", "bash:cd /repo && cat src/a.py",
+                  "--fires", "bash:sed -n '1,400p' src/a.py",
+                  "--silent", "read:/repo/src/a.py@1,200", "--silent", "read:/repo/docs/a.md",
+                  "--silent", "bash:cat src/a.py | head", "--silent", "bash:head -20 src/a.py",
+                  "--silent", "bash:cat src/a.py > /tmp/x")
+    check("read rule: Read-tool and bash cases go through bash_reads/read_facts/given_ok", rc == 0, out)
+    rc, out = run(read_rule, "--file-lines", "900", "--agent-main", "false", "--fires", "read:/repo/src/a.py")
+    check("read rule: --agent-main false makes a `agent.main: true` rule silent (FIRES FAIL)",
+          rc == 1 and "FIRES  FAIL" in out, out)
+    rc, out = run(read_rule, "--fires", "read:/nonexistent/a.py")
+    check("read rule: no --file-lines and no real file = no fact = cannot fire",
+          rc == 1 and "FIRES  FAIL" in out, out)
+    rc, out = run(read_rule, "--file-lines", "900", "--fires", "src/a.py")
+    check("read rule: a case without read:/bash: is refused with a hint",
+          rc == 1 and "read:<path>" in out, out)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")
