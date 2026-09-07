@@ -8,6 +8,17 @@ location), and ships it to ``save_artifact`` — routed to the repo's room the
 same way ``save_artifact.py`` routes, so an auto-captured spec lands where a
 hand-saved one would.
 
+Two sources feed one pass. ``dirty`` holds what the Edit/Write collector saw.
+The GIT SWEEP covers what it could not: a file written through the Bash tool
+(heredoc, ``sed -i``, a python script) never fires that matcher, so every
+repo the session recorded a ``cwd`` for is asked ``git status`` for
+modified/untracked ``.md`` files. Only what is dirty in git NOW and newer
+than the session's start stamp qualifies — a committed, clean file is never
+swept, and neither is a file the human left in the worktree before the
+session began. Ignored files, submodules, symlinks and anything resolving
+outside the repo are skipped. Both sources go through the same veto, size,
+hash and cap logic; a path in both is saved once.
+
 Draft semantics: the server has no status column, so a capture is marked by
 the ``auto-captured`` tag and a rationale naming the session. Re-saving the
 same ``name`` versions it (server behaviour), so an agent or human publishing
@@ -27,7 +38,10 @@ Stop hook. NEVER FAILS LOUDLY: any error exits 0 quietly — memory capture must
 not disturb the session. A path leaves the retry list only when it was saved
 (content hash recorded), judged a non-candidate, or is unchanged since its
 last save — so a server blip or the per-turn cap costs one turn, and a flaky
-server never re-saves an unchanged file.
+server never re-saves an unchanged file. A path that exhausted its retries
+is remembered by content hash (``gaveup``): the sweep would otherwise offer
+it again on every Stop for as long as it stays modified in git, so it is
+retried only once its content changes.
 """
 from __future__ import annotations
 
@@ -36,6 +50,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,9 +58,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from artifact_sync_reminder import MAP_RELPATH, link_for_path  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
-from md_capture import MAX_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
+from md_capture import MAX_BYTES, MIN_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
-from room_map import env_for_url, read_room, repo_root  # noqa: E402
+from room_map import env_for_url, git_env, git_readonly, read_room, repo_root  # noqa: E402
 
 TAG = "auto-captured"
 MAX_PER_TURN = 5          # a turn that rewrote 40 .md files is a migration, not deliverables
@@ -55,6 +70,10 @@ TIMEOUT_S = 20.0
 # after this many failed passes with a log line, instead of re-reading and
 # re-sending it on every Stop for the rest of the session. Reset on success.
 MAX_ATTEMPTS = 3
+# `git status` on a large worktree is the sweep's one real cost. It runs on
+# the async Stop path, so a slow repo costs nothing visible; past this it is
+# skipped for the turn (logged), never blocks the flush of `dirty`.
+SWEEP_TIMEOUT_S = 15
 
 
 def _log(msg: str) -> None:
@@ -104,6 +123,77 @@ def _digest(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
+def sweep_repos(state: dict, cwd: str | None) -> list[str]:
+    """Canonical paths of modified/untracked ``.md`` files in every repo the
+    session worked in — what a shell edit produced without passing through
+    the collector. Empty when no collector ever ran (no start stamp: nothing
+    was written this session) or no recorded cwd is inside a git repo."""
+    since = state.get("since")
+    if not isinstance(since, (int, float)):
+        return []
+    cwds = [c for c in (state.get("cwds") or []) if isinstance(c, str) and c]
+    cwds.append(cwd if isinstance(cwd, str) and cwd else os.getcwd())
+    roots: list[Path] = []
+    for c in cwds:
+        try:
+            root = repo_root(c)
+            root = root.resolve() if root is not None else None
+        except Exception:  # noqa: BLE001 — a cwd that vanished or is unreadable
+            root = None
+        if root is not None and root not in roots:
+            roots.append(root)
+    found: list[str] = []
+    for root in roots:
+        for key in _sweep_one(root, float(since)):
+            if key not in found:
+                found.append(key)
+    return found
+
+
+def _sweep_one(root: Path, since: float) -> list[str]:
+    try:
+        out = subprocess.run(
+            git_readonly(root) + ["status", "--porcelain=v1", "-z",
+                                  "--untracked-files=all", "--no-renames",
+                                  "--ignore-submodules=all"],
+            env=git_env(), capture_output=True, timeout=SWEEP_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as e:
+        _log(f"sweep {root.name}: git status failed ({type(e).__name__})")
+        return []
+    if out.returncode != 0:
+        _log(f"sweep {root.name}: git status exit {out.returncode}")
+        return []
+    found: list[str] = []
+    # `-z --no-renames`: one `XY <path>` record per NUL, no quoting, no
+    # second path field. Ignored files are absent unless asked for (they
+    # are not); a deleted file has nothing to read.
+    for entry in out.stdout.split(b"\0"):
+        if len(entry) < 4:
+            continue
+        xy, rel = entry[:2], os.fsdecode(entry[3:])
+        if b"D" in xy or xy == b"!!" or not rel.lower().endswith(".md"):
+            continue
+        p = root / rel
+        try:
+            # A symlink is not read through (the flush refuses one too), and a
+            # path that resolves outside the worktree is not this repo's work.
+            if p.is_symlink():
+                continue
+            rp = p.resolve()
+            if not rp.is_relative_to(root) or not rp.is_file():
+                continue
+            if rp.stat().st_mtime < since:
+                continue
+        except (OSError, RuntimeError):
+            continue
+        # Location and name vetoes only — size and frontmatter are judged in
+        # the main loop from the file's content, same as a `dirty` path.
+        ok, _ = is_candidate(rp, size=MIN_BYTES)
+        if ok:
+            found.append(str(rp))
+    return found
+
+
 class SaveRejected(RuntimeError):
     """The server answered, but not with a saved artifact."""
 
@@ -137,12 +227,18 @@ async def _save(session, call_args: dict) -> dict:
     return out
 
 
-async def flush(session_id: str) -> None:
+async def flush(session_id: str, cwd: str | None = None) -> None:
     state = load_state(session_id)
     dirty = list(state.get("dirty") or [])
-    if not dirty:
+    # The sweep never writes into `dirty`: a swept path that fails to save is
+    # simply swept again next Stop (it is still modified in git), so it needs
+    # no retry list — only the attempt counter and the give-up hash.
+    swept = [k for k in sweep_repos(state, cwd) if k not in dirty]
+    if not dirty and not swept:
         return
     saved = dict(state.get("saved") or {})   # path -> content digest
+    gaveup0 = dict(state.get("gaveup") or {})   # path -> digest that exhausted its retries
+    gaveup: dict[str, str] = {}                 # this pass's additions
     attempts = dict(state.get("attempts") or {})   # path -> consecutive failures
     attempts0 = dict(attempts)                       # to write back only what changed
     # `processed` is built from OUTCOMES, not from the input list: a path leaves
@@ -151,7 +247,7 @@ async def flush(session_id: str) -> None:
     # `dirty` so the next Stop retries them without needing another edit.
     processed: set[str] = set()
     todo: list[tuple[str, Path, str, str]] = []   # (raw key, path, text, digest)
-    for raw in dirty:
+    for raw in dirty + swept:
         p = Path(raw)
         if not p.is_file():
             processed.add(raw)                   # deleted/moved: nothing to retry
@@ -193,16 +289,19 @@ async def flush(session_id: str) -> None:
         if saved.get(raw) == d:
             processed.add(raw)                   # unchanged since last successful save
             continue
+        if gaveup0.get(raw) == d:
+            processed.add(raw)                   # exhausted its retries with this exact content
+            continue
         todo.append((raw, p, text, d))
     if len(todo) > MAX_PER_TURN:
         _log(f"{len(todo)} candidates > cap {MAX_PER_TURN}; saving the {MAX_PER_TURN} largest, "
              f"the rest retry next Stop")
         todo = sorted(todo, key=lambda t: -len(t[2]))[:MAX_PER_TURN]
     if not todo:
-        _persist(session_id, processed, saved, _changed(attempts0, attempts))
+        _persist(session_id, processed, saved, _changed(attempts0, attempts), gaveup)
         return
 
-    pending = {raw for raw, _, _, _ in todo}   # not yet attempted this pass
+    pending = {raw: d for raw, _, _, d in todo}   # not yet attempted this pass
     try:
         # Lazy SDK imports INSIDE the guard: if they fail, `finally` still
         # persists the non-candidate / unchanged decisions made above.
@@ -214,7 +313,7 @@ async def flush(session_id: str) -> None:
             async with ClientSession(r, w) as s:
                 await s.initialize()
                 for raw, p, text, d in todo:
-                    pending.discard(raw)
+                    pending.pop(raw, None)
                     # The whole per-item body is guarded, not just the save:
                     # a malformed room file or odd content must skip ONE item
                     # (which stays dirty), never the rest of the turn.
@@ -246,14 +345,16 @@ async def flush(session_id: str) -> None:
                             call_args["agent_brain_id"] = room["brain_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
                     except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
-                        _bump(attempts, raw, processed, f"{type(e).__name__}: {str(e)[:120]}")
+                        _bump(attempts, raw, processed, f"{type(e).__name__}: {str(e)[:120]}",
+                              gaveup, d)
                         continue
                     # Keyed on `raw` — the exact string in `dirty` — so the
                     # dedup lookup and the `_persist` removal both match it.
                     saved[raw] = d
                     processed.add(raw)
                     attempts.pop(raw, None)
-                    _log(f"saved '{name}' ({len(body):,} chars) → "
+                    _log(f"saved '{name}' ({len(body):,} chars"
+                         f"{', git sweep' if raw in swept else ''}) → "
                          f"{room['name'] if room else 'personal memory'} "
                          f"id={out.get('artifact_id') or out.get('id')}")
     except Exception as e:  # noqa: BLE001 — connection-level: SDK import, auth, initialize
@@ -263,13 +364,13 @@ async def flush(session_id: str) -> None:
         # no MAX_ATTEMPTS ceiling.
         # Type only: an auth / transport exception can carry the URL or a
         # header in its message, and this line goes to stderr.
-        for raw in pending:
-            _bump(attempts, raw, processed, f"connection: {type(e).__name__}")
+        for raw, d in pending.items():
+            _bump(attempts, raw, processed, f"connection: {type(e).__name__}", gaveup, d)
     finally:
         # Persist whatever was decided even if the connection itself failed:
         # non-candidates drop out, successes record their digest, everything
         # else remains dirty for the next Stop.
-        _persist(session_id, processed, saved, _changed(attempts0, attempts))
+        _persist(session_id, processed, saved, _changed(attempts0, attempts), gaveup)
 
 
 def _hand_saved(root: Path, p: Path) -> bool:
@@ -281,8 +382,13 @@ def _hand_saved(root: Path, p: Path) -> bool:
         return False
 
 
-def _bump(attempts: dict, raw: str, processed: set, why: str) -> None:
-    """Count a failed pass for `raw`; give up (mark processed) at the cap."""
+def _bump(attempts: dict, raw: str, processed: set, why: str,
+          gaveup: dict | None = None, digest: str | None = None) -> None:
+    """Count a failed pass for `raw`; give up (mark processed) at the cap.
+
+    With a digest, the give-up is remembered by content so the git sweep does
+    not offer the same bytes again next Stop; an unreadable file has no
+    digest and is simply re-judged when it is next seen."""
     n = attempts.get(raw, 0) + 1
     attempts[raw] = n
     name = Path(raw).name
@@ -290,6 +396,8 @@ def _bump(attempts: dict, raw: str, processed: set, why: str) -> None:
         _log(f"giving up on {name} after {n} failed passes: {why}")
         processed.add(raw)
         attempts.pop(raw, None)
+        if gaveup is not None and digest:
+            gaveup[raw] = digest
     else:
         _log(f"will retry {name} next Stop ({n}/{MAX_ATTEMPTS}): {why}")
 
@@ -299,7 +407,8 @@ def _changed(before: dict, after: dict) -> dict:
     return {k: n for k, n in after.items() if before.get(k) != n}
 
 
-def _persist(session_id: str, processed: set, saved: dict, attempts: dict | None = None) -> None:
+def _persist(session_id: str, processed: set, saved: dict, attempts: dict | None = None,
+             gaveup: dict | None = None) -> None:
     """Write back by MERGING into a fresh read, never from the snapshot taken
     before the network window. The Stop hook is async, so the collector keeps
     appending to the same file while a save is in flight; persisting the
@@ -308,6 +417,8 @@ def _persist(session_id: str, processed: set, saved: dict, attempts: dict | None
     fresh = load_state(session_id)
     fresh["dirty"] = [d for d in fresh.get("dirty") or [] if d not in processed]
     fresh.setdefault("saved", {}).update(saved)
+    if gaveup:
+        fresh.setdefault("gaveup", {}).update(gaveup)
     # `attempts` follows the same merge discipline: only the keys THIS pass
     # decided are written. Every processed path is terminal, so its counter
     # goes (a non-candidate/unchanged/deleted outcome after an earlier
@@ -329,7 +440,9 @@ def main() -> int:
         session_id = (hook_input.get("session_id") or "").strip()
         if not session_id:
             return 0
-        asyncio.run(asyncio.wait_for(flush(session_id), timeout=TIMEOUT_S * (MAX_PER_TURN + 1)))
+        cwd = hook_input.get("cwd")
+        asyncio.run(asyncio.wait_for(flush(session_id, cwd if isinstance(cwd, str) else None),
+                                     timeout=TIMEOUT_S * (MAX_PER_TURN + 1)))
     except Exception as e:  # noqa: BLE001 — never disturb the session
         try:
             _log(f"flush aborted: {type(e).__name__}: {str(e)[:120]}")
