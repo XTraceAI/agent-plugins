@@ -554,6 +554,18 @@ async def _send(session, arguments, room, title, namespace,
              f"(conv {str(out.get('conversation_id'))[:8]}, "
              f"path={out.get('path')}) -> {dest} "
              "— server processes the delta")
+        # Say what became of the PR URL this flush carried: the whole point
+        # of sending it from the hook is that the session gets linked NOW,
+        # and "flushed N records" cannot show whether that happened.
+        if arguments.get("provenance"):
+            acked = pr_provenance.accepted_urls(out)
+            if acked:
+                _log(f"{label}PR evidence recorded by the server: {', '.join(acked)}")
+            elif pr_provenance.has_provenance_ack(out):
+                _log(f"{label}PR evidence NOT accepted by the server (it will be retried "
+                     "from the transcript at the next flush)")
+            else:
+                _log(f"{label}server predates PR evidence; URL not recorded")
         # Retract any earlier failure on this path. Without it a single
         # throttled slice would keep warning for a day even though the backstop
         # went on to work — the same crying-wolf the per-turn hook clears with
