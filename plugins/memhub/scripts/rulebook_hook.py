@@ -7,7 +7,9 @@ Lanes (the mode argument):
            slot (measured 4% vs 88% for in-flight), so it carries worldview,
            never enforcement.
   pre      PreToolUse: proactive advisories at the violation moment (on="bash",
-           "edit", "write_stdlib") and the ordering-rule GATE (on="ordering").
+           "edit", "read", "write_stdlib") and the ordering-rule GATE (on="ordering").
+           A read rule sees the Read tool AND the shell forms that pull a file
+           into context (cat/head/tail/less/more/sed -n on a path).
   post     PostToolUse: reactive advisories on failing/erroring results
            (on="result"); ordering-rule ARM (edit-family) and RECEIPT (bash).
   fetch    Refresh the server book for one repo (GET /rules?view=hook with
@@ -50,11 +52,16 @@ How a fire reaches people (spec §5.3):
     marker in the content, which allows that write and stays in the diff. The
     edit marker must name its rule BECAUSE it stays: an unnamed one would mean
     a different thing the day a second edit gate covers that line, and it is
-    the form that content copied from elsewhere satisfies by accident. Either way the fire
+    the form that content copied from elsewhere satisfies by accident. A Read
+    tool call has neither a prefix nor content, so a blocked read is retried
+    narrower (`offset`/`limit`), delegated to a subagent, or — when the whole
+    file must enter THIS context — run as `RULEBOOK_OVERRIDE='<why>' cat
+    <path>`, which is the Bash lane's override and records like one. Either way the fire
     records its own `override_reason`, and the next matching call is gated
-    again. Gates are never deduped and never cut by the advisory cap. Both
-    lanes gate because the hook sees them BEFORE they run — an edit rule
-    matches `tool_input`, the content the tool is about to write. A result
+    again. Gates are never deduped and never cut by the advisory cap. All
+    three lanes gate because the hook sees them BEFORE they run — an edit rule
+    matches `tool_input`, the content the tool is about to write, and a read
+    rule the path a call is about to pull in. A result
     rule runs after the fact and cannot gate, and neither can the synthetic
     lane that finds files a shell command already wrote.
   * A gate is honoured from whatever book is cached, however old. There is no
@@ -91,11 +98,13 @@ Two engines, one evaluate():
 
 A matcher rule may also carry a `given` block — predicates the call must
 satisfy AFTER its regex matched: `repo` facts (branch, what the branch has
-changed against its base, a dirty tree) and `user` facts (what the person
-typed this session). They are answered by `Probes`, lazily and once per hook
-call, from read-only git and the local transcript; a fact that cannot be
-established never satisfies a predicate, so the rule stays silent. `given_ok()`
-is pure over a Probes, which is how the verifier feeds it fixtures.
+changed against its base, a dirty tree), `user` facts (what the person
+typed this session), `file` facts (how much a read would pull into context)
+and `agent` facts (main agent or subagent). They are answered by `Probes`,
+lazily and once per hook call, from read-only git, the local transcript and
+the file the call names; a fact that cannot be established never satisfies a
+predicate, so the rule stays silent. `given_ok()` is pure over a Probes and
+the event's read facts, which is how the verifier feeds it fixtures.
 """
 import fnmatch
 import hashlib
@@ -177,6 +186,9 @@ FLUSH_EVERY_FIRES = 10       # Stop-hook throttle: flush when this many rows wai
 FLUSH_EVERY_S = 300          # …or this long has passed since the last flush
 FLUSH_BATCH = 200
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+READ_TOOLS = ("Read",)
+BASH_READ_MAX_FILES = 8            # read segments named per Bash call; past that it is a script, not a read
+READ_COUNT_MAX_BYTES = 64 << 20    # lines are counted this far; a file past it is over any threshold anyone sets
 # A Bash call that wrote files is an edit too (see `bash_written_files`).
 BASH_EDIT_MAX_FILES = 40            # more than this in one call is a generator, not an edit
 BASH_EDIT_MAX_BYTES = 512 * 1024    # per file; bigger is data, not source
@@ -412,6 +424,188 @@ def bash_written_files(root, cmd, since):
     return out
 
 
+# ── files a Bash call READS into context ────────────────────────────────────
+#
+# A read rule (`event: read`) is about what enters the model's context. The
+# Read tool is one door; `cat`, `head`, `tail`, `less`, `more` and `sed` on a
+# path are the other, and in auto mode the model is TOLD to use them.
+# Measured on 14 days of local sessions: 3,123 Read calls with a median file
+# of 22 lines, against 1,113 bare cat/head/tail segments — and 67 of the 80
+# largest tool results were whole-file shell dumps. A rule that watched only
+# the Read tool would have missed every one of those.
+#
+# Read from the COMMAND, not the disk after the fact: this lane must gate, and
+# a gate can only refuse a call it sees before it runs. A pipe (`cat f |
+# grep`) or a redirect (`cat f > out`) is not a read into context and is
+# skipped, and so is any form this parser cannot name — every doubt resolves
+# to "no read here", which under-counts and never false-fires. `cd` is
+# tracked segment by segment, because `cd <repo> && cat spec.md` is how a
+# real command reads a relative path, and it is the form a prefix-anchored
+# hook (`^cat`) misses entirely.
+
+_READ_CMDS = ("cat", "head", "tail", "less", "more", "sed")
+# stdout going somewhere other than the context: `> f`, `>> f`, `&> f`, and a
+# heredoc opener (its stdin is data). `2>/dev/null` and `2>&1` are not that.
+_REDIRECT_RX = re.compile(r"(?<![0-9&<])>(?!&)|&>|<<")
+_SED_RANGE_RX = re.compile(r"^(\d+)(?:,(\+)?(\d+|\$))?p$")
+_LINES_FLAG_RX = re.compile(r"^(?:-n|--lines=)(\d+)$|^-(\d+)$")
+
+
+def _head_tail_lines(args):
+    """(lines printed, indices of the flag VALUES) for `head`/`tail`: 10 by
+    default, `-N`, `-n N`, `-nN`, `--lines=N`. (None, None) for a form this
+    does not name (`-c` bytes, `-n +N`) — not a read this can measure."""
+    n, i, used = 10, 0, set()
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--bytes") or a.startswith("--bytes=") or a.startswith("-c"):
+            return None, None
+        if a in ("-n", "--lines"):
+            if i + 1 >= len(args) or not args[i + 1].isdigit():
+                return None, None
+            n, used, i = int(args[i + 1]), used | {i + 1}, i + 2
+            continue
+        m = _LINES_FLAG_RX.match(a)
+        if m:
+            n = int(m.group(1) or m.group(2))
+        i += 1
+    return n, used
+
+
+def _sed_lines(args):
+    """(lines printed, indices that are not files) for a `sed` that prints
+    to stdout. `-n 'A,Bp'` is a range, `-n 'Ap'` one line, `-n '1,$p'` the
+    whole file; `sed s/a/b/ f` with no -n prints every line. `-i` writes in
+    place and prints nothing, and a script this cannot read is not a read —
+    both answer (None, None)."""
+    if any(a == "-i" or a.startswith("-i") or a == "--in-place" for a in args):
+        return None, None
+    quiet, script, used, i = False, None, set(), 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-n", "--quiet", "--silent"):
+            quiet = True
+        elif a in ("-e", "--expression", "-f", "--file"):
+            if i + 1 < len(args):
+                used.add(i + 1)
+                if a in ("-e", "--expression"):
+                    script = args[i + 1]
+            i += 2
+            continue
+        elif a.startswith("-"):
+            pass
+        elif script is None:
+            script, used = a, used | {i}
+        i += 1
+    if script is None:
+        return None, None
+    if not quiet:
+        return None, used               # prints the whole file, transformed
+    m = _SED_RANGE_RX.match(script.replace(" ", ""))
+    if not m:
+        return None, None               # `/x/,/y/p` and friends: not a read we can measure
+    a, plus, b = int(m.group(1)), m.group(2), m.group(3)
+    if b is None:
+        return 1, used
+    if b == "$":
+        return None, used
+    return (int(b) + 1 if plus else max(int(b) - a + 1, 0)), used
+
+
+def bash_reads(cwd, cmd):
+    """(path, pulled) for each file a Bash call would print into the context;
+    `pulled` is the line count the form asks for, None meaning every line.
+    Relative paths resolve where the command runs, `cd` included. Anything
+    this cannot name is not a read — the list is empty on every doubt."""
+    out = []
+    here = os.path.expanduser(cwd or "") or os.getcwd()
+    for seg in re.split(r"&&|\|\||;|\n", shell_only(cmd or "")):
+        seg = strip_leading_assignments(seg.strip()).strip()
+        if not seg:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        if toks[0] == "cd":
+            target = os.path.expanduser(toks[1]) if len(toks) > 1 else os.path.expanduser("~")
+            here = target if os.path.isabs(target) else os.path.normpath(os.path.join(here, target))
+            continue
+        if "|" in seg or _REDIRECT_RX.search(seg):
+            continue
+        name = os.path.basename(toks[0])
+        if name not in _READ_CMDS:
+            continue
+        args, pulled, used = toks[1:], None, set()
+        if name in ("head", "tail"):
+            pulled, used = _head_tail_lines(args)
+            if used is None:
+                continue
+        elif name == "sed":
+            pulled, used = _sed_lines(args)
+            if used is None:
+                continue
+        # a token with `<` or `>` in it is a redirection operand (`2>/dev/null`),
+        # never a file to read
+        files = [a for i, a in enumerate(args)
+                 if i not in used and a != "-" and not a.startswith("-") and "<" not in a and ">" not in a]
+        for f in files:
+            path = os.path.expanduser(f)
+            if not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(here, path))
+            out.append((path, pulled))
+            if len(out) >= BASH_READ_MAX_FILES:
+                return out
+    return out
+
+
+def read_facts(path, pulled=None, offset=None, limit=None, total=None):
+    """{"lines": n, "bytes": b} — what this read would pull into the context:
+    the file's length, narrowed by the Read tool's `offset`/`limit` or by the
+    line count a shell form asks for. None when the path is not a regular
+    file, and None never satisfies a `given.file` predicate: a rule about a
+    file it cannot measure stays silent. `total` pre-answers the line count —
+    the verifier's way in, so a case needs no real file."""
+    try:
+        size = None
+        if total is None:
+            st = os.stat(path)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            size, total, seen, last = st.st_size, 0, 0, b"\n"
+            with open(path, "rb") as f:
+                while seen < READ_COUNT_MAX_BYTES:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += chunk.count(b"\n")
+                    seen += len(chunk)
+                    last = chunk[-1:]
+            if seen and last != b"\n":
+                total += 1                # a last line without a newline is still a line
+        total = int(total)
+        n = total
+        if offset is not None:
+            try:
+                n = max(total - max(int(offset), 1) + 1, 0)
+            except (TypeError, ValueError):
+                pass
+        for cap in (limit, pulled):
+            if cap is not None:
+                try:
+                    n = min(n, max(int(cap), 0))
+                except (TypeError, ValueError):
+                    pass
+        nbytes = None
+        if size is not None:
+            nbytes = size if n >= total else (int(size * n / total) if total else 0)
+        return {"lines": n, "bytes": nbytes}
+    except Exception:
+        return None
+
+
 def read_edit_body(path, is_new=True):
     """What an edit rule reads for a Bash-written file, matching what it
     reads for the tools: a NEW file is the whole file (a Write), a MODIFIED
@@ -473,6 +667,18 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
                 return not (rule.get("content_not_rx")
                             and re.search(rule["content_not_rx"], body, re.M))
             return False
+        if hook_phase == "pre" and on == "read" and tool in READ_TOOLS and file_path:
+            # Which file, not how much: size is a `given.file` fact, answered
+            # per event, so the same rule reads the same on the Read tool and
+            # on a `cat`. A read that came through a shell command honours the
+            # rule's command exemption — the veto a bash rule gets.
+            if rule.get("path_rx") and not re.search(rule["path_rx"], file_path):
+                return False
+            if rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path):
+                return False
+            if cmd and rule.get("not_rx") and re.search(rule["not_rx"], cmd, re.I):
+                return False
+            return True
         if hook_phase == "pre" and on == "write_stdlib" and tool == "Write" \
                 and file_path.endswith(".py") and "scratchpad" not in file_path \
                 and not (rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)) \
@@ -660,6 +866,14 @@ _GIVEN = {
              "diff_files_gt": "int", "diff_paths_rx": "rx", "diff_paths_none_rx": "rx",
              "dirty": "bool"},
     "user": {"said_rx": "rx", "not_said_rx": "rx"},
+    # what a read would pull into context — answered per EVENT (`read_facts`),
+    # not per call, so a `cat a b` is measured file by file
+    "file": {"lines_gt": "int", "bytes_gt": "int"},
+    # main agent vs subagent (transcript under <session>/subagents/). A rule
+    # about the main context's budget says `main: true`, and a subagent's
+    # reads pass — delegation is the way past the rule, so it must not gate
+    # the delegate.
+    "agent": {"main": "bool"},
 }
 
 
@@ -780,11 +994,13 @@ class Probes:
     `fixture` pre-answers probes by name — the verifier's and the tests' way
     in, so given_ok() never needs a real repo to be exercised."""
 
-    def __init__(self, root, branch, transcript_path=None, fixture=None, command=""):
+    def __init__(self, root, branch, transcript_path=None, fixture=None, command="",
+                 agent_id=None):
         self.root, self._branch, self.tp = root, branch, transcript_path
         self._fix = dict(fixture or {})
         self._memo = {}
         self._cmd = command or ""
+        self._agent_id = agent_id
 
     def _get(self, key, compute):
         if key in self._fix:
@@ -935,13 +1151,28 @@ class Probes:
     def user_turns(self):
         return self._get("user_turns", lambda: user_turns_of(self.tp))
 
+    def agent_main(self):
+        """True for the main agent, False inside a subagent — read off the
+        transcript path, the one place the harness says which this is."""
+        return self._get("agent_main", lambda: self._agent_id is None)
 
-def given_ok(rule, probes):
+
+def given_ok(rule, probes, read=None):
     """True when every predicate in the rule's `given` holds. Pure over the
-    Probes (which memoizes); a probe answering None fails its predicate."""
+    Probes (which memoizes) and `read`, the event's own `read_facts`; a probe
+    answering None — or a `file` predicate with no facts — fails."""
     g = rule.get("given")
     if not g:
         return True
+    for k, v in (g.get("file") or {}).items():
+        have = (read or {}).get({"lines_gt": "lines", "bytes_gt": "bytes"}.get(k, ""))
+        if have is None or not have > v:
+            return False
+    for k, v in (g.get("agent") or {}).items():
+        if k == "main":
+            m = probes.agent_main()
+            if m is None or m != v:
+                return False
     for k, v in (g.get("repo") or {}).items():
         if k == "branch_rx":
             b = probes.branch()
@@ -2418,7 +2649,7 @@ def main():
         probe_root = elsewhere
         probe_branch = _branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
     probes = Probes(probe_root, probe_branch, command=cmd_text,
-                    transcript_path=data.get("transcript_path"))
+                    transcript_path=data.get("transcript_path"), agent_id=ctx["agent_id"])
 
     if mode == "session":
         # Fetch BEFORE rendering, but only when the book is old enough to be
@@ -2485,7 +2716,7 @@ def main():
     # then receipt — the other order would arm an obligation the same call
     # already discharged.
     real = {"tool": tool, "phase": mode, "order_phase": mode, "cmd": cmd, "fp": fp,
-            "body": body, "rtext": rtext, "resp": resp, "via": None}
+            "body": body, "rtext": rtext, "resp": resp, "via": None, "read": None}
     events = []
     if tool == "Bash":
         marks = st.setdefault("bash_t0", {})
@@ -2509,6 +2740,20 @@ def main():
                                    "cmd": "", "fp": path, "body": text, "rtext": "",
                                    "resp": None, "via": "bash"})
     events.append(real)
+    # Reads (§5.1): what this call would pull into the context. The Read tool
+    # is the call itself; a Bash call contributes one synthetic Read per file
+    # a cat/head/tail/less/more/sed segment names, in the pre phase, because
+    # unlike a written file these have not happened yet and CAN be refused.
+    # Measured only when a read rule is armed: a line count is one file walk.
+    wants_reads = mode == "pre" and any(r.get("on") == "read" and r.get("status", "active") == "active"
+                                        for r in rules)
+    if wants_reads and tool in READ_TOOLS and fp:
+        real["read"] = read_facts(fp, offset=inp.get("offset"), limit=inp.get("limit"))
+    elif wants_reads and tool == "Bash" and cmd:
+        for path, pulled in bash_reads(cwd, cmd):
+            events.append({"tool": "Read", "phase": "pre", "order_phase": "pre", "cmd": cmd,
+                           "fp": path, "body": "", "rtext": "", "resp": None,
+                           "via": "bash-read", "read": read_facts(path, pulled=pulled)})
 
     # Conversions: did this call perform the action an earlier fire asked for?
     # Deterministic, under-counts, never over-counts (spec §5.1).
@@ -2591,22 +2836,27 @@ def main():
                     fired_on[rid] = ev
                 continue
 
-            if not path_in_scope(r, efp if etool in EDIT_TOOLS else "", root):
+            if not path_in_scope(r, efp if etool in EDIT_TOOLS + READ_TOOLS else "", root):
                 continue
             scope = r.get("fire_scope", "session")
             # A gate blocks EVERY matching call — never deduped (§5.3), in
-            # either lane the hook can refuse: a Bash command, or an edit the
-            # tool has not written yet. `via` guards the difference: a
-            # synthetic edit event is a file a command ALREADY wrote, so it
-            # cannot be refused and keeps its rule's ordinary dedup.
-            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") is None \
+            # any lane the hook can refuse: a Bash command, an edit the tool
+            # has not written yet, or a read — the Read tool's own, or one a
+            # Bash segment is about to make. `via` guards the difference: a
+            # synthetic EDIT event is a file a command ALREADY wrote, so it
+            # cannot be refused and keeps its rule's ordinary dedup; a
+            # synthetic READ has not happened, and refusing the command is
+            # refusing the read.
+            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") in (None, "bash-read") \
                     and ((etool == "Bash" and r.get("on") == "bash")
-                         or (etool in EDIT_TOOLS and r.get("on") == "edit")):
+                         or (etool in EDIT_TOOLS and r.get("on") == "edit")
+                         or (etool in READ_TOOLS and r.get("on") == "read")):
                 scope = "call"
             key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
             # the regex first (pure, cheap), the given second (probes run only now)
             matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
-                               body=ebody, result_text=ev["rtext"]) and given_ok(r, probes)
+                               body=ebody, result_text=ev["rtext"]) \
+                and given_ok(r, probes, read=ev.get("read"))
             if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
                 if matched:
                     st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
@@ -2640,10 +2890,13 @@ def main():
     def _gateable(r):
         if mode != "pre" or r.get("mode") != "gate":
             return False
-        if (fired_on.get(r["id"]) or {}).get("via") == "bash":
+        via = (fired_on.get(r["id"]) or {}).get("via")
+        if via == "bash":
             return False
         if tool == "Bash":
-            return r.get("on") in ("bash", "ordering")
+            return r.get("on") in ("bash", "ordering") or (r.get("on") == "read" and via == "bash-read")
+        if tool in READ_TOOLS:
+            return r.get("on") == "read"
         return tool in EDIT_TOOLS and r.get("on") == "edit"
 
     gate_ids = {r["id"] for r in fired_now if _gateable(r)}
@@ -2697,11 +2950,15 @@ def main():
         knows which file a Write was, but a heredoc's target is buried in
         the command it just ran."""
         ev = fired_on.get(r["id"])
-        if not ev or ev.get("via") != "bash":
+        if not ev or ev.get("via") not in ("bash", "bash-read"):
             return ""
         path = ev["fp"]
         if root and path.startswith(root.rstrip("/") + "/"):
             path = os.path.relpath(path, root)
+        if ev.get("via") == "bash-read":
+            n = (ev.get("read") or {}).get("lines")
+            return f" _(`{path}`, {n} lines, read by that command)_" if n is not None \
+                else f" _(`{path}`, read by that command)_"
         return f" _(in `{path}`, written by that command)_"
 
     for r in shown:
@@ -2712,13 +2969,13 @@ def main():
             user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}")
         elif r["id"] in overridden:
             why = overridden[r["id"]]
-            lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)} "
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)} "
                          f"_(gate overridden: {why})_")
             user_lines.append(f"{BRAND} ⚠ gate overridden — [{label}] {why}")
         else:
-            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_why(r)}")
-            user_lines.append(f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}")
-            deny_lines.append(f"[{label}] {r['text']}{detail}")
+            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
+            user_lines.append(f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}")
+            deny_lines.append(f"[{label}] {r['text']}{detail}{_where(r)}")
     deny = None
     if blocked:
         # Each lane names the override it actually accepts: an Edit tool call
@@ -2728,6 +2985,15 @@ def main():
         if tool == "Bash":
             how = ("re-run the same command prefixed RULEBOOK_OVERRIDE='<why>' — that allows "
                    "exactly that call and records why")
+        elif tool in READ_TOOLS:
+            # No prefix and no content on a Read call. The ways past are the
+            # ways the rule wants: a narrower read, or a delegate whose ANSWER
+            # comes back instead of the file. The recorded override rides the
+            # Bash lane, which is the one that can carry a reason.
+            how = ("read only the part you need (`offset`/`limit`), or hand the question to a "
+                   "subagent so its answer, not the file, enters this context; if the whole "
+                   "file must be read here, run RULEBOOK_OVERRIDE='<why>' cat <path> in Bash — "
+                   "that allows exactly that read and records why")
         else:
             # Always the named form: a marker stays in the file, so it has to
             # say which rule it answers to the reader who finds it later.
@@ -2756,6 +3022,8 @@ def main():
         ev = fired_on.get(r["id"])
         if ev and ev.get("via") == "bash":
             return f"bash-edit {ev['fp']}"
+        if ev and ev.get("via") == "bash-read":
+            return f"bash-read {ev['fp']}"
         return cmd or fp or ""
 
     ids = {}

@@ -35,6 +35,17 @@ object: {"case": "git push", "branch": "main", "diff_paths": [...],
 "diff_lines": 620, "dirty": true, "user_said": ["please push it"]}.
 No git runs and no transcript is read — the fixture IS the repo.
 
+For a `read` rule a case is the Read tool (`read:<path>`, narrowed with
+`@<offset>,<limit>` or `@<limit>`) or a shell command run through the same
+parser the hook uses (`bash:<command>`, relative paths against `--cwd`).
+`--file-lines N` stands in for the file's length so a case needs no real
+file; `--agent-main false` runs the case as a subagent:
+
+  --fires  'read:/repo/src/service.py' --file-lines 900 \
+  --silent 'read:/repo/src/service.py@1,200' \
+  --silent 'bash:cat src/service.py | head -50' \
+  --silent 'bash:cat src/service.py' --agent-main false
+
 An `ordering` rule is verified as a SEQUENCE of steps joined by ` >> `, ending
 in the gated call; the case fires when that call is gated:
 
@@ -56,7 +67,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rulebook_hook as H  # noqa: E402  (path set above so the engine is importable)
 
-_FIXTURE_KEYS = ("branch", "diff_paths", "diff_lines", "dirty", "user_said")
+_FIXTURE_KEYS = ("branch", "diff_paths", "diff_lines", "dirty", "user_said",
+                 "file_lines", "agent_main", "cwd")
 
 
 # `create_rule` takes the matcher nested; the hook reads a flat row. Build the
@@ -98,6 +110,7 @@ def _probes(fixture: dict) -> "H.Probes":
            "diff_lines": fixture.get("diff_lines"),
            "dirty": fixture.get("dirty"),
            "user_turns": list(fixture["user_said"]) if "user_said" in fixture else None,
+           "agent_main": fixture.get("agent_main", True),
            "base": None}
     return H.Probes("", pre["branch"], fixture=pre)
 
@@ -132,10 +145,42 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
     return outcome == "fired"
 
 
+def _read_fires(hook_rule: dict, raw: str, fixture: dict) -> bool:
+    """`read:<path>[@<offset>,<limit>|@<limit>]` is the Read tool; `bash:<cmd>`
+    goes through `bash_reads`, the parser the hook runs on a shell command,
+    and fires if ANY file it names does. `file_lines` stands in for the
+    length of every file in the case; without it the path is measured on
+    disk, and a path that does not exist has no facts and never fires."""
+    kind, sep, rest = raw.partition(":")
+    total = fixture.get("file_lines")
+    probes = _probes(fixture)
+    if kind == "bash" and sep:
+        for path, pulled in H.bash_reads(fixture.get("cwd") or os.getcwd(), rest):
+            if H.evaluate(hook_rule, hook_phase="pre", tool="Read", cmd=rest, file_path=path) \
+                    and H.given_ok(hook_rule, probes, read=H.read_facts(path, pulled=pulled, total=total)):
+                return True
+        return False
+    if kind != "read" or not sep:
+        raise ValueError("a read rule's case is 'read:<path>[@offset,limit]' or 'bash:<command>'")
+    path, offset, limit = rest, None, None
+    if "@" in rest:
+        path, _, span = rest.rpartition("@")
+        a, _, b = span.partition(",")
+        try:
+            offset, limit = (int(a), int(b)) if b else (None, int(a))
+        except ValueError:
+            raise ValueError("the narrowing after '@' is '<offset>,<limit>' or '<limit>'") from None
+    facts = H.read_facts(path, offset=offset, limit=limit, total=total)
+    return bool(H.evaluate(hook_rule, hook_phase="pre", tool="Read", file_path=path)) \
+        and H.given_ok(hook_rule, probes, read=facts)
+
+
 def _fires(hook_rule: dict, raw: str, fixture: dict | None = None) -> bool:
     on = hook_rule.get("on")
     if on == "ordering":
         return _ordering_fires(hook_rule, raw)
+    if on == "read":
+        return _read_fires(hook_rule, raw, fixture or {})
     path, content = _split_case(raw)
     if on in ("edit", "write", "write_stdlib"):
         hit = H.evaluate(hook_rule, hook_phase="pre", tool="Edit",
@@ -289,6 +334,11 @@ def main() -> int:
     fx.add_argument("--dirty", type=_bool, help="whether the working tree has changes")
     fx.add_argument("--user-said", action="append", default=None, metavar="TEXT",
                     help="a user turn from this session (repeatable; none given = no transcript)")
+    fx.add_argument("--file-lines", type=int, metavar="N",
+                    help="read rules: the length of every file a case names (no real file needed)")
+    fx.add_argument("--agent-main", type=_bool, metavar="BOOL",
+                    help="read rules: false runs the case inside a subagent (default true)")
+    fx.add_argument("--cwd", help="read rules: where a 'bash:' case's relative paths resolve")
     args = ap.parse_args()
 
     raw = args.rule
@@ -312,6 +362,12 @@ def main() -> int:
         fixture["dirty"] = args.dirty
     if args.user_said is not None:
         fixture["user_said"] = args.user_said
+    if args.file_lines is not None:
+        fixture["file_lines"] = args.file_lines
+    if args.agent_main is not None:
+        fixture["agent_main"] = args.agent_main
+    if args.cwd is not None:
+        fixture["cwd"] = args.cwd
 
     fires, silent = list(args.fires), list(args.silent)
     if args.cases:
