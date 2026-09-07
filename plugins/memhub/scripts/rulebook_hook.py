@@ -17,7 +17,9 @@ Lanes (the mode argument):
            behind a sent-watermark (ledger/.sent). `flush final` ignores the
            every-N-fires / every-M-minutes throttle.
 
-Book = the server book, fetched once per session and cached with its ETag.
+Book = the server book, cached with its ETag. SessionStart re-fetches a stale
+one BEFORE the digest renders (a fresh one just spawns the detached child), and
+the pre lane refreshes it in the background once it is a minute old.
 Offline → the cached book; no cache → no rules. There is no local rule file:
 rules are authored through the memhub `create_rule` tool.
 
@@ -58,7 +60,7 @@ How a fire reaches people (spec §5.3):
   * A gate is honoured from whatever book is cached, however old. There is no
     timer that turns a gate off: a rule retired on the server disappears at
     the next successful fetch, and a running session refreshes its own book
-    once it is an hour old (pre lane, detached, throttled). A stale gate costs
+    once it is a minute old (pre lane, detached, throttled). A stale gate costs
     one `RULEBOOK_OVERRIDE`; a gate that silently stops enforcing because the
     server was unreachable for a day is the failure a gate exists to prevent.
 
@@ -154,8 +156,9 @@ RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the t
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
-REFRESH_AFTER_S = 3600       # pre lane: refresh a book this old in the background…
-REFRESH_RETRY_S = 600        # …and retry no more than this often while the server is down
+REFRESH_AFTER_S = 60         # pre lane: refresh a book this old in the background…
+REFRESH_RETRY_S = 60         # …and retry no more than this often while the server is down
+SESSION_FETCH_TIMEOUT_S = 1.0   # session lane: the ONE blocking fetch, and only on a stale book
 API_PATH = "/v1/team/rulebook"
 
 
@@ -1265,9 +1268,9 @@ def maybe_refresh(repo, fetched_at):
     """A session outlives its SessionStart fetch — a /loop or an overnight
     babysit runs for days on the book it started with, and a gate flipped
     back to advise on the server would keep blocking it until restart. Once
-    the cache is an hour old, refresh it in the background: the child is
+    the cache is a minute old, refresh it in the background: the child is
     detached, so the lane never waits, and the stamp file keeps a dead server
-    from being probed more than once every ten minutes. No cache at all
+    from being probed more than once a minute. No cache at all
     counts as infinitely old, so a session whose start-up fetch failed gets
     retried here too."""
     if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0":
@@ -1284,7 +1287,7 @@ def maybe_refresh(repo, fetched_at):
     try:
         # The stamp records the ATTEMPT, so it goes first: a fork that fails
         # under resource pressure must not be retried on every tool call, and
-        # ten minutes before the next try costs at most one override on a rule
+        # a minute before the next try costs at most one override on a rule
         # the server has since retired. The other order was tried and reverted.
         _atomic_json(stamp, {"at": _now()})
         spawn_fetch(repo)
@@ -1346,7 +1349,7 @@ def _api():
     return pak.api_base(url), bearer, mcp_http
 
 
-def fetch_book(repo):
+def fetch_book(repo, timeout=None):
     """GET /rules?repo=<repo>&view=hook with If-None-Match.
 
     No `status=` param: `view=hook` serves ACTIVE rules on its own, and the
@@ -1365,7 +1368,7 @@ def fetch_book(repo):
     q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
-                          timeout=FETCH_TIMEOUT_S)
+                          timeout=timeout or FETCH_TIMEOUT_S)
     except Exception as exc:          # keep the cache; say so where an operator can look
         _breadcrumb("fetch", exc)
         return
@@ -1448,9 +1451,11 @@ RECALL_TIMEOUT_S = _timeout(1.5)   # inside the PreToolUse hook budget; fail ope
 def recall_anchor_rules(repo, tool, handles, already_fired):
     """POST /recall — the server runs the book's anchor rules through xmem's
     directive funnel (identifier extraction → exact anchor match → the SLM
-    relevance judge). Returns the kept rule ids, or [] on ANY failure: an
-    anchor being present is not relevance, and a judge outage is never a
-    reason to block or slow the call."""
+    relevance judge). Returns the kept server ROWS (not ids: the reply
+    carries title/statement/version/anchors, which is a whole rule, and the
+    caller needs them for a rule its cached book does not have yet), or [] on
+    ANY failure: an anchor being present is not relevance, and a judge outage
+    is never a reason to block or slow the call."""
     try:
         api = _api()
         if not api:
@@ -1465,7 +1470,7 @@ def recall_anchor_rules(repo, tool, handles, already_fired):
         # The lane's only record of working. Zero kept rules is still a success:
         # what is being retracted is "recall is failing", not "a rule matched".
         _breadcrumb_clear("recall")
-        return [str(r.get("rule_id")) for r in reply.data.get("rules") or []
+        return [r for r in reply.data.get("rules") or []
                 if isinstance(r, dict) and r.get("rule_id")]
     except Exception as exc:
         _breadcrumb("recall", exc)
@@ -2416,16 +2421,30 @@ def main():
                     transcript_path=data.get("transcript_path"))
 
     if mode == "session":
+        # Fetch BEFORE rendering, but only when the book is old enough to be
+        # wrong. The digest is a session's only view of the book, and rendering
+        # from the cache first made it show the PREVIOUS session's rules: a rule
+        # activated or paused on the server needed two session starts to appear
+        # or to go away. A book younger than the pre lane's refresh window is
+        # already current, so it keeps the detached spawn and SessionStart pays
+        # nothing — the common case, since the pre lane refreshed it minutes
+        # ago. Only a stale book is worth waiting for, and never longer than
+        # SESSION_FETCH_TIMEOUT_S: `fetch_book` leaves the cache untouched on
+        # every failure path, so a timeout renders exactly what we already had.
+        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
+            try:
+                if _age_s(fetched_at) >= REFRESH_AFTER_S:
+                    fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
+                    rules, _, fetched_at, sources = load_rules(repo)
+                else:
+                    spawn_fetch(repo)
+            except Exception:
+                pass
         try:        # which source each rule came from — the pilot's merge audit
             _atomic_json(book_path(repo) + ".sources", {"at": _now(), "sources": sources})
         except Exception:
             pass
         session_digest(rules, repo, gitdir, ctx)
-        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
-            try:
-                spawn_fetch(repo)
-            except Exception:
-                pass
         return 0
     if mode == "pre":
         maybe_refresh(repo, fetched_at)
@@ -2529,9 +2548,17 @@ def main():
         handles["file_path"] = fp
     if mode == "pre" and anchor_rules and handles \
             and os.environ.get("MEMHUB_RULEBOOK_RECALL", "1") != "0":
-        for rid in recall_anchor_rules(repo, tool, handles, st["fired"]):
-            r = anchor_rules.get(rid)
-            if r is not None:
+        for row in recall_anchor_rules(repo, tool, handles, st["fired"]):
+            rid = str(row.get("rule_id"))
+            # Prefer the cached rule — it carries scope and the book facts the
+            # wire row omits. Otherwise build one from the reply: the server
+            # matched this rule, judged it relevant and scoped it to this repo,
+            # and dropping it because our book predates it is exactly how a
+            # newly activated anchor rule stayed silent until the next fetch.
+            # Safe unseen: recall rules can only advise (server §4.7) and
+            # `to_hook_rule` defaults `mode` to advise, so no gate arrives here.
+            r = anchor_rules.get(rid) or to_hook_rule(row)
+            if r is not None and r.get("on") == "anchor":
                 st["fired"].append(rid)
                 dedup_keys[rid] = rid
                 fired_now.append(r)

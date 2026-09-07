@@ -592,7 +592,7 @@ def main():
               and "500" in json.load(open(os.path.join(td, "ledger", ".last_error"), encoding="utf-8"))["error"])
         run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), on)
         time.sleep(0.5)
-        check("refresh: still stale, but the stamp throttles — no second probe inside ten minutes",
+        check("refresh: still stale, but the stamp throttles — no second probe inside the retry window",
               len(fake.requests) == n0 + 1)
         with open(stamp, "w", encoding="utf-8") as f:
             json.dump({"at": (now - timedelta(minutes=20)).astimezone().isoformat(timespec="seconds")}, f)
@@ -610,6 +610,32 @@ def main():
         run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), on)
         time.sleep(0.5)
         check("refresh: a fresh book spawns nothing", len(fake.requests) == n1)
+
+        # ── the digest shows the server's book, not the last session's ──────
+        # Rendering the digest from the cache BEFORE fetching made SessionStart
+        # serve the PREVIOUS session's rules: a rule activated or paused on the
+        # server took two session starts to appear or to go away.
+        fake.etag = '"v-fresh"'
+        fake.rules = fake.rules + [
+            {"rule_id": "s-new", "title": "fresh posture", "statement": "FRESHLY ACTIVATED",
+             "delivery": "session_context", "status": "active", "mode": "advise",
+             "version": 1, "scope_repos": []}]
+        stale_book = json.load(open(cache, encoding="utf-8"))
+        stale_book["fetched_at"] = (now - timedelta(hours=2)).astimezone().isoformat(timespec="seconds")
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(stale_book, f)
+        rc, out = run("session", {"cwd": repo, "session_id": "digest1"}, on)
+        check("session: a stale book is refetched BEFORE the digest renders",
+              "FRESHLY ACTIVATED" in ctx(out), ctx(out))
+        n2 = len(fake.requests)
+        rc, out = run("session", {"cwd": repo, "session_id": "digest2"}, on)
+        deadline = time.monotonic() + 8
+        while len(fake.requests) == n2 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.5)                        # room for a second child, if one were spawned
+        check("session: …and a fresh book renders from cache, refreshing detached",
+              "FRESHLY ACTIVATED" in ctx(out) and len(fake.requests) == n2 + 1,
+              f"{len(fake.requests) - n2} request(s)")
         rc, out = run("pre", dict(base, session_id="g1", tool_input={"command": "local-cmd"}),
                       dict(env, MEMHUB_TOKEN=""))
         check("no credential: tool lanes unaffected", rc == 0 and "LOCAL TEXT" in ctx(out))
