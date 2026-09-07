@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
@@ -393,6 +394,125 @@ with tempfile.TemporaryDirectory() as td:
         check([a["name"] for a in seen_args] == ["Free (free-spec.md)"], f"linked file skipped, unlinked file saved: {[a['name'] for a in seen_args]}")
         check(st["dirty"] == [] and str(owned) not in st["saved"], f"linked file leaves dirty without a digest (not retried): {st}")
         (root / ".claude" / "artifact-map.json").unlink()
+
+        # ---- git sweep: markdown written through Bash never enters `dirty` ----
+        # A harness that prefers shell edits (heredoc, sed -i) never fires the
+        # Edit/Write matcher; the flush asks git instead. Real repo, real git.
+        print("git sweep (Bash-written markdown)")
+        import room_map as rm
+        f.repo_root = rm.repo_root
+        f.read_room = lambda *a, **k: None
+        f._save = capture_save
+        repo = (root / "sweep").resolve(); repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@x",
+                                   "-c", "commit.gpgsign=false", *args], capture_output=True, text=True, check=True)
+        git("init", "-q")
+        (repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+        (repo / "docs").mkdir()
+        committed = repo / "docs" / "committed-spec.md"
+        committed.write_text("# Committed\n" + "c" * 7000, encoding="utf-8")
+        stale = repo / "docs" / "stale-spec.md"     # untracked, but left here BEFORE the session
+        stale.write_text("# Stale\n" + "s" * 7000, encoding="utf-8")
+        git("add", "docs/committed-spec.md", ".gitignore"); git("commit", "-q", "-m", "base")
+        time.sleep(1.1)                              # coarse-mtime filesystems: the session starts strictly later
+        since = time.time()
+        sid9 = "sess-md-sweep"
+        # what the collector's Bash mode writes: no dirty paths, just where the session works
+        mc.save_state(sid9, {"dirty": [], "saved": {}, "attempts": {}, "since": since, "cwds": [str(repo / "docs")]})
+        shell = repo / "docs" / "shell-spec.md"       # cat > docs/shell-spec.md <<EOF
+        shell.write_text("# Shell spec\n" + "u" * 7000, encoding="utf-8")
+        (repo / "docs" / "note.md").write_text("# small\n", encoding="utf-8")            # below floor
+        (repo / "ignored").mkdir(); (repo / "ignored" / "big.md").write_text("# I\n" + "i" * 7000, encoding="utf-8")
+        (repo / "node_modules" / "pkg").mkdir(parents=True)
+        (repo / "node_modules" / "pkg" / "README.md").write_text("# NM\n" + "n" * 7000, encoding="utf-8")   # veto location
+        (repo / "CLAUDE.md").write_text("# rules\n" + "r" * 7000, encoding="utf-8")                          # veto name
+        committed.write_text("# Committed\n" + "m" * 7000, encoding="utf-8")   # sed -i on a tracked file → modified
+        linked = repo / "docs" / "link-spec.md"; linked.symlink_to(shell)       # symlink → not read through
+        seen_args.clear()
+        asyncio.run(f.flush(sid9, str(repo)))
+        names = sorted(a["name"] for a in seen_args)
+        check(names == ["Committed (docs/committed-spec.md)", "Shell spec (docs/shell-spec.md)"],
+              f"untracked + modified .md above the floor are swept; small/ignored/veto/stale/symlink are not: {names}")
+        st = mc.load_state(sid9)
+        check(set(st["saved"]) == {str(shell), str(committed)}, f"digests recorded under canonical paths: {list(st['saved'])}")
+        check(st["dirty"] == [], "the sweep never writes into dirty")
+        seen_args.clear()
+        asyncio.run(f.flush(sid9, str(repo)))
+        check(seen_args == [], "second Stop, nothing changed → unchanged swept files are not re-saved")
+        # a path the Write collector ALSO recorded is saved once, not twice
+        shell.write_text("# Shell spec\n" + "v" * 7000, encoding="utf-8")
+        st = mc.load_state(sid9); st["dirty"] = [str(shell)]; mc.save_state(sid9, st)
+        seen_args.clear()
+        asyncio.run(f.flush(sid9, str(repo)))
+        check([a["name"] for a in seen_args] == ["Shell spec (docs/shell-spec.md)"], f"path in both dirty and the sweep → one save: {[a['name'] for a in seen_args]}")
+        check(mc.load_state(sid9)["dirty"] == [], "the dirty entry is cleared by that save")
+        # committed and clean is not this session's work: a never-saved big
+        # .md that is committed must NOT be swept
+        never = repo / "docs" / "never-saved-spec.md"; never.write_text("# Never\n" + "z" * 7000, encoding="utf-8")
+        git("add", "-A"); git("commit", "-q", "-m", "clean")
+        seen_args.clear()
+        asyncio.run(f.flush(sid9, str(repo)))
+        check(seen_args == [], f"committed-clean .md (never saved) is not swept: {[a['name'] for a in seen_args]}")
+        # the Stop payload's cwd is a sweep root even when the state recorded none
+        mc.save_state(sid9, {"dirty": [], "saved": {}, "attempts": {}, "since": since})
+        (repo / "docs" / "late-spec.md").write_text("# Late\n" + "l" * 7000, encoding="utf-8")
+        seen_args.clear()
+        asyncio.run(f.flush(sid9, str(repo / "docs")))
+        check([a["name"] for a in seen_args] == ["Late (docs/late-spec.md)"], "payload cwd alone locates the repo")
+        # no start stamp = no collector ever ran this session → no sweep at all
+        mc.save_state(sid9, {"dirty": [], "saved": {}, "attempts": {}})
+        seen_args.clear()
+        asyncio.run(f.flush(sid9, str(repo)))
+        check(seen_args == [], "state without a session stamp (nothing written) is never swept")
+        # outside a git repo: no-op, same as before
+        plain = (root / "plain").resolve(); plain.mkdir()
+        (plain / "loose-spec.md").write_text("# Loose\n" + "p" * 7000, encoding="utf-8")
+        sid10 = "sess-md-sweep-nogit"
+        mc.save_state(sid10, {"dirty": [], "saved": {}, "attempts": {}, "since": since, "cwds": [str(plain)]})
+        seen_args.clear()
+        asyncio.run(f.flush(sid10, str(plain)))
+        check(seen_args == [] and mc.load_state(sid10)["saved"] == {}, "non-git cwd → no sweep, nothing saved")
+        # a swept path that keeps failing is retried MAX_ATTEMPTS times, then
+        # remembered by content: git offers it again on every Stop, the flush
+        # declines until the bytes change
+        sid11 = "sess-md-sweep-gaveup"
+        git("add", "-A"); git("commit", "-q", "-m", "settle")     # only flaky-spec.md is dirty below
+        mc.save_state(sid11, {"dirty": [], "saved": {}, "attempts": {}, "since": since, "cwds": [str(repo)]})
+        flaky = repo / "docs" / "flaky-spec.md"; flaky.write_text("# Flaky\n" + "q" * 7000, encoding="utf-8")
+        tries = {"n": 0}
+        async def count_fail(session, call_args):
+            tries["n"] += 1; raise f.SaveRejected("quota")
+        f._save = count_fail
+        for i in range(f.MAX_ATTEMPTS):
+            asyncio.run(f.flush(sid11, str(repo)))
+        st = mc.load_state(sid11)
+        check(tries["n"] == f.MAX_ATTEMPTS and st.get("attempts") == {} and st.get("gaveup", {}).get(str(flaky)),
+              f"swept path fails {f.MAX_ATTEMPTS}× → counter cleared, give-up digest recorded: {st.get('gaveup')}")
+        asyncio.run(f.flush(sid11, str(repo)))
+        check(tries["n"] == f.MAX_ATTEMPTS, "still modified in git, same bytes → not attempted again")
+        flaky.write_text("# Flaky\n" + "w" * 7000, encoding="utf-8")
+        asyncio.run(f.flush(sid11, str(repo)))
+        check(tries["n"] == f.MAX_ATTEMPTS + 1, "content changed → attempted once more")
+        f._save = capture_save
+
+        # the collector's Bash mode (real hook contract): records cwd + stamp,
+        # never a path, never reads the command
+        sidb = "sess-md-bash-mode"
+        rb = run({"session_id": sidb, "cwd": str(repo), "tool_name": "Bash",
+                  "tool_input": {"command": "cat > docs/x-spec.md <<'EOF'\n# X\nEOF"}})
+        check(rb.returncode == 0 and rb.stdout == "", "Bash → exit 0, silent")
+        stb = mc.load_state(sidb)
+        check(stb["dirty"] == [] and stb.get("cwds") == [str(repo)] and isinstance(stb.get("since"), float),
+              f"Bash mode state: no dirty path, cwd + since recorded: {stb}")
+        before = mc.state_path(sidb).stat().st_mtime_ns
+        run({"session_id": sidb, "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        check(mc.state_path(sidb).stat().st_mtime_ns == before, "same cwd again → no rewrite (one JSON read per Bash call)")
+        run({"session_id": sidb, "cwd": str(repo), "tool_name": "Write", "tool_input": {"file_path": spec}})
+        stb = mc.load_state(sidb)
+        check(stb["dirty"] == [canonical_spec] and stb["cwds"] == [str(repo)], "a later Write still records its path alongside")
+        check(mc.load_state("sess-md-bash-mode").get("since", 0) <= time.time() - mc.SINCE_GRACE_S + 5,
+              "the stamp is backdated by the grace window (a spec the first command wrote is not stale)")
 
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
         mc.WINDOWS_TEMP_ROOTS = wtr

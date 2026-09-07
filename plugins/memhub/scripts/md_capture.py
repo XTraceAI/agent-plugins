@@ -22,6 +22,15 @@ our convention, not theirs.
 Why two stages: the edit hook sees one write; the deliverable is the file's
 state when the agent STOPS. A spec edited nine times in a turn is one
 artifact, not nine. The flush reads the file off disk at Stop.
+
+Why a Bash mode too: a harness that prefers shell edits (heredocs, ``sed -i``,
+a python one-liner) never fires the Edit/Write matcher, so a spec written that
+way never entered ``dirty`` and was never flushed — three MemHub-Backend specs
+went uncaptured that way on 2026-09-07. Parsing the command string for
+redirects is a losing game. Instead the Bash matcher records only the
+session's ``cwd`` (plus a session-start stamp, once), and the flush sweeps
+``git status`` in that repo for modified/untracked ``.md`` files: the
+deliverable is on disk either way, and git already knows which files are new.
 """
 from __future__ import annotations
 
@@ -31,6 +40,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 STATE_PREFIX = "memhub-md-capture-"
@@ -62,6 +72,16 @@ VETO_PARTS = ("/.claude/", "/scratchpad/", "/tmp/", "/private/tmp/", "/var/folde
               "/node_modules/", "/.git/")
 VETO_NAMES = {"CLAUDE.md", "AGENTS.md", "MEMORY.md"}
 FRONTMATTER_OPT_IN = re.compile(r"^memhub:\s*artifact\s*$", re.M)
+
+# The git sweep only wants THIS session's work, so it ignores files whose
+# mtime predates the session. The state file is born on the first tool call
+# the collector sees — a PostToolUse, i.e. AFTER that call ran — so the stamp
+# is backdated by the longest a single Bash call can plausibly have run, or a
+# spec written by the session's very first command would be judged stale.
+# Bounded on both sides: a file the human left in the worktree an hour ago is
+# still excluded.
+SINCE_GRACE_S = 300
+MAX_CWDS = 8
 
 
 def _is_usable_windows_temp_root(path_key: str) -> bool:
@@ -164,6 +184,25 @@ def save_state(session_id: str, state: dict) -> None:
         raise
 
 
+def note_cwd(state: dict, payload: dict) -> bool:
+    """Record the session's ``cwd`` — the repo the flush sweeps — and, once,
+    the session-start stamp. Returns True when the state changed, so the
+    caller writes only when there is news (one JSON read per Bash call)."""
+    changed = False
+    if not isinstance(state.get("since"), (int, float)):
+        state["since"] = time.time() - SINCE_GRACE_S
+        changed = True
+    cwds = state.get("cwds")
+    if not isinstance(cwds, list):
+        cwds = state["cwds"] = []
+        changed = True
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd and cwd not in cwds and len(cwds) < MAX_CWDS:
+        cwds.append(cwd)
+        changed = True
+    return changed
+
+
 def edited_path(payload: dict) -> Path | None:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -227,8 +266,17 @@ def main() -> int:
     if not isinstance(payload, dict):
         return 0
     session_id = payload.get("session_id")
+    if not isinstance(session_id, str):
+        return 0
+    if payload.get("tool_name") == "Bash":
+        # Bash mode: there is no path to record — the flush finds what the
+        # shell wrote by sweeping git in this cwd. Never look at the command.
+        state = load_state(session_id)
+        if note_cwd(state, payload):
+            save_state(session_id, state)
+        return 0
     path = edited_path(payload)
-    if not isinstance(session_id, str) or path is None:
+    if path is None:
         return 0
     # Only the cheap, content-free checks run here; size and frontmatter are
     # judged at flush time from the file's final on-disk state.
@@ -244,8 +292,11 @@ def main() -> int:
     except OSError:
         key = os.path.abspath(str(path))
     state = load_state(session_id)
+    changed = note_cwd(state, payload)
     if key not in state["dirty"]:
         state["dirty"].append(key)
+        changed = True
+    if changed:
         save_state(session_id, state)
     return 0
 
