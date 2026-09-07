@@ -2448,8 +2448,16 @@ def message_id_of(data):
 
 
 def agent_id_of(data):
-    """Subagent transcripts live at <session>/subagents/agent-<id>.jsonl;
-    the main agent's do not. NULL = main agent."""
+    """NULL = main agent. A subagent's call carries `agent_id` (and
+    `agent_type`) at the top of the hook input — verified live 2026-09-07,
+    where `transcript_path` is the PARENT session's file, so the path alone
+    says "main" for every subagent call. Older builds had no such field and
+    wrote the subagent's transcript at <session>/subagents/agent-<id>.jsonl;
+    that form is still read second. `given.agent.main` and the ledger's
+    `agent_id` both hang off this answer."""
+    aid = data.get("agent_id")
+    if isinstance(aid, str) and aid.strip():
+        return aid.strip()[:64]
     tp = str(data.get("transcript_path") or "")
     if "/subagents/" in tp:
         return os.path.basename(tp).rsplit(".", 1)[0]

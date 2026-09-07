@@ -601,6 +601,25 @@ def read_lane_checks() -> None:
         denied, c, _, _ = pre("Read", {"file_path": env_file}, transcript_path=sub_tp)
         check("read: a rule without `agent.main` still fires inside a subagent",
               "[no-env-read]" in c, c)
+        # The live payload shape (Claude Code 2026-09): `agent_id` / `agent_type`
+        # at the top level, transcript_path = the PARENT's file. Measured E2E:
+        # without this the subagent the rule points to was gated too.
+        main_tp = os.path.join(td, "sess.jsonl")
+        open(main_tp, "w").close()
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=main_tp,
+                              agent_id="a09250b37f45b254a", agent_type="Explore")
+        check("read: a subagent identified by the payload's agent_id (parent transcript_path) passes",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=main_tp)
+        check("read: the same payload without agent_id is the main agent and is DENIED",
+              denied and "[big-read]" in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": env_file}, transcript_path=main_tp,
+                              agent_id="a09250b37f45b254a", agent_type="Explore")
+        rows = [json.loads(l) for l in open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8")
+                if l.strip()]
+        check("read: a subagent's fire records the payload's agent_id on the ledger",
+              "[no-env-read]" in c and any(r.get("agent_id") == "a09250b37f45b254a"
+                                            and r["rule_id"] == "no-env-read" for r in rows), c)
 
         # --- the same rule through Bash --------------------------------------
         def bash(cmd, **kw):
