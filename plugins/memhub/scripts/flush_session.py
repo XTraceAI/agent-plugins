@@ -174,7 +174,8 @@ def _deadline_s() -> float:
     return value if value > 0 else _DEFAULT_DEADLINE_S
 
 
-async def _flush(session_id: str, transcript_path: str) -> None:
+async def _flush(session_id: str, transcript_path: str,
+                 hook_urls: list[str] | None = None) -> None:
 
     # Tolerant parse, NOT json.loads-or-die: this hook reads the transcript
     # while Claude Code is still appending to it, so a truncated final line
@@ -208,7 +209,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if missing_pr_urls:
         _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
              "canonical GitHub PR URL")
-    provenance = pr_provenance.import_provenance(pr_urls)
+    # The URL this very hook fired on. At PostToolUse the transcript does not
+    # hold the tool result yet, so the rescan above cannot see it; the payload
+    # can. Sent now so the PR is linked while the session is still running —
+    # the Stop-time rescan would find it too, minutes later.
+    provenance = pr_provenance.import_provenance(
+        pr_provenance.merge_urls(pr_urls, hook_urls or []))
+    if hook_urls:
+        _log(f"PR created by this call: {', '.join(hook_urls)}")
 
     # Slash-command bookkeeping never leaves the machine. Applied HERE as well
     # as in the other two upload paths deliberately: the filter's own contract
@@ -605,6 +613,8 @@ def main() -> int:
         reason = str(hook_input.get("reason") or "")[:40]
         _log(f"trigger: {cmd!r}" if cmd
              else f"trigger: session end ({reason or 'no reason given'})")
+        hook_urls, _ = pr_provenance.scan_shell_event(
+            str(hook_input.get("hook_event_name") or ""), hook_input)
         # HARD bound on the whole flush, not just on the gaps between slices.
         # The between-slice deadline can only stop the loop where it looks;
         # ONE slow call — an oversized record riding alone, a stalled server —
@@ -613,8 +623,12 @@ def main() -> int:
         # case it cannot see. Ending ourselves first is what guarantees the
         # breadcrumb below is always written.
         started = time.monotonic()
-        asyncio.run(asyncio.wait_for(
-            _flush(session_id, transcript_path), timeout=timeout_s))
+        # The third argument only when there is one: `_flush` is what the
+        # tests stand in for, and the common SessionEnd / commit trigger has
+        # no PR to carry.
+        flush = (_flush(session_id, transcript_path, hook_urls) if hook_urls
+                 else _flush(session_id, transcript_path))
+        asyncio.run(asyncio.wait_for(flush, timeout=timeout_s))
     # BaseException, not Exception: when anyio's task group mixes a
     # CancelledError into the group (e.g. the auth failure cancelling sibling
     # tasks), the result is a BaseExceptionGroup — a BaseException — which
