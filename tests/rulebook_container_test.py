@@ -377,7 +377,9 @@ def test_delivery_lanes() -> None:
             g.write(f.read().replace(          # keep the anchor without a network call
                 "def recall_anchor_rules(repo, tool, handles, already_fired):",
                 "def recall_anchor_rules(repo, tool, handles, already_fired):\n"
-                "    return ['anch']\n"
+                "    return [{'rule_id': 'anch', 'title': 'Anchor advisory',\n"
+                "             'statement': 'Anchor advisory', 'version': 1,\n"
+                "             'anchors': ['deploy-now']}]\n"
                 "def _recall_unused(repo, tool, handles, already_fired):", 1))
         pr = subprocess.run([sys.executable, stub, "pre"],
                             input=json.dumps({"cwd": repo, "session_id": "s-anch",
@@ -392,6 +394,28 @@ def test_delivery_lanes() -> None:
               shown_labels[:1] == ["Anchor advisory"], repr(atext))
         check("…and the wider book still outranks the narrower behind it",
               shown_labels == ["Anchor advisory", "Org A"], repr(shown_labels))
+
+        # --- an anchor rule the cached book has never seen still fires ------
+        # The server matched it, judged it relevant and scoped it to this repo.
+        # Dropping it because our book predates it is exactly how a rule
+        # activated a minute ago stayed silent until the next fetch.
+        unseen = os.path.join(td, "stub_hook_unseen.py")
+        with open(HOOK, encoding="utf-8") as f, open(unseen, "w", encoding="utf-8") as g:
+            g.write(f.read().replace(
+                "def recall_anchor_rules(repo, tool, handles, already_fired):",
+                "def recall_anchor_rules(repo, tool, handles, already_fired):\n"
+                "    return [{'rule_id': 'brand-new', 'title': 'Brand new',\n"
+                "             'statement': 'Brand new anchor', 'version': 3,\n"
+                "             'anchors': ['deploy-now']}]\n"
+                "def _recall_unused(repo, tool, handles, already_fired):", 1))
+        ur = subprocess.run([sys.executable, unseen, "pre"],
+                            input=json.dumps({"cwd": repo, "session_id": "s-unseen",
+                                              "tool_name": "Bash",
+                                              "tool_input": {"command": "deploy-now"}}),
+                            capture_output=True, text=True,
+                            env=dict(os.environ, **dict(env, MEMHUB_RULEBOOK_RECALL="1")), timeout=30)
+        check("an anchor rule the cached book has never seen still fires",
+              "Brand new anchor" in ctx(ur.stdout), repr(ctx(ur.stdout)))
 
         # --- session start: one budget across books, widest first ----------
         posture = []
