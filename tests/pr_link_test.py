@@ -146,6 +146,23 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("gh api --method GET repos/o/r/pulls -f state=open --jq '.[0].html_url'",
          "pulls_collection", False),
         ("gh api --method PATCH repos/o/r/pulls/12 -f title=x", "pull_item", False),
+        # A QUOTED method value. The blanked text lost it, so an explicit GET
+        # read as "no method" and `-f` inferred a POST (Codex review, PR #182).
+        ("gh api repos/o/r/pulls --method 'GET' -f state=open", "pulls_collection", False),
+        ('gh api repos/o/r/pulls --method "GET" -f state=open', "pulls_collection", False),
+        ("curl https://api.github.com/repos/o/r/pulls -X 'GET' -d x",
+         "pulls_collection", False),
+        ("curl -XPOST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        ("curl --request=POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        # curl's `-f` is --fail, NOT a field: it must not imply a write.
+        ("curl -f https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # A `-X POST` inside a quoted body is data, not a method.
+        ("""curl https://api.github.com/repos/o/r/pulls -X GET -d '{"t":"-X POST"}'""",
+         "pulls_collection", False),
+        # An unbalanced quote cannot be read, so it must not manufacture one.
+        ("curl -X POST https://api.github.com/repos/o/r/pulls -d '{", "pulls_collection", False),
         ("gh api repos/o/r/pulls", "pulls_collection", False),
         ("gh api repos/o/r/pulls/12", "pull_item", False),
         ("curl -X POST https://gh.corp/api/v3/repos/o/r/pulls -d '{}'",
@@ -221,6 +238,37 @@ def test_github_mcp_tools_are_recognised_by_their_server_segment():
     for name, touches, creates in cases:
         check(f"mcp touches: {name}", pr_link.touches_github(name, {}) is touches)
         check(f"mcp creates: {name}", pr_link.creates_pr(name, {}) is creates)
+
+
+def test_an_enterprise_create_resolves_its_own_host():
+    """`github_api_call` accepts an enterprise REST target, but
+    `urls_from_output_text` only knows `github.com` — so the enterprise create
+    was detected and then produced no URL, and the hook went silent on exactly
+    the calls it had decided to care about (Codex review, PR #182)."""
+    command = "curl -X POST https://ghe.corp/api/v3/repos/o/r/pulls -d '{\"title\":\"x\"}'"
+    body = {"stdout": '{"html_url": "https://ghe.corp/o/r/pull/7", '
+                      '"issue_url": "https://ghe.corp/api/v3/repos/o/r/issues/7"}',
+            "stderr": ""}
+    check("the host comes from the command",
+          pr_link.github_api_host(command) == "ghe.corp")
+    check("a github.com command names no extra host",
+          pr_link.github_api_host(
+              "curl https://api.github.com/repos/o/r/pulls") is None)
+    got = pr_link.context_for_call(
+        "Bash", {"command": command}, body, "s1",
+        checker=lambda _u: {"enabled": True, "github_connected": True,
+                            "repo_in_install": True})
+    check("an enterprise create reaches B1",
+          bool(got) and "without asking" in got, str(got)[:120])
+    # The host is taken from the COMMAND, never wildcarded over the response —
+    # `https://<any host>/<o>/<r>/pull/<n>` would match unrelated sites.
+    check("an unrelated host in the output of a github.com call is ignored",
+          pr_link.pr_url_from_response(
+              {"stdout": "https://evil.example/o/r/pull/7"},
+              host=pr_link.github_api_host("gh pr view 7")) is None)
+    check("github.com extraction is unchanged",
+          pr_link.pr_url_from_response({"stdout": "https://github.com/o/r/pull/7"})
+          == "https://github.com/o/r/pull/7")
 
 
 def test_a_quoted_api_target_is_still_found_but_a_quoted_mention_is_not():

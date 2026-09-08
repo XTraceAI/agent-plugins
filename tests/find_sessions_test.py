@@ -207,6 +207,11 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
         # shas to anyone with the repo, so it is not authorship evidence.
         claude_session(home, "reader", wt, branch="unrelated",
                        commands=["git log --oneline -3"], results=[sha + " fix"])
+        # …nor does one that only PUSHED commits an earlier session made: a
+        # push prints an old..new range for work it did not write.
+        claude_session(home, "pusher", wt, branch="unrelated",
+                       commands=["git push origin HEAD"],
+                       results=[f"   {sha[:7]}..{sha[8:15]}  feat/x -> feat/x"])
         rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--sha", sha,
                            "--host", "claude")
         ids = [r["conversation_id"] for r in json.loads(out)]
@@ -214,6 +219,8 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
               "inspector" not in ids, out)
         check("…nor is a session that only read the history with `git log`",
               "reader" not in ids, out)
+        check("…nor one that only pushed commits it did not write",
+              "pusher" not in ids, out)
         check("…while the session that made the commit still counts",
               "author" in ids, out)
 

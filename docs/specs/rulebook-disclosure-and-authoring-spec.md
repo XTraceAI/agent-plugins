@@ -260,7 +260,7 @@ a second implementation of `book_path` in a skill would drift from the one the h
 ### 4.3 The scratch worktree
 
 ```bash
-git -C <repo> worktree add --detach "$(mktemp -d)/rulebook-forward-test" HEAD
+git -C <repo> worktree add -b rulebook-fwd-<8 hex> "$(mktemp -d)/rulebook-forward-test" HEAD
 ```
 
 Real layout, real remote, real repo identity — so repo- and path-scoped rules match without any
@@ -268,8 +268,22 @@ faking, which a synthetic fixture repo would have to reproduce by hand. The hook
 repo from the acted-on file's worktree, so a rule scoped to this repo fires there exactly as it
 would in the user's own checkout.
 
-Remove it in step 7 with `git worktree remove --force`, and `rm -rf` the temp dir. Never run the
-sub-agent in the user's own working tree.
+**On a branch, never `--detach`.** A detached worktree makes `_branch()` report `detached`, so
+every `given.repo.branch_rx` / `branch_not_rx` predicate silently fails — including the
+`{"repo": {"branch_rx": "^(main|master)$"}}` example this repo's own `create-rule` documents.
+Because §4 is mandatory, that reads as "the rule never fired" and blocks filing a good rule.
+Verified: detached → `given_ok` returns False for that predicate; `-b <name>` → it evaluates
+normally.
+
+Where the candidate carries a branch predicate, name the worktree's branch to satisfy it. Where
+the pattern demands a name that is already checked out (`^(main|master)$` — git refuses a second
+worktree on it), the predicate cannot be exercised here: report it as **unexercised** and route to
+§4.6 rather than reporting a failed rule. Never strip the `given` block to make the test pass — a
+fire the rule would not produce in production is a worse answer than no fire.
+
+Remove it in step 7 with `git worktree remove --force`, delete the branch `-b` created
+(`git branch -D rulebook-fwd-<hex>`), and `rm -rf` the temp dir. Never run the sub-agent in the
+user's own working tree.
 
 ### 4.4 Evaluation — the ledger first, the transcript second
 

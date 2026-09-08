@@ -45,10 +45,15 @@ _SHA_RX = re.compile(r"\b[0-9a-f]{7,40}\b")
 # than a denylist: the default for an unrecognised command is "not proof",
 # because the cost of a wrong author is worse than the cost of a missed one —
 # and a real author still scores on files (2 each) and branch (3).
+# `push` is deliberately NOT here. A push prints an `old..new` range for
+# commits that already existed — often made in an earlier session — so a
+# session that only pushed someone else's work scored the top signal plus the
+# branch match and was recommended for linking. `apply` and `stash` are out for
+# the same reason: neither creates the pull request's commits.
 _COMMIT_PRODUCING = re.compile(
     r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
     r"git\b(?:\s+-[cC]\s+\S+)*\s+"
-    r"(?:commit|push|cherry-pick|revert|merge|rebase|am|apply|stash)\b", re.I)
+    r"(?:commit|cherry-pick|revert|merge|rebase|am)\b", re.I)
 _APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
 _GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
 _BRANCH_CMD = re.compile(
@@ -113,10 +118,10 @@ def _matches_pr_file(edited: str, pr_files: dict[str, str]) -> str | None:
 def _makes_commits(tool: str, payload: dict) -> bool:
     """Would this call have CREATED the commits whose shas it prints?
 
-    Only the shell can; and only a commit-producing git subcommand does. A
+    Only the shell can, and only a commit-CREATING git subcommand does. A
     `gh pr view --json commits` (the skill's own step 2), a `git log`, a
-    `git show` — all of these merely display shas that already exist and that
-    anyone with the repo can read.
+    `git show`, and a `git push` — all of these merely display shas that
+    already exist and that anyone with the repo can read.
     """
     if tool not in ("Bash", "shell", "local_shell", "exec", "exec_command"):
         return False

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -80,10 +81,50 @@ _API_URL = re.compile(
 )
 _API_PATH = re.compile(r"(?:^|\s)/?repos/[\w.-]+/[\w.-]+/pulls(/\d+)?(?![\w.-])")
 _GH_API = re.compile(_GH_PREFIX + r"\bapi\b")
-_POST = re.compile(r"(?:^|\s)(?:-X\s*POST\b|-XPOST\b|--request[\s=]+POST\b|--method[\s=]+POST\b)", re.I)
-_EXPLICIT_METHOD = re.compile(r"(?:^|\s)(?:-X\s*\w+|-X\w+|--request[\s=]+\w+|--method[\s=]+\w+)", re.I)
-_CURL_DATA = re.compile(r"(?:^|\s)(?:-d\b|--data(?:-raw|-binary|-urlencode)?\b)")
-_GH_API_WRITE = re.compile(r"(?:^|\s)(?:-f\b|-F\b|--field\b|--raw-field\b|--input\b)")
+# Flags are read from shell TOKENS, not with a regex over the text. A regex has
+# to be told where quoting starts and stops, and it kept getting that wrong in
+# both directions: `--method 'GET'` had its value blanked away, so an explicit
+# GET looked like no method at all and `-f` then inferred a POST — a listing
+# read as a pull-request creation. Tokenising lets the shell's own rules decide
+# what is a flag and what is a value, so a `-X POST` sitting INSIDE a quoted
+# JSON body stays one token of data.
+_METHOD_FLAGS = ("-X", "--request", "--method")
+# `gh api` sends fields as POST unless `--method GET` says otherwise.
+_GH_FIELD_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
+# curl's `-d`/`--data*`/`-F` imply POST. NOT `-f`, which is curl's `--fail`.
+_CURL_DATA_FLAGS = frozenset({
+    "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+    "--data-ascii", "-F", "--form", "--form-string"})
+_SHELL_PUNCTUATION = ";&|`()<>\r\n"
+
+
+def _tokens(command: str) -> list[str] | None:
+    """The command as shell words, or None if it does not parse.
+
+    None means "cannot read the flags", and the caller treats that as "do not
+    infer a write" — an unbalanced quote must never manufacture a create.
+    """
+    try:
+        lexer = shlex.shlex(command[:MAX_COMMAND_CHARS], posix=True,
+                            punctuation_chars=_SHELL_PUNCTUATION)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _explicit_method(tokens: list[str]) -> str | None:
+    """The method the command NAMES, in any spelling, or None."""
+    for index, token in enumerate(tokens):
+        for flag in _METHOD_FLAGS:
+            if token == flag and index + 1 < len(tokens):
+                return tokens[index + 1].upper()
+            if token.startswith(flag + "="):
+                return token[len(flag) + 1:].upper()
+        if token.startswith("-X") and len(token) > 2:      # -XPOST
+            return token[2:].upper()
+    return None
 # `curl`, `http`, `wget`, `xh` — the shells people actually paste. `gh api`
 # is recognised separately because its path argument has no scheme.
 _HTTP_CLIENT = re.compile(r"(?:^|[;&|`\n(]|\$\()\s*(?:\w+=\S*\s+)*(?:curl|wget|http|https|xh|xhs)\b")
@@ -204,21 +245,64 @@ def github_api_call(command: object) -> tuple[str | None, bool]:
         return None, False
 
     target = "pull_item" if number else "pulls_collection"
-    if _POST.search(text):
-        return target, True
+    tokens = _tokens(command if isinstance(command, str) else "")
+    if tokens is None:
+        return target, False
+
     # An explicit method always wins over an inferred one, on BOTH clients.
     # `gh api --help`: "To send the parameters as a GET query string instead,
     # use --method GET" — so `gh api --method GET …/pulls -f state=open` is a
     # documented LISTING that carries `-f`. Reading it as a write made
     # `creates_pr` true, and B1 then told a session that had only listed pull
     # requests to record a confirmed self-link on one of them.
-    explicit = bool(_EXPLICIT_METHOD.search(text))
-    if is_gh_api and _GH_API_WRITE.search(text) and not explicit:
+    method = _explicit_method(tokens)
+    if method is not None:
+        return target, method == "POST"
+    if is_gh_api and any(t in _GH_FIELD_FLAGS for t in tokens):
         return target, True
-    # curl's `-d` implies POST, but only when no method was named explicitly.
-    if is_http and _CURL_DATA.search(text) and not explicit:
+    if is_http and any(t in _CURL_DATA_FLAGS or t.startswith("--data")
+                       for t in tokens):
         return target, True
     return target, False
+
+
+def github_api_host(command: object) -> str | None:
+    """The GitHub host this command addressed, when it is not github.com.
+
+    `github_api_call` accepts an enterprise REST target, but
+    `pr_provenance.urls_from_output_text` only recognises `github.com` URLs —
+    so an enterprise create was detected and then produced no URL, and the hook
+    went silent on exactly the calls it had just decided to care about.
+
+    The host is taken from the COMMAND rather than from a widened pattern over
+    the response: `https://<any host>/<o>/<r>/pull/<n>` would match unrelated
+    sites that happen to use that path shape. Only the host the session itself
+    just talked to is trusted.
+    """
+    text = _dequoted(command)
+    m = re.search(r"https?://([\w.-]+)/api/v3/repos/[\w.-]+/[\w.-]+/pulls", text, re.I)
+    host = m.group(1).lower() if m else None
+    return host if host and host not in ("api.github.com", "github.com") else None
+
+
+def _urls_on_host(text: object, host: str) -> list[str]:
+    """PR URLs on one specific enterprise host — same shape as the canonical
+    rule in `pr_provenance`, with the host pinned rather than wildcarded."""
+    if not isinstance(text, str) or not text:
+        return []
+    pattern = (r"https://" + re.escape(host) +
+               r"/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
+               r"([A-Za-z0-9_.-]{1,100})/pull/([1-9][0-9]*)(?![A-Za-z0-9/])")
+    found: list[str] = []
+    budget = text[:pr_provenance.MAX_RESULT_TEXT_BYTES]
+    for match in re.finditer(pattern, budget, re.I):
+        owner, repo, number = match.groups()
+        url = f"https://{host}/{owner.lower()}/{repo.lower()}/pull/{int(number)}"
+        if url not in found:
+            found.append(url)
+            if len(found) >= pr_provenance.MAX_URLS:
+                break
+    return found
 
 
 def _mcp_tool_name(tool_name: object) -> str:
@@ -297,7 +381,7 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
     return target == "pulls_collection" and is_write
 
 
-def pr_url_from_response(tool_response: object) -> str | None:
+def pr_url_from_response(tool_response: object, host: str | None = None) -> str | None:
     """The one PR URL in this tool result, or None.
 
     Zero URLs (a failed command, a `gh pr checkout` printing only a branch) or
@@ -336,7 +420,10 @@ def pr_url_from_response(tool_response: object) -> str | None:
 
     urls: list[str] = []
     for text in texts:
-        for url in pr_provenance.urls_from_output_text(text):
+        found = pr_provenance.urls_from_output_text(text)
+        if host:
+            found = found + _urls_on_host(text, host)
+        for url in found:
             if url not in urls:
                 urls.append(url)
         if len(urls) > 1:
@@ -587,7 +674,8 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
     """stdin → the text to inject, or None. The whole hook, minus its I/O."""
     if not touches_github(tool_name, tool_input):
         return None
-    pr_url = pr_url_from_response(tool_response)
+    pr_url = pr_url_from_response(
+        tool_response, host=github_api_host(_command_of(tool_name, tool_input)))
     if not pr_url:
         return None
     reply = checker(pr_url)
@@ -602,7 +690,7 @@ __all__ = [
     "CHECK_TIMEOUT_S", "CONNECT_ADVISORY", "CREATED", "HOSTS", "IN_PLAY",
     "NEGATIVE_TTL_S", "REPO_ADVISORY", "STATE_DIR", "breadcrumb", "check",
     "context_for", "context_for_call", "conversation_id_for", "creates_pr",
-    "github_api_call", "is_gh_pr_command", "is_gh_pr_create",
+    "github_api_call", "github_api_host", "is_gh_pr_command", "is_gh_pr_create",
     "is_github_mcp_create", "is_github_mcp_tool", "pr_url_from_response",
     "touches_github",
 ]
