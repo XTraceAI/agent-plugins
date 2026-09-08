@@ -112,8 +112,10 @@ def test_entities_are_relative_path_plus_basename() -> None:
     check("basename is an entity", "brain_brief.py" in ents)
     check("refs, symbols and errors follow", ents[-3:] == ["PR #1", "room_map.read_room",
                                                            "Agent brain not found"])
-    many = bi.entities_for([f"dir/f{i}.py" for i in range(400)], [])
+    many = bi.entities_for([f"dir/f{i}.py" for i in range(400)], ["PR #7"], ["room_map"])
     check("the entity list is capped under the server's limit", len(many) <= bi.MAX_ENTITIES)
+    check("refs and symbols keep their slots when paths would fill the cap",
+          "PR #7" in many and "room_map" in many and "dir/f0.py" in many)
 
 
 def _git(repo: Path, *args: str) -> str:

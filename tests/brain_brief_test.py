@@ -501,6 +501,25 @@ check("a pending cache for another branch is not delivered by the prompt hook, a
       and served_state.load_ids(served_state.STATE_DIR, "s9") == [])
 brain_brief._write_json(PCACHE, POINTERS)
 
+# a budget cut at SessionStart leaves the marker alone, so the prompt delivers the rest
+os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "300"
+bctx = _ctx(_brief({"cwd": "/repo", "session_id": "s10"}))
+shown_at_start = set(brain_brief._ids_in(bctx))
+check("the trimmed brief showed some but not all cached pointers",
+      bctx.endswith(brain_brief._TRIMMED_FOOTER) and 0 < len(shown_at_start) < 4)
+check("a partial delivery does not advance the cache marker",
+      served_state.load_marker(served_state.STATE_DIR, "s10", "brief") == {})
+os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
+out = _prompt({"cwd": "/repo", "session_id": "s10", "prompt": "no identifiers here"})
+rest = set(brain_brief._ids_in(_ctx(out)))
+check("the first prompt delivers exactly the pointers the budget cut",
+      rest and rest.isdisjoint(shown_at_start) and shown_at_start | rest == {"d1", "d2", "e1", "a1"})
+check("…and then the marker is advanced",
+      served_state.load_marker(served_state.STATE_DIR, "s10", "brief").get("computed_at")
+      == POINTERS["computed_at"])
+out = _prompt({"cwd": "/repo", "session_id": "s10", "prompt": "no identifiers here"})
+check("nothing is left to deliver after that", out == {})
+
 # ── no network on the brief path — with a room AND a pointer cache present ─
 probe = subprocess.run(
     [sys.executable, "-c",

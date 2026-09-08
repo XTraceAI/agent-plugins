@@ -423,6 +423,18 @@ def _spawn_pointers(cwd: str) -> None:
         pass
 
 
+def _mark_delivered(session_id: str, cache: dict, offered: list[str], context: str) -> None:
+    """Advance the once-per-refresh marker only when EVERY pointer the cache
+    offered this session made it into ``context``. A budget cut leaves the
+    marker alone, so the next prompt delivers the remainder — served ids
+    already keep the shown ones from repeating."""
+    if not session_id:
+        return
+    if set(offered) <= set(_ids_in(context)):
+        served_state.save_marker(served_state.STATE_DIR, session_id, "brief",
+                                 {"computed_at": cache.get("computed_at")})
+
+
 def _cached_pointer_sections(cache: dict, session_id: str) -> tuple[list[str], list[str]]:
     """``(apply_lines, recall_lines)`` from a pointer cache, minus what this
     session has already seen. The cache is shared by every session of the
@@ -471,19 +483,20 @@ def cmd_brief(payload: dict) -> int:
     # Apply / Recall: from the pointer cache, refreshed by a detached child.
     apply: list[str] = []
     recall: list[str] = []
+    cache: dict = {}
     git = brief_identifiers.from_git(cwd)
     if git.get("root"):
         cache = _read_json(_pointers_path(env, brain_id, git["root"]))
         if cache and _pointers_usable(cache, git.get("branch")):
             apply, recall = _cached_pointer_sections(cache, session_id)
-            if session_id:
-                served_state.save_marker(served_state.STATE_DIR, session_id, "brief",
-                                         {"computed_at": cache.get("computed_at")})
         if _pointers_need_refresh(cache, git):
             _spawn_pointers(cwd)
 
+    offered = _ids_in("\n".join(apply + recall))
     context = _assemble(head, map_lines, apply, recall, brief_budget.brief_chars())
     _mark_served(session_id, _ids_in(context))   # only what survived the budget
+    if cache:
+        _mark_delivered(session_id, cache, offered, context)
     out: dict = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -730,10 +743,12 @@ def cmd_prompt(payload: dict) -> int:
 
     apply: list[str] = []
     recall: list[str] = []
+    pending: dict = {}
     # The pointer cache the brief could not deliver (it landed after
-    # SessionStart printed) — rendered once per refresh, and only when it was
-    # computed for the branch the checkout is on NOW: a `git switch` since
-    # the brief must not inject the old branch's lessons.
+    # SessionStart printed, or the budget cut part of it) — rendered until
+    # every pointer has been, and only when it was computed for the branch
+    # the checkout is on NOW: a `git switch` since the brief must not inject
+    # the old branch's lessons.
     if root is not None:
         cache = _read_json(_pointers_path(env, brain_id, str(root)))
         branch = brief_identifiers.current_branch(root)
@@ -741,9 +756,7 @@ def cmd_prompt(payload: dict) -> int:
         if cache and cache.get("computed_at") != marker.get("computed_at"):
             if _pointers_usable(cache, branch or None):
                 apply, recall = _cached_pointer_sections(cache, session_id)
-                if session_id:
-                    served_state.save_marker(served_state.STATE_DIR, session_id, "brief",
-                                             {"computed_at": cache.get("computed_at")})
+                pending = cache
             elif branch and cache.get("branch") != branch:
                 _spawn_pointers(cwd)
     pending_ids = _ids_in("\n".join(apply + recall))
@@ -764,6 +777,8 @@ def cmd_prompt(payload: dict) -> int:
     if prompt_lines:
         context = (context + "\n\n" if context else "") + "\n".join(prompt_lines)
     _mark_served(session_id, _ids_in(context))   # only what survived
+    if pending:
+        _mark_delivered(session_id, pending, pending_ids, context)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
         "additionalContext": context,

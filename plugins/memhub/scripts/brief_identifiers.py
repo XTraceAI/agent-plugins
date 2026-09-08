@@ -160,16 +160,22 @@ def entities_for(paths: list[str], refs: list[str],
                  symbols: list[str] | None = None,
                  errors: list[str] | None = None) -> list[str]:
     """Relative path + basename per path (the server's own canonical forms —
-    an absolute path would miss), then refs, symbols, error strings."""
+    an absolute path would miss), then refs, symbols, error strings.
+
+    Refs, symbols and errors are reserved FIRST under the cap: a large
+    refactor's hundred paths would otherwise fill every slot and the branch's
+    PR / ENG numbers — the reference-keyed half of Apply — would never reach
+    the server."""
+    tail = _dedupe([*refs, *(symbols or []), *(errors or [])])[:MAX_ENTITIES]
+    seen = set(tail)
     out: list[str] = []
     for p in paths:
         rel = p.replace("\\", "/").strip("/")
-        out.append(rel)
-        out.append(rel.rsplit("/", 1)[-1])
-    out += refs
-    out += symbols or []
-    out += errors or []
-    return _dedupe(out)[:MAX_ENTITIES]
+        for cand in (rel, rel.rsplit("/", 1)[-1]):
+            if cand and cand not in seen and len(out) < MAX_ENTITIES - len(tail):
+                seen.add(cand)
+                out.append(cand)
+    return out + tail
 
 
 # ── the prompt ─────────────────────────────────────────────────────────────
