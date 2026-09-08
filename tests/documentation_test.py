@@ -152,7 +152,13 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
                  # The ledger window must bracket the sub-agent, not the whole
                  # step — otherwise the skill's own setup fires the candidate.
                  "immediately before the Agent call",
-                 "worktree add -b"):
+                 "worktree add -b",
+                 # The ledger is shared per repo, so another live session can
+                 # fire the armed candidate inside the window.
+                 "must be the sub-agent's rather than the parent's",
+                 # An interrupted run leaves a doctored book that SessionStart
+                 # deliberately considers fresh — it does not heal itself.
+                 'ls "$BOOK".pretest-*'):
         check(f"create-rule keeps {text!r}", text in skill)
 
 

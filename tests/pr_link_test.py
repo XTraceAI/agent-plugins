@@ -208,6 +208,20 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", False),
         ("curl -o out.json https://api.github.com/repos/o/r/pulls",
          "pulls_collection", False),
+        # An ATTACHED value must not be scanned for more options: `-Dheaders`
+        # is `--dump-header headers`, and finding the `d` in "headers" called a
+        # GET a creation (Codex review, PR #182 — a regression I introduced).
+        ("curl -Dheaders https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("curl -oFood https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("curl -Afriend https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("curl -HFood:x https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # Wrapper flags that take a separate operand.
+        ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
+         "pulls_collection", True),
+        ("sudo -u ci curl -X POST https://api.github.com/repos/o/r/pulls -d x",
+         "pulls_collection", True),
+        ("timeout -s KILL 5 curl -X POST https://api.github.com/repos/o/r/pulls -d x",
+         "pulls_collection", True),
         ("http POST https://api.github.com/repos/o/r/pulls title=x",
          "pulls_collection", True),
         ("xh POST https://api.github.com/repos/o/r/pulls title=x",
@@ -457,6 +471,52 @@ def test_a_chained_gh_pr_create_cannot_claim_the_other_prs_url():
                     'gh pr create --title "pr" --body b'):
         check(f"one create is still a create: {command[:40]!r}",
               pr_link.creates_pr("Bash", {"command": command}))
+
+
+def test_a_create_that_FAILED_opened_nothing():
+    """`gh pr create` on a branch that already has one prints THAT pull
+    request's URL to stderr and exits non-zero; an MCP failure returns
+    `isError` with the same shape. Either way B1 would have recorded a
+    confirmed `session_self` link to a pull request somebody else opened.
+    `pr_babysit_trigger` guards this exact case (Codex review, PR #182)."""
+    connected = {"enabled": True, "github_connected": True, "repo_in_install": True}
+    url = "https://github.com/o/r/pull/5"
+
+    def ctx(response, tool="Bash", payload=None):
+        return pr_link.context_for_call(
+            tool, payload if payload is not None else {"command": "gh pr create --fill"},
+            response, "s1", checker=lambda _u: connected) or ""
+
+    for label, response in (
+        ("exit_code", {"stdout": "", "stderr": f"already exists:\n{url}", "exit_code": 1}),
+        ("is_error", {"stdout": "", "stderr": url, "is_error": True}),
+        ("success:false", {"stdout": "", "stderr": url, "success": False}),
+    ):
+        got = ctx(response)
+        check(f"a failed create does not self-link ({label})",
+              "you just opened" not in got, got[:110])
+        check(f"…it falls to B2, where the model judges ({label})",
+              "IF IT WAS NOT" in got, got[:110])
+    for label, response in (
+        ("exit_code 0", {"stdout": url, "stderr": "", "exit_code": 0}),
+        ("no status fields at all", {"stdout": url, "stderr": ""}),
+    ):
+        check(f"a successful create still self-links ({label})",
+              "you just opened" in ctx(response))
+    # MCP spells it `isError`, which pr_provenance's helper does not know.
+    body = {"content": [{"type": "text", "text": json.dumps({"html_url": url})}]}
+    check("a failed MCP create does not self-link",
+          "you just opened" not in ctx(dict(body, isError=True),
+                                       "mcp__github__create_pull_request", {"title": "x"}))
+    check("…but a successful one does",
+          "you just opened" in ctx(body, "mcp__github__create_pull_request", {"title": "x"}))
+
+
+def test_gh_pr_new_is_an_alias_for_create():
+    for command in ("gh pr new --fill", "cd .. && gh pr new"):
+        check(f"{command!r} creates", pr_link.creates_pr("Bash", {"command": command}))
+    check("gh pr view is still not a create",
+          not pr_link.creates_pr("Bash", {"command": "gh pr view 12"}))
 
 
 def test_b1_needs_the_url_to_be_provably_the_creates_own():

@@ -424,17 +424,43 @@ success or failure. Copy `$BOOK.pretest-$$` back over `$BOOK` (restoring its
 original `fetched_at` and `etag`), restore or delete the `.refresh` stamp, and
 delete the backup. **Verify by hashing**: if the restored file does not match
 the backup byte-for-byte, say so loudly and tell the user the path — a doctored
-book is a rule set they did not choose. If the skill is interrupted between
-arming and restoring, the next SessionStart re-fetches the book and overwrites
-the candidate; the damage window is one session. Note that in the report so an
-interrupted run is not a mystery.
+book is a rule set they did not choose.
+
+**An interrupted run does NOT heal itself, so check for one first.** §4b.3
+writes `fetched_at` as *now* precisely so the background re-fetch leaves the
+book alone — which means that after a Ctrl-C the next SessionStart considers
+the doctored book FRESH, renders the candidate, and only spawns a best-effort
+background fetch. If that fetch fails, an unfiled rule stays armed
+indefinitely. (An earlier version of this step claimed the damage window was
+one session. It is not, and the mechanism that makes the test reliable is the
+same one that makes the interruption durable.)
+
+So **before arming anything**, look for a leftover from a previous run:
+
+```bash
+ls "$BOOK".pretest-* 2>/dev/null
+```
+
+If one exists, restore it over `$BOOK` (and restore or delete `$BOOK.refresh`)
+before doing anything else, and tell the user you found and undid a doctored
+book from an interrupted run — naming the file, because a rule set they did not
+choose was live until you did.
 
 **Evaluate: the ledger first (fact), the transcript second (judgment).**
 
 Read the rows between the two offsets from §4b.4 — not merely "since the
-start" — and keep those with `rule_id == "candidate-<hex>"`. A candidate row
-outside that window was caused by your own setup or restore, not by the
-sub-agent, and it proves nothing. Report per row: `hook_phase` (pre/post),
+start" — and keep those with `rule_id == "candidate-<hex>"` **that also belong
+to the sub-agent**: the row's `session_id` must be this session's, and its
+`agent_id` must be the sub-agent's rather than the parent's.
+
+**Why the id check, not just the window.** The book you doctored is the repo's
+book, shared by every session on this machine. A teammate's terminal — or your
+own second window — working in the same repo loads the candidate too, and a
+fire it causes lands in the same ledger inside your window. Filtering on
+`rule_id` alone would then report a pass that your fake feature never earned,
+which is the one outcome this step exists to prevent. A candidate row outside
+the window, or carrying another session's ids, was not caused by the sub-agent
+and proves nothing. Report per row: `hook_phase` (pre/post),
 `tool`, `mode`, `fired_at`, `excerpt`.
 
 | Ledger result | Meaning | What you do |

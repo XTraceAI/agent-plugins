@@ -81,11 +81,19 @@ _API_URL = re.compile(
 )
 # `gh api` takes a bare path instead of a URL.
 _API_PATH = re.compile(r"^/?repos/[\w.-]+/[\w.-]+/pulls(?:/(\d+))?(?:/.*)?$")
+# `gh pr new` is a documented alias of `gh pr create`.
+_GH_CREATE_SUBS = frozenset({"create", "new"})
 _HTTP_CLIENTS = frozenset({"curl", "wget", "http", "https", "xh", "xhs"})
 _WRAPPERS = frozenset({"env", "sudo", "doas", "nohup", "command", "exec",
                        "timeout", "time", "stdbuf"})
 _ASSIGN_TOKEN = re.compile(r"[A-Za-z_]\w*=")
 _HOSTNAME_FLAG = "--hostname"
+# Wrapper flags that take a separate operand. `env -u DEBUG curl …` skipped
+# `env` and `-u`, then read `DEBUG` as the executable and saw no GitHub call at
+# all. (`env -u/--unset`, `sudo -u/-g/-p/-U/-C`, `timeout -s/-k`.)
+_WRAPPER_VALUE_FLAGS = frozenset({
+    "-u", "--unset", "-g", "--group", "-p", "--prompt", "-U", "-C",
+    "--close-from", "-s", "--signal", "-k", "--kill-after"})
 
 # Text-level equivalents, used ONLY when the command will not tokenise. The
 # command already ran, so it was valid shell — `shlex` merely models less of it
@@ -311,7 +319,12 @@ def _command_name(segment: list[str]) -> tuple[str, list[str]]:
         if _basename(token) in _WRAPPERS:
             index, after_wrapper = index + 1, True
             continue
-        if token.startswith("-") or (after_wrapper and token[:1].isdigit()):
+        if token.startswith("-"):
+            # A wrapper flag with a separate operand takes the next token too.
+            index += 2 if (after_wrapper and token in _WRAPPER_VALUE_FLAGS
+                           and "=" not in token) else 1
+            continue
+        if after_wrapper and token[:1].isdigit():      # `timeout 5 …`
             index += 1
             continue
         break
@@ -332,18 +345,41 @@ def _positional_method(args: list[str]) -> str | None:
     return None
 
 
-# `curl -d'{"title":"x"}'` and `-Ftitle=x` tokenise as `-d{...}` / `-Ftitle=x`,
-# which no exact-token test matches. Single-dash short options may also be
-# bundled (`-sSfd '{}'`), so the test is "a short-option run containing `d` or
-# `F`". `-f` is curl's --fail and `-D` its --dump-header, and neither is here.
-_CURL_ATTACHED_DATA = re.compile(r"^-[A-Za-z]*[dF]")
+# curl short options that CONSUME a value. Once one of these appears in a
+# bundle, everything after it in the same token is that option's argument and
+# must not be read as more options — `-Dheaders` is `--dump-header headers`,
+# and a pattern that scanned the whole token found the `d` in "headers" and
+# called a GET a creation. `-o Food`, `-A friend` and `-H Food:x` failed the
+# same way.
+_CURL_VALUE_OPTS = frozenset("abCcDdEeFHKmoTtUuwXxYyZz")
+_CURL_DATA_OPTS = frozenset("dF")
+
+
+def _curl_short_run_posts(token: str) -> bool:
+    """Does this single-dash short-option run carry request data?
+
+    Walked character by character: a boolean flag (`-s`, `-f`, `-L`, `-k`)
+    continues the run, `d`/`F` are the data options, and any other
+    value-taking option ends the run because the rest of the token is its
+    argument.
+    """
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return False
+    for char in token[1:]:
+        if char in _CURL_DATA_OPTS:
+            return True
+        if char in _CURL_VALUE_OPTS:
+            return False
+        if not char.isalpha():
+            return False
+    return False
 
 
 def _curl_posts(segment: list[str]) -> bool:
     for token in segment:
         if token in _CURL_DATA_FLAGS or token.startswith("--data"):
             return True
-        if not token.startswith("--") and _CURL_ATTACHED_DATA.match(token):
+        if _curl_short_run_posts(token):
             return True
     return False
 
@@ -670,9 +706,26 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
     if not _url_source_is_certain(command):
         return False
     if subs:
-        return subs[0] == "create"
+        return subs[0] in _GH_CREATE_SUBS
     target, is_write = github_api_call(command)
     return target == "pulls_collection" and is_write
+
+
+def _call_failed(tool_response: object) -> bool:
+    """Did the call that produced this result FAIL?
+
+    `pr_provenance._execution_status` reads the shell shape (`exit_code`,
+    `is_error`, `success`) and is reused rather than re-derived — but MCP
+    results spell it `isError`, which that helper does not know and which this
+    module must not teach it (pr_provenance is shared with the provenance
+    path and the spec keeps it unmodified). So the camelCase spelling is
+    checked here, beside the caller that needs it.
+    """
+    if not isinstance(tool_response, dict):
+        return False
+    if tool_response.get("isError") is True:
+        return True
+    return pr_provenance._execution_status(tool_response) == "failure"
 
 
 def _response_texts(tool_response: object) -> list[str] | None:
@@ -1019,6 +1072,17 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
     """stdin → the text to inject, or None. The whole hook, minus its I/O."""
     if not touches_github(tool_name, tool_input):
         return None
+    # A create that FAILED opened nothing. `gh pr create` on a branch that
+    # already has one prints THAT pull request's URL to stderr and exits
+    # non-zero, and a GitHub MCP failure returns `isError` with the same shape
+    # — so B1 would tell the session to record a confirmed `session_self` link
+    # to a pull request somebody else opened. `pr_babysit_trigger` guards this
+    # exact case and the guard was dropped on the way over.
+    #
+    # It only downgrades B1 → B2: the URL is still a pull request that is in
+    # play, and the model judges whether it wrote the code.
+    created = creates_pr(tool_name, tool_input) and not _call_failed(tool_response)
+
     # `api_host`, NOT `host`: `host` is the SESSION's host (claude/codex/cursor)
     # and namespaces the conversation id below. Reusing the name here silently
     # made every Codex and Cursor session id un-namespaced.
@@ -1035,8 +1099,7 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
     if not isinstance(reply, dict):
         return None
     conv_id = conversation_id_for(host, session_id) or ""
-    return context_for(reply, pr_url, conv_id,
-                       created=creates_pr(tool_name, tool_input))
+    return context_for(reply, pr_url, conv_id, created=created)
 
 
 __all__ = [
