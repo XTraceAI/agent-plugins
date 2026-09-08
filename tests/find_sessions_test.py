@@ -155,16 +155,22 @@ def test_switch_creates_a_branch_too():
         home = Path(td) / "home"
         wt = str(Path(td) / "repo")
         # `branch=None` means no gitBranch record: the Codex/Cursor shape.
-        claude_session(home, "switcher", wt, branch=None,
-                       edits=[f"{wt}/app/x.py"],
-                       commands=["git switch -c feat/x"])
+        # Every spelling git accepts for the same thing.
+        for index, command in enumerate(("git switch -c feat/x",
+                                         "git switch -cfeat/x",
+                                         "git switch --create=feat/x",
+                                         "git checkout -bfeat/x")):
+            claude_session(home, f"switcher{index}", wt, branch=None,
+                           edits=[f"{wt}/app/x.py"], commands=[command])
         rc, out, _err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
         rows = {r["conversation_id"]: r for r in json.loads(out)}
-        check("the branch is picked up from `git switch -c`",
-              rows.get("switcher", {}).get("evidence", {}).get("branch_match") is True,
-              out[:220])
-        check("…so it scores the file AND the branch (2 + 3)",
-              rows.get("switcher", {}).get("score") == 5, out[:220])
+        for index, command in enumerate(("-c feat/x", "-cfeat/x",
+                                         "--create=feat/x", "-bfeat/x")):
+            row = rows.get(f"switcher{index}", {})
+            check(f"the branch is picked up from `{command}`",
+                  row.get("evidence", {}).get("branch_match") is True, out[:240])
+            check(f"…so `{command}` scores the file AND the branch (2 + 3)",
+                  row.get("score") == 5, out[:240])
 
 
 def test_a_commit_message_is_not_a_list_of_edited_paths():
@@ -176,12 +182,17 @@ def test_a_commit_message_is_not_a_list_of_edited_paths():
         wt = str(Path(td) / "repo")
         claude_session(home, "talker", wt, branch="unrelated",
                        commands=['git commit -m "docs: update app/x.py and app/y.py"'])
+        # …including the bundled spelling, where `-am` is `-a -m`.
+        claude_session(home, "bundler", wt, branch="unrelated",
+                       commands=['git commit -am "docs: update app/x.py"'])
         claude_session(home, "doer", wt, branch="unrelated",
                        commands=['git commit -m "fix" app/x.py app/y.py'])
         rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
         rows = {r["conversation_id"]: r for r in json.loads(out)}
         check("a session that only NAMED the files in a message is not a candidate",
               "talker" not in rows, out[:200])
+        check("…nor when the flags were bundled as `-am`",
+              "bundler" not in rows, out[:200])
         check("…while one that passed them as pathspecs is",
               sorted(rows.get("doer", {}).get("evidence", {}).get("files", []))
               == ["app/x.py", "app/y.py"], out[:200])

@@ -203,6 +203,10 @@ _VALUE_LONG_OPTS = frozenset({
     "--happy-eyeballs-timeout-ms", "--continue-at", "--socks4", "--socks5"})
 
 
+# Short options known to take NO operand, across the clients we accept. Like
+# the long list below, this exists to keep the common cases working — the
+# DEFAULT is what provides the safety.
+_NO_OPERAND_SHORT = frozenset("sSfLkvViIgG#OJNqn46lRpBjMr")
 # Options known to take NO operand. This list exists to make the DEFAULT below
 # safe rather than to be exhaustive.
 _NO_OPERAND_LONG = frozenset({
@@ -252,7 +256,13 @@ def _consumes_operand(token: str) -> bool:
     for position, char in enumerate(token[1:], start=1):
         if char in _CURL_VALUE_OPTS:
             return position == len(token) - 1
-    return False
+    # The same inversion as for long options, and for the same reason: the
+    # value table above is curl's and is shared with every client, so `curl -A`
+    # (user agent) and `wget -P` (directory prefix) were not in it and their
+    # operands were re-read as `-XPOST`. A run made ENTIRELY of characters
+    # known to take no operand is trusted; anything else is assumed to consume
+    # one, which can only cost a link, never manufacture a claim.
+    return not all(char in _NO_OPERAND_SHORT for char in token[1:])
 
 
 def _explicit_method(tokens: list[str]) -> str | None:

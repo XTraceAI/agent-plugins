@@ -275,6 +275,17 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", True),
         ("curl --silent --location -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
          "pulls_collection", True),
+        # SHORT options needed the same inverted default: the value table is
+        # curl's and shared, so `curl -A` and `wget -P` were not in it and
+        # their operands were re-read as a method (Codex review, PR #182).
+        ("curl -A '-XPOST' 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("wget -P '-XPOST' -O - 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("curl -Z '-XPOST' 'https://api.github.com/repos/o/r/pulls'",
+         "pulls_collection", False),
+        ("curl -k -v -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
