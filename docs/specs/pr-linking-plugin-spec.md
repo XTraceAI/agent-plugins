@@ -19,18 +19,23 @@ and `pr_babysit_trigger.py` arms the babysit loop — but neither creates a link
 
 **Solution.** One new hook and two new skills.
 
-- **`pr_link_trigger.py`** — a PostToolUse hook on shell commands. When a `gh pr …` command's
-  output contains exactly one PR URL, it asks the backend one question
-  (`GET /v1/team/pr-links/check`) and injects one of three instructions:
+- **`pr_link_trigger.py`** — a PostToolUse hook on shell commands **and GitHub MCP tool calls**.
+  When a call that addressed GitHub — `gh pr …`, a `curl`/`gh api` request to the REST API, or a
+  GitHub MCP tool — returns output containing exactly one PR URL, it asks the backend one question
+  (`GET /v1/team/pr-links/check`) and injects one instruction:
   1. *not connected* → tell the user, once, that connecting GitHub on MemHub is what links this
      work to the code;
-  2. *connected, and this session wrote the code* → call `link_pr(pr_url, [session_id],
-     link_source="session_self")`;
-  3. *connected, and it did not* → offer to run `/memhub:find-contributing-sessions`.
+  2. *connected, and this call OPENED the pull request* (`gh pr create`, a POST to
+     `…/repos/<o>/<r>/pulls`, or a create-shaped GitHub MCP tool) → link this session,
+     unconditionally, `link_source="session_self"` — and, only if the code came mostly from
+     elsewhere, also offer `/memhub:find-contributing-sessions`;
+  3. *connected, any other GitHub call that names one PR* → the model decides: link if it wrote
+     the code here, else offer `/memhub:find-contributing-sessions`.
 
-  **Who decides which of 2 or 3 applies is the model, not the hook.** The hook has no authorship
-  detection; the agent knows whether it edited the code in this PR this session, and that
-  judgment is the whole design.
+  **Opening a pull request is itself work the session did**, so case 2 asks no authorship question
+  — the creating session is always part of that PR's history, and a PR having many sessions means
+  linking it displaces nobody. Case 3 is where judgment lives, and it is the model's, not the
+  hook's: the agent knows whether it edited these files this session, and no heuristic has to.
 - **`/memhub:link-pr`** — the manual path. Link this session (or named ones) to a PR.
 - **`/memhub:find-contributing-sessions`** — scans local session history for sessions that
   plausibly wrote the code in a PR, ranks them, has the user approve, and links the approved ones.
@@ -108,7 +113,7 @@ all call it. Three copies of a string prefix is how a host silently stops linkin
 
 | File | Change |
 |---|---|
-| `plugins/memhub/scripts/pr_link.py` | **New.** Shared, importable, side-effect-free: command detection, URL extraction, `conversation_id_for`, the `check` call, and the three context texts. |
+| `plugins/memhub/scripts/pr_link.py` | **New.** Shared, importable, side-effect-free: the `touches_github` / `creates_pr` detectors (shell, REST API, MCP), URL extraction, `conversation_id_for`, the `check` call, and the context texts. |
 | `plugins/memhub/scripts/pr_link_trigger.py` | **New.** The hook entry point: stdin → `pr_link` → `additionalContext` on stdout. |
 | `plugins/memhub/scripts/capture.py` | **Changed.** New `current` subcommand (§7). |
 | `plugins/memhub/scripts/readers/{claude,codex,cursor}.py` | **Changed.** Each gains `session_cwd(path) -> str | None` (§7). |
@@ -128,7 +133,26 @@ all call it. Three copies of a string prefix is how a host silently stops linkin
 
 Stdlib only. No network at import. Every public function is pure except `check()`.
 
-### 4.1 `is_gh_pr_command(command: str) -> bool`
+### 4.1 Two questions, not one
+
+Every detector below answers one of exactly two questions, and the answers are independent:
+
+- **`touches_github(tool_name, tool_input) -> bool`** — did this tool call address GitHub at all?
+  This is the gate: if it is false the hook stops, whatever the output contains.
+- **`creates_pr(tool_name, tool_input) -> bool`** — is this call *opening* a pull request? True
+  selects context **B1** (unconditional self-link); false selects **B2** (the model judges).
+
+`gh pr …` is one implementation of each (§4.1a / §4.1b); the other PR-creation paths are §4.1c.
+`creates_pr` implies `touches_github` for every input, and a test asserts it (§10).
+
+**Why a "touches GitHub" gate rather than "any output containing a PR URL".** The URL rule in
+§4.2 is what actually recognises a pull request, and it is tempting to run it over every tool
+result. Don't: a `cat CHANGELOG.md`, a `git log` whose commit message cites a PR, a WebFetch of a
+PR page, or the agent re-reading its own earlier output would all inject linking context about a
+pull request nobody is working on. The gate keeps the feature attached to *acting on GitHub*,
+which is the thing that correlates with the session having a stake in the PR.
+
+### 4.1a `is_gh_pr_command(command: str) -> bool`
 
 True when the command invokes `gh` **at command position** with `pr` as its subcommand — *any*
 `gh pr …`, not just `create`. Build it from `pr_babysit_trigger.GH_PR_CREATE` by replacing the
@@ -147,19 +171,97 @@ both modules agree on a shared corpus of commands (§10).
 Deliberately **no subcommand allowlist.** `gh pr list` and `gh pr status` are excluded by §4.2's
 "exactly one URL" rule, not by naming subcommands — a rule that keeps working when `gh` adds one.
 
+### 4.1b `is_gh_pr_create(command: str) -> bool`
+
+The same regex with `\bpr\s+create\b` instead of `\bpr\b` — i.e. exactly
+`pr_babysit_trigger.is_pr_create`. This is a **separate, narrower** predicate, not a refinement of
+§4.1, and it decides which of the two connected contexts the hook emits (§4.5): a session that
+ran `gh pr create` links itself unconditionally, while every other `gh pr …` subcommand leaves the
+decision to the model.
+
+Both predicates run on every qualifying command. `is_gh_pr_create` implies `is_gh_pr_command`,
+and a test asserts that (§10) — a corpus where the narrow one accepts something the wide one
+rejects would mean a `gh pr create` that never reaches the hook at all.
+
+### 4.1c The other ways an agent opens a pull request
+
+`gh pr create` is the common path, not the only one. Each of these must reach the same B1
+context, or a session that opened a PR silently fails to link itself — and the user has no way to
+tell that happened.
+
+**1. The REST API from a shell command** (`curl`, `http`, `wget`, `xh`, or `gh api`):
+
+```bash
+curl -L -X POST -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $TOKEN" \
+  https://api.github.com/repos/OWNER/REPO/pulls \
+  -d '{"title":"…","head":"octocat:new-feature","base":"master"}'
+
+gh api --method POST repos/OWNER/REPO/pulls -f title=… -f head=… -f base=main
+```
+
+`github_api_call(command)` → `("pulls_collection" | "pull_item" | None, is_write)`:
+
+- Strip quoted segments first (as §4.1a does), then look for a GitHub API target:
+  `https://api.github.com/repos/<owner>/<repo>/pulls` or, for `gh api`, a bare
+  `repos/<owner>/<repo>/pulls` path argument. A trailing `/<number>` (or `/<number>/…`) makes it
+  `pull_item`; the bare collection is `pulls_collection`. Enterprise hosts count too: accept any
+  `https://<host>/api/v3/repos/…` and `gh api --hostname <host>`.
+- `is_write` when the command carries `-X POST` / `--request POST` / `--method POST` / `-XPOST`,
+  or (for `gh api`) any of `-f`/`--field`/`--raw-field`/`--input`, or (for `curl`) `-d`/`--data*`
+  without an explicit non-POST method. `curl` with `-d` and no `-X` **is** a POST — that is the
+  example in the wild, and reading it as a GET would miss every hand-rolled PR creation.
+- **`creates_pr` = `pulls_collection` AND `is_write`.** A POST to the *collection* is what opens a
+  PR; a POST to `pulls/<n>` is an edit, and a GET of either is B2 territory.
+- `touches_github` = any GitHub API target at all, read or write.
+
+The response body is the PR object, whose `html_url` is the one `github.com/<o>/<r>/pull/<n>`
+string in it — `issue_url`, `comments_url`, `review_comments_url` and `_links` are all
+`api.github.com` URLs, which `_PR_URL_RE` does not match, and `head.repo.html_url` has no `/pull/`
+segment. So §4.2's "exactly one URL" rule resolves a create response cleanly with no special
+casing.
+
+**2. A GitHub MCP server tool call.** The hook payload names the tool rather than a command
+(`mcp__github__create_pull_request`, `mcp__github-mcp__create_pr`, vendor-specific spellings
+vary):
+
+- `touches_github` when the tool name matches `(?i)^mcp__[^_]*github[^_]*__` — the *server*
+  segment names GitHub. Matching `github` anywhere in the name would catch a tool called
+  `mcp__notes__github_summary`, which is not the same thing.
+- `creates_pr` when the tool segment additionally matches
+  `(?i)(create|open|submit).*(pull.?request|\bpr\b)`. Deliberately loose on the verb and strict
+  on the object: a server that spells it `open_pull_request` should not need a plugin release.
+- The result is a JSON object; §4.2 already walks dicts/lists for text, so the PR's `html_url`
+  surfaces the same way.
+
+**3. Everything else** — a Python script using PyGithub, a Makefile target, a CI helper, `hub
+pull-request`. These are **not** detected, deliberately: recognising arbitrary programs that
+happen to open a PR is the automatic-attribution problem this whole design walked away from. The
+answer is `/memhub:link-pr`, and §8's skill exists precisely so an undetected path is one command
+away from a link rather than a silent gap. Say so in the README (§11) rather than leaving the
+user to discover it.
+
+**Ordering.** `creates_pr` is checked as: `is_gh_pr_create(cmd)` OR (`github_api_call` is a
+writing `pulls_collection`) OR (MCP create-shaped tool name). The first match wins; there is no
+scoring.
+
 ### 4.2 `pr_url_from_response(tool_response) -> str | None`
 
-1. Take the response's text: `tool_response["stdout"]` when it is a dict with a string `stdout`;
-   the whole string when the response is a string; otherwise `""` **plus** `tool_response.get(
-   "stderr")` if it is a string — `gh pr create` on an existing branch prints the existing PR's
-   URL to stderr, and that is still the PR the user is working on.
+1. Take the response's text. A shell result is a dict with `stdout` / `stderr` strings, or a bare
+   string; an MCP result is a nested object. Handle both by walking the response for strings the
+   way `pr_provenance._result_strings` already does (`content` / `text` / `output` keys, bounded
+   by node count and byte budget) and concatenating what comes back, with `stdout` and `stderr`
+   both included — `gh pr create` on an existing branch prints the existing PR's URL to stderr,
+   and that is still the PR the user is working on. Reuse that helper rather than writing a
+   second walker; it already carries the depth, node and byte caps.
 2. `urls = pr_provenance.urls_from_output_text(text)` — bounded, canonical, deduped, lowercased.
 3. Return `urls[0]` **only when `len(urls) == 1`**. Zero (a `gh pr list` with no matches, a failed
    command, `gh pr checkout` printing only a branch) or two-or-more (`gh pr list`, `gh pr status`)
    → `None` → the hook is silent.
 
 This single rule is what keeps the hook quiet on the listing commands while still firing on
-`create`, `view`, `checkout`, `comment`, `merge`, `ready`, and `edit`.
+`create`, `view`, `checkout`, `comment`, `merge`, `ready`, and `edit` — and, unchanged, on a
+`curl` POST response or a GitHub MCP result, both of which carry exactly one `html_url`.
 
 `urls_from_output_text` already tolerates a `#issuecomment-…` suffix (its regex stops at the PR
 number and rejects only a following alphanumeric or `/`), so `gh pr comment`'s reply URL resolves
@@ -195,8 +297,9 @@ command forever, for an answer that cannot change without an admin action. A fre
 integration is picked up within a day, or immediately if the user runs `/memhub:link-pr` (which
 always calls live).
 
-### 4.5 The three contexts
+### 4.5 The contexts
 
+Four of them — one advisory, one repo-specific variant of it, and the two connected cases.
 Exact strings live in `pr_link.py` as module constants so the tests can assert on them and the two
 skills can quote the same vocabulary. Each is prefixed with the PR URL and, when
 `linked_sessions` is non-empty, a one-line summary of what is already linked.
@@ -209,16 +312,34 @@ skills can quote the same vocabulary. Each is prefixed with the PR URL and, when
 > agent sessions to the code that shipped. Do not repeat it, do not offer to do it for them, and
 > do not let it interrupt what they asked for.
 
-**B — connected, decide authorship** (`github_connected:true`):
+**B1 — connected, and this call opened the pull request** (`github_connected:true` and
+`creates_pr` true — §4.1b or §4.1c). **No authorship judgment happens here.** The session that opened the pull request is
+part of that pull request's history whatever else contributed to it — it is where the PR was
+written up, where the branch was pushed from, and usually where the review will be handled — so
+it links itself unconditionally:
+
+> MemHub: you just opened `<pr_url>` (`<repo>#<n>`).
+> `<Already linked: 2 sessions (1 of them this user's).>`
+> Link this session to it now: `link_pr` with `pr_url="<pr_url>"`,
+> `session_ids=["<session_id>"]`, `link_source="session_self"`. Do this without asking — opening
+> the pull request is itself work this session did, and the call is idempotent.
+> Then, **only if most of the code in this pull request was written in OTHER sessions** (you
+> opened it for work done earlier, or you are shipping someone else's branch), add one sentence
+> offering `/memhub:find-contributing-sessions <pr_url>` so those sessions get linked too. A pull
+> request has many sessions; yours does not displace them. Do not run it without a yes.
+
+**B2 — connected, any other GitHub call naming one PR** (`github_connected:true`,
+`creates_pr` false). Here the model does judge, because viewing, checking out, commenting on or
+fetching a pull request says nothing about who wrote it:
 
 > MemHub: a pull request is in play — `<pr_url>` (`<repo>#<n>`, `<state>`).
 > `<Already linked: 2 sessions (1 of them this user's).>`
 > A pull request has many sessions and a session has many pull requests, so linking again from a
 > different session is expected, not a duplicate.
-> **If the code in this pull request was written in THIS session** — you edited those files, or
-> you opened the PR for work you did here — call `link_pr` with `pr_url="<pr_url>"`,
-> `session_ids=["<session_id>"]`, `link_source="session_self"`. Do it without asking; it is a
-> record of work you did, and it is idempotent.
+> **If the code in this pull request was written in THIS session** — you edited those files here
+> — call `link_pr` with `pr_url="<pr_url>"`, `session_ids=["<session_id>"]`,
+> `link_source="session_self"`. Do it without asking; it is a record of work you did, and it is
+> idempotent.
 > **If it was not** — you are reviewing, checking out, or commenting on someone else's work, or
 > work from an earlier session — do not link. Instead offer, in one sentence, to run
 > `/memhub:find-contributing-sessions <pr_url>` to find the sessions that did write it. Do not
@@ -228,7 +349,7 @@ skills can quote the same vocabulary. Each is prefixed with the PR URL and, when
 `repo_in_install:false` uses variant **A** with a different first sentence naming the repo:
 "…GitHub is connected, but `<repo>` isn't part of the install, so this PR can't be linked."
 
-The final line of B is what keeps a stateless hook quiet inside a `/memhub:pr-babysit` loop, which
+The final line of B2 is what keeps a stateless hook quiet inside a `/memhub:pr-babysit` loop, which
 runs `gh pr view` on every pass: the agent has its own conversation context and can see it already
 handled this PR. There is deliberately **no state file** — a PR↔session relationship is
 many-to-many, and a dedup file keyed on the PR is exactly what would stop a genuinely new session
@@ -245,31 +366,52 @@ cannot silence the other:
 
 ```json
 {
-  "matcher": "Bash",
+  "matcher": "^(Bash|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$",
   "hooks": [{
     "type": "command",
     "timeout": 15,
     "statusMessage": "MemHub: checking PR link",
-    "command": "IN=$(cat); case \"$IN\" in *gh*pr*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
+    "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
   }]
 }
 ```
 
-The `case` pre-filter is a cheap byte test that keeps `python3` from starting on ordinary shell
-traffic — the same trick the flush and babysit entries use. Synchronous (not `async`), because
-`additionalContext` from an async hook is not delivered; 15s covers a 4s HTTP call with room to
-spare, and the script self-limits regardless.
+**The matcher is a regex over the tool name**, so it must name the GitHub MCP servers as well as
+`Bash` — `"Bash"` alone silently misses every §4.1c case 2. It is deliberately anchored on the
+*server* segment rather than `mcp__.*`: matching every MCP tool would start a Python process on
+every MCP call in every session, for a check that is almost always going to decline.
 
-Hook input fields consumed: `session_id`, `tool_input.command`, `tool_response`.
+The `case` pre-filter is a cheap byte test that keeps `python3` from starting on ordinary shell
+traffic — the same trick the flush and babysit entries use. Both alternatives are needed:
+`*gh*pr*` catches `gh pr create` (which contains no "github"), and `*[Gg]it[Hh]ub*` catches the
+`api.github.com` URL in a `curl`/`gh api` command or response and the server name in an MCP tool
+call. A `gh api repos/o/r/pulls` command matches through the `api.github.com` URL in its own
+*response*, which is in the same payload.
+
+Synchronous (not `async`), because `additionalContext` from an async hook is not delivered; 15s
+covers a 4s HTTP call with room to spare, and the script self-limits regardless.
+
+Hook input fields consumed: `session_id`, `tool_name`, `tool_input` (`.command` for shell, the
+whole object for MCP), `tool_response`.
 
 ### 5.2 Codex — `codex_hook_bridge.py`
 
-In `_dispatch_post`, add a job when `tool in _SHELL_TOOLS`:
+In `_dispatch_post`, add a job for shell tools **and** GitHub MCP tools:
 
 ```python
-if tool in _SHELL_TOOLS:
+_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__[^_]*github[^_]*__")
+
+if tool in _SHELL_TOOLS or (isinstance(tool, str) and _GITHUB_MCP_RX.match(tool)):
     jobs.append(lambda: _run(root, "pr_link_trigger.py", payload, timeout=_PR_LINK_TIMEOUT_S))
 ```
+
+The bridge's own `PostToolUse` matcher in `references/codex-hooks-bridge.json` lists tool names
+(`^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|shell|local_shell|Bash)$`) and therefore does
+**not** dispatch MCP calls to the bridge at all. Widening it means editing a file users have
+already trusted in `~/.codex/hooks.json`, which `setup_codex_hooks.py` would have to re-install.
+**Out of scope for this change:** on Codex, shell-based PR creation (`gh`, `curl`) is covered and
+MCP-based creation is not. Say so in the README (§11) alongside the Cursor note, and leave the
+manifest alone rather than shipping a hooks change that needs a re-trust.
 
 `_dispatch_post` already runs its jobs concurrently and folds each result's
 `hookSpecificOutput.additionalContext` into one document, so nothing else changes. Add
@@ -303,6 +445,11 @@ fallback and then applies `conversation_id_for("codex", sid)`.
 
 Cursor's payload gives the session id via `payload.get("session_id") or
 payload.get("conversation_id")` (`cursor_flush.py:336`), then `conversation_id_for("cursor", …)`.
+
+Cursor's hook set is shell- and edit-shaped (`beforeShellExecution`, `afterShellExecution`,
+`afterFileEdit`, `afterAgentResponse`, `stop`, `beforeSubmitPrompt`) with no MCP-execution event,
+so §4.1c case 2 cannot be detected there at all. Shell-based creation is covered if §5.3 lands;
+MCP-based creation is `/memhub:link-pr` territory.
 
 ---
 
@@ -506,6 +653,27 @@ every `def test_*` to actually be invoked — use `globals()` discovery or list 
   `gh --repo o/r pr merge`, `env FOO=1 gh pr ready`, `sudo gh pr edit`, `x && gh pr view`;
   false for `grep "gh pr view" f`, `echo gh pr create`, `ghost pr view`, `gh repo view && foo pr
   create`, `gh pr` inside single quotes.
+- `is_gh_pr_create`: true for `gh pr create --fill`, **`cd .. && gh pr create`**,
+  `cd /repo; gh pr create`, `(cd sub && gh pr create)`, `env X=1 gh pr create`; false for
+  `gh pr view`, `gh pr merge`, `grep "gh pr create" f`. The chained-command cases are not
+  decoration — a `^gh pr create` anchor would miss them, and missing them is what silently turns
+  an unconditional self-link into a coin flip.
+- **implication test**: for every command in the corpus, `is_gh_pr_create(c)` implies
+  `is_gh_pr_command(c)`, and `creates_pr(t, i)` implies `touches_github(t, i)`.
+- `github_api_call`: the user's exact `curl -L -X POST … https://api.github.com/repos/O/R/pulls
+  -d '{…}'` → `("pulls_collection", True)`; the same without `-X POST` but with `-d` → still a
+  write (this is the shape people actually paste); with `-X GET` → not a write;
+  `…/pulls/12` → `("pull_item", …)`; `gh api --method POST repos/o/r/pulls -f title=x` → write on
+  the collection; `gh api repos/o/r/pulls` → read; an enterprise `https://gh.corp/api/v3/repos/o/r/pulls`
+  POST → write; `curl https://api.github.com/repos/o/r/issues` → `(None, …)`;
+  `echo "https://api.github.com/repos/o/r/pulls"` and a quoted URL inside `grep` → `(None, …)`.
+- MCP detection: `mcp__github__create_pull_request` → both true;
+  `mcp__github-mcp__open_pull_request` → both true; `mcp__github__get_pull_request` →
+  `touches_github` only; `mcp__notes__github_summary` → **neither** (the server segment is not
+  GitHub); `mcp__GitHub__createPullRequest` → both true (case-insensitive).
+- a real `create_pull_request` MCP result fixture (with `html_url`, `issue_url`, `comments_url`,
+  `_links` and `head.repo.html_url`) → `pr_url_from_response` returns exactly the `html_url`; a
+  real `curl` POST response body fixture → the same.
 - **agreement test**: every command in the shared corpus that `pr_babysit_trigger.is_pr_create`
   accepts must also satisfy `pr_link.is_gh_pr_command` — the widened regex may never be narrower.
 - `pr_url_from_response`: exactly one URL → that URL; `gh pr list` output with three → `None`;
@@ -521,8 +689,17 @@ every `def test_*` to actually be invoked — use `globals()` discovery or list 
 
 **`tests/pr_link_trigger_test.py`** (subprocess, like the other hook tests)
 - a Claude PostToolUse payload for `gh pr create` with one URL and a stubbed connected `check` →
-  stdout parses as `hookSpecificOutput.additionalContext` containing the URL, the session id, and
-  the "if the code in this pull request was written in THIS session" sentence.
+  stdout parses as `hookSpecificOutput.additionalContext` carrying the **B1** text: the URL, the
+  session id, `link_source="session_self"`, and "without asking". It must NOT contain B2's
+  "if the code in this pull request was written in THIS session" conditional.
+- the same payload with `cd .. && gh pr create` as the command → still B1.
+- a `curl -X POST …/pulls` payload whose response body is a PR object → **B1**.
+- an `mcp__github__create_pull_request` payload (tool_name set, no `tool_input.command`) → **B1**.
+- an `mcp__github__get_pull_request` payload → **B2**.
+- a `cat CHANGELOG.md` payload whose output contains one PR URL → **empty stdout**: the gate is
+  "did this call address GitHub", not "does this text mention a PR".
+- a `gh pr view` payload with one URL and the same stubbed `check` → the **B2** text, with the
+  conditional and no unconditional link instruction.
 - `github_connected:false` → variant A text, with the `connect_url`.
 - `repo_in_install:false` → the repo-specific variant of A.
 - `enabled:false` → **empty stdout, exit 0**.
@@ -555,10 +732,14 @@ caps are honoured on a synthetic 50k-record session.
     in MemHub, so the PR's session context is published from a confirmed fact.
   - `/memhub:find-contributing-sessions [pr]` — scans this machine's session history for the
     sessions that wrote a PR's code, ranks the candidates, and links the ones you approve.
-- **`README.md`**, the PR section — a short paragraph: after any `gh pr …` command, MemHub checks
-  whether the org has GitHub connected and either links this session (when it wrote the code),
-  offers the finder, or mentions connecting GitHub. Say plainly that **linking is never automatic
-  for work this session did not do**.
+- **`README.md`**, the PR section — a short paragraph: after a call that addresses GitHub (`gh pr
+  …`, a `curl` / `gh api` request to the REST API, or a GitHub MCP tool), MemHub checks whether
+  the org has GitHub connected and either links this session, offers the finder, or mentions
+  connecting GitHub. Say plainly that **a session that opens a PR always links itself**, that
+  **linking is otherwise never automatic for work this session did not do**, and that **a PR
+  opened by some other means — a script, a CI helper — is linked with `/memhub:link-pr`**, with
+  the per-host gaps named (no MCP detection on Codex or Cursor; no hook at all on Cursor if §5.3
+  lands skills-only).
 - If §5.3 lands skills-only for Cursor, say so in the Cursor install section.
 - `documentation_test.py` asserts on README strings; add assertions for the two new skill names so
   a future rename cannot silently drop them from the docs.
