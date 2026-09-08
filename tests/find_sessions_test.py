@@ -53,15 +53,16 @@ def _record(uuid: str, branch: str | None, cwd: str, blocks: list) -> dict:
 
 def claude_session(home: Path, sid: str, cwd: str, *, branch: str | None,
                    edits: list[str] = (), commands: list[str] = (),
-                   results: list[str] = (), age_s: float = 0.0) -> Path:
+                   results: list[str] = (), age_s: float = 0.0,
+                   path_key: str = "file_path", tool: str = "Edit") -> Path:
     project = home / ".claude" / "projects" / cwd.replace("/", "-")
     project.mkdir(parents=True, exist_ok=True)
     rows = [_record(f"{sid}-0", branch, cwd, [{"type": "text", "text": PROSE}])]
     n = 1
     for path in edits:
         rows.append(_record(f"{sid}-{n}", branch, cwd, [{
-            "type": "tool_use", "id": f"t{n}", "name": "Edit",
-            "input": {"file_path": path, "new_string": PROSE}}]))
+            "type": "tool_use", "id": f"t{n}", "name": tool,
+            "input": {path_key: path, "new_string": PROSE}}]))
         n += 1
     for command in commands:
         rows.append(_record(f"{sid}-{n}", branch, cwd, [{
@@ -124,6 +125,26 @@ def test_the_session_that_edited_the_files_on_the_head_branch_wins():
               rows and rows[0]["evidence"]["branch_match"] is True, out)
         check("the main-only session that touched nothing scores out",
               all(r["conversation_id"] != "bbbb-2222" for r in rows), out)
+
+
+def test_edit_paths_are_read_under_every_host_s_spelling():
+    """The readers pass NATIVE tool arguments through unchanged — Cursor's own
+    `args` go straight into `input` (readers/cursor.py) — so reading only
+    `file_path` gave Cursor sessions no file evidence at all, and genuine
+    contributors were crowded out by weaker candidates (Codex, PR #182)."""
+    for key, tool in (("file_path", "Edit"), ("path", "Write"),
+                      ("notebook_path", "NotebookEdit")):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            wt = str(Path(td) / "repo")
+            claude_session(home, "editor", wt, branch="unrelated",
+                           edits=[f"{wt}/app/x.py", f"{wt}/app/y.py"],
+                           path_key=key, tool=tool)
+            rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
+            rows = json.loads(out)
+            check(f"an edit under {key!r} counts as file evidence",
+                  rows and sorted(rows[0]["evidence"]["files"])
+                  == ["app/x.py", "app/y.py"], out[:200])
 
 
 def test_a_hidden_path_keeps_its_leading_dot():

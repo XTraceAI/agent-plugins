@@ -132,9 +132,10 @@ _METHOD_FLAGS = ("-X", "--request", "--method")
 # `gh api` sends fields as POST unless `--method GET` says otherwise.
 _GH_FIELD_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
 # curl's `-d`/`--data*`/`-F` imply POST. NOT `-f`, which is curl's `--fail`.
+# `curl --help all` on `--json <data>`: "HTTP POST JSON".
 _CURL_DATA_FLAGS = frozenset({
     "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
-    "--data-ascii", "-F", "--form", "--form-string"})
+    "--data-ascii", "-F", "--form", "--form-string", "--json"})
 # wget documents `--post-data=STRING` / `--post-file=FILE` as "use the POST
 # method". Accepting wget as a client and then only knowing curl's flags meant
 # a real creation through it fell to B2 — safe, but the client was listed as

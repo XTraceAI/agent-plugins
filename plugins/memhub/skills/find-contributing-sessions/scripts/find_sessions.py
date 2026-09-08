@@ -35,6 +35,11 @@ MAX_RECORDS = 20_000
 MAX_BYTES = 64 * 1024 * 1024
 MAX_TEXT_SCAN = 256 * 1024      # per tool result, for sha hunting
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# Which key holds the path depends on the HOST, not on us: the readers pass
+# native tool arguments through unchanged (`readers/cursor.py` puts the tool's
+# own `args` straight into `input`), so `file_path` is the Claude spelling and
+# assuming it silently gave Cursor sessions no file evidence at all.
+EDIT_PATH_KEYS = ("file_path", "path", "notebook_path")
 WINDOW_DAYS = 30
 
 _SHA_RX = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -213,10 +218,13 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
 
     for tool, payload, result, result_is_sha_proof in _tool_calls(records):
         if tool in EDIT_TOOLS:
-            note_path(payload.get("file_path"))
-            for edit in (payload.get("edits") or []) if isinstance(payload.get("edits"), list) else []:
+            for key in EDIT_PATH_KEYS:
+                note_path(payload.get(key))
+            edits = payload.get("edits")
+            for edit in edits if isinstance(edits, list) else []:
                 if isinstance(edit, dict):
-                    note_path(edit.get("file_path"))
+                    for key in EDIT_PATH_KEYS:
+                        note_path(edit.get(key))
         elif tool == "apply_patch":
             for match in _APPLY_PATCH_PATH.finditer(str(payload.get("input", ""))[:MAX_TEXT_SCAN]):
                 note_path(match.group(1))

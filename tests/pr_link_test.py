@@ -190,6 +190,11 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("wget --post-file=b.json https://api.github.com/repos/o/r/pulls",
          "pulls_collection", True),
         ("wget https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # `curl --help all`: "--json <data>  HTTP POST JSON" (Codex, PR #182).
+        ("curl --json '{\"title\":\"x\"}' https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
+        ("curl --json @body.json https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
         ("http POST https://api.github.com/repos/o/r/pulls title=x",
          "pulls_collection", True),
         ("xh POST https://api.github.com/repos/o/r/pulls title=x",
