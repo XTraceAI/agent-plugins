@@ -243,6 +243,18 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", True),
         ("curl -XPOST https://api.github.com/repos/o/r/pulls -d @b",
          "pulls_collection", True),
+        # curl documents that a repeated -X uses the LAST value; returning the
+        # first read `-X POST -X GET` as a creation (Codex review, PR #182).
+        ("curl -X POST -X GET 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("curl -X GET -X POST https://api.github.com/repos/o/r/pulls -d @b",
+         "pulls_collection", True),
+        # `-d` is curl's data but wget's --debug. Sharing curl's predicate with
+        # every HTTP client turned a wget LISTING into a claimed creation.
+        ("wget -d -O - 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("wget --post-data='{}' https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),

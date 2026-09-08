@@ -148,6 +148,25 @@ sys.path.insert(0, _plugin_scripts())
 import pr_link  # noqa: E402
 import readers  # noqa: E402
 
+try:                                  # same resolver the rulebook hook uses
+    from repo_identity import repo_name as _repo_name_of
+except Exception:                     # noqa: BLE001 — degrade to no filtering
+    _repo_name_of = None
+
+
+def _session_repo(cwd: str | None) -> str | None:
+    """The repo a session's cwd belongs to, or None if it cannot be resolved.
+
+    Resolved from the checkout (git remote) rather than the directory name, so
+    a worktree of the PR's repo still matches.
+    """
+    if not cwd or _repo_name_of is None:
+        return None
+    try:
+        return _repo_name_of(cwd.rstrip("/"))
+    except Exception:                 # noqa: BLE001
+        return None
+
 
 def _norm(path: str) -> str:
     """Repo-relative POSIX form. Strips a literal `./` prefix and leading
@@ -341,6 +360,11 @@ def main() -> int:
     ap.add_argument("--sha", action="append", default=[],
                     help="a commit oid on the PR (repeatable)")
     ap.add_argument("--created-at", default=None, help="the PR's createdAt, ISO-8601")
+    ap.add_argument("--repo", default=None,
+                    help="only sessions in this repo (resolved from the git "
+                         "remote, so a worktree counts). Path matching is by "
+                         "SUFFIX, so without this an unrelated project's "
+                         "README.md scores against the PR's.")
     ap.add_argument("--host", default="all", choices=["all", *readers.READERS])
     ap.add_argument("--limit", type=int, default=200,
                     help="how many recent sessions per host to scan")
@@ -406,6 +430,16 @@ def main() -> int:
                 cwd = reader.session_cwd(path)
             except Exception:  # noqa: BLE001
                 cwd = None
+            # A session in ANOTHER repository can score on this one's files,
+            # because `_matches_pr_file` matches by suffix on purpose — an
+            # unrelated project's `README.md` or `src/index.ts` would otherwise
+            # take a slot on the capped list from a real contributor. A cwd
+            # that cannot be resolved is KEPT: dropping it would silently lose
+            # candidates, and the user still approves every link.
+            if args.repo:
+                session_repo = _session_repo(cwd)
+                if session_repo is not None and session_repo != args.repo:
+                    continue
             rows.append({
                 "conversation_id": pr_link.conversation_id_for(host, session["id"]),
                 "session_id": session["id"], "host": host, "cwd": cwd,

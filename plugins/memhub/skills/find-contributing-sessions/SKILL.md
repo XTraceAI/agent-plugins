@@ -64,10 +64,19 @@ enterprise host add `--hostname <host>`:
 ```bash
 python3 "<plugin-root>/skills/find-contributing-sessions/scripts/find_sessions.py" \
   --files-from /tmp/pr-files.txt \
+  --repo <repo> \
   --branch <headRefName> --base <baseRefName> \
   --sha <oid> --sha <oid> \
   --created-at <createdAt>
 ```
+
+**Pass `--repo`** — the repo name from `$PR_URL` (the `<repo>` of
+`<owner>/<repo>`, which is what `scope_repos` uses elsewhere). Path matching is
+by SUFFIX on purpose, since a worktree's absolute prefix differs from the PR's,
+and without this scope an unrelated project's `README.md` or `src/index.ts`
+scores against the PR's files and can take a slot on the capped list from
+someone who actually wrote the code. Sessions whose repo cannot be resolved are
+still scanned, so nothing is silently lost.
 
 It prints ranked candidates as JSON — conversation id, host, cwd, mtime, score
 and the evidence components. It never prints transcript text.

@@ -339,6 +339,38 @@ def test_the_caps_hold_on_an_enormous_session():
               json.loads(out)[0]["evidence"]["files"] == ["app/x.py"], out[:400])
 
 
+def test_repo_scope_keeps_another_project_off_the_list():
+    """`_matches_pr_file` matches by SUFFIX on purpose, so an unrelated
+    project's `README.md` scores against the PR's files and can take a slot on
+    the capped list from a real contributor (Codex review, PR #182)."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        mine = str(Path(td) / "ours")
+        theirs = str(Path(td) / "elsewhere")
+        for path in (mine, theirs):
+            os.makedirs(path)
+            subprocess.run(["git", "-C", path, "init", "-q", "-b", "main"],
+                           check=True, capture_output=True)
+        subprocess.run(["git", "-C", mine, "remote", "add", "origin",
+                        "https://github.com/o/ours.git"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", theirs, "remote", "add", "origin",
+                        "https://github.com/o/elsewhere.git"], check=True, capture_output=True)
+        claude_session(home, "ours", mine, branch="feat/x",
+                       edits=[f"{mine}/app/x.py", f"{mine}/app/y.py"])
+        claude_session(home, "theirs", theirs, branch="feat/x",
+                       edits=[f"{theirs}/app/x.py", f"{theirs}/app/y.py"])
+
+        rc, out, _err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
+        check("without --repo, the unrelated project scores too",
+              "theirs" in [r["conversation_id"] for r in json.loads(out)], out[:200])
+
+        rc, out, _err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude",
+                            "--repo", "ours")
+        ids = [r["conversation_id"] for r in json.loads(out)]
+        check("with --repo, only this repo's session is a candidate",
+              ids == ["ours"], out[:200])
+
+
 def test_bad_input_is_a_clean_error():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td) / "home"

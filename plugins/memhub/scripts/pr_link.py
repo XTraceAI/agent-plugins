@@ -203,19 +203,26 @@ def _explicit_method(tokens: list[str]) -> str | None:
     than re-examined, so a header, a body or a filename that happens to look
     like `-XPOST` is data, not a method.
     """
+    found = None
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        matched = False
         for flag in _METHOD_FLAGS:
             if token == flag and index + 1 < len(tokens):
-                return tokens[index + 1].upper()
+                found, matched = tokens[index + 1].upper(), True
+                break
             if token.startswith(flag + "="):
-                return token[len(flag) + 1:].upper()
-        if (token.startswith("-X") and len(token) > 2
-                and not token.startswith("--")):        # -XPOST
-            return token[2:].upper()
+                found, matched = token[len(flag) + 1:].upper(), True
+                break
+        if not matched and (token.startswith("-X") and len(token) > 2
+                            and not token.startswith("--")):        # -XPOST
+            found = token[2:].upper()
+        # Keep scanning: curl documents that when `-X/--request` is given
+        # several times, the LAST one is used. Returning the first read
+        # `-X POST -X GET` as a creation.
         index += 2 if _consumes_operand(token) else 1
-    return None
+    return found
 
 # The SERVER segment must name GitHub — `mcp__<server>__<tool>`. Matching
 # `github` anywhere in the whole name would catch `mcp__notes__github_summary`,
@@ -667,7 +674,10 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
         write = True
     elif name == "curl" and _curl_forces_get(args):
         write = False              # -G/--get: the data goes in the query string
-    elif is_http and _curl_posts(args):
+    elif name == "curl" and _curl_posts(args):
+        # curl's flags ONLY. `wget -d` is `--debug`, not data, and reading it
+        # as a POST turned a listing into a claimed creation; wget has its own
+        # branch above and HTTPie/xh theirs.
         write = True
     else:
         write = False
