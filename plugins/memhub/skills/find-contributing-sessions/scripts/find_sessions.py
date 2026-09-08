@@ -74,7 +74,14 @@ import readers  # noqa: E402
 
 
 def _norm(path: str) -> str:
-    return path.replace("\\", "/").strip().lstrip("./")
+    """Repo-relative POSIX form. Strips a literal `./` prefix and leading
+    separators — NOT leading dots: `lstrip("./")` turned `.env` into `env` and
+    `.github/workflows/ci.yml` into `github/…`, so a session that edited the
+    non-hidden path scored false file evidence against a hidden one."""
+    p = path.replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
 
 
 def _matches_pr_file(edited: str, pr_files: dict[str, str]) -> str | None:

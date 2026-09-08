@@ -330,11 +330,11 @@ never touch anything outside the scratch worktree, and it must **not** be
 phrased as "trigger the rule": a prompt that names the rule tests the
 sub-agent's obedience, not the rule's pattern.
 
-**4b.2 Scaffold a scratch worktree.**
+**4b.2 Scaffold a scratch worktree — on a BRANCH, not detached.**
 
 ```bash
 SCRATCH=$(mktemp -d)
-git -C <repo> worktree add --detach "$SCRATCH/rulebook-forward-test" HEAD
+git -C <repo> worktree add -b rulebook-fwd-<8 hex> "$SCRATCH/rulebook-forward-test" HEAD
 ```
 
 Real layout, real remote, real repo identity — so repo- and path-scoped rules
@@ -342,6 +342,24 @@ match without any faking. The hook resolves a rule's repo from the acted-on
 file's worktree, so a rule scoped to this repo fires there exactly as it would
 in the user's own checkout. **Never run the sub-agent in the user's own working
 tree.**
+
+**Use `-b`, not `--detach`.** A detached worktree makes the hook report the
+branch as `detached`, so **every `given.repo.branch_rx` / `branch_not_rx`
+predicate silently fails** — including the documented "never push to main"
+rule. Step 4b is mandatory, so that reads as "the rule never fired" and blocks
+filing a perfectly good rule. Verified: in a detached scratch worktree
+`given_ok` returns False for `branch_rx: "^(main|master)$"`; on a named branch
+it evaluates normally.
+
+**When the rule asks about the branch, name the branch to match.** Read the
+candidate's `given.repo.branch_rx` and choose a worktree branch that satisfies
+it (`git worktree add -b <matching-name> …`). If the pattern demands a name
+that is already checked out — `^(main|master)$` is the common case, and git
+refuses a second worktree on it — you cannot exercise that predicate here:
+say so, report the branch predicate as **unexercised**, and treat the run as
+§4b.6 (ask before filing) rather than reporting a failed rule. Never delete the
+`given` block to make the test pass: a fire the rule would not produce in
+production is a worse answer than no fire.
 
 **4b.3 Arm the candidate in the local book cache.** The candidate is not filed
 yet and a proposed rule never fires, so the test arms it by editing the book the
@@ -410,7 +428,7 @@ Read the rows appended to `fires.jsonl` since the offset and keep those with
 | Ledger result | Meaning | What you do |
 |---|---|---|
 | ≥1 candidate row | fired | continue to the transcript check |
-| 0 rows, candidate still in the book at restore time | did not fire | **do not file.** Report it as a real failure: the pattern passes the verifier's synthetic cases but not a real session. Offer to revise the pattern and re-run |
+| 0 rows, candidate still in the book at restore time | did not fire | **do not file.** Report it as a real failure: the pattern passes the verifier's synthetic cases but not a real session. Offer to revise the pattern and re-run. First rule out §4b.2's branch trap — a `given.repo.branch_rx` that the scratch worktree's branch cannot satisfy fails the same way a bad pattern does |
 | 0 rows, candidate **gone** from the book | inconclusive — the book was re-fetched mid-test | re-run once; if it recurs, report the environment problem and do not file |
 
 Then read the sub-agent's returned output (an Agent-tool sub-agent's turns are
@@ -429,11 +447,13 @@ they are a judgment where the ledger result is a fact.
 **Report and clean up.** Name: the fake feature used, the worktree path (now
 removed), the ledger rows, the transcript judgment, and — always — the two
 caveats: *the candidate was armed in advise mode, so blocking was not
-exercised*, and *this proves the rule fires, not that it is worth firing*.
+exercised*, and *this proves the rule fires, not that it is worth firing*. Add a
+third when it applies: *the branch predicate was not exercised* (§4b.2).
 
 Cleanup is mandatory and happens even on failure: restore the book, `git
-worktree remove --force` the scratch worktree, `rm -rf` the temp dir, delete
-the backup files.
+worktree remove --force` the scratch worktree, delete the branch `-b` created
+(`git branch -D rulebook-fwd-<hex>`), `rm -rf` the temp dir, delete the backup
+files.
 
 **4b.6 The one thing that is not a failure.** If the step cannot be **run at
 all** — the repo is not a git checkout, `git worktree add` fails (a bare repo,

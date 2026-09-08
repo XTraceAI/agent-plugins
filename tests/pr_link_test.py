@@ -178,6 +178,27 @@ def test_github_mcp_tools_are_recognised_by_their_server_segment():
         ("mcp__GitHub__createPullRequest", True, True),
         ("mcp__github__get_pull_request", True, False),
         ("mcp__github__list_pull_requests", True, False),
+        # Reviewing someone else's PR is not opening it. Without an anchored
+        # object these all read as "you created this pull request", and B1 tells
+        # the reviewing session to record itself as the author of code it was
+        # only reading (Codex review, PR #182).
+        ("mcp__github__create_pull_request_review", True, False),
+        ("mcp__github__create_pull_request_comment", True, False),
+        ("mcp__github__submit_pull_request_review", True, False),
+        ("mcp__github__create_pull_request_review_comment", True, False),
+        ("mcp__github__create_and_submit_pull_request_review", True, False),
+        ("mcp__github__merge_pull_request", True, False),
+        ("mcp__github__update_pull_request", True, False),
+        # …and the real creation spellings still land on B1. `create_pr` is
+        # here because `\bpr\b` never matched it — `_` is a word character, so
+        # there is no boundary between `create_` and `pr`.
+        ("mcp__github__create_draft_pull_request", True, True),
+        ("mcp__github__create_pr", True, True),
+        ("mcp__github__create_prs", True, True),
+        ("mcp__github__newPullRequest", True, True),
+        # The server segment still gates everything: a non-GitHub server that
+        # happens to expose a create_pull_request tool is not GitHub.
+        ("mcp__notes__create_pull_request", False, False),
         # The SERVER segment is not GitHub — this is a note-taking tool.
         ("mcp__notes__github_summary", False, False),
         ("Bash", False, False),

@@ -91,9 +91,26 @@ _HTTP_CLIENT = re.compile(r"(?:^|[;&|`\n(]|\$\()\s*(?:\w+=\S*\s+)*(?:curl|wget|h
 # The SERVER segment must name GitHub. Matching `github` anywhere in the tool
 # name would catch `mcp__notes__github_summary`, which is a note-taking tool.
 _MCP_GITHUB = re.compile(r"(?i)^mcp__[^_]*github[^_]*__")
-# Loose on the verb, strict on the object: a server spelling it
-# `open_pull_request` should not need a plugin release.
-_MCP_CREATE = re.compile(r"(?i)(create|open|submit).*(pull.?request|\bpr\b)")
+# Loose on the verb, strict on the object — but read as TOKENS rather than as
+# one regex, because both halves of that sentence have to hold at once and a
+# regex kept getting one of them wrong:
+#
+#   * `create_pull_request_review`, `create_pull_request_comment` and
+#     `submit_pull_request_review` are NOT openings. Reviewing someone else's
+#     pull request read as "you opened this", and B1 then told the reviewing
+#     session to record itself as the author of code it was only reading.
+#   * `create_pr` is an opening, and `\bpr\b` never matched it: `_` is a word
+#     character, so there is no boundary between `create_` and `pr`.
+#
+# So: split the tool segment into words (camelCase and `_`/`-` both count),
+# require a creation verb anywhere, and require the TAIL to be the pull request
+# itself. The asymmetry decides the trade — a missed create falls through to
+# B2, where the model judges and links only if it wrote the code, while a false
+# create writes a confirmed authorship claim for work the session did not do.
+_CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_CREATE_VERBS = frozenset({"create", "open", "submit", "new"})
+_PR_HEADS = frozenset({"pr", "prs", "pullrequest", "pullrequests"})
+_PR_TAILS = (["pull", "request"], ["pull", "requests"])
 
 MAX_COMMAND_CHARS = pr_provenance.MAX_COMMAND_CHARS
 
@@ -196,12 +213,22 @@ def is_github_mcp_tool(tool_name: object) -> bool:
     return bool(_MCP_GITHUB.match(_mcp_tool_name(tool_name)))
 
 
+def _words(segment: str) -> list[str]:
+    """`createPullRequest` and `create_pull_request` both → the same words."""
+    spaced = _CAMEL_SPLIT.sub(" ", segment)
+    return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", spaced) if w]
+
+
 def is_github_mcp_create(tool_name: object) -> bool:
+    """Does this GitHub MCP tool OPEN a pull request (not review or comment on
+    one)? The object must be the pull request itself — the tail of the name."""
     name = _mcp_tool_name(tool_name)
     if not _MCP_GITHUB.match(name):
         return False
-    segment = name.split("__", 2)[-1]
-    return bool(_MCP_CREATE.search(segment))
+    words = _words(name.split("__", 2)[-1])
+    if not words or not _CREATE_VERBS.intersection(words):
+        return False
+    return words[-1] in _PR_HEADS or words[-2:] in _PR_TAILS
 
 
 def _command_of(tool_name: object, tool_input: object) -> str:

@@ -126,6 +126,32 @@ def test_the_session_that_edited_the_files_on_the_head_branch_wins():
               all(r["conversation_id"] != "bbbb-2222" for r in rows), out)
 
 
+def test_a_hidden_path_keeps_its_leading_dot():
+    """`lstrip("./")` strips every leading dot, not a `./` prefix — so
+    `.github/workflows/ci.yml` became `github/…` and a session that edited the
+    non-hidden path scored false file evidence (Codex review, PR #182)."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        # On an unrelated branch, so file evidence is the ONLY thing that
+        # could put it on the list.
+        claude_session(home, "wrong", wt, branch="unrelated",
+                       edits=[f"{wt}/github/workflows/ci.yml", f"{wt}/env"])
+        claude_session(home, "right", wt, branch="feat/x",
+                       edits=[f"{wt}/.github/workflows/ci.yml", f"{wt}/.env"])
+        rc, out, err = run(home, [".github/workflows/ci.yml", ".env"],
+                           "--branch", "feat/x", "--host", "claude")
+        ids = [r["conversation_id"] for r in json.loads(out)]
+        check("the session that edited the HIDDEN paths is a candidate",
+              "right" in ids, out)
+        check("the session that edited the non-hidden look-alikes is not",
+              "wrong" not in ids, out)
+        rows = {r["conversation_id"]: r for r in json.loads(out)}
+        check("…and the evidence names the paths with their dots intact",
+              sorted(rows.get("right", {}).get("evidence", {}).get("files", []))
+              == [".env", ".github/workflows/ci.yml"], out)
+
+
 def test_a_commit_sha_outscores_everything():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td) / "home"
