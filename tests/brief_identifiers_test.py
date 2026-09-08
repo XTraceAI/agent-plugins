@@ -67,6 +67,9 @@ def test_bare_basename_needs_the_repo() -> None:
     found = bi.from_prompt("look at brain_brief.py and at wibble.py", REPO_TOKENS)
     check("a bare basename that IS a repo file is a path", "brain_brief.py" in found["paths"])
     check("a bare basename that is NOT a repo file is dropped", "wibble.py" not in found["paths"])
+    found = bi.from_prompt("add sub/new_file.py under scripts/newdir", REPO_TOKENS)
+    check("a slashed token with an extension is a path", "sub/new_file.py" in found["paths"])
+    check("a slashed token through a repo directory is a path", "scripts/newdir" in found["paths"])
     check("the path's own stem is not reported again as a symbol",
           "brain_brief" not in found["symbols"])
 
@@ -85,6 +88,7 @@ def test_negatives_yield_nothing() -> None:
         "see https://github.com/XTraceAI/agent-plugins/pull/9999 for context",
         "version 1.2.3 is out",
         "\"this is a long quoted sentence with nothing wrong in it\"",
+        "support client/server mode and input/output formats, choose yes/no",
     ):
         found = bi.from_prompt(prompt, REPO_TOKENS)
         check(f"nothing in: {prompt[:48]!r}",

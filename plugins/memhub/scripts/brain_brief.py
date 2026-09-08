@@ -110,6 +110,9 @@ _RECALL_TIMEOUT_S = 2.5     # prompt hook: synchronous, before the model sees th
 _TIMEOUT_S = 20.0           # detached worker / Stop refresh
 
 _TRIMMED_FOOTER = "… trimmed to budget"
+#: A rendered pointer ends in ``[id]``; the served list is read back off the
+#: final text, so an id cut by the budget is never marked as shown.
+_POINTER_ID_RE = re.compile(r"^• .*\[([^\[\]\n]+)\]$", re.M)
 
 #: The manifest footer every compiled digest carries — ``_2553 facts · 1058
 #: episodes · 51 artifacts (excl. this manifest)._``; a big brain says ``5000+``.
@@ -185,6 +188,11 @@ def _served(session_id: str) -> list[str]:
 def _mark_served(session_id: str, ids: list[str]) -> None:
     if session_id and ids:
         served_state.add_ids(served_state.STATE_DIR, session_id, ids)
+
+
+def _ids_in(context: str) -> list[str]:
+    """The ids of the pointers that survived into ``context``."""
+    return _POINTER_ID_RE.findall(context)
 
 
 # ── the map ────────────────────────────────────────────────────────────────
@@ -391,10 +399,11 @@ def _pointers_need_refresh(cache: dict, git: dict) -> bool:
         age = time.time() - float(cache.get("computed_at") or 0)
     except (TypeError, ValueError):
         return True
-    return age > _POINTERS_REFRESH_S or cache.get("head") != git.get("head")
+    return (age > _POINTERS_REFRESH_S or cache.get("head") != git.get("head")
+            or cache.get("branch") != git.get("branch"))
 
 
-def _spawn_pointers(cwd: str, session_id: str) -> None:
+def _spawn_pointers(cwd: str) -> None:
     """Refresh the pointer cache in a DETACHED child so SessionStart returns
     at once. ``MEMHUB_BRIEF_POINTERS=0`` disables the worker entirely."""
     if (os.environ.get("MEMHUB_BRIEF_POINTERS") or "").strip() == "0":
@@ -408,22 +417,22 @@ def _spawn_pointers(cwd: str, session_id: str) -> None:
                 | getattr(subprocess, "DETACHED_PROCESS", 0))
         else:
             kwargs["start_new_session"] = True
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "pointers",
-                          cwd, session_id or "-"], **kwargs)
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "pointers", cwd],
+                         **kwargs)
     except Exception:  # noqa: BLE001 — a missing refresh is a staler brief, never a failed one
         pass
 
 
-def _cached_pointer_sections(cache: dict, session_id: str) -> tuple[list[str], list[str], list[str]]:
-    """``(apply_lines, recall_lines, ids)`` from a pointer cache, minus what
-    this session has already seen."""
+def _cached_pointer_sections(cache: dict, session_id: str) -> tuple[list[str], list[str]]:
+    """``(apply_lines, recall_lines)`` from a pointer cache, minus what this
+    session has already seen. The cache is shared by every session of the
+    checkout, so this is where the per-session filter lives."""
     served = _served(session_id)
     apply = _unserved(list(cache.get("apply") or []), served, _MAX_APPLY)
     recall = _unserved(list(cache.get("recall") or []),
                        served + [str(d.get("id")) for d in apply], _MAX_RECALL)
-    ids = [str(d.get("id")) for d in apply + recall]
     return (_apply_lines(apply, "lessons/procedures on what this branch touches"),
-            _recall_lines(recall), ids)
+            _recall_lines(recall))
 
 
 # ── brief: SessionStart, stdlib only, no network ───────────────────────────
@@ -466,16 +475,15 @@ def cmd_brief(payload: dict) -> int:
     if git.get("root"):
         cache = _read_json(_pointers_path(env, brain_id, git["root"]))
         if cache and _pointers_usable(cache, git.get("branch")):
-            apply, recall, ids = _cached_pointer_sections(cache, session_id)
-            if ids:
-                _mark_served(session_id, ids)
+            apply, recall = _cached_pointer_sections(cache, session_id)
             if session_id:
                 served_state.save_marker(served_state.STATE_DIR, session_id, "brief",
                                          {"computed_at": cache.get("computed_at")})
         if _pointers_need_refresh(cache, git):
-            _spawn_pointers(cwd, session_id)
+            _spawn_pointers(cwd)
 
     context = _assemble(head, map_lines, apply, recall, brief_budget.brief_chars())
+    _mark_served(session_id, _ids_in(context))   # only what survived the budget
     out: dict = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -610,7 +618,7 @@ def _repo_name(root: str) -> str:
 
 # ── pointers: detached worker, network ─────────────────────────────────────
 
-def cmd_pointers(cwd: str, session_id: str) -> int:
+def cmd_pointers(cwd: str) -> int:
     room = room_map.read_room(cwd)
     if not room:
         return 0
@@ -640,9 +648,13 @@ def cmd_pointers(cwd: str, session_id: str) -> int:
         _write_json(path, record)
         return 0
 
-    served = _served(session_id)
+    # NO session filters here. The cache is shared by every session of this
+    # checkout (keyed env + brain + root), so a served list or a self-echo
+    # session_id baked in would hide pointers from the NEXT session. Both are
+    # applied at render time, per session; the cache holds twice the cap so
+    # that filter still leaves a full block.
     apply = _recall_items(url, bearer, brain_id, _repo_name(git["root"]), entities,
-                          served, session_id, _MAX_APPLY, _TIMEOUT_S)
+                          [], "", _MAX_APPLY * 2, _TIMEOUT_S)
     if apply is None:
         record["error"] = "recall failed"
     else:
@@ -652,14 +664,14 @@ def cmd_pointers(cwd: str, session_id: str) -> int:
              "as_of": d.get("as_of") or "",
              "match": _matched_trigger(d, entities)}
             for d in apply if str(d.get("id") or "").strip()
-        ])[:_MAX_APPLY]
+        ])[:_MAX_APPLY * 2]
     basenames = [p.rsplit("/", 1)[-1] for p in git["paths"]]
     recall_ids = brief_identifiers._dedupe(git["refs"] + basenames)[:16]
-    served_set = set(served) | {d["id"] for d in record["apply"]}
+    apply_ids = {d["id"] for d in record["apply"]}
     record["recall"] = _dedupe_text([
         d for d in _search_items(url, bearer, brain_id, recall_ids, _TIMEOUT_S)
-        if d["id"] and d["id"] not in served_set
-    ])[:_MAX_RECALL]
+        if d["id"] and d["id"] not in apply_ids
+    ])[:_MAX_RECALL * 2]
     _write_json(path, record)
     return 0
 
@@ -718,18 +730,23 @@ def cmd_prompt(payload: dict) -> int:
 
     apply: list[str] = []
     recall: list[str] = []
-    ids: list[str] = []
     # The pointer cache the brief could not deliver (it landed after
-    # SessionStart printed) — rendered once per refresh.
+    # SessionStart printed) — rendered once per refresh, and only when it was
+    # computed for the branch the checkout is on NOW: a `git switch` since
+    # the brief must not inject the old branch's lessons.
     if root is not None:
         cache = _read_json(_pointers_path(env, brain_id, str(root)))
+        branch = brief_identifiers.current_branch(root)
         marker = served_state.load_marker(served_state.STATE_DIR, session_id, "brief")
-        if cache and cache.get("computed_at") != marker.get("computed_at") \
-                and _pointers_usable(cache):
-            apply, recall, ids = _cached_pointer_sections(cache, session_id)
-            if session_id:
-                served_state.save_marker(served_state.STATE_DIR, session_id, "brief",
-                                         {"computed_at": cache.get("computed_at")})
+        if cache and cache.get("computed_at") != marker.get("computed_at"):
+            if _pointers_usable(cache, branch or None):
+                apply, recall = _cached_pointer_sections(cache, session_id)
+                if session_id:
+                    served_state.save_marker(served_state.STATE_DIR, session_id, "brief",
+                                             {"computed_at": cache.get("computed_at")})
+            elif branch and cache.get("branch") != branch:
+                _spawn_pointers(cwd)
+    pending_ids = _ids_in("\n".join(apply + recall))
 
     prompt_lines: list[str] = []
     found = brief_identifiers.from_prompt(
@@ -738,16 +755,15 @@ def cmd_prompt(payload: dict) -> int:
         found["paths"], found["refs"], found["symbols"], found["errors"])
     if entities:
         hits = _prompt_recall(brain_id, str(root) if root else "", entities,
-                              _served(session_id) + ids, session_id)
-        prompt_lines, hit_ids = _prompt_section(hits, entities)
-        ids += hit_ids
+                              _served(session_id) + pending_ids, session_id)
+        prompt_lines, _ = _prompt_section(hits, entities)
 
     if not (apply or recall or prompt_lines):
         return 0
     context = _assemble([], [], apply, recall, brief_budget.brief_chars())
     if prompt_lines:
         context = (context + "\n\n" if context else "") + "\n".join(prompt_lines)
-    _mark_served(session_id, ids)
+    _mark_served(session_id, _ids_in(context))   # only what survived
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
         "additionalContext": context,
@@ -850,9 +866,7 @@ def cmd_refresh(payload: dict) -> int:
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "brief"
     if cmd == "pointers":
-        cwd = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
-        sid = sys.argv[3] if len(sys.argv) > 3 else ""
-        return cmd_pointers(cwd, "" if sid == "-" else sid)
+        return cmd_pointers(sys.argv[2] if len(sys.argv) > 2 else os.getcwd())
     try:
         raw = sys.stdin.read()
     except Exception:  # noqa: BLE001

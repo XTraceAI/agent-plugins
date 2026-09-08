@@ -321,11 +321,11 @@ FAKE_GIT = {"root": "/repo", "branch": "b", "head": "h1", "base": "origin/main",
 brain_brief.brief_identifiers.from_git = lambda cwd: dict(FAKE_GIT)  # type: ignore[assignment]
 spawned: list[str] = []
 _real_spawn = brain_brief._spawn_pointers
-brain_brief._spawn_pointers = lambda cwd, sid: spawned.append(sid)  # type: ignore[assignment]
+brain_brief._spawn_pointers = lambda cwd: spawned.append(cwd)  # type: ignore[assignment]
 
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
 check("no pointer cache: no Apply/Recall, but the worker is spawned",
-      "## Apply" not in ctx and spawned == ["s1"])
+      "## Apply" not in ctx and spawned == ["/repo"])
 PCACHE = brain_brief._pointers_path("staging", BRAIN, "/repo")
 POINTERS = {
     "computed_at": time.time(), "head": "h1", "branch": "b", "base": "origin/main",
@@ -348,13 +348,14 @@ ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s2"}))
 check("another session still sees them", "[d1]" in ctx and "[a1]" in ctx)
 brain_brief._write_json(PCACHE, {**POINTERS, "head": "h0"})
 spawned.clear(); _brief({"cwd": "/repo", "session_id": "s3"})
-check("HEAD moved: the worker is spawned", spawned == ["s3"])
+check("HEAD moved: the worker is spawned", spawned == ["/repo"])
 brain_brief._write_json(PCACHE, {**POINTERS, "branch": "other"})
-ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s4"}))
-check("a cache computed for another branch is not rendered", "## Apply" not in ctx)
+spawned.clear(); ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s4"}))
+check("a cache computed for another branch is neither rendered nor kept",
+      "## Apply" not in ctx and spawned == ["/repo"])
 brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() - 2 * 86400})
 spawned.clear(); ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s5"}))
-check("a stale cache is neither rendered nor trusted", "## Apply" not in ctx and spawned == ["s5"])
+check("a stale cache is neither rendered nor trusted", "## Apply" not in ctx and spawned == ["/repo"])
 brain_brief._write_json(PCACHE, POINTERS)
 
 # the real spawner: disabled by env, else a detached `pointers` child
@@ -363,14 +364,47 @@ popen_calls: list[list[str]] = []
 _real_popen = brain_brief.subprocess.Popen
 brain_brief.subprocess.Popen = lambda argv, **kw: popen_calls.append(argv)  # type: ignore[assignment]
 os.environ["MEMHUB_BRIEF_POINTERS"] = "0"
-brain_brief._spawn_pointers("/repo", "s1")
+brain_brief._spawn_pointers("/repo")
 check("MEMHUB_BRIEF_POINTERS=0 spawns nothing", popen_calls == [])
 os.environ.pop("MEMHUB_BRIEF_POINTERS")
-brain_brief._spawn_pointers("/repo", "s1")
-check("otherwise a detached `pointers` child is started",
-      len(popen_calls) == 1 and popen_calls[0][2:] == ["pointers", "/repo", "s1"])
+brain_brief._spawn_pointers("/repo")
+check("otherwise a detached `pointers` child is started, with no session in its argv",
+      len(popen_calls) == 1 and popen_calls[0][2:] == ["pointers", "/repo"])
 brain_brief.subprocess.Popen = _real_popen
-brain_brief._spawn_pointers = lambda cwd, sid: spawned.append(sid)  # type: ignore[assignment]
+brain_brief._spawn_pointers = lambda cwd: spawned.append(cwd)  # type: ignore[assignment]
+
+# ── the worker builds a SHARED cache: no session filters baked in ──────────
+import types  # noqa: E402
+recorded: dict = {}
+_fake_auth = types.ModuleType("_memhub_auth")
+_fake_auth.resolve_bearer = lambda *a, **k: ("https://x", "bearer")  # type: ignore[attr-defined]
+sys.modules["_memhub_auth"] = _fake_auth
+
+
+def _fake_recall_items(url, bearer, brain_id, repo, entities, served, session_id, limit, timeout):
+    recorded.update(served=list(served), session_id=session_id, limit=limit)
+    return [{"id": f"w{i}", "type": "lesson", "content": f"lesson {i}", "triggers": ["x.py"]}
+            for i in range(limit)]
+
+
+_saved = (brain_brief._recall_items, brain_brief._search_items, brain_brief._repo_name)
+brain_brief._recall_items = _fake_recall_items  # type: ignore[assignment]
+brain_brief._search_items = lambda *a, **k: []  # type: ignore[assignment]
+brain_brief._repo_name = lambda root: "r"  # type: ignore[assignment]
+served_state.add_ids(served_state.STATE_DIR, "s1", ["w0"])
+check("worker exits clean", brain_brief.cmd_pointers("/repo") == 0)
+check("the worker sends no served list and no session id",
+      recorded.get("served") == [] and recorded.get("session_id") == "")
+wcache = brain_brief._read_json(PCACHE)
+check("the cache holds twice the cap so the per-session filter still fills a block",
+      recorded.get("limit") == 2 * brain_brief._MAX_APPLY
+      and len(wcache.get("apply") or []) == 2 * brain_brief._MAX_APPLY)
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
+check("a session's served ids are filtered at render time, not in the cache",
+      "[w0]" not in ctx and ctx.count("\n• ") == brain_brief._MAX_APPLY)
+brain_brief._recall_items, brain_brief._search_items, brain_brief._repo_name = _saved
+del sys.modules["_memhub_auth"]
+brain_brief._write_json(PCACHE, POINTERS)
 
 # ── the budget: one env var, 2:1, trimmed footer ───────────────────────────
 os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "300"
@@ -380,6 +414,9 @@ check("budget is tokens × 4 chars, split 2:1",
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s6"}))
 check("over budget the brief is trimmed, map intact",
       ctx.endswith(brain_brief._TRIMMED_FOOTER) and "## Map" in ctx and BRAIN in ctx)
+check("only pointers that survived the trim are marked served",
+      set(served_state.load_ids(served_state.STATE_DIR, "s6")) == set(brain_brief._ids_in(ctx))
+      and len(brain_brief._ids_in(ctx)) < 4)
 os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
 os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "garbage"
 check("an unparsable budget falls back to the default",
@@ -389,6 +426,7 @@ os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
 # ── the prompt hook ────────────────────────────────────────────────────────
 brain_brief.room_map.repo_root = lambda cwd=None: Path("/repo")  # type: ignore[assignment]
 brain_brief.brief_identifiers.repo_files = lambda root: {"room_map", "room_map.py"}  # type: ignore[assignment]
+brain_brief.brief_identifiers.current_branch = lambda root: "b"  # type: ignore[assignment]
 recall_calls: list[dict] = []
 PROMPT_ITEMS = [
     {"id": "p1", "type": "lesson", "content": "lesson about room_map", "as_of": "2026-09-02",
@@ -455,6 +493,13 @@ brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() + 1,
 out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
 check("a refreshed cache is delivered again, minus served ids",
       "[d9]" in _ctx(out) and "[d1]" not in _ctx(out))
+brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() + 2, "branch": "other"})
+spawned.clear()
+out = _prompt({"cwd": "/repo", "session_id": "s9", "prompt": "no identifiers here"})
+check("a pending cache for another branch is not delivered by the prompt hook, and is refreshed",
+      out == {} and spawned == ["/repo"]
+      and served_state.load_ids(served_state.STATE_DIR, "s9") == [])
+brain_brief._write_json(PCACHE, POINTERS)
 
 # ── no network on the brief path — with a room AND a pointer cache present ─
 probe = subprocess.run(

@@ -85,6 +85,10 @@ def default_branch_ref(root: str | Path) -> str:
     return ""
 
 
+def current_branch(root: str | Path) -> str:
+    return _git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+
+
 def refs_in(text: str) -> list[str]:
     """PR / ENG references, rendered canonically (``PR #182``, ``ENG-1010``)."""
     out: list[str] = []
@@ -107,7 +111,7 @@ def from_git(cwd: str | Path) -> dict:
     if root is None:
         return {"root": "", "branch": "", "head": "", "base": "",
                 "paths": [], "refs": []}
-    branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    branch = current_branch(root)
     head = _git(root, "rev-parse", "HEAD").strip()
     base = default_branch_ref(root)
     # Most immediate first, because MAX_PATHS is a cap: the working tree's
@@ -173,7 +177,8 @@ def entities_for(paths: list[str], refs: list[str],
 def from_prompt(prompt: str, repo_tokens: set[str]) -> dict:
     """``{paths, symbols, refs, errors}`` found in one prompt — each exact.
 
-    A path is kept when it has a directory part or names a repo file; a symbol
+    A path is kept when it names a repo file, or is slashed with an extension
+    or a repo directory in it (never bare prose like ``yes/no``); a symbol
     (``Module.name`` / ``snake_case``) only when it, or the module half of it,
     is in ``repo_tokens`` and it is at least six characters; refs and quoted
     error strings as they stand. URLs are stripped first so their path-like
@@ -185,7 +190,7 @@ def from_prompt(prompt: str, repo_tokens: set[str]) -> dict:
         tok = m.group(1).strip(".,;:()[]{}")
         if not tok or tok.startswith("."):
             continue
-        if "/" in tok or tok in repo_tokens:
+        if tok in repo_tokens or _looks_like_repo_path(tok, repo_tokens):
             if re.search(r"[A-Za-z]", tok) and not tok.replace(".", "").isdigit():
                 paths.append(tok)
     symbols: list[str] = []
@@ -212,6 +217,20 @@ def from_prompt(prompt: str, repo_tokens: set[str]) -> dict:
         "refs": refs_in(text),
         "errors": _dedupe(errors),
     }
+
+
+def _looks_like_repo_path(tok: str, repo_tokens: set[str]) -> bool:
+    """A slashed token is a path when its last segment carries an extension
+    or some segment is a repo file / directory. "client/server", "yes/no"
+    and "input/output" are prose, and prose must stay silent and free."""
+    if "/" not in tok:
+        return False
+    segs = [s for s in tok.split("/") if s]
+    if not segs:
+        return False
+    if re.search(r"\.[A-Za-z0-9]{1,8}$", segs[-1]):
+        return True
+    return any(s in repo_tokens for s in segs)
 
 
 def _dedupe(items) -> list[str]:
