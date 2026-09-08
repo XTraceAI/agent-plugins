@@ -1258,6 +1258,68 @@ def test_a_heredoc_create_is_GUARDED_not_waved_through():
           pr_link.touches_github("Bash", {"command": piped}))
 
 
+def test_a_here_string_is_not_a_heredoc_opener():
+    """`cat <<<EOF` feeds one word to stdin; the NEXT line is ordinary command
+    text. Matching the opener from the second `<` read `EOF` as an
+    unterminated tag and swallowed the rest of the command, so a real creation
+    stopped being detected at all (Codex review, PR #182)."""
+    here = "cat <<<EOF\ngh pr create --fill"
+    check("a here-string leaves the command after it alone",
+          pr_link.strip_heredocs(here) == here, repr(pr_link.strip_heredocs(here)))
+    check("…so the create after it is still a create",
+          pr_link.is_gh_pr_create(here)
+          and pr_babysit_trigger.is_pr_create(here))
+    check("a REAL heredoc is still stripped",
+          pr_link.strip_heredocs("cat <<'EOF'\nbody\nEOF\ngh pr create")
+          == "cat <<'EOF'\ngh pr create")
+    check("`<<-` (tab-stripping heredoc) still opens one",
+          pr_link.strip_heredocs("cat <<-EOF\nbody\nEOF\ngh pr create")
+          == "cat <<-EOF\ngh pr create")
+    check("both modules agree on the here-string",
+          pr_link.strip_heredocs(here) == pr_babysit_trigger.strip_heredocs(here))
+
+
+def test_the_gh_lane_never_reads_a_pr_url_out_of_rendered_prose():
+    """`gh pr view N --json body -q .body` prints a BODY — content anyone with
+    write access to that repository composed.
+
+    The permissive extractor finds a github.com URL anywhere in the text, so a
+    body citing another pull request chose the one this session got pointed at.
+    Applying the structural rule only to the enterprise fallback fixed the
+    enterprise half and left github.com open (Codex review, PR #182).
+    """
+    connected = lambda _u: {"enabled": True, "github_connected": True,
+                            "repo_in_install": True}
+
+    def context(command, stdout, stderr=""):
+        return pr_link.context_for_call("Bash", {"command": command},
+                                        {"stdout": stdout, "stderr": stderr},
+                                        "s1", checker=connected)
+
+    check("a body citing another PR is NOT read as gh's answer — on github.com",
+          context("gh pr view 123 --json body -q .body",
+                  "This supersedes https://github.com/evil/repo/pull/777 entirely.") is None)
+    check("…and not on an enterprise host either",
+          context("gh pr view 123 --json body -q .body",
+                  "obsoletes https://ghe.corp/a/b/pull/1 — see there") is None)
+    check("a create's own URL line still resolves",
+          "you just opened" in (context("gh pr create --fill",
+                                        "https://github.com/o/r/pull/42") or ""))
+    check("`gh pr view`'s key:value table still resolves",
+          "in play" in (context("gh pr view 42",
+                                "title:\tX\nurl:\thttps://github.com/o/r/pull/42") or ""))
+    check("an enterprise create still resolves through the same rule",
+          "you just opened" in (context("gh pr create --fill",
+                                        "https://ghe.corp/o/r/pull/9") or ""))
+    # The API and MCP lanes are unaffected: their URL arrives inside a JSON
+    # body, where it is never alone on a line.
+    check("a curl POST response body still resolves (B2)",
+          "in play" in (context(
+              "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+              '{"html_url": "https://github.com/o/r/pull/42", '
+              '"issue_url": "https://api.github.com/repos/o/r/issues/42"}') or ""))
+
+
 def test_the_url_gh_reports_is_structural_not_prose_it_quotes():
     """`gh pr view N --json body -q .body` prints a pull-request BODY, which
     anyone with write access to that repository composed. Accepting any PR URL

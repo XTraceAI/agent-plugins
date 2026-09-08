@@ -392,8 +392,13 @@ MAX_COMMAND_CHARS = pr_provenance.MAX_COMMAND_CHARS
 # KB pushes the `gh pr create` that follows it past the cap, so the body has to
 # come out BEFORE the command is truncated, not after.
 MAX_HEREDOC_SCAN_CHARS = 256 * 1024
-# An identifier tag only: `2 << 3` is arithmetic, not a heredoc.
-_HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# An identifier tag only: `2 << 3` is arithmetic, not a heredoc. And a
+# HERE-STRING is not a heredoc: `cat <<<EOF` feeds one word to stdin and the
+# next line is ordinary command text — matching from the second `<` treated
+# `EOF` as an unterminated tag and swallowed the rest of the command, so
+# `cat <<<EOF\ngh pr create --fill` stopped being a creation entirely
+# (Codex review, PR #182).
+_HEREDOC_OPEN = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def strip_heredocs(command: str) -> str:
@@ -1656,13 +1661,25 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
     api_host = github_api_host(_command_of(tool_name, tool_input))
     if api_host is None and is_github_mcp_tool(tool_name):
         api_host = _mcp_result_host(tool_response)
-    pr_url = pr_url_from_response(tool_response, host=api_host)
-    if not pr_url and (_gh_pr_subcommands(_command_of(tool_name, tool_input)) or []):
-        # A `gh pr` command on an enterprise host names it nowhere; gh knows it
-        # from the repository's remote. Its own output is the one place it
-        # appears, and this is the only lane where reading a host from the
-        # RESPONSE is sound (see `_gh_reported_pr_url`).
+    if _gh_pr_subcommands(_command_of(tool_name, tool_input)):
+        # THE GH LANE READS GH'S REPORT, on any host, and nothing else.
+        #
+        # `gh pr view 123 --json body -q .body` prints a pull-request BODY —
+        # prose composed by anyone with write access to that repository. The
+        # permissive extractor below finds a github.com URL anywhere in the
+        # text, so a body saying "this supersedes https://github.com/evil/
+        # repo/pull/777" chose the pull request this session was pointed at.
+        # Applying the structural rule only to the enterprise fallback fixed
+        # the enterprise half and left github.com wide open (Codex review,
+        # PR #182).
+        #
+        # gh reports a URL alone on its line (`gh pr create`, `--json url -q`)
+        # or as a `key:\tvalue` field (`gh pr view`'s table). A URL cited
+        # mid-sentence is the repository's content, not gh's answer. This also
+        # supplies the enterprise host, which a `gh pr` command names nowhere.
         pr_url = _gh_reported_pr_url(tool_response)
+    else:
+        pr_url = pr_url_from_response(tool_response, host=api_host)
     if not pr_url:
         return None
     reply = checker(pr_url)

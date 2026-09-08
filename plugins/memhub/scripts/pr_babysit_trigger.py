@@ -34,8 +34,13 @@ GH_PR_CREATE = re.compile(
 # shared-corpus agreement test; not imported, because this module is a hook
 # entry point and a cross-hook import is a coupling neither wants.
 MAX_HEREDOC_SCAN_CHARS = 256 * 1024
-# An identifier tag only: `2 << 3` is arithmetic, not a heredoc.
-HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# An identifier tag only: `2 << 3` is arithmetic, not a heredoc. And a
+# HERE-STRING is not a heredoc: `cat <<<EOF` feeds one word to stdin and the
+# next line is ordinary command text — matching from the second `<` treated
+# `EOF` as an unterminated tag and swallowed the rest of the command, so
+# `cat <<<EOF\ngh pr create --fill` stopped being a creation entirely
+# (Codex review, PR #182).
+HEREDOC_OPEN = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def strip_heredocs(command: str) -> str:
