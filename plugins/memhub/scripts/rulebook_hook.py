@@ -160,7 +160,15 @@ BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
 MAX_ADVISE = 2          # per tool call — habituation guard
 MAX_POSTURE = 15        # spec §2: session_context is hard-capped at 15 rules / ~2k tokens per scope
-POSTURE_BUDGET_CHARS = 8000   # ~2k tokens at ~4 chars/token
+# One budget with the session-start brief (MEMHUB_BRIEF_TOKEN_BUDGET, default
+# 2,500 tokens, split 2:1 brief:rulebook — navigation spec §4); this is the
+# rulebook's third. The literal fallback only covers a broken sibling import.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from brief_budget import rulebook_chars as _rulebook_chars
+    POSTURE_BUDGET_CHARS = _rulebook_chars()
+except Exception:
+    POSTURE_BUDGET_CHARS = 3333   # 2,500 tokens × 4 chars ÷ 3
 RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the tail
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)

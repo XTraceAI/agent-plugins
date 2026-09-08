@@ -15,7 +15,14 @@ session's first prompt:
   claiming writes land in a brain they do not reach;
 * a cached overview is injected and clipped, so a long digest cannot become a
   silent per-session token tax;
-* ``refresh`` is throttled and never raises, whatever the cache contains.
+* ``refresh`` is throttled and never raises, whatever the cache contains;
+* the map is drawn from the Index when the digest has one, else from the
+  footer counts; the prose clip is short;
+* apply / recall pointers come from a cache a detached child refreshes, are
+  rendered once per session (served ids are shared with directive_recall),
+  and are the first thing cut under the budget — never the map;
+* the prompt hook is silent and free on a prompt with no identifier, fires
+  one recall otherwise, and delivers a pending pointer cache exactly once.
 
 Run: python3 tests/brain_brief_test.py  (from the repo root; stdlib only).
 """
@@ -250,6 +257,227 @@ probe = subprocess.run(
 )
 loaded = json.loads(probe.stdout.strip() or "[]") if probe.returncode == 0 else ["?"]
 check("brief imports no transport/auth module", loaded == [])
+
+# ── the map: Index lines, footer counts, prose clip ────────────────────────
+import copy  # noqa: E402
+
+import brief_budget  # noqa: E402
+import brief_identifiers  # noqa: E402
+import served_state  # noqa: E402
+
+FOOTERED = ("# Repo: X — Overview\nProse here.\n\n## Key topics\n- a\n\n---\n"
+            "_2553 facts · 1058 episodes · 51 artifacts (excl. this manifest)._")
+prose, idx, counts = brain_brief._split_overview(FOOTERED)
+check("footer counts are parsed", counts == ("2,553", "1,058", "51"))
+check("no Index section means no index lines", idx == [])
+check("the digest's own H1 is dropped from the prose", "# Repo" not in prose)
+check("the footer is not prose", "facts ·" not in prose and "Prose here." in prose)
+check("a big brain's 5000+ counts survive",
+      brain_brief._split_overview("x\n_5000+ facts · 5000+ episodes · 967 artifacts._")[2]
+      == ("5,000+", "5,000+", "967"))
+
+INDEXED = ("# T\nProse\n\n## Index\nbrain\n├── Facts 1\n├── Episodes 2\n└── Artifacts 3\n"
+           "    ├── Specs 4\n    └── Docs 5\n    extra 6\n\n## Gotchas\n- g\n\n---\n"
+           "_1 facts · 2 episodes · 3 artifacts._")
+prose, idx, counts = brain_brief._split_overview(INDEXED)
+check("an Index section is lifted out whole", idx[0] == "brain" and len(idx) == 7)
+check("the prose keeps what follows the Index", "Gotchas" in prose and "Specs" not in prose)
+m = "\n".join(brain_brief._render_map(BRAIN, INDEXED))
+check("the map is the five-line top of the Index",
+      "    ├── Specs 4" in m and "Docs 5" not in m and "(full Index" in m)
+check("with an Index the counts tree is not drawn too", "Facts      " not in m)
+m = "\n".join(brain_brief._render_map(BRAIN, FOOTERED))
+check("without an Index the map is drawn from the footer counts",
+      "├── Facts        2,553" in m and 'memory_type="episodes")' in m)
+check("no digest at all points at get_brain_overview",
+      "No compiled overview cached yet" in "\n".join(brain_brief._render_map(BRAIN, "")))
+m = "\n".join(brain_brief._render_map(BRAIN, "just prose, no footer"))
+check("prose without a footer is still shown, without the no-overview line",
+      "just prose" in m and "No compiled overview" not in m)
+m = "\n".join(brain_brief._render_map(BRAIN, "P" * 5000))
+check("the prose clip is 600 chars", "truncated" in m
+      and len(m) < brain_brief._MAX_OVERVIEW_CHARS + 200)
+
+# ── assembly under budget: recall goes first, then apply, never the map ────
+HEAD = ["H"]
+MAP = ["## Map", "m1", "m2"]
+APPLY = ["## Apply"] + [f"• a{i}" for i in range(5)]
+RECALL = ["## Recall"] + [f"• r{i}" for i in range(5)] + ["(open one: …)"]
+full = brain_brief._assemble(HEAD, MAP, copy.copy(APPLY), copy.copy(RECALL), 10_000)
+check("under budget nothing is cut", "• r4" in full and brain_brief._TRIMMED_FOOTER not in full)
+just_apply = len("\n".join(HEAD + [""] + MAP + [""] + APPLY))
+tight = brain_brief._assemble(HEAD, MAP, copy.copy(APPLY), copy.copy(RECALL), just_apply + 40)
+check("recall pointers are dropped before any apply pointer",
+      "• a4" in tight and "• r" not in tight and "## Recall" not in tight)
+check("a cut brief says so", tight.endswith(brain_brief._TRIMMED_FOOTER))
+tighter = brain_brief._assemble(HEAD, MAP, copy.copy(APPLY), copy.copy(RECALL), 10)
+check("the map is never cut", "m2" in tighter and "• a" not in tighter
+      and tighter.endswith(brain_brief._TRIMMED_FOOTER))
+
+# ── brief + pointer cache: rendered, served, not repeated, refreshed ───────
+_stub_room(room)
+FAKE_GIT = {"root": "/repo", "branch": "b", "head": "h1", "base": "origin/main",
+            "paths": ["x.py"], "refs": []}
+brain_brief.brief_identifiers.from_git = lambda cwd: dict(FAKE_GIT)  # type: ignore[assignment]
+spawned: list[str] = []
+_real_spawn = brain_brief._spawn_pointers
+brain_brief._spawn_pointers = lambda cwd, sid: spawned.append(sid)  # type: ignore[assignment]
+
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
+check("no pointer cache: no Apply/Recall, but the worker is spawned",
+      "## Apply" not in ctx and spawned == ["s1"])
+PCACHE = brain_brief._pointers_path("staging", BRAIN, "/repo")
+POINTERS = {
+    "computed_at": time.time(), "head": "h1", "branch": "b", "base": "origin/main",
+    "apply": [{"id": "d1", "type": "lesson", "text": "lesson one", "as_of": "2026-09-01", "match": "x.py"},
+              {"id": "d2", "type": "procedure", "text": "proc two", "as_of": "", "match": ""}],
+    "recall": [{"id": "e1", "type": "episode", "text": "episode one", "match": "PR #1"},
+               {"id": "a1", "type": "artifact", "text": "artifact one", "match": "x.py"}],
+}
+brain_brief._write_json(PCACHE, POINTERS)
+spawned.clear()
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
+check("a fresh cache renders Apply", "## Apply" in ctx and "• [lesson] lesson one — 2026-09-01 · on x.py [d1]" in ctx)
+check("a fresh cache renders Recall & Consult", "## Recall & Consult" in ctx and "[artifact] artifact one" in ctx)
+check("every rendered id joins the served list",
+      set(served_state.load_ids(served_state.STATE_DIR, "s1")) == {"d1", "d2", "e1", "a1"})
+check("a fresh cache on the same HEAD is not recomputed", spawned == [])
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
+check("served ids are not rendered again", "## Apply" not in ctx and "## Recall" not in ctx)
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s2"}))
+check("another session still sees them", "[d1]" in ctx and "[a1]" in ctx)
+brain_brief._write_json(PCACHE, {**POINTERS, "head": "h0"})
+spawned.clear(); _brief({"cwd": "/repo", "session_id": "s3"})
+check("HEAD moved: the worker is spawned", spawned == ["s3"])
+brain_brief._write_json(PCACHE, {**POINTERS, "branch": "other"})
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s4"}))
+check("a cache computed for another branch is not rendered", "## Apply" not in ctx)
+brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() - 2 * 86400})
+spawned.clear(); ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s5"}))
+check("a stale cache is neither rendered nor trusted", "## Apply" not in ctx and spawned == ["s5"])
+brain_brief._write_json(PCACHE, POINTERS)
+
+# the real spawner: disabled by env, else a detached `pointers` child
+brain_brief._spawn_pointers = _real_spawn
+popen_calls: list[list[str]] = []
+_real_popen = brain_brief.subprocess.Popen
+brain_brief.subprocess.Popen = lambda argv, **kw: popen_calls.append(argv)  # type: ignore[assignment]
+os.environ["MEMHUB_BRIEF_POINTERS"] = "0"
+brain_brief._spawn_pointers("/repo", "s1")
+check("MEMHUB_BRIEF_POINTERS=0 spawns nothing", popen_calls == [])
+os.environ.pop("MEMHUB_BRIEF_POINTERS")
+brain_brief._spawn_pointers("/repo", "s1")
+check("otherwise a detached `pointers` child is started",
+      len(popen_calls) == 1 and popen_calls[0][2:] == ["pointers", "/repo", "s1"])
+brain_brief.subprocess.Popen = _real_popen
+brain_brief._spawn_pointers = lambda cwd, sid: spawned.append(sid)  # type: ignore[assignment]
+
+# ── the budget: one env var, 2:1, trimmed footer ───────────────────────────
+os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "300"
+check("budget is tokens × 4 chars, split 2:1",
+      (brief_budget.total_chars(), brief_budget.brief_chars(), brief_budget.rulebook_chars())
+      == (1200, 800, 400))
+ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s6"}))
+check("over budget the brief is trimmed, map intact",
+      ctx.endswith(brain_brief._TRIMMED_FOOTER) and "## Map" in ctx and BRAIN in ctx)
+os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
+os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "garbage"
+check("an unparsable budget falls back to the default",
+      brief_budget.total_tokens() == brief_budget.DEFAULT_TOKENS)
+os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
+
+# ── the prompt hook ────────────────────────────────────────────────────────
+brain_brief.room_map.repo_root = lambda cwd=None: Path("/repo")  # type: ignore[assignment]
+brain_brief.brief_identifiers.repo_files = lambda root: {"room_map", "room_map.py"}  # type: ignore[assignment]
+recall_calls: list[dict] = []
+PROMPT_ITEMS = [
+    {"id": "p1", "type": "lesson", "content": "lesson about room_map", "as_of": "2026-09-02",
+     "triggers": ["room_map.read_room"]},
+    {"id": "p2", "type": "lesson", "content": "second", "triggers": ["other"]},
+    {"id": "p3", "type": "procedure", "content": "third", "triggers": []},
+    {"id": "p4", "type": "lesson", "content": "fourth", "triggers": []},
+]
+
+
+def _fake_prompt_recall(brain_id, root, entities, served, session_id):
+    recall_calls.append({"entities": entities, "served": list(served)})
+    return [d for d in PROMPT_ITEMS if d["id"] not in served][:brain_brief._MAX_PROMPT]
+
+
+brain_brief._prompt_recall = _fake_prompt_recall  # type: ignore[assignment]
+
+
+def _prompt(payload: dict) -> dict:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        brain_brief.cmd_prompt(payload)
+    raw = buf.getvalue().strip()
+    return json.loads(raw) if raw else {}
+
+
+# s1 has already seen the cache, so only the prompt's own identifiers matter
+out = _prompt({"cwd": "/repo", "session_id": "s1", "prompt": "summarise what we did yesterday"})
+check("a prompt with no identifier makes no recall and prints nothing",
+      out == {} and recall_calls == [])
+out = _prompt({"cwd": "/repo", "session_id": "s1",
+               "prompt": "why does room_map.read_room return None for PR #182?"})
+pctx = _ctx(out)
+check("identifiers in the prompt fire one recall on them",
+      len(recall_calls) == 1 and {"room_map.read_room", "PR #182"} <= set(recall_calls[0]["entities"]))
+check("the hook answers as UserPromptSubmit",
+      out.get("hookSpecificOutput", {}).get("hookEventName") == "UserPromptSubmit")
+check("at most three pointers", pctx.count("\n• ") + pctx.startswith("• ") <= 3 and "[p4]" not in pctx)
+check("the matched trigger is shown", "on room_map.read_room [p1]" in pctx)
+check("prompt pointers join the served list",
+      {"p1", "p2", "p3"} <= set(served_state.load_ids(served_state.STATE_DIR, "s1")))
+out = _prompt({"cwd": "/repo", "session_id": "s1", "prompt": "again: room_map.read_room"})
+check("served pointers are not repeated: only the unseen one remains",
+      "[p4]" in _ctx(out) and "[p1]" not in _ctx(out))
+out = _prompt({"cwd": "/repo", "session_id": "s1", "prompt": "again: room_map.read_room"})
+check("and once everything is served the hook is silent", out == {})
+
+LONG_ITEMS = [{"id": f"L{i}", "type": "lesson", "content": "w" * 400, "triggers": []} for i in range(3)]
+brain_brief._prompt_recall = lambda *a, **k: LONG_ITEMS  # type: ignore[assignment]
+pctx = _ctx(_prompt({"cwd": "/repo", "session_id": "s7", "prompt": "see room_map.read_room"}))
+check("the prompt block stays under 600 chars, cut from the end",
+      0 < len(pctx) <= brain_brief._PROMPT_MAX_CHARS and "[L0]" in pctx and "[L2]" not in pctx)
+brain_brief._prompt_recall = _fake_prompt_recall  # type: ignore[assignment]
+
+# the pointer cache the brief could not deliver arrives on the first prompt — once
+out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
+check("a pending pointer cache is delivered by the prompt hook",
+      "## Apply" in _ctx(out) and "[a1]" in _ctx(out))
+out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
+check("…and only once per refresh", out == {})
+brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() + 1,
+                                 "apply": [{"id": "d9", "type": "lesson", "text": "new", "as_of": "", "match": ""}],
+                                 "recall": []})
+out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
+check("a refreshed cache is delivered again, minus served ids",
+      "[d9]" in _ctx(out) and "[d1]" not in _ctx(out))
+
+# ── no network on the brief path — with a room AND a pointer cache present ─
+probe = subprocess.run(
+    [sys.executable, "-c",
+     "import sys; sys.path.insert(0, %r)\n"
+     "import json, io, contextlib, time\n"
+     "import brain_brief\n"
+     "brain_brief.room_map.read_room = lambda cwd=None, env=None: %r\n"
+     "brain_brief.room_map.current_env = lambda: 'staging'\n"
+     "brain_brief.brief_identifiers.from_git = lambda cwd: %r\n"
+     "buf = io.StringIO()\n"
+     "with contextlib.redirect_stdout(buf): brain_brief.cmd_brief({'cwd': '/repo', 'session_id': 'probe'})\n"
+     "ctx = json.loads(buf.getvalue())['hookSpecificOutput']['additionalContext']\n"
+     "print(json.dumps([sorted(m for m in sys.modules if m in ('mcp_http', '_memhub_auth', 'urllib.request', 'http.client')), '## Apply' in ctx]))"
+     % (str(SCRIPTS), room, FAKE_GIT)],
+    capture_output=True, text=True,
+    env={**os.environ, "HOME": _TMP_HOME, "USERPROFILE": _TMP_HOME, "MEMHUB_BRIEF_POINTERS": "0"},
+)
+loaded, rendered = json.loads(probe.stdout.strip() or '[["?"], false]') if probe.returncode == 0 else (["?"], False)
+check("a full brief (map + cached pointers) loads no transport/auth module",
+      loaded == [] and rendered)
+
+brain_brief.brief_identifiers.from_git = brief_identifiers.from_git  # type: ignore[assignment]
 
 # ── the CLI, as the hook actually invokes it ───────────────────────────────
 cli = _run("brief", {"cwd": _TMP_HOME})
