@@ -274,6 +274,37 @@ def _title(rollout: list[dict]) -> str | None:
     return line[:150]
 
 
+def _result_failed(raw: object) -> bool:
+    """Whether a host's tool-result payload says the call FAILED.
+
+    Emitted as canonical `is_error`, which is the field Claude's own
+    transcripts carry — so this makes these readers MORE like the shape every
+    consumer already expects, not less. Only a clear signal counts; an
+    unreadable payload is not treated as a failure.
+    """
+    if isinstance(raw, str):
+        text = raw.lstrip()
+        if not text.startswith(("{", "[")):
+            return False
+        try:
+            raw = json.loads(text)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(raw, dict):
+        return False
+    for key in ("is_error", "isError", "error"):
+        if raw.get(key) is True:
+            return True
+    if raw.get("success") is False:
+        return True
+    for holder in (raw, raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}):
+        for key in ("exit_code", "exitCode", "status"):
+            code = holder.get(key)
+            if type(code) is int and code != 0:
+                return True
+    return False
+
+
 def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
@@ -472,13 +503,17 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
             # duplicate-linking — an unrelated call. Never happens for real Codex.
             call_id = pl.get("call_id") or pl.get("id") or f"codex-out-{idx}"
             output = pl.get("output")
+            failed = _result_failed(output)
             if not isinstance(output, str):
                 output = json.dumps(output) if output is not None else ""
-            out.append(user([{
+            block = {
                 "type": "tool_result",
                 "tool_use_id": call_id,
                 "content": output,
-            }]))
+            }
+            if failed:
+                block["is_error"] = True
+            out.append(user([block]))
 
     return out, meta
 

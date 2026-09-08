@@ -311,6 +311,12 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         # string; rejecting both meant no context at all for those forms.
         ("gh api repos/{owner}/{repo}/pulls -f title=x", "pulls_collection", True),
         ("gh api repos/o/r/pulls?state=open", "pulls_collection", False),
+        # The endpoint is an OPERAND. A URL handed to a read-only option is not
+        # the destination: this posts to example.test (Codex review, PR #182).
+        ("curl --referer https://api.github.com/repos/o/r/pulls -d url=x "
+         "https://example.test/echo", None, False),
+        ("curl -H 'Ref: https://api.github.com/repos/o/r/pulls' "
+         "https://api.github.com/repos/o/r/pulls -d '{}'", "pulls_collection", True),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -482,6 +488,35 @@ def test_an_enterprise_mcp_create_reads_its_host_from_the_result():
     check("a github.com MCP result names no extra host",
           pr_link._mcp_result_host({"content": [{"type": "text", "text": json.dumps(
               {"html_url": "https://github.com/o/r/pull/7"})}]}) is None)
+
+
+def test_a_gh_pr_command_may_report_an_enterprise_url_itself():
+    """`gh` infers its host from the repository's remote, so plain
+    `gh pr create --fill` on GHES names the host NOWHERE in the command. Its
+    own output is the only place it appears (Codex review, PR #182)."""
+    connected = {"enabled": True, "github_connected": True, "repo_in_install": True}
+
+    def ctx(command, response):
+        return pr_link.context_for_call("Bash", {"command": command}, response,
+                                        "s1", checker=lambda _u: connected) or ""
+
+    ghes = {"stdout": "https://ghe.corp/o/r/pull/7", "stderr": "", "exit_code": 0}
+    check("a plain gh pr create on GHES reaches B1",
+          "you just opened" in ctx("gh pr create --fill", ghes))
+    check("…and a gh pr view on GHES reaches B2",
+          "IF IT WAS NOT" in ctx("gh pr view 7", ghes))
+    # Accepting any host is scoped to the `gh pr` lane, because there the text
+    # is gh's own output. Everything else still takes its host from the command.
+    check("a non-gh command gets no host-agnostic parsing",
+          ctx("cat notes.md", ghes) == "")
+    check("…and two URLs still silence it",
+          ctx("gh pr create --fill",
+              {"stdout": "https://ghe.corp/o/r/pull/7 https://ghe.corp/o/r/pull/8",
+               "exit_code": 0}) == "")
+    check("github.com behaviour is unchanged",
+          "you just opened" in ctx("gh pr create --fill",
+                                   {"stdout": "https://github.com/o/r/pull/7",
+                                    "exit_code": 0}))
 
 
 def test_a_quoted_api_target_is_still_found_but_a_quoted_mention_is_not():

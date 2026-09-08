@@ -566,6 +566,25 @@ def _options_of(args: list[str], client: str = "curl"):
         index += 2 if _consumes_operand(token, client) else 1
 
 
+def _operands_of(args: list[str], client: str = "curl"):
+    """The tokens that are NOT options and NOT an option's value.
+
+    The endpoint is one of these. Scanning every token for it meant a URL
+    handed to a read-only option could be mistaken for the destination —
+    `curl --referer https://api.github.com/…/pulls … https://example.test/echo`
+    posts to example.test, and reading the REFERRER as the target called it a
+    pull-request creation.
+    """
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token.startswith("-") and token != "-":
+            index += 2 if _consumes_operand(token, client) else 1
+            continue
+        yield token
+        index += 1
+
+
 def _curl_posts(segment: list[str]) -> bool:
     for token in _options_of(segment, "curl"):
         if token in _CURL_DATA_FLAGS or token.startswith("--data"):
@@ -811,7 +830,7 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
     single invocation, separated by `--next`, each with its own options.
     """
     target = number = host = None
-    for arg in args:
+    for arg in _operands_of(args, name):
         match = _API_URL.match(arg)
         if match:
             host = (match.group(1) or match.group(5) or "").casefold()
@@ -1109,6 +1128,41 @@ def _response_texts(tool_response: object) -> list[str] | None:
     else:
         return None
     return texts
+
+
+_ANY_HOST_PR_RE = re.compile(
+    r"https://([\w.-]+)/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)"
+    r"/([A-Za-z0-9_.-]{1,100})/pull/([1-9][0-9]*)(?![A-Za-z0-9/])", re.I)
+
+
+def _gh_reported_pr_url(tool_response: object) -> str | None:
+    """The single PR URL a `gh pr` command printed, on ANY host.
+
+    `gh` infers its host from the repository's remote, so the ordinary GHES
+    `gh pr create --fill` names no host anywhere in the command — not in a URL,
+    not in `-R`, not in an environment assignment — and the enterprise URL it
+    prints was being dropped by the github.com-only parser.
+
+    Accepting any host is safe HERE and nowhere else: the caller has already
+    established that this command was a `gh pr` invocation, so the text being
+    read is gh's own output about the repository it just acted on, not the
+    stdout of an arbitrary program. The exactly-one rule still applies, so a
+    second URL from anywhere silences it.
+    """
+    texts = _response_texts(tool_response)
+    if texts is None:
+        return None
+    found: list[str] = []
+    for text in texts:
+        for match in _ANY_HOST_PR_RE.finditer(
+                text[:pr_provenance.MAX_RESULT_TEXT_BYTES]):
+            host, owner, repo, number = match.groups()
+            url = f"https://{host.lower()}/{owner.lower()}/{repo.lower()}/pull/{int(number)}"
+            if url not in found:
+                found.append(url)
+            if len(found) > 1:
+                return None
+    return found[0] if len(found) == 1 else None
 
 
 _HTML_URL_RE = re.compile(
@@ -1443,6 +1497,12 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
     if api_host is None and is_github_mcp_tool(tool_name):
         api_host = _mcp_result_host(tool_response)
     pr_url = pr_url_from_response(tool_response, host=api_host)
+    if not pr_url and (_gh_pr_subcommands(_command_of(tool_name, tool_input)) or []):
+        # A `gh pr` command on an enterprise host names it nowhere; gh knows it
+        # from the repository's remote. Its own output is the one place it
+        # appears, and this is the only lane where reading a host from the
+        # RESPONSE is sound (see `_gh_reported_pr_url`).
+        pr_url = _gh_reported_pr_url(tool_response)
     if not pr_url:
         return None
     reply = checker(pr_url)

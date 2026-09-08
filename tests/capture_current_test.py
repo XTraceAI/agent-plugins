@@ -196,6 +196,24 @@ def test_a_session_that_moved_is_found_where_it_ended():
         check("…and not under the one it started in", rc == 3)
 
 
+def test_a_busy_machine_does_not_hide_the_running_session():
+    """The readers sort globally by mtime, so capping the enumeration before
+    the cwd filter made the live session invisible whenever the host had that
+    many newer transcripts in other worktrees (Codex review, PR #182)."""
+    with tempfile.TemporaryDirectory() as td:
+        home, cwd = Path(td) / "home", str(Path(td) / "repo")
+        os.makedirs(cwd)
+        # The one we want is the OLDEST of the fresh sessions.
+        claude_session(home, "aaaa-1111", cwd, age_s=300)
+        for index in range(120):
+            other = str(Path(td) / f"other{index}")
+            os.makedirs(other)
+            claude_session(home, f"bbbb-{index:04d}", other, age_s=index)
+        rc, out, err = run(home, "--cwd", cwd, "--host", "claude")
+        check("the running session is still found behind 120 newer ones",
+              rc == 0 and out.splitlines()[:1] == ["aaaa-1111"], out + err[:200])
+
+
 def test_an_empty_home_is_a_clean_refusal():
     with tempfile.TemporaryDirectory() as td:
         home, cwd = Path(td) / "home", str(Path(td) / "repo")

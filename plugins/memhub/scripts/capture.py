@@ -83,7 +83,14 @@ def cmd_list(args) -> int:
 # live sessions, not one live and one finished — there is no evidence here
 # that separates them, so `current` refuses.
 _TIE_WINDOW_S = 120
-_CANDIDATE_SCAN = 40
+# How many recent sessions to ENUMERATE before filtering. The readers sort
+# globally by mtime, so a small cap made the running session invisible whenever
+# that host had this many newer transcripts in other worktrees — and `current`
+# then answered "no live session" for a session that was right there. The
+# freshness cut below is what keeps this cheap: it drops stale rows using the
+# mtime already in the listing, so only the handful within `--max-age-s` are
+# opened to read their cwd.
+_CANDIDATE_SCAN = 500
 
 
 def _real(path: str | None) -> str | None:
@@ -113,6 +120,8 @@ def _candidates(hosts: list[str], target: str, max_age_s: float, now: float) -> 
             continue
         for row in listed:
             mtime = row.get("mtime") or 0
+            # Cheap first: this comes from the listing, so a stale session
+            # costs nothing. Only survivors get their transcript opened.
             if now - mtime > max_age_s:
                 continue
             try:
