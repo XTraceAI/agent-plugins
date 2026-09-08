@@ -184,7 +184,23 @@ _VALUE_LONG_OPTS = frozenset({
     "--cacert", "--capath", "--connect-timeout", "--max-time", "--retry",
     "--range", "--write-out", "--config", "--hostname", "--input",
     "--field", "--raw-field", "--template", "--jq", "--method", "--request",
-    "--post-data", "--post-file", "--body-data", "--body-file"})
+    "--post-data", "--post-file", "--body-data", "--body-file",
+    # `--url-query <data>` adds a query part and its operand was being read as
+    # a method. This list IS the risk surface: any value-taking option missing
+    # from it lets its argument be re-interpreted as an option, so prefer
+    # adding one speculatively over leaving it out.
+    "--url-query", "--aws-sigv4", "--oauth2-bearer", "--proxy-header",
+    "--resolve", "--connect-to", "--request-target", "--unix-socket",
+    "--interface", "--noproxy", "--preproxy", "--proxy-user", "--netrc-file",
+    "--output-dir", "--max-filesize", "--max-redirs", "--limit-rate",
+    "--retry-delay", "--retry-max-time", "--trace", "--trace-ascii",
+    "--libcurl", "--login-options", "--mail-from", "--mail-rcpt", "--quote",
+    "--speed-limit", "--speed-time", "--tls-max", "--tlsuser",
+    "--tlspassword", "--tlsauthtype", "--service-name", "--sasl-authzid",
+    "--proto", "--proto-default", "--proto-redir", "--pubkey", "--engine",
+    "--ftp-account", "--ftp-method", "--ftp-port", "--krb", "--pass",
+    "--dns-servers", "--local-port", "--expect100-timeout",
+    "--happy-eyeballs-timeout-ms", "--continue-at", "--socks4", "--socks5"})
 
 
 def _consumes_operand(token: str) -> bool:
@@ -545,9 +561,12 @@ def _creating_segment_index(segments: list[tuple[str, list[str]]]) -> int | None
         name, args = _command_name(segment)
         creates = False
         if name in ("gh", "gh.exe") and "pr" in args:
-            position = args.index("pr")
-            creates = (position + 1 < len(args)
-                       and args[position + 1] in _GH_CREATE_SUBS)
+            # ONE implementation of "which subcommand is this", shared with
+            # `_gh_pr_subcommands`. They were written separately and drifted
+            # immediately: teaching one about `gh pr -R o/r create` and not the
+            # other left the create recognised and then rejected.
+            creates = (_gh_subcommand_after(args, args.index("pr"))
+                       in _GH_CREATE_SUBS)
         elif name in ("gh", "gh.exe") or name in _HTTP_CLIENTS:
             is_gh_api = name in ("gh", "gh.exe") and "api" in args
             for operation in _operations(name, args):
@@ -560,6 +579,48 @@ def _creating_segment_index(segments: list[tuple[str, list[str]]]) -> int | None
                 return None
             found = index
     return found
+
+
+# `gh`'s inherited flags may sit between `pr` and its subcommand
+# (`gh pr -R o/r create`), and `-R/--repo` takes an operand.
+_GH_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname", "--template",
+                             "--jq", "-q"})
+# `--dry-run` prints the pull request it WOULD open and opens nothing.
+_GH_DRY_RUN = "--dry-run"
+
+
+def _gh_subcommand_after(args: list[str], start: int) -> str:
+    """The subcommand following `pr`, skipping inherited flags."""
+    index = start + 1
+    while index < len(args):
+        token = args[index]
+        if not token.startswith("-"):
+            return token
+        index += 2 if (token in _GH_VALUE_FLAGS and "=" not in token) else 1
+    return ""
+
+
+def _gh_repo_host(args: list[str]) -> str | None:
+    """The host from `gh -R [HOST/]OWNER/REPO`, when one is given.
+
+    `gh -R ghe.corp/o/r pr create` prints an enterprise URL on success, and
+    with no REST target in the command there was nothing else to learn the host
+    from — so the automatic link stayed silent on the ordinary GHES `gh pr`
+    path.
+    """
+    for index, token in enumerate(args):
+        value = None
+        if token in ("-R", "--repo") and index + 1 < len(args):
+            value = args[index + 1]
+        elif token.startswith("--repo="):
+            value = token[len("--repo="):]
+        elif token.startswith("-R") and len(token) > 2:
+            value = token[2:]
+        if value and value.count("/") == 2:
+            host = value.split("/", 1)[0].casefold()
+            if host and host not in ("github.com", "api.github.com"):
+                return host
+    return None
 
 
 def _gh_pr_subcommands(command: object) -> list[str] | None:
@@ -578,8 +639,7 @@ def _gh_pr_subcommands(command: object) -> list[str] | None:
     for segment in _segments(tokens):
         name, args = _command_name(segment)
         if name in ("gh", "gh.exe") and "pr" in args:
-            index = args.index("pr")
-            subs.append(args[index + 1] if index + 1 < len(args) else "")
+            subs.append(_gh_subcommand_after(args, args.index("pr")))
     return subs
 
 
@@ -746,7 +806,19 @@ def github_api_host(command: object) -> str | None:
     sites that happen to use that path shape. Only the host the session itself
     just talked to is trusted.
     """
-    return _api_call(command)[2]
+    host = _api_call(command)[2]
+    if host:
+        return host
+    tokens = _tokens(command if isinstance(command, str) else "")
+    if tokens is None:
+        return None
+    for segment in _segments(tokens):
+        name, args = _command_name(segment)
+        if name in ("gh", "gh.exe") and "pr" in args:
+            found = _gh_repo_host(args)
+            if found:
+                return found
+    return None
 
 
 def _urls_on_host(text: object, host: str) -> list[str]:
@@ -861,6 +933,11 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
     if not _url_source_is_certain(command):
         return False
     if subs:
+        if _GH_DRY_RUN in (_tokens(command) or []):
+            # `gh pr create --dry-run` prints the pull request it WOULD open.
+            # If the proposed body quotes a PR URL, B1 would have claimed
+            # authorship of THAT one.
+            return False
         return subs[0] in _GH_CREATE_SUBS
     target, is_write = github_api_call(command)
     return target == "pulls_collection" and is_write

@@ -255,6 +255,12 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", False),
         ("wget --post-data='{}' https://api.github.com/repos/o/r/pulls",
          "pulls_collection", True),
+        # A value-taking long option missing from the list lets its argument be
+        # re-read as an option: `--url-query '-XPOST'` became a method.
+        ("curl --url-query '-XPOST' 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("curl --aws-sigv4 '-XPOST' 'https://api.github.com/repos/o/r/pulls'",
+         "pulls_collection", False),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -576,6 +582,43 @@ def test_gh_pr_new_is_an_alias_for_create():
         check(f"{command!r} creates", pr_link.creates_pr("Bash", {"command": command}))
     check("gh pr view is still not a create",
           not pr_link.creates_pr("Bash", {"command": "gh pr view 12"}))
+
+
+def test_gh_inherited_flags_and_dry_run():
+    """`gh`'s inherited flags sit between `pr` and its subcommand, and
+    `--dry-run` prints the pull request it WOULD open (Codex review, PR #182)."""
+    for command in ("gh pr -R o/r create --fill", "gh pr --repo o/r new",
+                    "gh pr -R ghe.corp/o/r create --fill"):
+        check(f"an inherited flag does not hide the subcommand: {command[:40]!r}",
+              pr_link.creates_pr("Bash", {"command": command}))
+    check("…and the subcommand is still read correctly",
+          not pr_link.creates_pr("Bash", {"command": "gh pr -R o/r view 12"}))
+    # A dry run opens nothing; if its proposed body quotes a PR URL, B1 would
+    # have claimed authorship of THAT pull request.
+    check("--dry-run is not a creation",
+          not pr_link.creates_pr("Bash", {"command": "gh pr create --fill --dry-run"}))
+    check("…while a real create is unaffected",
+          pr_link.creates_pr("Bash", {"command": "gh pr create --fill"}))
+
+
+def test_an_enterprise_gh_pr_create_recovers_its_host():
+    """`gh -R [HOST/]OWNER/REPO` is the ordinary GHES `gh pr` path, and with no
+    REST target in the command there was nothing to learn the host from, so the
+    link stayed silent (Codex review, PR #182)."""
+    check("the host comes from -R",
+          pr_link.github_api_host("gh -R ghe.corp/o/r pr create --fill") == "ghe.corp")
+    check("…and from --repo=", 
+          pr_link.github_api_host("gh --repo=ghe.corp/o/r pr create") == "ghe.corp")
+    check("a two-segment -R names no host",
+          pr_link.github_api_host("gh -R o/r pr create --fill") is None)
+    got = pr_link.context_for_call(
+        "Bash", {"command": "gh -R ghe.corp/o/r pr create --fill"},
+        {"stdout": "https://ghe.corp/o/r/pull/7\n", "stderr": "", "exit_code": 0},
+        "s1", checker=lambda _u: {"enabled": True, "github_connected": True,
+                                  "repo_in_install": True})
+    check("an enterprise gh pr create reaches B1",
+          bool(got) and "you just opened" in got and "ghe.corp/o/r/pull/7" in got,
+          str(got)[:140])
 
 
 def test_b1_needs_the_url_to_be_provably_the_creates_own():
