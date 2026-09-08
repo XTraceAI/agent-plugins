@@ -286,6 +286,17 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", False),
         ("curl -k -v -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
          "pulls_collection", True),
+        # The DATA inference needed the same operand-aware walk as the method
+        # scan: a header whose value looks like a flag is data, not a flag.
+        ("curl -H '-d' 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("curl -A '--data' 'https://api.github.com/repos/o/r/pulls'",
+         "pulls_collection", False),
+        ("gh api --jq '-f' repos/o/r/pulls", "pulls_collection", False),
+        ("wget --output-file '--post-data' https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("curl -H 'X-Y: z' -d '{}' https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -522,6 +533,36 @@ def test_the_negative_cache_is_scoped_to_the_repo_not_the_deployment():
         check("…but a DIFFERENT repo asks the server again",
               len(calls) == 2, str(calls))
     pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
+
+
+def test_a_newline_separates_commands_like_a_semicolon():
+    """`\n` was in the punctuation set but shlex's WHITESPACE rule consulted
+    first and swallowed it — so a multi-line command, which agents write
+    constantly, collapsed into ONE segment and every segment-based guard here
+    silently did nothing on it (Codex review, PR #182)."""
+    tokens = pr_link._tokens("gh pr create --fill\ntrue")
+    check("a newline survives tokenisation", "\n" in (tokens or []), str(tokens))
+    check("…and splits the command in two",
+          len(pr_link._segments(tokens)) == 2, str(pr_link._segments(tokens)))
+    connected = {"enabled": True, "github_connected": True, "repo_in_install": True}
+
+    def b1(command):
+        got = pr_link.context_for_call(
+            "Bash", {"command": command},
+            {"stdout": "https://github.com/o/r/pull/5", "stderr": "", "exit_code": 0},
+            "s1", checker=lambda _u: connected) or ""
+        return "you just opened" in got
+
+    # `true` after a newline makes the tool report ITS status, so a failed
+    # create looks successful and its stderr still holds the existing PR's URL.
+    check("a newline follower blocks the self-link",
+          not b1("gh pr create --fill\ntrue"))
+    check("…as does any other newline follower",
+          not b1("gh pr create --fill\ncat /tmp/url"))
+    check("a newline BEFORE the create is harmless",
+          b1("cd /repo\ngh pr create --fill"))
+    check("…including a multi-line prelude",
+          b1("git add -A\ngit commit -m x\ngh pr create --fill"))
 
 
 def test_a_chained_gh_pr_create_cannot_claim_the_other_prs_url():

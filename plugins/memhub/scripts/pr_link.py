@@ -167,6 +167,12 @@ def _tokens(command: str) -> list[str] | None:
                             punctuation_chars=_SHELL_PUNCTUATION)
         lexer.whitespace_split = True
         lexer.commenters = ""
+        # `\n` and `\r` are in `_SHELL_PUNCTUATION`, but shlex's WHITESPACE
+        # rule is consulted first and swallowed them — so a multi-line command
+        # (which agents write constantly) collapsed into a single segment and
+        # every segment-based guard here silently did nothing on it. Bash
+        # treats a newline as a control operator, and so must this.
+        lexer.whitespace = " \t"
         return list(lexer)
     except ValueError:
         return None
@@ -517,11 +523,28 @@ def _curl_short_run_has(token: str, wanted: str) -> bool:
 
 def _curl_forces_get(segment: list[str]) -> bool:
     return any(t == "--get" or _curl_short_run_has(t, _CURL_GET_OPT)
-               for t in segment)
+               for t in _options_of(segment))
+
+
+def _options_of(args: list[str]):
+    """The tokens that are OPTIONS, skipping every option's operand.
+
+    Every flag question in this module asks it of this walk rather than of the
+    raw list. Scanning flatly meant a read-only option's ARGUMENT could look
+    like a flag — `curl -H '-d' …` read the header as POST data, and
+    `curl -H '-XPOST' …` read it as a method — which turned listings into
+    claimed creations.
+    """
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token.startswith("-") and token != "-":
+            yield token
+        index += 2 if _consumes_operand(token) else 1
 
 
 def _curl_posts(segment: list[str]) -> bool:
-    for token in segment:
+    for token in _options_of(segment):
         if token in _CURL_DATA_FLAGS or token.startswith("--data"):
             return True
         if _curl_short_run_posts(token):
@@ -531,7 +554,7 @@ def _curl_posts(segment: list[str]) -> bool:
 
 def _wget_posts(segment: list[str]) -> bool:
     return any(t == f or t.startswith(f + "=")
-               for t in segment for f in _WGET_POST_FLAGS)
+               for t in _options_of(segment) for f in _WGET_POST_FLAGS)
 
 
 # HTTPie/xh default to GET with no request data and POST with some. Only BODY
@@ -594,7 +617,9 @@ def _url_source_is_certain(command: str) -> bool:
             continue
         if ">" in op:                      # stdout (or stderr) sent elsewhere
             return False
-        if op in (";", "||"):              # runs even if the create failed
+        # A NEWLINE sequences exactly like `;` — the follower runs whatever the
+        # create did, and its exit status is the one the tool reports.
+        if op in (";", "||") or op.strip("\r\n") == "":
             return False
         if op == "|":
             # Without `set -o pipefail` a pipeline reports the LAST command's
@@ -779,7 +804,7 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
         method = _positional_method(args)
     if method is not None:
         write = method == "POST"
-    elif is_gh_api and any(_is_gh_field_flag(t) for t in args):
+    elif is_gh_api and any(_is_gh_field_flag(t) for t in _options_of(args)):
         write = True
     elif name in _HTTPIE_CLIENTS and _httpie_posts(args):
         write = True

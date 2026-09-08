@@ -159,13 +159,17 @@ def test_switch_creates_a_branch_too():
         for index, command in enumerate(("git switch -c feat/x",
                                          "git switch -cfeat/x",
                                          "git switch --create=feat/x",
-                                         "git checkout -bfeat/x")):
+                                         "git checkout -bfeat/x",
+                                         # …and through the usual wrappers.
+                                         "env FOO=1 git switch -c feat/x",
+                                         "sudo -u ci git switch -c feat/x")):
             claude_session(home, f"switcher{index}", wt, branch=None,
                            edits=[f"{wt}/app/x.py"], commands=[command])
         rc, out, _err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
         rows = {r["conversation_id"]: r for r in json.loads(out)}
         for index, command in enumerate(("-c feat/x", "-cfeat/x",
-                                         "--create=feat/x", "-bfeat/x")):
+                                         "--create=feat/x", "-bfeat/x",
+                                         "env FOO=1 …", "sudo -u ci …")):
             row = rows.get(f"switcher{index}", {})
             check(f"the branch is picked up from `{command}`",
                   row.get("evidence", {}).get("branch_match") is True, out[:240])

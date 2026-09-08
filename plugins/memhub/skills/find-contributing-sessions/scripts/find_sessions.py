@@ -144,6 +144,43 @@ _BRANCH_VALUE_FLAGS = _BRANCH_CREATE_FLAGS | {"--start-point", "-t", "--track",
                                               "--orphan"}
 
 
+_WRAPPERS = frozenset({"cd", "env", "sudo", "doas", "time", "nohup", "command",
+                       "exec", "timeout", "stdbuf"})
+# Wrapper flags that take a SEPARATE operand — `env -u NAME`, `sudo -u USER`,
+# `timeout -s SIG`. Skipping only the wrapper's name left the operand to be
+# read as the executable, so `env FOO=1 git switch -c feat/x` found no git.
+_WRAPPER_VALUE_FLAGS = frozenset({"-u", "--unset", "-g", "--group", "-p",
+                                  "--prompt", "-U", "-C", "-s", "--signal",
+                                  "-k", "--kill-after"})
+_ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=")
+
+
+def _basename(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _after_wrappers(tokens: list[str]) -> list[str]:
+    """The command proper, with leading wrappers and their operands removed."""
+    index, after_wrapper = 0, False
+    while index < len(tokens):
+        token = tokens[index]
+        if _ASSIGNMENT.match(token):
+            index += 1
+            continue
+        if _basename(token) in _WRAPPERS:
+            index, after_wrapper = index + 1, True
+            continue
+        if token.startswith("-"):
+            index += 2 if (after_wrapper and token in _WRAPPER_VALUE_FLAGS
+                           and "=" not in token) else 1
+            continue
+        if after_wrapper and token[:1].isdigit():        # `timeout 5 …`
+            index += 1
+            continue
+        break
+    return tokens[index:]
+
+
 def _git_branches(command: str) -> list[str]:
     """Every branch named by a checkout/switch in this command."""
     found: list[str] = []
@@ -152,9 +189,8 @@ def _git_branches(command: str) -> list[str]:
             tokens = shlex.split(segment, posix=True)
         except ValueError:
             continue
-        while tokens and tokens[0] in ("cd", "env", "sudo", "time", "nohup"):
-            tokens = tokens[1:]
-        if len(tokens) < 2 or tokens[0] != "git":
+        tokens = _after_wrappers(tokens)
+        if len(tokens) < 2 or _basename(tokens[0]) != "git":
             continue
         rest = tokens[1:]
         while rest and rest[0].startswith("-"):     # `git -C dir switch …`
