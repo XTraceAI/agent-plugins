@@ -55,6 +55,12 @@ python3 "<plugin-root>/skills/find-contributing-sessions/scripts/find_sessions.p
 It prints ranked candidates as JSON — conversation id, host, cwd, mtime, score
 and the evidence components. It never prints transcript text.
 
+**Read stderr too.** A transcript too large to parse into memory is not
+scanned, and the scanner says so there (`note: N session(s) larger than … were
+not scanned`). If that line appears, tell the user which sessions were skipped —
+a long session is exactly the kind that did the work, and an unexamined one must
+not look like an examined one that scored zero.
+
 What the score is made of, so you can explain a row rather than quote a number:
 
 | Signal | Points |

@@ -143,6 +143,16 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("gh api repos/o/r/pulls/12", "pull_item", False),
         ("curl -X POST https://gh.corp/api/v3/repos/o/r/pulls -d '{}'",
          "pulls_collection", True),
+        # Quoting the target is the normal way to write these, and blanking
+        # quoted segments before looking for it used to delete it — a silent
+        # miss on a real PR creation (Codex review, PR #182).
+        ('curl -X POST "https://api.github.com/repos/O/R/pulls" -d \'{}\'',
+         "pulls_collection", True),
+        ("curl -X POST 'https://api.github.com/repos/O/R/pulls' -d '{}'",
+         "pulls_collection", True),
+        ("gh api --method POST 'repos/o/r/pulls' -f title=x", "pulls_collection", True),
+        ('gh api --method POST "repos/o/r/pulls" -f title=x', "pulls_collection", True),
+        ('curl "https://api.github.com/repos/O/R/pulls/12"', "pull_item", False),
         ("curl https://api.github.com/repos/o/r/issues", None, False),
         ('echo "https://api.github.com/repos/o/r/pulls"', None, False),
         ('grep "https://api.github.com/repos/o/r/pulls" f', None, False),
@@ -175,6 +185,56 @@ def test_github_mcp_tools_are_recognised_by_their_server_segment():
     for name, touches, creates in cases:
         check(f"mcp touches: {name}", pr_link.touches_github(name, {}) is touches)
         check(f"mcp creates: {name}", pr_link.creates_pr(name, {}) is creates)
+
+
+def test_a_quoted_api_target_is_still_found_but_a_quoted_mention_is_not():
+    """The two halves of the quoting rule, which pull against each other.
+
+    Quotes must not hide a real target (`curl -X POST "…/pulls"`), and must
+    still stop a mention from looking like a call (`grep "…/pulls" f`). What
+    separates them is WHO is at command position, which is asked of the
+    blanked text; the target is then looked for in the dequoted text.
+    """
+    for command in (
+        'curl -X POST "https://api.github.com/repos/o/r/pulls" -d \'{"title":"x"}\'',
+        "gh api --method POST 'repos/o/r/pulls' -f title=x",
+    ):
+        check(f"a quoted target still creates: {command[:44]!r}",
+              pr_link.creates_pr("Bash", {"command": command})
+              and pr_link.touches_github("Bash", {"command": command}))
+    for command in (
+        'grep "https://api.github.com/repos/o/r/pulls" f',
+        'echo "https://api.github.com/repos/o/r/pulls"',
+        "echo 'gh api repos/o/r/pulls'",
+        'rg "api.github.com/repos/o/r/pulls" .',
+    ):
+        check(f"a quoted mention is still not a call: {command[:44]!r}",
+              not pr_link.touches_github("Bash", {"command": command}))
+
+
+def test_the_negative_cache_is_scoped_to_the_repo_not_the_deployment():
+    """`enabled` and `github_connected` are per-ORG, and one person can be in
+    several on one backend. Keying on the api_base alone let one disconnected
+    org silence linking for every other org's PRs for 24h, with no request
+    (Codex review, PR #182)."""
+    calls: list[str] = []
+    disconnected = {"enabled": True, "github_connected": False,
+                    "connect_url": "https://app.example.test/i"}
+
+    def rest(url, *a, **k):
+        calls.append(url)
+        return _Reply(200, disconnected)
+
+    with tempfile.TemporaryDirectory() as td:
+        pr_link.STATE_DIR = Path(td) / "prlink"
+        _with_stub(rest, lambda: pr_link.check("https://github.com/orgA/x/pull/1"))
+        check("the disconnected org's answer is cached", len(calls) == 1)
+        _with_stub(rest, lambda: pr_link.check("https://github.com/orgA/x/pull/2"))
+        check("…and reused for another PR in the SAME repo", len(calls) == 1, str(calls))
+        _with_stub(rest, lambda: pr_link.check("https://github.com/orgB/y/pull/1"))
+        check("…but a DIFFERENT repo asks the server again",
+              len(calls) == 2, str(calls))
+    pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
 
 
 def test_the_gate_is_acting_on_github_not_mentioning_a_pr():

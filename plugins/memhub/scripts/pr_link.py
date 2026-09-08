@@ -99,10 +99,36 @@ MAX_COMMAND_CHARS = pr_provenance.MAX_COMMAND_CHARS
 
 
 def _unquoted(command: object) -> str:
-    """The command with quoted segments blanked, bounded like pr_provenance."""
+    """The command with quoted segments BLANKED, bounded like pr_provenance.
+
+    This is the text every command-position question is asked of, because
+    blanking is what stops `grep "gh pr view"` from looking like a `gh` call.
+    """
     if not isinstance(command, str) or not command:
         return ""
     return QUOTED.sub(" ", command[:MAX_COMMAND_CHARS])
+
+
+def _dequoted(command: object) -> str:
+    """The command with the quote CHARACTERS removed and their content kept.
+
+    Quoting the URL is the normal way to write these:
+
+        curl -X POST "https://api.github.com/repos/o/r/pulls" -d '{…}'
+        gh api --method POST 'repos/o/r/pulls' -f title=x
+
+    Blanking the quotes (as `_unquoted` does) deletes the target along with
+    them, and the call reads as "not GitHub at all" — a silent miss on a real
+    PR creation, which is the failure this whole feature exists to prevent.
+
+    Safe to search for a target in, because the caller has ALREADY decided,
+    from `_unquoted`, that a GitHub client sits at command position: `grep
+    "https://api.github.com/repos/o/r/pulls" f` never gets this far, because
+    `grep` is not curl.
+    """
+    if not isinstance(command, str) or not command:
+        return ""
+    return re.sub(r"['\"]", " ", command[:MAX_COMMAND_CHARS])
 
 
 def is_gh_pr_command(command: object) -> bool:
@@ -127,6 +153,9 @@ def github_api_call(command: object) -> tuple[str | None, bool]:
     `curl` with `-d` and no explicit `-X` **is** a POST — that is the shape in
     the wild, and reading it as a GET would miss every hand-rolled PR creation.
     """
+    # Command position is asked of the BLANKED text (so `grep "curl …"` is not
+    # a curl call); the target is looked for in the DEQUOTED text, because
+    # quoting the URL is the normal way to write one of these.
     text = _unquoted(command)
     if not text:
         return None, False
@@ -135,12 +164,13 @@ def github_api_call(command: object) -> tuple[str | None, bool]:
     if not (is_gh_api or is_http):
         return None, False
 
-    match = _API_URL.search(text)
+    target_text = _dequoted(command)
+    match = _API_URL.search(target_text)
     number = None
     if match:
         number = match.group(3) or match.group(6)
     elif is_gh_api:
-        path = _API_PATH.search(text)
+        path = _API_PATH.search(target_text)
         if not path:
             return None, False
         number = path.group(1)
@@ -287,15 +317,32 @@ def conversation_id_for(host: object, session_id: object) -> str | None:
 
 # ---------------------------------------------------------------- the check
 
-def _cache_path(api_base: str) -> Path:
-    digest = hashlib.sha256(api_base.encode("utf-8")).hexdigest()[:16]
+def _repo_of(pr_url: str) -> str:
+    """``owner/repo`` from a canonical PR URL, or "" if it is not one."""
+    m = re.search(r"https://github\.com/([^/]+)/([^/]+)/pull/", pr_url or "")
+    return f"{m.group(1)}/{m.group(2)}" if m else ""
+
+
+def _cache_path(api_base: str, scope: str = "") -> Path:
+    """Where a negative answer for THIS deployment and THIS repo is stored.
+
+    ``enabled`` and ``github_connected`` are properties of the MemHub ORG that
+    owns the repo, not of the deployment — one person can be in several orgs on
+    one backend. Keying on the api_base alone meant a single disconnected org
+    silenced linking for every other org's pull requests for 24 hours, without
+    a request, which is exactly the silent failure the feature is meant to
+    avoid. The repo is the coarsest thing in the request that determines which
+    org answers, so it is what scopes the entry; the cost is one round trip per
+    repo per day instead of one per `gh pr` call.
+    """
+    digest = hashlib.sha256(f"{api_base}\n{scope}".encode("utf-8")).hexdigest()[:16]
     return STATE_DIR / f"{digest}.json"
 
 
-def _cached_negative(api_base: str, now: float) -> dict | None:
+def _cached_negative(api_base: str, now: float, scope: str = "") -> dict | None:
     """A stored `enabled:false` / `github_connected:false` answer, if fresh."""
     try:
-        raw = json.loads(_cache_path(api_base).read_text(encoding="utf-8"))
+        raw = json.loads(_cache_path(api_base, scope).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(raw, dict):
@@ -310,12 +357,12 @@ def _cached_negative(api_base: str, now: float) -> dict | None:
     return answer
 
 
-def _store_negative(api_base: str, answer: dict, now: float) -> None:
+def _store_negative(api_base: str, answer: dict, now: float, scope: str = "") -> None:
     try:
         import atomic_write
 
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        atomic_write.publish(_cache_path(api_base),
+        atomic_write.publish(_cache_path(api_base, scope),
                              json.dumps({"at": now, "answer": answer}))
     except Exception:
         pass
@@ -353,7 +400,8 @@ def check(pr_url: str, *, timeout: float = CHECK_TIMEOUT_S, now: float | None = 
         breadcrumb("resolve", exc)
         return None
 
-    cached = _cached_negative(api_base, now)
+    scope = _repo_of(pr_url)
+    cached = _cached_negative(api_base, now, scope)
     if cached is not None:
         return cached
 
@@ -370,7 +418,7 @@ def check(pr_url: str, *, timeout: float = CHECK_TIMEOUT_S, now: float | None = 
             return None
         data = reply.data
         if data.get("enabled") is False or data.get("github_connected") is False:
-            _store_negative(api_base, data, now)
+            _store_negative(api_base, data, now, scope)
         return data
     except Exception as exc:  # noqa: BLE001
         breadcrumb("check", exc)

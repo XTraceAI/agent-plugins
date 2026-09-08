@@ -160,6 +160,56 @@ def test_a_session_only_ever_on_the_base_branch_is_pushed_below_zero():
         check("it is not offered as a candidate", json.loads(out) == [], out)
 
 
+def test_a_session_that_only_ASKED_github_about_the_pr_is_not_evidence():
+    """The skill's own step 2 runs `gh pr view <n> --json commits`, so the
+    session running the scan finds the PR's shas in its own transcript. Without
+    pairing a result back to the call that produced it, that session ranks
+    itself top on the highest-value signal — "proof" that it wrote code it only
+    looked at (Codex review, PR #182)."""
+    sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        claude_session(home, "inspector", wt, branch="unrelated",
+                       commands=["gh pr view 42 --json commits -q '.commits[].oid'"],
+                       results=[sha])
+        # …while a session that saw the sha in its OWN git output still counts.
+        claude_session(home, "author", wt, branch="unrelated",
+                       commands=["git log --oneline -3"], results=[sha + " fix"])
+        rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--sha", sha,
+                           "--host", "claude")
+        ids = [r["conversation_id"] for r in json.loads(out)]
+        check("the PR-inspecting session is not offered as a candidate",
+              "inspector" not in ids, out)
+        check("…while a sha from the session's own `git log` still counts",
+              "author" in ids, out)
+
+
+def test_an_oversize_session_is_reported_not_silently_dropped():
+    """A transcript too large to parse is skipped for memory reasons — but an
+    unexamined session must not look like an examined one that scored zero."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        project = home / ".claude" / "projects" / wt.replace("/", "-")
+        project.mkdir(parents=True)
+        row = json.dumps(_record("h-0", "feat/x", wt, [{
+            "type": "tool_use", "id": "t0", "name": "Edit",
+            "input": {"file_path": f"{wt}/app/x.py", "new_string": PROSE}}]))
+        # Just over the cap, written cheaply.
+        with (project / "huge.jsonl").open("w", encoding="utf-8") as handle:
+            written = 0
+            while written <= 64 * 1024 * 1024:
+                handle.write(row + "\n")
+                written += len(row) + 1
+        rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
+        check("it is not scanned", rc == 0 and json.loads(out) == [], out[:200])
+        check("…and the omission is reported on stderr, naming it",
+              "were not scanned" in err and "huge" in err, err)
+        check("…while stdout stays valid JSON for the caller",
+              isinstance(json.loads(out), list), out[:120])
+
+
 def test_no_transcript_text_ever_reaches_stdout():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td) / "home"

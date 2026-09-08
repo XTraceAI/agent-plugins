@@ -93,8 +93,17 @@ def _matches_pr_file(edited: str, pr_files: dict[str, str]) -> str | None:
 
 
 def _tool_calls(records):
-    """(tool, input, result_text) triples, bounded."""
+    """``(tool, input, result_text, result_is_pr_metadata)`` tuples, bounded.
+
+    A result is paired back to the call that produced it (by ``tool_use_id``,
+    the way ``mine_sessions.py`` does) for one reason: a commit sha printed by
+    a command that was ASKING GitHub about the pull request is not evidence
+    that this session wrote it. The skill's own step 2 runs `gh pr view <n>
+    --json commits`, so without this the session running the scan finds the
+    PR's shas in its own transcript and ranks itself top on "proof".
+    """
     seen = 0
+    metadata_calls: dict[str, bool] = {}
     for record in records:
         if seen >= MAX_RECORDS:
             return
@@ -109,15 +118,27 @@ def _tool_calls(records):
             if seen >= MAX_RECORDS:
                 return
             if block.get("type") == "tool_use":
-                yield block.get("name") or "", block.get("input") or {}, ""
+                payload = block.get("input") or {}
+                name = block.get("name") or ""
+                call_id = block.get("id")
+                if isinstance(call_id, str):
+                    if len(metadata_calls) >= MAX_RECORDS:
+                        metadata_calls.clear()
+                    # `touches_github` is exactly the question: did this call
+                    # ask GitHub about a pull request? Its output is metadata.
+                    # `git log` and `git push` do NOT touch GitHub, so the shas
+                    # they print still count.
+                    metadata_calls[call_id] = pr_link.touches_github(name, payload)
+                yield name, payload, "", False
             elif block.get("type") == "tool_result":
+                is_metadata = metadata_calls.pop(block.get("tool_use_id"), False)
                 body = block.get("content")
                 if isinstance(body, str):
-                    yield "", {}, body[:MAX_TEXT_SCAN]
+                    yield "", {}, body[:MAX_TEXT_SCAN], is_metadata
                 elif isinstance(body, list):
                     text = " ".join(str(part.get("text", "")) for part in body
                                     if isinstance(part, dict))
-                    yield "", {}, text[:MAX_TEXT_SCAN]
+                    yield "", {}, text[:MAX_TEXT_SCAN], is_metadata
 
 
 def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) -> dict:
@@ -134,7 +155,7 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
         if hit and hit not in files:
             files.append(hit)
 
-    for tool, payload, result in _tool_calls(records):
+    for tool, payload, result, result_is_pr_metadata in _tool_calls(records):
         if tool in EDIT_TOOLS:
             note_path(payload.get("file_path"))
             for edit in (payload.get("edits") or []) if isinstance(payload.get("edits"), list) else []:
@@ -154,7 +175,8 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
                 name = match.group(1) or match.group(2) or match.group(3)
                 if name:
                     branches.add(name.strip())
-        if result and sha_prefixes:
+        # A sha the session was TOLD by GitHub is not a sha it produced.
+        if result and sha_prefixes and not result_is_pr_metadata:
             for match in _SHA_RX.finditer(result):
                 token = match.group(0)
                 if token[:7] in sha_prefixes and token not in hit_shas:
@@ -240,6 +262,7 @@ def main() -> int:
 
     hosts = list(readers.READERS) if args.host == "all" else [args.host]
     rows = []
+    skipped: list[str] = []
     for host in hosts:
         reader = readers.reader_for(host)
         if reader is None:
@@ -251,7 +274,14 @@ def main() -> int:
         for session in listed:
             path = session.get("path")
             try:
+                # The readers parse a whole transcript into memory, so a size
+                # guard is the only bound available here. It stays — but a
+                # session dropped by it is REPORTED rather than silently
+                # absent: the ones that blow the cap are long sessions, which
+                # are exactly the ones likely to have done the work.
                 if os.path.getsize(path) > MAX_BYTES:
+                    skipped.append(f"{host} {session.get('id')} "
+                                   f"({os.path.getsize(path) // (1024 * 1024)} MiB)")
                     continue
                 records, _meta = reader.to_canonical(path)
             except Exception:  # noqa: BLE001 — a corrupt session is skipped, never fatal
@@ -277,6 +307,12 @@ def main() -> int:
 
     rows.sort(key=lambda r: (-r["score"], -(r["mtime"] or 0)))
     print(json.dumps(rows[:args.max_candidates], indent=2))
+    if skipped:
+        # stderr, so the JSON contract on stdout is untouched — the skill
+        # reads this and tells the user what was NOT looked at.
+        print(f"note: {len(skipped)} session(s) larger than "
+              f"{MAX_BYTES // (1024 * 1024)} MiB were not scanned: "
+              + ", ".join(skipped[:10]), file=sys.stderr)
     return 0
 
 
