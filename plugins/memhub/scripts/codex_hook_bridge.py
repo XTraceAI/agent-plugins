@@ -26,6 +26,17 @@ _SHELL_TOOLS = {"Bash", "shell", "local_shell"}
 _GATE_TIMEOUT_S = 1
 _RECALL_TIMEOUT_S = 6
 _ARTIFACT_TIMEOUT_S = 7
+_PR_LINK_TIMEOUT_S = 15
+# A GitHub MCP server — the same coarse test the hook manifests use, so a tool
+# called `mcp__notes__github_summary` is not mistaken for a GitHub client while
+# a server whose name contains underscores (`github_enterprise`, or any
+# plugin-provided one) still dispatches. `pr_link.is_github_mcp_tool` is the
+# precise gate; this only decides whether the trigger runs at all.
+# Only the plugin-bundled manifest (hooks/codex-hooks.json) dispatches these;
+# the compatibility bridge in references/codex-hooks-bridge.json still lists
+# shell and edit tools only, because widening it costs the user a re-trust of
+# a file already in ~/.codex/hooks.json.
+_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
 
 
 def _version_key(path: Path) -> tuple:
@@ -112,6 +123,50 @@ def _directive(root: Path, payload: bytes, reactive: bool) -> None:
         _relay(result)
 
 
+# Claude's manifest keeps the PR-link check behind a shell `case` byte filter,
+# so an ordinary shell call never starts a python process. Codex multiplexes
+# ONE PostToolUse handler, so there is nowhere in the manifest to put that —
+# without this, every shell call paid a subprocess (measured: +16 ms wall,
+# +37 ms CPU, +5.5 MB RSS each, and +159 ms per batch at 8 concurrent calls).
+# `touches_github` reads only the tool name and the command, so filtering on
+# the command alone is both cheaper and more precise than Claude's whole-stdin
+# `case`. Measured cost: 0.2-0.9 us on a real command, 186 us on a
+# pathological 8 KB one.
+_PR_LINK_HINT = re.compile(r"(?i)\bgh\b|github|api/v3|repos/.{0,120}?pulls")
+_HINT_SCAN_CHARS = 8192
+
+
+def _may_touch_github(hook: dict) -> bool:
+    """Cheap pre-filter: could this shell call possibly address GitHub?
+
+    Fails OPEN on any shape it does not recognise — a missed detection is a
+    silently unlinked pull request, and this filter exists to save a process,
+    not to make decisions.
+    """
+    tool_input = hook.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return True
+    command = tool_input.get("command")
+    if command is None:
+        command = tool_input.get("cmd")
+    if isinstance(command, list):          # Codex `shell` passes an argv array
+        command = " ".join(part for part in command if isinstance(part, str))
+    if not isinstance(command, str):
+        return True
+    return bool(_PR_LINK_HINT.search(command[:_HINT_SCAN_CHARS]))
+
+
+def _pr_link_result(root: Path, payload: bytes) -> subprocess.CompletedProcess:
+    return _run(
+        root,
+        "pr_link_trigger.py",
+        payload,
+        "--host",
+        "codex",
+        timeout=_PR_LINK_TIMEOUT_S,
+    )
+
+
 def _artifact_sync_result(root: Path, payload: bytes) -> subprocess.CompletedProcess:
     return _run(
         root,
@@ -160,6 +215,10 @@ def _dispatch_post(root: Path, payload: bytes, hook: dict) -> None:
     jobs = [lambda: _directive_result(root, payload, reactive=True)]
     if tool in _EDIT_TOOLS:
         jobs.append(lambda: _artifact_sync_result(root, payload))
+    # The MCP branch needs no byte scan — the tool NAME is the filter.
+    if (tool in _SHELL_TOOLS and _may_touch_github(hook)) or (
+            isinstance(tool, str) and _GITHUB_MCP_RX.match(tool)):
+        jobs.append(lambda: _pr_link_result(root, payload))
     if tool in _SHELL_TOOLS:
         _fail_open_job(lambda: _detach_flush(root, payload, "PostToolUse"))
 

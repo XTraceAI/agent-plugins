@@ -79,7 +79,8 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 19   # + UserPromptSubmit (brain_brief.py prompt)
+    assert len(commands) == 20   # + UserPromptSubmit (brain_brief.py prompt),
+                                 # + PostToolUse (pr_link_trigger.py)
     assert all("claude_hook_guard.py" in command for _, command in commands)
     capture_events = [event for event, command in commands
                       if "claude_hook_guard.py\" capture " in command]

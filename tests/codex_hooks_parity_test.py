@@ -64,6 +64,42 @@ def test_bundled_hooks_require_only_three_approvals():
     print("PASS test_bundled_hooks_require_only_three_approvals")
 
 
+def test_the_pr_link_prefilter_spares_ordinary_shell_calls():
+    """Claude keeps the PR-link check behind a shell `case` byte filter, so an
+    ordinary shell call never starts a python process. Codex multiplexes ONE
+    PostToolUse handler, so the filter has to live in the bridge — without it
+    every shell call paid a subprocess (measured: +16 ms wall, +37 ms CPU,
+    +5.5 MB RSS each; +159 ms per batch at 8 concurrent calls).
+
+    It must fail OPEN on anything it does not recognise: a missed detection is
+    a silently unlinked pull request, and this exists to save a process, not
+    to make decisions.
+    """
+    sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+    import codex_hook_bridge  # noqa: PLC0415
+
+    spared = ["ls -la", "make test", "npm run build", "pytest -q",
+              "python3 -c 'print(1)'", "cargo build --release"]
+    caught = ["gh pr create --fill", "gh pr view 42", "GH_HOST=ghe.corp gh pr list",
+              "curl https://api.github.com/repos/o/r/pulls/7",
+              "curl https://ghe.corp/api/v3/repos/o/r/pulls",
+              "git push && gh pr create"]
+    for command in spared:
+        assert not codex_hook_bridge._may_touch_github({"tool_input": {"command": command}}), \
+            f"should have been spared: {command!r}"
+    for command in caught:
+        assert codex_hook_bridge._may_touch_github({"tool_input": {"command": command}}), \
+            f"should have been caught: {command!r}"
+    # Codex's `shell` tool passes an argv array, not a string.
+    assert codex_hook_bridge._may_touch_github(
+        {"tool_input": {"command": ["bash", "-lc", "gh pr view 42"]}})
+    # Fail open: no tool_input, a non-dict one, a non-string command.
+    for shape in ({}, {"tool_input": "nonsense"}, {"tool_input": {"command": 7}},
+                  {"tool_input": {}}):
+        assert codex_hook_bridge._may_touch_github(shape), f"must fail open: {shape!r}"
+    print("PASS test_the_pr_link_prefilter_spares_ordinary_shell_calls")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

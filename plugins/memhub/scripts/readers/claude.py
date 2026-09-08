@@ -53,6 +53,60 @@ def _meta_of(path: Path, records: list[dict]) -> dict:
     return {"session_id": path.stem, "cwd": cwd, "title": None, "host": HOST}
 
 
+# The current directory is what `capture.py current` matches on, so the LAST
+# record that names one wins: a session can `cd`, and where it ended is where
+# it is running. Bounded on both ends — a transcript can exceed a gigabyte.
+_CWD_TAIL_BYTES = 256 * 1024
+_CWD_MAX_RECORDS = 200
+
+
+def session_cwd(path) -> str | None:
+    """The directory this session is running in, or None.
+
+    Read from the top-level ``cwd`` key on transcript records, NOT from
+    ``f.parent.name``: that is the encoded project directory, which collapses
+    ``/`` to ``-`` and cannot be compared against a real path.
+    """
+    p = Path(path)
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as handle:
+            if size > _CWD_TAIL_BYTES:
+                handle.seek(size - _CWD_TAIL_BYTES)
+                handle.readline()          # drop a line the seek cut in half
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()[-_CWD_MAX_RECORDS:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cwd = record.get("cwd") if isinstance(record, dict) else None
+        if isinstance(cwd, str) and cwd:
+            return cwd
+    if size <= _CWD_TAIL_BYTES:
+        return None
+    # A tail of nothing but huge tool results: the first record carries a cwd
+    # too, and a session that never moved is the common case.
+    try:
+        with p.open("r", encoding="utf-8", errors="replace") as handle:
+            for _, line in zip(range(_CWD_MAX_RECORDS), handle):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = record.get("cwd") if isinstance(record, dict) else None
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
 def list_sessions(limit: int = 20) -> list[dict]:
     """Most recent sessions across every project, newest first."""
     files = sorted(_session_files(), key=lambda f: f.stat().st_mtime, reverse=True)

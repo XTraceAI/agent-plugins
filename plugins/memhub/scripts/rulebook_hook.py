@@ -41,10 +41,20 @@ stable, and this build behaves as it did — which is what lets one plugin serve
 a migrated and an unmigrated backend.
 
 How a fire reaches people (spec §5.3):
-  * The agent gets `additionalContext` — the rule text under an XTrace Rulebook
-    header — and the USER gets a `systemMessage` line per rule (`XTrace ▸ …`),
-    the one hook field the terminal renders. Without it a fire is invisible to
-    the person the rule was written for.
+  * Every fire is DISCLOSED, on both channels, in one shape:
+    `📏 Rule fired: <the rule, in 20 words or fewer>` — `⛔️` when a gate
+    actually stopped the call. The USER sees it as the first line of the
+    `systemMessage` stanza, above the detail line this hook has always shown
+    (`XTrace ▸ …`); the AGENT is told, in `additionalContext`, to echo the
+    byte-identical line at the top of its reply. Both are needed: the first is
+    deterministic but invisible to everything downstream, and the second is the
+    only copy that reaches the transcript session capture, a handoff or a PR
+    comment can read. One function (`disclosure_line`) builds both, because a
+    terminal showing one string while the agent says another would be worse
+    than either channel alone.
+  * The agent also gets the rule text under an XTrace Rulebook header, as
+    before. Without the `systemMessage` a fire is invisible to the person the
+    rule was written for.
   * `mode: gate` rules BLOCK: a pre-hook call matching a gate rule is denied
     (`permissionDecision: deny`) with the statement and the override its lane
     accepts. A Bash call takes `RULEBOOK_OVERRIDE='<why>' <command>`, which
@@ -2373,6 +2383,71 @@ def find_edit_override(body):
     return found
 
 
+# §3.2: one sentence, two symbols. `⛔️` keeps its existing meaning — this call
+# was STOPPED — and every other fire, including a gate someone overrode, takes
+# `📏`. The sentence is identical either way, so the shape is one recognisable
+# thing and the symbol is what says whether work was actually halted.
+DISCLOSE_ADVISORY = "📏"
+DISCLOSE_BLOCKED = "⛔️"
+DISCLOSE_PREFIX = "Rule fired: "
+_DESC_WORDS = 20
+_DESC_CHARS = 120
+# Backticks and asterisks are markup and are dropped; a code span's CONTENT is
+# what the reader wants. Underscores are NOT stripped: rule titles name files
+# and symbols far more often than they use underscore emphasis, and stripping
+# them turned "never edit `snake_case_name.py`" into "never edit
+# snakecasename.py" and `__init__.py` into `init.py` — a wrong statement, in
+# the terminal and in the transcript the agent echoes it into.
+_EMPHASIS_RX = re.compile(r"[*`]+")
+
+
+def disclosure_desc(rule):
+    """The rule in 20 words or fewer: its title, else its statement, else its
+    id. One line, never wrapped by us — the terminal and the transcript both
+    get exactly this."""
+    for key in ("_label", "text"):
+        raw = rule.get(key)
+        if isinstance(raw, str) and raw.strip():
+            break
+    else:
+        raw = str(rule.get("id") or "")
+    text = " ".join(_EMPHASIS_RX.sub("", raw).split())
+    words = text.split(" ")
+    clipped = len(words) > _DESC_WORDS
+    text = " ".join(words[:_DESC_WORDS])
+    if len(text) > _DESC_CHARS:
+        cut = text[:_DESC_CHARS].rsplit(" ", 1)[0] or text[:_DESC_CHARS]
+        text, clipped = cut, True
+    return (text + "…") if clipped and text else text
+
+
+def disclosure_line(rule, blocked=False):
+    """The line the user is shown AND the line the agent is told to echo.
+
+    ONE function for both on purpose (§3.4): the terminal showing one string
+    while the agent is told to say a different one would be worse than either
+    channel alone."""
+    marker = DISCLOSE_BLOCKED if blocked else DISCLOSE_ADVISORY
+    return f"{marker} {DISCLOSE_PREFIX}{disclosure_desc(rule)}"
+
+
+def disclosure_instruction(lines):
+    """What goes at the end of `additionalContext`, once per emitting call.
+
+    The `systemMessage` copy is deterministic but invisible to everything
+    downstream; this copy is the one that lands in the transcript, and so the
+    only one session capture, /memhub:rules-from-sessions, a handoff or a PR
+    comment can ever see. Neither alone is enough."""
+    quoted = "\n".join(lines)
+    return ("\n_Disclose these to the user. Begin your next reply with the following "
+            "line(s), verbatim and each on its own line, before anything else — including "
+            "before any tool call narration:_\n" + quoted +
+            "\n_This is how the team sees its rules working. Do not paraphrase, do not merge "
+            "them into a sentence, and do not omit one because it did not change what you were "
+            "going to do — a rule that fired and changed nothing is exactly the rule the team "
+            "needs to hear about._")
+
+
 def emit(event_name, text, *, user_line=None, deny=None):
     """One JSON document on stdout. `text` reaches the agent (additionalContext);
     `user_line` reaches the USER (systemMessage — the one field the terminal
@@ -2526,6 +2601,20 @@ def log_conversion(fire_id, how):
         pass
 
 
+# §2. A CONSTANT, not a template: no rule counts, no repo name, nothing that
+# changes between sessions, so a reader who has seen it once can skip it.
+# ~65 words / ~420 chars, charged to every session that has any rule, and
+# deliberately NOT counted against POSTURE_BUDGET_CHARS — that budget bounds
+# rule CONTENT, and this framing is what makes the content usable. Do not let
+# it past ~500 chars without deciding that trade again.
+SESSION_PREAMBLE = (
+    "These are your team's engineering rules — standing instructions from your teammates, "
+    "carrying the same weight as this repo's CLAUDE.md. Follow them as you would CLAUDE.md: "
+    "they are how this team works, not suggestions to weigh. When one fires, you MUST disclose "
+    "it to the user on its own line, exactly `📏 Rule fired: <the rule, in 20 words or fewer>`, "
+    "before anything else in that reply."
+)
+
 MAX_BOOKS_NAMED = 6       # session-start roster: bounded, like every other context spend
 ROSTER_MAX_CHARS = 1000   # …and bounded again in bytes, since it is not charged to the budget
 
@@ -2596,7 +2685,7 @@ def session_digest(rules, repo, gitdir, ctx):
         else:
             cut.append(r)
     active = [r for r in in_scope if r.get("on") != "session"]
-    lines = [f"## {BRAND} Rulebook (team rules — advisory)"]
+    lines = [f"## {DISCLOSE_ADVISORY} Rulebook (team rules — advisory)", SESSION_PREAMBLE]
     for r in posture:
         lines.append(f"- {r['text']}{_why(r)}")
     if active:
@@ -2621,6 +2710,18 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
         fetch_book(sys.argv[2])
+        return 0
+    if mode == "book-path":
+        # For /memhub:create-rule's live forward-test (§4.2), which arms a
+        # candidate by editing this exact file. It asks the hook where the book
+        # is rather than recomputing the hash: a second implementation of
+        # book_path in a skill would drift from the one the hook reads, and the
+        # test would then doctor a file nothing loads.
+        repo = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not repo.strip():
+            print("usage: rulebook_hook.py book-path <repo>", file=sys.stderr)
+            return 2
+        print(book_path(repo))
         return 0
     if mode == "flush":                # needs nothing from the event payload
         try:
@@ -2977,21 +3078,33 @@ def main():
                 else f" _(`{path}`, read by that command)_"
         return f" _(in `{path}`, written by that command)_"
 
+    # §3: every fire is disclosed, on BOTH channels. The disclosure line comes
+    # first and today's line is kept verbatim beneath it, indented — so nothing
+    # a user recognises is lost, and the brand stays off the line the agent is
+    # told to echo into the transcript.
+    disclosures = []
     for r in shown:
         label = r.get("_label") or r["id"]
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
+        blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
-            user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}")
+            detail_line = f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}"
         elif r["id"] in overridden:
             why = overridden[r["id"]]
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)} "
                          f"_(gate overridden: {why})_")
-            user_lines.append(f"{BRAND} ⚠ gate overridden — [{label}] {why}")
+            detail_line = f"{BRAND} ⚠ gate overridden — [{label}] {why}"
         else:
             lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
-            user_lines.append(f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}")
+            detail_line = f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}"
             deny_lines.append(f"[{label}] {r['text']}{detail}{_where(r)}")
+        # A gate that was overridden still FIRED and the call still ran, so it
+        # takes 📏; ⛔️ is reserved for a call that was actually stopped.
+        line = disclosure_line(r, blocked=blocked_here)
+        disclosures.append(line)
+        user_lines.append(line)
+        user_lines.append("   " + detail_line)
     deny = None
     if blocked:
         # Each lane names the override it actually accepts: an Edit tool call
@@ -3024,6 +3137,10 @@ def main():
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
                 + f"\nIf this is a legitimate exception, {how}.")
         lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")
+    # Last, so it is the instruction the agent reads on the way out — and after
+    # the override guidance, which is what it needs first when a gate stood.
+    if disclosures:
+        lines.append(disclosure_instruction(disclosures))
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines),
              user_line="\n".join(user_lines), deny=deny)
