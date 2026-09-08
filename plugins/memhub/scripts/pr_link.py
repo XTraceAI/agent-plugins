@@ -323,6 +323,25 @@ def _explicit_method(tokens: list[str], client: str = "curl") -> str | None:
         if not matched and (token.startswith("-X") and len(token) > 2
                             and not token.startswith("--")):        # -XPOST
             found = token[2:].upper()
+            matched = True
+        if not matched and (token.startswith("-") and not token.startswith("--")
+                            and len(token) > 2 and "X" in token[1:]):
+            # A BUNDLED short run can carry the method flag: `curl -sX GET`
+            # is `-s -X GET`, and `curl -sXPOST` is `-s -XPOST`. Reading only
+            # a token that STARTS with `-X` missed both, so an explicitly
+            # requested GET was invisible and a later `-d` was then read as a
+            # write (Codex review, PR #182).
+            #
+            # getopt semantics: everything after `X` in the run is its value
+            # if there is any, otherwise the NEXT token is.
+            cut = token.index("X", 1)
+            rest = token[cut + 1:]
+            if rest:
+                found, matched = rest.upper(), True
+            elif index + 1 < len(tokens):
+                found, matched = tokens[index + 1].upper(), True
+                index += 2
+                continue
         # Keep scanning: curl documents that when `-X/--request` is given
         # several times, the LAST one is used. Returning the first read
         # `-X POST -X GET` as a creation.
@@ -1146,6 +1165,11 @@ def is_github_mcp_create(tool_name: object) -> bool:
     return words[-1] in _PR_HEADS or words[-2:] in _PR_TAILS
 
 
+# `sh -c` / `bash -lc` and friends: the script is an ARGUMENT, so it has to be
+# unwrapped rather than joined.
+_SHELL_WRAPPERS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "busybox"})
+
+
 def _command_of(tool_name: object, tool_input: object) -> str:
     """The shell command this call carries, or ''.
 
@@ -1163,6 +1187,23 @@ def _command_of(tool_name: object, tool_input: object) -> str:
         value = tool_input.get(key)
         if isinstance(value, str):
             return value
+        if isinstance(value, list):
+            # Codex's `shell` tool passes an ARGV LIST, not a command string —
+            # `{"command": ["bash", "-lc", "gh pr create --fill"]}`. Accepting
+            # only strings made `touches_github` false for every Codex shell
+            # call, silently disabling PR linking on that host: the bridge
+            # joined the list for its prefilter and then forwarded the original
+            # payload here (Codex review, PR #182).
+            parts = [part for part in value if isinstance(part, str)]
+            if not parts:
+                return ""
+            # `sh -c <script>` carries the real command in ONE element; joining
+            # the list would put `gh` after `bash -lc`, which is not command
+            # position, so the detectors would still miss it.
+            if (len(parts) >= 3 and Path(parts[0]).name in _SHELL_WRAPPERS
+                    and parts[1].startswith("-") and "c" in parts[1]):
+                return parts[2]
+            return " ".join(parts)
     return ""
 
 
@@ -1194,13 +1235,18 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
 
     subs = _gh_pr_subcommands(command)
     if subs is None:
-        # Unparseable (ANSI-C quoting, say): the regex is all we have — but the
-        # dry-run guard must still apply, or `gh pr create --dry-run` with a
-        # quote shlex cannot read claims authorship of whatever PR its printed
-        # details happen to mention.
-        if _is_dry_run(command.split()):
-            return False
-        return bool(is_gh_pr_create(command))
+        # Unparseable (ANSI-C quoting, say). The regex alone cannot be checked
+        # against the ordering guard or the dry-run guard, so B1 — an
+        # authorship claim nobody can withdraw — is not available here. B2 is,
+        # and the model judges.
+        #
+        # This used to be the ONLY path B1 ever took, because a heredoc body
+        # made every real `gh pr create` unparseable; the guards were being
+        # skipped on 20 of 20 real fires. Now that `_tokens` strips heredoc
+        # bodies first, the parsed path handles them and this branch is reached
+        # by nothing in a 15,287-call sample — so closing it costs nothing
+        # measurable and shuts the last unguarded route to B1.
+        return False
     producing = len(subs) + len(_api_matches(command))
     if producing != 1:
         return False
@@ -1309,7 +1355,7 @@ def _gh_reported_pr_url(tool_response: object) -> str | None:
     found: list[str] = []
     for text in texts:
         for line in text[:pr_provenance.MAX_RESULT_TEXT_BYTES].splitlines():
-            match = _GH_REPORTED_LINE.match(line.strip())
+            match = _gh_reported_match(line.strip())
             if match is None:
                 continue
             host, owner, repo, number = match.group("host"), match.group("owner"), \
@@ -1322,13 +1368,34 @@ def _gh_reported_pr_url(tool_response: object) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
-# gh prints the URL it is reporting either alone on a line (`gh pr create`,
-# `gh pr view --json url -q .url`) or as a `key:\tvalue` field (`gh pr view`'s
-# default table). Prose cites a URL mid-sentence, and that is the difference.
-_GH_REPORTED_LINE = re.compile(
-    r"^(?:[\w.-]+:\s*)?"
+# The exact shapes gh REPORTS a pull-request URL in, and no others.
+#
+# An earlier version allowed any `<word>:` prefix, which let a body whose one
+# line reads `Related: https://github.com/evil/repo/pull/777` pass as gh
+# metadata — `gh pr view N --json body -q .body` prints exactly that (Codex
+# review, PR #182). The key is now gh's actual field name, `url`.
+_PR_URL_PART = (
     r"https?://(?P<host>[\w.-]+)/(?P<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})"
-    r"/(?P<repo>[A-Za-z0-9_.-]{1,100})/pull/(?P<number>[1-9][0-9]*)/?$")
+    r"/(?P<repo>[A-Za-z0-9_.-]{1,100})/pull/(?P<number>[1-9][0-9]*)/?")
+_GH_REPORTED_FORMS = (
+    # `gh pr create`, and `gh pr view --json url -q .url`: the URL alone.
+    re.compile(r"^" + _PR_URL_PART + r"$"),
+    # `gh pr view`'s default table: `url:\thttps://…`.
+    re.compile(r"^url:\s*" + _PR_URL_PART + r"$"),
+    # `gh pr view 7 --json url` with no `--jq`: `{"url":"https://…"}`, and the
+    # multi-field form `{"title":"X","url":"https://…"}`. Anchored on a line
+    # that IS a JSON object, so prose containing a URL cannot reach it.
+    re.compile(r'^\{.*"url"\s*:\s*"' + _PR_URL_PART + r'"'),
+)
+
+
+def _gh_reported_match(line: str):
+    """The first reported-URL form this line is, or None."""
+    for form in _GH_REPORTED_FORMS:
+        match = form.match(line)
+        if match is not None:
+            return match
+    return None
 
 _HTML_URL_RE = re.compile(
     r'"html_url"\s*:\s*"(https://([\w.-]+)/[A-Za-z0-9][A-Za-z0-9-]{0,38}'

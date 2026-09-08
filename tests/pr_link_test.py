@@ -777,8 +777,13 @@ def test_gh_inherited_flags_and_dry_run():
     check("the command really is unparseable", pr_link._tokens(unparseable) is None)
     check("…and --dry-run is still not a creation",
           not pr_link.creates_pr("Bash", {"command": unparseable}))
-    check("…while an unparseable real create still is",
-          pr_link.creates_pr("Bash", {"command": "gh pr create --fill --body $'can\\'t x'"}))
+    # An unparseable REAL create is no longer a creation either. The guards
+    # live behind the tokeniser, so a command shlex cannot read cannot be
+    # checked by them, and B1 is an authorship claim nobody can withdraw
+    # (Codex review, PR #182). It falls to B2, where the model judges.
+    check("…and an unparseable real create is limited to B2 as well",
+          not pr_link.creates_pr("Bash", {"command": "gh pr create --fill --body $'can\\'t x'"})
+          and pr_link.touches_github("Bash", {"command": "gh pr create --fill --body $'can\\'t x'"}))
     check("…while a real create is unaffected",
           pr_link.creates_pr("Bash", {"command": "gh pr create --fill"}))
 
@@ -1256,6 +1261,92 @@ def test_a_heredoc_create_is_GUARDED_not_waved_through():
           and not pr_link.creates_pr("Bash", {"command": piped}))
     check("…and it still counts as addressing GitHub, so B2 gets it",
           pr_link.touches_github("Bash", {"command": piped}))
+
+
+def test_a_codex_argv_command_is_read_like_a_command_string():
+    """Codex's `shell` tool passes an ARGV LIST, not a string.
+
+    Accepting only strings made `touches_github` false for every Codex shell
+    call, silently disabling PR linking on that host — the bridge joined the
+    list for its prefilter and then forwarded the original payload
+    (Codex review, PR #182).
+    """
+    argv = {"command": ["bash", "-lc", "gh pr create --fill"]}
+    check("an argv create is a create", pr_link.creates_pr("shell", argv)
+          and pr_link.touches_github("shell", argv))
+    check("`sh -c` is unwrapped, not joined — `gh` must be at command position",
+          pr_link._command_of("shell", argv) == "gh pr create --fill",
+          repr(pr_link._command_of("shell", argv)))
+    check("a plain argv list is joined",
+          pr_link._command_of("shell", {"command": ["gh", "pr", "view", "42"]})
+          == "gh pr view 42")
+    check("an argv list with no GitHub in it stays quiet",
+          not pr_link.touches_github("shell", {"command": ["bash", "-lc", "ls -la"]}))
+    for junk in ({"command": []}, {"command": [1, 2]}, {"command": None}):
+        check(f"a malformed argv is not a command: {junk!r}",
+              pr_link._command_of("shell", junk) == "")
+
+
+def test_only_ghs_own_url_field_counts_as_metadata():
+    """The keyed form must be gh's actual field, not any word.
+
+    Allowing `<word>:` let a body whose one line reads
+    `Related: https://github.com/evil/repo/pull/777` pass as gh metadata, which
+    is exactly what `gh pr view N --json body -q .body` prints. And the
+    unfiltered `gh pr view 7 --json url` form — a JSON object — has to be
+    recognised without reopening that door (Codex review, PR #182).
+    """
+    def reported(text):
+        return pr_link._gh_reported_pr_url({"stdout": text, "stderr": ""})
+
+    PR = "https://github.com/o/r/pull/7"
+    for text, want in (
+        (PR, PR),                                     # gh pr create
+        (f"url:\t{PR}", PR),                          # gh pr view's table
+        ('{"url":"%s"}' % PR, PR),                    # --json url
+        ('{"title":"X","url":"%s"}' % PR, PR),        # --json title,url
+        (f"Related: {PR}", None),                     # a body's own prose
+        (f"See: {PR}", None),
+        (f"supersedes {PR} entirely", None),
+        (f"- {PR}", None),                            # a markdown bullet
+    ):
+        got = reported(text)
+        check(f"reported? {text[:44]!r}", got == want, repr(got))
+
+
+def test_an_unparseable_command_is_limited_to_B2():
+    """B1 is an authorship claim nobody can withdraw, and a command shlex
+    cannot read can be checked against neither the ordering guard nor the
+    dry-run guard (Codex review, PR #182).
+
+    This branch used to be the ONLY route B1 ever took, because a heredoc body
+    made every real `gh pr create` unparseable — 20 of 20 fires skipped the
+    guards. With heredoc bodies stripped before tokenising, the parsed path
+    handles them and nothing in a 15,287-call sample reaches here.
+    """
+    broken = "gh pr create --title 'x"
+    check("an unparseable create does not self-link",
+          pr_link._tokens(broken) is None
+          and not pr_link.creates_pr("Bash", {"command": broken}))
+    check("…but it still addresses GitHub, so B2 gets it",
+          pr_link.touches_github("Bash", {"command": broken}))
+
+
+def test_a_bundled_short_run_can_carry_the_method_flag():
+    """`curl -sX GET` is `-s -X GET`. Reading only a token that STARTS with
+    `-X` missed it, so an explicitly requested GET was invisible and a later
+    `-d` was then read as a write (Codex review, PR #182)."""
+    for command, want in (
+        ("curl -sX GET https://api.github.com/repos/o/r/pulls -d @b", False),
+        ("curl -sXPOST https://api.github.com/repos/o/r/pulls -d @b", True),
+        ("curl -X POST https://api.github.com/repos/o/r/pulls -d @b", True),
+        ("curl -s https://api.github.com/repos/o/r/pulls -d @b", True),
+        ("curl -sL https://api.github.com/repos/o/r/pulls", False),
+        # A header whose VALUE looks like a method is data, not a method.
+        ("curl -H '-XPOST' https://api.github.com/repos/o/r/pulls", False),
+    ):
+        got = pr_link.github_api_call(command)[1]
+        check(f"method read from a bundled run: {command[:46]!r}", got == want, repr(got))
 
 
 def test_a_here_string_is_not_a_heredoc_opener():

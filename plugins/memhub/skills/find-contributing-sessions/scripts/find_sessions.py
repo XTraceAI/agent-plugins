@@ -76,7 +76,35 @@ _SHA_DISPLAYING = re.compile(
     r"blame|shortlog|whatchanged|bisect|branch|tag|status|merge-base|"
     r"merge-tree|name-rev|for-each-ref)(?![-\w])", re.I)
 _APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
-_GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
+# `git add` / `git commit` found by TOKENS, not by a regex anchored on `git`
+# at command position. That regex missed `git -C /repo add README.md`,
+# `env FOO=1 git add …` and `sudo git commit -- …` — all of which agents write
+# — so the files those commands touched scored no evidence at all (Codex
+# review, PR #182). `_git_branches` already walks tokens this way; this reuses
+# the same wrapper handling so the two cannot disagree about what "a git
+# command" is.
+_GIT_PATH_SUBCOMMANDS = frozenset({"add", "commit"})
+
+
+def _git_path_arguments(command: str) -> list[str]:
+    """The argument text of every `git add` / `git commit` in this command."""
+    found: list[str] = []
+    for segment in re.split(r"[;&|]+", command):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+        tokens = _after_wrappers(tokens)
+        if len(tokens) < 2 or _basename(tokens[0]) != "git":
+            continue
+        rest = tokens[1:]
+        while rest and rest[0].startswith("-"):     # `git -C dir add …`
+            rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
+        if not rest or rest[0] not in _GIT_PATH_SUBCOMMANDS:
+            continue
+        found.append(shlex.join(rest[1:]) if hasattr(shlex, "join")
+                     else " ".join(rest[1:]))
+    return found
 # Flags whose VALUE is a separate word. `git commit -m "docs: update
 # README.md"` was handing every word of the message to the path matcher, so a
 # session that committed unrelated work scored file evidence for a PR file it
@@ -208,22 +236,29 @@ def _git_branches(command: str) -> list[str]:
             token = rest[index]
             if token == "--":
                 break
+            # A create flag NAMES the branch, and what follows it is the
+            # START POINT, not a second branch: `git switch -c review-copy
+            # feat/x` puts the session on `review-copy` and reads `feat/x`.
+            # Recording both scored a session for a branch it only branched
+            # FROM (Codex review, PR #182) — so stop this segment once the
+            # created branch is known.
             if token.startswith("--") and "=" in token:
                 flag, _, value = token.partition("=")
                 if flag in _BRANCH_CREATE_FLAGS and value:
                     found.append(value)
+                    break
                 index += 1
                 continue
             if token in _BRANCH_VALUE_FLAGS:
                 if index + 1 < len(rest) and token in _BRANCH_CREATE_FLAGS:
                     found.append(rest[index + 1])
+                    break
                 index += 2
                 continue
             if (token.startswith("-") and not token.startswith("--")
                     and len(token) > 2 and token[:2] in _BRANCH_CREATE_FLAGS):
                 found.append(token[2:])             # `-cfeat/x`
-                index += 1
-                continue
+                break
             if token.startswith("-"):
                 index += 1
                 continue
@@ -232,95 +267,6 @@ def _git_branches(command: str) -> list[str]:
     return [b for b in found if b]
 
 
-_SHA_RX = re.compile(r"\b[0-9a-f]{7,40}\b")
-# A sha is "proof" only when the command that printed it MADE the commit.
-# `git log`, `git show`, `git diff` and `gh pr view` all display history that
-# any session in the repo can see, so a reviewer who reads the branch scores
-# the highest-value signal for code they only looked at. An allowlist rather
-# than a denylist: the default for an unrecognised command is "not proof",
-# because the cost of a wrong author is worse than the cost of a missed one —
-# and a real author still scores on files (2 each) and branch (3).
-# `push` is deliberately NOT here. A push prints an `old..new` range for
-# commits that already existed — often made in an earlier session — so a
-# session that only pushed someone else's work scored the top signal plus the
-# branch match and was recommended for linking. `apply` and `stash` are out for
-# the same reason: neither creates the pull request's commits.
-_COMMIT_PRODUCING = re.compile(
-    r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
-    r"git\b(?:\s+-[cC]\s+\S+)*\s+"
-    # `(?![-\w])`, not `\b`: a word boundary also sits before a hyphen, so
-    # `\bmerge\b` matched `git merge-base` — a read-only query that prints an
-    # existing common-ancestor sha, scored as top-value authorship proof.
-    r"(?:commit|cherry-pick|revert|merge|rebase|am)(?![-\w])", re.I)
-# Anything that PRINTS shas it did not create. One Bash call is often a chain
-# and its result is the combined output, so `git commit -m x && git log` would
-# otherwise credit this session with every sha in the log. There is no way to
-# split one stdout back into its commands, so a command that both creates and
-# displays declines rather than guesses — `git add -A && git commit` still
-# counts, because `git add` prints no shas.
-_SHA_DISPLAYING = re.compile(
-    r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
-    r"git\b(?:\s+-[cC]\s+\S+)*\s+"
-    r"(?:log|show|rev-parse|rev-list|reflog|describe|cherry|ls-remote|diff|"
-    r"blame|shortlog|whatchanged|bisect|branch|tag|status|merge-base|"
-    r"merge-tree|name-rev|for-each-ref)(?![-\w])", re.I)
-_APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
-_GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
-# Flags whose VALUE is a separate word. `git commit -m "docs: update
-# README.md"` was handing every word of the message to the path matcher, so a
-# session that committed unrelated work scored file evidence for a PR file it
-# had never touched — and with branch and window points could outrank a real
-# contributor, or push one off the capped list.
-_GIT_VALUE_FLAGS = frozenset({
-    "-m", "--message", "-F", "--file", "-C", "--reuse-message",
-    "-c", "--reedit-message", "--author", "--date", "--squash", "--fixup",
-    "--pathspec-from-file", "--gpg-sign", "-S", "--cleanup", "--trailer"})
-# The same letters, for BUNDLED runs: `git commit -am "msg"` is `-a -m msg`,
-# and an exact-token test left the message to be read as a pathspec.
-_GIT_VALUE_SHORT = frozenset("mFCcSt")
-
-
-def _git_consumes_operand(token: str) -> bool:
-    if token in _GIT_VALUE_FLAGS:
-        return True
-    if token.startswith("--") or not token.startswith("-") or token == "-":
-        return False
-    # getopt: the first value-taking letter consumes the rest of the token if
-    # there is any, otherwise the next token.
-    for position, char in enumerate(token[1:], start=1):
-        if char in _GIT_VALUE_SHORT:
-            return position == len(token) - 1
-    return False
-
-
-def _git_pathspecs(argument_text: str) -> list[str]:
-    """The PATHSPEC operands of a `git add` / `git commit`, and nothing else.
-
-    Tokenised with `shlex` so a quoted commit message is one word rather than
-    several, then walked so a flag's operand is consumed with it.
-    """
-    try:
-        tokens = shlex.split(argument_text, posix=True)
-    except ValueError:
-        return []
-    paths: list[str] = []
-    index, only_paths = 0, False
-    while index < len(tokens):
-        token = tokens[index]
-        if only_paths:
-            paths.append(token)
-            index += 1
-            continue
-        if token == "--":                     # everything after is a pathspec
-            only_paths = True
-            index += 1
-            continue
-        if token.startswith("-"):
-            index += 2 if ("=" not in token and _git_consumes_operand(token)) else 1
-            continue
-        paths.append(token)
-        index += 1
-    return paths
 # `-b`/`-B` create a branch with `checkout`; `switch` spells the same thing
 # `-c`/`-C` (`--create`/`--force-create`). Codex and Cursor sessions have no
 # top-level `gitBranch` to fall back on, so missing `switch -c` cost them the
@@ -511,8 +457,8 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
         command = payload.get("command") or payload.get("cmd") or ""
         if isinstance(command, str) and command:
             command = command[:MAX_TEXT_SCAN]
-            for match in _GIT_PATHS.finditer(command):
-                for token in _git_pathspecs(match.group(1)):
+            for argument_text in _git_path_arguments(command):
+                for token in _git_pathspecs(argument_text):
                     note_path(token)
             for name in _git_branches(command):
                 branches.add(name.strip())

@@ -32,6 +32,15 @@ SCRIPTS = ROOT / "plugins" / "memhub" / "scripts"
 # If this sentence ever reaches stdout, the script is echoing transcript text.
 PROSE = "Zebras drafted the quarterly onboarding memorandum unaided."
 
+# The rest of this suite drives the script as a subprocess. Two checks below
+# need its command parsers directly, so load the module by path — it is not on
+# sys.path and its directory name has a hyphen, so it cannot be imported.
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location("find_sessions", SCRIPT)
+find_sessions = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(find_sessions)
+
 failures: list[str] = []
 
 
@@ -447,6 +456,43 @@ def test_bad_input_is_a_clean_error():
                  "MEMHUB_PLUGIN_SCRIPTS": str(SCRIPTS)})
         check("a missing file list → exit 2, no traceback",
               proc.returncode == 2 and "Traceback" not in proc.stderr, proc.stderr)
+
+
+def test_a_create_flags_branch_is_the_branch_not_its_start_point():
+    """`git switch -c review-copy feat/x` puts the session on `review-copy`
+    and READS `feat/x`. Recording both scored a session for a branch it only
+    branched from (Codex review, PR #182)."""
+    for command, want in (
+        ("git switch -c review-copy feat/x", ["review-copy"]),
+        ("git checkout -b feat/y main", ["feat/y"]),
+        ("git switch --create=feat/z origin/main", ["feat/z"]),
+        ("git checkout -bfeat/w main", ["feat/w"]),
+        ("git switch feat/plain", ["feat/plain"]),
+    ):
+        got = find_sessions._git_branches(command)
+        check(f"branch from {command[:40]!r}", got == want, repr(got))
+
+
+def test_git_add_and_commit_are_found_by_tokens_not_at_command_position():
+    """A regex anchored on `git` at command position missed the wrapper forms
+    agents write constantly, so the files those commands touched scored no
+    evidence at all (Codex review, PR #182)."""
+    for command in ("git add README.md",
+                    "git -C /repo add README.md",
+                    "env FOO=1 git add README.md",
+                    "sudo git commit -- README.md",
+                    "cd /repo && git add README.md"):
+        args = find_sessions._git_path_arguments(command)
+        paths = [pth for text in args for pth in find_sessions._git_pathspecs(text)]
+        check(f"README.md found in {command[:42]!r}", "README.md" in paths,
+              repr((args, paths)))
+    check("a commit MESSAGE is still not a pathspec",
+          "README.md" not in [
+              pth for text in find_sessions._git_path_arguments(
+                  "git commit -m 'docs: update README.md' src/a.py")
+              for pth in find_sessions._git_pathspecs(text)])
+    check("a non-path git subcommand is not collected",
+          find_sessions._git_path_arguments("git log --oneline") == [])
 
 
 if __name__ == "__main__":
