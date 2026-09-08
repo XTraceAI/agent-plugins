@@ -461,6 +461,12 @@ def _tool_calls(records):
                 # Default False: a result whose call was not a commit-producing
                 # git operation contributes no sha evidence at all.
                 is_proof = sha_bearing.pop(block.get("tool_use_id"), False)
+                # …and a commit-producing command that FAILED created nothing.
+                # `git cherry-pick <pr-sha>` answering `fatal: bad object
+                # <pr-sha>` echoes the sha straight back, so a reviewer who ran
+                # it scored five proof points for a commit that never existed.
+                if block.get("is_error") is True or block.get("isError") is True:
+                    is_proof = False
                 body = block.get("content")
                 if isinstance(body, str):
                     yield "", {}, body[:MAX_TEXT_SCAN], is_proof

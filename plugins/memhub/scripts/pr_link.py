@@ -80,7 +80,13 @@ _API_URL = re.compile(
     re.I,
 )
 # `gh api` takes a bare path instead of a URL.
-_API_PATH = re.compile(r"^/?repos/[\w.-]+/[\w.-]+/pulls(?:/(\d+))?(?:/.*)?$")
+# `gh api --help` documents `{owner}`/`{repo}` placeholders, and a query
+# string is the documented way to filter — `repos/o/r/pulls?state=open`.
+# Rejecting both meant a PR opened through the placeholder form got no context
+# at all.
+_API_PATH = re.compile(
+    r"^/?repos/(?:[\w.-]+|\{[\w.-]+\})/(?:[\w.-]+|\{[\w.-]+\})"
+    r"/pulls(?:/(\d+))?(?:[/?].*)?$")
 # `gh pr new` is a documented alias of `gh pr create`.
 _GH_CREATE_SUBS = frozenset({"create", "new"})
 _HTTP_CLIENTS = frozenset({"curl", "wget", "http", "https", "xh", "xhs"})
@@ -212,7 +218,23 @@ _VALUE_LONG_OPTS = frozenset({
 # Short options known to take NO operand, across the clients we accept. Like
 # the long list below, this exists to keep the common cases working — the
 # DEFAULT is what provides the safety.
-_NO_OPERAND_SHORT = frozenset("sSfLkvViIgG#OJNqn46lRpBjMr")
+# Per CLIENT, because the same letter means different things: `-O` is curl's
+# boolean --remote-name and wget's value-taking --output-document, and `-p` is
+# curl's --proxytunnel but gh's --preview <strings>. One shared set meant a
+# read-only option's operand was re-read as `-XPOST` in whichever client
+# disagreed with curl. Each set is deliberately SMALL — the default for
+# anything absent is "consumes an operand", which can only cost a link.
+_NO_OPERAND_SHORT = {
+    "curl": frozenset("sSfLkvViIgG#OJNq46lBM0123pn"),
+    "wget": frozenset("qvdcNSxrmkbE"),
+    "gh": frozenset("i"),
+    "gh.exe": frozenset("i"),
+    "http": frozenset("hv"),
+    "https": frozenset("hv"),
+    "xh": frozenset("hv"),
+    "xhs": frozenset("hv"),
+}
+_NO_OPERAND_SHORT_DEFAULT = frozenset()
 # Options known to take NO operand. This list exists to make the DEFAULT below
 # safe rather than to be exhaustive.
 _NO_OPERAND_LONG = frozenset({
@@ -234,7 +256,7 @@ _NO_OPERAND_LONG = frozenset({
     "--ignore-stdin", "--follow", "--offline", "--print-body"})
 
 
-def _consumes_operand(token: str) -> bool:
+def _consumes_operand(token: str, client: str = "curl") -> bool:
     """Does this option take the NEXT token as its value?
 
     The DEFAULT for an unrecognised option is YES, and that inversion is the
@@ -268,10 +290,11 @@ def _consumes_operand(token: str) -> bool:
     # operands were re-read as `-XPOST`. A run made ENTIRELY of characters
     # known to take no operand is trusted; anything else is assumed to consume
     # one, which can only cost a link, never manufacture a claim.
-    return not all(char in _NO_OPERAND_SHORT for char in token[1:])
+    booleans = _NO_OPERAND_SHORT.get(client, _NO_OPERAND_SHORT_DEFAULT)
+    return not all(char in booleans for char in token[1:])
 
 
-def _explicit_method(tokens: list[str]) -> str | None:
+def _explicit_method(tokens: list[str], client: str = "curl") -> str | None:
     """The method the command NAMES, in any spelling, or None.
 
     Walked with operand consumption: an option's argument is skipped rather
@@ -296,7 +319,7 @@ def _explicit_method(tokens: list[str]) -> str | None:
         # Keep scanning: curl documents that when `-X/--request` is given
         # several times, the LAST one is used. Returning the first read
         # `-X POST -X GET` as a creation.
-        index += 2 if _consumes_operand(token) else 1
+        index += 2 if _consumes_operand(token, client) else 1
     return found
 
 # The SERVER segment must name GitHub — `mcp__<server>__<tool>`. Matching
@@ -523,10 +546,10 @@ def _curl_short_run_has(token: str, wanted: str) -> bool:
 
 def _curl_forces_get(segment: list[str]) -> bool:
     return any(t == "--get" or _curl_short_run_has(t, _CURL_GET_OPT)
-               for t in _options_of(segment))
+               for t in _options_of(segment, "curl"))
 
 
-def _options_of(args: list[str]):
+def _options_of(args: list[str], client: str = "curl"):
     """The tokens that are OPTIONS, skipping every option's operand.
 
     Every flag question in this module asks it of this walk rather than of the
@@ -540,11 +563,11 @@ def _options_of(args: list[str]):
         token = args[index]
         if token.startswith("-") and token != "-":
             yield token
-        index += 2 if _consumes_operand(token) else 1
+        index += 2 if _consumes_operand(token, client) else 1
 
 
 def _curl_posts(segment: list[str]) -> bool:
-    for token in _options_of(segment):
+    for token in _options_of(segment, "curl"):
         if token in _CURL_DATA_FLAGS or token.startswith("--data"):
             return True
         if _curl_short_run_posts(token):
@@ -554,7 +577,7 @@ def _curl_posts(segment: list[str]) -> bool:
 
 def _wget_posts(segment: list[str]) -> bool:
     return any(t == f or t.startswith(f + "=")
-               for t in _options_of(segment) for f in _WGET_POST_FLAGS)
+               for t in _options_of(segment, "wget") for f in _WGET_POST_FLAGS)
 
 
 # HTTPie/xh default to GET with no request data and POST with some. Only BODY
@@ -678,6 +701,23 @@ def _gh_subcommand_after(args: list[str], start: int) -> str:
     return ""
 
 
+_GH_HOST_VARS = ("GH_HOST", "GITHUB_HOST")
+
+
+def _env_host(segment: list[str]) -> str | None:
+    """`GH_HOST=ghe.corp gh pr create` — `gh help environment` defines it as
+    the hostname for commands that name no other."""
+    for token in segment:
+        if not _ASSIGN_TOKEN.match(token):
+            break
+        name, _, value = token.partition("=")
+        if name in _GH_HOST_VARS and value:
+            host = value.casefold()
+            if host not in ("github.com", "api.github.com"):
+                return host
+    return None
+
+
 def _gh_repo_host(args: list[str]) -> str | None:
     """The host from `gh -R [HOST/]OWNER/REPO`, when one is given.
 
@@ -799,12 +839,12 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
     # documented LISTING that carries `-f`. Reading it as a write made
     # `creates_pr` true, and B1 then told a session that had only listed pull
     # requests to record a confirmed self-link on one.
-    method = _explicit_method(args)
+    method = _explicit_method(args, name)
     if method is None and name in _HTTPIE_CLIENTS:
         method = _positional_method(args)
     if method is not None:
         write = method == "POST"
-    elif is_gh_api and any(_is_gh_field_flag(t) for t in _options_of(args)):
+    elif is_gh_api and any(_is_gh_field_flag(t) for t in _options_of(args, "gh")):
         write = True
     elif name in _HTTPIE_CLIENTS and _httpie_posts(args):
         write = True
@@ -893,7 +933,7 @@ def github_api_host(command: object) -> str | None:
     for segment in _segments(tokens):
         name, args = _command_name(segment)
         if name in ("gh", "gh.exe") and "pr" in args:
-            found = _gh_repo_host(args)
+            found = _gh_repo_host(args) or _env_host(segment)
             if found:
                 return found
     return None

@@ -297,6 +297,20 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", False),
         ("curl -H 'X-Y: z' -d '{}' https://api.github.com/repos/o/r/pulls",
          "pulls_collection", True),
+        # Operand rules are PER CLIENT: `-O` is curl's boolean --remote-name
+        # but wget's value-taking --output-document, and `-p` is curl's
+        # --proxytunnel but gh's --preview <strings> (Codex review, PR #182).
+        ("wget -O '-XPOST' 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("gh api -p '-XPOST' repos/o/r/pulls", "pulls_collection", False),
+        # …and for curl, `-O` really does leave `-XPOST` as a method flag,
+        # which is the same distinction seen from the other side.
+        ("curl -O -XPOST https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
+        # `gh api --help` documents {owner}/{repo} placeholders and a query
+        # string; rejecting both meant no context at all for those forms.
+        ("gh api repos/{owner}/{repo}/pulls -f title=x", "pulls_collection", True),
+        ("gh api repos/o/r/pulls?state=open", "pulls_collection", False),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -677,6 +691,12 @@ def test_an_enterprise_gh_pr_create_recovers_its_host():
           pr_link.github_api_host("gh --repo=ghe.corp/o/r pr create") == "ghe.corp")
     check("a two-segment -R names no host",
           pr_link.github_api_host("gh -R o/r pr create --fill") is None)
+    # `gh help environment`: GH_HOST is the hostname for commands that name no
+    # other, and it is the ordinary way to point gh at GHES.
+    check("GH_HOST names the host",
+          pr_link.github_api_host("GH_HOST=ghe.corp gh pr create --fill") == "ghe.corp")
+    check("…but GH_HOST=github.com is not an enterprise host",
+          pr_link.github_api_host("GH_HOST=github.com gh pr create --fill") is None)
     got = pr_link.context_for_call(
         "Bash", {"command": "gh -R ghe.corp/o/r pr create --fill"},
         {"stdout": "https://ghe.corp/o/r/pull/7\n", "stderr": "", "exit_code": 0},

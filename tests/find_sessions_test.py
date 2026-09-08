@@ -54,7 +54,8 @@ def _record(uuid: str, branch: str | None, cwd: str, blocks: list) -> dict:
 def claude_session(home: Path, sid: str, cwd: str, *, branch: str | None,
                    edits: list[str] = (), commands: list[str] = (),
                    results: list[str] = (), age_s: float = 0.0,
-                   path_key: str = "file_path", tool: str = "Edit") -> Path:
+                   path_key: str = "file_path", tool: str = "Edit",
+                   result_is_error: bool = False) -> Path:
     project = home / ".claude" / "projects" / cwd.replace("/", "-")
     project.mkdir(parents=True, exist_ok=True)
     rows = [_record(f"{sid}-0", branch, cwd, [{"type": "text", "text": PROSE}])]
@@ -70,11 +71,12 @@ def claude_session(home: Path, sid: str, cwd: str, *, branch: str | None,
             "input": {"command": command}}]))
         n += 1
     for text in results:
+        block = {"type": "tool_result", "tool_use_id": "t1", "content": text}
+        if result_is_error:
+            block["is_error"] = True
         rows.append({"type": "user", "uuid": f"{sid}-{n}", "cwd": cwd,
                      "timestamp": "2026-09-01T10:00:00Z",
-                     "message": {"role": "user", "content": [{
-                         "type": "tool_result", "tool_use_id": "t1",
-                         "content": text}]}})
+                     "message": {"role": "user", "content": [block]}})
         n += 1
     path = project / f"{sid}.jsonl"
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
@@ -297,6 +299,12 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
         # with a commit-producing subcommand: `\bmerge\b` matched `merge-base`.
         claude_session(home, "ancestor", wt, branch="unrelated",
                        commands=["git merge-base main HEAD"], results=[sha])
+        # …nor one whose commit-producing command failed: `git cherry-pick
+        # <pr-sha>` answering `fatal: bad object <pr-sha>` echoes the sha back.
+        claude_session(home, "failer", wt, branch="unrelated",
+                       commands=[f"git cherry-pick {sha}"],
+                       results=[f"fatal: bad object {sha}"],
+                       result_is_error=True)
         rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--sha", sha,
                            "--host", "claude")
         ids = [r["conversation_id"] for r in json.loads(out)]
@@ -310,6 +318,8 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
               "mixed" not in ids, out)
         check("…nor one that only ran `git merge-base`",
               "ancestor" not in ids, out)
+        check("…nor one whose commit-producing command FAILED",
+              "failer" not in ids, out)
         check("…while the session that made the commit still counts",
               "author" in ids, out)
 
