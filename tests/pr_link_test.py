@@ -343,6 +343,14 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("xh POST https://api.github.com/repos/o/r/pulls title=x",
          "pulls_collection", True),
         ("http GET https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # HTTPie's method and body items are OPERANDS: `--session POST` names a
+        # session, and `--session ./foo=bar` a path (Codex review, PR #182).
+        ("http --session POST https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("http --session ./foo=bar https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("http --session mine POST https://api.github.com/repos/o/r/pulls t=x",
+         "pulls_collection", True),
         # HTTPie/xh default to GET with no data and POST with some. Only BODY
         # items count — `k==v` is a query param and `Header:value` a header,
         # and reading either as a body would turn a listing into a claimed
@@ -761,6 +769,12 @@ def test_an_enterprise_gh_pr_create_recovers_its_host():
     # other, and it is the ordinary way to point gh at GHES.
     check("GH_HOST names the host",
           pr_link.github_api_host("GH_HOST=ghe.corp gh pr create --fill") == "ghe.corp")
+    # …in the bare-endpoint api lane too, not just `gh pr`.
+    check("…including for `gh api`",
+          pr_link.github_api_host(
+              "GH_HOST=ghe.corp gh api --method POST repos/o/r/pulls -f t=x") == "ghe.corp")
+    check("…and a github.com `gh api` still names no extra host",
+          pr_link.github_api_host("gh api --method POST repos/o/r/pulls -f t=x") is None)
     check("…but GH_HOST=github.com is not an enterprise host",
           pr_link.github_api_host("GH_HOST=github.com gh pr create --fill") is None)
     got = pr_link.context_for_call(

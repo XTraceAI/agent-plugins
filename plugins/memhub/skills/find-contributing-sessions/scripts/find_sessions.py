@@ -142,6 +142,10 @@ _BRANCH_CREATE_FLAGS = frozenset({"-b", "-B", "-c", "-C",
                                   "--create", "--force-create"})
 _BRANCH_VALUE_FLAGS = _BRANCH_CREATE_FLAGS | {"--start-point", "-t", "--track",
                                               "--orphan"}
+# `git switch --detach feat/x` puts HEAD AT that commit without moving onto the
+# branch, so the session is not "on" it — a reviewer inspecting the PR's tip
+# was scoring the three branch points for it.
+_BRANCH_DETACH_FLAGS = frozenset({"--detach", "-d"})
 
 
 _WRAPPERS = frozenset({"cd", "env", "sudo", "doas", "time", "nohup", "command",
@@ -197,6 +201,8 @@ def _git_branches(command: str) -> list[str]:
             rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
         if not rest or rest[0] not in _BRANCH_SUBCOMMANDS:
             continue
+        if any(t in _BRANCH_DETACH_FLAGS for t in rest[1:]):
+            continue                # detaching is not being on the branch
         index = 1
         while index < len(rest):
             token = rest[index]

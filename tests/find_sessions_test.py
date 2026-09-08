@@ -179,6 +179,23 @@ def test_switch_creates_a_branch_too():
                   row.get("score") == 5, out[:240])
 
 
+def test_a_detached_checkout_is_not_being_on_the_branch():
+    """`git switch --detach feat/x` puts HEAD AT that commit without moving
+    onto the branch — a reviewer inspecting the PR's tip was scoring the three
+    branch points for it (Codex review, PR #182)."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        claude_session(home, "peeker", wt, branch=None,
+                       commands=["git switch --detach feat/x"])
+        claude_session(home, "worker", wt, branch=None,
+                       commands=["git switch feat/x"])
+        rc, out, _err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
+        ids = [r["conversation_id"] for r in json.loads(out)]
+        check("a detached checkout scores no branch point", "peeker" not in ids, out[:200])
+        check("…while actually switching to it does", "worker" in ids, out[:200])
+
+
 def test_a_commit_message_is_not_a_list_of_edited_paths():
     """`git commit -m "docs: update README.md"` handed every word of the
     message to the path matcher, so a session that committed unrelated work

@@ -472,10 +472,13 @@ def _command_name(segment: list[str]) -> tuple[str, list[str]]:
 
 
 def _positional_method(args: list[str]) -> str | None:
-    """HTTPie/xh name the method as a bare word before the URL."""
-    for token in args:
-        if token.startswith("-"):
-            continue
+    """HTTPie/xh name the method as a bare word before the URL.
+
+    Read from the OPERANDS, not the raw arguments: `http --session POST <url>`
+    names a session called POST, and taking it as the method turned a GET
+    listing into a claimed creation.
+    """
+    for token in _operands_of(args, "http"):
         upper = token.upper()
         if upper in _HTTP_VERBS:
             return upper
@@ -626,7 +629,9 @@ _HTTPIE_BODY_ITEM = re.compile(r"^[^:=@\s]+(?:=(?!=)|:=|@)")
 
 
 def _httpie_posts(args: list[str]) -> bool:
-    return any(not t.startswith("-") and _HTTPIE_BODY_ITEM.match(t) for t in args)
+    """…and its body items are operands too: `http --session ./foo=bar <url>`
+    passes a session PATH that happens to contain `=`."""
+    return any(_HTTPIE_BODY_ITEM.match(t) for t in _operands_of(args, "http"))
 
 
 def _hostname_flag(args: list[str]) -> str | None:
@@ -870,7 +875,8 @@ def _api_call(command: object) -> tuple[str | None, bool, str | None]:
 
 
 def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
-                     is_http: bool) -> tuple[str, bool, str | None] | None:
+                     is_http: bool,
+                     env_host: str | None = None) -> tuple[str, bool, str | None] | None:
     """``(target, is_write, enterprise_host)`` for ONE request, or None.
 
     "One request" is narrower than one shell command: `curl` takes several in a
@@ -910,6 +916,11 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
         # with no URL anywhere in it (documented in `gh api --help`).
         host = _hostname_flag(args) if is_gh_api else host
     enterprise = host if host and host not in ("api.github.com", "github.com") else None
+    # `GH_HOST=ghe.corp gh api --method POST repos/o/r/pulls` is a supported
+    # GHES creation whose host appears only in the environment — the same
+    # mechanism already read for `gh pr`, which this lane was not consulting.
+    if enterprise is None and is_gh_api:
+        enterprise = env_host
 
     # An explicit method always wins over an inferred one, on BOTH clients.
     # `gh api --help`: "To send the parameters as a GET query string instead,
@@ -970,9 +981,10 @@ def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]
         is_http = name in _HTTP_CLIENTS
         if not (is_gh_api or is_http):
             continue
+        env_host = _env_host(segment)
         for operation in _operations(name, args):
-            match = _operation_match(name, operation,
-                                     is_gh_api=is_gh_api, is_http=is_http)
+            match = _operation_match(name, operation, is_gh_api=is_gh_api,
+                                     is_http=is_http, env_host=env_host)
             if match is not None:
                 matches.append(match)
     return matches
