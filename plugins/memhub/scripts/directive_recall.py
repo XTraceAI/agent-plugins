@@ -71,6 +71,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_bearer  # noqa: E402
+import served_state  # noqa: E402
 
 # Bound on the recall round-trip. This runs synchronously before the tool, so a
 # hung server can't be allowed to stall the agent; the server's own LLM-gate
@@ -97,10 +98,11 @@ _ERROR_RE = re.compile(
 )
 
 # Session already_fired state: one small JSON list per session id, pruned by
-# age so the directory can't grow unbounded across months of sessions.
-_STATE_DIR = Path.home() / ".claude" / ".memhub" / "directive_fired"
-_STATE_MAX_AGE_S = 7 * 24 * 3600
-_MAX_FIRED_SENT = 1024
+# age so the directory can't grow unbounded across months of sessions. Shared
+# with the session-start brief and the prompt hook (see served_state).
+_STATE_DIR = served_state.STATE_DIR
+_STATE_MAX_AGE_S = served_state.MAX_AGE_S
+_MAX_FIRED_SENT = served_state.MAX_IDS
 
 
 def _log(msg: str) -> None:
@@ -115,32 +117,16 @@ def _state_path(session_id: str) -> Path | None:
 
 
 def _load_fired(session_id: str) -> list[str]:
-    """Ids injected earlier this session (empty on any problem — a lost state
-    file only means a directive may fire once more, never a broken hook)."""
-    path = _state_path(session_id)
-    if not path:
-        return []
-    try:
-        ids = json.loads(path.read_text(encoding="utf-8"))
-        return [str(i) for i in ids if str(i).strip()] if isinstance(ids, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
+    """Ids injected earlier this session — by THIS hook, the session-start
+    brief or the prompt hook, which all share one served list
+    (``served_state``). Empty on any problem: a lost state file only means a
+    directive may fire once more, never a broken hook."""
+    return served_state.load_ids(_STATE_DIR, session_id)
 
 
 def _save_fired(session_id: str, ids: list[str]) -> None:
     """Persist the injected-id list; opportunistically prune stale sessions."""
-    path = _state_path(session_id)
-    if not path:
-        return
-    try:
-        _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(ids[-_MAX_FIRED_SENT:]), encoding="utf-8")
-        cutoff = time.time() - _STATE_MAX_AGE_S
-        for old in _STATE_DIR.glob("*.json"):
-            if old != path and old.stat().st_mtime < cutoff:
-                old.unlink(missing_ok=True)
-    except OSError:
-        pass  # state is an optimization, never worth failing the hook
+    served_state.save_ids(_STATE_DIR, session_id, ids)
 
 
 # --- per-session first-touch handle cache ----------------------------------

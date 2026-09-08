@@ -140,6 +140,18 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking memory for identifiers in this prompt",
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" prompt; fi"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

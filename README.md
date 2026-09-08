@@ -178,18 +178,39 @@ the round-trip entirely.
 ### Session orientation
 
 Also independent of capture: a `SessionStart` hook (`brain_brief.py brief`)
-names the repo's default agent brain before the first prompt. It closes a
-read/write gap — writes already resolved the room, but `search_memory`
-without an explicit `agent_brain_id` defaulted to personal memory regardless.
-It's stdlib-only and makes no network call (everything comes from the cached
-room and a local overview cache), and it injects the brain id — plus a
-compiled overview, if one is cached — as context for the agent every
-session. It only tells the *user*, via `systemMessage`, when the resolved
-brain changes, so it doesn't become wallpaper; a repo with no cached room
-(not yet onboarded) stays silent. A companion `Stop` hook (`brain_brief.py
-refresh`, async) fetches `get_brain_overview` and writes the cache `brief`
-reads, throttled to once per 6 hours since the digest moves on the order of
-days, not turns.
+names the repo's default agent brain before the first prompt and renders
+three checkpoints under one budget, keyed on identifiers, never on similarity:
+
+- **Map** — what the brain holds: the top of the compiled overview's Index
+  (counts and the drill commands), plus a short clip of its prose.
+- **Apply** — lessons and procedures whose triggers intersect the files this
+  branch touches (`git diff --name-only origin/<default>` plus the last 20
+  commits' paths), from `recall_directives(entities=…)`. At most five.
+- **Recall & Consult** — the episodes and artifacts that *name* the same
+  identifiers (paths, `PR #N`, `ENG-N`); a search hit survives only when it
+  contains one of them as an exact token. At most five.
+
+`brief` is stdlib-only and makes no network call: the map comes from the
+overview cache, apply/recall from a pointer cache, and it spawns a detached
+`brain_brief.py pointers` child to refresh that cache, which the first
+prompt's hook then delivers. (A live call at `SessionStart` would put the
+map itself at the mercy of the host's 5 s hook timeout.) A `UserPromptSubmit`
+hook (`brain_brief.py prompt`) extracts identifiers from each prompt — file
+paths, symbols that exist in the repo, `PR #N` / `ENG-N`, quoted error strings
+— and fires one bounded recall on them, at most three pointers in 600
+characters; a prompt with no identifier costs nothing and prints nothing.
+There is deliberately no semantic search on prompt text.
+
+Everything rendered joins the session's served list (shared with
+`directive_recall`'s `already_fired`), so nothing is shown twice. The budget
+is `MEMHUB_BRIEF_TOKEN_BUDGET` (default 2,500 tokens, chars/4), split 2:1
+between the brief and the rulebook's session block; when the brief is cut it
+drops Recall pointers first, then Apply, never the map, and ends with
+`… trimmed to budget`. `MEMHUB_BRIEF_POINTERS=0` disables the background
+worker. The brief only tells the *user*, via `systemMessage`, when the
+resolved brain changes; a repo with no cached room stays silent. A companion
+`Stop` hook (`brain_brief.py refresh`, async) fetches `get_brain_overview`
+into the overview cache, throttled to once per 6 hours.
 
 ### Rulebooks
 
