@@ -230,6 +230,11 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("gh api repos/o/r/pulls -ftitle=x", "pulls_collection", True),
         ("gh api repos/o/r/pulls -Ftitle=x", "pulls_collection", True),
         ("gh api --method GET repos/o/r/pulls -ftitle=x", "pulls_collection", False),
+        # Long field flags carry their value with `=` too.
+        ("gh api repos/o/r/pulls --field=title=x", "pulls_collection", True),
+        ("gh api repos/o/r/pulls --raw-field=title=x", "pulls_collection", True),
+        ("gh api repos/o/r/pulls --input=body.json", "pulls_collection", True),
+        ("gh api --method GET repos/o/r/pulls --field=title=x", "pulls_collection", False),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -525,6 +530,25 @@ def test_a_create_that_FAILED_opened_nothing():
                                        "mcp__github__create_pull_request", {"title": "x"}))
     check("…but a successful one does",
           "you just opened" in ctx(body, "mcp__github__create_pull_request", {"title": "x"}))
+
+
+def test_curl_next_is_a_second_request_not_a_second_flag():
+    """curl takes several requests in one invocation, separated by `--next`,
+    each with its own options. Treating the whole call as one request took the
+    first target with the first operation's method — so a create followed by a
+    read of a DIFFERENT pull request claimed the create had produced the
+    second one's URL (Codex review, PR #182)."""
+    command = ("curl -X POST https://api.github.com/repos/o/a/pulls -d @body "
+               "-o /dev/null --next https://api.github.com/repos/o/b/pulls/7")
+    check("both operations are seen", len(pr_link._api_matches(command)) == 2,
+          str(pr_link._api_matches(command)))
+    check("it still counts as addressing GitHub",
+          pr_link.touches_github("Bash", {"command": command}))
+    check("…but cannot claim to have opened the PR that came back",
+          not pr_link.creates_pr("Bash", {"command": command}))
+    check("a single-operation POST is unaffected",
+          pr_link.creates_pr("Bash", {"command":
+              "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'"}))
 
 
 def test_gh_pr_new_is_an_alias_for_create():

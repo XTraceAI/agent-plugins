@@ -384,6 +384,11 @@ def _is_gh_field_flag(token: str) -> bool:
     and adding one switches the method to POST (`gh api --help`)."""
     if token in _GH_FIELD_FLAGS:
         return True
+    # `--field=title=x`, `--raw-field=title=x`, `--input=body.json`.
+    if any(token.startswith(flag + "=")
+           for flag in _GH_FIELD_FLAGS if flag.startswith("--")):
+        return True
+    # `-ftitle=x` — a short flag with its value attached.
     return (len(token) > 2 and token[0] == "-" and token[1] in "fF"
             and not token.startswith("--"))
 
@@ -540,8 +545,85 @@ def _api_call(command: object) -> tuple[str | None, bool, str | None]:
     return matches[0][0], False, hosts.pop() if len(hosts) == 1 else None
 
 
+def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
+                     is_http: bool) -> tuple[str, bool, str | None] | None:
+    """``(target, is_write, enterprise_host)`` for ONE request, or None.
+
+    "One request" is narrower than one shell command: `curl` takes several in a
+    single invocation, separated by `--next`, each with its own options.
+    """
+    target = number = host = None
+    for arg in args:
+        match = _API_URL.match(arg)
+        if match:
+            host = (match.group(1) or match.group(5) or "").casefold()
+            number = match.group(4) or match.group(8)
+            target = "pull_item" if number else "pulls_collection"
+            break
+        if is_gh_api:
+            path = _API_PATH.match(arg)
+            if path:
+                number = path.group(1)
+                target = "pull_item" if number else "pulls_collection"
+                break
+    if target is None:
+        return None
+
+    if host is None or host == "api.github.com":
+        # `gh api --hostname ghe.corp repos/o/r/pulls` is an enterprise call
+        # with no URL anywhere in it (documented in `gh api --help`).
+        host = _hostname_flag(args) if is_gh_api else host
+    enterprise = host if host and host not in ("api.github.com", "github.com") else None
+
+    # An explicit method always wins over an inferred one, on BOTH clients.
+    # `gh api --help`: "To send the parameters as a GET query string instead,
+    # use --method GET" — so `gh api --method GET …/pulls -f state=open` is a
+    # documented LISTING that carries `-f`. Reading it as a write made
+    # `creates_pr` true, and B1 then told a session that had only listed pull
+    # requests to record a confirmed self-link on one.
+    method = _explicit_method(args)
+    if method is None and name in _HTTPIE_CLIENTS:
+        method = _positional_method(args)
+    if method is not None:
+        write = method == "POST"
+    elif is_gh_api and any(_is_gh_field_flag(t) for t in args):
+        write = True
+    elif name in _HTTPIE_CLIENTS and _httpie_posts(args):
+        write = True
+    elif name == "wget" and _wget_posts(args):
+        write = True
+    elif name == "curl" and _curl_forces_get(args):
+        write = False              # -G/--get: the data goes in the query string
+    elif is_http and _curl_posts(args):
+        write = True
+    else:
+        write = False
+    return target, write, enterprise
+
+
+def _operations(name: str, args: list[str]) -> list[list[str]]:
+    """One argument list per request in this command.
+
+    curl's `--next` starts a NEW operation with a clean option state, so
+    `curl -X POST …/a/pulls -d @body -o /dev/null --next …/b/pulls/7` is a
+    create AND a read in one invocation — and taking the first target with the
+    first operation's method claimed the create had produced the second one's
+    URL. Each operation is its own match, which lets the existing
+    more-than-one-target rule refuse the B1 path.
+    """
+    if name != "curl" or "--next" not in args:
+        return [args]
+    groups: list[list[str]] = [[]]
+    for arg in args:
+        if arg == "--next":
+            groups.append([])
+        else:
+            groups[-1].append(arg)
+    return [g for g in groups if g]
+
+
 def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]]:
-    """``(target, is_write, enterprise_host)`` for each pulls-API segment."""
+    """``(target, is_write, enterprise_host)`` for every request in the call."""
     matches: list[tuple[str, bool, str | None]] = []
     for segment in _segments(tokens):
         name, args = _command_name(segment)
@@ -549,54 +631,11 @@ def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]
         is_http = name in _HTTP_CLIENTS
         if not (is_gh_api or is_http):
             continue
-
-        target = number = host = None
-        for arg in args:
-            match = _API_URL.match(arg)
-            if match:
-                host = (match.group(1) or match.group(5) or "").casefold()
-                number = match.group(4) or match.group(8)
-                target = "pull_item" if number else "pulls_collection"
-                break
-            if is_gh_api:
-                path = _API_PATH.match(arg)
-                if path:
-                    number = path.group(1)
-                    target = "pull_item" if number else "pulls_collection"
-                    break
-        if target is None:
-            continue
-
-        if host is None or host == "api.github.com":
-            # `gh api --hostname ghe.corp repos/o/r/pulls` is an enterprise
-            # call with no URL anywhere in it (documented in `gh api --help`).
-            host = _hostname_flag(args) if is_gh_api else host
-        enterprise = host if host and host not in ("api.github.com", "github.com") else None
-
-        # An explicit method always wins over an inferred one, on BOTH clients.
-        # `gh api --help`: "To send the parameters as a GET query string
-        # instead, use --method GET" — so `gh api --method GET …/pulls -f
-        # state=open` is a documented LISTING that carries `-f`. Reading it as
-        # a write made `creates_pr` true, and B1 then told a session that had
-        # only listed pull requests to record a confirmed self-link on one.
-        method = _explicit_method(segment)
-        if method is None and name in _HTTPIE_CLIENTS:
-            method = _positional_method(args)
-        if method is not None:
-            write = method == "POST"
-        elif is_gh_api and any(_is_gh_field_flag(t) for t in segment):
-            write = True
-        elif name in _HTTPIE_CLIENTS and _httpie_posts(args):
-            write = True
-        elif name == "wget" and _wget_posts(segment):
-            write = True
-        elif is_http and name == "curl" and _curl_forces_get(segment):
-            write = False          # -G/--get: the data goes in the query string
-        elif is_http and _curl_posts(segment):
-            write = True
-        else:
-            write = False
-        matches.append((target, write, enterprise))
+        for operation in _operations(name, args):
+            match = _operation_match(name, operation,
+                                     is_gh_api=is_gh_api, is_http=is_http)
+            if match is not None:
+                matches.append(match)
     return matches
 
 
