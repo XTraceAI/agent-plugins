@@ -161,8 +161,28 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         # A `-X POST` inside a quoted body is data, not a method.
         ("""curl https://api.github.com/repos/o/r/pulls -X GET -d '{"t":"-X POST"}'""",
          "pulls_collection", False),
-        # An unbalanced quote cannot be read, so it must not manufacture one.
+        # An unbalanced quote cannot be read, so it must not manufacture one —
+        # but the call still addressed GitHub, so it must not vanish either:
+        # it reaches B2, where the model judges, and never B1.
         ("curl -X POST https://api.github.com/repos/o/r/pulls -d '{", "pulls_collection", False),
+        # Flags belong to the invocation that carries the target. Reading them
+        # from the whole string bound a chained POST to a later listing, and
+        # the reverse order missed a real create (Codex review, PR #182).
+        ("gh api --method POST repos/o/r/issues -f x=1 && "
+         "gh api --method GET repos/o/r/pulls -f state=open", "pulls_collection", False),
+        ("gh api --method GET repos/o/r/issues && "
+         "gh api --method POST repos/o/r/pulls -f title=x", "pulls_collection", True),
+        ("grep 'https://api.github.com/repos/o/r/pulls' f && "
+         "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        # `gh api --hostname` is an enterprise call with no URL in it at all.
+        ("gh api --hostname ghe.corp --method POST repos/o/r/pulls -f title=x",
+         "pulls_collection", True),
+        # A path-prefixed client is still that client.
+        ("/usr/local/bin/curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        ("env X=1 sudo timeout 5 curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
         ("gh api repos/o/r/pulls", "pulls_collection", False),
         ("gh api repos/o/r/pulls/12", "pull_item", False),
         ("curl -X POST https://gh.corp/api/v3/repos/o/r/pulls -d '{}'",
@@ -251,6 +271,10 @@ def test_an_enterprise_create_resolves_its_own_host():
             "stderr": ""}
     check("the host comes from the command",
           pr_link.github_api_host(command) == "ghe.corp")
+    for flag in ("gh api --hostname ghe.corp --method POST repos/o/r/pulls -f t=x",
+                 "gh api --hostname=ghe.corp --method POST repos/o/r/pulls -f t=x"):
+        check(f"…including from --hostname: {flag[:38]!r}",
+              pr_link.github_api_host(flag) == "ghe.corp")
     check("a github.com command names no extra host",
           pr_link.github_api_host(
               "curl https://api.github.com/repos/o/r/pulls") is None)
@@ -294,6 +318,21 @@ def test_a_quoted_api_target_is_still_found_but_a_quoted_mention_is_not():
     ):
         check(f"a quoted mention is still not a call: {command[:44]!r}",
               not pr_link.touches_github("Bash", {"command": command}))
+
+
+def test_the_cache_scope_covers_enterprise_repos_too():
+    """A github.com-only scope parser gave every enterprise URL an empty scope,
+    so they shared one cache file and one disconnected enterprise repo silenced
+    linking for all the others (Codex review, PR #182)."""
+    scopes = [pr_link._repo_of(u) for u in (
+        "https://github.com/o/r/pull/1",
+        "https://ghe.corp/o/r/pull/1",
+        "https://ghe.corp/other/repo/pull/9",
+        "https://ghe2.corp/o/r/pull/1")]
+    check("every PR URL gets a scope", all(scopes), str(scopes))
+    check("…and they are all distinct across host, owner and repo",
+          len(set(scopes)) == 4, str(scopes))
+    check("a non-PR URL still has no scope", pr_link._repo_of("nonsense") == "")
 
 
 def test_the_negative_cache_is_scoped_to_the_repo_not_the_deployment():

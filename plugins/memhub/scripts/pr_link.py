@@ -72,15 +72,55 @@ _GH_PREFIX = (
 GH_PR = re.compile(_GH_PREFIX + r"\bpr\b")
 GH_PR_CREATE = re.compile(_GH_PREFIX + r"\bpr\s+create\b")
 
-# The GitHub REST API, on github.com and on an enterprise host. `gh api` also
-# accepts a bare `repos/<owner>/<repo>/pulls` path argument.
+# The GitHub REST API, on github.com and on an enterprise host. Matched against
+# a single shell TOKEN, because the command is tokenised before this runs.
 _API_URL = re.compile(
-    r"https?://api\.github\.com/repos/([\w.-]+)/([\w.-]+)/pulls(/\d+)?"
-    r"|https?://[\w.-]+/api/v3/repos/([\w.-]+)/([\w.-]+)/pulls(/\d+)?",
+    r"^https?://(api\.github\.com)/repos/([\w.-]+)/([\w.-]+)/pulls(?:/(\d+))?(?:[/?].*)?$"
+    r"|^https?://([\w.-]+)/api/v3/repos/([\w.-]+)/([\w.-]+)/pulls(?:/(\d+))?(?:[/?].*)?$",
     re.I,
 )
-_API_PATH = re.compile(r"(?:^|\s)/?repos/[\w.-]+/[\w.-]+/pulls(/\d+)?(?![\w.-])")
-_GH_API = re.compile(_GH_PREFIX + r"\bapi\b")
+# `gh api` takes a bare path instead of a URL.
+_API_PATH = re.compile(r"^/?repos/[\w.-]+/[\w.-]+/pulls(?:/(\d+))?(?:/.*)?$")
+_HTTP_CLIENTS = frozenset({"curl", "wget", "http", "https", "xh", "xhs"})
+_WRAPPERS = frozenset({"env", "sudo", "doas", "nohup", "command", "exec",
+                       "timeout", "time", "stdbuf"})
+_ASSIGN_TOKEN = re.compile(r"[A-Za-z_]\w*=")
+_HOSTNAME_FLAG = "--hostname"
+
+# Text-level equivalents, used ONLY when the command will not tokenise. The
+# command already ran, so it was valid shell — `shlex` merely models less of it
+# than the shell does ($'…', line continuations, process substitution). Going
+# silent there would lose a call that genuinely addressed GitHub, so the
+# fallback still recognises the target; it just never infers a write from text
+# it could not parse, so an unreadable command can reach B2 but never B1.
+_API_URL_TEXT = re.compile(
+    r"https?://(api\.github\.com)/repos/[\w.-]+/[\w.-]+/pulls(/\d+)?"
+    r"|https?://([\w.-]+)/api/v3/repos/[\w.-]+/[\w.-]+/pulls(/\d+)?", re.I)
+_API_PATH_TEXT = re.compile(r"(?:^|\s)/?repos/[\w.-]+/[\w.-]+/pulls(/\d+)?(?![\w.-])")
+_GH_API_TEXT = re.compile(_GH_PREFIX + r"\bapi\b")
+_HTTP_CLIENT_TEXT = re.compile(
+    r"(?:^|[;&|`\n(]|\$\()\s*(?:\w+=\S*\s+)*(?:curl|wget|http|https|xh|xhs)\b")
+
+
+def _api_call_untokenised(command: str) -> tuple[str | None, bool, str | None]:
+    """Best effort for a command `shlex` refused. Never reports a write."""
+    text = _unquoted(command)
+    is_gh_api = bool(_GH_API_TEXT.search(text))
+    if not (is_gh_api or _HTTP_CLIENT_TEXT.search(text)):
+        return None, False, None
+    match = _API_URL_TEXT.search(command[:MAX_COMMAND_CHARS])
+    if match:
+        host = (match.group(1) or match.group(3) or "").casefold()
+        number = match.group(2) or match.group(4)
+    elif is_gh_api:
+        path = _API_PATH_TEXT.search(command[:MAX_COMMAND_CHARS])
+        if not path:
+            return None, False, None
+        host, number = "", path.group(1)
+    else:
+        return None, False, None
+    enterprise = host if host and host not in ("api.github.com", "github.com") else None
+    return ("pull_item" if number else "pulls_collection"), False, enterprise
 # Flags are read from shell TOKENS, not with a regex over the text. A regex has
 # to be told where quoting starts and stops, and it kept getting that wrong in
 # both directions: `--method 'GET'` had its value blanked away, so an explicit
@@ -125,9 +165,6 @@ def _explicit_method(tokens: list[str]) -> str | None:
         if token.startswith("-X") and len(token) > 2:      # -XPOST
             return token[2:].upper()
     return None
-# `curl`, `http`, `wget`, `xh` — the shells people actually paste. `gh api`
-# is recognised separately because its path argument has no scheme.
-_HTTP_CLIENT = re.compile(r"(?:^|[;&|`\n(]|\$\()\s*(?:\w+=\S*\s+)*(?:curl|wget|http|https|xh|xhs)\b")
 
 # The SERVER segment must name GitHub — `mcp__<server>__<tool>`. Matching
 # `github` anywhere in the whole name would catch `mcp__notes__github_summary`,
@@ -176,28 +213,6 @@ def _unquoted(command: object) -> str:
     return QUOTED.sub(" ", command[:MAX_COMMAND_CHARS])
 
 
-def _dequoted(command: object) -> str:
-    """The command with the quote CHARACTERS removed and their content kept.
-
-    Quoting the URL is the normal way to write these:
-
-        curl -X POST "https://api.github.com/repos/o/r/pulls" -d '{…}'
-        gh api --method POST 'repos/o/r/pulls' -f title=x
-
-    Blanking the quotes (as `_unquoted` does) deletes the target along with
-    them, and the call reads as "not GitHub at all" — a silent miss on a real
-    PR creation, which is the failure this whole feature exists to prevent.
-
-    Safe to search for a target in, because the caller has ALREADY decided,
-    from `_unquoted`, that a GitHub client sits at command position: `grep
-    "https://api.github.com/repos/o/r/pulls" f` never gets this far, because
-    `grep` is not curl.
-    """
-    if not isinstance(command, str) or not command:
-        return ""
-    return re.sub(r"['\"]", " ", command[:MAX_COMMAND_CHARS])
-
-
 def is_gh_pr_command(command: object) -> bool:
     """Any `gh pr …` at command position — view, checkout, comment, merge…"""
     return bool(GH_PR.search(_unquoted(command)))
@@ -210,66 +225,143 @@ def is_gh_pr_create(command: object) -> bool:
     return bool(GH_PR_CREATE.search(_unquoted(command)))
 
 
+def _segments(tokens: list[str]) -> list[list[str]]:
+    """Split on shell operators into simple commands.
+
+    One Bash call routinely chains several. Reading flags from the whole string
+    bound them to the wrong invocation: `gh api --method POST …/issues && gh
+    api --method GET …/pulls` took the POST and classified the LISTING as a
+    creation, and the reverse order silently missed a real one.
+    """
+    out: list[list[str]] = []
+    segment: list[str] = []
+    for token in tokens:
+        if token and all(ch in _SHELL_PUNCTUATION for ch in token):
+            if segment:
+                out.append(segment)
+            segment = []
+        else:
+            segment.append(token)
+    if segment:
+        out.append(segment)
+    return out
+
+
+def _basename(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def _command_name(segment: list[str]) -> tuple[str, list[str]]:
+    """``(basename, args)`` for a simple command.
+
+    Leading env assignments and the usual wrappers are stepped over, so
+    `env X=1 sudo timeout 5 /usr/local/bin/curl …` still reads as curl.
+    """
+    index, after_wrapper = 0, False
+    while index < len(segment):
+        token = segment[index]
+        if _ASSIGN_TOKEN.match(token):
+            index += 1
+            continue
+        if _basename(token) in _WRAPPERS:
+            index, after_wrapper = index + 1, True
+            continue
+        if token.startswith("-") or (after_wrapper and token[:1].isdigit()):
+            index += 1
+            continue
+        break
+    if index >= len(segment):
+        return "", []
+    return _basename(segment[index]), segment[index + 1:]
+
+
+def _hostname_flag(args: list[str]) -> str | None:
+    """`gh api --hostname ghe.corp …` — an enterprise call with no URL in it."""
+    for index, token in enumerate(args):
+        if token == _HOSTNAME_FLAG and index + 1 < len(args):
+            return args[index + 1].casefold()
+        if token.startswith(_HOSTNAME_FLAG + "="):
+            return token[len(_HOSTNAME_FLAG) + 1:].casefold()
+    return None
+
+
+def _api_call(command: object) -> tuple[str | None, bool, str | None]:
+    """``(target, is_write, enterprise_host)`` for a call to the pulls API.
+
+    Everything is decided WITHIN the simple command that carries the target, so
+    a chained call cannot lend its method to a different invocation.
+    """
+    if not isinstance(command, str) or not command:
+        return None, False, None
+    tokens = _tokens(command)
+    if tokens is None:
+        return _api_call_untokenised(command)
+    if not tokens:
+        return None, False, None
+
+    for segment in _segments(tokens):
+        name, args = _command_name(segment)
+        is_gh_api = name in ("gh", "gh.exe") and "api" in args
+        is_http = name in _HTTP_CLIENTS
+        if not (is_gh_api or is_http):
+            continue
+
+        target = number = host = None
+        for arg in args:
+            match = _API_URL.match(arg)
+            if match:
+                host = (match.group(1) or match.group(5) or "").casefold()
+                number = match.group(4) or match.group(8)
+                target = "pull_item" if number else "pulls_collection"
+                break
+            if is_gh_api:
+                path = _API_PATH.match(arg)
+                if path:
+                    number = path.group(1)
+                    target = "pull_item" if number else "pulls_collection"
+                    break
+        if target is None:
+            continue
+
+        if host is None or host == "api.github.com":
+            # `gh api --hostname ghe.corp repos/o/r/pulls` is an enterprise
+            # call with no URL anywhere in it (documented in `gh api --help`).
+            host = _hostname_flag(args) if is_gh_api else host
+        enterprise = host if host and host not in ("api.github.com", "github.com") else None
+
+        # An explicit method always wins over an inferred one, on BOTH clients.
+        # `gh api --help`: "To send the parameters as a GET query string
+        # instead, use --method GET" — so `gh api --method GET …/pulls -f
+        # state=open` is a documented LISTING that carries `-f`. Reading it as
+        # a write made `creates_pr` true, and B1 then told a session that had
+        # only listed pull requests to record a confirmed self-link on one.
+        method = _explicit_method(segment)
+        if method is not None:
+            return target, method == "POST", enterprise
+        if is_gh_api and any(t in _GH_FIELD_FLAGS for t in segment):
+            return target, True, enterprise
+        if is_http and any(t in _CURL_DATA_FLAGS or t.startswith("--data")
+                           for t in segment):
+            return target, True, enterprise
+        return target, False, enterprise
+    return None, False, None
+
+
 def github_api_call(command: object) -> tuple[str | None, bool]:
     """``(target, is_write)`` for a REST call to GitHub's pulls API.
 
     ``target`` is ``"pulls_collection"`` (a POST to which OPENS a pull
     request), ``"pull_item"`` (``…/pulls/<n>`` — editing one, not opening
-    one), or None. ``is_write`` is whether the command carries a POST.
-
-    `curl` with `-d` and no explicit `-X` **is** a POST — that is the shape in
-    the wild, and reading it as a GET would miss every hand-rolled PR creation.
+    one), or None. ``is_write`` is whether that call carries a POST.
     """
-    # Command position is asked of the BLANKED text (so `grep "curl …"` is not
-    # a curl call); the target is looked for in the DEQUOTED text, because
-    # quoting the URL is the normal way to write one of these.
-    text = _unquoted(command)
-    if not text:
-        return None, False
-    is_gh_api = bool(_GH_API.search(text))
-    is_http = bool(_HTTP_CLIENT.search(text))
-    if not (is_gh_api or is_http):
-        return None, False
-
-    target_text = _dequoted(command)
-    match = _API_URL.search(target_text)
-    number = None
-    if match:
-        number = match.group(3) or match.group(6)
-    elif is_gh_api:
-        path = _API_PATH.search(target_text)
-        if not path:
-            return None, False
-        number = path.group(1)
-    else:
-        return None, False
-
-    target = "pull_item" if number else "pulls_collection"
-    tokens = _tokens(command if isinstance(command, str) else "")
-    if tokens is None:
-        return target, False
-
-    # An explicit method always wins over an inferred one, on BOTH clients.
-    # `gh api --help`: "To send the parameters as a GET query string instead,
-    # use --method GET" — so `gh api --method GET …/pulls -f state=open` is a
-    # documented LISTING that carries `-f`. Reading it as a write made
-    # `creates_pr` true, and B1 then told a session that had only listed pull
-    # requests to record a confirmed self-link on one of them.
-    method = _explicit_method(tokens)
-    if method is not None:
-        return target, method == "POST"
-    if is_gh_api and any(t in _GH_FIELD_FLAGS for t in tokens):
-        return target, True
-    if is_http and any(t in _CURL_DATA_FLAGS or t.startswith("--data")
-                       for t in tokens):
-        return target, True
-    return target, False
+    target, is_write, _host = _api_call(command)
+    return target, is_write
 
 
 def github_api_host(command: object) -> str | None:
     """The GitHub host this command addressed, when it is not github.com.
 
-    `github_api_call` accepts an enterprise REST target, but
+    `_api_call` accepts an enterprise REST target, but
     `pr_provenance.urls_from_output_text` only recognises `github.com` URLs —
     so an enterprise create was detected and then produced no URL, and the hook
     went silent on exactly the calls it had just decided to care about.
@@ -279,10 +371,7 @@ def github_api_host(command: object) -> str | None:
     sites that happen to use that path shape. Only the host the session itself
     just talked to is trusted.
     """
-    text = _dequoted(command)
-    m = re.search(r"https?://([\w.-]+)/api/v3/repos/[\w.-]+/[\w.-]+/pulls", text, re.I)
-    host = m.group(1).lower() if m else None
-    return host if host and host not in ("api.github.com", "github.com") else None
+    return _api_call(command)[2]
 
 
 def _urls_on_host(text: object, host: str) -> list[str]:
@@ -454,10 +543,20 @@ def conversation_id_for(host: object, session_id: object) -> str | None:
 
 # ---------------------------------------------------------------- the check
 
+_PR_URL_SCOPE = re.compile(r"https://([\w.-]+)/([^/]+)/([^/]+)/pull/\d+", re.I)
+
+
 def _repo_of(pr_url: str) -> str:
-    """``owner/repo`` from a canonical PR URL, or "" if it is not one."""
-    m = re.search(r"https://github\.com/([^/]+)/([^/]+)/pull/", pr_url or "")
-    return f"{m.group(1)}/{m.group(2)}" if m else ""
+    """``host/owner/repo`` from a PR URL, or "" if it is not one.
+
+    The HOST is part of the key, not just the repo: two enterprise deployments
+    are two different backends' worth of orgs. A github.com-only pattern gave
+    every enterprise URL an empty scope, so all of them shared one cache file
+    and a single disconnected enterprise repo silenced linking for every other
+    one — the bug this scoping was added to fix, reintroduced for enterprise.
+    """
+    m = _PR_URL_SCOPE.search(pr_url or "")
+    return f"{m.group(1)}/{m.group(2)}/{m.group(3)}".casefold() if m else ""
 
 
 def _cache_path(api_base: str, scope: str = "") -> Path:
