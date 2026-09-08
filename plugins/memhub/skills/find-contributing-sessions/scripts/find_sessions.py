@@ -26,6 +26,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -76,6 +77,45 @@ _SHA_DISPLAYING = re.compile(
     r"merge-tree|name-rev|for-each-ref)(?![-\w])", re.I)
 _APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
 _GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
+# Flags whose VALUE is a separate word. `git commit -m "docs: update
+# README.md"` was handing every word of the message to the path matcher, so a
+# session that committed unrelated work scored file evidence for a PR file it
+# had never touched — and with branch and window points could outrank a real
+# contributor, or push one off the capped list.
+_GIT_VALUE_FLAGS = frozenset({
+    "-m", "--message", "-F", "--file", "-C", "--reuse-message",
+    "-c", "--reedit-message", "--author", "--date", "--squash", "--fixup",
+    "--pathspec-from-file", "--gpg-sign", "-S", "--cleanup", "--trailer"})
+
+
+def _git_pathspecs(argument_text: str) -> list[str]:
+    """The PATHSPEC operands of a `git add` / `git commit`, and nothing else.
+
+    Tokenised with `shlex` so a quoted commit message is one word rather than
+    several, then walked so a flag's operand is consumed with it.
+    """
+    try:
+        tokens = shlex.split(argument_text, posix=True)
+    except ValueError:
+        return []
+    paths: list[str] = []
+    index, only_paths = 0, False
+    while index < len(tokens):
+        token = tokens[index]
+        if only_paths:
+            paths.append(token)
+            index += 1
+            continue
+        if token == "--":                     # everything after is a pathspec
+            only_paths = True
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 2 if (token in _GIT_VALUE_FLAGS and "=" not in token) else 1
+            continue
+        paths.append(token)
+        index += 1
+    return paths
 _BRANCH_CMD = re.compile(
     r"(?:^|[;&|])\s*git\s+(?:checkout|switch)\s+(?:-b\s+|-B\s+)?"
     r"(?:'([^']+)'|\"([^\"]+)\"|([^\s;&|'\"-][^\s;&|]*))")
@@ -236,9 +276,8 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
         if isinstance(command, str) and command:
             command = command[:MAX_TEXT_SCAN]
             for match in _GIT_PATHS.finditer(command):
-                for token in match.group(1).split():
-                    if not token.startswith("-"):
-                        note_path(token.strip("'\""))
+                for token in _git_pathspecs(match.group(1)):
+                    note_path(token)
             for match in _BRANCH_CMD.finditer(command):
                 name = match.group(1) or match.group(2) or match.group(3)
                 if name:

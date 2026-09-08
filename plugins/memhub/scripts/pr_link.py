@@ -353,6 +353,10 @@ def _positional_method(args: list[str]) -> str | None:
 # same way.
 _CURL_VALUE_OPTS = frozenset("abCcDdEeFHKmoTtUuwXxYyZz")
 _CURL_DATA_OPTS = frozenset("dF")
+# `curl --help all` on `-G, --get`: "Put the post data in the URL and use GET".
+# So `-G -d state=open` is a LISTING that carries data, and reading the `-d` as
+# a POST turned it into a claimed creation.
+_CURL_GET_OPT = "G"
 
 
 def _curl_short_run_posts(token: str) -> bool:
@@ -373,6 +377,33 @@ def _curl_short_run_posts(token: str) -> bool:
         if not char.isalpha():
             return False
     return False
+
+
+def _is_gh_field_flag(token: str) -> bool:
+    """`gh api … -f title=x` and `-ftitle=x` are the same request parameter,
+    and adding one switches the method to POST (`gh api --help`)."""
+    if token in _GH_FIELD_FLAGS:
+        return True
+    return (len(token) > 2 and token[0] == "-" and token[1] in "fF"
+            and not token.startswith("--"))
+
+
+def _curl_short_run_has(token: str, wanted: str) -> bool:
+    """Is `wanted` a real option in this short-option run, rather than a
+    character inside an attached value? Same walk as `_curl_short_run_posts`."""
+    if not token.startswith("-") or token.startswith("--") or len(token) < 2:
+        return False
+    for char in token[1:]:
+        if char == wanted:
+            return True
+        if char in _CURL_VALUE_OPTS or not char.isalpha():
+            return False
+    return False
+
+
+def _curl_forces_get(segment: list[str]) -> bool:
+    return any(t == "--get" or _curl_short_run_has(t, _CURL_GET_OPT)
+               for t in segment)
 
 
 def _curl_posts(segment: list[str]) -> bool:
@@ -553,12 +584,14 @@ def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]
             method = _positional_method(args)
         if method is not None:
             write = method == "POST"
-        elif is_gh_api and any(t in _GH_FIELD_FLAGS for t in segment):
+        elif is_gh_api and any(_is_gh_field_flag(t) for t in segment):
             write = True
         elif name in _HTTPIE_CLIENTS and _httpie_posts(args):
             write = True
         elif name == "wget" and _wget_posts(segment):
             write = True
+        elif is_http and name == "curl" and _curl_forces_get(segment):
+            write = False          # -G/--get: the data goes in the query string
         elif is_http and _curl_posts(segment):
             write = True
         else:

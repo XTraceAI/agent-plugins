@@ -215,6 +215,21 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("curl -oFood https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
         ("curl -Afriend https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
         ("curl -HFood:x https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # `-G/--get` puts the data in the URL and sends GET, so a listing that
+        # carries `-d` is still a read (Codex review, PR #182).
+        ("curl -G -d state=open https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("curl --get --data state=open https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("curl -sG -d state=open https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("curl -Gd state=open https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        # gh's field flags can carry their value attached, and a field
+        # switches the method to POST.
+        ("gh api repos/o/r/pulls -ftitle=x", "pulls_collection", True),
+        ("gh api repos/o/r/pulls -Ftitle=x", "pulls_collection", True),
+        ("gh api --method GET repos/o/r/pulls -ftitle=x", "pulls_collection", False),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),

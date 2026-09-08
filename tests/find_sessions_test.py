@@ -147,6 +147,26 @@ def test_edit_paths_are_read_under_every_host_s_spelling():
                   == ["app/x.py", "app/y.py"], out[:200])
 
 
+def test_a_commit_message_is_not_a_list_of_edited_paths():
+    """`git commit -m "docs: update README.md"` handed every word of the
+    message to the path matcher, so a session that committed unrelated work
+    scored file evidence for a PR file it never touched (Codex, PR #182)."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        claude_session(home, "talker", wt, branch="unrelated",
+                       commands=['git commit -m "docs: update app/x.py and app/y.py"'])
+        claude_session(home, "doer", wt, branch="unrelated",
+                       commands=['git commit -m "fix" app/x.py app/y.py'])
+        rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
+        rows = {r["conversation_id"]: r for r in json.loads(out)}
+        check("a session that only NAMED the files in a message is not a candidate",
+              "talker" not in rows, out[:200])
+        check("…while one that passed them as pathspecs is",
+              sorted(rows.get("doer", {}).get("evidence", {}).get("files", []))
+              == ["app/x.py", "app/y.py"], out[:200])
+
+
 def test_a_hidden_path_keeps_its_leading_dot():
     """`lstrip("./")` strips every leading dot, not a `./` prefix — so
     `.github/workflows/ci.yml` became `github/…` and a session that edited the
