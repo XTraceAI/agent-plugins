@@ -54,6 +54,17 @@ _COMMIT_PRODUCING = re.compile(
     r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
     r"git\b(?:\s+-[cC]\s+\S+)*\s+"
     r"(?:commit|cherry-pick|revert|merge|rebase|am)\b", re.I)
+# Anything that PRINTS shas it did not create. One Bash call is often a chain
+# and its result is the combined output, so `git commit -m x && git log` would
+# otherwise credit this session with every sha in the log. There is no way to
+# split one stdout back into its commands, so a command that both creates and
+# displays declines rather than guesses — `git add -A && git commit` still
+# counts, because `git add` prints no shas.
+_SHA_DISPLAYING = re.compile(
+    r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
+    r"git\b(?:\s+-[cC]\s+\S+)*\s+"
+    r"(?:log|show|rev-parse|rev-list|reflog|describe|cherry|ls-remote|diff|"
+    r"blame|shortlog|whatchanged|bisect|branch|tag|status)\b", re.I)
 _APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
 _GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
 _BRANCH_CMD = re.compile(
@@ -128,10 +139,14 @@ def _makes_commits(tool: str, payload: dict) -> bool:
     command = payload.get("command") or payload.get("cmd") or ""
     if not isinstance(command, str) or not command:
         return False
+    command = command[:MAX_TEXT_SCAN]
     # A command that addressed GitHub is asking about the PR, never making it.
     if pr_link.touches_github("Bash", {"command": command}):
         return False
-    return bool(_COMMIT_PRODUCING.search(command[:MAX_TEXT_SCAN]))
+    # …and a chain that also DISPLAYS shas cannot be told apart in one stdout.
+    if _SHA_DISPLAYING.search(command):
+        return False
+    return bool(_COMMIT_PRODUCING.search(command))
 
 
 def _tool_calls(records):

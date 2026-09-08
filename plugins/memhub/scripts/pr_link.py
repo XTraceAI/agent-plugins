@@ -135,6 +135,15 @@ _GH_FIELD_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
 _CURL_DATA_FLAGS = frozenset({
     "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
     "--data-ascii", "-F", "--form", "--form-string"})
+# wget documents `--post-data=STRING` / `--post-file=FILE` as "use the POST
+# method". Accepting wget as a client and then only knowing curl's flags meant
+# a real creation through it fell to B2 — safe, but the client was listed as
+# supported while being half-supported.
+_WGET_POST_FLAGS = ("--post-data", "--post-file", "--body-data", "--body-file")
+# HTTPie and xh take the method as a POSITIONAL argument: `http POST <url>`.
+_HTTPIE_CLIENTS = frozenset({"http", "https", "xh", "xhs"})
+_HTTP_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
+                         "OPTIONS"})
 _SHELL_PUNCTUATION = ";&|`()<>\r\n"
 
 
@@ -198,6 +207,16 @@ _CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _CREATE_VERBS = frozenset({"create", "open", "submit", "new"})
 _PR_HEADS = frozenset({"pr", "prs", "pullrequest", "pullrequests"})
 _PR_TAILS = (["pull", "request"], ["pull", "requests"])
+# An object that can only be attached TO a pull request, wherever it appears in
+# the name. The tail check alone accepted `create_review_for_pull_request` and
+# `create_comment_on_pull_request`, which end in the right words while creating
+# something else entirely — and B1 then told a session reviewing a teammate's
+# pull request to record itself as its author.
+_NOT_THE_PR = frozenset({
+    "review", "reviews", "comment", "comments", "thread", "threads",
+    "reply", "replies", "annotation", "annotations", "suggestion",
+    "suggestions", "label", "labels", "assignee", "assignees",
+    "reviewer", "reviewers", "milestone"})
 
 MAX_COMMAND_CHARS = pr_provenance.MAX_COMMAND_CHARS
 
@@ -275,6 +294,23 @@ def _command_name(segment: list[str]) -> tuple[str, list[str]]:
     return _basename(segment[index]), segment[index + 1:]
 
 
+def _positional_method(args: list[str]) -> str | None:
+    """HTTPie/xh name the method as a bare word before the URL."""
+    for token in args:
+        if token.startswith("-"):
+            continue
+        upper = token.upper()
+        if upper in _HTTP_VERBS:
+            return upper
+        return None            # the first bare word was the URL, not a verb
+    return None
+
+
+def _wget_posts(segment: list[str]) -> bool:
+    return any(t == f or t.startswith(f + "=")
+               for t in segment for f in _WGET_POST_FLAGS)
+
+
 def _hostname_flag(args: list[str]) -> str | None:
     """`gh api --hostname ghe.corp …` — an enterprise call with no URL in it."""
     for index, token in enumerate(args):
@@ -299,6 +335,7 @@ def _api_call(command: object) -> tuple[str | None, bool, str | None]:
     if not tokens:
         return None, False, None
 
+    matches: list[tuple[str, bool, str | None]] = []
     for segment in _segments(tokens):
         name, args = _command_name(segment)
         is_gh_api = name in ("gh", "gh.exe") and "api" in args
@@ -336,15 +373,35 @@ def _api_call(command: object) -> tuple[str | None, bool, str | None]:
         # a write made `creates_pr` true, and B1 then told a session that had
         # only listed pull requests to record a confirmed self-link on one.
         method = _explicit_method(segment)
+        if method is None and name in _HTTPIE_CLIENTS:
+            method = _positional_method(args)
         if method is not None:
-            return target, method == "POST", enterprise
-        if is_gh_api and any(t in _GH_FIELD_FLAGS for t in segment):
-            return target, True, enterprise
-        if is_http and any(t in _CURL_DATA_FLAGS or t.startswith("--data")
-                           for t in segment):
-            return target, True, enterprise
-        return target, False, enterprise
-    return None, False, None
+            write = method == "POST"
+        elif is_gh_api and any(t in _GH_FIELD_FLAGS for t in segment):
+            write = True
+        elif name == "wget" and _wget_posts(segment):
+            write = True
+        elif is_http and any(t in _CURL_DATA_FLAGS or t.startswith("--data")
+                             for t in segment):
+            write = True
+        else:
+            write = False
+        matches.append((target, write, enterprise))
+
+    if not matches:
+        return None, False, None
+    if len(matches) == 1:
+        return matches[0]
+    # Several pulls-API calls in ONE shell call. The tool result is their
+    # combined output, and there is no way to tell which segment produced the
+    # single URL in it — so `gh api --method POST repos/o/a/pulls >/dev/null &&
+    # gh api --method GET repos/o/b/pulls/7 --jq .html_url` would have taken
+    # the POST's verdict and applied it to PR b's URL, linking the session as
+    # the author of a pull request it did not open. The call still addressed
+    # GitHub (so it reaches B2 and the model judges), but it can never take the
+    # unconditional B1 path.
+    hosts = {host for _t, _w, host in matches}
+    return matches[0][0], False, hosts.pop() if len(hosts) == 1 else None
 
 
 def github_api_call(command: object) -> tuple[str | None, bool]:
@@ -423,6 +480,8 @@ def is_github_mcp_create(tool_name: object) -> bool:
         return False
     words = _words(parts[1])
     if not words or not _CREATE_VERBS.intersection(words):
+        return False
+    if _NOT_THE_PR.intersection(words):
         return False
     return words[-1] in _PR_HEADS or words[-2:] in _PR_TAILS
 

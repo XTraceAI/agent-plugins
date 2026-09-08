@@ -212,6 +212,11 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
         claude_session(home, "pusher", wt, branch="unrelated",
                        commands=["git push origin HEAD"],
                        results=[f"   {sha[:7]}..{sha[8:15]}  feat/x -> feat/x"])
+        # …nor one whose single Bash call both committed something unrelated
+        # AND printed the log: one stdout cannot be split back into commands.
+        claude_session(home, "mixed", wt, branch="unrelated",
+                       commands=["git commit -m unrelated && git log --oneline -5"],
+                       results=[f"[wip 9999999] unrelated\n{sha[:8]} someone else"])
         rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--sha", sha,
                            "--host", "claude")
         ids = [r["conversation_id"] for r in json.loads(out)]
@@ -221,6 +226,8 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
               "reader" not in ids, out)
         check("…nor one that only pushed commits it did not write",
               "pusher" not in ids, out)
+        check("…nor one whose call both committed and printed the log",
+              "mixed" not in ids, out)
         check("…while the session that made the commit still counts",
               "author" in ids, out)
 

@@ -183,6 +183,24 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", True),
         ("env X=1 sudo timeout 5 curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
          "pulls_collection", True),
+        # The other clients we accept: wget documents `--post-data` as POST,
+        # and HTTPie/xh take the method as a bare word (Codex review, PR #182).
+        ("wget --post-data='{\"title\":\"x\"}' https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
+        ("wget --post-file=b.json https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
+        ("wget https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("http POST https://api.github.com/repos/o/r/pulls title=x",
+         "pulls_collection", True),
+        ("xh POST https://api.github.com/repos/o/r/pulls title=x",
+         "pulls_collection", True),
+        ("http GET https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # Two pulls calls in ONE shell call: the tool result is their combined
+        # output and nothing says which produced the URL, so this can reach B2
+        # but never the unconditional B1 (Codex review, PR #182).
+        ("gh api --method POST repos/o/a/pulls >/dev/null && "
+         "gh api --method GET repos/o/b/pulls/7 --jq .html_url",
+         "pulls_collection", False),
         ("gh api repos/o/r/pulls", "pulls_collection", False),
         ("gh api repos/o/r/pulls/12", "pull_item", False),
         ("curl -X POST https://gh.corp/api/v3/repos/o/r/pulls -d '{}'",
@@ -231,6 +249,12 @@ def test_github_mcp_tools_are_recognised_by_their_server_segment():
         ("mcp__github__submit_pull_request_review", True, False),
         ("mcp__github__create_pull_request_review_comment", True, False),
         ("mcp__github__create_and_submit_pull_request_review", True, False),
+        # The tail check alone accepted these: they END in the right words
+        # while creating something attached to the PR (Codex review, PR #182).
+        ("mcp__github__create_review_for_pull_request", True, False),
+        ("mcp__github__create_comment_on_pull_request", True, False),
+        ("mcp__github__submit_review_for_pull_request", True, False),
+        ("mcp__github__add_labels_to_pull_request", True, False),
         ("mcp__github__merge_pull_request", True, False),
         ("mcp__github__update_pull_request", True, False),
         # …and the real creation spellings still land on B1. `create_pr` is
@@ -358,6 +382,26 @@ def test_the_negative_cache_is_scoped_to_the_repo_not_the_deployment():
         check("…but a DIFFERENT repo asks the server again",
               len(calls) == 2, str(calls))
     pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
+
+
+def test_an_ambiguous_multi_target_call_can_never_self_link():
+    """One stdout, two pulls calls, no way to say which made the URL."""
+    command = ("gh api --method POST repos/o/a/pulls >/dev/null && "
+               "gh api --method GET repos/o/b/pulls/7 --jq .html_url")
+    check("it still counts as addressing GitHub",
+          pr_link.touches_github("Bash", {"command": command}))
+    check("…but it cannot claim to have opened anything",
+          not pr_link.creates_pr("Bash", {"command": command}))
+    got = pr_link.context_for_call(
+        "Bash", {"command": command},
+        {"stdout": "https://github.com/o/b/pull/7"}, "s1",
+        checker=lambda _u: {"enabled": True, "github_connected": True,
+                            "repo_in_install": True})
+    # B2 also contains "without asking" (inside its *conditional* branch), so
+    # the thing that separates the two is B1's opening claim.
+    check("…so the model judges instead of self-linking",
+          bool(got) and "IF IT WAS NOT" in got and "you just opened" not in got,
+          str(got)[:160])
 
 
 def test_the_gate_is_acting_on_github_not_mentioning_a_pr():
