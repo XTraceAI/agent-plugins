@@ -38,6 +38,17 @@ EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 WINDOW_DAYS = 30
 
 _SHA_RX = re.compile(r"\b[0-9a-f]{7,40}\b")
+# A sha is "proof" only when the command that printed it MADE the commit.
+# `git log`, `git show`, `git diff` and `gh pr view` all display history that
+# any session in the repo can see, so a reviewer who reads the branch scores
+# the highest-value signal for code they only looked at. An allowlist rather
+# than a denylist: the default for an unrecognised command is "not proof",
+# because the cost of a wrong author is worse than the cost of a missed one —
+# and a real author still scores on files (2 each) and branch (3).
+_COMMIT_PRODUCING = re.compile(
+    r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
+    r"git\b(?:\s+-[cC]\s+\S+)*\s+"
+    r"(?:commit|push|cherry-pick|revert|merge|rebase|am|apply|stash)\b", re.I)
 _APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
 _GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
 _BRANCH_CMD = re.compile(
@@ -99,18 +110,38 @@ def _matches_pr_file(edited: str, pr_files: dict[str, str]) -> str | None:
     return None
 
 
+def _makes_commits(tool: str, payload: dict) -> bool:
+    """Would this call have CREATED the commits whose shas it prints?
+
+    Only the shell can; and only a commit-producing git subcommand does. A
+    `gh pr view --json commits` (the skill's own step 2), a `git log`, a
+    `git show` — all of these merely display shas that already exist and that
+    anyone with the repo can read.
+    """
+    if tool not in ("Bash", "shell", "local_shell", "exec", "exec_command"):
+        return False
+    command = payload.get("command") or payload.get("cmd") or ""
+    if not isinstance(command, str) or not command:
+        return False
+    # A command that addressed GitHub is asking about the PR, never making it.
+    if pr_link.touches_github("Bash", {"command": command}):
+        return False
+    return bool(_COMMIT_PRODUCING.search(command[:MAX_TEXT_SCAN]))
+
+
 def _tool_calls(records):
-    """``(tool, input, result_text, result_is_pr_metadata)`` tuples, bounded.
+    """``(tool, input, result_text, result_is_sha_proof)`` tuples, bounded.
 
     A result is paired back to the call that produced it (by ``tool_use_id``,
-    the way ``mine_sessions.py`` does) for one reason: a commit sha printed by
-    a command that was ASKING GitHub about the pull request is not evidence
-    that this session wrote it. The skill's own step 2 runs `gh pr view <n>
-    --json commits`, so without this the session running the scan finds the
-    PR's shas in its own transcript and ranks itself top on "proof".
+    the way ``mine_sessions.py`` does) so that a sha counts as authorship
+    evidence only when the call that printed it MADE the commit. Two ways this
+    went wrong before: the skill's own step 2 runs `gh pr view <n> --json
+    commits`, so the session running the scan found the PR's shas in its own
+    transcript; and a reviewer who ran `git log` on the branch saw them too.
+    Both scored the highest-value signal for code they had only read.
     """
     seen = 0
-    metadata_calls: dict[str, bool] = {}
+    sha_bearing: dict[str, bool] = {}
     for record in records:
         if seen >= MAX_RECORDS:
             return
@@ -129,23 +160,21 @@ def _tool_calls(records):
                 name = block.get("name") or ""
                 call_id = block.get("id")
                 if isinstance(call_id, str):
-                    if len(metadata_calls) >= MAX_RECORDS:
-                        metadata_calls.clear()
-                    # `touches_github` is exactly the question: did this call
-                    # ask GitHub about a pull request? Its output is metadata.
-                    # `git log` and `git push` do NOT touch GitHub, so the shas
-                    # they print still count.
-                    metadata_calls[call_id] = pr_link.touches_github(name, payload)
+                    if len(sha_bearing) >= MAX_RECORDS:
+                        sha_bearing.clear()
+                    sha_bearing[call_id] = _makes_commits(name, payload)
                 yield name, payload, "", False
             elif block.get("type") == "tool_result":
-                is_metadata = metadata_calls.pop(block.get("tool_use_id"), False)
+                # Default False: a result whose call was not a commit-producing
+                # git operation contributes no sha evidence at all.
+                is_proof = sha_bearing.pop(block.get("tool_use_id"), False)
                 body = block.get("content")
                 if isinstance(body, str):
-                    yield "", {}, body[:MAX_TEXT_SCAN], is_metadata
+                    yield "", {}, body[:MAX_TEXT_SCAN], is_proof
                 elif isinstance(body, list):
                     text = " ".join(str(part.get("text", "")) for part in body
                                     if isinstance(part, dict))
-                    yield "", {}, text[:MAX_TEXT_SCAN], is_metadata
+                    yield "", {}, text[:MAX_TEXT_SCAN], is_proof
 
 
 def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) -> dict:
@@ -162,7 +191,7 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
         if hit and hit not in files:
             files.append(hit)
 
-    for tool, payload, result, result_is_pr_metadata in _tool_calls(records):
+    for tool, payload, result, result_is_sha_proof in _tool_calls(records):
         if tool in EDIT_TOOLS:
             note_path(payload.get("file_path"))
             for edit in (payload.get("edits") or []) if isinstance(payload.get("edits"), list) else []:
@@ -182,8 +211,8 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
                 name = match.group(1) or match.group(2) or match.group(3)
                 if name:
                     branches.add(name.strip())
-        # A sha the session was TOLD by GitHub is not a sha it produced.
-        if result and sha_prefixes and not result_is_pr_metadata:
+        # A sha the session was SHOWN is not a sha it produced.
+        if result and sha_prefixes and result_is_sha_proof:
             for match in _SHA_RX.finditer(result):
                 token = match.group(0)
                 if token[:7] in sha_prefixes and token not in hit_shas:

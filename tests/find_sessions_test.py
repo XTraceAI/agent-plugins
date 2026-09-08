@@ -159,10 +159,11 @@ def test_a_commit_sha_outscores_everything():
         # Two PR files + head branch = 4 + 3 = 7.
         claude_session(home, "aaaa-1111", wt, branch="feat/x",
                        edits=[f"{wt}/app/x.py", f"{wt}/app/y.py"])
-        # A sha and nothing else = 5, but the sha is proof, so it must appear.
+        # A sha and nothing else = 5, but only from a command that MADE the
+        # commit — `git log` merely displays one (Codex review, PR #182).
         claude_session(home, "cccc-3333", wt, branch="other",
-                       commands=["git log --oneline"],
-                       results=["a1b2c3d4 fix the thing"])
+                       commands=["git commit -m 'fix the thing'"],
+                       results=["[other a1b2c3d4] fix the thing"])
         rc, out, _ = run(home, PR_FILES, "--branch", "feat/x",
                          "--sha", "a1b2c3d4e5f6a7b8", "--host", "claude")
         rows = json.loads(out)
@@ -186,12 +187,12 @@ def test_a_session_only_ever_on_the_base_branch_is_pushed_below_zero():
         check("it is not offered as a candidate", json.loads(out) == [], out)
 
 
-def test_a_session_that_only_ASKED_github_about_the_pr_is_not_evidence():
-    """The skill's own step 2 runs `gh pr view <n> --json commits`, so the
-    session running the scan finds the PR's shas in its own transcript. Without
-    pairing a result back to the call that produced it, that session ranks
-    itself top on the highest-value signal — "proof" that it wrote code it only
-    looked at (Codex review, PR #182)."""
+def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
+    """A sha is proof of authorship only if the command printing it created the
+    commit. Two ways this went wrong: the skill's own step 2 runs `gh pr view
+    <n> --json commits`, so the scanning session found the PR's shas in its own
+    transcript; and a reviewer running `git log` on the branch saw them too.
+    Both scored the top signal for code they had only read (Codex, PR #182)."""
     sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
     with tempfile.TemporaryDirectory() as td:
         home = Path(td) / "home"
@@ -199,15 +200,21 @@ def test_a_session_that_only_ASKED_github_about_the_pr_is_not_evidence():
         claude_session(home, "inspector", wt, branch="unrelated",
                        commands=["gh pr view 42 --json commits -q '.commits[].oid'"],
                        results=[sha])
-        # …while a session that saw the sha in its OWN git output still counts.
+        # …while the session that actually MADE the commit still counts.
         claude_session(home, "author", wt, branch="unrelated",
+                       commands=["git commit -m fix"], results=[f"[wip {sha[:8]}] fix"])
+        # …and a session that merely READ the history does not: `git log` shows
+        # shas to anyone with the repo, so it is not authorship evidence.
+        claude_session(home, "reader", wt, branch="unrelated",
                        commands=["git log --oneline -3"], results=[sha + " fix"])
         rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--sha", sha,
                            "--host", "claude")
         ids = [r["conversation_id"] for r in json.loads(out)]
         check("the PR-inspecting session is not offered as a candidate",
               "inspector" not in ids, out)
-        check("…while a sha from the session's own `git log` still counts",
+        check("…nor is a session that only read the history with `git log`",
+              "reader" not in ids, out)
+        check("…while the session that made the commit still counts",
               "author" in ids, out)
 
 

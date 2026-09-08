@@ -88,9 +88,18 @@ _GH_API_WRITE = re.compile(r"(?:^|\s)(?:-f\b|-F\b|--field\b|--raw-field\b|--inpu
 # is recognised separately because its path argument has no scheme.
 _HTTP_CLIENT = re.compile(r"(?:^|[;&|`\n(]|\$\()\s*(?:\w+=\S*\s+)*(?:curl|wget|http|https|xh|xhs)\b")
 
-# The SERVER segment must name GitHub. Matching `github` anywhere in the tool
-# name would catch `mcp__notes__github_summary`, which is a note-taking tool.
-_MCP_GITHUB = re.compile(r"(?i)^mcp__[^_]*github[^_]*__")
+# The SERVER segment must name GitHub — `mcp__<server>__<tool>`. Matching
+# `github` anywhere in the whole name would catch `mcp__notes__github_summary`,
+# which is a note-taking tool.
+#
+# The segment is taken up to the FIRST `__`, not with `[^_]*`: server names
+# contain underscores all the time. `github_enterprise` is one, and any
+# plugin-provided server is another — this repo's own tools arrive as
+# `mcp__plugin_memhub-staging_memhub__add_memory`. `[^_]*` stopped at the first
+# underscore and rejected every tool from such a server, so neither the create
+# link nor the in-play judgment could ever fire for them.
+_MCP_SPLIT = re.compile(r"(?i)^mcp__(.+?)__(.+)$")
+_MCP_IS_GITHUB = re.compile(r"(?i)github")
 # Loose on the verb, strict on the object — but read as TOKENS rather than as
 # one regex, because both halves of that sentence have to hold at once and a
 # regex kept getting one of them wrong:
@@ -197,10 +206,17 @@ def github_api_call(command: object) -> tuple[str | None, bool]:
     target = "pull_item" if number else "pulls_collection"
     if _POST.search(text):
         return target, True
-    if is_gh_api and _GH_API_WRITE.search(text):
+    # An explicit method always wins over an inferred one, on BOTH clients.
+    # `gh api --help`: "To send the parameters as a GET query string instead,
+    # use --method GET" — so `gh api --method GET …/pulls -f state=open` is a
+    # documented LISTING that carries `-f`. Reading it as a write made
+    # `creates_pr` true, and B1 then told a session that had only listed pull
+    # requests to record a confirmed self-link on one of them.
+    explicit = bool(_EXPLICIT_METHOD.search(text))
+    if is_gh_api and _GH_API_WRITE.search(text) and not explicit:
         return target, True
     # curl's `-d` implies POST, but only when no method was named explicitly.
-    if is_http and _CURL_DATA.search(text) and not _EXPLICIT_METHOD.search(text):
+    if is_http and _CURL_DATA.search(text) and not explicit:
         return target, True
     return target, False
 
@@ -209,8 +225,15 @@ def _mcp_tool_name(tool_name: object) -> str:
     return tool_name if isinstance(tool_name, str) else ""
 
 
+def _mcp_parts(tool_name: object) -> tuple[str, str] | None:
+    """``(server, tool)`` for an MCP tool name, or None if it is not one."""
+    m = _MCP_SPLIT.match(_mcp_tool_name(tool_name))
+    return (m.group(1), m.group(2)) if m else None
+
+
 def is_github_mcp_tool(tool_name: object) -> bool:
-    return bool(_MCP_GITHUB.match(_mcp_tool_name(tool_name)))
+    parts = _mcp_parts(tool_name)
+    return bool(parts and _MCP_IS_GITHUB.search(parts[0]))
 
 
 def _words(segment: str) -> list[str]:
@@ -222,10 +245,10 @@ def _words(segment: str) -> list[str]:
 def is_github_mcp_create(tool_name: object) -> bool:
     """Does this GitHub MCP tool OPEN a pull request (not review or comment on
     one)? The object must be the pull request itself — the tail of the name."""
-    name = _mcp_tool_name(tool_name)
-    if not _MCP_GITHUB.match(name):
+    parts = _mcp_parts(tool_name)
+    if not parts or not _MCP_IS_GITHUB.search(parts[0]):
         return False
-    words = _words(name.split("__", 2)[-1])
+    words = _words(parts[1])
     if not words or not _CREATE_VERBS.intersection(words):
         return False
     return words[-1] in _PR_HEADS or words[-2:] in _PR_TAILS

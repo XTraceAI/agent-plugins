@@ -139,6 +139,13 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("curl https://api.github.com/repos/O/R/pulls/12", "pull_item", False),
         ("curl -X POST https://api.github.com/repos/O/R/pulls/12", "pull_item", True),
         ("gh api --method POST repos/o/r/pulls -f title=x", "pulls_collection", True),
+        # `gh api --help`: "To send the parameters as a GET query string
+        # instead, use --method GET" — a documented LISTING that carries `-f`.
+        # Reading it as a write told a session that had only listed PRs to
+        # record a confirmed self-link (Codex review, PR #182).
+        ("gh api --method GET repos/o/r/pulls -f state=open --jq '.[0].html_url'",
+         "pulls_collection", False),
+        ("gh api --method PATCH repos/o/r/pulls/12 -f title=x", "pull_item", False),
         ("gh api repos/o/r/pulls", "pulls_collection", False),
         ("gh api repos/o/r/pulls/12", "pull_item", False),
         ("curl -X POST https://gh.corp/api/v3/repos/o/r/pulls -d '{}'",
@@ -199,6 +206,14 @@ def test_github_mcp_tools_are_recognised_by_their_server_segment():
         # The server segment still gates everything: a non-GitHub server that
         # happens to expose a create_pull_request tool is not GitHub.
         ("mcp__notes__create_pull_request", False, False),
+        # …but a server whose NAME contains underscores is still GitHub.
+        # `[^_]*` stopped at the first one and rejected every tool from
+        # `github_enterprise`, or from any plugin-provided server — this repo's
+        # own tools arrive as `mcp__plugin_memhub-staging_memhub__…`
+        # (Codex review, PR #182).
+        ("mcp__github_enterprise__create_pull_request", True, True),
+        ("mcp__plugin_github_github__create_pull_request", True, True),
+        ("mcp__github_enterprise__get_pull_request", True, False),
         # The SERVER segment is not GitHub — this is a note-taking tool.
         ("mcp__notes__github_summary", False, False),
         ("Bash", False, False),

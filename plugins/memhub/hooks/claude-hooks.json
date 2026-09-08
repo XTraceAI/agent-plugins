@@ -103,7 +103,7 @@
         ]
       },
       {
-        "matcher": "^(Bash|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$",
+        "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
         "hooks": [
           {
             "type": "command",

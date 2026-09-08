@@ -27,13 +27,16 @@ _GATE_TIMEOUT_S = 1
 _RECALL_TIMEOUT_S = 6
 _ARTIFACT_TIMEOUT_S = 7
 _PR_LINK_TIMEOUT_S = 15
-# The SERVER segment names GitHub — the same anchor pr_link uses, so a tool
-# called `mcp__notes__github_summary` is not mistaken for a GitHub client.
+# A GitHub MCP server — the same coarse test the hook manifests use, so a tool
+# called `mcp__notes__github_summary` is not mistaken for a GitHub client while
+# a server whose name contains underscores (`github_enterprise`, or any
+# plugin-provided one) still dispatches. `pr_link.is_github_mcp_tool` is the
+# precise gate; this only decides whether the trigger runs at all.
 # Only the plugin-bundled manifest (hooks/codex-hooks.json) dispatches these;
 # the compatibility bridge in references/codex-hooks-bridge.json still lists
 # shell and edit tools only, because widening it costs the user a re-trust of
 # a file already in ~/.codex/hooks.json.
-_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__[^_]*github[^_]*__")
+_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
 
 
 def _version_key(path: Path) -> tuple:

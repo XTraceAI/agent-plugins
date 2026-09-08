@@ -50,12 +50,14 @@ _ALL_TOOLS = "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_s
 # PostToolUse also carries the PR-link check, which fires on GitHub MCP tool
 # calls as well as shell ones. The SERVER segment must name GitHub — the same
 # anchor pr_link.py uses — so a tool called `mcp__notes__github_summary` never
-# starts the dispatcher. Only this bundled manifest is widened: the
+# starts the dispatcher. It is deliberately coarse about WHERE "github" sits,
+# because the server segment can contain underscores — `github_enterprise`, or any plugin-provided server such as `plugin_github_github`; `pr_link.is_github_mcp_tool` is the precise gate and
+# this only decides whether a process starts at all. Only this bundled manifest is widened: the
 # compatibility bridge in references/codex-hooks-bridge.json is a file the user
 # already trusted in ~/.codex/hooks.json, and widening it would cost a
 # re-trust for a detection they can do with /memhub:link-pr.
 _POST_TOOLS = ("^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|"
-               "local_shell|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$")
+               "local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$")
 
 
 # Claude-only capture scripts: they read Claude's transcript store and must
