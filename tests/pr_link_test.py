@@ -124,6 +124,27 @@ def test_the_widened_regex_is_never_narrower_than_the_babysit_one():
             check(f"agreement: {command!r}", pr_link.is_gh_pr_command(command))
             check(f"agreement (create): {command!r}", pr_link.is_gh_pr_create(command))
 
+    # Both modules carry their own copy of strip_heredocs — pr_babysit_trigger
+    # is a hook entry point and a cross-hook import is a coupling neither
+    # wants. Pin them to the same answers so the copies cannot drift.
+    for command in (
+        "gh pr create --body-file - <<'EOF'\n## Bug\nIt doesn't work.\nEOF\n",
+        "python3 - <<'PY'\nprint('gh pr create')\nPY\n",
+        "git commit -F - <<'MSG'\nfix: gh pr create noise\nMSG\n",
+        "cmd <<'A' <<'B'\naaa\nA\nbbb\nB\ngh pr create",
+        "echo $((2 << 3))\ngh pr create --fill",
+        "cat <<'EOF'\nunterminated\n",
+        "gh pr create --fill",
+    ):
+        check(f"strip_heredocs agrees: {command[:38]!r}",
+              pr_link.strip_heredocs(command) == pr_babysit_trigger.strip_heredocs(command),
+              repr((pr_link.strip_heredocs(command),
+                    pr_babysit_trigger.strip_heredocs(command))))
+        check(f"is_pr_create agrees: {command[:38]!r}",
+              pr_babysit_trigger.is_pr_create(command) == pr_link.is_gh_pr_create(command),
+              repr((pr_babysit_trigger.is_pr_create(command),
+                    pr_link.is_gh_pr_create(command))))
+
 
 def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
     cases = [
@@ -392,14 +413,19 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         got = pr_link.github_api_call(command)
         check(f"api: {command[:52]!r}", got == (target, is_write), repr(got))
 
-    # A POST to the COLLECTION opens a PR; a POST to pulls/<n> is an edit.
-    check("only a write to the collection creates a PR",
-          pr_link.creates_pr("Bash", {"command":
-              "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'"})
-          and not pr_link.creates_pr("Bash", {"command":
-              "curl -X POST https://api.github.com/repos/o/r/pulls/12 -d '{}'"})
-          and not pr_link.creates_pr("Bash", {"command":
-              "gh api repos/o/r/pulls"}))
+    # An HTTP client is never a CREATION any more — B1 is `gh pr create` and
+    # the GitHub MCP create tool only. Recognising a POST across
+    # curl/wget/httpie/xh meant parsing four option grammars to find a method
+    # and a body, and B1's failure mode is an authorship claim nobody can
+    # withdraw. These still ADDRESS GitHub, so they reach B2, where the model
+    # judges — the safe direction.
+    for command in ("curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+                    "curl -X POST https://api.github.com/repos/o/r/pulls/12 -d '{}'",
+                    "gh api --method POST repos/o/r/pulls -f title=x",
+                    "gh api repos/o/r/pulls"):
+        check(f"an HTTP write is B2, not B1: {command[:44]!r}",
+              pr_link.touches_github("Bash", {"command": command})
+              and not pr_link.creates_pr("Bash", {"command": command}))
 
 
 def test_github_mcp_tools_are_recognised_by_their_server_segment():
@@ -553,9 +579,9 @@ def test_a_quoted_api_target_is_still_found_but_a_quoted_mention_is_not():
         'curl -X POST "https://api.github.com/repos/o/r/pulls" -d \'{"title":"x"}\'',
         "gh api --method POST 'repos/o/r/pulls' -f title=x",
     ):
-        check(f"a quoted target still creates: {command[:44]!r}",
-              pr_link.creates_pr("Bash", {"command": command})
-              and pr_link.touches_github("Bash", {"command": command}))
+        check(f"a quoted target is still a GitHub call: {command[:44]!r}",
+              pr_link.touches_github("Bash", {"command": command})
+              and not pr_link.creates_pr("Bash", {"command": command}))
     for command in (
         'grep "https://api.github.com/repos/o/r/pulls" f',
         'echo "https://api.github.com/repos/o/r/pulls"',
@@ -709,8 +735,10 @@ def test_curl_next_is_a_second_request_not_a_second_flag():
           pr_link.touches_github("Bash", {"command": command}))
     check("…but cannot claim to have opened the PR that came back",
           not pr_link.creates_pr("Bash", {"command": command}))
-    check("a single-operation POST is unaffected",
-          pr_link.creates_pr("Bash", {"command":
+    check("a single-operation POST addresses GitHub but never self-links",
+          pr_link.touches_github("Bash", {"command":
+              "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'"})
+          and not pr_link.creates_pr("Bash", {"command":
               "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'"}))
 
 
@@ -825,10 +853,12 @@ def test_b1_needs_the_url_to_be_provably_the_creates_own():
                     "cd .. && gh pr create --fill",
                     "cd /repo; gh pr create --fill",
                     "(cd sub && gh pr create)",
-                    "echo hi; curl -X POST https://api.github.com/repos/o/r/pulls -d @b",
                     "git add -A && git commit -m x && gh pr create --fill"):
         check(f"…and a create still links: {command[:44]!r}",
               pr_link.creates_pr("Bash", {"command": command}))
+    check("a curl POST behind a separator is B2 like every other curl POST",
+          not pr_link.creates_pr("Bash", {"command":
+              "echo hi; curl -X POST https://api.github.com/repos/o/r/pulls -d @b"}))
 
 
 def test_an_ambiguous_multi_target_call_can_never_self_link():
@@ -1147,6 +1177,107 @@ def test_context_for_call_wires_the_gates_together():
           pr_link.context_for_call("Bash", {"command": "gh pr list"},
                                    {"stdout": "nothing here"}, "s1",
                                    checker=checker) is None)
+
+
+def test_a_heredoc_body_is_prose_not_command_text():
+    """The shape 100% of real `gh pr create` calls actually have.
+
+    Measured over 15,134 tool calls in 150 real sessions: every genuine
+    creation carries its body as a heredoc, and reading that body as command
+    text failed in BOTH directions — four real creations went undetected
+    because the body's apostrophes made `QUOTED` blank the `gh pr create` that
+    followed the terminator, and 19 non-creations matched because their body
+    merely contained the words.
+    """
+    real = ("cat > /tmp/pr.md <<'EOF'\n"
+            "## The bug\n\nIt doesn't restore the user's previous choice.\n"
+            "EOF\n"
+            "gh pr create --base staging --head fix/x --body-file /tmp/pr.md\n")
+    check("a create after a heredoc whose prose has apostrophes is still a create",
+          pr_link.is_gh_pr_create(real) and pr_link.creates_pr("Bash", {"command": real}))
+
+    inline = ("gh pr create --base staging --head fix/x --body-file - <<'EOF'\n"
+              "## The bug\n\nIt doesn't work; the user's branch isn't found.\n"
+              "EOF\n")
+    check("…and so is the inline --body-file - form",
+          pr_link.creates_pr("Bash", {"command": inline}))
+
+    for command, why in (
+        ("python3 - <<'PY'\nprint('gh pr create --fill')\nPY\n", "a python heredoc"),
+        ("git commit -F - <<'MSG'\nfix: stop gh pr create from firing\nMSG\n",
+         "a commit message"),
+        ("cat > notes.md <<'EOF'\nRun gh pr create when ready.\nEOF\n", "a written note"),
+    ):
+        check(f"{why} that merely NAMES the command is not one",
+              not pr_link.is_gh_pr_create(command)
+              and not pr_link.creates_pr("Bash", {"command": command}))
+
+    check("a heredoc that is never terminated does not swallow the whole command",
+          pr_link.strip_heredocs("gh pr create --fill\ncat <<'EOF'\nunterminated")
+          .startswith("gh pr create --fill"))
+    check("`2 << 3` is arithmetic, not a heredoc",
+          pr_link.strip_heredocs("echo $((2 << 3))\ngh pr create --fill")
+          == "echo $((2 << 3))\ngh pr create --fill")
+    check("one line can open two heredocs",
+          pr_link.strip_heredocs("cmd <<'A' <<'B'\naaa\nA\nbbb\nB\ngh pr create")
+          == "cmd <<'A' <<'B'\ngh pr create")
+
+
+def test_a_heredoc_create_is_GUARDED_not_waved_through():
+    """The guard has to see the command, and until the body came out it could
+    not.
+
+    `shlex` raises on a heredoc body's unbalanced prose quotes, so
+    `_tokens` returned None and `creates_pr` fell back to the bare regex —
+    which skips `_url_source_is_certain` entirely. Measured over 15,134 real
+    tool calls: 20 of 20 B1 decisions were taken with the ordering guard never
+    running, including on `… 2>&1 | tail -5` forms where a pipeline hides a
+    failed create whose stderr carries the EXISTING pull request's URL.
+
+    So this is deliberately NOT "more creations get linked". It is "the ones
+    that do were checked". A pipeline still declines to B2, where the model
+    judges — and a session that just opened the pull request answers that
+    correctly anyway.
+    """
+    body = "\n## The bug\n\nIt doesn't work; the user's branch isn't found.\nEOF\n"
+    plain = "gh pr create --base s --head f --body-file - <<'EOF'" + body
+    piped = "gh pr create --base s --head f --body-file - <<'EOF' 2>&1 | tail -5" + body
+    chained = "cd /repo && gh pr create --base s --head f --body-file - <<'EOF'" + body
+
+    check("a heredoc create now TOKENISES, so the guard runs at all",
+          pr_link._tokens(plain) is not None)
+    check("a plain heredoc create is certain, and links",
+          pr_link._url_source_is_certain(plain)
+          and pr_link.creates_pr("Bash", {"command": plain}))
+    check("a separator BEFORE the create still links",
+          pr_link.creates_pr("Bash", {"command": chained}))
+    check("a pipeline hides a failed create, so it declines to B2",
+          not pr_link._url_source_is_certain(piped)
+          and not pr_link.creates_pr("Bash", {"command": piped}))
+    check("…and it still counts as addressing GitHub, so B2 gets it",
+          pr_link.touches_github("Bash", {"command": piped}))
+
+
+def test_the_url_gh_reports_is_structural_not_prose_it_quotes():
+    """`gh pr view N --json body -q .body` prints a pull-request BODY, which
+    anyone with write access to that repository composed. Accepting any PR URL
+    in it let that text choose the pull request this session gets pointed at,
+    on a host of the author's choosing (Codex review follow-up, PR #182)."""
+    def reported(text):
+        return pr_link._gh_reported_pr_url({"stdout": text, "stderr": ""})
+
+    check("a URL alone on its line is gh reporting it",
+          reported("https://ghe.corp/o/r/pull/12\n") == "https://ghe.corp/o/r/pull/12")
+    check("…so is a `key:\\tvalue` field, which is gh pr view's table",
+          reported("title:\tX\nurl:\thttps://ghe.corp/o/r/pull/12\n")
+          == "https://ghe.corp/o/r/pull/12")
+    check("a URL cited mid-sentence in a body is NOT",
+          reported("This supersedes https://github.com/evil/repo/pull/777 — see there.\n")
+          is None)
+    check("…on any host, including one the reader has never seen",
+          reported("obsoletes https://evil.tld/a/b/pull/1 entirely\n") is None)
+    check("two reported URLs still silence it",
+          reported("https://ghe.corp/o/r/pull/1\nhttps://ghe.corp/o/r/pull/2\n") is None)
 
 
 if __name__ == "__main__":

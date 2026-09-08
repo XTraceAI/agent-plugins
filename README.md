@@ -354,16 +354,34 @@ question and injects one instruction. There are three answers:
 - the org has no GitHub integration connected → the agent mentions once, and
   only if it isn't intrusive, that connecting GitHub is what links sessions to
   the code that shipped;
-- **this call opened the pull request** → the session links itself,
-  unconditionally. Opening a PR is itself work the session did, so no
-  authorship question is asked; a PR has many sessions and linking one
-  displaces none;
+- **this call ran `gh pr create`** (or the GitHub MCP create tool), and the
+  command is one where the returned URL provably came from that create → the
+  session links itself, unconditionally. Opening a PR is itself work the
+  session did, so no authorship question is asked; a PR has many sessions and
+  linking one displaces none;
 - **any other GitHub call naming one PR** → the agent decides. It links only if
   it wrote that code in this session, and otherwise offers
   `/memhub:find-contributing-sessions`.
 
-So **a session that opens a PR always links itself**, and **linking is
-otherwise never automatic for work this session did not do** — the agent
+Unconditional self-linking is deliberately the **narrow** lane. A hand-rolled
+`curl -X POST …/pulls` is not treated as a creation: recognising a write meant
+parsing the option grammar of four HTTP clients to find a method and a body,
+and getting that wrong makes an authorship claim nobody can withdraw. Measured
+across 15,134 tool calls from 150 real sessions, that layer decided nothing —
+every genuine creation was a `gh pr create`. So a `curl` POST lands in the
+judged lane instead, which is the safe direction.
+
+The same conservatism applies to the shell around the create. A pipeline hides
+a failed `gh pr create` — whose stderr carries the *existing* PR's URL — so
+`gh pr create … 2>&1 | tail -5` declines to the judged lane rather than
+claiming authorship. **Heredoc bodies are removed before any of this is
+decided**: `--body-file - <<'EOF'` is how essentially every real PR body is
+written, and reading that prose as command text used to break both directions
+at once — a body's apostrophes hid the real `gh pr create` from the parser,
+while a `python3 - <<'PY'` script that merely *mentioned* the words looked like
+one.
+
+So **linking is never automatic for work this session did not do** — the agent
 judges, and offers the finder when the answer is no. The hook is
 stateless and holds no per-PR file: a session↔PR relationship is many-to-many,
 and a dedup file keyed on the PR is exactly what would stop a genuinely new
@@ -379,7 +397,7 @@ design walked away from. `/memhub:link-pr` is one command away.
 
 Per-host coverage differs, because the hosts differ:
 
-| Host | `gh` / `curl` PR creation | GitHub MCP tool | Fallback |
+| Host | `gh pr create` | GitHub MCP tool | Fallback |
 |---|---|---|---|
 | Claude Code | detected | detected | — |
 | Codex (plugin hooks) | detected | detected | — |

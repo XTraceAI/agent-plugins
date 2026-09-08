@@ -26,8 +26,39 @@ GH_PR_CREATE = re.compile(
 )
 
 
+# A heredoc BODY is prose, not command text. `python3 - <<'PY' … PY` and
+# `git commit -F - <<'MSG' … MSG` whose body merely contains the words
+# `gh pr create` armed a babysit loop on whatever pull request the output
+# happened to name — 19 such commands in a 15,134-call sample of real
+# sessions. Kept byte-identical to pr_link.strip_heredocs and pinned by a
+# shared-corpus agreement test; not imported, because this module is a hook
+# entry point and a cross-hook import is a coupling neither wants.
+MAX_HEREDOC_SCAN_CHARS = 256 * 1024
+# An identifier tag only: `2 << 3` is arithmetic, not a heredoc.
+HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def strip_heredocs(command: str) -> str:
+    """The command with every heredoc BODY removed, the opening line kept."""
+    if "<<" not in command:
+        return command
+    lines = command[:MAX_HEREDOC_SCAN_CHARS].split("\n")
+    kept = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for match in HEREDOC_OPEN.finditer(line):
+            tag = match.group(2)
+            while index < len(lines) and lines[index].strip() != tag:
+                index += 1
+            index += 1
+    return "\n".join(kept)
+
+
 def is_pr_create(command: str) -> bool:
-    return bool(GH_PR_CREATE.search(QUOTED.sub(" ", command)))
+    return bool(GH_PR_CREATE.search(QUOTED.sub(" ", strip_heredocs(command))))
 
 
 def main() -> None:

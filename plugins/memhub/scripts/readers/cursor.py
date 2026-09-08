@@ -380,37 +380,6 @@ def _model_of(obj) -> str | None:
     return (po.get("cursor") or {}).get("modelName") if isinstance(po, dict) else None
 
 
-def _result_failed(raw: object) -> bool:
-    """Whether a host's tool-result payload says the call FAILED.
-
-    Emitted as canonical `is_error`, which is the field Claude's own
-    transcripts carry — so this makes these readers MORE like the shape every
-    consumer already expects, not less. Only a clear signal counts; an
-    unreadable payload is not treated as a failure.
-    """
-    if isinstance(raw, str):
-        text = raw.lstrip()
-        if not text.startswith(("{", "[")):
-            return False
-        try:
-            raw = json.loads(text)
-        except (ValueError, TypeError):
-            return False
-    if not isinstance(raw, dict):
-        return False
-    for key in ("is_error", "isError", "error"):
-        if raw.get(key) is True:
-            return True
-    if raw.get("success") is False:
-        return True
-    for holder in (raw, raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}):
-        for key in ("exit_code", "exitCode", "status"):
-            code = holder.get(key)
-            if type(code) is int and code != 0:
-                return True
-    return False
-
-
 def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                   session_id: str, cwd: str | None, model_hint: str | None,
                   created_ts: str | None) -> tuple[list[dict], dict]:
@@ -523,18 +492,14 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                 if not isinstance(b, dict) or b.get("type") != "tool-result":
                     continue
                 result = b.get("result")
-                failed = _result_failed(result) or _result_failed(b)
                 if not isinstance(result, str):
                     result = _text_of(b.get("experimental_content")) or (
                         json.dumps(result) if result is not None else "")
-                block = {
+                out.append(user([{
                     "type": "tool_result",
                     "tool_use_id": b.get("toolCallId") or f"cursor-out-{len(out)}",
                     "content": result,
-                }
-                if failed:
-                    block["is_error"] = True
-                out.append(user([block]))
+                }]))
 
     meta = {"session_id": session_id, "cwd": cwd, "model": model,
             "title": title, "host": HOST}

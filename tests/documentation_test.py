@@ -94,9 +94,16 @@ def test_the_finder_collects_facts_from_the_pr_it_was_given() -> None:
 
 def test_readme_explains_session_pr_linking_and_its_per_host_gaps() -> None:
     for text in (
-        # The two properties a user has to be able to trust.
-        "a session that opens a PR always links itself",
-        "linking is otherwise never automatic for work this session did not do",
+        # The properties a user has to be able to trust. The old README
+        # promised "a session that opens a PR always links itself" — that
+        # claim was retired: unconditional self-linking now requires a
+        # `gh pr create` whose returned URL provably came from it, and every
+        # other shape falls to the judged lane. Over-promising here is worse
+        # than the narrower guarantee, because the failure it hid is an
+        # authorship claim nobody can withdraw.
+        "Unconditional self-linking is deliberately the **narrow** lane",
+        "linking is never automatic for work this session did not do",
+        "Heredoc bodies are removed before any of this is decided",
         # The undetected paths, said out loud rather than left to be discovered.
         "is not detected, deliberately",
         "Cursor links a session to a pull request with `/memhub:link-pr`",

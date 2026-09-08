@@ -110,17 +110,41 @@ def _home():
     return tempfile.mkdtemp(prefix="memhub-prlink-hook-")
 
 
+def test_an_http_post_to_the_pulls_collection_is_B2_not_B1():
+    """B1 is `gh pr create` and the MCP create tool only.
+
+    Recognising a POST across curl/wget/httpie/xh meant parsing four option
+    grammars to find a method and a body, and getting it wrong makes an
+    authorship claim nobody can withdraw. Over 15,134 real tool calls that
+    layer decided nothing: every real creation was a `gh pr create`. So this
+    still reaches the hook — it addresses GitHub and names one pull request —
+    but it lands in B2, where the model judges whether it wrote the code.
+    """
+    FAKE.reply = dict(CONNECTED)
+    body = payload("curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+                   response={"stdout": json.dumps({
+                       "html_url": PR,
+                       "issue_url": "https://api.github.com/repos/o/r/issues/7"}),
+                       "stderr": ""})
+    rc, out = run(body, home=_home())
+    ctx = context(out)
+    check("a curl POST still reaches the hook", rc == 0 and PR in ctx, out)
+    # B1 and B2 both name `link_source="session_self"` — B2 only inside its
+    # conditional. What separates them is the opener and the conditional
+    # itself, so assert on those rather than on a substring both share.
+    check("…but never claims this session opened it",
+          not ctx.startswith("MemHub: you just opened"), ctx)
+    check("…it asks the model to judge instead",
+          ctx.startswith("MemHub: a pull request is in play")
+          and "IF THE CODE IN THIS PULL REQUEST WAS WRITTEN IN THIS SESSION" in ctx
+          and "IF IT WAS NOT" in ctx, ctx)
+
+
 def test_a_create_gets_the_unconditional_self_link():
     FAKE.reply = dict(CONNECTED)
     for label, body in (
         ("gh pr create", payload("gh pr create --fill")),
         ("a chained create", payload("cd .. && gh pr create")),
-        ("a curl POST to the pulls collection",
-         payload("curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
-                 response={"stdout": json.dumps({
-                     "html_url": PR,
-                     "issue_url": "https://api.github.com/repos/o/r/issues/7"}),
-                     "stderr": ""})),
         ("a GitHub MCP create tool",
          payload(tool="mcp__github__create_pull_request",
                  tool_input={"title": "x", "head": "f", "base": "main"},

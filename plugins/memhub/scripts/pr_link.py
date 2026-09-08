@@ -167,9 +167,16 @@ def _tokens(command: str) -> list[str] | None:
 
     None means "cannot read the flags", and the caller treats that as "do not
     infer a write" — an unbalanced quote must never manufacture a create.
+
+    Heredoc bodies come out FIRST. A body is prose, and prose has unbalanced
+    quotes, so `gh pr create --body-file - <<'EOF' … EOF` — the shape every
+    real creation has — raised out of shlex and took the unparseable fallback,
+    which skips `_url_source_is_certain` entirely. Measured over 15,134 real
+    tool calls: 20 of 20 B1 decisions were made without the ordering guard
+    ever running. Stripping the body first is what puts them back under it.
     """
     try:
-        lexer = shlex.shlex(command[:MAX_COMMAND_CHARS], posix=True,
+        lexer = shlex.shlex(strip_heredocs(command)[:MAX_COMMAND_CHARS], posix=True,
                             punctuation_chars=_SHELL_PUNCTUATION)
         lexer.whitespace_split = True
         lexer.commenters = ""
@@ -368,15 +375,65 @@ _NOT_THE_PR = frozenset({
 MAX_COMMAND_CHARS = pr_provenance.MAX_COMMAND_CHARS
 
 
-def _unquoted(command: object) -> str:
-    """The command with quoted segments BLANKED, bounded like pr_provenance.
+# A heredoc BODY is prose, not command text, and reading it as command text
+# fails in BOTH directions — measured over 15,134 real tool calls:
+#
+#   * `cat > pr.md <<'EOF' … EOF` then `gh pr create --body-file pr.md`: the
+#     body's unbalanced apostrophes ("doesn't", "user's") make `QUOTED` below
+#     blank the REAL `gh pr create` that follows the terminator. Four genuine
+#     creations produced no context at all because `is_gh_pr_create` answered
+#     False on a command that plainly runs it.
+#   * `python3 - <<'PY' … PY` and `git commit -F - <<'MSG' … MSG` whose body
+#     merely CONTAINS the text `gh pr create`: 19 such commands matched. They
+#     are stopped today only by the exactly-one-URL rule downstream — and they
+#     do fire `pr_babysit_trigger`, which has no such rule.
+#
+# Bounded well above MAX_COMMAND_CHARS on purpose: a PR body of a few tens of
+# KB pushes the `gh pr create` that follows it past the cap, so the body has to
+# come out BEFORE the command is truncated, not after.
+MAX_HEREDOC_SCAN_CHARS = 256 * 1024
+# An identifier tag only: `2 << 3` is arithmetic, not a heredoc.
+_HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
-    This is the text every command-position question is asked of, because
-    blanking is what stops `grep "gh pr view"` from looking like a `gh` call.
+
+def strip_heredocs(command: str) -> str:
+    """The command with every heredoc BODY removed, the opening line kept.
+
+    Line-oriented, which is the shape a heredoc has: the body runs from the
+    line after the one that opened it to a line holding the terminator alone.
+    A terminator sharing a line with other code is not handled — bash does not
+    accept that either.
+    """
+    if "<<" not in command:
+        return command
+    lines = command[:MAX_HEREDOC_SCAN_CHARS].split("\n")
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        # One line can open several (`cmd <<'A' <<'B'`); bash reads them in
+        # the order they appear.
+        for match in _HEREDOC_OPEN.finditer(line):
+            tag = match.group(2)
+            while index < len(lines) and lines[index].strip() != tag:
+                index += 1
+            index += 1                     # the terminator line goes too
+    return "\n".join(kept)
+
+
+def _unquoted(command: object) -> str:
+    """The command with heredoc bodies REMOVED and quoted segments BLANKED,
+    bounded like pr_provenance.
+
+    This is the text every command-position question is asked of. Blanking is
+    what stops `grep "gh pr view"` from looking like a `gh` call; stripping is
+    what stops a heredoc body from doing either half of that damage.
     """
     if not isinstance(command, str) or not command:
         return ""
-    return QUOTED.sub(" ", command[:MAX_COMMAND_CHARS])
+    return QUOTED.sub(" ", strip_heredocs(command)[:MAX_COMMAND_CHARS])
 
 
 def is_gh_pr_command(command: object) -> bool:
@@ -1153,8 +1210,15 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
             # authorship of THAT one.
             return False
         return subs[0] in _GH_CREATE_SUBS
-    target, is_write = github_api_call(command)
-    return target == "pulls_collection" and is_write
+    # An HTTP client POSTing to a pulls collection is NOT treated as a
+    # creation. Recognising a write across curl/wget/httpie/xh meant parsing
+    # each client's option grammar to find its method and body, and B1's
+    # failure mode is an authorship claim nobody can withdraw. Measured over
+    # 15,134 real tool calls, that layer decided nothing: every real creation
+    # is a `gh pr create`, and none of them reached B1 through the HTTP path.
+    # A `curl -X POST .../pulls` now falls to B2, where the model judges —
+    # the safe direction — and `/memhub:link-pr` covers it explicitly.
+    return False
 
 
 def _call_failed(tool_response: object) -> bool:
@@ -1225,15 +1289,26 @@ def _gh_reported_pr_url(tool_response: object) -> str | None:
     read is gh's own output about the repository it just acted on, not the
     stdout of an arbitrary program. The exactly-one rule still applies, so a
     second URL from anywhere silences it.
+
+    But "gh's own output" is not the same as "written by gh": `gh pr view N
+    --json body -q .body` prints a pull-request BODY, and a body saying "this
+    supersedes https://github.com/evil/repo/pull/777" would otherwise choose
+    the pull request this session gets pointed at — on a host of the author's
+    choosing. So only a URL gh reports STRUCTURALLY counts: alone on its line,
+    or as the value of a `key:` field, which is how `gh pr create` and
+    `gh pr view` print one. A URL cited mid-sentence in prose does not.
     """
     texts = _response_texts(tool_response)
     if texts is None:
         return None
     found: list[str] = []
     for text in texts:
-        for match in _ANY_HOST_PR_RE.finditer(
-                text[:pr_provenance.MAX_RESULT_TEXT_BYTES]):
-            host, owner, repo, number = match.groups()
+        for line in text[:pr_provenance.MAX_RESULT_TEXT_BYTES].splitlines():
+            match = _GH_REPORTED_LINE.match(line.strip())
+            if match is None:
+                continue
+            host, owner, repo, number = match.group("host"), match.group("owner"), \
+                match.group("repo"), match.group("number")
             url = f"https://{host.lower()}/{owner.lower()}/{repo.lower()}/pull/{int(number)}"
             if url not in found:
                 found.append(url)
@@ -1241,6 +1316,14 @@ def _gh_reported_pr_url(tool_response: object) -> str | None:
                 return None
     return found[0] if len(found) == 1 else None
 
+
+# gh prints the URL it is reporting either alone on a line (`gh pr create`,
+# `gh pr view --json url -q .url`) or as a `key:\tvalue` field (`gh pr view`'s
+# default table). Prose cites a URL mid-sentence, and that is the difference.
+_GH_REPORTED_LINE = re.compile(
+    r"^(?:[\w.-]+:\s*)?"
+    r"https?://(?P<host>[\w.-]+)/(?P<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})"
+    r"/(?P<repo>[A-Za-z0-9_.-]{1,100})/pull/(?P<number>[1-9][0-9]*)/?$")
 
 _HTML_URL_RE = re.compile(
     r'"html_url"\s*:\s*"(https://([\w.-]+)/[A-Za-z0-9][A-Za-z0-9-]{0,38}'

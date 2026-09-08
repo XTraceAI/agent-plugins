@@ -159,7 +159,8 @@ True when the command invokes `gh` **at command position** with `pr` as its subc
 `gh pr …`, not just `create`. Build it from `pr_babysit_trigger.GH_PR_CREATE` by replacing the
 trailing `\bpr\s+create\b` with `\bpr\b`, keeping everything else:
 
-- quoted segments stripped first (`QUOTED`), so `grep "gh pr view"` never matches;
+- **heredoc bodies removed first** (`strip_heredocs`), then quoted segments stripped
+  (`QUOTED`), so `grep "gh pr view"` never matches;
 - `gh` only after a start, `;`, `&`, `|`, backtick, newline, `(`, or `$(`;
 - leading `VAR=…`, `env`, `sudo`, `nohup`, `command`, `exec`, `timeout` and their flags tolerated;
 - flags allowed between `gh` and `pr`, but never across a separator.
@@ -171,6 +172,36 @@ both modules agree on a shared corpus of commands (§10).
 
 Deliberately **no subcommand allowlist.** `gh pr list` and `gh pr status` are excluded by §4.2's
 "exactly one URL" rule, not by naming subcommands — a rule that keeps working when `gh` adds one.
+
+#### Heredoc bodies are prose, not command text
+
+A heredoc **body** must come out of the command before any command-position question is asked of
+it — and before `shlex` sees it. This is not an edge case; it is the shape essentially every real
+`gh pr create` has, because the PR body is written with `--body-file - <<'EOF'`. Measured over
+15,134 tool calls in 150 real sessions, reading the body as command text failed in **both**
+directions:
+
+- **False negatives.** A body's ordinary apostrophes (`doesn't`, `user's`) leave `QUOTED` with an
+  unbalanced run, which blanks the real `gh pr create` that follows the terminator. Four genuine
+  creations produced no context at all.
+- **False positives.** `python3 - <<'PY' … PY` and `git commit -F - <<'MSG' … MSG` whose body
+  merely *contains* the words `gh pr create` matched — 19 commands in the corpus. Downstream,
+  §4.2's exactly-one-URL rule stopped them reaching B1, but `pr_babysit_trigger` has no such rule
+  and armed a babysit loop on them. Both modules therefore carry `strip_heredocs`, pinned
+  byte-identical by the agreement test in §10.
+- **Guards that never ran.** `shlex` raises on the same unbalanced prose, so `_tokens` returned
+  `None` and `creates_pr` fell back to the bare regex — which skips §4.4's ordering guard
+  entirely. **20 of 20** B1 decisions in the corpus were taken with that guard never running,
+  including on `… 2>&1 | tail -5` forms where a pipeline hides a failed create whose stderr
+  carries the *existing* pull request's URL. Stripping the body first is what puts them back
+  under it, and the visible consequence is that fewer calls reach B1 — correctly. The rest land
+  in B2, where a session that just opened the pull request answers the authorship question
+  correctly anyway.
+
+`strip_heredocs` is line-oriented, matching how a heredoc actually works: the body runs from the
+line after the one that opened it to a line holding the terminator alone. An identifier tag is
+required, so `2 << 3` is arithmetic rather than a heredoc opener. A terminator sharing a line with
+other code is not handled — bash does not accept that either.
 
 ### 4.1b `is_gh_pr_create(command: str) -> bool`
 
@@ -186,9 +217,9 @@ rejects would mean a `gh pr create` that never reaches the hook at all.
 
 ### 4.1c The other ways an agent opens a pull request
 
-`gh pr create` is the common path, not the only one. Each of these must reach the same B1
-context, or a session that opened a PR silently fails to link itself — and the user has no way to
-tell that happened.
+`gh pr create` is the common path. It is **the only shell path that reaches B1** — see the
+REVISED note below — but the others below must still reach `touches_github`, so they land in B2
+rather than vanishing.
 
 **1. The REST API from a shell command** (`curl`, `http`, `wget`, `xh`, or `gh api`):
 
@@ -203,18 +234,28 @@ gh api --method POST repos/OWNER/REPO/pulls -f title=… -f head=… -f base=mai
 
 `github_api_call(command)` → `("pulls_collection" | "pull_item" | None, is_write)`:
 
-- Strip quoted segments first (as §4.1a does), then look for a GitHub API target:
-  `https://api.github.com/repos/<owner>/<repo>/pulls` or, for `gh api`, a bare
+- Strip heredoc bodies and quoted segments first (as §4.1a does), then look for a GitHub API
+  target: `https://api.github.com/repos/<owner>/<repo>/pulls` or, for `gh api`, a bare
   `repos/<owner>/<repo>/pulls` path argument. A trailing `/<number>` (or `/<number>/…`) makes it
   `pull_item`; the bare collection is `pulls_collection`. Enterprise hosts count too: accept any
   `https://<host>/api/v3/repos/…` and `gh api --hostname <host>`.
-- `is_write` when the command carries `-X POST` / `--request POST` / `--method POST` / `-XPOST`,
-  or (for `gh api`) any of `-f`/`--field`/`--raw-field`/`--input`, or (for `curl`) `-d`/`--data*`
-  without an explicit non-POST method. `curl` with `-d` and no `-X` **is** a POST — that is the
-  example in the wild, and reading it as a GET would miss every hand-rolled PR creation.
-- **`creates_pr` = `pulls_collection` AND `is_write`.** A POST to the *collection* is what opens a
-  PR; a POST to `pulls/<n>` is an edit, and a GET of either is B2 territory.
-- `touches_github` = any GitHub API target at all, read or write.
+- `touches_github` = any GitHub API target at all, read or write. **This is all the REST lane
+  decides.**
+
+**REVISED — a REST call is B2, never B1.** This section originally made an HTTP POST to the pulls
+collection a creation, which required reading a method and a body out of four different option
+grammars (`curl`, `wget`, HTTPie, `xh`, plus `gh api`). That was measured against 15,134 tool
+calls from 150 real sessions and **decided nothing**: every genuine creation in the corpus was a
+`gh pr create`, and not one reached B1 through the HTTP path. Against that, B1's failure mode is
+an authorship claim nobody can withdraw — two review findings (an unparseable command inferred as
+a creation; `curl -sX GET … -d @body` read as a POST because the bundled short run hid the
+method) both lived in exactly that layer.
+
+So `creates_pr` is now **`gh pr create` / `gh pr new` at command position, or the GitHub MCP
+create tool** — nothing else. A `curl -X POST …/pulls` still reaches the hook, still names its
+pull request, and lands in **B2**, where the model judges whether it wrote the code. That is the
+safe direction, and `/memhub:link-pr` covers it explicitly. The option-grammar layer is retained
+only to find the URL among a command's operands; no decision reads `is_write`.
 
 The response body is the PR object, whose `html_url` is the one `github.com/<o>/<r>/pull/<n>`
 string in it — `issue_url`, `comments_url`, `review_comments_url` and `_links` are all
@@ -758,7 +799,8 @@ every `def test_*` to actually be invoked — use `globals()` discovery or list 
   session id, `link_source="session_self"`, and "without asking". It must NOT contain B2's
   "if the code in this pull request was written in THIS session" conditional.
 - the same payload with `cd .. && gh pr create` as the command → still B1.
-- a `curl -X POST …/pulls` payload whose response body is a PR object → **B1**.
+- a `curl -X POST …/pulls` payload whose response body is a PR object → **B2** (see §4.1c:
+  an HTTP client is never a creation; the model judges).
 - an `mcp__github__create_pull_request` payload (tool_name set, no `tool_input.command`) → **B1**.
 - an `mcp__github__get_pull_request` payload → **B2**.
 - a `cat CHANGELOG.md` payload whose output contains one PR URL → **empty stdout**: the gate is
