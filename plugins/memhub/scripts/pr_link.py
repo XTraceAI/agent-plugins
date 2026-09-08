@@ -172,16 +172,49 @@ def _tokens(command: str) -> list[str] | None:
         return None
 
 
+# Long options that take a separate operand. Without consuming them,
+# `curl -H '-XPOST' …` read the HEADER as a method flag and called a GET a
+# creation — the argument of a read-only option must never be interpreted as
+# an option itself.
+_VALUE_LONG_OPTS = frozenset({
+    "--header", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+    "--data-ascii", "--form", "--form-string", "--json", "--url", "--output",
+    "--user", "--user-agent", "--referer", "--cookie", "--cookie-jar",
+    "--dump-header", "--upload-file", "--proxy", "--cert", "--key",
+    "--cacert", "--capath", "--connect-timeout", "--max-time", "--retry",
+    "--range", "--write-out", "--config", "--hostname", "--input",
+    "--field", "--raw-field", "--template", "--jq", "--method", "--request",
+    "--post-data", "--post-file", "--body-data", "--body-file"})
+
+
+def _consumes_operand(token: str) -> bool:
+    """Does this option take the NEXT token as its value?"""
+    if token in _VALUE_LONG_OPTS:
+        return True
+    if token.startswith("--") or not token.startswith("-") or len(token) != 2:
+        return False
+    return token[1] in _CURL_VALUE_OPTS
+
+
 def _explicit_method(tokens: list[str]) -> str | None:
-    """The method the command NAMES, in any spelling, or None."""
-    for index, token in enumerate(tokens):
+    """The method the command NAMES, in any spelling, or None.
+
+    Walked with operand consumption: an option's argument is skipped rather
+    than re-examined, so a header, a body or a filename that happens to look
+    like `-XPOST` is data, not a method.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
         for flag in _METHOD_FLAGS:
             if token == flag and index + 1 < len(tokens):
                 return tokens[index + 1].upper()
             if token.startswith(flag + "="):
                 return token[len(flag) + 1:].upper()
-        if token.startswith("-X") and len(token) > 2:      # -XPOST
+        if (token.startswith("-X") and len(token) > 2
+                and not token.startswith("--")):        # -XPOST
             return token[2:].upper()
+        index += 2 if _consumes_operand(token) else 1
     return None
 
 # The SERVER segment must name GitHub — `mcp__<server>__<tool>`. Matching
@@ -472,14 +505,54 @@ def _url_source_is_certain(command: str) -> bool:
     tokens = _tokens(command)
     if tokens is None:
         return False
-    for index, (op, _segment) in enumerate(_segments_with_ops(tokens)):
-        if not index:
+    segments = _segments_with_ops(tokens)
+    # Only what comes AFTER the creating segment can supply the URL or mask its
+    # status. A separator BEFORE it — `cd /repo; gh pr create` — is harmless,
+    # and rejecting those broke the documented guarantee that the session which
+    # opens a pull request always links itself.
+    creator = _creating_segment_index(segments)
+    if creator is None:
+        return False
+    for index, (op, _segment) in enumerate(segments):
+        if index <= creator:
             continue
         if ">" in op:                      # stdout (or stderr) sent elsewhere
             return False
         if op in (";", "||"):              # runs even if the create failed
             return False
-    return True
+        if op == "|":
+            # Without `set -o pipefail` a pipeline reports the LAST command's
+            # status, so `gh pr create | tee log` exits 0 even when the create
+            # failed because the pull request already exists — and its stderr
+            # still carries THAT pull request's URL. The failed-create guard
+            # cannot see through that, so the pipeline declines instead.
+            return False
+    # A redirect inside the creating segment itself sends its URL away.
+    return ">" not in (segments[creator][0] if creator else "")
+
+
+def _creating_segment_index(segments: list[tuple[str, list[str]]]) -> int | None:
+    """Which simple command opens the pull request, if exactly one does."""
+    found = None
+    for index, (_op, segment) in enumerate(segments):
+        name, args = _command_name(segment)
+        creates = False
+        if name in ("gh", "gh.exe") and "pr" in args:
+            position = args.index("pr")
+            creates = (position + 1 < len(args)
+                       and args[position + 1] in _GH_CREATE_SUBS)
+        elif name in ("gh", "gh.exe") or name in _HTTP_CLIENTS:
+            is_gh_api = name in ("gh", "gh.exe") and "api" in args
+            for operation in _operations(name, args):
+                match = _operation_match(name, operation, is_gh_api=is_gh_api,
+                                         is_http=name in _HTTP_CLIENTS)
+                if match and match[0] == "pulls_collection" and match[1]:
+                    creates = True
+        if creates:
+            if found is not None:
+                return None
+            found = index
+    return found
 
 
 def _gh_pr_subcommands(command: object) -> list[str] | None:

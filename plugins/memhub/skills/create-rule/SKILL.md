@@ -399,9 +399,16 @@ defeat it on its own terms:
 
 **No cached book for this repo** (nothing fetched yet, or no rulebook binds the
 user here) → there is no file to copy: **write one** containing exactly the
-candidate plus a `fetched_at` of now, and record that there was no backup.
-Restore then means *deleting* the file. Nothing is displaced, because nothing
-was there — this is not the §4b.6 escape.
+candidate plus a `fetched_at` of now. Restore then means *deleting* the file.
+Nothing is displaced, because nothing was there — this is not the §4b.6 escape.
+
+**Still leave a marker**: `touch "$BOOK.pretest-absent"` before writing the
+book. §4b.5's recovery looks for `$BOOK.pretest-*`, and with no original to
+back up there would otherwise be nothing on disk saying a test was running — so
+an interruption here would leave a freshly created book holding one unfiled,
+armed candidate that the next run cannot discover. The marker means "delete
+`$BOOK`", where a `pretest-<pid>` backup means "copy it back". Delete the
+marker as part of restoring.
 
 **4b.4 Bracket the ledger around the sub-agent, then run it.** Note the byte
 offset of `<base>/ledger/fires.jsonl` (`<base>` is `$MEMHUB_RULEBOOK_BASE` or
@@ -441,10 +448,15 @@ So **before arming anything**, look for a leftover from a previous run:
 ls "$BOOK".pretest-* 2>/dev/null
 ```
 
-If one exists, restore it over `$BOOK` (and restore or delete `$BOOK.refresh`)
-before doing anything else, and tell the user you found and undid a doctored
-book from an interrupted run — naming the file, because a rule set they did not
-choose was live until you did.
+Two shapes can come back and they mean OPPOSITE things:
+
+- `$BOOK.pretest-<pid>` — a backup of a real book. **Copy it over `$BOOK`.**
+- `$BOOK.pretest-absent` — there was no book before the interrupted run.
+  **Delete `$BOOK`.** Restoring a file here would leave the candidate armed.
+
+Either way, restore or delete `$BOOK.refresh`, remove the marker, and tell the
+user you found and undid a doctored book from an interrupted run — naming the
+file, because a rule set they did not choose was live until you did.
 
 **Evaluate: the ledger first (fact), the transcript second (judgment).**
 

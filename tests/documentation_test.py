@@ -158,7 +158,10 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
                  "must be the sub-agent's rather than the parent's",
                  # An interrupted run leaves a doctored book that SessionStart
                  # deliberately considers fresh — it does not heal itself.
-                 'ls "$BOOK".pretest-*'):
+                 'ls "$BOOK".pretest-*',
+                 # …and the no-original case needs its own marker, or an
+                 # interruption there leaves an armed candidate undiscoverable.
+                 "$BOOK.pretest-absent"):
         check(f"create-rule keeps {text!r}", text in skill)
 
 

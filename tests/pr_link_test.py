@@ -235,6 +235,14 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("gh api repos/o/r/pulls --raw-field=title=x", "pulls_collection", True),
         ("gh api repos/o/r/pulls --input=body.json", "pulls_collection", True),
         ("gh api --method GET repos/o/r/pulls --field=title=x", "pulls_collection", False),
+        # A read-only option's OPERAND must not be read as an option: `-H` takes
+        # a header, and `-XPOST` inside one is data (Codex review, PR #182).
+        ("curl -H '-XPOST' 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        ("curl -H 'X-Y: z' -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        ("curl -XPOST https://api.github.com/repos/o/r/pulls -d @b",
+         "pulls_collection", True),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -487,7 +495,7 @@ def test_a_chained_gh_pr_create_cannot_claim_the_other_prs_url():
               and not pr_link.creates_pr("Bash", {"command": command}))
     for command in ("gh pr create --fill",
                     "cd .. && gh pr create",
-                    "gh pr create --fill | tee log",
+                    # `pr` here is a quoted TITLE value, not the subcommand.
                     'gh pr create --title "pr" --body b'):
         check(f"one create is still a create: {command[:40]!r}",
               pr_link.creates_pr("Bash", {"command": command}))
@@ -576,12 +584,22 @@ def test_b1_needs_the_url_to_be_provably_the_creates_own():
     # `&&` proves the create succeeded, so its URL IS in the output — and a
     # second URL would trip the exactly-one rule into silence anyway. A
     # pipeline carries the create's own stdout onward.
+    # A PIPELINE is not safe after all: without `set -o pipefail` the call
+    # reports the LAST command's status, so `gh pr create | tee log` exits 0
+    # even when the create failed because the PR already exists — and its
+    # stderr still carries THAT pull request's URL (Codex review, PR #182).
+    check("a pipeline can hide a failed create, so it declines",
+          not pr_link.creates_pr("Bash", {"command": "gh pr create --fill | tee log"}))
+    # …while a separator BEFORE the create cannot supply the URL or mask the
+    # status, so it must NOT downgrade — that broke the documented guarantee
+    # that a session opening a pull request always links itself.
     for command in ("gh pr create --fill",
                     "cd .. && gh pr create --fill",
+                    "cd /repo; gh pr create --fill",
                     "(cd sub && gh pr create)",
-                    "git add -A && git commit -m x && gh pr create --fill",
-                    "gh pr create --fill | tee log"):
-        check(f"…but an && chain or pipeline still links: {command[:44]!r}",
+                    "echo hi; curl -X POST https://api.github.com/repos/o/r/pulls -d @b",
+                    "git add -A && git commit -m x && gh pr create --fill"):
+        check(f"…and a create still links: {command[:44]!r}",
               pr_link.creates_pr("Bash", {"command": command}))
 
 
