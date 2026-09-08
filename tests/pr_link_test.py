@@ -317,6 +317,20 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "https://example.test/echo", None, False),
         ("curl -H 'Ref: https://api.github.com/repos/o/r/pulls' "
          "https://api.github.com/repos/o/r/pulls -d '{}'", "pulls_collection", True),
+        # curl's documented `--url <url>`: the destination arrives as an
+        # option's VALUE, which the operand walk correctly skips — so it has to
+        # be read back deliberately (Codex review, PR #182).
+        ("curl --url https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("curl --url https://api.github.com/repos/o/r/pulls -X POST -d '{}'",
+         "pulls_collection", True),
+        ("curl --url=https://api.github.com/repos/o/r/pulls -X POST -d '{}'",
+         "pulls_collection", True),
+        # One curl operation performs one transfer PER URL, so with two of them
+        # nothing says which produced the response.
+        ("curl -X POST -d @body -o /dev/null https://api.github.com/repos/o/a/pulls "
+         "https://example.test/echo", "pulls_collection", False),
+        ("curl -X POST -d @body https://api.github.com/repos/o/a/pulls "
+         "https://api.github.com/repos/o/b/pulls", "pulls_collection", False),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),
@@ -712,6 +726,15 @@ def test_gh_inherited_flags_and_dry_run():
     # have claimed authorship of THAT pull request.
     check("--dry-run is not a creation",
           not pr_link.creates_pr("Bash", {"command": "gh pr create --fill --dry-run"}))
+    # …including when the command will not tokenise at all. ANSI-C quoting
+    # ($'…') defeats shlex, and the guard sat AFTER that fallback returned,
+    # so the dry run claimed authorship of whatever its details mentioned.
+    unparseable = "gh pr create --dry-run --body $'can\\'t x'"
+    check("the command really is unparseable", pr_link._tokens(unparseable) is None)
+    check("…and --dry-run is still not a creation",
+          not pr_link.creates_pr("Bash", {"command": unparseable}))
+    check("…while an unparseable real create still is",
+          pr_link.creates_pr("Bash", {"command": "gh pr create --fill --body $'can\\'t x'"}))
     check("…while a real create is unaffected",
           pr_link.creates_pr("Bash", {"command": "gh pr create --fill"}))
 

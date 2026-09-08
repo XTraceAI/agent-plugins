@@ -566,6 +566,23 @@ def _options_of(args: list[str], client: str = "curl"):
         index += 2 if _consumes_operand(token, client) else 1
 
 
+_LOOKS_LIKE_URL = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+# Options whose VALUE is a destination rather than an ordinary argument.
+_URL_OPTIONS = ("--url",)
+
+
+def _url_option_values(args: list[str]) -> list[str]:
+    """The destinations given through `--url <url>` / `--url=<url>`."""
+    found: list[str] = []
+    for index, token in enumerate(args):
+        if token in _URL_OPTIONS and index + 1 < len(args):
+            found.append(args[index + 1])
+        for flag in _URL_OPTIONS:
+            if token.startswith(flag + "="):
+                found.append(token[len(flag) + 1:])
+    return found
+
+
 def _operands_of(args: list[str], client: str = "curl"):
     """The tokens that are NOT options and NOT an option's value.
 
@@ -829,8 +846,20 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
     "One request" is narrower than one shell command: `curl` takes several in a
     single invocation, separated by `--next`, each with its own options.
     """
+    # Every place a destination can come from: a bare operand, or the value of
+    # curl's documented `--url <url>` (which `_operands_of` correctly skips as
+    # an option's argument, and which therefore hid the endpoint entirely).
+    destinations = list(_operands_of(args, name)) + _url_option_values(args)
+    # curl performs one transfer per URL in a SINGLE operation, so
+    # `curl -X POST -d @body -o /dev/null …/a/pulls https://example.test/echo`
+    # discards the create's response and prints the second transfer's. With
+    # more than one transfer, nothing says which produced the URL that came
+    # back — the same reasoning as `--next` and as two shell segments.
+    transfers = [d for d in destinations if _LOOKS_LIKE_URL.match(d)]
+    ambiguous = len(transfers) > 1
+
     target = number = host = None
-    for arg in _operands_of(args, name):
+    for arg in destinations:
         match = _API_URL.match(arg)
         if match:
             host = (match.group(1) or match.group(5) or "").casefold()
@@ -878,7 +907,7 @@ def _operation_match(name: str, args: list[str], *, is_gh_api: bool,
         write = True
     else:
         write = False
-    return target, write, enterprise
+    return target, (write and not ambiguous), enterprise
 
 
 def _operations(name: str, args: list[str]) -> list[list[str]]:
@@ -1060,7 +1089,13 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
         return False
 
     subs = _gh_pr_subcommands(command)
-    if subs is None:                       # unparseable: the regex is all we have
+    if subs is None:
+        # Unparseable (ANSI-C quoting, say): the regex is all we have — but the
+        # dry-run guard must still apply, or `gh pr create --dry-run` with a
+        # quote shlex cannot read claims authorship of whatever PR its printed
+        # details happen to mention.
+        if _GH_DRY_RUN in command:
+            return False
         return bool(is_gh_pr_create(command))
     producing = len(subs) + len(_api_matches(command))
     if producing != 1:
