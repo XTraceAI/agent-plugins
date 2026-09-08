@@ -4,6 +4,9 @@ sessions through one command, using the per-host readers.
 
     python3 capture.py list [--host all|claude|codex|cursor] [--limit N]
 
+    python3 capture.py current [--host auto|claude|codex|cursor] [--cwd PATH] \
+        [--max-age-s 1800] [--json]
+
     uv run --with 'mcp<2' python capture.py import --session <ref> \
         [--host auto|claude|codex|cursor] [--conversation-id <id>] [--title "..."] \
         [--agent-brain-id <id>] [--no-room] [--namespace <ns>] [--url <mcp-url>] \
@@ -22,24 +25,34 @@ then hand the canonical transcript to the SAME ``import_session.py`` — one
 pipeline, per-host front doors. Conversation ids for non-Claude hosts are
 namespaced ``<host>-<session-id>`` so server-side watermarks stay per-host.
 
+``current`` prints the RUNNING session's conversation id — host-namespaced the
+way the capture client sends it — for callers that need to name this session to
+the server and have no other way to learn it (`/memhub:link-pr`). It matches on
+the session's own working directory rather than trusting "newest .jsonl by
+mtime", and it REFUSES rather than guesses: two live sessions in one worktree
+is real, and picking the newer one would silently link the wrong one.
+
 The mcp SDK pin (``uv run --with 'mcp<2'``) matches every other invocation
 site: mcp 2.x renamed streamablehttp_client, breaking import_session.py's
-transport. ``list`` is stdlib-only and runs under bare python3. Automatic
-capture deliberately keeps per-host flush entry points because each host has
-different trigger and watermark semantics; this command unifies listing and
-manual import, where the behavior is genuinely shared.
+transport. ``list`` and ``current`` are stdlib-only and run under bare
+python3. Automatic capture deliberately keeps per-host flush entry points
+because each host has different trigger and watermark semantics; this command
+unifies listing and manual import, where the behavior is genuinely shared.
 """
 from __future__ import annotations
 
 import argparse
 import datetime
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pr_link  # noqa: E402
 import readers  # noqa: E402
 from readers import claude as claude_reader  # noqa: E402
 
@@ -63,6 +76,100 @@ def cmd_list(args) -> int:
     for s in rows[:args.limit]:
         ts = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
         print(f"{s['host']:<7} {ts}  {s['id']}  {s.get('cwd') or ''}")
+    return 0
+
+
+# Two sessions whose transcripts were written this close together are two
+# live sessions, not one live and one finished — there is no evidence here
+# that separates them, so `current` refuses.
+_TIE_WINDOW_S = 120
+_CANDIDATE_SCAN = 40
+
+
+def _real(path: str | None) -> str | None:
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return str(Path(path).expanduser().resolve())
+    except (OSError, ValueError):
+        return None
+
+
+def _candidates(hosts: list[str], target: str, max_age_s: float, now: float) -> list[dict]:
+    """Sessions whose OWN cwd is ``target`` and whose transcript is fresh.
+
+    The cwd match is the content signature. The freshness cut is the other
+    half: the running session's transcript was written seconds ago, so
+    anything stale is a different session that merely shares the directory.
+    """
+    rows: list[dict] = []
+    for host in hosts:
+        reader = readers.reader_for(host)
+        if reader is None:
+            continue
+        try:
+            listed = reader.list_sessions(limit=_CANDIDATE_SCAN)
+        except Exception:  # noqa: BLE001 — one unreadable host must not blind the rest
+            continue
+        for row in listed:
+            mtime = row.get("mtime") or 0
+            if now - mtime > max_age_s:
+                continue
+            try:
+                cwd = reader.session_cwd(row["path"])
+            except Exception:  # noqa: BLE001
+                cwd = None
+            if _real(cwd) != target:
+                continue
+            rows.append({"session_id": row["id"], "host": host, "path": row["path"],
+                         "cwd": cwd, "mtime": mtime})
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def _describe(row: dict, now: float) -> str:
+    age = max(0, int(now - (row["mtime"] or 0)))
+    return (f"{row['host']:<7} {pr_link.conversation_id_for(row['host'], row['session_id'])}"
+            f"  {age}s ago  {row['cwd']}")
+
+
+def cmd_current(args) -> int:
+    now = time.time()
+    target = _real(args.cwd or os.getcwd())
+    if target is None:
+        print(f"ERROR: cannot resolve {args.cwd or os.getcwd()!r}", file=sys.stderr)
+        return 2
+    hosts = list(readers.READERS) if args.host == "auto" else [args.host]
+    rows = _candidates(hosts, target, args.max_age_s, now)
+
+    if not rows:
+        print(f"no live session found for {target}", file=sys.stderr)
+        return 3
+
+    tied = [r for r in rows if rows[0]["mtime"] - (r["mtime"] or 0) <= _TIE_WINDOW_S]
+    # Candidates from more than one host are ambiguous however far apart their
+    # clocks are: nothing here says which host the caller is running under.
+    if len(tied) > 1 or len({r["host"] for r in rows}) > 1:
+        ambiguous = rows if len({r["host"] for r in rows}) > 1 else tied
+        print(f"ambiguous: {len(ambiguous)} live sessions in {target} — pass the one you mean",
+              file=sys.stderr)
+        for row in ambiguous:
+            print("  " + _describe(row, now), file=sys.stderr)
+        if args.json:
+            print(json.dumps([{
+                "conversation_id": pr_link.conversation_id_for(r["host"], r["session_id"]),
+                "session_id": r["session_id"], "host": r["host"],
+                "cwd": r["cwd"], "mtime": r["mtime"]} for r in ambiguous]))
+        return 4
+
+    row = rows[0]
+    conv_id = pr_link.conversation_id_for(row["host"], row["session_id"])
+    if args.json:
+        print(json.dumps({"conversation_id": conv_id, "session_id": row["session_id"],
+                          "host": row["host"], "cwd": row["cwd"], "mtime": row["mtime"]}))
+    else:
+        print(conv_id)
+        print(row["host"])
     return 0
 
 
@@ -263,6 +370,15 @@ def main() -> int:
     lp.add_argument("--host", default="all", choices=["all", *readers.READERS])
     lp.add_argument("--limit", type=int, default=20)
     lp.set_defaults(fn=cmd_list)
+
+    cp = sub.add_parser("current", help="print the running session's conversation id")
+    cp.add_argument("--host", default="auto", choices=["auto", *readers.READERS])
+    cp.add_argument("--cwd", default=None,
+                    help="the directory to match on; default is the current one")
+    cp.add_argument("--max-age-s", type=float, default=1800.0,
+                    help="a transcript untouched for longer is a different session")
+    cp.add_argument("--json", action="store_true")
+    cp.set_defaults(fn=cmd_current)
 
     ip = sub.add_parser("import", help="import one session into MemHub")
     ip.add_argument("--session", required=True,

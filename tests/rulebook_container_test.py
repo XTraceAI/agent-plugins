@@ -355,10 +355,16 @@ def test_delivery_lanes() -> None:
         seed_book(td, "xmem", strip_books(rows))
         _, out_old = run("pre", {"cwd": repo, "session_id": "s-old", "tool_name": "Bash",
                                  "tool_input": {"command": "deploy-now"}}, env)
-        check("no book facts → byte-identical to the pre-container output",
-              ctx(out_old) == ("## XTrace Rulebook (team rules — advisory, not blocking)\n"
-                               "- **[Pair advisory]** Pair advisory\n"
-                               "- **[Team advisory]** Team advisory"),
+        # The disclosure block (spec: rulebook disclosure §3.4) is appended to
+        # every emitting call and carries no book facts, so it is built from
+        # the hook's own helper rather than re-typed — what is pinned here is
+        # that NOTHING book-derived appears when the backend sends no books.
+        pre_container = ("## XTrace Rulebook (team rules — advisory, not blocking)\n"
+                         "- **[Pair advisory]** Pair advisory\n"
+                         "- **[Team advisory]** Team advisory")
+        check("no book facts → byte-identical to the pre-container output, plus the disclosure",
+              ctx(out_old) == pre_container + "\n" + hook.disclosure_instruction(
+                  ["📏 Rule fired: Pair advisory", "📏 Rule fired: Team advisory"]),
               repr(ctx(out_old)))
 
         # --- an anchor rule is not displaced by a wider book ----------------

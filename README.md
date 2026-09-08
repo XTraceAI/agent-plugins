@@ -88,6 +88,10 @@ Open **Customize**, find **MemHub** in the XTrace marketplace, and select
 it needs attention. Then ask Cursor Agent to **Log in to MemHub** for capture
 and **Onboard MemHub for this repo**.
 
+Cursor's hooks are observational — `afterShellExecution` defines no reply the
+agent can see — so the rulebook and the session ↔ PR link hook do not run
+there. Cursor links a session to a pull request with `/memhub:link-pr`.
+
 ### Capture credential
 
 The foreground login skill opens a browser once and mints a 90-day personal
@@ -234,7 +238,7 @@ both will fire, so it goes to you as a decision.
 
 ## Skills
 
-Eleven skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Thirteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
@@ -303,6 +307,14 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   create` (see PR babysitting below). One pass polls the PR's review bots and
   CI, fixes real findings, and — once clean — saves the fixing process to the
   repo's agent brain.
+- `/memhub:link-pr [pr] [--session <id>] [--unlink]` — links a coding session
+  to a pull request in MemHub, so the PR's session context is published from a
+  confirmed fact rather than a branch-name guess. This is also how a PR opened
+  by something the hook cannot see — a script, a CI helper — gets linked.
+- `/memhub:find-contributing-sessions [pr]` — scans this machine's session
+  history (Claude Code, Codex, Cursor) for the sessions that wrote a PR's code,
+  ranks the candidates by the evidence that matched, and links the ones you
+  approve. It never links anything without an explicit yes.
 
 ## PR babysitting
 
@@ -331,6 +343,55 @@ rather than competes) into the repo's room, then ends the loop. It never
 imports the session transcript: per-turn capture already ships that into the
 same room continuously, so babysit only adds the judgment call a transcript
 doesn't record — which findings were real, which were rejected and why.
+
+### Session ↔ PR linking
+
+After a call that **addresses GitHub** — `gh pr …`, a `curl` / `gh api` request
+to the REST API, or a GitHub MCP tool — whose output names exactly one pull
+request, a `PostToolUse` hook (`pr_link_trigger.py`) asks the backend one
+question and injects one instruction. There are three answers:
+
+- the org has no GitHub integration connected → the agent mentions once, and
+  only if it isn't intrusive, that connecting GitHub is what links sessions to
+  the code that shipped;
+- **this call opened the pull request** → the session links itself,
+  unconditionally. Opening a PR is itself work the session did, so no
+  authorship question is asked; a PR has many sessions and linking one
+  displaces none;
+- **any other GitHub call naming one PR** → the agent decides. It links only if
+  it wrote that code in this session, and otherwise offers
+  `/memhub:find-contributing-sessions`.
+
+So **a session that opens a PR always links itself**, and **linking is
+otherwise never automatic for work this session did not do** — the agent
+judges, and offers the finder when the answer is no. The hook is
+stateless and holds no per-PR file: a session↔PR relationship is many-to-many,
+and a dedup file keyed on the PR is exactly what would stop a genuinely new
+session from linking itself later. Every path degrades to silence — a
+disconnected org, an unreachable server, no credential, a listing command whose
+output names several PRs, or a command that merely *mentions* a PR without
+addressing GitHub.
+
+**A PR opened by some other means — a script, a Makefile target, a CI helper,
+`hub pull-request` — is not detected, deliberately**: recognising arbitrary
+programs that happen to open a PR is the automatic-attribution problem this
+design walked away from. `/memhub:link-pr` is one command away.
+
+Per-host coverage differs, because the hosts differ:
+
+| Host | `gh` / `curl` PR creation | GitHub MCP tool | Fallback |
+|---|---|---|---|
+| Claude Code | detected | detected | — |
+| Codex (plugin hooks) | detected | detected | — |
+| Codex (compatibility bridge) | detected | not detected | `/memhub:link-pr` |
+| Cursor | not detected | not detected | `/memhub:link-pr` |
+
+Cursor ships skills-only here: its `afterShellExecution` hook has no output
+schema at all — only `beforeShellExecution` can say anything to the agent, and
+that fires before the command has produced a PR URL. The Codex split is a
+trust one: the plugin-bundled hook manifest is re-fetched on upgrade and costs
+nothing to widen, while the compatibility bridge lives in the user's own
+`~/.codex/hooks.json` and widening it would require them to re-approve it.
 
 ## Artifact-sync reminder
 

@@ -4,8 +4,8 @@
 — the backend half. The two were written together; §2 below restates the wire contract, but the
 backend spec is authoritative if they ever disagree.
 
-**Status:** not implemented. This document is the sole source of truth for the plugin half: an
-implementer should need nothing else.
+**Status:** implemented in v0.50.0, and inert until the backend half ships (§12). This document
+is the sole source of truth for the plugin half: an implementer should need nothing else.
 
 ---
 
@@ -118,7 +118,8 @@ all call it. Three copies of a string prefix is how a host silently stops linkin
 | `plugins/memhub/scripts/capture.py` | **Changed.** New `current` subcommand (§7). |
 | `plugins/memhub/scripts/readers/{claude,codex,cursor}.py` | **Changed.** Each gains `session_cwd(path) -> str | None` (§7). |
 | `plugins/memhub/scripts/codex_hook_bridge.py` | **Changed.** `_dispatch_post` also runs `pr_link_trigger.py` for shell tools (§5.2). |
-| `plugins/memhub/scripts/cursor_capture.py` | **Changed, conditionally.** §5.3. |
+| `plugins/memhub/scripts/cursor_capture.py` | **Unchanged** — §5.3 resolved to skills-only for Cursor. |
+| `plugins/memhub/hooks/codex-hooks.json` | **Changed.** PostToolUse matcher widened for GitHub MCP tools (§5.2). |
 | `plugins/memhub/hooks/claude-hooks.json` | **Changed.** One new PostToolUse(Bash) entry (§5.1). |
 | `plugins/memhub/skills/link-pr/SKILL.md` | **New** (§8). |
 | `plugins/memhub/skills/find-contributing-sessions/SKILL.md` | **New** (§9). |
@@ -405,13 +406,22 @@ if tool in _SHELL_TOOLS or (isinstance(tool, str) and _GITHUB_MCP_RX.match(tool)
     jobs.append(lambda: _run(root, "pr_link_trigger.py", payload, timeout=_PR_LINK_TIMEOUT_S))
 ```
 
-The bridge's own `PostToolUse` matcher in `references/codex-hooks-bridge.json` lists tool names
-(`^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|shell|local_shell|Bash)$`) and therefore does
-**not** dispatch MCP calls to the bridge at all. Widening it means editing a file users have
-already trusted in `~/.codex/hooks.json`, which `setup_codex_hooks.py` would have to re-install.
-**Out of scope for this change:** on Codex, shell-based PR creation (`gh`, `curl`) is covered and
-MCP-based creation is not. Say so in the README (§11) alongside the Cursor note, and leave the
-manifest alone rather than shipping a hooks change that needs a re-trust.
+Codex has **two** PostToolUse manifests, and they are widened differently because they cost
+different things:
+
+- **`plugins/memhub/hooks/codex-hooks.json`** — the plugin-bundled manifest, read by Codex
+  releases that load hooks from the plugin itself. It is re-fetched with every plugin upgrade and
+  costs the user nothing, so its `PostToolUse` matcher IS widened here, to
+  `^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$`.
+  On that path Codex gets GitHub-MCP detection.
+- **`references/codex-hooks-bridge.json`** — the compatibility bridge `setup_codex_hooks.py`
+  installs into `~/.codex/hooks.json`, a file the user has already trusted. Widening it would
+  require a re-trust, so it is **left exactly as it is**. On the bridge path, shell-based PR
+  creation (`gh`, `curl`) is covered and MCP-based creation is not.
+
+Say that split in the README (§11) alongside the Cursor note: on Codex, MCP-based PR creation is
+detected on the native plugin-hooks path and not on the compatibility bridge, where the answer is
+`/memhub:link-pr`.
 
 `_dispatch_post` already runs its jobs concurrently and folds each result's
 `hookSpecificOutput.additionalContext` into one document, so nothing else changes. Add
@@ -423,35 +433,49 @@ Codex's hook payload names the session as `session_id` (`codex_flush.py:266` rea
 `payload.get("session_id") or payload.get("conversation_id")`); `pr_link_trigger` uses the same
 fallback and then applies `conversation_id_for("codex", sid)`.
 
-### 5.3 Cursor — verify before implementing
+### 5.3 Cursor — resolved: skills only
 
 `cursor_capture.py` is a launcher: it detaches `cursor_flush.py` and answers
-`{"permission": "allow"}`. There is no context-injection path in this repo today, and
-`afterShellExecution`'s output contract is not documented anywhere in it.
+`{"permission": "allow"}`. There is no context-injection path in this repo today, and step 1
+below settled why there cannot be one.
 
-**Implementation step, in this order:**
-
-1. Check Cursor's current hooks reference for whether `afterShellExecution` accepts an
-   agent-visible field (`agentMessage`, `userMessage`, or equivalent) in its JSON reply.
-2. **If it does:** in `cursor_capture.py`, when `event == "afterShellExecution"`, run
-   `pr_link_trigger.py` synchronously with a 5s cap *before* printing, and merge its context into
-   the reply: `{"permission": "allow", "<field>": context}`. Detaching the flusher must still
-   happen first, and a failure or timeout in the trigger must leave the reply exactly as it is
-   today. `tests/cursor_capture_test.py` asserts the current reply byte-for-byte — extend it, do
-   not weaken it.
-3. **If it does not:** ship Cursor with skills only. Note it in the README's Cursor section:
-   Cursor users link with `/memhub:link-pr`. Do **not** approximate it by injecting text into the
-   transcript some other way.
-
-Cursor's payload gives the session id via `payload.get("session_id") or
-payload.get("conversation_id")` (`cursor_flush.py:336`), then `conversation_id_for("cursor", …)`.
+1. **Checked (2026-09-07, Cursor's hooks reference).** `afterShellExecution` has **no output
+   schema at all** — the reference describes it as observational ("useful for auditing or
+   collecting metrics from command output") and defines no reply fields. Only
+   `beforeShellExecution` returns anything the agent can see (`permission`, plus `agent_message`,
+   which is the message shown *when the call is denied*, and `user_message`). There is no field on
+   the post-shell event that puts text in front of the model.
+2. **Therefore: Cursor ships with skills only.** `cursor_capture.py` is **unchanged** — it still
+   detaches the flusher and prints exactly `{"permission": "allow"}`, and
+   `tests/cursor_capture_test.py`'s byte-for-byte assertion on that reply stands untouched. Do
+   **not** approximate the injection by borrowing `beforeShellExecution` (it fires before the
+   command runs, so there is no PR URL yet, and its `agent_message` only surfaces on a denial) and
+   do **not** write into the transcript some other way.
+3. Note it in the README's Cursor section: Cursor users link with `/memhub:link-pr`.
 
 Cursor's hook set is shell- and edit-shaped (`beforeShellExecution`, `afterShellExecution`,
-`afterFileEdit`, `afterAgentResponse`, `stop`, `beforeSubmitPrompt`) with no MCP-execution event,
-so §4.1c case 2 cannot be detected there at all. Shell-based creation is covered if §5.3 lands;
-MCP-based creation is `/memhub:link-pr` territory.
+`afterFileEdit`, `afterAgentResponse`, `stop`, `beforeSubmitPrompt`, `sessionEnd`) with no
+MCP-execution event either, so §4.1c case 2 could not be detected there in any case. On Cursor,
+every path to a link is `/memhub:link-pr`.
 
----
+Cursor's payload gives the session id via `payload.get("session_id") or
+payload.get("conversation_id")` (`cursor_flush.py:336`), then `conversation_id_for("cursor", …)` —
+which the skill path still needs, through `capture.py current`.
+
+### 5.4 Which host is the hook running under
+
+`pr_link_trigger.py` must namespace the session id per §2.3, so it must know its host, and the
+payload does not reliably say. The host is passed **on argv**, not sniffed:
+
+```
+python3 pr_link_trigger.py [--host claude|codex|cursor]     # default: claude
+```
+
+Claude Code's hook entry (§5.1) passes nothing and gets the default; the Codex bridge passes
+`--host codex`. Sniffing (Codex's `shell`/`local_shell` tool names, Claude's `transcript_path`)
+would be a heuristic that silently mis-namespaces a session the day a host renames a field —
+and a mis-namespaced id links nothing, with no error. An unknown `--host` value is treated as
+`claude`, because a wrong prefix is worse than no prefix.
 
 ## 6. Exposing the tools to the skills
 
@@ -760,12 +784,23 @@ plugins/memhub/.cursor-plugin/plugin.json
 plugins/memhub-staging/.claude-plugin/plugin.json
 ```
 
-From `0.47.1` → **`0.48.0`** (new user-visible surfaces, not a fix).
+From `0.49.1` → **`0.50.0`** (new user-visible surfaces, not a fix). The base moved
+under this work — `0.48.0` and `0.49.x` shipped while it was being written — so the
+number here is whatever the next minor is at merge time, not a fixed one.
 
 **Order of operations.** The backend ships first and the flag is enabled for the test org; the
 plugin can ship at any time after, because every path degrades to silence when `check` reports
 `enabled:false` or is unreachable. Do not ship the plugin before the endpoint exists — the hook
 would be silent, which is safe, but there is nothing to gain and the version is then burned.
+
+**Status as implemented (2026-09-07).** The backend half is **not deployed**:
+`GET https://api.staging.memhub.xtrace.ai/v1/team/pr-links/check` answers `404`, and neither
+`link_pr` nor `unlink_pr` appears in the staging MCP tool list. The plugin half is nonetheless
+implemented in full, hook entry included, because every path is silent without the endpoint —
+`check()` returns `None` on a 404 and the hook prints nothing. **The pull request carrying it must
+not be merged until the endpoint exists**, and the manual verification below cannot be performed
+before then; steps 1–6 are unrun, and saying otherwise would be a claim about behaviour nobody has
+observed.
 
 Verify on staging first: install `memhub-staging@memhub-internal` from the branch
 (`CONTRIBUTING.md` § "Installing the staging build"), and exercise:

@@ -164,6 +164,16 @@ def _transcript_paths() -> list[Path]:
     return list(_PROJECTS.glob("*/agent-transcripts/*/*.jsonl"))
 
 
+def session_cwd(path) -> str | None:
+    """The directory this session is running in, from the session dir's
+    ``meta.json`` — the same key ``list_sessions`` already surfaces. A
+    transcript-only session (no ``store.db``) has no meta.json and no cwd."""
+    p = Path(path)
+    meta = _read_meta_json(p if p.is_dir() else p.parent) or {}
+    cwd = meta.get("cwd")
+    return cwd if isinstance(cwd, str) and cwd else None
+
+
 def list_sessions(limit: int = 20) -> list[dict]:
     """Most recent Cursor sessions, preferring the richer store per UUID."""
     rows: list[dict] = []

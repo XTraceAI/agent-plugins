@@ -495,6 +495,38 @@ def _rollout_files() -> list[Path]:
                                        recursive=True)]
 
 
+# `session_meta` is the rollout's first record in every layout observed; a few
+# hundred lines of slack costs nothing and parsing the whole rollout to read
+# one key costs a lot on a long session.
+_META_MAX_RECORDS = 200
+
+
+def session_cwd(path) -> str | None:
+    """The directory this session was started in, from ``session_meta.cwd``.
+
+    Same read ``to_canonical`` already does through ``_session_meta``, without
+    parsing the rollout to get there.
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+            for _, line in zip(range(_META_MAX_RECORDS), handle):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict) or record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload")
+                cwd = payload.get("cwd") if isinstance(payload, dict) else None
+                return cwd if isinstance(cwd, str) and cwd else None
+    except OSError:
+        return None
+    return None
+
+
 def list_sessions(limit: int = 20) -> list[dict]:
     """Most recent rollouts, newest first."""
     files = sorted(_rollout_files(), key=lambda f: f.stat().st_mtime, reverse=True)

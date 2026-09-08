@@ -1418,11 +1418,13 @@ def main() -> int:
 
         rc, out = run("pre", dict(base, tool_input={"command": "advisory-cmd"}), genv)
         j = outj(out)
-        check("advisory: user sees an XTrace line naming the rule (systemMessage)",
-              j.get("systemMessage", "").startswith("XTrace") and "[adv]" in j.get("systemMessage", "")
+        check("advisory: the user's first line is the disclosure, the branded detail beneath it",
+              j.get("systemMessage", "").startswith("📏 Rule fired: ")
+              and "\n   XTrace ▸ [adv] " in j.get("systemMessage", "")
               and "Advisory text" in j["systemMessage"], out)
-        check("advisory: agent context header is branded, no ruler",
-              "XTrace Rulebook" in ctx(out) and "📏" not in ctx(out), ctx(out))
+        check("advisory: agent context header stays branded and carries the echo instruction",
+              "XTrace Rulebook" in ctx(out) and "📏 Rule fired: " in ctx(out)
+              and "Begin your next reply" in ctx(out), ctx(out))
         check("advisory: never blocks", "permissionDecision" not in j["hookSpecificOutput"])
 
         push = dict(base, tool_input={"command": "git push --force origin main"})
@@ -1433,9 +1435,10 @@ def main() -> int:
         check("gate: deny reason carries the statement and the override line",
               "Never force-push" in hso.get("permissionDecisionReason", "")
               and "RULEBOOK_OVERRIDE=" in hso.get("permissionDecisionReason", ""), out)
-        check("gate: user line says blocked, branded",
-              j.get("systemMessage", "").startswith("XTrace") and "blocked" in j["systemMessage"]
-              and "[no-force-push]" in j["systemMessage"], out)
+        check("gate: the user's first line is the blocked disclosure, branded detail beneath it",
+              j.get("systemMessage", "").startswith("⛔️ Rule fired: ")
+              and "\n   XTrace ⛔ blocked by [no-force-push] " in j.get("systemMessage", "")
+              and "blocked" in j["systemMessage"], out)
         rc, out = run("pre", push, genv)
         check("gate: the SAME call is gated again — gates are never deduped",
               outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
@@ -1614,8 +1617,9 @@ def main() -> int:
               and "rulebook-override[no-hex]:" in hso.get("permissionDecisionReason", "")
               and "RULEBOOK_OVERRIDE=" not in hso.get("permissionDecisionReason", ""), out)
         check("edit gate: the user is told the write was blocked",
-              j.get("systemMessage", "").startswith("XTrace") and "blocked" in j["systemMessage"]
-              and "[no-hex]" in j["systemMessage"], out)
+              j.get("systemMessage", "").startswith("⛔️ Rule fired: ")
+              and "\n   XTrace ⛔ blocked by [no-hex] " in j.get("systemMessage", "")
+              and "blocked" in j["systemMessage"], out)
 
         rc, out = run("pre", dict(base, tool_input={
             "file_path": tsx, "content": 'const brand = "#1a1a1a";\n'}), genv)

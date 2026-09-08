@@ -16,7 +16,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell)$",
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$",
         "hooks": [
           {
             "type": "command",

@@ -26,6 +26,14 @@ _SHELL_TOOLS = {"Bash", "shell", "local_shell"}
 _GATE_TIMEOUT_S = 1
 _RECALL_TIMEOUT_S = 6
 _ARTIFACT_TIMEOUT_S = 7
+_PR_LINK_TIMEOUT_S = 15
+# The SERVER segment names GitHub — the same anchor pr_link uses, so a tool
+# called `mcp__notes__github_summary` is not mistaken for a GitHub client.
+# Only the plugin-bundled manifest (hooks/codex-hooks.json) dispatches these;
+# the compatibility bridge in references/codex-hooks-bridge.json still lists
+# shell and edit tools only, because widening it costs the user a re-trust of
+# a file already in ~/.codex/hooks.json.
+_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__[^_]*github[^_]*__")
 
 
 def _version_key(path: Path) -> tuple:
@@ -112,6 +120,17 @@ def _directive(root: Path, payload: bytes, reactive: bool) -> None:
         _relay(result)
 
 
+def _pr_link_result(root: Path, payload: bytes) -> subprocess.CompletedProcess:
+    return _run(
+        root,
+        "pr_link_trigger.py",
+        payload,
+        "--host",
+        "codex",
+        timeout=_PR_LINK_TIMEOUT_S,
+    )
+
+
 def _artifact_sync_result(root: Path, payload: bytes) -> subprocess.CompletedProcess:
     return _run(
         root,
@@ -160,6 +179,8 @@ def _dispatch_post(root: Path, payload: bytes, hook: dict) -> None:
     jobs = [lambda: _directive_result(root, payload, reactive=True)]
     if tool in _EDIT_TOOLS:
         jobs.append(lambda: _artifact_sync_result(root, payload))
+    if tool in _SHELL_TOOLS or (isinstance(tool, str) and _GITHUB_MCP_RX.match(tool)):
+        jobs.append(lambda: _pr_link_result(root, payload))
     if tool in _SHELL_TOOLS:
         _fail_open_job(lambda: _detach_flush(root, payload, "PostToolUse"))
 

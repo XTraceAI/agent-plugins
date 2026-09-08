@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
 argument-hint: [--rulebook "<name or id>"] [the rule, in your own words]
-allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
+allowed-tools: Bash, Read, Write, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
 ---
 
 You are creating a **Rulebook rule**: a human-authored, team-owned rule stored
@@ -204,6 +204,16 @@ verify locally (step 4) and file once the backend accepts it.
   mention the pattern (`python -c`, `grep`).
 - Default `warn_once_per: "session"` — a rule that nags every call gets ignored.
   `turn` is for rules where each occurrence matters (e.g. force-push).
+- **Never anchor a `command_rx` with `^`.** Real commands arrive chained and
+  prefixed: `cd .. && gh pr create`, `cd sub; npm test`, `(cd pkg && git push)`,
+  `env CI=1 pytest`. A pattern anchored at the start of the string matches none
+  of them, and the rule then fires for some people and not others with nothing
+  to show why — the worst failure a rule has, because it looks like the rule
+  working. Match at **command position** instead: `(?:^|[;&|(]\s*)` before your
+  trigger, or simply no anchor at all plus a `command_not_rx` for the
+  mention-in-argument cases you are protecting against. This is the mirror
+  image of the SILENT guidance in step 4: that guards the false positive, this
+  guards the false negative.
 
 ### 4. Prove it fires — and prove it stops
 
@@ -287,6 +297,11 @@ exits non-zero, and show the table to the user.** What each line means:
   is how people investigate it, and firing there is the largest false-fire
   class we have measured. If those two fail, add a `command_not_rx`.
 
+**Always give at least one `--fires` case in CHAINED form** — `--fires 'cd .. &&
+<your trigger>'` alongside your plain case. A rule whose chained form does not
+fire is not ready to file, and the anchor that broke it (step 3) is invisible
+in a table that only ever tested the bare command.
+
 **Always give at least one `--silent` case for the complied-with form** — the
 code *after* someone does what the rule asks. This is the check authors skip
 and the one that matters most: a rule that keeps firing once you have fixed
@@ -294,6 +309,140 @@ the problem cannot tell a violation from a fix, so people learn to ignore it.
 If you cannot write a `--silent` case that the rule passes, the rule is not
 expressible as a pattern — make it `anchor_recall` or a `session_context`
 note instead of shipping a nag.
+
+### 4b. Prove it fires in a LIVE session — mandatory
+
+`rulebook_verify.py` proves the pattern matches the strings you thought of. It
+cannot prove the rule fires in a real session, at a moment that helps — and the
+most common way a pattern is wrong in practice is a false negative nobody
+writes a case for. So before filing, run the rule against a real agent doing
+real work.
+
+**The rule is not filed until this step has produced a fire.** There is no
+"skip the live test": if the user asks to skip it, tell them what it would have
+proven and run it. The one exception is §4b.6 — an environment that cannot run
+it at all.
+
+**4b.1 Write the fake feature prompt.** Compose a short, realistic task that
+should trip the rule with near-certainty and is doable in a couple of tool
+calls — a demo, not a project. Show it to the user before running it. It must
+never touch anything outside the scratch worktree, and it must **not** be
+phrased as "trigger the rule": a prompt that names the rule tests the
+sub-agent's obedience, not the rule's pattern.
+
+**4b.2 Scaffold a scratch worktree.**
+
+```bash
+SCRATCH=$(mktemp -d)
+git -C <repo> worktree add --detach "$SCRATCH/rulebook-forward-test" HEAD
+```
+
+Real layout, real remote, real repo identity — so repo- and path-scoped rules
+match without any faking. The hook resolves a rule's repo from the acted-on
+file's worktree, so a rule scoped to this repo fires there exactly as it would
+in the user's own checkout. **Never run the sub-agent in the user's own working
+tree.**
+
+**4b.3 Arm the candidate in the local book cache.** The candidate is not filed
+yet and a proposed rule never fires, so the test arms it by editing the book the
+hook actually reads. Ask the hook where that is — never recompute the hash:
+
+```bash
+BOOK=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>")
+cp "$BOOK" "$BOOK.pretest-$$"        # the restore source
+```
+
+Then write `$BOOK` back with the candidate **appended** to `rules` — never
+replacing the list, so the team's real rules stay armed and the test window
+cannot leave the user unprotected. Normalise the appended copy:
+
+- `id`: `candidate-<8 hex>` — unique, and identifiable if a row ever leaks to
+  the ledger;
+- `_label`: the candidate's title, so disclosure renders as it will in
+  production;
+- `status`: `active`;
+- **`mode`: `advise`, ALWAYS — even for a rule that will ship as a gate.** A
+  gate armed in the user's live session can block the *user's own* next
+  command, not just the sub-agent's. Gate behaviour is what
+  `rulebook_verify`'s table already proves; what this test adds is that the
+  pattern fires in a real session, and advise proves that just as well. Say so
+  in the report rather than letting the author believe blocking was exercised.
+
+**Defeat the background re-fetch.** `maybe_refresh` runs on every PreToolUse
+and will overwrite the book once the cache is an hour old — silently deleting
+the candidate mid-test, which reads exactly like "the rule never fired". You
+cannot set `MEMHUB_RULEBOOK_FETCH=0` for hooks that are already running, so
+defeat it on its own terms:
+
+- write `fetched_at` in the doctored book as **now**, which makes the age check
+  return early;
+- also write `{"at": "<now>"}` to `$BOOK.refresh` (backing up any existing
+  stamp), which blocks a retry even if the age check is ever changed.
+
+**No cached book for this repo** (nothing fetched yet, or no rulebook binds the
+user here) → there is no file to copy: **write one** containing exactly the
+candidate plus a `fetched_at` of now, and record that there was no backup.
+Restore then means *deleting* the file. Nothing is displaced, because nothing
+was there — this is not the §4b.6 escape.
+
+**4b.4 Record the ledger position, then run the sub-agent.** Before arming,
+note the byte offset of `<base>/ledger/fires.jsonl` (`<base>` is
+`$MEMHUB_RULEBOOK_BASE` or `~/.config/memhub-plugin/rulebook`). Then run the
+sub-agent with the Agent tool on the fake feature prompt, instructing it to
+work **only** inside the scratch worktree path.
+
+**4b.5 Restore the book — always, immediately after the sub-agent returns**,
+success or failure. Copy `$BOOK.pretest-$$` back over `$BOOK` (restoring its
+original `fetched_at` and `etag`), restore or delete the `.refresh` stamp, and
+delete the backup. **Verify by hashing**: if the restored file does not match
+the backup byte-for-byte, say so loudly and tell the user the path — a doctored
+book is a rule set they did not choose. If the skill is interrupted between
+arming and restoring, the next SessionStart re-fetches the book and overwrites
+the candidate; the damage window is one session. Note that in the report so an
+interrupted run is not a mystery.
+
+**Evaluate: the ledger first (fact), the transcript second (judgment).**
+
+Read the rows appended to `fires.jsonl` since the offset and keep those with
+`rule_id == "candidate-<hex>"`. Report per row: `hook_phase` (pre/post),
+`tool`, `mode`, `fired_at`, `excerpt`.
+
+| Ledger result | Meaning | What you do |
+|---|---|---|
+| ≥1 candidate row | fired | continue to the transcript check |
+| 0 rows, candidate still in the book at restore time | did not fire | **do not file.** Report it as a real failure: the pattern passes the verifier's synthetic cases but not a real session. Offer to revise the pattern and re-run |
+| 0 rows, candidate **gone** from the book | inconclusive — the book was re-fetched mid-test | re-run once; if it recurs, report the environment problem and do not file |
+
+Then read the sub-agent's returned output (an Agent-tool sub-agent's turns are
+sidechain records of THIS session, not a separate session file, so `capture.py`
+cannot be used here) and judge:
+
+- did the fire land where it could actually change what the agent did, or after
+  the fact;
+- did the sub-agent disclose it as `📏 Rule fired: …` — this is also the
+  end-to-end check on fire disclosure;
+- did the fire change the behaviour, or did the agent acknowledge and proceed.
+
+State these as **observations with the evidence quoted**, and be explicit that
+they are a judgment where the ledger result is a fact.
+
+**Report and clean up.** Name: the fake feature used, the worktree path (now
+removed), the ledger rows, the transcript judgment, and — always — the two
+caveats: *the candidate was armed in advise mode, so blocking was not
+exercised*, and *this proves the rule fires, not that it is worth firing*.
+
+Cleanup is mandatory and happens even on failure: restore the book, `git
+worktree remove --force` the scratch worktree, `rm -rf` the temp dir, delete
+the backup files.
+
+**4b.6 The one thing that is not a failure.** If the step cannot be **run at
+all** — the repo is not a git checkout, `git worktree add` fails (a bare repo,
+no `HEAD`, a filesystem that refuses it), or the Agent tool is unavailable in
+this host — then say which precondition was missing in one sentence, say that
+the pattern is therefore proven only against the verifier's synthetic cases,
+and **ask** whether to file anyway. Nothing is filed without a yes. A
+sub-agent that ran and tripped nothing is NOT this case: that is a failing
+test, and it blocks. Cleanup still runs.
 
 ### 5. Conflict check, confirm, then file
 

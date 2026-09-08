@@ -1,0 +1,489 @@
+"""The PR-link detectors, URL extraction, session-id namespacing and check().
+
+The two questions this module answers are independent and both matter:
+``touches_github`` is the gate (without it, a `cat CHANGELOG.md` whose text
+mentions a PR would inject linking context about a pull request nobody is
+working on), and ``creates_pr`` chooses between an unconditional self-link and
+a judgment left to the model. The implication test below is the lock on them:
+a `creates_pr` that does not imply `touches_github` is a `gh pr create` that
+never reaches the hook at all.
+
+Nothing here reaches a network. ``check()`` is exercised against a stubbed
+``mcp_http.rest``, and ``$HOME`` is redirected before the import so the
+negative-answer cache writes into a tmpdir.
+
+Run: python3 tests/pr_link_test.py   (stdlib only)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "plugins" / "memhub" / "scripts"
+
+_HOME = tempfile.mkdtemp(prefix="memhub-prlink-home-")
+os.environ["HOME"] = _HOME
+os.environ["USERPROFILE"] = _HOME
+# A stray credential in the environment would let check() try a real request.
+os.environ.pop("MEMHUB_TOKEN", None)
+
+sys.path.insert(0, str(SCRIPTS))
+import mcp_http  # noqa: E402
+import pr_babysit_trigger  # noqa: E402
+import pr_link  # noqa: E402
+
+failures: list[str] = []
+
+
+def check(label: str, condition: bool, detail: str = "") -> None:
+    print(f"  {'ok ' if condition else 'FAIL'} {label}"
+          + (f" — {detail}" if detail and not condition else ""))
+    if not condition:
+        failures.append(label)
+
+
+# A shared corpus, used by the individual predicates AND by the two implication
+# tests. Adding a command here strengthens every one of them at once.
+GH_PR_COMMANDS = [
+    "gh pr create --fill",
+    "cd .. && gh pr create",
+    "cd /repo; gh pr create",
+    "(cd sub && gh pr create)",
+    "env X=1 gh pr create",
+    "gh pr view 12",
+    "gh pr checkout 12",
+    "gh --repo o/r pr merge",
+    "env FOO=1 gh pr ready",
+    "sudo gh pr edit",
+    "x && gh pr view",
+    "gh pr comment 12 --body hi",
+]
+NOT_GH_PR_COMMANDS = [
+    'grep "gh pr view" f',
+    "echo gh pr create",
+    "ghost pr view",
+    "gh repo view && foo pr create",
+    "echo 'gh pr create'",
+    "git push",
+    "",
+]
+
+
+def test_is_gh_pr_command_matches_any_subcommand_at_command_position():
+    for command in GH_PR_COMMANDS:
+        check(f"gh-pr: {command!r}", pr_link.is_gh_pr_command(command))
+    for command in NOT_GH_PR_COMMANDS:
+        check(f"not gh-pr: {command!r}", not pr_link.is_gh_pr_command(command))
+
+
+def test_is_gh_pr_create_is_narrower_and_survives_chaining():
+    # The chained cases are not decoration: a `^gh pr create` anchor would miss
+    # them, and missing them turns an unconditional self-link into a coin flip.
+    for command in ("gh pr create --fill", "cd .. && gh pr create",
+                    "cd /repo; gh pr create", "(cd sub && gh pr create)",
+                    "env X=1 gh pr create"):
+        check(f"create: {command!r}", pr_link.is_gh_pr_create(command))
+    for command in ("gh pr view", "gh pr merge", 'grep "gh pr create" f',
+                    "echo gh pr create"):
+        check(f"not create: {command!r}", not pr_link.is_gh_pr_create(command))
+
+
+def test_creates_pr_implies_touches_github():
+    corpus = GH_PR_COMMANDS + NOT_GH_PR_COMMANDS + [
+        "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+        "gh api --method POST repos/o/r/pulls -f title=x",
+        "curl https://api.github.com/repos/o/r/pulls/12",
+    ]
+    for command in corpus:
+        if pr_link.is_gh_pr_create(command):
+            check(f"create implies gh-pr: {command!r}",
+                  pr_link.is_gh_pr_command(command))
+        payload = ("Bash", {"command": command})
+        if pr_link.creates_pr(*payload):
+            check(f"creates_pr implies touches_github: {command!r}",
+                  pr_link.touches_github(*payload))
+    for name in ("mcp__github__create_pull_request",
+                 "mcp__github-mcp__open_pull_request",
+                 "mcp__GitHub__createPullRequest"):
+        if pr_link.creates_pr(name, {}):
+            check(f"creates_pr implies touches_github: {name}",
+                  pr_link.touches_github(name, {}))
+
+
+def test_the_widened_regex_is_never_narrower_than_the_babysit_one():
+    # pr_link copies pr_babysit_trigger's command-position regex and widens it.
+    # A command the narrow one accepts and the wide one rejects would be a
+    # `gh pr create` the link hook never sees.
+    for command in GH_PR_COMMANDS + NOT_GH_PR_COMMANDS:
+        if pr_babysit_trigger.is_pr_create(command):
+            check(f"agreement: {command!r}", pr_link.is_gh_pr_command(command))
+            check(f"agreement (create): {command!r}", pr_link.is_gh_pr_create(command))
+
+
+def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
+    cases = [
+        # (command, target, is_write)
+        ("curl -L -X POST -H 'Accept: application/vnd.github+json' "
+         "https://api.github.com/repos/O/R/pulls -d '{\"title\":\"x\"}'",
+         "pulls_collection", True),
+        # `-d` with no explicit method IS a POST — the shape in the wild.
+        ("curl https://api.github.com/repos/O/R/pulls -d '{\"title\":\"x\"}'",
+         "pulls_collection", True),
+        ("curl -X GET https://api.github.com/repos/O/R/pulls -d '{}'",
+         "pulls_collection", False),
+        ("curl https://api.github.com/repos/O/R/pulls/12", "pull_item", False),
+        ("curl -X POST https://api.github.com/repos/O/R/pulls/12", "pull_item", True),
+        ("gh api --method POST repos/o/r/pulls -f title=x", "pulls_collection", True),
+        ("gh api repos/o/r/pulls", "pulls_collection", False),
+        ("gh api repos/o/r/pulls/12", "pull_item", False),
+        ("curl -X POST https://gh.corp/api/v3/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        ("curl https://api.github.com/repos/o/r/issues", None, False),
+        ('echo "https://api.github.com/repos/o/r/pulls"', None, False),
+        ('grep "https://api.github.com/repos/o/r/pulls" f', None, False),
+    ]
+    for command, target, is_write in cases:
+        got = pr_link.github_api_call(command)
+        check(f"api: {command[:52]!r}", got == (target, is_write), repr(got))
+
+    # A POST to the COLLECTION opens a PR; a POST to pulls/<n> is an edit.
+    check("only a write to the collection creates a PR",
+          pr_link.creates_pr("Bash", {"command":
+              "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'"})
+          and not pr_link.creates_pr("Bash", {"command":
+              "curl -X POST https://api.github.com/repos/o/r/pulls/12 -d '{}'"})
+          and not pr_link.creates_pr("Bash", {"command":
+              "gh api repos/o/r/pulls"}))
+
+
+def test_github_mcp_tools_are_recognised_by_their_server_segment():
+    cases = [
+        ("mcp__github__create_pull_request", True, True),
+        ("mcp__github-mcp__open_pull_request", True, True),
+        ("mcp__GitHub__createPullRequest", True, True),
+        ("mcp__github__get_pull_request", True, False),
+        ("mcp__github__list_pull_requests", True, False),
+        # The SERVER segment is not GitHub — this is a note-taking tool.
+        ("mcp__notes__github_summary", False, False),
+        ("Bash", False, False),
+    ]
+    for name, touches, creates in cases:
+        check(f"mcp touches: {name}", pr_link.touches_github(name, {}) is touches)
+        check(f"mcp creates: {name}", pr_link.creates_pr(name, {}) is creates)
+
+
+def test_the_gate_is_acting_on_github_not_mentioning_a_pr():
+    response = {"stdout": "see https://github.com/o/r/pull/7 for context\n"}
+    check("a `cat` whose output names a PR does not touch GitHub",
+          not pr_link.touches_github("Bash", {"command": "cat CHANGELOG.md"}))
+    check("…so it produces no context at all",
+          pr_link.context_for_call("Bash", {"command": "cat CHANGELOG.md"},
+                                   response, "s1",
+                                   checker=lambda _u: {"enabled": True,
+                                                       "github_connected": True}) is None)
+
+
+def test_pr_url_from_response_requires_exactly_one():
+    one = "https://github.com/o/r/pull/12"
+    check("one URL on stdout", pr_link.pr_url_from_response({"stdout": one}) == one)
+    check("one URL on stderr only",
+          pr_link.pr_url_from_response(
+              {"stdout": "", "stderr": f"a pull request already exists: {one}"}) == one)
+    check("a bare string response is scanned",
+          pr_link.pr_url_from_response(one + "\n") == one)
+    check("three URLs (a `gh pr list`) → None",
+          pr_link.pr_url_from_response({"stdout": "\n".join(
+              f"https://github.com/o/r/pull/{n}" for n in (1, 2, 3))}) is None)
+    check("no URL → None", pr_link.pr_url_from_response({"stdout": "branch-name\n"}) is None)
+    check("a non-string stdout yields nothing",
+          pr_link.pr_url_from_response({"stdout": {"nested": one}}) is None)
+    check("an #issuecomment suffix still resolves to the PR",
+          pr_link.pr_url_from_response(
+              {"stdout": one + "#issuecomment-99"}) == one)
+    check("a non-dict, non-string response → None",
+          pr_link.pr_url_from_response(12) is None)
+
+
+def test_a_create_response_body_resolves_to_its_html_url():
+    # The PR object's other URLs are all api.github.com (which _PR_URL_RE does
+    # not match) and head.repo.html_url has no /pull/ segment — so the
+    # exactly-one rule resolves a create response with no special casing.
+    body = {
+        "html_url": "https://github.com/octo/hello/pull/1347",
+        "issue_url": "https://api.github.com/repos/octo/hello/issues/1347",
+        "comments_url": "https://api.github.com/repos/octo/hello/issues/1347/comments",
+        "review_comments_url": "https://api.github.com/repos/octo/hello/pulls/1347/comments",
+        "_links": {"self": {"href": "https://api.github.com/repos/octo/hello/pulls/1347"}},
+        "head": {"repo": {"html_url": "https://github.com/octo/hello"}},
+    }
+    curl = {"stdout": json.dumps(body), "stderr": ""}
+    check("a curl POST response body → the html_url",
+          pr_link.pr_url_from_response(curl) == "https://github.com/octo/hello/pull/1347")
+    mcp = {"content": [{"type": "text", "text": json.dumps(body)}]}
+    check("an MCP create result → the same",
+          pr_link.pr_url_from_response(mcp) == "https://github.com/octo/hello/pull/1347")
+
+
+def test_conversation_id_is_namespaced_once_per_host():
+    check("claude → the bare id",
+          pr_link.conversation_id_for("claude", "abc-123") == "abc-123")
+    check("codex → prefixed",
+          pr_link.conversation_id_for("codex", "01J") == "codex-01J")
+    check("cursor → prefixed",
+          pr_link.conversation_id_for("cursor", "u1") == "cursor-u1")
+    check("an already-namespaced id is not double-prefixed",
+          pr_link.conversation_id_for("codex", "codex-01J") == "codex-01J")
+    check("an unknown host is left bare",
+          pr_link.conversation_id_for("zed", "x") == "x")
+    for empty in (None, "", "   ", 12):
+        check(f"no session id → None ({empty!r})",
+              pr_link.conversation_id_for("claude", empty) is None)
+
+
+class _Reply:
+    def __init__(self, status, data):
+        self.status, self.data, self.etag = status, data, None
+
+
+def _with_stub(rest, fn):
+    real_rest, real_resolve = mcp_http.rest, None
+    import _memhub_auth
+    real_resolve = _memhub_auth.resolve_bearer
+    mcp_http.rest = rest
+    _memhub_auth.resolve_bearer = lambda url=None, refresh=True: (
+        "https://api.example.test/mcp/", "mhk_test")
+    try:
+        return fn()
+    finally:
+        mcp_http.rest = real_rest
+        _memhub_auth.resolve_bearer = real_resolve
+
+
+def test_check_degrades_to_none_and_never_raises():
+    good = {"enabled": True, "github_connected": True, "repo_in_install": True}
+    check("200 → the dict",
+          _with_stub(lambda *a, **k: _Reply(200, good),
+                     lambda: pr_link.check("https://github.com/o/r/pull/1")) == good)
+    for label, rest in (
+        ("500", lambda *a, **k: (_ for _ in ()).throw(mcp_http.McpError("boom", 500))),
+        ("timeout", lambda *a, **k: (_ for _ in ()).throw(TimeoutError())),
+        ("garbage body", lambda *a, **k: _Reply(200, "not a dict")),
+        ("non-200", lambda *a, **k: _Reply(204, None)),
+        # A reply object that is not shaped like one is one more reason to be
+        # silent, not a traceback in the middle of someone's session.
+        ("a reply that is not a RestReply", lambda *a, **k: "not a reply"),
+    ):
+        check(f"{label} → None, no raise",
+              _with_stub(rest, lambda: pr_link.check(
+                  "https://github.com/o/r/pull/1")) is None)
+
+    import _memhub_auth
+    real = _memhub_auth.resolve_bearer
+    _memhub_auth.resolve_bearer = lambda url=None, refresh=True: ("u", None)
+    try:
+        check("no credential → None, and no request is made",
+              pr_link.check("https://github.com/o/r/pull/1") is None)
+    finally:
+        _memhub_auth.resolve_bearer = real
+
+
+def test_the_pr_url_cannot_add_a_query_parameter():
+    """The URL comes from untrusted tool output; it must stay one value."""
+    seen: list[str] = []
+
+    def rest(url, *a, **k):
+        seen.append(url)
+        return _Reply(200, {"enabled": False})
+
+    with tempfile.TemporaryDirectory() as td:
+        pr_link.STATE_DIR = Path(td) / "prlink"
+        _with_stub(rest, lambda: pr_link.check(
+            "https://github.com/o/r/pull/7?admin=1&x=2#frag"))
+    url = seen[0] if seen else ""
+    check("exactly one '?' — the PR URL's own is escaped", url.count("?") == 1, url)
+    check("no unescaped '&' or '#' reaches the query",
+          "&" not in url and "#" not in url, url)
+    check("the whole PR URL is percent-encoded as one value",
+          "pr_url=https%3A%2F%2Fgithub.com%2Fo%2Fr%2Fpull%2F7%3Fadmin%3D1" in url, url)
+    pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
+
+
+def test_a_hostile_or_unwritable_cache_is_never_fatal():
+    disconnected = {"enabled": True, "github_connected": False}
+    with tempfile.TemporaryDirectory() as td:
+        pr_link.STATE_DIR = Path(td) / "prlink"
+        pr_link.STATE_DIR.mkdir(parents=True)
+        path = pr_link._cache_path("https://api.example.test")
+        for label, body in (("corrupt json", "{ not json"), ("a list", "[1,2]"),
+                            ("no 'at'", '{"answer": {}}'),
+                            ("'at' is a string", '{"at": "yesterday", "answer": {}}'),
+                            ("answer is not a dict", '{"at": 1, "answer": "x"}'),
+                            ("empty", "")):
+            path.write_text(body, encoding="utf-8")
+            check(f"{label} is ignored, not fatal",
+                  pr_link._cached_negative("https://api.example.test", time.time()) is None)
+
+        # A clock that moved backwards must not pin a stale answer forever.
+        pr_link._store_negative("https://api.example.test", disconnected, time.time())
+        check("a fresh entry is used",
+              pr_link._cached_negative("https://api.example.test", time.time()) is not None)
+        check("a clock jumped a week BACK does not read the cache",
+              pr_link._cached_negative("https://api.example.test",
+                                       time.time() - 7 * 86400) is None)
+        check("past the TTL it is not read either",
+              pr_link._cached_negative("https://api.example.test",
+                                       time.time() + 25 * 3600) is None)
+
+    # An unwritable state directory must not take the hook down with it.
+    with tempfile.TemporaryDirectory() as td:
+        parent = Path(td) / "ro"
+        parent.mkdir()
+        pr_link.STATE_DIR = parent / "prlink"
+        os.chmod(parent, 0o500)
+        try:
+            pr_link._store_negative("https://api.example.test", disconnected, time.time())
+            pr_link.breadcrumb("probe", RuntimeError("x"))
+            check("an unwritable state dir raises nothing", True)
+        except Exception as exc:  # noqa: BLE001
+            check("an unwritable state dir raises nothing", False, repr(exc))
+        finally:
+            os.chmod(parent, 0o700)
+    pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
+
+
+def test_only_the_negative_org_answer_is_cached():
+    calls: list[str] = []
+    disconnected = {"enabled": True, "github_connected": False,
+                    "connect_url": "https://app.example.test/i"}
+
+    def rest(url, *a, **k):
+        calls.append(url)
+        return _Reply(200, disconnected)
+
+    with tempfile.TemporaryDirectory() as td:
+        pr_link.STATE_DIR = Path(td) / "prlink"
+        _with_stub(rest, lambda: pr_link.check("https://github.com/o/r/pull/1"))
+        check("a disconnected reply is written to the cache",
+              len(list((Path(td) / "prlink").glob("*.json"))) == 1)
+        again = _with_stub(rest, lambda: pr_link.check("https://github.com/o/r/pull/2"))
+        check("…and a second call inside the TTL makes no request",
+              len(calls) == 1 and again == disconnected, str(calls))
+
+        # A connected reply changes constantly (linked_sessions, pr.known) and
+        # is never cached.
+        calls.clear()
+        pr_link.STATE_DIR = Path(td) / "prlink2"
+        connected = {"enabled": True, "github_connected": True, "repo_in_install": True}
+        _with_stub(lambda *a, **k: (calls.append(1), _Reply(200, connected))[1],
+                   lambda: pr_link.check("https://github.com/o/r/pull/1"))
+        check("a connected reply writes nothing",
+              not (Path(td) / "prlink2").exists()
+              or not list((Path(td) / "prlink2").glob("*.json")))
+
+        # A corrupt cache file is ignored, not fatal.
+        pr_link.STATE_DIR = Path(td) / "prlink3"
+        pr_link.STATE_DIR.mkdir(parents=True)
+        for path in ((Path(td) / "prlink3" / f)
+                     for f in ("a.json",)):
+            path.write_text("{ not json", encoding="utf-8")
+        calls.clear()
+        got = _with_stub(rest, lambda: pr_link.check("https://github.com/o/r/pull/9"))
+        check("a corrupt cache file is ignored, not fatal",
+              got == disconnected and len(calls) == 1)
+    pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
+
+
+def test_the_contexts_say_the_right_thing_for_each_case():
+    url = "https://github.com/o/r/pull/7"
+    base = {"enabled": True, "github_connected": True, "repo_in_install": True,
+            "pr": {"repo_full_name": "o/r", "pr_number": 7, "state": "open"},
+            "linked_sessions": [{"session_id": "a", "is_mine": True},
+                                {"session_id": "b", "is_mine": False}]}
+
+    created = pr_link.context_for(base, url, "s1", created=True)
+    check("B1 tells the agent to link without asking",
+          "without asking" in created and 'session_ids=["s1"]' in created
+          and 'link_source="session_self"' in created, created)
+    check("B1 carries no authorship conditional",
+          "IF THE CODE IN THIS PULL REQUEST WAS WRITTEN IN THIS SESSION" not in created)
+    check("B1 names what is already linked",
+          "Already linked: 2 sessions (1 of them this user's)." in created, created)
+    check("B1 names the PR", f"{url}" in created and "(o/r#7" in created, created)
+
+    in_play = pr_link.context_for(base, url, "s1", created=False)
+    check("B2 makes the model judge",
+          "IF THE CODE IN THIS PULL REQUEST WAS WRITTEN IN THIS SESSION" in in_play
+          and "IF IT WAS NOT" in in_play, in_play)
+    check("B2 ends with the already-linked escape that keeps a babysit loop quiet",
+          in_play.rstrip().endswith("say nothing at all."), in_play)
+    check("B2 offers the finder and forbids running it unasked",
+          "/memhub:find-contributing-sessions" in in_play
+          and "without the user saying yes" in in_play)
+
+    disconnected = pr_link.context_for(
+        {"enabled": True, "github_connected": False,
+         "connect_url": "https://app.example.test/i"}, url, "s1", created=True)
+    check("A names the connect URL and says it once",
+          "https://app.example.test/i" in disconnected
+          and "ONCE per session" in disconnected, disconnected)
+    check("A never tells the agent to link", "link_pr" not in disconnected)
+
+    not_installed = pr_link.context_for(
+        {"enabled": True, "github_connected": True, "repo_in_install": False,
+         "connect_url": "https://app.example.test/i",
+         "pr": {"repo_full_name": "o/r", "pr_number": 7}}, url, "s1", created=True)
+    check("the repo variant of A names the repo",
+          "o/r isn't part of the install" in not_installed, not_installed)
+
+    check("enabled:false is total silence",
+          pr_link.context_for({"enabled": False, "github_connected": True},
+                              url, "s1", created=True) is None)
+    check("no linked sessions → no already-linked line",
+          "Already linked" not in pr_link.context_for(
+              {"enabled": True, "github_connected": True, "repo_in_install": True},
+              url, "s1", created=False))
+
+
+def test_context_for_call_wires_the_gates_together():
+    connected = {"enabled": True, "github_connected": True, "repo_in_install": True}
+    url = "https://github.com/o/r/pull/7"
+
+    def checker(_url):
+        return connected
+
+    got = pr_link.context_for_call("Bash", {"command": "cd .. && gh pr create"},
+                                   {"stdout": url}, "s1", checker=checker)
+    check("a chained create still reaches B1", got and "without asking" in got)
+    got = pr_link.context_for_call("Bash", {"command": "gh pr view 7"},
+                                   {"stdout": url}, "s1", checker=checker)
+    check("a view reaches B2", got and "IF IT WAS NOT" in got)
+    got = pr_link.context_for_call("Bash", {"command": "gh pr create"},
+                                   {"stdout": url}, "s1", host="codex", checker=checker)
+    check("the host namespaces the session id", got and '["codex-s1"]' in got, got)
+    check("a server that never answers is silence",
+          pr_link.context_for_call("Bash", {"command": "gh pr view 7"},
+                                   {"stdout": url}, "s1",
+                                   checker=lambda _u: None) is None)
+    check("no PR URL is silence",
+          pr_link.context_for_call("Bash", {"command": "gh pr list"},
+                                   {"stdout": "nothing here"}, "s1",
+                                   checker=checker) is None)
+
+
+if __name__ == "__main__":
+    print("pr_link")
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            print(f"\n{name}")
+            fn()
+    print()
+    if failures:
+        print(f"{len(failures)} FAILED: {', '.join(failures)}")
+    else:
+        print("all pr_link checks passed")
+    sys.exit(1 if failures else 0)

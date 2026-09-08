@@ -4,7 +4,7 @@
 and `plugins/memhub/skills/create-rule/SKILL.md`. Independent of the PR-linking specs in this
 directory; they share only a release train.
 
-**Status:** not implemented. Sole source of truth for these four changes.
+**Status:** implemented in v0.50.0. Sole source of truth for these four changes.
 
 **Host scope: Claude Code only.** The rulebook hook is not wired into the Codex bridge
 (`codex_hook_bridge.py` dispatches directive recall, artifact sync and flush — never
@@ -137,19 +137,26 @@ anything was dropped. One line, never wrapped by us.
 
 ### 3.3 The rendered `systemMessage`
 
-The mandated line first, the existing detail indented beneath it so nothing today's user sees is
-lost:
+The mandated line first, and beneath it — indented by three spaces — **today's line, unchanged**:
+the same `{BRAND} ▸ [label] …` / `{BRAND} ⚠ gate overridden — …` / `{BRAND} ⛔ blocked by …`
+strings this hook already builds. The disclosure line is new; the detail line is not rewritten,
+so nothing a user recognises today is lost and the existing detail assertions in
+`rulebook_hook_test.py` keep asserting on the same substrings.
 
 ```
 📏 Rule fired: Run the suite before pushing
-   Run the tests before you push — a red main blocks everyone. (in `src/db.py`, written by that command)
+   XTrace ▸ [run-tests] Run the tests before you push — a red main blocks everyone. (in `src/db.py`, written by that command)
 
 ⛔️ Rule fired: Never force-push to main
-   BLOCKED — Never force-push a shared branch. Re-run prefixed RULEBOOK_OVERRIDE='<why>' if this is a legitimate exception.
+   XTrace ⛔ blocked by [no-force-push] Never force-push a shared branch.
 
 📏 Rule fired: Never force-push to main
-   gate overridden: rebasing my own topic branch
+   XTrace ⚠ gate overridden — [no-force-push] rebasing my own topic branch
 ```
+
+The brand lives on the detail line and nowhere else in the stanza: the disclosure line must be
+**byte-identical** to what §3.4 tells the agent to echo, and an echoed `XTrace ▸` would put the
+plugin's own branding into the user's transcript on every fire.
 
 Several rules firing on one call produce several such stanzas in one `systemMessage`, in the
 existing order.
@@ -243,6 +250,12 @@ a second implementation of `book_path` in a skill would drift from the one the h
 6. **If the skill is interrupted between 2 and 5**, the next SessionStart re-fetches the book and
    overwrites the candidate. The damage window is one session, and the stale-stamp trick above
    does not survive a restart. Note this in the report so an interrupted run is not a mystery.
+7. **No cached book for this repo** (nothing has been fetched yet, or no rulebook binds the user
+   here) → there is no file to copy, so **write one** containing exactly the candidate plus a
+   `fetched_at` of now, and record that there was no backup. Restore then means *deleting* the
+   file, not copying one back; the next SessionStart fetches the real book as it always would.
+   Nothing is displaced, because there was nothing there. Do not treat this as the escape in §4.6
+   — the test still proves what it exists to prove.
 
 ### 4.3 The scratch worktree
 
@@ -298,6 +311,28 @@ fires, not that it is worth firing*.
 Cleanup is mandatory and happens even on failure: restore the book (§4.2.5), remove the worktree,
 delete the temp dir, delete the backup files.
 
+### 4.6 The one thing that is not a failure
+
+Step 4b is **mandatory and has no user opt-out**: "the rule did not fire" blocks filing, and a
+user asking to skip the test is answered with what the test would have proven, not with a
+shortcut. `source_ref` never records a rule as filed-unproven, because there is no such state.
+
+There is exactly one exception, and it is about the *environment*, never the rule: the test cannot
+be **run at all**. That means, concretely — the repo is not a git checkout, `git worktree add`
+fails (a bare repo, no `HEAD`, a filesystem that refuses it), or the Agent tool is unavailable in
+this host. A missing book cache is NOT one of these (§4.2.7 covers it), and neither is a
+sub-agent that ran and tripped nothing — that is a failing test, and it blocks.
+
+When the step genuinely cannot run, the skill:
+
+1. says which precondition was missing, in one sentence, and what the run would have proven;
+2. states plainly that the pattern is proven only against `rulebook_verify`'s synthetic cases —
+   the thing §0 says is not enough;
+3. **asks** whether to file anyway. Nothing is filed without a yes, and the yes is the user's, not
+   an inference from their earlier answers.
+
+Cleanup still runs: an aborted step 4b must leave no worktree, no temp dir, and no doctored book.
+
 ---
 
 ## 5. Change D — chained commands in `command_rx`
@@ -340,9 +375,11 @@ this is its mirror image: SILENT guards false positives, this guards the false n
   posture rules are present.
 
 **`tests/rulebook_hook_test.py`** (extend, do not rewrite)
-- every existing assertion on `XTrace ▸` / `⛔ blocked by` is updated to the new shapes. These are
-  the regression guard for §3 — if one is deleted rather than updated, the coverage silently
-  shrinks (see `registration_test.py`'s own docstring on exactly that failure mode).
+- every existing assertion on `XTrace ▸` / `⛔ blocked by` is **kept**, because §3.3 keeps the
+  detail line verbatim; what changes is the handful that assert `systemMessage.startswith("XTrace")`,
+  which now assert the disclosure line comes first and `XTrace …` appears on the line beneath.
+  If one is deleted rather than updated, the coverage silently shrinks (see
+  `registration_test.py`'s own docstring on exactly that failure mode).
 - `book-path <repo>` subcommand prints the same path `book_path()` computes, and exits non-zero
   for an empty repo argument.
 
@@ -357,8 +394,8 @@ Skill behaviour itself (§4) is not unit-testable here; §7's manual verificatio
 ## 7. Rollout and manual verification
 
 No backend change, no flag, no manifest beyond the version bump. `plugins/memhub/**` changes, so
-all five version manifests move together (`version_parity_test.py`); ship as **0.48.0** with the
-PR-linking work, or **0.47.2** if this lands alone.
+all five version manifests move together (`version_parity_test.py`); shipped as **0.50.0**
+with the PR-linking work (a patch bump if it ever lands alone).
 
 Verify by hand on the staging build:
 
@@ -392,3 +429,8 @@ Verify by hand on the staging build:
   fire the model failed to disclose is indistinguishable from no fire.
 - **D7.** Chained-command coverage is author guidance, not an auto-generated verifier case.
 - **D8.** Claude Code only, because the rulebook itself is (see the header).
+- **D9.** The disclosure line carries no brand and the detail line beneath it keeps today's
+  `{BRAND} ▸ …` shape verbatim (§3.3). The line the agent echoes is the line the terminal shows,
+  and it should read as the team's rule rather than as the plugin's advertisement.
+- **D10.** Step 4b has no user-facing skip (§4.6). The only way past it is an environment that
+  cannot run it, which is reported as unproven and filed only on an explicit yes.
