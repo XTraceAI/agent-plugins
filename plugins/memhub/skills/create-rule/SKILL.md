@@ -403,11 +403,21 @@ candidate plus a `fetched_at` of now, and record that there was no backup.
 Restore then means *deleting* the file. Nothing is displaced, because nothing
 was there — this is not the §4b.6 escape.
 
-**4b.4 Record the ledger position, then run the sub-agent.** Before arming,
-note the byte offset of `<base>/ledger/fires.jsonl` (`<base>` is
-`$MEMHUB_RULEBOOK_BASE` or `~/.config/memhub-plugin/rulebook`). Then run the
-sub-agent with the Agent tool on the fake feature prompt, instructing it to
-work **only** inside the scratch worktree path.
+**4b.4 Bracket the ledger around the sub-agent, then run it.** Note the byte
+offset of `<base>/ledger/fires.jsonl` (`<base>` is `$MEMHUB_RULEBOOK_BASE` or
+`~/.config/memhub-plugin/rulebook`) **immediately before the Agent call, after
+the book is already armed**, and note it again **immediately after the Agent
+returns, before restoring**. Only rows between those two offsets are evidence.
+
+**Why not "before arming, after restoring".** Your own setup and restore are
+shell commands, and the candidate is armed while you run them — so a rule whose
+matcher covers `cp`, `git`, `python3` or `rm` fires on §4b.3's
+`cp "$BOOK" "$BOOK.pretest-$$"` or §4b.5's restore. The wider window then
+reports a fire the sub-agent never caused, and the rule passes a test nothing
+exercised. That is worse than a failed test: it is a green light nobody earned.
+
+Then run the sub-agent with the Agent tool on the fake feature prompt,
+instructing it to work **only** inside the scratch worktree path.
 
 **4b.5 Restore the book — always, immediately after the sub-agent returns**,
 success or failure. Copy `$BOOK.pretest-$$` back over `$BOOK` (restoring its
@@ -421,8 +431,10 @@ interrupted run is not a mystery.
 
 **Evaluate: the ledger first (fact), the transcript second (judgment).**
 
-Read the rows appended to `fires.jsonl` since the offset and keep those with
-`rule_id == "candidate-<hex>"`. Report per row: `hook_phase` (pre/post),
+Read the rows between the two offsets from §4b.4 — not merely "since the
+start" — and keep those with `rule_id == "candidate-<hex>"`. A candidate row
+outside that window was caused by your own setup or restore, not by the
+sub-agent, and it proves nothing. Report per row: `hook_phase` (pre/post),
 `tool`, `mode`, `fired_at`, `excerpt`.
 
 | Ledger result | Meaning | What you do |

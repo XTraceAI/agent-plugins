@@ -24,8 +24,13 @@ explicit yes.
 
 Same rules as `/memhub:link-pr`: a full URL is used as-is; a bare number
 resolves with `gh pr view <n> --json url -q .url`; no argument uses the current
-branch's PR. Normalise to `https://github.com/<owner>/<repo>/pull/<n>` with no
-trailing slash, query or fragment.
+branch's PR. Normalise to `https://<host>/<owner>/<repo>/pull/<n>` — no trailing slash, no
+query, no fragment. **Keep the host the user gave you.** Most PRs are on
+`github.com`, but an enterprise PR (`https://ghe.corp/o/r/pull/7`) is equally
+valid and the hook already passes those to the same backend; rewriting the host
+to `github.com` would name a different pull request, and rejecting it would
+leave enterprise users — including every Cursor user, for whom this skill is
+the only path — with no way to link at all.
 
 ## 2. Collect the PR's facts — in the terminal, never in context
 

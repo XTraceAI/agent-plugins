@@ -384,6 +384,26 @@ def test_the_negative_cache_is_scoped_to_the_repo_not_the_deployment():
     pr_link.STATE_DIR = Path(_HOME) / ".config" / "memhub-plugin" / "prlink"
 
 
+def test_a_chained_gh_pr_create_cannot_claim_the_other_prs_url():
+    """`gh pr create >/dev/null && gh pr view 99` opens one pull request and
+    prints another's. The REST lane had this guard; the `gh pr` lane, which
+    used a whole-command regex, did not (Codex review, PR #182)."""
+    for command in (
+        "gh pr create --fill >/dev/null && gh pr view 99 --json url -q .url",
+        # …and across the two lanes at once.
+        "gh pr create --fill && curl -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+    ):
+        check(f"ambiguous, so no self-link: {command[:46]!r}",
+              pr_link.touches_github("Bash", {"command": command})
+              and not pr_link.creates_pr("Bash", {"command": command}))
+    for command in ("gh pr create --fill",
+                    "cd .. && gh pr create",
+                    "gh pr create --fill | tee log",
+                    'gh pr create --title "pr" --body b'):
+        check(f"one create is still a create: {command[:40]!r}",
+              pr_link.creates_pr("Bash", {"command": command}))
+
+
 def test_an_ambiguous_multi_target_call_can_never_self_link():
     """One stdout, two pulls calls, no way to say which made the URL."""
     command = ("gh api --method POST repos/o/a/pulls >/dev/null && "

@@ -226,12 +226,31 @@ casing.
 (`mcp__github__create_pull_request`, `mcp__github-mcp__create_pr`, vendor-specific spellings
 vary):
 
-- `touches_github` when the tool name matches `(?i)^mcp__[^_]*github[^_]*__` — the *server*
-  segment names GitHub. Matching `github` anywhere in the name would catch a tool called
-  `mcp__notes__github_summary`, which is not the same thing.
-- `creates_pr` when the tool segment additionally matches
-  `(?i)(create|open|submit).*(pull.?request|\bpr\b)`. Deliberately loose on the verb and strict
-  on the object: a server that spells it `open_pull_request` should not need a plugin release.
+- `touches_github` when the name splits as `mcp__<server>__<tool>` and the **server** segment
+  contains "github". The server segment runs to the FIRST `__`, and is not `[^_]*`: server names
+  routinely contain underscores (`github_enterprise`, and every plugin-provided server — this
+  repo's own tools arrive as `mcp__plugin_memhub-staging_memhub__add_memory`), and a
+  no-underscore pattern rejected all of them. Matching `github` anywhere in the WHOLE name would
+  instead catch `mcp__notes__github_summary`, which is a note-taking tool — the server segment is
+  what separates the two.
+- `creates_pr` when the tool segment, read as WORDS, opens the pull request itself. Split the
+  segment on camelCase and `_`/`-`; require a creation verb (`create`, `open`, `submit`, `new`)
+  anywhere; require the tail to be the pull request (`…pull request`, `…pr`, `…prs`); and reject
+  the name outright if it contains an object that can only be attached TO a pull request —
+  `review`, `comment`, `thread`, `reply`, `annotation`, `suggestion`, `label`, `assignee`,
+  `reviewer`, `milestone`.
+
+  **Do not do this with one regex.** `(?i)(create|open|submit).*(pull.?request|\bpr\b)` was the
+  first attempt and it accepted `create_pull_request_review`; anchoring the object at the end
+  fixed that and still accepted `create_review_for_pull_request` and
+  `create_comment_on_pull_request`. Both spellings make a session that REVIEWED a teammate's pull
+  request record itself as its author, which is the one mistake this feature cannot take back.
+  The same regex also silently rejected `create_pr`, because `_` is a word character so `\bpr\b`
+  has no boundary after `create_`.
+
+  The asymmetry is the rule to keep: a missed create falls through to B2, where the model judges
+  and links only if it wrote the code, so an unusual spelling losing the tail costs little; a
+  false create writes a confirmed authorship claim about work the session did not do.
 - The result is a JSON object; §4.2 already walks dicts/lists for text, so the PR's `html_url`
   surfaces the same way.
 
@@ -242,9 +261,24 @@ answer is `/memhub:link-pr`, and §8's skill exists precisely so an undetected p
 away from a link rather than a silent gap. Say so in the README (§11) rather than leaving the
 user to discover it.
 
-**Ordering.** `creates_pr` is checked as: `is_gh_pr_create(cmd)` OR (`github_api_call` is a
-writing `pulls_collection`) OR (MCP create-shaped tool name). The first match wins; there is no
-scoring.
+**Ordering.** A create-shaped MCP tool name answers `creates_pr` on its own — an MCP call is one
+call. For a SHELL command the question is asked of the whole call, not of the first match in it:
+count the pull-request-producing segments (`gh pr <sub>` invocations plus writing
+`pulls_collection` REST calls), and answer true only when there is **exactly one** and it is a
+create. There is no scoring and no first-match-wins.
+
+**Why the whole call.** One Bash command routinely chains several, and the tool result is their
+COMBINED output with nothing in it to say which segment produced the single URL §4.2 extracted.
+`gh pr create >/dev/null && gh pr view 99 --json url` opens one pull request and prints another's;
+`gh api --method POST repos/o/a/pulls >/dev/null && gh api --method GET repos/o/b/pulls/7` does
+the same through the REST lane. Taking the create verdict and applying it to the URL that came
+back links the session as the author of a pull request it did not open. An ambiguous call still
+reaches B2 — it did address GitHub — and the model judges there.
+
+Flags are read the same way: from the shell TOKENS of the segment that carries the target, never
+with a regex over the whole command string. A regex has to be told where quoting starts and
+stops, and got it wrong three separate ways (a quoted URL, a quoted `--method`, and a method
+belonging to a different invocation), each time turning a listing into a claimed creation.
 
 ### 4.2 `pr_url_from_response(tool_response) -> str | None`
 
@@ -367,26 +401,33 @@ cannot silence the other:
 
 ```json
 {
-  "matcher": "^(Bash|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$",
+  "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
   "hooks": [{
     "type": "command",
     "timeout": 15,
     "statusMessage": "MemHub: checking PR link",
-    "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
+    "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
   }]
 }
 ```
 
 **The matcher is a regex over the tool name**, so it must name the GitHub MCP servers as well as
-`Bash` — `"Bash"` alone silently misses every §4.1c case 2. It is deliberately anchored on the
-*server* segment rather than `mcp__.*`: matching every MCP tool would start a Python process on
-every MCP call in every session, for a check that is almost always going to decline.
+`Bash` — `"Bash"` alone silently misses every §4.1c case 2. It stays narrower than `mcp__.*`,
+because matching every MCP tool would start a Python process on every MCP call in every session
+for a check that is almost always going to decline — but it must NOT use `[^_]*` around the
+server segment, which rejects `github_enterprise` and every plugin-provided server. This matcher
+and the `case` guard below are coarse pre-filters that only decide whether a process starts;
+`pr_link.is_github_mcp_tool` is the precise gate, and it is the one that has to be exactly right.
 
 The `case` pre-filter is a cheap byte test that keeps `python3` from starting on ordinary shell
-traffic — the same trick the flush and babysit entries use. Both alternatives are needed:
-`*gh*pr*` catches `gh pr create` (which contains no "github"), and `*[Gg]it[Hh]ub*` catches the
+traffic — the same trick the flush and babysit entries use. All four alternatives are needed:
+`*gh*pr*` catches `gh pr create` (which contains no "github"); `*[Gg]it[Hh]ub*` catches the
 `api.github.com` URL in a `curl`/`gh api` command or response and the server name in an MCP tool
-call. A `gh api repos/o/r/pulls` command matches through the `api.github.com` URL in its own
+call; and `*api/v3*` plus `*repos/*pulls*` catch the ENTERPRISE forms, which contain neither —
+`curl -X POST https://ghe.corp/api/v3/repos/o/r/pulls` has no "github" anywhere in it, and
+`gh api --hostname ghe.corp … repos/o/r/pulls` has no URL at all. Without those two the whole
+enterprise path is detected by the Python and then never reached, which is a silence no log
+explains. A `gh api repos/o/r/pulls` command matches through the `api.github.com` URL in its own
 *response*, which is in the same payload.
 
 Synchronous (not `async`), because `additionalContext` from an async hook is not delivered; 15s
@@ -400,7 +441,7 @@ whole object for MCP), `tool_response`.
 In `_dispatch_post`, add a job for shell tools **and** GitHub MCP tools:
 
 ```python
-_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__[^_]*github[^_]*__")
+_GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
 
 if tool in _SHELL_TOOLS or (isinstance(tool, str) and _GITHUB_MCP_RX.match(tool)):
     jobs.append(lambda: _run(root, "pr_link_trigger.py", payload, timeout=_PR_LINK_TIMEOUT_S))
@@ -412,7 +453,7 @@ different things:
 - **`plugins/memhub/hooks/codex-hooks.json`** — the plugin-bundled manifest, read by Codex
   releases that load hooks from the plugin itself. It is re-fetched with every plugin upgrade and
   costs the user nothing, so its `PostToolUse` matcher IS widened here, to
-  `^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__[^_]*[Gg]it[Hh]ub[^_]*__.*)$`.
+  `^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$`.
   On that path Codex gets GitHub-MCP detection.
 - **`references/codex-hooks-bridge.json`** — the compatibility bridge `setup_codex_hooks.py`
   installs into `~/.codex/hooks.json`, a file the user has already trusted. Widening it would

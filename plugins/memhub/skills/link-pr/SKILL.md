@@ -37,8 +37,13 @@ Arguments: `$ARGUMENTS`
   (no PR for this branch, not a repo, `gh` unauthenticated), **ask** which PR
   they mean rather than guessing.
 
-Normalise to `https://github.com/<owner>/<repo>/pull/<n>` — no trailing slash,
-no query, no fragment. The server rejects anything else.
+Normalise to `https://<host>/<owner>/<repo>/pull/<n>` — no trailing slash, no
+query, no fragment. **Keep the host the user gave you.** Most PRs are on
+`github.com`, but an enterprise PR (`https://ghe.corp/o/r/pull/7`) is equally
+valid and the hook already passes those to the same backend; rewriting the host
+to `github.com` would name a different pull request, and rejecting it would
+leave enterprise users — including every Cursor user, for whom this skill is
+the only path — with no way to link at all.
 
 ## 2. Resolve the sessions
 

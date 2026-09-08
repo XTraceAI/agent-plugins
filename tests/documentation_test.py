@@ -7,6 +7,7 @@ checks make the supported install and recovery paths part of the test suite.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -90,13 +91,51 @@ _SPELLED = {11: "Eleven", 12: "Twelve", 13: "Thirteen", 14: "Fourteen",
             15: "Fifteen", 16: "Sixteen"}
 
 
+def test_the_specs_do_not_prescribe_patterns_the_code_rejects() -> None:
+    """A spec is the sole source of truth by its own header, so a pattern left
+    in it that the implementation has since rejected is a trap for the next
+    implementer — it reintroduces the bug and looks authorised (Codex, #182)."""
+    specs = (ROOT / "docs" / "specs" / "pr-linking-plugin-spec.md").read_text(encoding="utf-8")
+    rulebook = (ROOT / "docs" / "specs"
+                / "rulebook-disclosure-and-authoring-spec.md").read_text(encoding="utf-8")
+    # A pattern may still be NAMED as known-bad — that is how the next
+    # implementer learns not to reach for it. What must not survive is a
+    # pattern presented as the rule to implement, so each dead one is allowed
+    # only inside the paragraph that warns against it.
+    warning = specs[specs.index("**Do not do this with one regex.**"):][:1200]
+    for dead in ("mcp__[^_]*", "[^_]*[Gg]it[Hh]ub[^_]*",
+                 "(create|open|submit).*(pull.?request"):
+        outside = specs.replace(warning, "")
+        check(f"pr-linking spec no longer prescribes {dead!r}", dead not in outside)
+    # Prose wraps; a phrase check must not depend on where a line ended.
+    flat = " ".join(specs.split())
+    check("…and it says why, so the pattern is not reached for again",
+          "was the first attempt" in flat and "cannot take back" in flat)
+    check("the rulebook spec no longer prescribes a detached forward test",
+          "worktree add --detach" not in rulebook)
+    # …and the manifest the spec quotes must be the manifest that ships.
+    shipped = (ROOT / "plugins" / "memhub" / "hooks"
+               / "claude-hooks.json").read_text(encoding="utf-8")
+    for group in json.loads(shipped)["hooks"]["PostToolUse"]:
+        for hook in group["hooks"]:
+            if "pr_link_trigger" in hook.get("command", ""):
+                check(f"the spec quotes the shipped matcher {group['matcher']}",
+                      group["matcher"] in specs)
+                guard = 'case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*)'
+                check("…and the shipped case guard", guard in hook["command"])
+
+
 def test_create_rule_skill_keeps_its_authoring_gates() -> None:
     """The skill is prose, and prose silently loses steps."""
     skill = (ROOT / "plugins" / "memhub" / "skills" / "create-rule"
              / "SKILL.md").read_text(encoding="utf-8")
     for text in ("### 4b.", "scratch worktree", "advise mode",
                  "Never anchor a `command_rx` with `^`",
-                 "command position"):
+                 "command position",
+                 # The ledger window must bracket the sub-agent, not the whole
+                 # step — otherwise the skill's own setup fires the candidate.
+                 "immediately before the Agent call",
+                 "worktree add -b"):
         check(f"create-rule keeps {text!r}", text in skill)
 
 

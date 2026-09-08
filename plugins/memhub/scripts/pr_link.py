@@ -321,6 +321,38 @@ def _hostname_flag(args: list[str]) -> str | None:
     return None
 
 
+def _gh_pr_subcommands(command: object) -> list[str] | None:
+    """The subcommand of each `gh pr …` simple command, or None if unparseable.
+
+    `gh pr create >/dev/null && gh pr view 99 --json url` is one Bash call with
+    two pull requests in it; the whole-command regex saw the create and the
+    response carried the OTHER PR's URL.
+    """
+    if not isinstance(command, str) or not command:
+        return []
+    tokens = _tokens(command)
+    if tokens is None:
+        return None
+    subs: list[str] = []
+    for segment in _segments(tokens):
+        name, args = _command_name(segment)
+        if name in ("gh", "gh.exe") and "pr" in args:
+            index = args.index("pr")
+            subs.append(args[index + 1] if index + 1 < len(args) else "")
+    return subs
+
+
+def _api_matches(command: object) -> list[tuple[str, bool, str | None]]:
+    """Every pulls-API invocation in the command, one entry per segment."""
+    if not isinstance(command, str) or not command:
+        return []
+    tokens = _tokens(command)
+    if tokens is None:
+        target, write, host = _api_call_untokenised(command)
+        return [(target, write, host)] if target else []
+    return _api_segment_matches(tokens)
+
+
 def _api_call(command: object) -> tuple[str | None, bool, str | None]:
     """``(target, is_write, enterprise_host)`` for a call to the pulls API.
 
@@ -335,6 +367,25 @@ def _api_call(command: object) -> tuple[str | None, bool, str | None]:
     if not tokens:
         return None, False, None
 
+    matches = _api_segment_matches(tokens)
+    if not matches:
+        return None, False, None
+    if len(matches) == 1:
+        return matches[0]
+    # Several pulls-API calls in ONE shell call. The tool result is their
+    # combined output, and there is no way to tell which segment produced the
+    # single URL in it — so `gh api --method POST repos/o/a/pulls >/dev/null &&
+    # gh api --method GET repos/o/b/pulls/7 --jq .html_url` would have taken
+    # the POST's verdict and applied it to PR b's URL, linking the session as
+    # the author of a pull request it did not open. The call still addressed
+    # GitHub (so it reaches B2 and the model judges), but it can never take the
+    # unconditional B1 path.
+    hosts = {host for _t, _w, host in matches}
+    return matches[0][0], False, hosts.pop() if len(hosts) == 1 else None
+
+
+def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]]:
+    """``(target, is_write, enterprise_host)`` for each pulls-API segment."""
     matches: list[tuple[str, bool, str | None]] = []
     for segment in _segments(tokens):
         name, args = _command_name(segment)
@@ -387,21 +438,7 @@ def _api_call(command: object) -> tuple[str | None, bool, str | None]:
         else:
             write = False
         matches.append((target, write, enterprise))
-
-    if not matches:
-        return None, False, None
-    if len(matches) == 1:
-        return matches[0]
-    # Several pulls-API calls in ONE shell call. The tool result is their
-    # combined output, and there is no way to tell which segment produced the
-    # single URL in it — so `gh api --method POST repos/o/a/pulls >/dev/null &&
-    # gh api --method GET repos/o/b/pulls/7 --jq .html_url` would have taken
-    # the POST's verdict and applied it to PR b's URL, linking the session as
-    # the author of a pull request it did not open. The call still addressed
-    # GitHub (so it reaches B2 and the model judges), but it can never take the
-    # unconditional B1 path.
-    hosts = {host for _t, _w, host in matches}
-    return matches[0][0], False, hosts.pop() if len(hosts) == 1 else None
+    return matches
 
 
 def github_api_call(command: object) -> tuple[str | None, bool]:
@@ -517,14 +554,29 @@ def touches_github(tool_name: object, tool_input: object) -> bool:
 
 
 def creates_pr(tool_name: object, tool_input: object) -> bool:
-    """Is this call OPENING a pull request? First match wins; no scoring."""
+    """Is this call OPENING a pull request?
+
+    One shell call can name several pull requests, and its tool result is their
+    combined output with nothing to say which produced the single URL in it.
+    So the question is asked of the WHOLE call: unless exactly one segment in
+    it produces a pull request, this can never claim the session opened the one
+    that came back — `gh pr create >/dev/null && gh pr view 99` opened one PR
+    and printed another's URL.
+    """
     if is_github_mcp_create(tool_name):
         return True
     command = _command_of(tool_name, tool_input)
     if not command:
         return False
-    if is_gh_pr_create(command):
-        return True
+
+    subs = _gh_pr_subcommands(command)
+    if subs is None:                       # unparseable: the regex is all we have
+        return bool(is_gh_pr_create(command))
+    producing = len(subs) + len(_api_matches(command))
+    if producing != 1:
+        return False
+    if subs:
+        return subs[0] == "create"
     target, is_write = github_api_call(command)
     return target == "pulls_collection" and is_write
 
