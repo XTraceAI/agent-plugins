@@ -663,6 +663,12 @@ def _url_source_is_certain(command: str) -> bool:
     tokens = _tokens(command)
     if tokens is None:
         return False
+    # A TRAILING `&` has no segment after it, so `_segments_with_ops` has
+    # nowhere to hang it — `gh pr create --fill &` would otherwise look like a
+    # plain create. Read it off the token list directly.
+    if tokens and "&" in tokens[-1] and tokens[-1] != "&&" and all(
+            ch in _SHELL_PUNCTUATION for ch in tokens[-1]):
+        return False
     segments = _segments_with_ops(tokens)
     # Only what comes AFTER the creating segment can supply the URL or mask its
     # status. A separator BEFORE it — `cd /repo; gh pr create` — is harmless,
@@ -680,6 +686,12 @@ def _url_source_is_certain(command: str) -> bool:
         # create did, and its exit status is the one the tool reports.
         if op in (";", "||") or op.strip("\r\n") == "":
             return False
+        # `&` BACKGROUNDS the command before it, so the tool reports whatever
+        # ran next — `gh pr create --fill & wait` exits 0 even when the create
+        # failed, and its stderr still carries the existing PR's URL. `&&` is
+        # a different operator and stays trusted.
+        if "&" in op and op != "&&":
+            return False
         if op == "|":
             # Without `set -o pipefail` a pipeline reports the LAST command's
             # status, so `gh pr create | tee log` exits 0 even when the create
@@ -687,7 +699,13 @@ def _url_source_is_certain(command: str) -> bool:
             # still carries THAT pull request's URL. The failed-create guard
             # cannot see through that, so the pipeline declines instead.
             return False
-    # A redirect inside the creating segment itself sends its URL away.
+    # A redirect inside the creating segment itself sends its URL away — and a
+    # create that is itself backgrounded (`gh pr create --fill &`) has no
+    # status to read at all.
+    if creator + 1 < len(segments):
+        following = segments[creator + 1][0]
+        if "&" in following and following != "&&":
+            return False
     return ">" not in (segments[creator][0] if creator else "")
 
 
@@ -722,8 +740,20 @@ def _creating_segment_index(segments: list[tuple[str, list[str]]]) -> int | None
 # (`gh pr -R o/r create`), and `-R/--repo` takes an operand.
 _GH_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname", "--template",
                              "--jq", "-q"})
-# `--dry-run` prints the pull request it WOULD open and opens nothing.
+# `--dry-run` prints the pull request it WOULD open and opens nothing. gh also
+# accepts the attached boolean spellings, so an exact-token test missed
+# `--dry-run=true` — the third distinct way this one flag has been written.
 _GH_DRY_RUN = "--dry-run"
+_FALSEY = frozenset({"false", "0", "no", "off"})
+
+
+def _is_dry_run(tokens: list[str]) -> bool:
+    for token in tokens:
+        if token == _GH_DRY_RUN:
+            return True
+        if token.startswith(_GH_DRY_RUN + "="):
+            return token[len(_GH_DRY_RUN) + 1:].casefold() not in _FALSEY
+    return False
 
 
 def _gh_subcommand_after(args: list[str], start: int) -> str:
@@ -1094,7 +1124,7 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
         # dry-run guard must still apply, or `gh pr create --dry-run` with a
         # quote shlex cannot read claims authorship of whatever PR its printed
         # details happen to mention.
-        if _GH_DRY_RUN in command:
+        if _is_dry_run(command.split()):
             return False
         return bool(is_gh_pr_create(command))
     producing = len(subs) + len(_api_matches(command))
@@ -1105,7 +1135,7 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
     if not _url_source_is_certain(command):
         return False
     if subs:
-        if _GH_DRY_RUN in (_tokens(command) or []):
+        if _is_dry_run(_tokens(command) or []):
             # `gh pr create --dry-run` prints the pull request it WOULD open.
             # If the proposed body quotes a PR URL, B1 would have claimed
             # authorship of THAT one.

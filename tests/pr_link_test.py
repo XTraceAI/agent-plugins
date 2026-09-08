@@ -724,8 +724,16 @@ def test_gh_inherited_flags_and_dry_run():
           not pr_link.creates_pr("Bash", {"command": "gh pr -R o/r view 12"}))
     # A dry run opens nothing; if its proposed body quotes a PR URL, B1 would
     # have claimed authorship of THAT pull request.
-    check("--dry-run is not a creation",
-          not pr_link.creates_pr("Bash", {"command": "gh pr create --fill --dry-run"}))
+    for command in ("gh pr create --fill --dry-run",
+                    # gh accepts the attached boolean spellings too.
+                    "gh pr create --fill --dry-run=true",
+                    "gh pr create --fill --dry-run=TRUE"):
+        check(f"not a creation: {command[24:]!r}",
+              not pr_link.creates_pr("Bash", {"command": command}))
+    for command in ("gh pr create --fill --dry-run=false",
+                    "gh pr create --fill --dry-run=0"):
+        check(f"…but an explicitly disabled dry run IS: {command[24:]!r}",
+              pr_link.creates_pr("Bash", {"command": command}))
     # …including when the command will not tokenise at all. ANSI-C quoting
     # ($'…') defeats shlex, and the guard sat AFTER that fallback returned,
     # so the dry run claimed authorship of whatever its details mentioned.
@@ -776,6 +784,13 @@ def test_b1_needs_the_url_to_be_provably_the_creates_own():
         "gh pr create --fill ; cat /tmp/pr-url",               # runs even if it failed
         "gh pr create --fill || cat /tmp/pr-url",
         "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}' > /dev/null",
+        # `&` BACKGROUNDS the create, so the tool reports whatever ran next —
+        # `& wait` exits 0 even when the create failed and its stderr still
+        # holds the existing PR's URL (Codex review, PR #182).
+        "gh pr create --fill & wait",
+        "gh pr create --fill & echo done",
+        "gh pr create --fill &",                       # trailing: no next segment
+        "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}' &",
     ):
         check(f"no self-link when the URL's source is uncertain: {command[:44]!r}",
               pr_link.touches_github("Bash", {"command": command})
