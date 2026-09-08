@@ -238,6 +238,10 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
         claude_session(home, "mixed", wt, branch="unrelated",
                        commands=["git commit -m unrelated && git log --oneline -5"],
                        results=[f"[wip 9999999] unrelated\n{sha[:8]} someone else"])
+        # …nor one running a read-only history query whose name merely STARTS
+        # with a commit-producing subcommand: `\bmerge\b` matched `merge-base`.
+        claude_session(home, "ancestor", wt, branch="unrelated",
+                       commands=["git merge-base main HEAD"], results=[sha])
         rc, out, err = run(home, PR_FILES, "--branch", "feat/x", "--sha", sha,
                            "--host", "claude")
         ids = [r["conversation_id"] for r in json.loads(out)]
@@ -249,6 +253,8 @@ def test_a_sha_counts_only_from_the_call_that_MADE_the_commit():
               "pusher" not in ids, out)
         check("…nor one whose call both committed and printed the log",
               "mixed" not in ids, out)
+        check("…nor one that only ran `git merge-base`",
+              "ancestor" not in ids, out)
         check("…while the session that made the commit still counts",
               "author" in ids, out)
 

@@ -58,7 +58,10 @@ _SHA_RX = re.compile(r"\b[0-9a-f]{7,40}\b")
 _COMMIT_PRODUCING = re.compile(
     r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
     r"git\b(?:\s+-[cC]\s+\S+)*\s+"
-    r"(?:commit|cherry-pick|revert|merge|rebase|am)\b", re.I)
+    # `(?![-\w])`, not `\b`: a word boundary also sits before a hyphen, so
+    # `\bmerge\b` matched `git merge-base` — a read-only query that prints an
+    # existing common-ancestor sha, scored as top-value authorship proof.
+    r"(?:commit|cherry-pick|revert|merge|rebase|am)(?![-\w])", re.I)
 # Anything that PRINTS shas it did not create. One Bash call is often a chain
 # and its result is the combined output, so `git commit -m x && git log` would
 # otherwise credit this session with every sha in the log. There is no way to
@@ -69,7 +72,8 @@ _SHA_DISPLAYING = re.compile(
     r"(?:^|[;&|(`]|\$\()\s*(?:\w+=\S*\s+)*"
     r"git\b(?:\s+-[cC]\s+\S+)*\s+"
     r"(?:log|show|rev-parse|rev-list|reflog|describe|cherry|ls-remote|diff|"
-    r"blame|shortlog|whatchanged|bisect|branch|tag|status)\b", re.I)
+    r"blame|shortlog|whatchanged|bisect|branch|tag|status|merge-base|"
+    r"merge-tree|name-rev|for-each-ref)(?![-\w])", re.I)
 _APPLY_PATCH_PATH = re.compile(r"\*\*\* (?:Update|Add|Delete) File: (.+)")
 _GIT_PATHS = re.compile(r"(?:^|[;&|])\s*git\s+(?:add|commit)\b([^;&|\n]*)")
 _BRANCH_CMD = re.compile(

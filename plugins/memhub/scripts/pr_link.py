@@ -245,6 +245,31 @@ def is_gh_pr_create(command: object) -> bool:
     return bool(GH_PR_CREATE.search(_unquoted(command)))
 
 
+def _segments_with_ops(tokens: list[str]) -> list[tuple[str, list[str]]]:
+    """``(operator_before, segment)`` for each simple command.
+
+    The operator matters for one question only — whether the segment before it
+    is known to have SUCCEEDED. `&&` says yes, so a `gh pr create &&` chain has
+    the created PR's URL in its output; `;` and `||` run their follower even
+    when the create failed, in which case the only URL in the result came from
+    somewhere else entirely.
+    """
+    out: list[tuple[str, list[str]]] = []
+    segment: list[str] = []
+    op = ""
+    for token in tokens:
+        if token and all(ch in _SHELL_PUNCTUATION for ch in token):
+            if segment:
+                out.append((op, segment))
+                segment = []
+            op = token
+        else:
+            segment.append(token)
+    if segment:
+        out.append((op, segment))
+    return out
+
+
 def _segments(tokens: list[str]) -> list[list[str]]:
     """Split on shell operators into simple commands.
 
@@ -307,6 +332,22 @@ def _positional_method(args: list[str]) -> str | None:
     return None
 
 
+# `curl -d'{"title":"x"}'` and `-Ftitle=x` tokenise as `-d{...}` / `-Ftitle=x`,
+# which no exact-token test matches. Single-dash short options may also be
+# bundled (`-sSfd '{}'`), so the test is "a short-option run containing `d` or
+# `F`". `-f` is curl's --fail and `-D` its --dump-header, and neither is here.
+_CURL_ATTACHED_DATA = re.compile(r"^-[A-Za-z]*[dF]")
+
+
+def _curl_posts(segment: list[str]) -> bool:
+    for token in segment:
+        if token in _CURL_DATA_FLAGS or token.startswith("--data"):
+            return True
+        if not token.startswith("--") and _CURL_ATTACHED_DATA.match(token):
+            return True
+    return False
+
+
 def _wget_posts(segment: list[str]) -> bool:
     return any(t == f or t.startswith(f + "=")
                for t in segment for f in _WGET_POST_FLAGS)
@@ -333,6 +374,40 @@ def _hostname_flag(args: list[str]) -> str | None:
         if token.startswith(_HOSTNAME_FLAG + "="):
             return token[len(_HOSTNAME_FLAG) + 1:].casefold()
     return None
+
+
+# `>` and its variants arrive as their own operator token (`>`, `>&`, `>>`),
+# so the test is simply "this operator contains a redirect character".
+
+
+def _url_source_is_certain(command: str) -> bool:
+    """Could the single URL in this result have come from somewhere other than
+    the pull-request-creating segment?
+
+    B1's claim is "the URL that came back is the pull request you just opened",
+    and it is only sound when the create's own output is what produced it. Two
+    shapes break that, and both are cheap to spot:
+
+    * the create's stdout is **redirected away** — `gh pr create >/dev/null &&
+      cat /tmp/pr-url` shows a URL that provably is not the create's;
+    * a follower runs **even if the create failed** — after `;` or `||`. A
+      failed create prints no URL, so the only one in the result came from the
+      follower. `&&` is safe: it proves the create succeeded, so its URL is in
+      the output, and any second URL would trip the exactly-one rule into
+      silence anyway. A pipeline (`| tee log`) carries the create's own stdout
+      onward, so it is safe for the same reason.
+    """
+    tokens = _tokens(command)
+    if tokens is None:
+        return False
+    for index, (op, _segment) in enumerate(_segments_with_ops(tokens)):
+        if not index:
+            continue
+        if ">" in op:                      # stdout (or stderr) sent elsewhere
+            return False
+        if op in (";", "||"):              # runs even if the create failed
+            return False
+    return True
 
 
 def _gh_pr_subcommands(command: object) -> list[str] | None:
@@ -448,8 +523,7 @@ def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]
             write = True
         elif name == "wget" and _wget_posts(segment):
             write = True
-        elif is_http and any(t in _CURL_DATA_FLAGS or t.startswith("--data")
-                             for t in segment):
+        elif is_http and _curl_posts(segment):
             write = True
         else:
             write = False
@@ -590,6 +664,10 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
         return bool(is_gh_pr_create(command))
     producing = len(subs) + len(_api_matches(command))
     if producing != 1:
+        return False
+    # Counting only the RECOGNISED invocations is not enough: any other segment
+    # can print a URL too (`gh pr create >/dev/null && cat /tmp/pr-url`).
+    if not _url_source_is_certain(command):
         return False
     if subs:
         return subs[0] == "create"

@@ -195,6 +195,19 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", True),
         ("curl --json @body.json https://api.github.com/repos/o/r/pulls",
          "pulls_collection", True),
+        # Short options can carry their value attached, and can be bundled.
+        # `-f` is curl's --fail and `-D` its --dump-header, so neither counts
+        # (Codex review, PR #182).
+        ("curl -d'{\"title\":\"x\"}' https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
+        ("curl -Ftitle=x https://api.github.com/repos/o/r/pulls", "pulls_collection", True),
+        ("curl -sSfd @b.json https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", True),
+        ("curl -fsSL https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("curl -D headers.txt https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
+        ("curl -o out.json https://api.github.com/repos/o/r/pulls",
+         "pulls_collection", False),
         ("http POST https://api.github.com/repos/o/r/pulls title=x",
          "pulls_collection", True),
         ("xh POST https://api.github.com/repos/o/r/pulls title=x",
@@ -443,6 +456,33 @@ def test_a_chained_gh_pr_create_cannot_claim_the_other_prs_url():
                     "gh pr create --fill | tee log",
                     'gh pr create --title "pr" --body b'):
         check(f"one create is still a create: {command[:40]!r}",
+              pr_link.creates_pr("Bash", {"command": command}))
+
+
+def test_b1_needs_the_url_to_be_provably_the_creates_own():
+    """Counting recognised invocations is not enough — ANY segment can print a
+    URL. `gh pr create >/dev/null && cat /tmp/pr-url` shows one that provably
+    is not the create's (Codex review, PR #182)."""
+    for command in (
+        "gh pr create --fill >/dev/null && cat /tmp/pr-url",   # redirected away
+        "gh pr create --fill > out.txt",
+        "gh pr create --fill 2>&1 | tee log",
+        "gh pr create --fill ; cat /tmp/pr-url",               # runs even if it failed
+        "gh pr create --fill || cat /tmp/pr-url",
+        "curl -X POST https://api.github.com/repos/o/r/pulls -d '{}' > /dev/null",
+    ):
+        check(f"no self-link when the URL's source is uncertain: {command[:44]!r}",
+              pr_link.touches_github("Bash", {"command": command})
+              and not pr_link.creates_pr("Bash", {"command": command}))
+    # `&&` proves the create succeeded, so its URL IS in the output — and a
+    # second URL would trip the exactly-one rule into silence anyway. A
+    # pipeline carries the create's own stdout onward.
+    for command in ("gh pr create --fill",
+                    "cd .. && gh pr create --fill",
+                    "(cd sub && gh pr create)",
+                    "git add -A && git commit -m x && gh pr create --fill",
+                    "gh pr create --fill | tee log"):
+        check(f"…but an && chain or pipeline still links: {command[:44]!r}",
               pr_link.creates_pr("Bash", {"command": command}))
 
 
