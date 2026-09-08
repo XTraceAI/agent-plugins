@@ -116,8 +116,14 @@ def _git_pathspecs(argument_text: str) -> list[str]:
         paths.append(token)
         index += 1
     return paths
+# `-b`/`-B` create a branch with `checkout`; `switch` spells the same thing
+# `-c`/`-C` (`--create`/`--force-create`). Codex and Cursor sessions have no
+# top-level `gitBranch` to fall back on, so missing `switch -c` cost them the
+# branch signal — three points and their second piece of evidence — on the
+# very command that creates the PR's branch.
 _BRANCH_CMD = re.compile(
-    r"(?:^|[;&|])\s*git\s+(?:checkout|switch)\s+(?:-b\s+|-B\s+)?"
+    r"(?:^|[;&|])\s*git\s+(?:checkout|switch)\s+"
+    r"(?:(?:-b|-B|-c|-C|--create|--force-create)\s+)?"
     r"(?:'([^']+)'|\"([^\"]+)\"|([^\s;&|'\"-][^\s;&|]*))")
 
 

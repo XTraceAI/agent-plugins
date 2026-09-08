@@ -261,6 +261,20 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
          "pulls_collection", False),
         ("curl --aws-sigv4 '-XPOST' 'https://api.github.com/repos/o/r/pulls'",
          "pulls_collection", False),
+        ("wget --output-file '-XPOST' -O - 'https://api.github.com/repos/o/r/pulls?per_page=1'",
+         "pulls_collection", False),
+        # The point of the inverted default: an option this code has never
+        # heard of consumes its operand, so it can cost a link but never
+        # manufacture a claim (Codex review, PR #182).
+        ("curl --some-future-option '-XPOST' 'https://api.github.com/repos/o/r/pulls'",
+         "pulls_collection", False),
+        # …while known boolean flags do NOT swallow the method after them.
+        ("curl -s -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        ("curl -fsSL -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
+        ("curl --silent --location -X POST https://api.github.com/repos/o/r/pulls -d '{}'",
+         "pulls_collection", True),
         # Wrapper flags that take a separate operand.
         ("env -u DEBUG curl -X POST https://api.github.com/repos/o/r/pulls -d x",
          "pulls_collection", True),

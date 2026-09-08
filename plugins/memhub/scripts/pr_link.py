@@ -203,13 +203,56 @@ _VALUE_LONG_OPTS = frozenset({
     "--happy-eyeballs-timeout-ms", "--continue-at", "--socks4", "--socks5"})
 
 
+# Options known to take NO operand. This list exists to make the DEFAULT below
+# safe rather than to be exhaustive.
+_NO_OPERAND_LONG = frozenset({
+    "--silent", "--show-error", "--fail", "--fail-early", "--fail-with-body",
+    "--location", "--location-trusted", "--insecure", "--verbose", "--include",
+    "--head", "--compressed", "--get", "--next", "--no-buffer", "--netrc",
+    "--progress-bar", "--no-progress-meter", "--path-as-is", "--tcp-nodelay",
+    "--http1.0", "--http1.1", "--http2", "--http3", "--create-dirs", "--raw",
+    "--remote-name", "--remote-header-name", "--globoff", "--ipv4", "--ipv6",
+    "--anyauth", "--basic", "--digest", "--ntlm", "--negotiate", "--disable",
+    "--list-only", "--append", "--use-ascii", "--crlf", "--junk-session-cookies",
+    # wget
+    "--debug", "--quiet", "--no-verbose", "--continue", "--timestamping",
+    "--spider", "--no-check-certificate", "--content-disposition",
+    "--server-response", "--mirror", "--recursive", "--no-clobber",
+    # gh
+    "--dry-run", "--fill", "--fill-first", "--draft", "--web", "--paginate",
+    # httpie / xh
+    "--ignore-stdin", "--follow", "--offline", "--print-body"})
+
+
 def _consumes_operand(token: str) -> bool:
-    """Does this option take the NEXT token as its value?"""
-    if token in _VALUE_LONG_OPTS:
-        return True
-    if token.startswith("--") or not token.startswith("-") or len(token) != 2:
+    """Does this option take the NEXT token as its value?
+
+    The DEFAULT for an unrecognised option is YES, and that inversion is the
+    point. When the default was "no", every value-taking option missing from
+    the list let its argument be re-read as an option — five separate findings
+    ended that way, each a listing reported as a creation because somebody's
+    filename or header happened to contain `-XPOST`.
+
+    Defaulting to "consumes" makes an incomplete list fail the other way: the
+    worst case is that a real method flag is skipped, the call reports no
+    explicit method, and it falls to B2 where the model judges. A missed
+    creation costs a link; a false one makes a confirmed authorship claim about
+    work the session did not do.
+    """
+    if not token.startswith("-") or token == "-":
         return False
-    return token[1] in _CURL_VALUE_OPTS
+    if token.startswith("--"):
+        if token in _VALUE_LONG_OPTS:
+            return True
+        if "=" in token or token in _NO_OPERAND_LONG:
+            return False
+        return True                    # unknown long option: assume a value
+    # A short-option run follows getopt: the first value-taking character
+    # consumes the REST of the token if there is any, otherwise the next token.
+    for position, char in enumerate(token[1:], start=1):
+        if char in _CURL_VALUE_OPTS:
+            return position == len(token) - 1
+    return False
 
 
 def _explicit_method(tokens: list[str]) -> str | None:

@@ -147,6 +147,26 @@ def test_edit_paths_are_read_under_every_host_s_spelling():
                   == ["app/x.py", "app/y.py"], out[:200])
 
 
+def test_switch_creates_a_branch_too():
+    """`git switch -c` is how the PR's branch is usually made, and Codex and
+    Cursor have no top-level `gitBranch` to fall back on — so missing it cost
+    those sessions the branch signal entirely (Codex review, PR #182)."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        # `branch=None` means no gitBranch record: the Codex/Cursor shape.
+        claude_session(home, "switcher", wt, branch=None,
+                       edits=[f"{wt}/app/x.py"],
+                       commands=["git switch -c feat/x"])
+        rc, out, _err = run(home, PR_FILES, "--branch", "feat/x", "--host", "claude")
+        rows = {r["conversation_id"]: r for r in json.loads(out)}
+        check("the branch is picked up from `git switch -c`",
+              rows.get("switcher", {}).get("evidence", {}).get("branch_match") is True,
+              out[:220])
+        check("…so it scores the file AND the branch (2 + 3)",
+              rows.get("switcher", {}).get("score") == 5, out[:220])
+
+
 def test_a_commit_message_is_not_a_list_of_edited_paths():
     """`git commit -m "docs: update README.md"` handed every word of the
     message to the path matcher, so a session that committed unrelated work
