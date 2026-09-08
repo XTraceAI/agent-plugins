@@ -75,6 +75,23 @@ def test_readme_names_every_shipped_skill() -> None:
           f"{_SPELLED[len(skills)]} skills ship in" in README)
 
 
+def test_the_finder_collects_facts_from_the_pr_it_was_given() -> None:
+    """`gh pr view <n>` resolves the number against the CURRENT checkout, so a
+    URL for another repo would have ranked sessions against a different pull
+    request and then linked them to the one the user named (Codex, #182)."""
+    skill = (ROOT / "plugins" / "memhub" / "skills" / "find-contributing-sessions"
+             / "SKILL.md").read_text(encoding="utf-8")
+    flat = " ".join(skill.split())
+    # Step 1 resolving a bare NUMBER against the current repo is correct and
+    # stays; it is the facts section that must use the resolved URL.
+    facts = skill[skill.index("## 2. Collect the PR's facts"):skill.index("## 3. Run the scanner")]
+    check("the facts commands take the URL, not the bare number",
+          'gh pr view "$PR_URL" --json' in facts and "gh pr view <n> --json" not in facts)
+    check("…and it says why", "resolves the number against the CURRENT checkout" in flat)
+    check("…and it checks the answer came from that PR",
+          "Sanity-check the `url` that comes back" in flat)
+
+
 def test_readme_explains_session_pr_linking_and_its_per_host_gaps() -> None:
     for text in (
         # The two properties a user has to be able to trust.

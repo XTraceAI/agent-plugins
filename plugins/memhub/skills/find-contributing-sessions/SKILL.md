@@ -37,15 +37,27 @@ the only path — with no way to link at all.
 Never paste a diff into context. Write the file list to a file and pass the
 rest as flags:
 
+**Pass the resolved URL, never the bare number.** `gh pr view <n>` resolves the
+number against the CURRENT checkout, so if the user named a pull request in a
+different repository you would collect that repo's branch, files and commits,
+rank sessions against them, and then link the approved ones to the URL the user
+actually gave — the wrong sessions on the right pull request. `gh pr view`
+takes `<number> | <url> | <branch>`, so hand it the URL:
+
 ```bash
-gh pr view <n> --json headRefName,baseRefName,createdAt,url,title
-gh pr view <n> --json files -q '.files[].path' > /tmp/pr-files.txt
-gh pr view <n> --json commits -q '.commits[].oid'
+PR_URL="<the URL from step 1>"
+gh pr view "$PR_URL" --json headRefName,baseRefName,createdAt,url,title
+gh pr view "$PR_URL" --json files -q '.files[].path' > /tmp/pr-files.txt
+gh pr view "$PR_URL" --json commits -q '.commits[].oid'
 ```
 
-For a large PR, `gh pr view --json files` truncates; use
+Sanity-check the `url` that comes back against `$PR_URL` before going on; if
+they differ, stop and say so rather than scanning for the wrong pull request.
+
+For a large PR, `gh pr view --json files` truncates. Use the `<owner>/<repo>`
+and `<n>` **from `$PR_URL`**, not from the current checkout — and on an
+enterprise host add `--hostname <host>`:
 `gh api repos/<owner>/<repo>/pulls/<n>/files --paginate -q '.[].filename' > /tmp/pr-files.txt`
-instead.
 
 ## 3. Run the scanner
 

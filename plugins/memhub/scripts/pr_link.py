@@ -312,6 +312,19 @@ def _wget_posts(segment: list[str]) -> bool:
                for t in segment for f in _WGET_POST_FLAGS)
 
 
+# HTTPie/xh default to GET with no request data and POST with some. Only BODY
+# items count: `k=v` (string field), `k:=v` (raw JSON) and `k@file` (upload).
+# `k==v` is a query parameter and `Header:value` is a header — neither is a
+# body, and reading either as one would turn a listing into a claimed
+# creation. Anchored, so a URL (`https://…`, or one carrying `?state=open`)
+# can never look like a field: it fails at the very first character.
+_HTTPIE_BODY_ITEM = re.compile(r"^[^:=@\s]+(?:=(?!=)|:=|@)")
+
+
+def _httpie_posts(args: list[str]) -> bool:
+    return any(not t.startswith("-") and _HTTPIE_BODY_ITEM.match(t) for t in args)
+
+
 def _hostname_flag(args: list[str]) -> str | None:
     """`gh api --hostname ghe.corp …` — an enterprise call with no URL in it."""
     for index, token in enumerate(args):
@@ -430,6 +443,8 @@ def _api_segment_matches(tokens: list[str]) -> list[tuple[str, bool, str | None]
         if method is not None:
             write = method == "POST"
         elif is_gh_api and any(t in _GH_FIELD_FLAGS for t in segment):
+            write = True
+        elif name in _HTTPIE_CLIENTS and _httpie_posts(args):
             write = True
         elif name == "wget" and _wget_posts(segment):
             write = True
@@ -582,18 +597,12 @@ def creates_pr(tool_name: object, tool_input: object) -> bool:
     return target == "pulls_collection" and is_write
 
 
-def pr_url_from_response(tool_response: object, host: str | None = None) -> str | None:
-    """The one PR URL in this tool result, or None.
+def _response_texts(tool_response: object) -> list[str] | None:
+    """Every string in a tool result, bounded. None if it is not a result shape.
 
-    Zero URLs (a failed command, a `gh pr checkout` printing only a branch) or
-    two-or-more (`gh pr list`, `gh pr status`) both answer None, and the hook
-    is then silent. That single rule is what keeps the listing commands quiet
-    while `create`, `view`, `checkout`, `comment`, `merge`, `ready` and `edit`
-    still resolve — as do a `curl` POST response body and a GitHub MCP result,
-    which each carry exactly one `html_url`.
-
-    stderr counts: `gh pr create` on a branch that already has one prints the
-    existing PR's URL there, and that is still the PR being worked on.
+    A shell result is a dict with `stdout`/`stderr`, or a bare string; an MCP
+    result is a nested object. Both are handled here so the URL rule and the
+    enterprise-host lookup read exactly the same bytes.
     """
     texts: list[str] = []
     if isinstance(tool_response, str):
@@ -617,6 +626,53 @@ def pr_url_from_response(tool_response: object, host: str | None = None) -> str 
             [pr_provenance.MAX_RESULT_NODES],
         ))
     else:
+        return None
+    return texts
+
+
+_HTML_URL_RE = re.compile(
+    r'"html_url"\s*:\s*"(https://([\w.-]+)/[A-Za-z0-9][A-Za-z0-9-]{0,38}'
+    r'/[A-Za-z0-9_.-]{1,100}/pull/[1-9][0-9]*)"')
+
+
+def _mcp_result_host(tool_response: object) -> str | None:
+    """The enterprise host named by a GitHub MCP result's own `html_url`.
+
+    The MCP lane has no shell command, so `github_api_host` has nothing to read
+    — and a GHES server's create was recognised and then dropped, because the
+    default parser only knows github.com.
+
+    This reads the `html_url` FIELD rather than scanning the text for any
+    `/pull/` URL. A shell command's stdout can contain anything at all, which
+    is why the shell lane takes its host from the command; an MCP result is the
+    structured reply of a server whose own name had to say "github" to get
+    here, and `html_url` is that reply's canonical field. Free prose in the
+    body (a PR description quoting some other site) is not consulted.
+    """
+    for text in _response_texts(tool_response):
+        match = _HTML_URL_RE.search(text[:pr_provenance.MAX_RESULT_TEXT_BYTES])
+        if match:
+            host = match.group(2).casefold()
+            if host not in ("github.com", "api.github.com"):
+                return host
+    return None
+
+
+def pr_url_from_response(tool_response: object, host: str | None = None) -> str | None:
+    """The one PR URL in this tool result, or None.
+
+    Zero URLs (a failed command, a `gh pr checkout` printing only a branch) or
+    two-or-more (`gh pr list`, `gh pr status`) both answer None, and the hook
+    is then silent. That single rule is what keeps the listing commands quiet
+    while `create`, `view`, `checkout`, `comment`, `merge`, `ready` and `edit`
+    still resolve — as do a `curl` POST response body and a GitHub MCP result,
+    which each carry exactly one `html_url`.
+
+    stderr counts: `gh pr create` on a branch that already has one prints the
+    existing PR's URL there, and that is still the PR being worked on.
+    """
+    texts = _response_texts(tool_response)
+    if texts is None:
         return None
 
     urls: list[str] = []
@@ -885,8 +941,16 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
     """stdin → the text to inject, or None. The whole hook, minus its I/O."""
     if not touches_github(tool_name, tool_input):
         return None
-    pr_url = pr_url_from_response(
-        tool_response, host=github_api_host(_command_of(tool_name, tool_input)))
+    # `api_host`, NOT `host`: `host` is the SESSION's host (claude/codex/cursor)
+    # and namespaces the conversation id below. Reusing the name here silently
+    # made every Codex and Cursor session id un-namespaced.
+    #
+    # The shell lane takes its API host from the command it just ran; the MCP
+    # lane has no command, so it reads the server's own `html_url` field.
+    api_host = github_api_host(_command_of(tool_name, tool_input))
+    if api_host is None and is_github_mcp_tool(tool_name):
+        api_host = _mcp_result_host(tool_response)
+    pr_url = pr_url_from_response(tool_response, host=api_host)
     if not pr_url:
         return None
     reply = checker(pr_url)

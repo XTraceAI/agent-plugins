@@ -200,6 +200,19 @@ def test_github_api_call_reads_the_rest_shapes_people_actually_paste():
         ("xh POST https://api.github.com/repos/o/r/pulls title=x",
          "pulls_collection", True),
         ("http GET https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        # HTTPie/xh default to GET with no data and POST with some. Only BODY
+        # items count — `k==v` is a query param and `Header:value` a header,
+        # and reading either as a body would turn a listing into a claimed
+        # creation (Codex review, PR #182).
+        ("http https://api.github.com/repos/o/r/pulls title=x head=f base=main",
+         "pulls_collection", True),
+        ("xh https://api.github.com/repos/o/r/pulls body:=@b.json", "pulls_collection", True),
+        ("http https://api.github.com/repos/o/r/pulls", "pulls_collection", False),
+        ("http https://api.github.com/repos/o/r/pulls state==open", "pulls_collection", False),
+        ("http https://api.github.com/repos/o/r/pulls X-Api-Key:abc", "pulls_collection", False),
+        ("http 'https://api.github.com/repos/o/r/pulls?state=open'", "pulls_collection", False),
+        # An explicit verb still beats the inference.
+        ("http GET https://api.github.com/repos/o/r/pulls title=x", "pulls_collection", False),
         # Two pulls calls in ONE shell call: the tool result is their combined
         # output and nothing says which produced the URL, so this can reach B2
         # but never the unconditional B1 (Codex review, PR #182).
@@ -322,6 +335,30 @@ def test_an_enterprise_create_resolves_its_own_host():
     check("github.com extraction is unchanged",
           pr_link.pr_url_from_response({"stdout": "https://github.com/o/r/pull/7"})
           == "https://github.com/o/r/pull/7")
+
+
+def test_an_enterprise_mcp_create_reads_its_host_from_the_result():
+    """The MCP lane has no shell command, so `github_api_host` has nothing to
+    read and a GHES server's create was recognised and then dropped. The host
+    comes from the reply's own `html_url` FIELD — an MCP result is the
+    structured answer of a server whose name had to say "github" to get here,
+    unlike a shell stdout, which can contain anything (Codex, PR #182)."""
+    connected = {"enabled": True, "github_connected": True, "repo_in_install": True}
+    ghes = {"content": [{"type": "text", "text": json.dumps({
+        "html_url": "https://ghe.corp/o/r/pull/7",
+        "issue_url": "https://ghe.corp/api/v3/repos/o/r/issues/7"})}]}
+    got = pr_link.context_for_call("mcp__github__create_pull_request", {"title": "x"},
+                                   ghes, "s1", checker=lambda _u: connected)
+    check("a GHES MCP create reaches B1",
+          bool(got) and "you just opened" in got, str(got)[:120])
+    check("…naming the enterprise PR", bool(got) and "ghe.corp/o/r/pull/7" in got)
+    check("the host is read from html_url, not from free text",
+          pr_link._mcp_result_host(
+              {"content": [{"type": "text",
+                            "text": "see https://evil.example/o/r/pull/9"}]}) is None)
+    check("a github.com MCP result names no extra host",
+          pr_link._mcp_result_host({"content": [{"type": "text", "text": json.dumps(
+              {"html_url": "https://github.com/o/r/pull/7"})}]}) is None)
 
 
 def test_a_quoted_api_target_is_still_found_but_a_quoted_mention_is_not():
