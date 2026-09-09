@@ -2243,6 +2243,35 @@ def armed_lane_checks() -> None:
         out = prompt("p4", "what about staging?")
         check("prompt lane: emits nothing", out.strip() == "", out)
 
+        # A prompt is the ONLY chance a prompt-armed rule gets. Evaluated
+        # against a stale book, the matching prompt is gone — so a rule
+        # activated while the session sat idle stays unarmed and silently
+        # permits its gated commands. The lane refreshes first, on the same
+        # terms the session digest uses; here the fetch is disabled, so the
+        # test asserts the shape instead: a rule absent from the book at
+        # prompt time cannot arm, and one present can.
+        import datetime as _dt2
+        stale = (_dt2.datetime.now(_dt2.timezone.utc)
+                 - _dt2.timedelta(seconds=rb_mod.REFRESH_AFTER_S + 60)).isoformat()
+        d = os.path.join(td, "book")
+        bp = [os.path.join(d, f) for f in os.listdir(d)][0]
+        book = json.load(open(bp))
+        without = [r for r in book["rules"] if r.get("id") != "probe-before-answering"]
+        json.dump({**book, "fetched_at": stale, "rules": without}, open(bp, "w"))
+        start("p6")
+        prompt("p6", "is staging up?")
+        json.dump({**book, "fetched_at": stale}, open(bp, "w"))   # the rule is activated
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: a rule absent at prompt time did not arm "
+              "(the prompt is gone — hence the refresh before arming)",
+              c == "", c)
+        prompt("p6", "is staging up?")            # the next matching prompt does arm it
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: ...and the next matching prompt arms it",
+              "[probe-staging]" in c, c)
+        check("refresh_if_stale: honours MEMHUB_RULEBOOK_FETCH=0",
+              rb_mod.refresh_if_stale("x", ["r"], stale, {"a": 1}) == (["r"], stale, {"a": 1}))
+
         # `armed_by_rx` runs in the prompt lane — synchronous, on a 5s hook
         # timeout, before the person's words reach the model. An
         # uncompilable or catastrophically backtracking one would raise or

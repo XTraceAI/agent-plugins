@@ -3430,6 +3430,33 @@ def session_digest(rules, repo, gitdir, ctx):
                   raw_counts={r["id"]: 0 for r in cut})
 
 
+def refresh_if_stale(repo, rules, fetched_at, sources):
+    """(rules, fetched_at, sources), with the book re-fetched first when it is
+    old enough to be wrong.
+
+    Only when stale: a book younger than the pre lane's refresh window is
+    already current, so the common case keeps the detached spawn and pays
+    nothing. A stale one is worth waiting for, bounded by
+    SESSION_FETCH_TIMEOUT_S — `fetch_book` leaves the cache untouched on every
+    failure path, so a timeout proceeds with exactly what we already had.
+
+    Shared by the two lanes that get ONE look at their trigger. The session
+    digest is a session's only view of the book; a prompt is the only chance a
+    prompt-armed rule gets. Both were written this way; only one of them had
+    the code."""
+    if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0":
+        return rules, fetched_at, sources
+    try:
+        if _age_s(fetched_at) >= REFRESH_AFTER_S:
+            fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
+            rules, _, fetched_at, sources = load_rules(repo)
+        else:
+            spawn_fetch(repo)
+    except Exception:
+        pass
+    return rules, fetched_at, sources
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
@@ -3477,10 +3504,18 @@ def main():
     if mode == "prompt":
         # UserPromptSubmit. It arms and says nothing: anything printed here is
         # injected above the person's own words, and an arming is not news —
-        # the fire at the gated command is. Nothing else in this lane runs, so
-        # a prompt costs one book read.
+        # the fire at the gated command is.
+        #
+        # The book is refreshed FIRST, on the same terms the session lane
+        # uses. A prompt is the only chance a prompt-armed rule gets: evaluate
+        # it against a stale book and the matching prompt is GONE, so a rule
+        # activated while the session sat idle stays unarmed and silently
+        # permits its gated commands until somebody happens to raise the
+        # subject again. The pre lane's detached refresh cannot help — it
+        # lands after the prompt it needed to see.
         text = str(data.get("prompt") or "")
         if text and not harness_prompt(text):
+            rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
             arm_obligations(rules, repo, gitdir, session, "prompt", prompt=text)
         return 0
     # Repo facts answer about the tree the COMMAND runs in; which rules bind
@@ -3512,15 +3547,7 @@ def main():
         # ago. Only a stale book is worth waiting for, and never longer than
         # SESSION_FETCH_TIMEOUT_S: `fetch_book` leaves the cache untouched on
         # every failure path, so a timeout renders exactly what we already had.
-        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
-            try:
-                if _age_s(fetched_at) >= REFRESH_AFTER_S:
-                    fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
-                    rules, _, fetched_at, sources = load_rules(repo)
-                else:
-                    spawn_fetch(repo)
-            except Exception:
-                pass
+        rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
         try:        # which source each rule came from — the pilot's merge audit
             _atomic_json(book_path(repo) + ".sources", {"at": _now(), "sources": sources})
         except Exception:
