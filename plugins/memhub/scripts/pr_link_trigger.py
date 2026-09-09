@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pr_link  # noqa: E402
 
 
-def _host(argv: list[str]) -> str:
+def host_from_argv(argv: list[str]) -> str:
     for index, arg in enumerate(argv):
         if arg == "--host" and index + 1 < len(argv):
             value = argv[index + 1].strip().lower()
@@ -45,26 +45,43 @@ def _host(argv: list[str]) -> str:
     return "claude"
 
 
+# The old private name, kept because it is the one this module was reviewed
+# under and a hook entry point is not worth a rename churn downstream.
+_host = host_from_argv
+
+
+def context_for(payload: object, *, host: str = "claude") -> str | None:
+    """The link instruction for this payload, or None to stay silent.
+
+    Split out of `main` so `pr_post_context.py` can call the lane in-process
+    rather than paying an interpreter start for it. `main` keeps its stdin →
+    stdout contract intact: `codex_hook_bridge.py` runs this file as a
+    SUBPROCESS and `tests/pr_link_trigger_test.py` drives it the same way.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    session_id = payload.get("session_id") or payload.get("conversation_id") or ""
+    if not isinstance(session_id, str):
+        session_id = ""
+
+    return pr_link.context_for_call(
+        payload.get("tool_name"),
+        payload.get("tool_input"),
+        payload.get("tool_response"),
+        session_id,
+        host=host,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return 0
-    if not isinstance(payload, dict):
-        return 0
 
-    session_id = payload.get("session_id") or payload.get("conversation_id") or ""
-    if not isinstance(session_id, str):
-        session_id = ""
-
-    context = pr_link.context_for_call(
-        payload.get("tool_name"),
-        payload.get("tool_input"),
-        payload.get("tool_response"),
-        session_id,
-        host=_host(argv),
-    )
+    context = context_for(payload, host=host_from_argv(argv))
     if not context:
         return 0
     print(json.dumps({

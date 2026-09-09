@@ -2,7 +2,16 @@
 """PostToolUse(Bash) hook: after a successful `gh pr create`, inject context
 telling Claude to start a self-paced loop running /memhub:pr-babysit on the
 new PR. Emits nothing (hook is a no-op) unless the command was a PR creation
-whose output contains a PR URL."""
+whose output contains a PR URL.
+
+Registered as a hook no longer: `pr_post_context.py` owns the PR lane's single
+registration and calls `context_for` directly, because two PostToolUse groups
+that each return `additionalContext` do not both reach the model. This file
+stays a working entry point — `python3 pr_babysit_trigger.py` still reads a
+payload on stdin and prints the same document — so it can be smoked by hand
+and driven by a test as a subprocess.
+"""
+from __future__ import annotations
 
 import json
 import re
@@ -66,18 +75,15 @@ def is_pr_create(command: str) -> bool:
     return bool(GH_PR_CREATE.search(QUOTED.sub(" ", strip_heredocs(command))))
 
 
-def main() -> None:
-    try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return
+def context_for(payload: object) -> str | None:
+    """The babysit instruction for this payload, or None to stay silent."""
     if not isinstance(payload, dict):
-        return
+        return None
 
     tool_input = payload.get("tool_input") or {}
     command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
     if not is_pr_create(command):
-        return
+        return None
 
     # Only arm the loop if a PR URL actually came back — a failed
     # `gh pr create` produces no URL and should stay silent. gh prints the
@@ -96,10 +102,10 @@ def main() -> None:
         blob = ""
     match = PR_URL.search(blob)
     if not match:
-        return
+        return None
     url = match.group(0)
 
-    context = (
+    return (
         f"A pull request was just created: {url} . MemHub PR-babysit policy: "
         "unless the user asked not to babysit PRs (in this session or in memory), "
         "start a self-paced loop NOW that babysits it — invoke the loop skill with "
@@ -109,6 +115,16 @@ def main() -> None:
         "process to the repo's MemHub agent brain and ends the loop. Tell the "
         "user the babysit loop is running and that saying 'stop the loop' ends it."
     )
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+    context = context_for(payload)
+    if not context:
+        return
     print(
         json.dumps(
             {

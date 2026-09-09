@@ -350,7 +350,7 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 
 ## PR babysitting
 
-A `PostToolUse` hook (`pr_babysit_trigger.py`) watches Bash calls for a
+The babysit lane (`pr_babysit_trigger.py`) watches Bash calls for a
 successful `gh pr create` — it only fires once the tool's own stdout actually
 contains a PR URL, so a failed create stays silent — and injects context
 telling the agent to start a self-paced `/loop` running `/memhub:pr-babysit
@@ -380,8 +380,8 @@ doesn't record — which findings were real, which were rejected and why.
 
 After a call that **addresses GitHub** — `gh pr …`, a `curl` / `gh api` request
 to the REST API, or a GitHub MCP tool — whose output names exactly one pull
-request, a `PostToolUse` hook (`pr_link_trigger.py`) asks the backend one
-question and injects one instruction. There are three answers:
+request, the link lane (`pr_link_trigger.py`) asks the backend one question and
+injects one instruction. There are three answers:
 
 - the org has no GitHub integration connected → the agent mentions once, and
   only if it isn't intrusive, that connecting GitHub is what links sessions to
@@ -394,6 +394,24 @@ question and injects one instruction. There are three answers:
 - **any other GitHub call naming one PR** → the agent decides. It links only if
   it wrote that code in this session, and otherwise offers
   `/memhub:find-contributing-sessions`.
+
+#### One hook, one context
+
+Both lanes ship as a **single** `PostToolUse` registration
+(`pr_post_context.py`), which runs the link lane, then the babysit lane, and
+emits one `additionalContext` with the link instruction first. They were two
+registrations until v0.53.2, and on `gh pr create` — the one command where both
+fire — only one of the two instructions ever reached the model. A `PostToolUse`
+call yields one context: when two hook groups each return one, the
+earlier-registered group's survives and the later one is dropped, silently, so
+the self-link on the one call that links unconditionally was the instruction
+that lost. Merging them also removes any dependence on registration order. The
+Codex path already worked this way — `codex_hook_bridge.py` folds its jobs into
+one document — so the two hosts now compose context the same way.
+
+Widening the registration to the GitHub MCP tools (which the link lane already
+matched) did not widen what arms a babysit loop: that lane is still gated on a
+Bash tool running a real `gh pr create` whose own stdout carries the URL.
 
 Unconditional self-linking is deliberately the **narrow** lane. A hand-rolled
 `curl -X POST …/pulls` is not treated as a creation: recognising a write meant

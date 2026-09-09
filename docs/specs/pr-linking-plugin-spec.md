@@ -114,7 +114,8 @@ all call it. Three copies of a string prefix is how a host silently stops linkin
 | File | Change |
 |---|---|
 | `plugins/memhub/scripts/pr_link.py` | **New.** Shared, importable, side-effect-free: the `touches_github` / `creates_pr` detectors (shell, REST API, MCP), URL extraction, `conversation_id_for`, the `check` call, and the context texts. |
-| `plugins/memhub/scripts/pr_link_trigger.py` | **New.** The hook entry point: stdin → `pr_link` → `additionalContext` on stdout. |
+| `plugins/memhub/scripts/pr_link_trigger.py` | **New.** The link lane: `context_for(payload, host=…)`, plus a `main()` that keeps the stdin → `additionalContext` contract for the Codex bridge and the tests. |
+| `plugins/memhub/scripts/pr_post_context.py` | **New** (v0.53.2). The lane's single `PostToolUse` registration: runs the link lane then the babysit lane and emits ONE `additionalContext`. |
 | `plugins/memhub/scripts/capture.py` | **Changed.** New `current` subcommand (§7). |
 | `plugins/memhub/scripts/readers/{claude,codex,cursor}.py` | **Changed.** Each gains `session_cwd(path) -> str | None` (§7). |
 | `plugins/memhub/scripts/codex_hook_bridge.py` | **Changed.** `_dispatch_post` also runs `pr_link_trigger.py` for shell tools (§5.2). |
@@ -437,8 +438,21 @@ from linking itself later.
 
 ### 5.1 Claude Code — `plugins/memhub/hooks/claude-hooks.json`
 
-A new entry in `PostToolUse`, alongside (not merged into) the babysit one, so a change to either
-cannot silence the other:
+ONE entry in `PostToolUse`, shared with the babysit lane.
+
+> **Revised.** This said *"a new entry … alongside (not merged into) the babysit one, so a change
+> to either cannot silence the other"*. That was wrong, and it was wrong in the one direction that
+> mattered. Two `PostToolUse` groups that each return `hookSpecificOutput.additionalContext` do
+> **not** both reach the model: the earlier registration's context survives and the later one is
+> dropped, silently. `gh pr create` is the only command where both PR-lane hooks fire, the babysit
+> entry was registered earlier, and so the instruction that lost was exactly the B1 self-link on
+> the one call that links unconditionally — while the babysit instruction that won sent the model
+> into a `/loop` where it never revisited the question. Separate registrations did not protect the
+> two hooks from each other; they were the mechanism by which one silenced the other. The lane now
+> has a single entry point, `pr_post_context.py`, which calls
+> `pr_link_trigger.context_for` and then `pr_babysit_trigger.context_for` and joins what comes
+> back with `"\n\n"` — the link instruction FIRST, so the model reads it before the babysit
+> instruction hands it a loop. See `docs/specs/pr-hook-context-merge.md`.
 
 ```json
 {
@@ -446,11 +460,19 @@ cannot silence the other:
   "hooks": [{
     "type": "command",
     "timeout": 15,
-    "statusMessage": "MemHub: checking PR link",
-    "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
+    "statusMessage": "MemHub: checking PR context",
+    "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_post_context.py\"; fi ;; esac"
   }]
 }
 ```
+
+The merged group keeps the **babysit** group's index (3, not 6). While the harness delivers the
+earliest context, sitting at 3 means a rulebook fire at `[5]` cannot displace the PR context;
+sitting at 6 would mean it can. The index is a mitigation; the fix is that the lane's own two
+instructions can no longer displace each other. The babysit lane is gated inside
+`pr_post_context.py` on the tool name matching `re.compile("Bash")` — unanchored, replicating the
+harness matcher it replaced — so widening the registration to the GitHub MCP tools did not widen
+what arms a babysit loop.
 
 **The matcher is a regex over the tool name**, so it must name the GitHub MCP servers as well as
 `Bash` — `"Bash"` alone silently misses every §4.1c case 2. It stays narrower than `mcp__.*`,
@@ -472,7 +494,10 @@ explains. A `gh api repos/o/r/pulls` command matches through the `api.github.com
 *response*, which is in the same payload.
 
 Synchronous (not `async`), because `additionalContext` from an async hook is not delivered; 15s
-covers a 4s HTTP call with room to spare, and the script self-limits regardless.
+covers a 4s HTTP call with room to spare, and the script self-limits regardless. 15s is also the
+budget for the merged lane: it replaced the babysit entry's 30s, and the only I/O in either lane
+is the 4s check, so the merge cannot make a `PostToolUse` call slower than this hook alone was
+already allowed to be.
 
 Hook input fields consumed: `session_id`, `tool_name`, `tool_input` (`.command` for shell, the
 whole object for MCP), `tool_response`.

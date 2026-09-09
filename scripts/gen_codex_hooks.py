@@ -72,6 +72,11 @@ CLAUDE_ONLY_CAPTURE = (
     "flush_session.py",
     "turn_flush_prefilter.py",
     "pr_babysit_trigger.py",
+    # The merged PR-lane entry point CALLS pr_babysit_trigger, so mounting it
+    # on Codex would arm a Claude-only babysit loop by the back door. Codex
+    # reaches the link lane through codex_hook_bridge, which already folds
+    # its jobs into one context and calls pr_link_trigger directly.
+    "pr_post_context.py",
 )
 
 

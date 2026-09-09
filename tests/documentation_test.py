@@ -140,13 +140,24 @@ def test_the_specs_do_not_prescribe_patterns_the_code_rejects() -> None:
     # …and the manifest the spec quotes must be the manifest that ships.
     shipped = (ROOT / "plugins" / "memhub" / "hooks"
                / "claude-hooks.json").read_text(encoding="utf-8")
-    for group in json.loads(shipped)["hooks"]["PostToolUse"]:
-        for hook in group["hooks"]:
-            if "pr_link_trigger" in hook.get("command", ""):
-                check(f"the spec quotes the shipped matcher {group['matcher']}",
-                      group["matcher"] in specs)
-                guard = 'case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*)'
-                check("…and the shipped case guard", guard in hook["command"])
+    # The registration has to be FOUND before its quote can be checked. This
+    # loop was `if "pr_link_trigger" in command`, and when the PR lane's two
+    # handlers merged behind pr_post_context.py it matched nothing — so it
+    # stopped asserting anything and still passed. A vacuous guard outliving
+    # the thing it guards is worse than no guard, so the count is asserted.
+    entry = "pr_post_context.py"
+    registrations = [(group, hook)
+                     for group in json.loads(shipped)["hooks"]["PostToolUse"]
+                     for hook in group["hooks"]
+                     if entry in hook.get("command", "")]
+    check(f"the PR lane ships as exactly one {entry} handler",
+          len(registrations) == 1)
+    check("…and the spec names that entry point", entry in specs)
+    for group, hook in registrations:
+        check(f"the spec quotes the shipped matcher {group['matcher']}",
+              group["matcher"] in specs)
+        guard = 'case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*)'
+        check("…and the shipped case guard", guard in hook["command"])
 
 
 def test_create_rule_skill_keeps_its_authoring_gates() -> None:
