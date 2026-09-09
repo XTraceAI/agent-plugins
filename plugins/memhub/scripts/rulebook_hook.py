@@ -265,11 +265,28 @@ def and_only_segments(shell):
     Such a chain that exits 0 ran every one of its segments and every one of
     them succeeded — so for that shape, and only that shape, the call's single
     exit status is each segment's own. Everywhere else the last unpiped
-    segment is still the only one the status belongs to."""
-    rest = shell.replace("&&", "\x00")
-    if any(ch in rest for ch in "|;&\n"):
+    segment is still the only one the status belongs to.
+
+    Separators are classified on the BLANKED copy, so an operator character
+    inside a quoted argument is the data it is. This was deliberately left
+    quote-unaware once, on the reasoning that mis-reading a quoted `|` only
+    disqualifies a chain and so costs an extra gate. That reasoning was
+    wrong: `npm test -- --grep 'a|b' && git push` is a chain whose test DID
+    run and pass, and refusing to see it fires the gate at someone who has
+    complied. A rule that fires when you have already done the thing is the
+    one people learn to ignore — the same point `rulebook_verify` presses on
+    every author."""
+    blank = blank_quoted(shell or "")
+    # Length-preserving throughout, so every offset still indexes the
+    # original: `&&` becomes two spaces rather than one sentinel.
+    if any(ch in _AND_RX.sub("  ", blank) for ch in "|;&\n"):
         return []
-    return [x.strip() for x in rest.split("\x00") if x.strip()]
+    out, pos = [], 0
+    for m in _AND_RX.finditer(blank):
+        out.append(shell[pos:m.start()])
+        pos = m.end()
+    out.append(shell[pos:])
+    return [x.strip() for x in out if x.strip()]
 
 
 # Quoted spans, blanked to spaces IN PLACE. `shlex` would tokenise properly
@@ -286,6 +303,7 @@ _QUOTED_SINGLE = r"'[^']*'"
 _QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
 _QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
 _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\|")
+_AND_RX = re.compile(r"&&")
 
 
 def blank_quoted(text):
@@ -1356,7 +1374,9 @@ def command_root(cwd, command):
     ../RepoA || cd ../RepoB; git diff` runs the second only when the FIRST
     failed, and which happened is not visible from the command text. Guessing
     would answer branch and diff predicates about a tree the shell never
-    entered.
+    entered. A `cd` PIPED into something (`cd ../Other | git diff`) is refused
+    for the opposite reason — it runs in a subshell, so it is certain the
+    directory never reached the command.
 
     A `cd` to a directory that is not there leaves the shell where it was, so
     the answer is the deepest directory the chain provably REACHED, not
@@ -1369,11 +1389,16 @@ def command_root(cwd, command):
     """
     segs = split_shell(shell_only(command or ""))
     path, reached = "", ""
-    for joiner, seg in segs[:-1]:            # the last segment is the command, not a `cd`
+    for i, (joiner, seg) in enumerate(segs[:-1]):   # the last segment is the command
         m = _CD_SEGMENT.match(seg.strip())
         if not m:
             break
         if joiner == "||":                   # conditional on a failure we cannot see
+            return ""
+        if segs[i + 1][0] == "|":
+            # `cd ../Other | git diff` runs the `cd` in a subshell: the
+            # directory never reaches the right-hand side, which still runs
+            # where the shell already was.
             return ""
         arg = next((g for g in m.groups() if g), "")
         if not arg:                          # `cd` home, `cd -`: unknowable
@@ -1432,9 +1457,14 @@ def named_repo(command):
         # local one — and GH_HOST supplies the host an unqualified `-R`
         # leaves out. `strip_leading_assignments` had just thrown both away,
         # so `GH_REPO=… gh pr view` fell back to the session's checkout.
+        # Written on the command first, then whatever the SESSION was
+        # launched with: `gh` reads both, and Claude Code hands the hook the
+        # same environment it hands the tool shell. An inherited GH_REPO
+        # silently retargets every plain `gh` call in the session, so not
+        # reading it left those calls measured against the cwd checkout.
         env = leading_env(seg)
-        host = env.get("GH_HOST", "").strip().strip("\"'")
-        repo_env = env.get("GH_REPO", "").strip().strip("\"'")
+        host = (env.get("GH_HOST") or os.environ.get("GH_HOST", "")).strip().strip("\"'")
+        repo_env = (env.get("GH_REPO") or os.environ.get("GH_REPO", "")).strip().strip("\"'")
         if repo_env and _SLUG.match(repo_env):
             from_env.add(("%s/%s" % (host, repo_env) if host and repo_env.count("/") == 1
                           else repo_env).casefold())

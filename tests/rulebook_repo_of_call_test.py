@@ -427,6 +427,13 @@ def bash_target_checks() -> None:
               addressed(recover) == other, f"{recover!r} -> {addressed(recover)}")
         check("bash: and with no directory ever reached it still keeps cwd's",
               addressed("cd /nope/nowhere && git diff") == here)
+        # A `cd` on the LEFT of a pipeline runs in a subshell, so the
+        # directory never reaches the right-hand side. `||` is refused because
+        # we cannot see which branch ran; this is refused because we can.
+        check("bash: a `cd` piped into something is refused — it runs in a "
+              "subshell and the directory never carries",
+              addressed(f"cd {other} | git diff") == here,
+              addressed(f"cd {other} | git diff"))
 
         # --- 1. the repo the command NAMES ----------------------------------
         check("bash: `gh -R acme/other` measures the repo it addresses, not cwd",
@@ -516,6 +523,27 @@ def bash_target_checks() -> None:
               addressed("GH_HOST=github.com gh pr view -R acme/other") == other)
         check("bash: an assignment that is not leading is not env",
               addressed("echo GH_REPO=acme/other") == here)
+        # `gh` also reads GH_REPO/GH_HOST from the environment it inherits,
+        # and Claude Code hands the hook the same environment it hands the
+        # tool shell. An exported GH_REPO silently retargets every plain `gh`
+        # call in the session.
+        import os as _os
+        for var, val in (("GH_REPO", "acme/other"),):
+            saved = _os.environ.get(var)
+            _os.environ[var] = val
+            try:
+                check("bash: an INHERITED GH_REPO names the repo",
+                      rb.named_repo("gh pr view 7") == "acme/other",
+                      rb.named_repo("gh pr view 7"))
+                check("bash: an explicit `-R` still outranks an inherited one",
+                      rb.named_repo("gh pr view 7 -R acme/here") == "acme/here")
+            finally:
+                if saved is None:
+                    _os.environ.pop(var, None)
+                else:
+                    _os.environ[var] = saved
+        check("bash: and with nothing inherited a plain `gh` names nothing",
+              rb.named_repo("gh pr view 7") == "")
         # `gh help environment`: GH_REPO applies to commands that would
         # OTHERWISE use the local repo; `-R` selects one explicitly. The flag
         # wins. Treating them as two candidates made this look ambiguous and

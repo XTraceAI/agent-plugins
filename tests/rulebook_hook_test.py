@@ -1985,6 +1985,23 @@ def armed_lane_checks() -> None:
         # put the real command in an argument by construction. This is the
         # shape the SHIPPED tests-before-push rule is written against, so
         # anchoring without it would have broken a live rule.
+        # An operator character inside a quoted argument is data, so a chain
+        # carrying one is still an `&&`-only chain. Reading it as a separator
+        # refused to see a required command that DID run and pass, and fired
+        # the gate at someone who had complied — the habituation failure the
+        # whole design worries about.
+        start("s12")
+        post("s12", "git fetch --all -- --grep 'a|b'")
+        c = pre("s12", "git log origin/main -5")
+        check("session-armed: a quoted `|` does not stop a chain from being a "
+              "receipt", c == "", c)
+        check("and_only_segments: a quoted operator is data",
+              rb_mod.and_only_segments("npm test -- --grep 'a|b' && git push")
+              == ["npm test -- --grep 'a|b'", "git push"],
+              str(rb_mod.and_only_segments("npm test -- --grep 'a|b' && git push")))
+        check("and_only_segments: a REAL pipe still disqualifies the chain",
+              rb_mod.and_only_segments("a | b && c") == [])
+
         start("s9")
         post("s9", "sudo git fetch --all")
         c = pre("s9", "git log origin/main -5")
