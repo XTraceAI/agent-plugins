@@ -676,6 +676,20 @@ def bash_target_checks() -> None:
                   addressed(grouped) == other, f"{grouped!r} -> {addressed(grouped)}")
         check("bash: command substitution is not grouping",
               rb._segment_target("git checkout $(git branch --show-current)") == "local")
+        # A subshell's `cd` DOES move the commands inside that subshell, so a
+        # group wrapping the WHOLE command is unwrapped and read normally.
+        # The two shapes where it does not move the last command are left
+        # alone: `(cd a) && x` closes the subshell first, and `(cd a && x) &&
+        # y` moves only `x`.
+        check("bash: `(cd ../Other && git push)` measures Other",
+              rb.command_root(here, f"(cd {other} && git push)") == other,
+              rb.command_root(here, f"(cd {other} && git push)"))
+        check("bash: `{ cd ../Other && git push; }` reads the same",
+              rb.command_root(here, f"{{ cd {other} && git push; }}") == other)
+        check("bash: `(cd ../Other) && git push` does NOT — the subshell exited",
+              rb.command_root(here, f"(cd {other}) && git push") == "")
+        check("bash: `(cd ../Other && x) && y` does NOT — only `x` moved",
+              rb.command_root(here, f"(cd {other} && x) && git push") == "")
 
         # A standalone `&` backgrounds the command to its left and the next
         # one runs anyway, so this is TWO commands addressing two repos.

@@ -252,13 +252,23 @@ def shell_only(cmd):
     return "\n".join(out)
 
 
-_LAST_SEG_SPLIT_RX = re.compile(r"&&|\|\||;|\n")
+# Everything `_SEPARATOR_RX` knows EXCEPT the single pipe, which is left in
+# so a piped command stays one segment for the receipt test below to refuse.
+# A bare `&` belongs here: `git fetch & true` is two commands, and reading it
+# as one let `true`'s exit 0 vouch for a fetch that was still running.
+_LAST_SEG_SPLIT_RX = re.compile(r"&&|\|\||;|\n|(?<![>&])&(?![>&])")
 
 
 def last_segment(shell):
-    """The final command segment of a shell string (split on ;, &&, ||, newline)."""
-    parts = [x.strip() for x in _LAST_SEG_SPLIT_RX.split(shell) if x.strip()]
-    return parts[-1] if parts else ""
+    """The final command segment of a shell string (split on ;, &&, ||, a
+    background `&`, newline). Separators are located in the blanked copy, so
+    one written inside a quoted argument is the data it is, and the segment
+    itself is sliced out of the original."""
+    text = shell or ""
+    end = 0
+    for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(text)):
+        end = m.end()
+    return text[end:].strip()
 
 
 def and_only_segments(shell):
@@ -468,8 +478,12 @@ def receipt_segments(shell, whole_chain=False):
     joiners = [m.group(0) for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(shell or ""))]
     if joiners and joiners[-1] == "||":
         return []
+    # A call that ENDS in a background `&` now yields an empty last segment —
+    # the separator is the final token — and an empty one is no receipt. That
+    # is right: `git fetch &` exits 0 from launching the job, not from the
+    # fetch, which may still be running or about to fail.
     last = last_segment(shell)
-    if last and "|" not in last and not last.rstrip().endswith("&"):
+    if last and "|" not in last:
         return [last]
     return []
 
@@ -1431,7 +1445,19 @@ def command_root(cwd, command):
     Returns "" when the command redirects nowhere, or nowhere that is a
     worktree, and the caller keeps the session's root.
     """
-    segs = split_shell(shell_only(command or ""))
+    text = shell_only(command or "").strip()
+    # `(cd ../Other && git push)` runs the push in the directory its own
+    # subshell moved to, so the group is unwrapped and read normally. Only
+    # when the group is the WHOLE command: `(cd a) && git push` closes the
+    # subshell first and the push runs where the shell already was, and
+    # `(cd a && x) && y` moves only `x`. Neither is unwrapped, and neither
+    # matches `_CD_SEGMENT` with its bracket still attached, so both keep the
+    # session's tree — which is the right answer for their last segment.
+    if text[:1] in "({" and text[-1:] in ")}":
+        inner = text[1:-1].strip().rstrip(";").strip()
+        if not any(c in inner for c in "(){}"):
+            text = inner
+    segs = split_shell(text)
     path, reached = "", ""
     for i, (joiner, seg) in enumerate(segs[:-1]):   # the last segment is the command
         m = _CD_SEGMENT.match(seg.strip())

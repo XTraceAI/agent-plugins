@@ -2037,6 +2037,26 @@ def armed_lane_checks() -> None:
         c = pre("s15", "git log origin/main -5")
         check("session-armed: after `;` the last segment did run", c == "", c)
 
+        # A BACKGROUNDED required command is not a receipt: the call's exit 0
+        # came from launching it, or from whatever ran in the foreground
+        # afterwards, and the fetch may still be running or about to fail.
+        # `last_segment` did not split on a bare `&`, so `git fetch & true`
+        # read as one segment starting with `git fetch`.
+        for bg in ("git fetch --all & true", "git fetch --all &"):
+            sess = "bg" + str(abs(hash(bg)) % 9999)
+            start(sess)
+            post(sess, bg)
+            c = pre(sess, "git log origin/main -5")
+            check("session-armed: a backgrounded fetch is not a receipt",
+                  "[fetch-first]" in c, f"{bg!r} -> {c}")
+        check("last_segment: a bare `&` separates, a redirection `&` does not",
+              rb_mod.last_segment("git fetch & true") == "true"
+              and rb_mod.last_segment("git fetch 2>&1") == "git fetch 2>&1",
+              rb_mod.last_segment("git fetch & true"))
+        check("last_segment: a separator inside quotes is data",
+              rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
+              rb_mod.last_segment("echo 'a; b'"))
+
         start("s9")
         post("s9", "sudo git fetch --all")
         c = pre("s9", "git log origin/main -5")
