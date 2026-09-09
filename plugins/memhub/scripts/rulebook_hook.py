@@ -1590,6 +1590,15 @@ def _segment_target(seg):
     # no repo, and calling it `local` made the group disagree with itself.
     bare = strip_leading_assignments(bare.strip("(){} \t")).strip()
     if not bare:
+        # An assignment-only segment (`GH_REPO=inner; gh pr view`) sets
+        # variables for the commands AFTER it, and bash keeps the export
+        # attribute of one that was already exported — so it really does
+        # retarget that `gh`, while this resolved the segment as nothing and
+        # let the next fall back to the inherited value. Twin of the `export`
+        # form handled one round earlier; I fixed the spelling with the
+        # keyword and not the one without it.
+        if _STEERING_RX.search(blank_quoted(seg or "")):
+            return "export"
         return ""               # nothing here at all: a stray `}`, an empty
     if _CD_SEGMENT.match(bare):
         return "cd"             # addresses no repo, but MOVES the shell
@@ -1697,7 +1706,10 @@ def named_repo(command):
     return "" if only in ("local", "unknown") else only
 
 
-def segment_targets(command):
+_SUBST_DEPTH_MAX = 3       # `$( $( $( … ) ) )` past this is nobody's real command
+
+
+def segment_targets(command, _depth=0):
     """The set of repos this call's segments address — `named_repo`'s working,
     kept separate because two answers hide inside one empty string.
 
@@ -1733,16 +1745,23 @@ def segment_targets(command):
         bodies = _substitutions(seg)
         if bodies is None:
             out.add("unknown")
+        elif bodies and _depth >= _SUBST_DEPTH_MAX:
+            out.add("unknown")
         else:
+            # A body is a command LIST, not one command: `$(echo ok; gh pr
+            # view -R other)` runs both, and reading only its leading `echo`
+            # reported `local` for a substitution that addresses another repo.
+            # Recursed rather than read flat, so the body's own separators,
+            # wrappers and nested substitutions get the same treatment as the
+            # outer command's.
             for body in bodies:
-                inner = _segment_target(body)
-                if inner:
-                    out.add(inner)
+                out |= segment_targets(body, _depth + 1)
     return out
 
 
 _SUBST_RX = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|[<>]\(([^()]*)\)")
 _NESTED_SUBST_RX = re.compile(r"\$\((?=[^()]*\()")
+_ARITH_RX = re.compile(r"\$\(\([^()]*\)\)")
 
 
 def _substitutions(seg):
@@ -1755,7 +1774,13 @@ def _substitutions(seg):
     cmd. Blanking both hid every substitution written inside double quotes,
     which is most of them. The bodies are sliced out of the ORIGINAL at those
     offsets."""
-    blank = blank_single_quoted(seg or "")
+    # `$(( … ))` is ARITHMETIC, not a command, and its inner parens read as a
+    # nested substitution — so `echo "$(( 1 + 1 ))"` refused the whole call.
+    # Blanked first, length-preserving, so the offsets below still index the
+    # original. Found by auditing the substitution spellings against each
+    # other, not reported.
+    blank = _ARITH_RX.sub(lambda m: " " * len(m.group(0)),
+                          blank_single_quoted(seg or ""))
     if _NESTED_SUBST_RX.search(blank):
         return None
     out = []

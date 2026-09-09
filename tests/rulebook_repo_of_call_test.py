@@ -781,6 +781,43 @@ def bash_target_checks() -> None:
               "unknown" in rb.segment_targets("export GH_REPO=acme/other && gh pr view"))
         check("bash: `set -a` refuses too — every later assignment is exported",
               "unknown" in rb.segment_targets("set -a && GH_REPO=acme/other gh pr view"))
+        # Bash keeps the export attribute of a variable that was already
+        # exported, so an assignment-only segment really does retarget a
+        # later `gh`. Twin of the `export` keyword form: both spellings, and
+        # `declare -x` / `typeset -x`, now refuse alike.
+        for spelling in ("export GH_REPO=a/b && gh pr view",
+                         "GH_REPO=a/b; gh pr view",
+                         "declare -x GH_REPO=a/b && gh pr view",
+                         "typeset -x GH_REPO=a/b && gh pr view",
+                         "GIT_DIR=/x; git diff"):
+            check(f"bash: {spelling.split(' ')[0]!r} form of a steering var refuses",
+                  "unknown" in rb.segment_targets(spelling),
+                  str(sorted(rb.segment_targets(spelling))))
+        check("bash: the SAME-segment form still resolves — it steers only "
+              "its own command",
+              rb.named_repo("GH_REPO=a/b gh pr view") == "a/b")
+
+        # A substitution body is a command LIST. Reading only its leading
+        # command reported `local` for a body that addresses another repo.
+        check("bash: every command in a substitution body is resolved",
+              sorted(rb.segment_targets('echo "$(echo ok; gh pr view -R acme/other)"'))
+              == ["acme/other", "local"],
+              str(sorted(rb.segment_targets('echo "$(echo ok; gh pr view -R acme/other)"'))))
+        for spelling in ('echo "$(gh pr view -R acme/other)"',
+                         "echo `gh pr view -R acme/other`",
+                         "diff <(gh pr view -R acme/other) f"):
+            check(f"bash: {spelling.split(' ')[1][:3]!r} substitution executes and is seen",
+                  "acme/other" in rb.segment_targets(spelling),
+                  str(sorted(rb.segment_targets(spelling))))
+        # ...but `$(( ))` is ARITHMETIC, not a command. Its inner parens read
+        # as a nested substitution and refused the whole call. Found by
+        # auditing the substitution spellings, not reported.
+        check("bash: arithmetic expansion is not a command substitution",
+              sorted(rb.segment_targets('echo "$(( 1 + 1 ))"')) == ["local"],
+              str(sorted(rb.segment_targets('echo "$(( 1 + 1 ))"'))))
+        check("bash: and it does not poison the segment around it",
+              "a/b" in rb.segment_targets("i=$((i+1)); gh pr view -R a/b"))
+
         check("bash: an export of something UNrelated does not refuse",
               sorted(rb.segment_targets("export PATH=/x && gh pr view -R acme/other"))
               == ["acme/other", "local"])
