@@ -118,11 +118,27 @@ def _probes(fixture: dict) -> "H.Probes":
 def _ordering_fires(hook_rule: dict, raw: str) -> bool:
     """Replay `step >> step >> gate:cmd` through the real OrderingEngine in a
     throwaway state dir. Steps: `edit:<path>`, `ok:<cmd>` (green receipt),
-    `red:<cmd>` (red receipt), `gate:<cmd>` (the gated pre-call). The case
-    fires when the LAST gate step is gated."""
+    `red:<cmd>` (red receipt), `session` (the SessionStart arming),
+    `prompt:<what the person typed>` (the UserPromptSubmit arming),
+    `gate:<cmd>` (the gated pre-call). The case fires when the LAST gate step
+    is gated.
+
+    A `prompt:` step whose text does not match the rule's `armed_by_rx` arms
+    nothing and is not an error — that is the silent case worth writing.
+
+    `session` and `prompt` exist because an obligation armed by either is
+    armed OUTSIDE the engine — `arm_obligations` writes it into session state
+    and the pre lane hands it to `feed`. Without a step for them, a rule whose
+    only arming event is `session` or `prompt` could never make a `--fires`
+    case pass, so the authoring skill's mandatory verification step would
+    reject every rule written to the two recipes it documents. `H.arms_on` is
+    the same predicate the live lanes use, so a rule this blesses is a rule
+    the hook actually arms."""
     steps = [s.strip() for s in raw.split(">>") if s.strip()]
     rule = dict(hook_rule)
     outcome = None
+    armed = None
+    armed_once = set()
     saved = H.BASE
     with tempfile.TemporaryDirectory() as td:
         H.BASE = td
@@ -132,14 +148,56 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
                 kind, _, arg = step.partition(":")
                 kind, arg = kind.strip(), arg.strip()
                 if kind == "edit":
-                    outcome = eng.feed(rule, hook_phase="post", tool="Edit", file_path=arg)
+                    outcome = eng.feed(rule, hook_phase="post", tool="Edit", file_path=arg,
+                                       armed=armed)
                 elif kind in ("ok", "red"):
                     outcome = eng.feed(rule, hook_phase="post", tool="Bash", cmd=arg,
-                                       ok=(kind == "ok"))
+                                       ok=(kind == "ok"), armed=armed)
+                    if outcome == "discharged":
+                        armed = None        # what main() does on a discharge
+                elif kind in ("session", "prompt"):
+                    # The step is refused only when the RULE cannot be armed by
+                    # this event at all — that is a case written against the
+                    # wrong rule. A `prompt:` whose text does not match
+                    # `armed_by_rx` is not an error: it is the silent case
+                    # every prompt-armed rule should carry, the one proving the
+                    # rule stays quiet when nobody raised the subject.
+                    spec = rule.get("ordering") or {}
+                    events = tuple(spec.get("armed_by_events", ("edit", "write")))
+                    if kind not in events:
+                        raise ValueError(
+                            "step %r cannot arm this rule: armed_by_events is %r"
+                            % (step, list(events)))
+                    if kind == "prompt" and not spec.get("armed_by_rx"):
+                        raise ValueError(
+                            "step %r needs the rule to carry armed_by_rx — without one "
+                            "a prompt-armed rule arms on nothing" % step)
+                    # The live lane refuses to arm on a prompt the HARNESS
+                    # wrote, so the verifier has to as well — otherwise a
+                    # case passes here and the rule never arms in a session,
+                    # which is the one discrepancy `arms_on` exists to
+                    # prevent.
+                    # SessionStart is once per session even when the client
+                    # fires it again on resume or `/clear` — `arm_obligations`
+                    # records `session:<rule>` in `armed_once` and refuses the
+                    # rest. Without that here, `session >> ok:git fetch >>
+                    # session >> gate:…` reported a fire, so a case whose LIVE
+                    # behaviour is correctly discharged failed the mandatory
+                    # authoring verification.
+                    if kind == "session" and kind in armed_once:
+                        pass
+                    elif kind == "prompt" and H.harness_prompt(arg):
+                        pass
+                    elif H.arms_on(rule, kind, arg):
+                        armed_once.add(kind)
+                        armed = kind
                 elif kind == "gate":
-                    outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg)
+                    outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg,
+                                       armed=armed)
                 else:
-                    raise ValueError("unknown ordering step %r (edit: | ok: | red: | gate:)" % step)
+                    raise ValueError(
+                        "unknown ordering step %r "
+                        "(edit: | ok: | red: | session | prompt: | gate:)" % step)
         finally:
             H.BASE = saved
     return outcome == "fired"
@@ -201,9 +259,13 @@ def _load_failure(rule: dict, out: list[str]) -> None:
                 else "does not compile, or backtracks catastrophically"
             out.append("             %s: %s" % (key, why))
     given = matcher.get("given")
-    if given is not None and H.given_norm(given) is None:
+    if given is not None and (H.given_norm(given) is None or H.given_unsupported(given)):
         known = ", ".join("%s.%s" % (b, k) for b, ks in H._GIVEN.items() for k in ks)
         out.append("             given: unknown key or wrong value kind (known: %s)" % known)
+    unknown = H.ordering_unsupported(rule.get("ordering"))
+    if unknown:
+        out.append("             %s: not a key this hook knows (known: %s)"
+                   % (unknown, ", ".join(sorted(H._ORDERING_KEYS))))
     if not any(l.startswith("             ") for l in out):
         out.append("             no engine block, or two of them, or a missing id")
 
@@ -219,9 +281,31 @@ def verify(rule: dict, fires: list, silent: list,
 
     # 1. The load gate. A rule that does not survive this never runs at all,
     #    and the hook says nothing when it drops one.
-    hook_rule = H.to_hook_rule(_hook_row(rule))
-    if hook_rule is None:
-        out.append("LOAD   FAIL  the hook would drop this rule at load time")
+    #
+    #    A key the hook does not know is refused HERE even though the hook now
+    #    degrades it to advice rather than dropping it. The two answer
+    #    different questions: to a hook reading a book it did not write, an
+    #    unknown key is a rule from a newer plugin and running it as advice is
+    #    the honest outcome; to an author checking a rule they are about to
+    #    file, it is a typo, and filing a rule that can never gate on the
+    #    machine that just linted it is not an outcome anyone wants.
+    row = _hook_row(rule)
+    hook_rule = H.to_hook_rule(row)
+    unknown = H.given_unsupported((row.get("matcher") or {}).get("given")) \
+        or H.ordering_unsupported(row.get("ordering"))
+    # A malformed `min_hook_version` degrades the rule to advice at load, so a
+    # gate carrying one never gates. The author has to hear that HERE — the
+    # verifier reported LOAD ok and exited 0, and create-rule would then file
+    # a "verified" gate that blocks nothing, ever.
+    floor = row.get("min_hook_version")
+    if floor is not None and H.version_tuple(floor) is None:
+        out.append("LOAD   FAIL  min_hook_version %r is not major.minor.patch "
+                   "— a rule carrying it can only advise" % (floor,))
+        _load_failure(rule, out)
+        return False, False, out
+    if hook_rule is None or unknown:
+        out.append("LOAD   FAIL  the hook would drop this rule at load time" if hook_rule is None
+                   else "LOAD   FAIL  this hook does not understand `%s`" % unknown)
         _load_failure(rule, out)
         return False, False, out
     out.append("LOAD   ok    the hook loads it (patterns compile, within bounds)")
