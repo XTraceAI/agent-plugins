@@ -1957,6 +1957,24 @@ def armed_lane_checks() -> None:
             check(f"session-armed: no self-discharge when the {why}",
                   "[fetch-first]" in c, f"{bad!r} -> {c}")
 
+        # A required command that is DATA, not a command. Everywhere else a
+        # regex over a whole segment only over-fires; on the two paths that
+        # let a call OUT of a gate it under-gates, which is the direction that
+        # must not happen.
+        for quoted in ("echo 'git fetch' && git log origin/main -5",
+                       'grep "git fetch" setup.sh && git log origin/main -5'):
+            sess = "q" + str(abs(hash(quoted)) % 9999)
+            start(sess)
+            c = pre(sess, quoted)
+            check("session-armed: quoted text is not a command and does not "
+                  "excuse the gate", "[fetch-first]" in c, f"{quoted!r} -> {c}")
+
+        start("s8")
+        post("s8", "echo 'git fetch --all'")
+        c = pre("s8", "git log origin/main -5")
+        check("session-armed: quoted text is not a receipt either",
+              "[fetch-first]" in c, c)
+
         start("s3")
         post("s3", "git fetch --all", exit_code=1)
         c = pre("s3", "git log origin/main -5")

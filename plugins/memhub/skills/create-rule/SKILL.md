@@ -280,15 +280,34 @@ JSON
 ```
 
 An `ordering` rule is verified as a sequence of steps joined by ` >> `
-(`edit:<path>`, `ok:<cmd>` a green receipt, `red:<cmd>` a red one, and last
-`gate:<cmd>`); the case fires when that final call is gated:
+(`edit:<path>`, `ok:<cmd>` a green receipt, `red:<cmd>` a red one, `session`
+the SessionStart arming, `prompt:<what the person typed>` the
+UserPromptSubmit arming, and last `gate:<cmd>`); the case fires when that
+final call is gated. Use the arming step your rule's `armed_by_events` names
+— a case that never arms the rule can never fire:
 
 ```bash
+# armed_by_events: ["edit", "write"]
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
   --fires  'edit:src/a.py >> gate:git push' \
   --fires  'edit:src/a.py >> red:pytest tests >> gate:git push' \
   --silent 'edit:src/a.py >> ok:pytest tests >> gate:git push'
+
+# armed_by_events: ["session"]
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires  'session >> gate:git log origin/main' \
+  --silent 'session >> ok:git fetch -q >> gate:git log origin/main'
+
+# armed_by_events: ["prompt"] + armed_by_rx
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires  'prompt:is the staging brain 404ing? >> gate:gh pr comment 7 --body ok' \
+  --silent 'prompt:how is production? >> gate:gh pr comment 7 --body ok' \
+  --silent 'prompt:check staging >> ok:curl -s https://staging/health >> gate:gh pr comment 7 --body ok'
 ```
+
+A `prompt:` whose text does not match `armed_by_rx` arms nothing, so it is
+the natural `--silent` case: it proves the rule stays quiet when nobody
+raised the subject.
 
 It exits non-zero until every case behaves. **Do not file a rule while it
 exits non-zero, and show the table to the user.** What each line means:

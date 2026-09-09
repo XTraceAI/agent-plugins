@@ -118,11 +118,26 @@ def _probes(fixture: dict) -> "H.Probes":
 def _ordering_fires(hook_rule: dict, raw: str) -> bool:
     """Replay `step >> step >> gate:cmd` through the real OrderingEngine in a
     throwaway state dir. Steps: `edit:<path>`, `ok:<cmd>` (green receipt),
-    `red:<cmd>` (red receipt), `gate:<cmd>` (the gated pre-call). The case
-    fires when the LAST gate step is gated."""
+    `red:<cmd>` (red receipt), `session` (the SessionStart arming),
+    `prompt:<what the person typed>` (the UserPromptSubmit arming),
+    `gate:<cmd>` (the gated pre-call). The case fires when the LAST gate step
+    is gated.
+
+    A `prompt:` step whose text does not match the rule's `armed_by_rx` arms
+    nothing and is not an error — that is the silent case worth writing.
+
+    `session` and `prompt` exist because an obligation armed by either is
+    armed OUTSIDE the engine — `arm_obligations` writes it into session state
+    and the pre lane hands it to `feed`. Without a step for them, a rule whose
+    only arming event is `session` or `prompt` could never make a `--fires`
+    case pass, so the authoring skill's mandatory verification step would
+    reject every rule written to the two recipes it documents. `H.arms_on` is
+    the same predicate the live lanes use, so a rule this blesses is a rule
+    the hook actually arms."""
     steps = [s.strip() for s in raw.split(">>") if s.strip()]
     rule = dict(hook_rule)
     outcome = None
+    armed = None
     saved = H.BASE
     with tempfile.TemporaryDirectory() as td:
         H.BASE = td
@@ -132,14 +147,39 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
                 kind, _, arg = step.partition(":")
                 kind, arg = kind.strip(), arg.strip()
                 if kind == "edit":
-                    outcome = eng.feed(rule, hook_phase="post", tool="Edit", file_path=arg)
+                    outcome = eng.feed(rule, hook_phase="post", tool="Edit", file_path=arg,
+                                       armed=armed)
                 elif kind in ("ok", "red"):
                     outcome = eng.feed(rule, hook_phase="post", tool="Bash", cmd=arg,
-                                       ok=(kind == "ok"))
+                                       ok=(kind == "ok"), armed=armed)
+                    if outcome == "discharged":
+                        armed = None        # what main() does on a discharge
+                elif kind in ("session", "prompt"):
+                    # The step is refused only when the RULE cannot be armed by
+                    # this event at all — that is a case written against the
+                    # wrong rule. A `prompt:` whose text does not match
+                    # `armed_by_rx` is not an error: it is the silent case
+                    # every prompt-armed rule should carry, the one proving the
+                    # rule stays quiet when nobody raised the subject.
+                    spec = rule.get("ordering") or {}
+                    events = tuple(spec.get("armed_by_events", ("edit", "write")))
+                    if kind not in events:
+                        raise ValueError(
+                            "step %r cannot arm this rule: armed_by_events is %r"
+                            % (step, list(events)))
+                    if kind == "prompt" and not spec.get("armed_by_rx"):
+                        raise ValueError(
+                            "step %r needs the rule to carry armed_by_rx — without one "
+                            "a prompt-armed rule arms on nothing" % step)
+                    if H.arms_on(rule, kind, arg):
+                        armed = kind
                 elif kind == "gate":
-                    outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg)
+                    outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg,
+                                       armed=armed)
                 else:
-                    raise ValueError("unknown ordering step %r (edit: | ok: | red: | gate:)" % step)
+                    raise ValueError(
+                        "unknown ordering step %r "
+                        "(edit: | ok: | red: | session | prompt: | gate:)" % step)
         finally:
             H.BASE = saved
     return outcome == "fired"

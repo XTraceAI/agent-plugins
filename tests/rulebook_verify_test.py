@@ -147,6 +147,41 @@ def main() -> int:
     ordering = {"title": "t", "statement": "s", "delivery": "agent_hook",
                 "ordering": {"required_command_rx": r"\bpytest\b", "gated_command_rx": r"^git\s+push\b",
                              "armed_by_events": ["edit"], "min_edits": 1, "display_name": "pytest"}}
+    # The two arming events the create-rule skill documents recipes for must
+    # be verifiable, or that skill's mandatory verification step rejects every
+    # rule written to them.
+    sess = {"title": "t", "statement": "s", "delivery": "agent_hook",
+            "ordering": {"required_command_rx": r"git\s+(fetch|pull)\b",
+                         "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
+                         "armed_by_events": ["session"], "display_name": "git fetch"}}
+    rc, out = run(sess, "--fires", "session >> gate:git log origin/main",
+                  "--silent", "session >> ok:git fetch -q >> gate:git log origin/main",
+                  "--no-self-mention")
+    check("ordering: a session-armed rule can be verified",
+          rc == 0 and "FIRES  ok" in out and "SILENT ok" in out, out)
+    rc, out = run(sess, "--fires", "prompt:anything >> gate:git log origin/main",
+                  "--no-self-mention")
+    check("ordering: an arming step the rule does not name is refused",
+          rc == 1 and "cannot arm this rule" in out, out)
+
+    prompt_rule = {"title": "t", "statement": "s", "delivery": "agent_hook",
+                   "ordering": {"required_command_rx": r"curl\b[^\n]*staging",
+                                "gated_command_rx": r"gh\s+pr\s+comment\b",
+                                "armed_by_events": ["prompt"], "armed_by_rx": r"\bstaging\b",
+                                "display_name": "a staging probe"}}
+    rc, out = run(prompt_rule,
+                  "--fires", "prompt:is the staging brain 404ing? >> gate:gh pr comment 7",
+                  "--silent", "prompt:how is production? >> gate:gh pr comment 7",
+                  "--no-self-mention")
+    check("ordering: a prompt-armed rule verifies, and a prompt that does not "
+          "match armed_by_rx is a SILENT case rather than an error",
+          rc == 0 and "FIRES  ok" in out and "SILENT ok" in out, out)
+    rc, out = run(dict(prompt_rule, ordering={k: v for k, v in prompt_rule["ordering"].items()
+                                              if k != "armed_by_rx"}),
+                  "--fires", "prompt:staging >> gate:gh pr comment 7", "--no-self-mention")
+    check("ordering: a prompt-armed rule with no armed_by_rx is refused — it "
+          "would arm on nothing", rc == 1 and "armed_by_rx" in out, out)
+
     rc, out = run(ordering,
                   "--fires", "edit:src/a.py >> gate:git push",
                   "--fires", "edit:src/a.py >> red:pytest tests >> gate:git push",

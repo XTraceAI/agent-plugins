@@ -437,6 +437,18 @@ def bash_target_checks() -> None:
               addressed("grep -R foo/bar .") == here)
         check("bash: a `-R` that is not a plain owner/repo is refused",
               addressed("gh pr create -R https://github.com/acme/other") == here)
+        # `gh pr view --help`: `-R, --repo [HOST/]OWNER/REPO`. Missing a valid
+        # spelling is not harmless — it falls back to the CWD checkout, which
+        # is the bug this whole function exists to fix.
+        for spelling in ("gh pr view 7 -R ghe.corp/acme/other",     # GitHub Enterprise
+                         "gh pr view 7 -Racme/other",               # attached short form
+                         "gh pr view 7 --repo=acme/other",          # equals form
+                         "gh pr view 7 --repo acme/other"):
+            check(f"bash: {spelling.split(' ', 3)[3]!r} names the repo",
+                  addressed(spelling) == other, f"{spelling!r} -> {addressed(spelling)}")
+        check("bash: a host-qualified and a bare spelling of ONE repo are not "
+              "two repos", addressed("gh pr view -R ghe.corp/acme/other || "
+                                     "gh pr view -R acme/other") == other)
         check("bash: a repo named on a later `gh` segment still counts",
               addressed("git status && gh pr view 7 -R acme/other") == other)
 
@@ -472,6 +484,20 @@ def bash_target_checks() -> None:
               rb.addressed_root(container, "", f"cd {wt} && gh pr view 7 -R acme/other"))
         check("bash: a repo with exactly ONE checkout still resolves",
               addressed("gh pr view 7 -R acme/here") == here)
+
+        # A scan that stopped on its cap or its deadline has not ruled out a
+        # second worktree further down the listing, so its single hit is not
+        # a proven-unique hit.
+        saved = rb._SIBLINGS_MAX
+        try:
+            rb._SIBLINGS_MAX = 1
+            check("bash: a TRUNCATED scan answers nothing, even with one hit",
+                  rb.addressed_root(container, "", "gh pr view 7 -R acme/here") == "",
+                  rb.addressed_root(container, "", "gh pr view 7 -R acme/here"))
+        finally:
+            rb._SIBLINGS_MAX = saved
+        check("bash: and resolves again once the scan can finish",
+              rb.addressed_root(container, "", "gh pr view 7 -R acme/here") == here)
 
         # No root is not a crash: every probe answers None, which satisfies
         # no predicate.

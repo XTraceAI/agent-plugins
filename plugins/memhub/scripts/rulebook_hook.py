@@ -272,6 +272,28 @@ def and_only_segments(shell):
     return [x.strip() for x in rest.split("\x00") if x.strip()]
 
 
+# Quoted spans, blanked. `shlex` would tokenise properly but throws on the
+# half-quoted strings real commands contain, and this only needs the contents
+# gone, not the tokens.
+_SQ_RX = re.compile(r"'[^']*'")
+_DQ_RX = re.compile(r'"[^"]*"')
+
+
+def unquoted(text):
+    """`text` with the CONTENTS of quoted spans removed.
+
+    A regex over a whole segment cannot tell a command from an argument that
+    merely spells one, and everywhere else in this hook that only over-fires.
+    On the two paths that let a call OUT of a gate — the self-discharge
+    exemption and the receipt — it lets it out instead, which is the one
+    direction that must not happen: `echo 'git fetch' && git log origin/main`
+    and `grep 'git fetch' setup.sh && git log origin/main` would both read the
+    stale ref with the obligation cleared. Blanking quoted text costs a
+    receipt whose command is genuinely quoted (`pytest "tests/x"`), and that
+    costs an extra gate rather than a missed one."""
+    return _DQ_RX.sub('""', _SQ_RX.sub("''", text or ""))
+
+
 def self_discharging(shell, spec):
     """Does this one call run the required command BEFORE the gated one, in a
     chain whose single exit status vouches for the required part?
@@ -281,7 +303,7 @@ def self_discharging(shell, spec):
     one already ran and passed. Anything else — a `||`, a `;`, a pipe, or the
     required command written after the gated one — is a command the gate is
     there for."""
-    segs = and_only_segments(shell)
+    segs = [unquoted(part) for part in and_only_segments(shell)]
     required = next((i for i, part in enumerate(segs)
                      if re.search(spec["required_command_rx"], part)), None)
     if required is None:
@@ -301,10 +323,10 @@ def receipt_segments(shell, whole_chain=False):
     if whole_chain:
         segs = and_only_segments(shell)
         if segs:
-            return segs
+            return [unquoted(part) for part in segs]
     last = last_segment(shell)
     if last and "|" not in last and not last.rstrip().endswith("&"):
-        return [last]
+        return [unquoted(last)]
     return []
 
 
@@ -1189,9 +1211,17 @@ _CD_SEGMENT = re.compile(r"^\s*cd\s+" + _ARG + r"\s*$")
 # `-R` / `--repo` is read only off a `gh` segment: to grep, cp and rsync the
 # same flag means --recursive, and `grep -R foo/bar .` would otherwise name a
 # repo nobody mentioned.
-_REPO_ARG = re.compile(r"(?:^|\s)(?:-R|--repo)[=\s]+" + _ARG)
+# `gh pr view --help`: `-R, --repo [HOST/]OWNER/REPO`. The short flag also
+# takes its value attached (`-Racme/repo`), which is the form a shell alias
+# usually ends up with.
+_REPO_ARG = re.compile(r"(?:^|\s)(?:-R\s*=?\s*|--repo\s*=?\s*)" + _ARG)
 _GH_SEGMENT = re.compile(r"^gh\b")
-_SLUG = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+# `[HOST/]OWNER/REPO`. The host is parsed so a GitHub Enterprise argument is
+# RECOGNISED, then dropped: `origin_slug` reads owner/repo out of a remote URL
+# and comparing hosts would mean teaching it to normalise every URL spelling
+# git accepts. Dropping it can only widen a match to a same-named repo on
+# another host — which is the ambiguity case, and that now answers nothing.
+_SLUG = re.compile(r"^(?:[A-Za-z0-9._-]+/)?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$")
 _ORIGIN_SECTION = re.compile(r'^\[\s*remote\s+"origin"\s*\]', re.I)
 _CONFIG_URL = re.compile(r"^url\s*=\s*(.+)$", re.I)
 _SIBLINGS_MAX = 128     # CHECKOUTS examined, not entries listed: a fleet parent
@@ -1255,10 +1285,8 @@ def named_repo(command):
             value = next((g for g in m.groups() if g), "")
             if value:
                 named.add(value)
-    if len(named) != 1:
-        return ""
-    slug = named.pop()
-    return slug if _SLUG.match(slug) else ""
+    slugs = {m.group(1) for m in (_SLUG.match(v) for v in named) if m}
+    return slugs.pop() if len(slugs) == 1 else ""
 
 
 def _slug_of_url(url):
@@ -1329,7 +1357,7 @@ def checkout_of(cwd, root, slug, command=""):
     if cd_root and origin_slug(cd_root).casefold() == want:
         return cd_root
     deadline = time.monotonic() + _SIBLINGS_BUDGET_S
-    hits, seen = [], set()
+    hits, seen, truncated = [], set(), False
     for parent in (cwd, os.path.dirname(root) if root else ""):
         if not parent or parent in seen:
             continue
@@ -1345,13 +1373,20 @@ def checkout_of(cwd, root, slug, command=""):
                 continue        # one stat; only a real checkout costs a read
             looked += 1
             if looked > _SIBLINGS_MAX or time.monotonic() > deadline:
+                truncated = True     # a second worktree could be in the tail
                 break
             cand = repo_info(d)[1]
             if cand and origin_slug(cand).casefold() == want and cand not in hits:
                 hits.append(cand)
                 if len(hits) > 1:       # ambiguous: stop looking, answer nothing
                     return ""
-    return hits[0] if len(hits) == 1 else ""
+        if truncated:
+            break
+    # One hit is only one hit if the whole listing was looked at. A scan that
+    # stopped on the cap or the deadline has not ruled out a second worktree
+    # further down the alphabet, and "probably unique" is the guess this
+    # function exists to refuse.
+    return hits[0] if len(hits) == 1 and not truncated else ""
 
 
 def addressed_root(cwd, root, command):
@@ -2656,6 +2691,27 @@ def harness_prompt(text):
     return bool(_HARNESS_PROMPT_RX.match(text or ""))
 
 
+def arms_on(rule, event, prompt=""):
+    """Does `event` arm this ordering rule?
+
+    The one statement of it: `arm_obligations` asks it for the live lanes and
+    `rulebook_verify` asks it for a `--fires` case, so a rule the verifier
+    says fires is a rule the hook arms. Two copies of this predicate would
+    let the authoring tool bless a rule the engine never arms."""
+    if rule.get("on") != "ordering":
+        return False
+    spec = rule.get("ordering") or {}
+    if event not in tuple(spec.get("armed_by_events", ("edit", "write"))):
+        return False
+    if event == "prompt":
+        # A prompt lane with no pattern would arm on every prompt, which is a
+        # session-armed rule wearing the wrong label. Say which prompts, or
+        # arm on none.
+        rx = spec.get("armed_by_rx")
+        return bool(rx) and bool(re.search(rx, prompt, re.I))
+    return True
+
+
 def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
     """Record the ordering rules THIS event arms, in the session's own state
     file — the one the pre lane already loads and reads.
@@ -2667,22 +2723,9 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
     armed by what the person just said ("you are asking about staging — probe
     it before you answer"). Both arm at a moment that is not a tool call, so
     both write here rather than into the worktree state the edit lane keeps."""
-    ids = []
-    for r in rules:
-        if r.get("on") != "ordering" or r.get("status", "active") != "active" \
-                or not scope_ok(r, repo, gitdir):
-            continue
-        spec = r.get("ordering") or {}
-        if event not in tuple(spec.get("armed_by_events", ("edit", "write"))):
-            continue
-        if event == "prompt":
-            # A prompt lane with no pattern would arm on every prompt, which
-            # is a session-armed rule wearing the wrong label. Say which
-            # prompts, or arm on none.
-            rx = spec.get("armed_by_rx")
-            if not rx or not re.search(rx, prompt, re.I):
-                continue
-        ids.append(r["id"])
+    ids = [r["id"] for r in rules
+           if r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
+           and arms_on(r, event, prompt)]
     if not ids:
         return []
     sp = state_path(session)
