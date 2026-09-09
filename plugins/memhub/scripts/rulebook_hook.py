@@ -258,6 +258,38 @@ def last_segment(shell):
     return parts[-1] if parts else ""
 
 
+def and_only_segments(shell):
+    """The segments of a chain joined ONLY by `&&`, or [] when it is anything
+    else (a pipe, a `;`, a `||`, a background `&`, a second line).
+
+    Such a chain that exits 0 ran every one of its segments and every one of
+    them succeeded — so for that shape, and only that shape, the call's single
+    exit status is each segment's own. Everywhere else the last unpiped
+    segment is still the only one the status belongs to."""
+    rest = shell.replace("&&", "\x00")
+    if any(ch in rest for ch in "|;&\n"):
+        return []
+    return [x.strip() for x in rest.split("\x00") if x.strip()]
+
+
+def receipt_segments(shell, whole_chain=False):
+    """The segments of `shell` whose success the call's exit status vouches
+    for. Today's answer — the last segment, unpiped, not backgrounded — is
+    what an arbitrary command line can support. `whole_chain` widens it to
+    every segment of an `&&`-only chain, which is sound (see
+    `and_only_segments`) and is what the session- and prompt-armed rules
+    need: the shape they are about puts the required command FIRST
+    (`git fetch -q && git log origin/main`) and never last."""
+    if whole_chain:
+        segs = and_only_segments(shell)
+        if segs:
+            return segs
+    last = last_segment(shell)
+    if last and "|" not in last and not last.rstrip().endswith("&"):
+        return [last]
+    return []
+
+
 # ── a leading assignment is not part of the command ─────────────────────────
 #
 # `FOO=1 git push` execs `git push` — bash strips the assignment before it
@@ -793,11 +825,19 @@ class OrderingEngine:
             portable_lock.unlock(lock.fileno())
             lock.close()
 
-    def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None):
+    def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None, armed=None):
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
-        under lock; None on lock timeout (fail open)."""
+        under lock; None on lock timeout (fail open).
+
+        `armed` is the event that armed this obligation OUTSIDE the worktree
+        state — "session" or "prompt" — read by the caller from the SESSION's
+        own state file. A session- or prompt-armed obligation belongs to one
+        session (each session must fetch before it reads `origin/*`; the
+        sibling session down the hall fetching does not answer for this one),
+        so it cannot live in the worktree state every session shares."""
         spec = rule["ordering"]
         armed_by = tuple(spec.get("armed_by_events", ("edit", "write")))
+        by_call = any(k in armed_by for k in ("session", "prompt"))
         is_edit = tool in EDIT_TOOLS and hook_phase == "post"
         if is_edit and not any(k in armed_by for k in ("edit", "write")):
             return None
@@ -807,13 +847,22 @@ class OrderingEngine:
         # A Bash call reports ONE exit status. It is the receipt's own status
         # only when the receipt is the final segment and not piped (`pytest |
         # tail` returns tail's status). Earlier segments / pipelines never
-        # discharge — under-counting is the safe direction.
-        last = last_segment(seg) if seg else ""
+        # discharge — under-counting is the safe direction. A session- or
+        # prompt-armed rule reads an `&&`-only chain whole instead
+        # (`receipt_segments`): its required command sits FIRST in that chain,
+        # never last, and a chain that exits 0 vouches for every segment.
         is_receipt = hook_phase == "post" and tool == "Bash" and seg and \
-            re.search(spec["required_command_rx"], last) and \
-            "|" not in last and not last.rstrip().endswith("&")   # piped / backgrounded: status isn't the suite's
+            any(re.search(spec["required_command_rx"], part)
+                for part in receipt_segments(seg, whole_chain=by_call))
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             command_fires(spec["gated_command_rx"], seg, flags=0)
+        # One call that runs the required command AND the gated one discharges
+        # its own obligation (`git fetch -q && git log origin/main`). Blocking
+        # it would be a gate firing on the very call that satisfies it — and
+        # the miner's replay reads it the same way, so the two agree about
+        # which sessions a rule would have caught.
+        if is_gate and by_call and re.search(spec["required_command_rx"], seg):
+            return None
         if not (is_edit or is_receipt or is_gate):
             return None
 
@@ -839,11 +888,16 @@ class OrderingEngine:
                     return "discharged"
                 return None
             # handler 3: the gate — read-only
+            name = spec.get("display_name", rule["id"])
             if s["count"] >= int(spec.get("min_edits", 1)):
                 rule["_gate_msg"] = (
                     f"{s['count']} edit(s) since the last passing "
-                    f"'{spec.get('display_name', rule['id'])}' "
-                    f"(last: {s['last_edit']}). Run it first.")
+                    f"'{name}' (last: {s['last_edit']}). Run it first.")
+                return "fired"
+            if armed:
+                since = ("this session started" if armed == "session"
+                         else "your prompt armed this rule")
+                rule["_gate_msg"] = f"no passing '{name}' since {since}. Run it first."
                 return "fired"
             return "allowed"
         finally:
@@ -2180,12 +2234,14 @@ def state_path(session_id):
 
 
 def load_state(p):
-    st = {"fired": [], "counts": {}, "raw": {}, "open": {}}
+    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
     except Exception:
         pass
+    if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
+        st["armed"] = {}
     return st
 
 
@@ -2195,6 +2251,70 @@ def save_state(p, st):
             json.dump(st, f)
     except Exception:
         pass
+
+
+# The wrappers Claude Code puts around a prompt IT generated rather than one a
+# person typed: a slash command's expansion, a skill body, a resumed session's
+# continuation, a loop wake-up, a background task's notification. Anchored at
+# the START and never searched — a prompt that merely QUOTES one of these is a
+# person talking about them, which is exactly what a conversation about this
+# hook looks like. `transcript_filter._OPENS_WITH_WRAPPER` makes the same
+# statement about the same tags for the capture path; this is the hook's own
+# copy, because a hook on the prompt path must not grow an import to read one
+# regex.
+_HARNESS_PROMPT_RX = re.compile(
+    r"\s*(?:<(?:command-name|command-message|command-args|local-command-stdout"
+    r"|local-command-stderr|local-command-caveat|system-reminder|task-notification)>"
+    r"|This session is being continued|Caveat: The messages below"
+    r"|Base directory for this skill|Approach this as)")
+
+
+def harness_prompt(text):
+    """True when this UserPromptSubmit carries something the HARNESS wrote.
+
+    Only what a PERSON typed may arm an obligation: a rule armed by the word
+    "staging" in a prompt exists because someone said they were asking about
+    staging, and a skill body or a loop wake-up that happens to contain the
+    word said nothing of the kind. It would arm the rule for the rest of the
+    session with nobody having asked for it."""
+    return bool(_HARNESS_PROMPT_RX.match(text or ""))
+
+
+def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
+    """Record the ordering rules THIS event arms, in the session's own state
+    file — the one the pre lane already loads and reads.
+
+    `armed_by_events` used to mean the edit family alone, so the only
+    obligations the engine could carry were "you changed something, now run
+    the suite". The two shapes it could not carry are the ones a team asks for
+    most: armed for the whole session ("fetch before you read `origin/*`") and
+    armed by what the person just said ("you are asking about staging — probe
+    it before you answer"). Both arm at a moment that is not a tool call, so
+    both write here rather than into the worktree state the edit lane keeps."""
+    ids = []
+    for r in rules:
+        if r.get("on") != "ordering" or r.get("status", "active") != "active" \
+                or not scope_ok(r, repo, gitdir):
+            continue
+        spec = r.get("ordering") or {}
+        if event not in tuple(spec.get("armed_by_events", ("edit", "write"))):
+            continue
+        if event == "prompt":
+            # A prompt lane with no pattern would arm on every prompt, which
+            # is a session-armed rule wearing the wrong label. Say which
+            # prompts, or arm on none.
+            rx = spec.get("armed_by_rx")
+            if not rx or not re.search(rx, prompt, re.I):
+                continue
+        ids.append(r["id"])
+    if not ids:
+        return []
+    sp = state_path(session)
+    st = load_state(sp)
+    for rid in ids:
+        st["armed"].setdefault(rid, event)   # first arming wins; re-arming is a no-op
+    save_state(sp, st)
+    return ids
 
 
 def result_text(resp):
@@ -2750,6 +2870,15 @@ def main():
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data)}
+    if mode == "prompt":
+        # UserPromptSubmit. It arms and says nothing: anything printed here is
+        # injected above the person's own words, and an arming is not news —
+        # the fire at the gated command is. Nothing else in this lane runs, so
+        # a prompt costs one book read.
+        text = str(data.get("prompt") or "")
+        if text and not harness_prompt(text):
+            arm_obligations(rules, repo, gitdir, session, "prompt", prompt=text)
+        return 0
     # Repo facts answer about the tree the COMMAND runs in; which rules bind
     # you is still the session's repo, and stays keyed on it.
     #
@@ -2793,6 +2922,7 @@ def main():
         except Exception:
             pass
         session_digest(rules, repo, gitdir, ctx)
+        arm_obligations(rules, repo, gitdir, session, "session")
         return 0
     if mode == "pre":
         maybe_refresh(repo, fetched_at)
@@ -2942,9 +3072,13 @@ def main():
                     ok = bash_ok(ev["resp"], strict=r.get("mode") == "gate") \
                         if ev["resp"] is not None else None
                     outcome = ordering.feed(r, hook_phase=ev["order_phase"], tool=etool, cmd=ecmd,
-                                            file_path=efp, ok=ok)
+                                            file_path=efp, ok=ok, armed=st["armed"].get(rid))
                 except Exception:
                     outcome = None
+                if outcome == "discharged":
+                    # The session's own arming is discharged here, not in the
+                    # worktree state: it was never written there.
+                    st["armed"].pop(rid, None)
                 if outcome == "discharged" and r.get("_converted_fire"):
                     log_conversion(r["_converted_fire"], "discharged")
                 elif outcome == "fired":

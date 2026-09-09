@@ -15,6 +15,9 @@ Covers the properties that make this safe to ship in everyone's harness:
 * ordering rules arm on edits, discharge on a GREEN receipt only, gate the
   push, and keep state per (worktree, branch) — shared by sibling sessions and
   subagents, never leaking across branches;
+* an obligation can also be armed by the SESSION or by what the person typed
+  (`armed_by_events: ["session"] / ["prompt"]`), and that arming is the
+  session's own — a sibling session's receipt does not discharge it;
 * the post lane fires on failing result text, gated by cmd_rx;
 * repo_scope filters rules to the repo the session is in;
 * MEMHUB_RULEBOOK_BASE relocates the book cache, state and ledger together, so
@@ -1814,6 +1817,7 @@ def main() -> int:
     bash_edit_checks()
     read_lane_checks()
     diff_base_checks()
+    armed_lane_checks()
 
     print()
     if FAILURES:
@@ -1821,6 +1825,167 @@ def main() -> int:
     else:
         print("all rulebook hook checks passed")
     return 1 if FAILURES else 0
+
+
+def armed_lane_checks() -> None:
+    """An obligation can be armed by something that is not an edit.
+
+    `ordering.armed_by_events` accepted the edit family alone, so the two
+    shapes a team asks for most could not fire at a command at all. Armed for
+    the whole SESSION — "fetch before you read `origin/*`", which the local
+    corpus says would have caught 38 of 799 sessions and which could only be
+    delivered as a session-start note. And armed by what the person just typed
+    ("you are asking about staging — probe it before you answer"), which had
+    no lane at all: there was no UserPromptSubmit entry for this hook.
+
+    A session- or prompt-armed obligation is the SESSION's, not the
+    worktree's: each session must fetch for itself, and a sibling session in
+    the same checkout fetching does not answer for this one. So the arming
+    lives in the session's own state file, and these checks pin that.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "armedrepo")
+        os.makedirs(repo)
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        with open(os.path.join(repo, "f.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        _git(repo, "add", "-A")
+        assert _git(repo, "commit", "-q", "-m", "base").returncode == 0
+
+        fetch_rule = {
+            "id": "fetch-before-origin-read", "on": "ordering", "repo_scope": "any",
+            "mode": "gate", "_label": "fetch-first",
+            "ordering": {"required_command_rx": r"git\s+(fetch|pull)\b",
+                         "gated_command_rx": r"git\s+(log|diff|show)\b[^\n]*\borigin/",
+                         "armed_by_events": ["session"], "display_name": "git fetch"},
+            "text": "Fetch before you read origin/*", "why": "the ref is as old as your clone"}
+        probe_rule = {
+            "id": "probe-before-answering", "on": "ordering", "repo_scope": "any",
+            "mode": "gate", "_label": "probe-staging",
+            "ordering": {"required_command_rx": r"curl\b[^\n]*staging",
+                         "gated_command_rx": r"gh\s+pr\s+comment\b",
+                         "armed_by_events": ["prompt"], "armed_by_rx": r"\bstaging\b",
+                         "display_name": "a live staging probe"},
+            "text": "Probe staging live before you answer about it", "why": "w"}
+        seed_book(td, "armedrepo", [fetch_rule, probe_rule])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def start(session):
+            return run("session", {"session_id": session, "cwd": repo,
+                                   "hook_event_name": "SessionStart"}, env)[1]
+
+        def prompt(session, text):
+            return run("prompt", {"session_id": session, "cwd": repo,
+                                  "hook_event_name": "UserPromptSubmit",
+                                  "prompt": text}, env)[1]
+
+        def pre(session, command):
+            n[0] += 1
+            return ctx(run("pre", {"session_id": session, "cwd": repo, "tool_name": "Bash",
+                                   "tool_use_id": f"a{n[0]}",
+                                   "tool_input": {"command": command}}, env)[1])
+
+        def post(session, command, exit_code=0):
+            n[0] += 1
+            return ctx(run("post", {"session_id": session, "cwd": repo, "tool_name": "Bash",
+                                    "tool_use_id": f"a{n[0]}",
+                                    "tool_input": {"command": command},
+                                    "tool_response": {"stdout": "", "exit_code": exit_code}},
+                           env)[1])
+
+        # --- session arming ------------------------------------------------
+        c = pre("s0", "git log origin/main -5")
+        check("session-armed: nothing is armed before SessionStart runs", c == "", c)
+
+        start("s1")
+        c = pre("s1", "git log origin/main -5")
+        check("session-armed: the gated command fires after SessionStart armed it",
+              "[fetch-first]" in c, c)
+        check("session-armed: it BLOCKS — a gate the engine could not run before",
+              "BLOCKED" in c, c)
+        check("session-armed: the reason names the session, not an edit count",
+              "since this session started" in c, c)
+
+        post("s1", "git fetch --all")
+        c = pre("s1", "git log origin/main -5")
+        check("session-armed: a green fetch discharges it for the rest of the session",
+              c == "", c)
+
+        # The arming is the SESSION's. s1 fetched; s2 has not, and s2 shares
+        # the worktree state file with it.
+        start("s2")
+        c = pre("s2", "git log origin/main -5")
+        check("session-armed: a sibling session's fetch does not discharge this one",
+              "[fetch-first]" in c, c)
+
+        chain = "git fetch -q && git log origin/main -5"
+        c = pre("s2", chain)
+        check("session-armed: one call that fetches AND reads discharges itself, "
+              "never gates", c == "", c)
+        post("s2", chain)
+        c = pre("s2", "git log origin/main -5")
+        check("session-armed: and that call's fetch really did discharge it — an "
+              "`&&` chain that exits 0 vouches for every segment, so the receipt "
+              "need not be last", c == "", c)
+
+        start("s3")
+        post("s3", "git fetch --all", exit_code=1)
+        c = pre("s3", "git log origin/main -5")
+        check("session-armed: a RED fetch discharges nothing", "[fetch-first]" in c, c)
+
+        start("s4")
+        post("s4", "git fetch --all | tee /tmp/f", exit_code=0)
+        c = pre("s4", "git log origin/main -5")
+        check("session-armed: a piped fetch discharges nothing — the exit status "
+              "is tee's", "[fetch-first]" in c, c)
+
+        # An edit is not one of this rule's arming events, and an edit-armed
+        # rule's own semantics are untouched by any of this.
+        start("s5")
+        post("s5", "git fetch --all")
+        n[0] += 1
+        run("post", {"session_id": "s5", "cwd": repo, "tool_name": "Write",
+                     "tool_use_id": f"a{n[0]}",
+                     "tool_input": {"file_path": os.path.join(repo, "f.py"),
+                                    "content": "x = 2\n"}}, env)
+        c = pre("s5", "git log origin/main -5")
+        check("session-armed: an edit does not re-arm a rule armed by the session",
+              c == "", c)
+
+        # --- prompt arming --------------------------------------------------
+        start("p1")
+        c = pre("p1", "gh pr comment 7 --body ok")
+        check("prompt-armed: unarmed until a prompt matches", c == "", c)
+
+        prompt("p1", "is the staging brain still returning 404s?")
+        c = pre("p1", "gh pr comment 7 --body ok")
+        check("prompt-armed: a matching prompt arms it", "[probe-staging]" in c, c)
+        check("prompt-armed: the reason names the prompt",
+              "since your prompt armed this rule" in c, c)
+
+        post("p1", "curl -s https://staging.example/health")
+        c = pre("p1", "gh pr comment 7 --body ok")
+        check("prompt-armed: the probe discharges it", c == "", c)
+
+        start("p2")
+        prompt("p2", "is production still returning 404s?")
+        c = pre("p2", "gh pr comment 7 --body ok")
+        check("prompt-armed: a prompt that does not match arms nothing", c == "", c)
+
+        # Only what a PERSON typed arms an obligation. A skill body or a loop
+        # wake-up that happens to contain the word said nothing of the kind,
+        # and would arm the rule for the rest of the session with nobody
+        # having asked.
+        start("p3")
+        prompt("p3", "<command-name>/deploy</command-name>\ncheck staging first")
+        c = pre("p3", "gh pr comment 7 --body ok")
+        check("prompt-armed: a harness-generated prompt arms nothing", c == "", c)
+
+        # The prompt lane says nothing itself: anything it printed would be
+        # injected above the person's own words, and an arming is not news.
+        out = prompt("p4", "what about staging?")
+        check("prompt lane: emits nothing", out.strip() == "", out)
 
 
 if __name__ == "__main__":
