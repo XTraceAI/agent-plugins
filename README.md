@@ -422,6 +422,19 @@ disconnected org, an unreachable server, no credential, a listing command whose
 output names several PRs, or a command that merely *mentions* a PR without
 addressing GitHub.
 
+The **one** thing it remembers is a negative: an org that has the feature on but
+no GitHub connected cannot change that without an admin acting, so that answer
+is cached for **30 minutes** rather than re-asked on every `gh pr` command. The
+entry is scoped to the deployment, the repo *and* the credential that earned it,
+because which org answers depends on which token is resolved. Two replies are
+deliberately never cached — a connected one (`linked_sessions` and `pr.known`
+change constantly) and one that just says the feature is off, since the server
+answers that from a flag check without looking at the integration at all, so its
+`github_connected` field is a default rather than a finding. Caching that field
+once silenced linking for a day on machines whose GitHub was connected the whole
+time. Set `MEMHUB_PRLINK_NEGATIVE_TTL_S` to change the window; `/memhub:link-pr`
+always asks live.
+
 **A PR opened by some other means — a script, a Makefile target, a CI helper,
 `hub pull-request` — is not detected, deliberately**: recognising arbitrary
 programs that happen to open a PR is the automatic-attribution problem this

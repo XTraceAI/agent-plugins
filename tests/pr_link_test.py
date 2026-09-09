@@ -1046,7 +1046,7 @@ def test_a_hostile_or_unwritable_cache_is_never_fatal():
                                        time.time() - 7 * 86400) is None)
         check("past the TTL it is not read either",
               pr_link._cached_negative("https://api.example.test",
-                                       time.time() + 25 * 3600) is None)
+                                       time.time() + 31 * 60) is None)
 
     # An unwritable state directory must not take the hook down with it.
     with tempfile.TemporaryDirectory() as td:
