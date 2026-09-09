@@ -418,6 +418,7 @@ _CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
 # — `sudo cd x` cannot move this shell and `env cd x` fails outright.
 _CD_WRAPPERS = frozenset({"command", "builtin"})
 _MODAL_RUNNERS = frozenset({"command", "builtin", "exec"})
+_EXPANSION_RX = re.compile(r"[$`]")   # `$VAR`, `${…}`, `$(…)`, backticks
 _CMD_PREFIXES = frozenset({"!", "if", "elif", "then", "else", "while", "until", "do"})
 _BLOCK_END = frozenset({"fi", "done", "esac", "}", ";;"})
 
@@ -468,7 +469,12 @@ def executes(segment, rx):
     script — would be a per-tool parser that is wrong for the next tool, and
     it would buy nothing against a deliberate bypass that has an approved
     door already."""
-    text = strip_leading_assignments(unquoted(segment or "")).strip()
+    # Grouping is not part of a command's name — `(git fetch -q)` runs the
+    # fetch and propagates its status, so it is as good a receipt as the bare
+    # form. `_segment_target` has stripped this since round 13; found by
+    # auditing the three against each other, not reported.
+    text = strip_leading_assignments(
+        unquoted(segment or "").strip("(){} \t")).strip()
     if not text:
         return False
     if re.match(rx, text):
@@ -1550,7 +1556,11 @@ def command_root(cwd, command):
     Other, was measured in Here. That is the same sentinel-for-two-answers
     bug `_segment_target` had between "a bare cd" and "nothing here".
     """
-    text = shell_only(command or "").strip()
+    # Comments blanked first: `cd ../Other  # note` followed by a newline is
+    # still a `cd`, and `_CD_SEGMENT` requires the segment to END after the
+    # path, so the trailing comment hid it entirely. The matchers have read
+    # comments this way since round 21; this loop had not.
+    text = strip_comments(shell_only(command or "")).strip()
     # `(cd ../Other && git push)` runs the push in the directory its own
     # subshell moved to, so the group is unwrapped and read normally. Only
     # when the group is the WHOLE command: `(cd a) && git push` closes the
@@ -1588,6 +1598,13 @@ def command_root(cwd, command):
             return ""
         arg = next((g for g in m.groups() if g), "")
         if not arg:                          # `cd` home, `cd -`: unknowable
+            return None
+        if _EXPANSION_RX.search(arg):
+            # `cd "$OTHER" && git diff` really moves; the literal `$OTHER` is
+            # not a directory, and treating that as a FAILED `cd` fell back to
+            # the session checkout. What it expands to is not knowable from
+            # the command text, so this refuses rather than guessing — the
+            # same answer `cd -` gets, for the same reason.
             return None
         arg = os.path.expanduser(arg)
         path = arg if os.path.isabs(arg) else os.path.join(path or cwd or "", arg)
@@ -2450,6 +2467,16 @@ def _norm_given(r):
     left is removed entirely rather than left as an empty block that would
     read as "no condition, all good"."""
     raw = r["given"]
+    if not isinstance(raw, dict):
+        return False
+    # A known BLOCK whose value is not a dict of predicates is malformed, and
+    # `given_supported` skipped it exactly as it skips an unknown block — so
+    # `{"repo": 42}` left nothing supported, no skew reported, and the rule
+    # loaded with its condition silently removed. Checked before the strip,
+    # because after it the two are indistinguishable.
+    for block, spec in raw.items():
+        if block in _GIVEN and not (isinstance(spec, dict) and spec):
+            return False
     supported = given_supported(raw)
     kept = given_norm(supported) if supported else None
     # The two failures are judged separately, because a rule can carry both.

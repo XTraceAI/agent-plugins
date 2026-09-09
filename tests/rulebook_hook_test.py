@@ -2107,6 +2107,15 @@ def armed_lane_checks() -> None:
                             "uv run --with 'mcp<2' python tests/run_all.py"):
             check(f"receipt: {really_runs[:28]!r} really runs it",
                   rb_mod.executes(really_runs, _rx), really_runs)
+        # Found by auditing `executes` against `_segment_target`: grouping is
+        # not part of a command's name, and `(git fetch -q)` runs the fetch
+        # and propagates its status, so it is as good a receipt as the bare
+        # form. `_segment_target` has stripped this since round 13.
+        for grouped in ("(git fetch -q)", "{ git fetch -q; }"):
+            check(f"receipt: {grouped!r} is a receipt",
+                  rb_mod.executes(grouped, r"git\s+(fetch|pull)\b"), grouped)
+        check("receipt: and a group running something else is not",
+              not rb_mod.executes("(echo hi)", r"git\s+(fetch|pull)\b"))
         check("last_segment: a separator inside quotes is data",
               rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
               rb_mod.last_segment("echo 'a; b'"))
@@ -2387,6 +2396,14 @@ def min_hook_version_checks() -> None:
                                                   "branch_rx": 42}})) is None)
         r = H.to_hook_rule(_row_given({"repo": {"branch_rx": "^main$",
                                                 "future_key": 1}}))
+        # A KNOWN block whose VALUE is the wrong kind is malformed too, and
+        # `given_supported` skipped it exactly as it skips an unknown block —
+        # so nothing was supported, no skew was reported, and the rule loaded
+        # with its condition silently removed.
+        check("mixed: a known block with a non-dict value drops the rule",
+              H.to_hook_rule(_row_given({"repo": 42})) is None)
+        check("mixed: an EMPTY known block drops it too",
+              H.to_hook_rule(_row_given({"repo": {}})) is None)
         check("mixed: a WELL-FORMED known key beside an unsupported one is "
               "kept and still checked",
               r is not None and r.get("given") == {"repo": {"branch_rx": "^main$"}},

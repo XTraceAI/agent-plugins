@@ -496,6 +496,26 @@ def bash_target_checks() -> None:
                   rb._segment_target(prefixed) == "acme/other",
                   rb._segment_target(prefixed))
         check("bash: a block terminator runs nothing", rb._segment_target("fi") == "")
+
+        # A `cd` target the shell EXPANDS is not a literal path. `cd "$OTHER"`
+        # really moves; testing `$OTHER` as a directory concluded the `cd`
+        # FAILED and fell back to the session checkout. Unknowable from the
+        # command text, so it refuses — the same answer `cd -` gets.
+        for expanded in ('cd "$OTHER" && git diff', "cd $OTHER && git diff",
+                         "cd `pwd`/x && git diff"):
+            check(f"bash: {expanded.split(' &&')[0]!r} refuses rather than "
+                  "reading as a failed cd",
+                  rb.command_root(here, expanded) is None,
+                  repr(rb.command_root(here, expanded)))
+        check("bash: a literal path is unaffected",
+              rb.command_root(here, f"cd {other} && git diff") == other)
+
+        # --- found by auditing the three siblings against each other ---
+        # `command_root` read raw segments, so a comment after a `cd` hid it:
+        # `_CD_SEGMENT` requires the segment to END after the path.
+        check("bash: a comment after a `cd` does not hide it",
+              rb.command_root(here, f"cd {other}  # note\ngit diff") == other,
+              repr(rb.command_root(here, f"cd {other}  # note\ngit diff")))
         for not_a_comment in ("git log --format=%h#%s", "curl http://x/#frag"):
             check(f"bash: a mid-word `#` in {not_a_comment.split()[0]!r} is not a comment",
                   "#" in rb.blank_quoted(not_a_comment), rb.blank_quoted(not_a_comment))
