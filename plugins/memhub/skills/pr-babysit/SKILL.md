@@ -1,7 +1,7 @@
 ---
 description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or auto-armed by the memhub hook right after `gh pr create`). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
 argument-hint: [pr-number-or-url]
-allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash, Read, Edit, Write, Glob, Grep
+allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__search_brains, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash, Read, Edit, Write, Glob, Grep
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -25,8 +25,13 @@ already resolved.
    repo is already cached — take that id and skip the lookup. Otherwise: name
    `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
    stripped), match it EXACTLY in `list_agent_brains` — a teammate may have
-   created it; use theirs. No match → `create_agent_brain` (omit
-   `workspace_id`). Either way, persist what you resolved with `room_map.py set
+   created it and shared it with you; use theirs. No match → `create_agent_brain`
+   (omit `workspace_id`) — but note that a miss here does not prove the room is
+   absent, only that none is shared with YOU, and that what you create is
+   private to you until shared. Say so in one line when you create one, and
+   point at `/memhub:onboard`, which does the sharing with a user present to
+   approve it. Do not share from inside a babysit pass. Either way, persist what
+   you resolved with `room_map.py set
    --brain-id <id> --org-id <org-id>` (the org id is the one you passed to
    `list_agent_brains`, or the default org's from `list_orgs` — the response's
    `scope` carries only `org_name`) so later passes and the capture hooks

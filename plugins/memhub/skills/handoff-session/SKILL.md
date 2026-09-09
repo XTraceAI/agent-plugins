@@ -29,8 +29,10 @@ Do exactly this:
 
 2. Create the handoff container: `create_agent_brain` with
    `name: "Handoff: <title>"` and a one-line `description` naming who it's
-   from, who it's for, and the topic. Omit `workspace_id` (your own workspace
-   — as creator you keep the contributor access that sharing requires).
+   from, who it's for, and the topic. Omit `workspace_id` — that chooses where
+   the brain lives, not who can read it, and you are its creator (so admin on
+   it) wherever it is homed. Either way it is readable by you alone until
+   step 4 shares it; putting it in a shared workspace would NOT share it.
 
 3. Write the handoff brief and save it with `save_artifact` into that agent
    brain (`agent_brain_id` from step 2, `artifact_type: "document"`,
@@ -80,6 +82,14 @@ Do exactly this:
    Both are readable immediately — the brief because you just wrote it, the
    session's memory because capture extracted it as the session ran.
 
-If `share_agent_brain` fails on permissions, you don't have contributor
-access to the agent brain — this happens when reusing someone else's agent
-brain instead of creating one in step 2; create your own and retry.
+If `share_agent_brain` fails on permissions, you lack contributor access to
+whichever brain you were sharing — and the fix differs by which one:
+
+- **Step 4 (the handoff brain)** — you created it, so this should not happen;
+  if it does, you reused someone else's brain instead of creating one in step
+  2. Create your own and retry.
+- **Step 5 (the repo room)** — expected, and NOT something to work around.
+  The room is usually a teammate's, shared with you read-only. Do not create a
+  second one: minting another `Repo: <org>/<name>` forks the repo's memory.
+  Say you could only share the handoff brain, and tell the user the room's
+  owner (or `/memhub:onboard`) can share the room itself.
