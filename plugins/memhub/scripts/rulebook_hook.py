@@ -308,13 +308,21 @@ _QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
 # lookarounds keep redirection out: `2>&1`, `cmd >&2`, `cmd &> log`.
 _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
+_ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
 
 
 def blank_quoted(text):
-    """`text` with the contents of quoted spans replaced by spaces, character
-    for character, so every offset still points at the same place."""
-    return _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
-                          + m.group(0)[-1], text or "")
+    """`text` with the contents of quoted spans — and every backslash escape
+    outside them — replaced by spaces, character for character, so every
+    offset still points at the same place.
+
+    A `\\|` is not a pipe. `gh pr view --jq .title\\|ascii_downcase -R
+    acme/other` is one command, and reading its escaped pipe as an operator
+    left the `-R` in a fragment that no longer began with `gh`. Quoting was
+    only ever half of "this character is data"."""
+    blanked = _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
+                             + m.group(0)[-1], text or "")
+    return _ESCAPE_RX.sub("  ", blanked)
 
 
 def unquoted(text):
@@ -1351,6 +1359,7 @@ _CD_SEGMENT = re.compile(r"^\s*cd\s+" + _ARG + r"\s*$")
 # usually ends up with.
 _REPO_ARG = re.compile(r"(?:^|\s)(?:-R\s*=?\s*|--repo\s*=?\s*)" + _ARG)
 _GH_SEGMENT = re.compile(r"^gh\b")
+_GIT_C_RX = re.compile(r"(?:^|\s)-C(?:[=\s]|$)")
 # `[HOST/]OWNER/REPO`, host KEPT. Dropping it was wrong in the one case the
 # host exists to distinguish: with a single local checkout of
 # `github.com/acme/repo`, `-R ghe.corp/acme/repo` matched it unambiguously and
@@ -1490,7 +1499,15 @@ def _segment_target(seg):
         # truth.
         env = dict(env, **leading_env(rest))
         bare = strip_leading_assignments(rest).strip()
-    if not _GH_SEGMENT.match(bare):
+    head = bare.split()[0] if bare.split() else ""
+    if os.path.basename(head) == "git" and _GIT_C_RX.search(blank_quoted(bare)):
+        # `git -h`: `git [-C <path>] …`. It selects a DIRECTORY, not a repo
+        # this can name, and the call already knows more than `checkout_of`
+        # could resolve from a slug. Refusing keeps it out of the wrong tree;
+        # measuring the session's would be the confidently wrong answer this
+        # whole path exists to remove.
+        return "unknown"
+    if os.path.basename(head) != "gh":   # invoked by path is still `gh`
         return "local"          # runs in the checkout the shell is in
     # An assignment written as `GH_REPO=` is an EXPLICIT empty value: the
     # shell passes it and `gh` then uses the local repository. Presence

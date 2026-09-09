@@ -650,6 +650,23 @@ def bash_target_checks() -> None:
             check(f"segment target: {cmd!r} -> {want}",
                   rb._segment_target(cmd) == want, rb._segment_target(cmd))
 
+        # Quoting was only ever half of "this character is data": a
+        # backslash-escaped operator outside quotes is not an operator.
+        esc_op = r"gh pr view --jq .title\|ascii_downcase -R acme/other"
+        check("bash: a backslash-escaped pipe is not a separator",
+              addressed(esc_op) == other, f"{esc_op!r} -> {addressed(esc_op)}")
+        check("bash: `gh` invoked by path is still `gh`",
+              addressed("/usr/bin/gh pr view -R acme/other") == other,
+              addressed("/usr/bin/gh pr view -R acme/other"))
+        # `git [-C <path>] …` selects a DIRECTORY. The call knows more than a
+        # slug could resolve, so refusing keeps it out of the wrong tree —
+        # measuring the session's would be the confidently wrong answer.
+        check("bash: `git -C <path>` refuses rather than measuring the session's",
+              addressed("git -C ../Other diff") == "",
+              addressed("git -C ../Other diff"))
+        check("bash: a plain git command is unaffected",
+              addressed("git diff --stat") == here)
+
         # A standalone `&` backgrounds the command to its left and the next
         # one runs anyway, so this is TWO commands addressing two repos.
         bg = "gh pr view -R acme/other & git push"
