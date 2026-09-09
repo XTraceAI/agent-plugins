@@ -13,6 +13,17 @@ payloads return success so the original command continues unchanged. Cursor
 payloads stop the Claude command; capture boundaries additionally launch the
 native ``cursor_flush.py`` path as an idempotent fallback. Native and fallback
 capture may both fire, but they share the same per-session lock and watermark.
+
+The guard has a second, unrelated job: suppressing the plugin for sessions the
+plugin itself started (``MEMHUB_HARNESS_CHILD``). Same mechanism, opposite
+origin — Cursor is a foreign host wearing Claude's payload shape; a harness
+child is this plugin's own headless ``claude -p``, which is a real Claude
+session and would otherwise be captured as one.
+
+Exit codes: 0 means "run the Claude handler", non-zero means "skip it". Every
+hook command invokes the guard as an ``if`` condition, so a skip still leaves
+the shell command itself exiting 0 — the hook never fails, it just does
+nothing.
 """
 from __future__ import annotations
 
@@ -29,6 +40,13 @@ _CURSOR_ENV_MARKERS = (
     "CURSOR_TRANSCRIPT_PATH",
     "CURSOR_SESSION_ID",
 )
+# The harness extractor and the post-session review run headless `claude -p`
+# INSIDE a repo (harness-tied-memory-spec §4.2/§4.3), so this plugin's own
+# hooks fire for them: a replay's turns get captured into the repo brain, the
+# rulebook routes on them, and the session shows up on the fleet board as an
+# agent nobody started. It has happened. The extractor exports this variable
+# for every child it spawns, and every hook event then does nothing at all.
+_HARNESS_CHILD_ENV = "MEMHUB_HARNESS_CHILD"
 _CURSOR_EVENTS = {
     "aftermcpexecution",
     "afterfileedit",
@@ -106,9 +124,21 @@ def _spawn_cursor_flush(raw: bytes, event: str) -> None:
     spawn_cursor_flush(raw, event)
 
 
+def is_harness_child(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether this hook fired inside a process the harness itself started."""
+    env = os.environ if environ is None else environ
+    return _nonempty_string(env.get(_HARNESS_CHILD_ENV))
+
+
 def route(action: str, source_event: str, payload: object, raw: bytes,
           environ: Mapping[str, str] | None = None) -> bool:
     """Return True when the caller should continue its Claude handler."""
+    # Checked before the Cursor branch and before any fallback launch: a
+    # harness child must produce NO capture on any path, including the Cursor
+    # fallback flush, which would otherwise write the replay under a second
+    # host's shape. Nothing is captured, routed or rule-checked for it.
+    if is_harness_child(environ):
+        return False
     if not is_cursor(payload, environ):
         return True
     if action == "capture":

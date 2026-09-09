@@ -345,3 +345,87 @@ session-armed orderings waiting on the engine mode. Note the activation
 date — the next run with `--baseline-date <that date>` over fresh sessions
 (with a new facet pass) measures whether the friction shrank. Identical
 re-files are no-ops on the server, so re-running is safe.
+
+---
+
+# Appendix — the S0 replay harness (harness-tied memory)
+
+Everything above mines rules from transcripts and files them for a human.
+The scripts below answer a different, narrower question, and they are
+**measurement tools, not a rule-filing path**: *would an agent, at the Stop
+hook, draft a lesson worth activating?* That is slice **S0** of
+`harness-tied-memory-spec.md` — the offline proving ground that gates the
+live sensors (S1). Nothing here activates a rule, fires anything, or writes
+to a server.
+
+| script | what it answers |
+|---|---|
+| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_extract.py` | the pipeline itself: router → judge → author → drafts |
+| `scripts/replay_hooks.py` | one command: replay a session through the installed hook AND the extractor |
+| `scripts/staging_sessions.py` | read-only adapter: a teammate's staging-captured session → the replay window |
+| `scripts/score_s0.py` | the scorecard: judge recall on gold, router hits, whole-pipeline over a corpus |
+
+## Replay one session
+
+```bash
+# a local Claude Code session — hooks AND extraction
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/replay_hooks.py" \
+  --session 132a2af4 --out replay-out
+
+# a teammate's session, no local transcript (extraction only — the hook's
+# job is to read a transcript, and there is not one)
+python3 .../staging_sessions.py fetch --conv <conv_id> --out t.json
+python3 .../replay_hooks.py --turns t.json --out replay-out
+```
+
+## The corpus, and why it comes from staging
+
+Every earlier number came from one engineer's machine. Teammates' sessions
+are already captured on staging — `team_memory_messages` keeps `role`,
+`ordinal` and the `parts[]` render script with each tool call's input and
+output — so `staging_sessions.py` replays them with no local file.
+
+**It is read-only by construction**: the connection is opened read-only, every
+statement is a SELECT, and drafts go to a local file. It never writes to
+staging, never mints a rule, never saves an artifact. The DSN is read from
+`SUPABASE_DATABASE_URL` (default `~/xtrace/MemHub-Backend/.env.staging`, or
+`MEMHUB_STAGING_DSN`) and is never printed.
+
+```bash
+PY=~/xtrace/MemHub-Backend/.venv/bin/python   # any python with psycopg2
+$PY .../staging_sessions.py --since 2026-07-01 --min-turns 8 \
+    corpus --out corpus --sessions 24 --min-corrections 2
+```
+
+Sessions are picked round-robin **by engineer**, not "the N biggest" — the
+biggest sessions all belong to the same two people, and a corpus that is 18
+sessions from one engineer does not answer S0's question. Engineers are
+labelled `eng-<hash>` so a scorecard can say "5 engineers" without putting
+teammates' user ids in a PR.
+
+## The scorecard
+
+```bash
+python3 .../score_s0.py router --corpus corpus              # free, no model
+python3 .../score_s0.py gold   --jobs 6 --out gold.json     # judge vs 140 labels
+python3 .../score_s0.py corpus --corpus corpus --out s0-run --jobs 8
+```
+
+`corpus` writes `judge_sheet.md`: every drafted row, numbered, with the
+rubric. **That hand judgement is the gate** — `rows a human would activate ÷
+rows drafted ≥ 0.5`. Counts are not the deliverable; the judged set is.
+
+**Do not tune the judge for precision.** A false positive costs one author
+call, which usually ends in a refusal; a false negative is a lesson that
+never exists. Precision is measured at the END of the pipeline, by the
+activate ratio, not at the judge.
+
+## What runs a model, and how it is kept out of your session
+
+The judge and author are headless `claude -p` calls. Each child runs under
+`--safe-mode` (no plugins, no hooks, no CLAUDE.md) **and** carries
+`MEMHUB_HARNESS_CHILD=1`, which `claude_hook_guard.py` honours by disarming
+every hook. Both, because the first is a Claude-Code-only flag and the second
+works on every host. Without them a replay's own child sessions get captured
+into the repo brain and show up on the fleet board — that happened while S0
+was being measured.
