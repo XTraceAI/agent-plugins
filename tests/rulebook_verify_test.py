@@ -159,6 +159,12 @@ def main() -> int:
                   "--no-self-mention")
     check("ordering: a session-armed rule can be verified",
           rc == 0 and "FIRES  ok" in out and "SILENT ok" in out, out)
+    rc, out = run(sess, "--fires", "session >> gate:git log origin/main",
+                  "--silent", "session >> ok:git fetch -q >> session >> "
+                              "gate:git log origin/main", "--no-self-mention")
+    check("ordering: a second `session` step does not re-arm — SessionStart "
+          "fires again on resume and `/clear`, and the live lane refuses it",
+          rc == 0 and "SILENT ok" in out, out)
     rc, out = run(sess, "--fires", "prompt:anything >> gate:git log origin/main",
                   "--no-self-mention")
     check("ordering: an arming step the rule does not name is refused",

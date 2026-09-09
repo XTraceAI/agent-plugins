@@ -1439,6 +1439,18 @@ def leading_env(segment):
         pos = m.end()
 
 
+def _unwrap_env(text):
+    """`text` with a leading `env NAME=VALUE …` wrapper removed.
+
+    `env --help`: `env [NAME=VALUE]... [COMMAND]` sets the variables and runs
+    that command, so `env GH_REPO=acme/other gh pr view` IS a `gh` call —
+    stripping the assignments left a segment starting with `env`, which no
+    longer looked like one."""
+    if not re.match(r"env(\s|$)", text or ""):
+        return text
+    return strip_leading_assignments(text[3:].lstrip()).strip()
+
+
 def named_repo(command):
     """The `owner/repo` a `gh` command names with `-R` / `--repo`, or "".
 
@@ -1450,8 +1462,6 @@ def named_repo(command):
     named, from_env = set(), set()
     for _, seg in split_shell(shell_only(command or "")):
         bare = strip_leading_assignments(seg).strip()
-        if not _GH_SEGMENT.match(bare):
-            continue
         # `gh help environment`: GH_REPO names the repo, in the same
         # `[HOST/]OWNER/REPO` form, for commands that would otherwise use the
         # local one — and GH_HOST supplies the host an unqualified `-R`
@@ -1463,8 +1473,20 @@ def named_repo(command):
         # silently retargets every plain `gh` call in the session, so not
         # reading it left those calls measured against the cwd checkout.
         env = leading_env(seg)
-        host = (env.get("GH_HOST") or os.environ.get("GH_HOST", "")).strip().strip("\"'")
-        repo_env = (env.get("GH_REPO") or os.environ.get("GH_REPO", "")).strip().strip("\"'")
+        inner = _unwrap_env(bare)
+        if inner is not bare and inner != bare:
+            env = dict(leading_env(bare[3:].lstrip()), **env)   # `env A=1 gh …`
+            bare = inner
+        if not _GH_SEGMENT.match(bare):
+            continue
+        # An assignment written as `GH_REPO=` is an EXPLICIT empty value: the
+        # shell passes it, and `gh` then uses the local repository. Falling
+        # back on falsiness restored the inherited value and probed the wrong
+        # repo, so presence is what decides, not truth.
+        host = (env["GH_HOST"] if "GH_HOST" in env
+                else os.environ.get("GH_HOST", "")).strip().strip("\"'")
+        repo_env = (env["GH_REPO"] if "GH_REPO" in env
+                    else os.environ.get("GH_REPO", "")).strip().strip("\"'")
         if repo_env and _SLUG.match(repo_env):
             from_env.add(("%s/%s" % (host, repo_env) if host and repo_env.count("/") == 1
                           else repo_env).casefold())
@@ -1646,8 +1668,32 @@ def addressed_root(cwd, root, command):
     whose `given` cannot be checked stays silent."""
     slug = named_repo(command)
     if slug:
+        if not _all_segments_addressed(command):
+            # `gh pr view -R acme/other && git push` addresses TWO repos: the
+            # `-R` selects another repository for the `gh` call only, and the
+            # push still runs here. There is one probe root per Bash call, so
+            # there is no answer that is right for both segments — and a push
+            # rule measured against the other repo's branch and diff is the
+            # bug this function exists to remove, pointed the other way.
+            # Per-segment probes would be the complete answer; refusing is the
+            # honest one, and it is the same rule already applied to two `-R`
+            # values and to several worktrees.
+            return ""
         return checkout_of(cwd, root, slug, command)
     return command_root(cwd, command) or root
+
+
+def _all_segments_addressed(command):
+    """Is EVERY segment of this call either the `gh` call that named the repo
+    or a bare `cd`? A `cd` runs no repo-sensitive command, so it does not
+    disagree with anything; anything else does."""
+    for _, seg in split_shell(shell_only(command or "")):
+        bare = _unwrap_env(strip_leading_assignments(seg).strip())
+        if not bare or _CD_SEGMENT.match(bare):
+            continue
+        if not _GH_SEGMENT.match(bare):
+            return False
+    return True
 
 
 class Probes:

@@ -544,6 +544,38 @@ def bash_target_checks() -> None:
                     _os.environ[var] = saved
         check("bash: and with nothing inherited a plain `gh` names nothing",
               rb.named_repo("gh pr view 7") == "")
+        # An assignment written as `GH_REPO=` is an EXPLICIT empty value: the
+        # shell passes it and `gh` falls back to the local repo. Falling back
+        # on falsiness restored the inherited value and probed the wrong one.
+        saved = _os.environ.get("GH_REPO")
+        _os.environ["GH_REPO"] = "acme/other"
+        try:
+            check("bash: `GH_REPO= gh …` clears an inherited value",
+                  rb.named_repo("GH_REPO= gh pr view") == "",
+                  rb.named_repo("GH_REPO= gh pr view"))
+        finally:
+            if saved is None:
+                _os.environ.pop("GH_REPO", None)
+            else:
+                _os.environ["GH_REPO"] = saved
+        # `env --help`: `env [NAME=VALUE]... [COMMAND]`. Stripping the
+        # assignments left a segment starting with `env`, which no longer
+        # looked like a `gh` call.
+        check("bash: `env GH_REPO=… gh …` is a gh call",
+              addressed("env GH_REPO=acme/other gh pr view") == other,
+              addressed("env GH_REPO=acme/other gh pr view"))
+
+        # ONE call has ONE probe root, so a call whose segments address
+        # DIFFERENT repos has no answer that is right for both. `-R` selects
+        # another repository for the `gh` call only; the push still runs here.
+        mixed = "gh pr view -R acme/other && git push"
+        check("bash: a call that addresses two repos measures neither",
+              addressed(mixed) == "", f"{mixed!r} -> {addressed(mixed)}")
+        check("bash: all-`gh` segments still resolve",
+              addressed("gh pr view -R acme/other && gh pr merge -R acme/other") == other)
+        check("bash: a bare `cd` alongside a `gh` call is not a disagreement",
+              addressed(f"cd {plain} && gh pr view -R acme/other") == other,
+              addressed(f"cd {plain} && gh pr view -R acme/other"))
         # `gh help environment`: GH_REPO applies to commands that would
         # OTHERWISE use the local repo; `-R` selects one explicitly. The flag
         # wins. Treating them as two candidates made this look ambiguous and
@@ -559,8 +591,12 @@ def bash_target_checks() -> None:
                '\\"a|b\\" then .title else empty end" -R acme/other')
         check("bash: an escaped quote inside a quoted jq expression does not "
               "end the span", addressed(esc) == other, f"{esc!r} -> {addressed(esc)}")
-        check("bash: a repo named on a later `gh` segment still counts",
-              addressed("git status && gh pr view 7 -R acme/other") == other)
+        # A repo named on a later `gh` segment is SEEN — but the call also
+        # runs `git status` here, so it addresses two repos and measures
+        # neither (see the disagreement checks below). `named_repo` is the
+        # part being pinned here.
+        check("bash: a repo named on a later `gh` segment is still seen",
+              rb.named_repo("git status && gh pr view 7 -R acme/other") == "acme/other")
 
         # `origin_slug` reads .git/config, never git — this decides a probe
         # root on every Bash call's hot path. It carries the HOST, because

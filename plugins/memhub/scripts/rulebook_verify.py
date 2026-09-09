@@ -138,6 +138,7 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
     rule = dict(hook_rule)
     outcome = None
     armed = None
+    armed_once = set()
     saved = H.BASE
     with tempfile.TemporaryDirectory() as td:
         H.BASE = td
@@ -176,9 +177,19 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
                     # case passes here and the rule never arms in a session,
                     # which is the one discrepancy `arms_on` exists to
                     # prevent.
-                    if kind == "prompt" and H.harness_prompt(arg):
+                    # SessionStart is once per session even when the client
+                    # fires it again on resume or `/clear` — `arm_obligations`
+                    # records `session:<rule>` in `armed_once` and refuses the
+                    # rest. Without that here, `session >> ok:git fetch >>
+                    # session >> gate:…` reported a fire, so a case whose LIVE
+                    # behaviour is correctly discharged failed the mandatory
+                    # authoring verification.
+                    if kind == "session" and kind in armed_once:
+                        pass
+                    elif kind == "prompt" and H.harness_prompt(arg):
                         pass
                     elif H.arms_on(rule, kind, arg):
+                        armed_once.add(kind)
                         armed = kind
                 elif kind == "gate":
                     outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg,
