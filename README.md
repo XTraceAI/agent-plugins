@@ -88,6 +88,10 @@ Open **Customize**, find **MemHub** in the XTrace marketplace, and select
 it needs attention. Then ask Cursor Agent to **Log in to MemHub** for capture
 and **Onboard MemHub for this repo**.
 
+Cursor's hooks are observational — `afterShellExecution` defines no reply the
+agent can see — so the rulebook and the session ↔ PR link hook do not run
+there. Cursor links a session to a pull request with `/memhub:link-pr`.
+
 ### Capture credential
 
 The foreground login skill opens a browser once and mints a 90-day personal
@@ -149,6 +153,17 @@ Capture runs on independent paths that all feed one server-side watermark
    SAME room only if it was shared with them — being in the workspace it lives
    in reaches nothing — which is what `/memhub:onboard` offers at create time.
 
+5. **Naming.** A captured session is called what its host calls it, so the
+   sessions list in MemHub reads the same as the one in the editor: Claude
+   Code's generated title (a rename by the user outranks it), and on Codex the
+   `thread_name` Codex itself generated — read from the rollout, or from
+   `~/.codex/session_index.jsonl` for the hosts that only record it there —
+   passed through verbatim. Only a session its host never named falls back to
+   a title derived from the first prompt, trimmed to one readable line. Codex
+   re-derives this on every flush, so a thread renamed mid-session updates on
+   its next turn; Cursor exposes no host-generated name, so its title stays the
+   one derived from the opening ask.
+
 All of the above authenticate with the plugin's own credential — separate
 from `/mcp`, provisioned by `/memhub:login` (see Install) — because they run
 as cold background processes that can never open a browser.
@@ -176,22 +191,88 @@ the round-trip entirely.
 ### Session orientation
 
 Also independent of capture: a `SessionStart` hook (`brain_brief.py brief`)
-names the repo's default agent brain before the first prompt. It closes a
-read/write gap — writes already resolved the room, but `search_memory`
-without an explicit `agent_brain_id` defaulted to personal memory regardless.
-It's stdlib-only and makes no network call (everything comes from the cached
-room and a local overview cache), and it injects the brain id — plus a
-compiled overview, if one is cached — as context for the agent every
-session. It only tells the *user*, via `systemMessage`, when the resolved
-brain changes, so it doesn't become wallpaper; a repo with no cached room
-(not yet onboarded) stays silent. A companion `Stop` hook (`brain_brief.py
-refresh`, async) fetches `get_brain_overview` and writes the cache `brief`
-reads, throttled to once per 6 hours since the digest moves on the order of
-days, not turns.
+names the repo's default agent brain before the first prompt and renders
+three checkpoints under one budget, keyed on identifiers, never on similarity:
+
+- **Map** — what the brain holds: the top of the compiled overview's Index
+  (counts and the drill commands), plus a short clip of its prose.
+- **Apply** — lessons and procedures whose triggers intersect the files this
+  branch touches (`git diff --name-only origin/<default>` plus the last 20
+  commits' paths), from `recall_directives(entities=…)`. At most five.
+- **Recall & Consult** — the episodes and artifacts that *name* the same
+  identifiers (paths, `PR #N`, `ENG-N`); a search hit survives only when it
+  contains one of them as an exact token. At most five.
+
+`brief` is stdlib-only and makes no network call: the map comes from the
+overview cache, apply/recall from a pointer cache, and it spawns a detached
+`brain_brief.py pointers` child to refresh that cache, which the first
+prompt's hook then delivers. (A live call at `SessionStart` would put the
+map itself at the mercy of the host's 5 s hook timeout.) A `UserPromptSubmit`
+hook (`brain_brief.py prompt`) extracts identifiers from each prompt — file
+paths, symbols that exist in the repo, `PR #N` / `ENG-N`, quoted error strings
+— and fires one bounded recall on them, at most three pointers in 600
+characters; a prompt with no identifier costs nothing and prints nothing.
+There is deliberately no semantic search on prompt text.
+
+Everything rendered joins the session's served list (shared with
+`directive_recall`'s `already_fired`), so nothing is shown twice. The budget
+is `MEMHUB_BRIEF_TOKEN_BUDGET` (default 2,500 tokens, chars/4), split 2:1
+between the brief and the rulebook's session block; when the brief is cut it
+drops Recall pointers first, then Apply, never the map, and ends with
+`… trimmed to budget`. `MEMHUB_BRIEF_POINTERS=0` disables the background
+worker. The brief only tells the *user*, via `systemMessage`, when the
+resolved brain changes; a repo with no cached room stays silent. A companion
+`Stop` hook (`brain_brief.py refresh`, async) fetches `get_brain_overview`
+into the overview cache, throttled to once per 6 hours.
+
+### Rulebooks
+
+A team rule lives in a **rulebook** — a container with its own membership, not
+a brain and not a document. Whoever is a member of a rulebook has their coding
+agent bound by its active rules; a rulebook can bind an explicit list of people
+or every member of the org, and one person can be in several (their org's book
+plus their team's). Membership is managed in MemHub, not from here: the plugin
+reads it, and the only container it ever creates is one you say yes to.
+
+The `SessionStart` / `PreToolUse` / `PostToolUse` hooks
+(`scripts/rulebook_hook.py`) cache every book that binds you, per repo, and
+inject a matching rule as an advisory at the moment of the call. An edit rule
+(`event: edit`) sees a file however it was written: through the Edit/Write
+tools before the write, and through a Bash command — `cat > f <<EOF`, a
+`python - <<PY … write_text()`, `sed -i` — right after it, because the
+post-call hook reads what the command left changed on disk (git decides what
+is a candidate, the file's mtime decides what that call touched) and runs the
+same matcher on it. In auto mode the agent is told to write through Bash, so
+without this an edit rule would be silent exactly where it is needed. Two
+books can both fire on one call. When they do, the plugin does **not** pick a winner and The repo is
+the one the **call** works in — the edited file's checkout first, the session's
+directory second — so working from a folder that merely *contains* your
+checkouts still applies each one's own rules to the calls that touch it, and a
+rule scoped to a repo matches from any of its worktrees. A path is followed
+only while it stays inside the session's directory, so what the agent edits
+can never point the hook at a checkout you did not open. Session-start rules
+are the exception, since that event names no file: they resolve from the
+session's directory alone, and a session rooted *above* your checkouts still
+gets none.
+Two books can both fire on one call. When they do, the plugin does **not** pick a winner and
+hide the loser — both fire and both reach the local ledger — but the per-call
+advisory cap and the session-start note budget are spent **widest book first**,
+so an org-wide policy is never crowded out by a two-person book's note. Session
+start names the books in play when there is more than one; in-flight advisories
+stay as short as they were. The server takes no position on any of this: it
+puts each rule's book, scope and member count on the wire and the client
+decides.
+
+Authoring (`/memhub:create-rule`, `/memhub:rules-from-sessions`) resolves which
+book a rule lands in before drafting anything — one visible book is the answer,
+several is a question for you, none is an offer to create one that binds only
+you. The conflict check spans every book you can see, and flags a collision in
+a book you are *not* filing into: nothing you file can supersede that rule, and
+both will fire, so it goes to you as a decision.
 
 ## Skills
 
-Eleven skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Thirteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
@@ -253,19 +334,29 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   A `viewer` grant is read-only, so those teammates propose spec changes
   through the normal repo/PR flow; a `contributor` can revise directly.
 - `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
-  failure, correction, or procedure and checks for conflicts before saving it.
+  failure, correction, or procedure, resolves which rulebook it lands in (and
+  offers to create one when you have none), and checks it for conflicts across
+  every rulebook you can see before saving it.
 - `/memhub:rules-from-sessions` — one run over your CLAUDE.md **and** your
   past coding sessions (Claude Code, Codex, Cursor): every candidate rule is
   replayed through the real hook, and each proposal says why it exists (the
   CLAUDE.md sentence, or the sessions and your own words), what it cost you,
   and what changes with it on. Hook rules first — at the command, on the
   error, when a name comes up — session-start notes last. Files survivors as
-  `proposed`; never activates anything.
+  `proposed` into the rulebook you pick; never activates anything.
 - `/memhub:pr-babysit [pr-number-or-url]` — usually **auto-armed**, not typed:
   a hook offers to start this as a self-paced loop right after `gh pr
   create` (see PR babysitting below). One pass polls the PR's review bots and
   CI, fixes real findings, and — once clean — saves the fixing process to the
   repo's agent brain.
+- `/memhub:link-pr [pr] [--session <id>] [--unlink]` — links a coding session
+  to a pull request in MemHub, so the PR's session context is published from a
+  confirmed fact rather than a branch-name guess. This is also how a PR opened
+  by something the hook cannot see — a script, a CI helper — gets linked.
+- `/memhub:find-contributing-sessions [pr]` — scans this machine's session
+  history (Claude Code, Codex, Cursor) for the sessions that wrote a PR's code,
+  ranks the candidates by the evidence that matched, and links the ones you
+  approve. It never links anything without an explicit yes.
 
 ## PR babysitting
 
@@ -294,6 +385,73 @@ rather than competes) into the repo's room, then ends the loop. It never
 imports the session transcript: per-turn capture already ships that into the
 same room continuously, so babysit only adds the judgment call a transcript
 doesn't record — which findings were real, which were rejected and why.
+
+### Session ↔ PR linking
+
+After a call that **addresses GitHub** — `gh pr …`, a `curl` / `gh api` request
+to the REST API, or a GitHub MCP tool — whose output names exactly one pull
+request, a `PostToolUse` hook (`pr_link_trigger.py`) asks the backend one
+question and injects one instruction. There are three answers:
+
+- the org has no GitHub integration connected → the agent mentions once, and
+  only if it isn't intrusive, that connecting GitHub is what links sessions to
+  the code that shipped;
+- **this call ran `gh pr create`** (or the GitHub MCP create tool), and the
+  command is one where the returned URL provably came from that create → the
+  session links itself, unconditionally. Opening a PR is itself work the
+  session did, so no authorship question is asked; a PR has many sessions and
+  linking one displaces none;
+- **any other GitHub call naming one PR** → the agent decides. It links only if
+  it wrote that code in this session, and otherwise offers
+  `/memhub:find-contributing-sessions`.
+
+Unconditional self-linking is deliberately the **narrow** lane. A hand-rolled
+`curl -X POST …/pulls` is not treated as a creation: recognising a write meant
+parsing the option grammar of four HTTP clients to find a method and a body,
+and getting that wrong makes an authorship claim nobody can withdraw. Measured
+across 15,134 tool calls from 150 real sessions, that layer decided nothing —
+every genuine creation was a `gh pr create`. So a `curl` POST lands in the
+judged lane instead, which is the safe direction.
+
+The same conservatism applies to the shell around the create. A pipeline hides
+a failed `gh pr create` — whose stderr carries the *existing* PR's URL — so
+`gh pr create … 2>&1 | tail -5` declines to the judged lane rather than
+claiming authorship. **Heredoc bodies are removed before any of this is
+decided**: `--body-file - <<'EOF'` is how essentially every real PR body is
+written, and reading that prose as command text used to break both directions
+at once — a body's apostrophes hid the real `gh pr create` from the parser,
+while a `python3 - <<'PY'` script that merely *mentioned* the words looked like
+one.
+
+So **linking is never automatic for work this session did not do** — the agent
+judges, and offers the finder when the answer is no. The hook is
+stateless and holds no per-PR file: a session↔PR relationship is many-to-many,
+and a dedup file keyed on the PR is exactly what would stop a genuinely new
+session from linking itself later. Every path degrades to silence — a
+disconnected org, an unreachable server, no credential, a listing command whose
+output names several PRs, or a command that merely *mentions* a PR without
+addressing GitHub.
+
+**A PR opened by some other means — a script, a Makefile target, a CI helper,
+`hub pull-request` — is not detected, deliberately**: recognising arbitrary
+programs that happen to open a PR is the automatic-attribution problem this
+design walked away from. `/memhub:link-pr` is one command away.
+
+Per-host coverage differs, because the hosts differ:
+
+| Host | `gh pr create` | GitHub MCP tool | Fallback |
+|---|---|---|---|
+| Claude Code | detected | detected | — |
+| Codex (plugin hooks) | detected | detected | — |
+| Codex (compatibility bridge) | detected | not detected | `/memhub:link-pr` |
+| Cursor | not detected | not detected | `/memhub:link-pr` |
+
+Cursor ships skills-only here: its `afterShellExecution` hook has no output
+schema at all — only `beforeShellExecution` can say anything to the agent, and
+that fires before the command has produced a PR URL. The Codex split is a
+trust one: the plugin-bundled hook manifest is re-fetched on upgrade and costs
+nothing to widen, while the compatibility bridge lives in the user's own
+`~/.codex/hooks.json` and widening it would require them to re-approve it.
 
 ## Artifact-sync reminder
 

@@ -79,7 +79,10 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 18
+    assert len(commands) == 19   # + UserPromptSubmit (brain_brief.py prompt),
+                                 # + PostToolUse (pr_link_trigger.py); SessionEnd
+                                 # carries capture AND the fire flush in ONE
+                                 # handler, because they must run in that order.
     assert all("claude_hook_guard.py" in command for _, command in commands)
     capture_events = [event for event, command in commands
                       if "claude_hook_guard.py\" capture " in command]
@@ -153,6 +156,58 @@ def test_exact_imported_stop_hook_never_runs_claude_flusher():
         assert not (Path(td) / ".config" / "memhub-plugin" /
                     "turnflush").exists()
     print("PASS test_exact_imported_stop_hook_never_runs_claude_flusher")
+
+
+def test_session_end_flushes_fires_after_capture_and_regardless_of_it():
+    """The fire flush must run STRICTLY after capture, in the same handler.
+
+    A rule that fires at SessionStart reaches the server long before the
+    conversation exists, so its row is stored with no session; only a later
+    capture can link it, and session end is the last chance a short session
+    gets. Claude Code runs every hook for an event in PARALLEL, so two separate
+    handlers raced — roughly one session in six ended with its SessionStart
+    fires permanently sessionless. One handler, two stages, in order.
+
+    Sequenced with `;`, never `&&`: a capture that fails must not swallow the
+    flush. Fires are watermarked in the ledger, so a flush that never runs only
+    defers them — but a flush that runs BEFORE capture links nothing.
+    """
+    if os.name == "nt":
+        print("SKIP test_session_end_flushes_fires_after_capture_and_regardless_of_it "
+              "(POSIX hook command)")
+        return
+    document = json.loads(
+        (PLUGIN / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
+    groups = document["hooks"]["SessionEnd"]
+    assert len(groups) == 1 and len(groups[0]["hooks"]) == 1
+    command = groups[0]["hooks"][0]["command"]
+
+    def order_for(capture_rc: int) -> list[str]:
+        with tempfile.TemporaryDirectory() as td:
+            scripts = Path(td) / "plugin" / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "claude_hook_guard.py").write_text("raise SystemExit(0)\n")
+            (scripts / "flush_session.py").write_text(
+                "import os, sys\n"
+                "open(os.environ['ORDER'], 'a').write('capture\\n')\n"
+                f"raise SystemExit({capture_rc})\n")
+            (scripts / "rulebook_hook.py").write_text(
+                "import os\n"
+                "open(os.environ['ORDER'], 'a').write('fire-flush\\n')\n")
+            order = Path(td) / "order"
+            order.touch()
+            result = subprocess.run(
+                ["bash", "-c", command], input=json.dumps(FIXTURE), text=True,
+                capture_output=True, timeout=30,
+                env={**os.environ, "CLAUDE_PLUGIN_ROOT": str(scripts.parent),
+                     "ORDER": str(order)})
+            assert result.returncode == 0, result.stderr
+            return order.read_text().split()
+
+    assert order_for(0) == ["capture", "fire-flush"]
+    # …and a capture that fails still leaves the fires flushed.
+    assert order_for(1) == ["capture", "fire-flush"]
+    print("PASS test_session_end_flushes_fires_after_capture_and_regardless_of_it")
 
 
 if __name__ == "__main__":

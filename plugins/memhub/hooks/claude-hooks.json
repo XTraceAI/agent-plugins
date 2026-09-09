@@ -24,7 +24,7 @@
         ]
       },
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write|NotebookEdit)$",
+        "matcher": "^(Bash|Edit|MultiEdit|Write|NotebookEdit|Read)$",
         "hooks": [
           {
             "type": "command",
@@ -82,7 +82,7 @@
         ]
       },
       {
-        "matcher": "^(Edit|MultiEdit|Write)$",
+        "matcher": "^(Edit|MultiEdit|Write|Bash)$",
         "hooks": [
           {
             "type": "command",
@@ -92,13 +92,24 @@
         ]
       },
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write|NotebookEdit)$",
+        "matcher": "^(Bash|Edit|MultiEdit|Write|NotebookEdit|Read)$",
         "hooks": [
           {
             "type": "command",
             "timeout": 5,
             "statusMessage": "MemHub: checking team rules",
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" post; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 15,
+            "statusMessage": "MemHub: checking PR link",
+            "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
           }
         ]
       }
@@ -125,6 +136,18 @@
             "timeout": 5,
             "statusMessage": "MemHub: loading team rules",
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" session; fi"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "statusMessage": "MemHub: checking memory for identifiers in this prompt",
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" prompt; fi"
           }
         ]
       }
@@ -173,19 +196,9 @@
           {
             "type": "command",
             "async": true,
-            "timeout": 300,
+            "timeout": 360,
             "statusMessage": "MemHub: saving session memory",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" capture SessionEnd; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "async": true,
-            "timeout": 60,
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionEnd; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" flush final; fi"
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ]; then if printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" capture SessionEnd; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush_session.py\"; fi; if printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionEnd; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" flush final; fi; fi"
           }
         ]
       }

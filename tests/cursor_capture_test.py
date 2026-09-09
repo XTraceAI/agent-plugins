@@ -117,8 +117,8 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         (ROOT / "plugins" / "memhub" / "hooks" / "cursor-hooks.json")
         .read_text(encoding="utf-8"))
     assert set(document["hooks"]) == {
-        "beforeShellExecution", "afterFileEdit", "afterAgentResponse",
-        "stop", "beforeSubmitPrompt", "sessionEnd"
+        "beforeShellExecution", "afterShellExecution", "afterFileEdit",
+        "afterAgentResponse", "stop", "beforeSubmitPrompt", "sessionEnd"
     }
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
@@ -215,12 +215,135 @@ def test_real_platform_is_unconditional():
     print("PASS test_real_platform_is_unconditional")
 
 
+def test_pr_url_is_queued_before_send_and_cleared_on_ack():
+    url = "https://github.com/xtraceai/agent-plugins/pull/321"
+    state: dict = {}
+    seen: list[dict] = []
+    originals = {
+        "redact_records": cursor_flush.redact_records,
+        "resolve_bearer": cursor_flush.resolve_bearer,
+        "session": cursor_flush.mcp_http.Session,
+        "read_state": cursor_flush._read_state,
+        "save_state": cursor_flush._save_state,
+        "log": cursor_flush._log,
+    }
+
+    class Session:
+        def __init__(self, _url, _bearer, **_kwargs):
+            pass
+
+        async def call_tool(self, _name, arguments):
+            seen.append(arguments)
+            assert state["pending_pr_urls"] == [url]
+            if len(seen) == 3:
+                structured = {
+                    "conversation_id": "cursor-session-1",
+                    "ack_through": "u1",
+                }
+            else:
+                received = [url] if len(seen) == 2 else []
+                structured = {
+                    "conversation_id": "cursor-session-1",
+                    "ack_through": "u1",
+                    "provenance_received": {"github_pr_urls": received},
+                }
+            return types.SimpleNamespace(
+                structuredContent=structured,
+                content=[],
+                isError=False,
+            )
+
+    def save_state(_sid, **fields):
+        state.update(fields)
+
+    records = [
+        {"type": "assistant", "uuid": "u0", "message": {
+            "role": "assistant", "content": [{
+                "type": "tool_use", "id": "create", "name": "exec",
+                "input": {"command": "gh pr create --fill"},
+            }]}},
+        {"type": "user", "uuid": "u1", "message": {
+            "role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "create",
+                "content": url,
+            }]}},
+    ]
+    try:
+        cursor_flush.redact_records = lambda value: value
+        cursor_flush.resolve_bearer = lambda: (
+            "https://example.test/mcp", "token")
+        cursor_flush.mcp_http.Session = Session
+        cursor_flush._read_state = lambda _sid: dict(state)
+        cursor_flush._save_state = save_state
+        cursor_flush._log = lambda _message: None
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=records, meta={"cwd": None, "title": None},
+        ))
+        assert state["pending_pr_urls"] == [url]
+        assert "transcript_revision" not in state
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=records, meta={"cwd": None, "title": None},
+        ))
+        confirmed_state = dict(state)
+        state.clear()
+        asyncio.run(cursor_flush._flush(
+            "session-1", Path("/tmp/transcript.jsonl"), set(),
+            source_kind="transcript", source_revision="rev-1",
+            records=records, meta={"cwd": None, "title": None},
+        ))
+        old_server_state = dict(state)
+    finally:
+        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.resolve_bearer = originals["resolve_bearer"]
+        cursor_flush.mcp_http.Session = originals["session"]
+        cursor_flush._read_state = originals["read_state"]
+        cursor_flush._save_state = originals["save_state"]
+        cursor_flush._log = originals["log"]
+
+    assert len(seen) == 3
+    assert all(item["provenance"] == {"github_pr_urls": [url]}
+               for item in seen)
+    assert confirmed_state["transcript_revision"] == "rev-1"
+    assert confirmed_state["pending_pr_urls"] == []
+    assert confirmed_state["accepted_pr_urls"] == [url]
+    assert old_server_state["transcript_revision"] == "rev-1"
+    assert old_server_state["pending_pr_urls"] == []
+    assert old_server_state["fail_streak"] == 0
+    assert not old_server_state["unsupported"]
+    print("PASS test_pr_url_is_queued_before_send_and_cleared_on_ack")
+
+
 def test_no_new_blobs_never_flushes():
     for event in ("afterAgentResponse", "stop", "afterFileEdit",
-                  "beforeShellExecution", "beforeSubmitPrompt", "sessionEnd"):
+                  "beforeShellExecution", "afterShellExecution",
+                  "beforeSubmitPrompt", "sessionEnd"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 SHIPPED, FRESH, NOW), event
     print("PASS test_no_new_blobs_never_flushes")
+
+
+def test_pending_after_shell_evidence_forces_unchanged_transcript_send():
+    payload = {
+        "command": "gh pr create --fill",
+        "output": "https://github.com/x/r/pull/22",
+    }
+    assert cursor_flush._event_can_flush("afterShellExecution", payload)
+    assert should_flush(
+        "afterShellExecution", payload, SHIPPED, FRESH, NOW,
+        provenance_pending=True,
+    )
+    assert not should_flush(
+        "afterShellExecution", payload, SHIPPED, FRESH, NOW,
+        provenance_pending=False,
+    )
+    assert not cursor_flush._event_can_flush("afterShellExecution", {
+        **payload, "output": "command failed",
+    })
+    print("PASS test_pending_after_shell_evidence_forces_unchanged_transcript_send")
 
 
 def test_milestone_gates_shell_events():
@@ -378,8 +501,8 @@ def test_import_verdicts_and_dormancy():
     # transient blip ships before the streak ever reaches dormancy.
     dormant = {"unsupported": True, "unsupported_at": 1_000.0}
     for event in ("afterFileEdit", "beforeShellExecution",
-                  "afterAgentResponse", "stop", "beforeSubmitPrompt",
-                  "sessionEnd"):
+                  "afterShellExecution", "afterAgentResponse", "stop",
+                  "beforeSubmitPrompt", "sessionEnd"):
         assert not should_flush(event, {"command": "git commit -m x"},
                                 dormant, {"new-blob"}, 1_000.0), event
     # ...but dormancy is NOT a one-way door: going dormant means never

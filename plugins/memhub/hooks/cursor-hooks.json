@@ -6,6 +6,11 @@
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeShellExecution"
       }
     ],
+    "afterShellExecution": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" afterShellExecution"
+      }
+    ],
     "afterFileEdit": [
       {
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" afterFileEdit"

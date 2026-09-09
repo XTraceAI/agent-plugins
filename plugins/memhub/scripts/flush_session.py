@@ -51,6 +51,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
+import pr_provenance  # noqa: E402
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
@@ -203,6 +204,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _log("empty transcript; nothing to flush")
         return
 
+    pr_urls, missing_pr_urls = pr_provenance.scan_tool_results(records)
+    if missing_pr_urls:
+        _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
+             "canonical GitHub PR URL")
+    provenance = pr_provenance.import_provenance(pr_urls)
+
     # Slash-command bookkeeping never leaves the machine. Applied HERE as well
     # as in the other two upload paths deliberately: the filter's own contract
     # is that a session cannot come out clean or dirty depending on which path
@@ -336,6 +343,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "conversation_id": session_id,
             "source_platform": "claude",
         }
+        if provenance:
+            arguments["provenance"] = provenance
         # Bound this call by the time LEFT, not a fixed fraction of the
         # budget. `_stop_before_slice` only checks BEFORE a slice, so a
         # slice starting just under the deadline could otherwise run a full

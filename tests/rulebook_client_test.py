@@ -11,12 +11,15 @@ refused). What is asserted is the client contract from the spec (§4.1, §4.3,
   merge audit names each rule's source;
 * offline / 500 / slow keep the LAST book; no book at all → silent;
 * the session lane and the tool-call lanes never wait on the network — the
-  pre lane makes zero requests and its latency with the server down is bounded;
+  pre lane makes no request of its own (a book older than an hour is refreshed
+  by a detached child, at most once per ten minutes while the server is down)
+  and its latency with the server down is bounded;
 * flush POSTs the v2 rows minus ``excerpt``, advances a watermark only on a
   2xx, retries a failed batch with the SAME ``fire_id``, re-sends a converted
   fire as an update, logs ``rejected`` rows locally and never retries them,
   and honours the every-N / every-M throttle unless ``final``;
-* ``mode: gate`` from a cache older than 24 h degrades to advise, said once.
+* ``mode: gate`` is honoured from the cached book however old it is — there is
+  no freshness timer; a stale book refreshes itself instead.
 
 Run: python3 tests/rulebook_client_test.py  (stdlib only).
 """
@@ -188,6 +191,23 @@ def _anchor_lane_checks(check, run, ctx):
         rc, out = run("pre", dict(ev, session_id="an4"), env)
         check("anchor: slow judge → fail open within the hook budget", rc == 0 and out.strip() == "" and _t.time() - t0 < 4.5)
         fake.mode = "ok"
+
+        # The blip above is exactly the shape that used to warn at the NEXT
+        # session start: recall has no book of its own, so the crumb stood
+        # until an unrelated lane happened to succeed. It clears itself now.
+        crumb = os.path.join(td, "ledger", ".last_error")
+        check("anchor: the timed-out judge leaves a breadcrumb", os.path.exists(crumb))
+        rc, out = run("pre", dict(ev, session_id="an5"), env)
+        check("anchor: the next successful recall retracts its own breadcrumb",
+              not os.path.exists(crumb))
+        with open(crumb, "w", encoding="utf-8") as f:
+            json.dump({"at": "2026-01-01T00:00:00-07:00", "what": "fetch",
+                       "error": "unrelated"}, f)
+        rc, out = run("pre", dict(ev, session_id="an6"), env)
+        check("anchor: a successful recall does NOT clear another lane's failure",
+              os.path.exists(crumb))
+        os.unlink(crumb)
+
         rows = jl(os.path.join(td, "ledger", "fires.jsonl"))
         check("anchor: the kept rule is logged like any other fire",
               any(r["rule_id"] == "a-bus" and r["hook_phase"] == "pre" for r in rows))
@@ -425,7 +445,6 @@ def main():
         import rulebook_hook as H  # noqa: E402
         check("in-process hook is relocated to the temp dir (never the real ledger)", H.BASE == td)
         now = datetime.now(timezone.utc)
-        gate = {"mode": "gate"}
         rr = H.to_hook_rule({"rule_id": "x", "statement": "s", "matcher": {"event": "result", "command_rx": "pytest",
                              "result_rx": "FAIL", "warn_once_per": "turn"}})
         check("to_hook_rule: result event maps command_rx→cmd_rx, result_rx→rx, turn→call",
@@ -496,6 +515,17 @@ def main():
               H.scope_ok(scoped, "app", "/w/app/.git") and not H.scope_ok(scoped, "apple", "/w/apple/.git")
               and H.scope_ok(scoped, "wt", "/w/app/.git/worktrees/wt")
               and not H.scope_ok(scoped, "other", "/home/app/projects/other/.git"))
+        cased = H.to_hook_rule({"rule_id": "cs", "statement": "s",
+                                "scope_repos": ["MemHub-Backend"],
+                                "matcher": {"event": "bash", "command_rx": "x"}})
+        check("scope_ok: a repo name matches however either side spelled it",
+              H.scope_ok(cased, "MemHub-Backend", "/w/MemHub-Backend/.git")
+              and H.scope_ok(cased, "memhub-backend", "/w/memhub-backend/.git")
+              and H.scope_ok(cased, "MEMHUB-BACKEND", "/w/MEMHUB-BACKEND/.git")
+              # …and through a worktree, where the name comes from the main checkout
+              and H.scope_ok(cased, "wt", "/w/memhub-backend/.git/worktrees/wt"))
+        check("scope_ok: folding case does not start matching by substring",
+              not H.scope_ok(cased, "memhub-backend-fork", "/w/memhub-backend-fork/.git"))
         # per-batch watermark: batch 1 accepted, batch 2 fails → batch 1 is not re-sent
         H.FLUSH_BATCH = 2
         with open(ledger, "a", encoding="utf-8") as f:
@@ -517,21 +547,95 @@ def main():
         check("flush: per-batch watermark — an accepted batch is never re-sent after a later batch fails",
               after1 < after2 == os.path.getsize(ledger) and calls["n"] == 4, f"{after1} {after2} {calls}")
         H.FLUSH_BATCH = 200
-        check("effective_mode: fresh cache honours gate",
-              H.effective_mode(gate, (now - timedelta(hours=1)).isoformat(), now) == "gate")
-        check("effective_mode: >24h cache degrades gate to advise",
-              H.effective_mode(gate, (now - timedelta(hours=25)).isoformat(), now) == "advise")
-        check("effective_mode: advise/local rules are advise",
-              H.effective_mode({"mode": "advise"}, now.isoformat(), now) == "advise"
-              and H.effective_mode(gate, None, now) == "advise")
+        # ── gates have no freshness timer ────────────────────────────────
+        # The cached book is the book. A rule the server retired disappears at
+        # the next successful fetch; a stale gate costs one RULEBOOK_OVERRIDE,
+        # while a gate that stops enforcing because the server was unreachable
+        # for a day is the failure a gate exists to prevent.
+        def decision(o):
+            try:
+                return json.loads(o)["hookSpecificOutput"].get("permissionDecision")
+            except Exception:
+                return None
+        stale_at = (now - timedelta(days=30)).astimezone().isoformat(timespec="seconds")
         b = json.load(open(cache, encoding="utf-8"))
-        b["fetched_at"] = (now - timedelta(hours=30)).isoformat()
+        b["fetched_at"] = stale_at
         with open(cache, "w", encoding="utf-8") as f:
             json.dump(b, f)
         rc, out = run("pre", dict(base, session_id="g1", tool_input={"command": "gated-cmd"}), env)
-        check("stale book: gate rule fires as advisory and says so", "GATE TEXT" in ctx(out) and ">24 h" in ctx(out))
-        rc, out = run("pre", dict(base, session_id="g1", tool_input={"command": "server-only-cmd"}), env)
-        check("stale book: the degrade notice is said once per session", ">24 h" not in ctx(out))
+        check("gate: a month-old cached book still BLOCKS",
+              decision(out) == "deny" and "GATE TEXT" in ctx(out) and "24 h" not in ctx(out), out)
+        rc, out = run("pre", dict(base, session_id="g1", tool_input={"command": "gated-cmd"}), env)
+        check("gate: …and blocks again on the next call (never deduped)", decision(out) == "deny")
+
+        # ── pre lane refresh: a stale book fetches itself, detached, throttled ──
+        stamp = cache + ".refresh"
+        n0 = len(fake.requests)
+        run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), env)   # env: FETCH=0
+        check("refresh: MEMHUB_RULEBOOK_FETCH=0 → no fetch, no stamp",
+              len(fake.requests) == n0 and not os.path.exists(stamp))
+        on = dict(env, MEMHUB_RULEBOOK_FETCH="1")
+        fake.mode = "500"                      # server down: the cache must stay stale
+        t = time.monotonic()
+        run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), on)
+        t_pre = time.monotonic() - t
+        deadline = time.monotonic() + 8
+        while len(fake.requests) == n0 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.5)                        # room for a second child, if one were spawned
+        check("refresh: a stale book makes the pre lane spawn ONE detached GET",
+              len(fake.requests) == n0 + 1 and fake.requests[-1]["method"] == "GET"
+              and os.path.exists(stamp), str(len(fake.requests) - n0))
+        check("refresh: the lane itself did not wait on it", t_pre < 1.5, f"{t_pre:.2f}s")
+        check("refresh: a 500 leaves the book untouched and a breadcrumb behind",
+              json.load(open(cache, encoding="utf-8"))["fetched_at"] == stale_at
+              and "500" in json.load(open(os.path.join(td, "ledger", ".last_error"), encoding="utf-8"))["error"])
+        run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), on)
+        time.sleep(0.5)
+        check("refresh: still stale, but the stamp throttles — no second probe inside the retry window",
+              len(fake.requests) == n0 + 1)
+        with open(stamp, "w", encoding="utf-8") as f:
+            json.dump({"at": (now - timedelta(minutes=20)).astimezone().isoformat(timespec="seconds")}, f)
+        fake.mode = "ok"
+        run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), on)
+        deadline = time.monotonic() + 8
+        while len(fake.requests) == n0 + 1 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        deadline = time.monotonic() + 8
+        while json.load(open(cache, encoding="utf-8"))["fetched_at"] == stale_at and time.monotonic() < deadline:
+            time.sleep(0.1)
+        check("refresh: past the retry window the probe repeats and a 200 rewrites fetched_at",
+              len(fake.requests) == n0 + 2 and json.load(open(cache, encoding="utf-8"))["fetched_at"] > stale_at)
+        n1 = len(fake.requests)
+        run("pre", dict(base, session_id="g1", tool_input={"command": "ls"}), on)
+        time.sleep(0.5)
+        check("refresh: a fresh book spawns nothing", len(fake.requests) == n1)
+
+        # ── the digest shows the server's book, not the last session's ──────
+        # Rendering the digest from the cache BEFORE fetching made SessionStart
+        # serve the PREVIOUS session's rules: a rule activated or paused on the
+        # server took two session starts to appear or to go away.
+        fake.etag = '"v-fresh"'
+        fake.rules = fake.rules + [
+            {"rule_id": "s-new", "title": "fresh posture", "statement": "FRESHLY ACTIVATED",
+             "delivery": "session_context", "status": "active", "mode": "advise",
+             "version": 1, "scope_repos": []}]
+        stale_book = json.load(open(cache, encoding="utf-8"))
+        stale_book["fetched_at"] = (now - timedelta(hours=2)).astimezone().isoformat(timespec="seconds")
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(stale_book, f)
+        rc, out = run("session", {"cwd": repo, "session_id": "digest1"}, on)
+        check("session: a stale book is refetched BEFORE the digest renders",
+              "FRESHLY ACTIVATED" in ctx(out), ctx(out))
+        n2 = len(fake.requests)
+        rc, out = run("session", {"cwd": repo, "session_id": "digest2"}, on)
+        deadline = time.monotonic() + 8
+        while len(fake.requests) == n2 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        time.sleep(0.5)                        # room for a second child, if one were spawned
+        check("session: …and a fresh book renders from cache, refreshing detached",
+              "FRESHLY ACTIVATED" in ctx(out) and len(fake.requests) == n2 + 1,
+              f"{len(fake.requests) - n2} request(s)")
         rc, out = run("pre", dict(base, session_id="g1", tool_input={"command": "local-cmd"}),
                       dict(env, MEMHUB_TOKEN=""))
         check("no credential: tool lanes unaffected", rc == 0 and "LOCAL TEXT" in ctx(out))

@@ -39,10 +39,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
+import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
-from redact import redact_records  # noqa: E402
+from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
@@ -325,8 +326,8 @@ def _command_text(payload: dict) -> str:
 
 
 def should_flush(event: str, payload: dict, state: dict, size: int) -> bool:
-    """Pure gate. Growth is a precondition for every event; Stop is the turn
-    boundary and always ships growth; PostToolUse ships only milestones."""
+    """Pure gate. Growth or pending PR telemetry is required; Stop is the turn
+    boundary and PostToolUse ships only milestones."""
     watermark = state.get("rollout_size") or 0
     if size < watermark:
         # SHRINK: the rollout was truncated, rotated, or a smaller file now
@@ -345,7 +346,7 @@ def should_flush(event: str, payload: dict, state: dict, size: int) -> bool:
     if (state.get("unsupported") and
             time.time() - (state.get("unsupported_at") or 0) < DORMANT_RETRY_S):
         return False
-    if size <= watermark:
+    if size <= watermark and not state.get("pending_pr_urls"):
         return False
     if event == "Stop":
         return True
@@ -441,6 +442,19 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
     records, meta = codex_reader.to_canonical(rollout)
+    state = _read_state(sid)
+    pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
+        pr_provenance.queued_urls(state, records)
+    )
+    if missing_pr_urls:
+        _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
+             "canonical GitHub PR URL")
+    if pending_pr_urls or accepted_pr_urls:
+        _save_state(
+            sid,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
     sendable = redact_records(elide_oversized_tool_results(records))
     if not sendable:
         # Nothing to send. Empty is normal for a rollout with no user turns
@@ -519,12 +533,23 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             arguments["org_id"] = room["org_id"]
     if namespace:
         arguments["namespace"] = namespace
+    provenance = pr_provenance.import_provenance(pending_pr_urls)
+    if provenance:
+        arguments["provenance"] = provenance
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         # Bound a semi-trusted session title (store content, like cwd): a
         # non-str from a corrupt meta is dropped rather than sent as-is, and a
         # runaway length is capped so it can't bloat every re-send.
-        arguments["title"] = title.strip()[:200]
+        #
+        # Redacted HERE because the title is derived from RAW records -- the
+        # `redact_records` above covers only `sendable`, so a session whose
+        # first prompt is `export MEMHUB_TOKEN=mhk_...` would otherwise ship
+        # its key as the conversation's NAME, the most visible field there is.
+        # Redact BEFORE the cap. Capping first can chop a straddling key
+        # below `_SECRET`'s {16,} floor, and the surviving fragment then
+        # matches nothing and ships in the clear. Verified both ways.
+        arguments["title"] = redact_text(title.strip())[:200]
 
     try:
         res = await session.call_tool("import_conversation",
@@ -554,10 +579,27 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _note_failure(sid, "unconfirmed_import")
         return
 
+    ack = mcp_http.ack_of(res, f"codex-{sid}")
+    reconciled = pr_provenance.acknowledge_confirmed_import(
+        pending_pr_urls,
+        accepted_pr_urls,
+        ack,
+    )
+    pending_pr_urls, accepted_pr_urls = reconciled
+    if pending_pr_urls:
+        # The transcript committed, but its optional URL write did not. Hold
+        # the byte watermark so the next Stop can retry the same deduplicated
+        # transcript with the still-pending URL.
+        _save_state(sid, pending_pr_urls=pending_pr_urls,
+                    accepted_pr_urls=accepted_pr_urls)
+        _note_failure(sid, "unconfirmed_provenance")
+        return
     _save_state(sid, rollout_size=size, last_ok_at=time.time(),
                 last_error=None, last_error_at=0,
                 # The re-probe worked: this server confirms after all.
                 unsupported=False, unsupported_at=0,
+                pending_pr_urls=pending_pr_urls,
+                accepted_pr_urls=accepted_pr_urls,
                 fail_streak=0)
     _log(f"flushed {len(sendable)} records → codex-{sid}"
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))

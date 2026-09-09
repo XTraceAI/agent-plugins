@@ -56,8 +56,15 @@ import datetime
 import json
 import re
 import sqlite3
+import sys
 import uuid as _uuid
 from pathlib import Path
+
+# See the same note in ``readers/codex.py`` — shared title rules, stdlib only.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from session_title import normalize_title  # noqa: E402
 
 HOST = "cursor"
 
@@ -162,6 +169,16 @@ def _session_dirs() -> list[Path]:
 
 def _transcript_paths() -> list[Path]:
     return list(_PROJECTS.glob("*/agent-transcripts/*/*.jsonl"))
+
+
+def session_cwd(path) -> str | None:
+    """The directory this session is running in, from the session dir's
+    ``meta.json`` — the same key ``list_sessions`` already surfaces. A
+    transcript-only session (no ``store.db``) has no meta.json and no cwd."""
+    p = Path(path)
+    meta = _read_meta_json(p if p.is_dir() else p.parent) or {}
+    cwd = meta.get("cwd")
+    return cwd if isinstance(cwd, str) and cwd else None
 
 
 def list_sessions(limit: int = 20) -> list[dict]:
@@ -434,7 +451,11 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
             if ask:
                 out.append(user(ask))
                 if title is None:
-                    title = ask.strip().splitlines()[0][:150]
+                    # Cursor exposes no host-generated name anywhere in its
+                    # artifacts, so the first ask is all there is — but it gets
+                    # the same shaping as every other derived title instead of
+                    # a ragged mid-word cut.
+                    title = normalize_title(ask)
             continue
 
         if role == "assistant":

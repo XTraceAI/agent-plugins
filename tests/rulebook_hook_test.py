@@ -24,9 +24,11 @@ Run: python3 rulebook_hook_test.py  (stdlib only).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -50,6 +52,133 @@ def run(mode: str, payload: dict, env_extra: dict) -> tuple[int, str]:
     return p.returncode, p.stdout
 
 
+def portability_check() -> None:
+    """The hook must import on native Windows, where ``fcntl`` is absent."""
+    with open(HOOK, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".", 1)[0])
+    check(
+        "portability: rulebook hook uses the shared lock shim, never fcntl directly",
+        "fcntl" not in imports,
+        str(sorted(imports)),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "portable_lock.py"), "w", encoding="utf-8") as f:
+            f.write("raise RuntimeError('loaded untrusted cwd module')\n")
+        probe = (
+            "import importlib.util; "
+            f"spec = importlib.util.spec_from_file_location('rulebook_probe', {HOOK!r}); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module); "
+            "print(module.portable_lock.__file__)"
+        )
+        imported = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=td,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        check(
+            "portability: embedded import pins the packaged portable_lock",
+            imported.returncode == 0
+            and os.path.realpath(imported.stdout.strip())
+            == os.path.realpath(os.path.join(os.path.dirname(HOOK), "portable_lock.py")),
+            imported.stderr or imported.stdout,
+        )
+
+        incomplete = os.path.join(td, "incomplete")
+        os.mkdir(incomplete)
+        incomplete_hook = os.path.join(incomplete, "rulebook_hook.py")
+        shutil.copy2(HOOK, incomplete_hook)
+        incomplete_repo = os.path.join(td, "incomplete-repo")
+        os.makedirs(os.path.join(incomplete_repo, ".git"))
+        with open(
+            os.path.join(incomplete_repo, ".git", "HEAD"), "w", encoding="utf-8"
+        ) as f:
+            f.write("ref: refs/heads/main\n")
+        incomplete_base = os.path.join(td, "incomplete-base")
+        seed_book(
+            incomplete_base,
+            "incomplete-repo",
+            [
+                {
+                    "id": "missing-shim-gate",
+                    "on": "bash",
+                    "rx": r"git\s+push",
+                    "mode": "gate",
+                    "fire_scope": "call",
+                    "repo_scope": "any",
+                    "status": "active",
+                    "text": "Do not push yet",
+                    "why": "partial installs must not disable matcher gates",
+                }
+            ],
+        )
+        missing_shim = subprocess.run(
+            [sys.executable, incomplete_hook, "pre"],
+            input=json.dumps(
+                {
+                    "cwd": incomplete_repo,
+                    "session_id": "missing-shim",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git push origin main"},
+                }
+            ),
+            cwd=td,
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ,
+                MEMHUB_RULEBOOK_BASE=incomplete_base,
+                MEMHUB_RULEBOOK_FETCH="0",
+            ),
+            timeout=30,
+        )
+        try:
+            missing_output = json.loads(missing_shim.stdout)
+        except Exception:
+            missing_output = {}
+        check(
+            "portability: a missing lock shim preserves matcher gates",
+            missing_shim.returncode == 0
+            and missing_shim.stderr == ""
+            and missing_output.get("hookSpecificOutput", {}).get(
+                "permissionDecision"
+            )
+            == "deny",
+            missing_shim.stderr or missing_shim.stdout,
+        )
+        check(
+            "portability: a missing lock shim does not create undrainable telemetry",
+            not os.path.exists(
+                os.path.join(incomplete_base, "ledger", "fires.jsonl")
+            ),
+        )
+        missing_flush = subprocess.run(
+            [sys.executable, incomplete_hook, "flush"],
+            input="",
+            cwd=td,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, MEMHUB_RULEBOOK_BASE=incomplete_base),
+            timeout=30,
+        )
+        check(
+            "portability: missing lock shim skips the lock-dependent flush",
+            missing_flush.returncode == 0
+            and missing_flush.stdout == ""
+            and missing_flush.stderr == "",
+            missing_flush.stderr or missing_flush.stdout,
+        )
+
+
 def seed_book(base, repo_name, rules):
     """Write a cached server book for `repo_name` under `base` (what the fetch
     lane would have cached). Rows in the pilot shape (an `on` key) pass
@@ -71,7 +200,788 @@ def ctx(out: str) -> str:
     return json.loads(out)["hookSpecificOutput"]["additionalContext"]
 
 
+def _row(rid, matcher=None, **extra):
+    """A server-shape (`?view=hook`) row — the shape a `given` block and path
+    scope arrive in; pilot-shape rows (an `on` key) never carry either."""
+    row = {"rule_id": rid, "title": rid, "statement": f"{rid} text", "delivery": "agent_hook",
+           "mode": "advise", "version": 1, "status": "active", "scope_repos": []}
+    if matcher is not None:
+        row["matcher"] = matcher
+    row.update(extra)
+    return row
+
+
+def _git(cwd, *args):
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@x", HOME=cwd, GIT_CONFIG_NOSYSTEM="1")
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env, timeout=30)
+
+
+def branch_name_checks() -> None:
+    """A branch name is whatever follows `refs/heads/`, slashes included.
+    `given.repo.branch_rx` decides whether a rule fires, so truncating
+    `feat/x` to `x` silently broke every rule keyed on a branch prefix."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+    with tempfile.TemporaryDirectory() as td:
+        def head(text):
+            p = os.path.join(td, "HEAD")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            return H._branch(p)
+        check("branch: a slashed name survives whole",
+              head("ref: refs/heads/feat/x\n") == "feat/x", head("ref: refs/heads/feat/x\n"))
+        check("branch: a deep name survives whole",
+              head("ref: refs/heads/user/feat/deep-thing\n") == "user/feat/deep-thing")
+        check("branch: a plain name is unchanged", head("ref: refs/heads/main\n") == "main")
+        check("branch: a detached HEAD reads detached",
+              head("9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c\n") == "detached")
+        check("branch: an unreadable HEAD is empty, never an exception",
+              H._branch(os.path.join(td, "nope")) == "")
+        # the predicate that made this load-bearing
+        p = H.Probes("", "feat/x")
+        check("given.repo.branch_rx ^feat/ matches a slashed branch",
+              H.given_ok({"given": {"repo": {"branch_rx": r"^feat/"}}}, p))
+        check("given.repo.branch_rx ^(main|master)$ does not",
+              not H.given_ok({"given": {"repo": {"branch_rx": r"^(main|master)$"}}}, p))
+
+
+def repo_identity_checks() -> None:
+    """The repo a session is IN, not the directory it sits in.
+
+    A worktree directory is named after the branch. Claude Code Desktop makes
+    one per session under `<root>/.claude/worktrees/<name>`, so keying the
+    book on the basename fetched a separate (empty) book per branch and
+    matched `scope_repos: ["<repo>"]` — an exact string on the server — in
+    none of them."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import repo_identity as RI
+    import rulebook_hook as H
+
+    def worktree(root, wt, commondir="../.."):
+        """A linked worktree of `root` at `wt`, laid out as git lays one out."""
+        gitdir = os.path.join(root, ".git", "worktrees", os.path.basename(wt))
+        os.makedirs(gitdir, exist_ok=True)
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(gitdir, "commondir"), "w", encoding="utf-8") as f:
+            f.write(commondir + "\n")
+        with open(os.path.join(gitdir, "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/fm-fix/thing\n")
+        with open(os.path.join(wt, ".git"), "w", encoding="utf-8") as f:
+            f.write(f"gitdir: {gitdir}\n")
+        return gitdir
+
+    with tempfile.TemporaryDirectory() as td:
+        # A repo whose directory name is NOT its remote name.
+        odd = os.path.join(td, "checked-out-as-something-else")
+        os.makedirs(odd)
+        _git(odd, "init", "-q")
+        _git(odd, "remote", "add", "origin", "https://github.com/Org/canonical.git")
+        RI._CACHE.clear()
+        check("repo: the origin remote names the repo, not the directory",
+              RI.repo_name(odd) == "canonical", RI.repo_name(odd))
+
+        # No remote, no worktree: exactly what every caller did before.
+        plain = os.path.join(td, "plainrepo")
+        os.makedirs(os.path.join(plain, ".git"))
+        RI._CACHE.clear()
+        check("repo: a remote-less checkout still reads its own basename",
+              RI.repo_name(plain, os.path.join(plain, ".git")) == "plainrepo")
+
+        # The bug: a linked worktree, offline (no remote to ask).
+        root = os.path.join(td, "myrepo")
+        os.makedirs(os.path.join(root, ".git"))
+        wt = os.path.join(td, "fm-fix-some-branch")
+        gd = worktree(root, wt)
+        RI._CACHE.clear()
+        check("repo: a linked worktree resolves to the repo it belongs to",
+              RI.repo_name(wt, gd) == "myrepo", RI.repo_name(wt, gd))
+
+        # The Desktop shape: the worktree lives INSIDE the project root.
+        dwt = os.path.join(root, ".claude", "worktrees", "session-abc")
+        dgd = worktree(root, dwt, commondir=os.path.join(root, ".git"))
+        RI._CACHE.clear()
+        check("repo: a Desktop `.claude/worktrees/<session>` resolves to the project",
+              RI.repo_name(dwt, dgd) == "myrepo", RI.repo_name(dwt, dgd))
+
+        # A submodule's commondir is `<super>/.git/modules/<sub>`; its parent
+        # is the meaningless `modules`, so the walk must decline it.
+        sub = os.path.join(td, "sub")
+        subgit = os.path.join(root, ".git", "modules", "sub")
+        os.makedirs(subgit)
+        os.makedirs(sub)
+        with open(os.path.join(subgit, "commondir"), "w", encoding="utf-8") as f:
+            f.write(".\n")
+        check("repo: a submodule never resolves to `modules`",
+              RI._main_worktree_basename(subgit) == "",
+              RI._main_worktree_basename(subgit))
+
+        # `git worktree --relative-paths` writes a relative gitdir pointer.
+        rel = os.path.join(td, "relwt")
+        relgd = worktree(root, rel)
+        with open(os.path.join(rel, ".git"), "w", encoding="utf-8") as f:
+            f.write("gitdir: " + os.path.relpath(relgd, rel) + "\n")
+        RI._CACHE.clear()
+        check("repo: a relative gitdir pointer resolves too",
+              H.repo_info(rel)[0] == "myrepo", H.repo_info(rel)[0])
+
+        # Nothing readable at all: the old behaviour, never an exception.
+        RI._CACHE.clear()
+        check("repo: an unresolvable directory falls back to its basename",
+              RI.repo_name(os.path.join(td, "gone", "leaf")) == "leaf")
+
+        # repo_info keeps every other field PHYSICAL: path scope and the diff
+        # probes measure this checkout, and ordering state must not be shared
+        # with the sibling worktree on another branch.
+        name, wroot, wgitdir, branch = H.repo_info(wt)
+        check("repo_info: root stays the worktree, not the main repo",
+              wroot == wt and wgitdir == gd and branch == "fm-fix/thing",
+              f"{wroot} {wgitdir} {branch}")
+
+    # End to end: a repo-scoped rule reaches a session running in a worktree.
+    with tempfile.TemporaryDirectory() as td:
+        root = os.path.join(td, "scopedrepo")
+        os.makedirs(os.path.join(root, ".git"))
+        wt = os.path.join(td, "fm-feat-branch-dir")
+        worktree(root, wt)
+        seed_book(td, "scopedrepo", [
+            _row("repo-scoped", {"event": "bash", "command_rx": r"\bcurl\b"},
+                 scope_repos=["scopedrepo"]),
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        _, out = run("pre", {"session_id": "s-wt", "cwd": wt, "tool_name": "Bash",
+                             "tool_input": {"command": "curl https://example.com"}}, env)
+        check("repo scope: a worktree session gets the main repo's rules",
+              "repo-scoped text" in ctx(out), out[:200])
+
+
+def given_and_scope_checks() -> None:
+    """The two exemption keys the pre-0.42 hook parsed and never read, the
+    §3.1 path scope it dropped on load, and the `given` block: facts a matched
+    rule must also satisfy, answered by read-only git and the local transcript."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "scoperepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/test-branch\n")
+        seed_book(td, "scoperepo", [
+            _row("no-bare-ignore", {"event": "edit", "path_rx": r"\.py$",
+                                    "content_rx": r"type:\s*ignore",
+                                    "content_not_rx": r"type:\s*ignore\[[^\]]+\]\s*#"}),
+            _row("post-exempt", {"event": "output", "command_rx": r"\bpytest\b",
+                                 "command_not_rx": r"--collect-only", "content_rx": r"FAILED"}),
+            _row("src-only", {"event": "edit", "path_rx": r".*"},
+                 scope_paths=["src/*"], scope_exclude_paths=["src/vendor/*"]),
+            _row("bash-path-scoped", {"event": "bash", "command_rx": r"scoped-cmd"},
+                 scope_paths=["src/*"]),
+            _row("push-from-main", {"event": "bash", "command_rx": r"^git\s+push\b",
+                                    "given": {"repo": {"branch_rx": r"^test-branch$"}}}),
+            _row("push-from-other", {"event": "bash", "command_rx": r"^git\s+push\b",
+                                     "given": {"repo": {"branch_rx": r"^main$"}}}),
+            _row("commit-unasked", {"event": "bash", "command_rx": r"^git\s+commit\b",
+                                    "given": {"user": {"not_said_rx": r"\bcommit\b"}}}),
+            _row("bad-given", {"event": "bash", "command_rx": r"bad-given-cmd",
+                               "given": {"repo": {"nope": 1}}}),
+            _row("bad-given-kind", {"event": "bash", "command_rx": r"bad-given-cmd",
+                                    "given": {"repo": {"diff_lines_gt": "500"}}}),
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def pre(tool, inp, **kw):
+            n[0] += 1
+            payload = {"cwd": repo, "session_id": f"gs{n[0]}", "tool_name": tool, "tool_input": inp}
+            payload.update(kw)
+            return ctx(run("pre", payload, env)[1])
+
+        def post(inp, resp):
+            n[0] += 1
+            return ctx(run("post", {"cwd": repo, "session_id": f"gs{n[0]}", "tool_name": "Bash",
+                                    "tool_input": inp, "tool_response": resp}, env)[1])
+
+        # --- content_not_rx on an edit rule (was parsed, never read) ---------
+        c = pre("Edit", {"file_path": f"{repo}/src/a.py", "new_string": "x = f()  # type: ignore"})
+        check("edit: content_rx fires on the bare suppression", "[no-bare-ignore]" in c, c)
+        c = pre("Edit", {"file_path": f"{repo}/src/a.py",
+                         "new_string": "x = f()  # type: ignore[attr-defined]  # stub lacks it"})
+        check("edit: content_not_rx exempts the complied-with form", "[no-bare-ignore]" not in c, c)
+
+        # --- command_not_rx on an output rule (was mapped to cmd_not_rx, never read)
+        c = post({"command": "pytest -x tests/"}, {"stdout": "FAILED tests/a.py::t", "exit_code": 1})
+        check("output: fires on a failing run", "[post-exempt]" in c, c)
+        c = post({"command": "pytest --collect-only -q"}, {"stdout": "FAILED to import", "exit_code": 1})
+        check("output: command_not_rx exempts the named form", "[post-exempt]" not in c, c)
+
+        # --- scope_paths / scope_exclude_paths (were dropped on load) --------
+        c = pre("Edit", {"file_path": f"{repo}/src/a.py", "new_string": "x"})
+        check("scope_paths: an edit inside the scope fires", "[src-only]" in c, c)
+        c = pre("Edit", {"file_path": f"{repo}/docs/a.md", "new_string": "x"})
+        check("scope_paths: an edit outside the scope is silent", "[src-only]" not in c, c)
+        c = pre("Edit", {"file_path": f"{repo}/src/vendor/x.py", "new_string": "x"})
+        check("scope_exclude_paths: an excluded path is silent", "[src-only]" not in c, c)
+        c = pre("Bash", {"command": "scoped-cmd"})
+        check("scope_paths: a Bash call carries no path, so an include-scoped rule never fires there",
+              "[bash-path-scoped]" not in c, c)
+
+        # --- given.repo.branch_rx: from .git/HEAD, no git needed --------------
+        c = pre("Bash", {"command": "git push origin HEAD"})
+        check("given.repo.branch_rx: fires when the checked-out branch matches",
+              "[push-from-main]" in c, c)
+        check("given.repo.branch_rx: silent when it does not", "[push-from-other]" not in c, c)
+
+        # --- given.user: only what the person typed counts -------------------
+        def transcript(name, records):
+            p = os.path.join(td, name)
+            with open(p, "w", encoding="utf-8") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+            return p
+        prompt = lambda t: {"type": "user", "message": {"role": "user", "content": t}}
+        tool_result = {"type": "user", "toolUseResult": {"stdout": "x"},
+                       "message": {"role": "user", "content": [
+                           {"type": "tool_result", "content": "please commit this"}]}}
+        meta = {"type": "user", "isMeta": True, "message": {"role": "user", "content": [
+            {"type": "text", "text": "injected: commit now"}]}}
+        assistant = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "I will commit"}]}}
+        t_unasked = transcript("t1.jsonl", [prompt("fix the bug in foo"), tool_result, meta, assistant])
+        t_asked = transcript("t2.jsonl", [prompt("fix it"), tool_result,
+                                          prompt([{"type": "text", "text": "then commit it"}])])
+        c = pre("Bash", {"command": "git commit -m x"}, transcript_path=t_unasked)
+        check("given.user.not_said_rx: fires when no user turn said it — tool results, meta rows "
+              "and assistant turns do not count", "[commit-unasked]" in c, c)
+        c = pre("Bash", {"command": "git commit -m x"}, transcript_path=t_asked)
+        check("given.user.not_said_rx: silent once the user asked (text-block prompt)",
+              "[commit-unasked]" not in c, c)
+        c = pre("Bash", {"command": "git commit -m x"})
+        check("given.user: no transcript = no fact = silent", "[commit-unasked]" not in c, c)
+
+        # --- a bad given drops the RULE at load, never the hook --------------
+        c = pre("Bash", {"command": "bad-given-cmd"})
+        check("given: an unknown key drops the rule", "[bad-given]" not in c, c)
+        check("given: a wrong value kind drops the rule", "[bad-given-kind]" not in c, c)
+
+        # --- given.repo diff probes against a real repository ----------------
+        gr = os.path.join(td, "gitrepo")
+        os.makedirs(os.path.join(gr, "src"))
+        ok = _git(gr, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        if ok:
+            with open(os.path.join(gr, "src", "a.py"), "w", encoding="utf-8") as f:
+                f.write("a = 1\n")
+            ok = _git(gr, "add", ".").returncode == 0 and _git(gr, "commit", "-qm", "base").returncode == 0 \
+                and _git(gr, "checkout", "-qb", "feat").returncode == 0
+        if not ok:
+            check("given.repo diff probes (git unavailable here — skipped)", True)
+            return
+        seed_book(td, "gitrepo", [
+            _row("pr-needs-test", {"event": "bash", "command_rx": r"gh\s+pr\s+create",
+                                   "given": {"repo": {"diff_paths_rx": r"^src/",
+                                                      "diff_paths_none_rx": r"^tests/"}}}),
+            _row("pr-too-big", {"event": "bash", "command_rx": r"gh\s+pr\s+create",
+                                "given": {"repo": {"diff_lines_gt": 3}}}),
+            # its own trigger: three fires on one call would meet the per-call
+            # advisory cap (MAX_ADVISE) and the third would be cut, not silent
+            _row("pr-dirty", {"event": "bash", "command_rx": r"gh\s+pr\s+ready",
+                              "given": {"repo": {"dirty": True}}}),
+        ])
+        genv = dict(env)
+
+        def gpre(sid, command="gh pr create --fill"):
+            return ctx(run("pre", {"cwd": gr, "session_id": sid, "tool_name": "Bash",
+                                   "tool_input": {"command": command}}, genv)[1])
+
+        c = gpre("d0")
+        check("given.repo: nothing changed against main → diff_paths_rx unmet, silent",
+              "[pr-needs-test]" not in c and "[pr-too-big]" not in c, c)
+        check("given.repo.dirty: a fresh checkout is not dirty", "[pr-dirty]" not in gpre("d0r", "gh pr ready"))
+        with open(os.path.join(gr, "src", "a.py"), "a", encoding="utf-8") as f:
+            f.write("b = 2\nc = 3\nd = 4\ne = 5\n")          # uncommitted: the working tree counts
+        c = gpre("d1")
+        check("given.repo.diff_paths_rx: an uncommitted source change fires the needs-a-test rule",
+              "[pr-needs-test]" in c, c)
+        check("given.repo.diff_lines_gt: four added lines exceed 3", "[pr-too-big]" in c, c)
+        c = gpre("d1r", "gh pr ready")
+        check("given.repo.dirty: an uncommitted change is dirty", "[pr-dirty]" in c, c)
+        os.makedirs(os.path.join(gr, "tests"))
+        with open(os.path.join(gr, "tests", "test_a.py"), "w", encoding="utf-8") as f:
+            f.write("def test_a(): pass\n")                     # untracked: still a changed path
+        c = gpre("d2")
+        check("given.repo.diff_paths_none_rx: an UNTRACKED test file satisfies the rule",
+              "[pr-needs-test]" not in c, c)
+        _git(gr, "add", ".")
+        _git(gr, "commit", "-qm", "feat")
+        c = gpre("d3")
+        check("given.repo: committed changes still count against the merge-base",
+              "[pr-too-big]" in c and "[pr-needs-test]" not in c, c)
+        c = gpre("d3r", "gh pr ready")
+        check("given.repo.dirty: a clean tree is not dirty", "[pr-dirty]" not in c, c)
+
+
+def read_lane_checks() -> None:
+    """`event: read` (spec §5.1): the Read tool and the shell forms that pull a
+    file into context — cat/head/tail/less/more/sed on a path, not piped, not
+    redirected — measured per file by `given.file`, exempting subagents with
+    `given.agent.main`, and gateable in both lanes because the hook sees the
+    read BEFORE it happens. Modelled on Spotify's shunt hook, which anchors on
+    `^cat` and misses `cd x && cat f`; this one must not."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "readrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        os.makedirs(os.path.join(repo, "src"))
+        os.makedirs(os.path.join(repo, "docs"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/test-branch\n")
+        big = os.path.join(repo, "src", "big.py")
+        small = os.path.join(repo, "src", "small.py")
+        bigdoc = os.path.join(repo, "docs", "big.md")
+        env_file = os.path.join(repo, ".env")
+        for path, n in ((big, 500), (small, 20), (bigdoc, 500), (env_file, 3)):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("".join(f"line {i}\n" for i in range(n)))
+        seed_book(td, "readrepo", [
+            _row("big-read", {"event": "read", "path_not_rx": r"\.md$",
+                              "given": {"file": {"lines_gt": 350}, "agent": {"main": True}}},
+                 mode="gate"),
+            _row("no-env-read", {"event": "read", "path_rx": r"(^|/)\.env(\..*)?$"}),
+            _row("docs-read", {"event": "read", "given": {"file": {"lines_gt": 350}}},
+                 scope_paths=["docs/*"]),
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def pre(tool, inp, **kw):
+            n[0] += 1
+            payload = {"cwd": repo, "session_id": f"rd{n[0]}", "tool_name": tool, "tool_input": inp}
+            payload.update(kw)
+            rc, out = run("pre", payload, env)
+            j = json.loads(out) if out.strip() else {}
+            hso = j.get("hookSpecificOutput", {})
+            return (hso.get("permissionDecision") == "deny", hso.get("additionalContext", ""),
+                    j.get("systemMessage", ""), hso.get("permissionDecisionReason", ""))
+
+        # --- the Read tool ---------------------------------------------------
+        denied, c, user, why = pre("Read", {"file_path": big})
+        check("read: a whole-file Read over the threshold is DENIED", denied and "[big-read]" in c, c)
+        check("read: the deny names the ways past — narrower read, subagent, recorded override",
+              "offset" in why and "subagent" in why and "RULEBOOK_OVERRIDE" in why, why)
+        check("read: the user sees the block", "⛔" in user and "big-read" in user, user)
+        denied, c, _, _ = pre("Read", {"file_path": big, "offset": 1, "limit": 100})
+        check("read: a targeted Read (offset/limit) under the threshold is silent",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big, "offset": 400})
+        check("read: an offset that leaves fewer lines than the threshold is silent",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": small})
+        check("read: a small file is silent", not denied and c == "", c)
+        denied, c, _, _ = pre("Read", {"file_path": bigdoc})
+        check("read: path_not_rx exempts the file (a .md is not gated)",
+              not denied and "[big-read]" not in c, c)
+        check("read: scope_paths is honoured on a Read call (docs/* rule fires on docs/big.md)",
+              "[docs-read]" in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big})
+        check("read: scope_paths keeps the docs/* rule off src/big.py", "[docs-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": os.path.join(repo, "src", "missing.py")})
+        check("read: a file that does not exist is silent (no fact, no fire)",
+              not denied and c == "", c)
+
+        # --- advisory read rule: fires, does not block ------------------------
+        denied, c, _, _ = pre("Read", {"file_path": env_file})
+        check("read: an advisory path rule fires and lets the call through",
+              not denied and "[no-env-read]" in c, c)
+
+        # --- subagents: `given.agent.main` ------------------------------------
+        sub_tp = os.path.join(td, "sess", "subagents", "agent-abc123.jsonl")
+        os.makedirs(os.path.dirname(sub_tp), exist_ok=True)
+        open(sub_tp, "w").close()
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=sub_tp)
+        check("read: a subagent's whole-file read passes a `agent.main: true` gate",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": env_file}, transcript_path=sub_tp)
+        check("read: a rule without `agent.main` still fires inside a subagent",
+              "[no-env-read]" in c, c)
+        # The live payload shape (Claude Code 2026-09): `agent_id` / `agent_type`
+        # at the top level, transcript_path = the PARENT's file. Measured E2E:
+        # without this the subagent the rule points to was gated too.
+        main_tp = os.path.join(td, "sess.jsonl")
+        open(main_tp, "w").close()
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=main_tp,
+                              agent_id="a09250b37f45b254a", agent_type="Explore")
+        check("read: a subagent identified by the payload's agent_id (parent transcript_path) passes",
+              not denied and "[big-read]" not in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": big}, transcript_path=main_tp)
+        check("read: the same payload without agent_id is the main agent and is DENIED",
+              denied and "[big-read]" in c, c)
+        denied, c, _, _ = pre("Read", {"file_path": env_file}, transcript_path=main_tp,
+                              agent_id="a09250b37f45b254a", agent_type="Explore")
+        rows = [json.loads(l) for l in open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8")
+                if l.strip()]
+        check("read: a subagent's fire records the payload's agent_id on the ledger",
+              "[no-env-read]" in c and any(r.get("agent_id") == "a09250b37f45b254a"
+                                            and r["rule_id"] == "no-env-read" for r in rows), c)
+
+        # --- the same rule through Bash --------------------------------------
+        def bash(cmd, **kw):
+            return pre("Bash", {"command": cmd}, **kw)
+        rel = os.path.relpath(big, repo)
+        for cmd in (f"cat {big}", f"cat {rel}", f"cd {repo} && cat {rel}",
+                    f"wc -l {rel} && cat {rel}", f"head -400 {rel}", f"head -n 400 {rel}",
+                    f"sed -n '1,400p' {rel}", f"sed 's/a/b/' {rel}", f"less {rel}",
+                    f"FOO=1 cat {rel}", f"cat {small} {rel}", f"cat {rel} 2>/dev/null"):
+            denied, c, _, _ = bash(cmd)
+            check(f"read via bash: DENIED — {cmd.replace(repo, '<repo>')[:50]}",
+                  denied and "[big-read]" in c, c)
+        denied, c, _, _ = bash(f"cat {rel}")
+        check("read via bash: the fire names the file and its line count",
+              "big.py" in c and "500 lines" in c, c)
+        for cmd in (f"cat {rel} | head -50", f"cat {rel} | grep line", f"cat {rel} > /tmp/out.txt",
+                    f"cat {rel} >> /tmp/out.txt", f"head -20 {rel}", f"tail {rel}",
+                    f"sed -n '10,60p' {rel}", f"sed -n 5p {rel}", f"sed -i 's/a/b/' {rel}",
+                    f"grep -n line {rel}", f"cat {small}", f"cat docs/big.md",
+                    f"python3 -c \"print(open('{rel}').read())\"", f"head -c 400 {rel}",
+                    f"cat > {rel} <<'EOF'\nhello\nEOF", "cat missing.py",
+                    f"cat {rel} | wc -l && echo done"):
+            denied, c, _, _ = bash(cmd)
+            check(f"read via bash: silent — {cmd.replace(repo, '<repo>')[:50]}",
+                  not denied and "[big-read]" not in c, c)
+        # the measured shape: a relative path after a cd (the session cwd stays the
+        # trust boundary — a cd OUT of the session's repo is not followed, as for
+        # every other lane)
+        for cmd in ("cd src && cat big.py", f"cd {repo}/src && cat big.py", "cd src; cat ./big.py"):
+            denied, c, _, _ = bash(cmd)
+            check(f"read via bash: a relative path resolves against the cd — {cmd[:40]}",
+                  denied and "[big-read]" in c, c)
+        denied, c, _, _ = bash(f"cat {rel}", transcript_path=sub_tp)
+        check("read via bash: a subagent's cat passes the `agent.main` gate", not denied, c)
+        denied, c, _, _ = bash(f"cat {os.path.relpath(env_file, repo)} | head -1")
+        check("read via bash: a piped read is not a read into context, even for a path rule",
+              "[no-env-read]" not in c, c)
+        denied, c, _, _ = bash(f"cat {os.path.relpath(env_file, repo)}")
+        check("read via bash: a path rule fires on a bare cat of the path", "[no-env-read]" in c, c)
+
+        # --- the recorded override rides the Bash lane ------------------------
+        denied, c, user, _ = bash(f"RULEBOOK_OVERRIDE='need the whole spec in context' cat {rel}")
+        check("read via bash: RULEBOOK_OVERRIDE allows exactly that read",
+              not denied and "gate overridden" in c and "whole spec" in user, c + user)
+        ledger = os.path.join(td, "ledger", "fires.jsonl")
+        rows = [json.loads(l) for l in open(ledger, encoding="utf-8") if l.strip()]
+        gate_rows = [r for r in rows if r["rule_id"] == "big-read" and r["mode"] == "gate"]
+        check("read: every block and the override are gate rows in the ledger",
+              len(gate_rows) >= 14 and any(r["override_reason"] == "need the whole spec in context"
+                                           for r in gate_rows), str(len(gate_rows)))
+        check("read: a Read-tool fire records tool=Read, a shell one tool=Bash",
+              {r["tool"] for r in gate_rows} == {"Read", "Bash"}, str({r["tool"] for r in gate_rows}))
+        check("read: a shell gate's excerpt is the command that would have read the file",
+              any(r["tool"] == "Bash" and r["excerpt"].startswith("cat ") and "big.py" in r["excerpt"]
+                  for r in gate_rows), "")
+
+        # --- no read rule armed: the Read tool costs nothing ------------------
+        seed_book(td, "readrepo", [_row("only-bash", {"event": "bash", "command_rx": r"^git\s+push"})])
+        denied, c, _, _ = pre("Read", {"file_path": big})
+        check("read: with no read rule in the book a Read call is silent exit-0",
+              not denied and c == "", c)
+
+
+def bash_edit_checks() -> None:
+    """A Bash call that writes files is an edit. The post lane reads what the
+    command left on disk since the pre lane stamped it and feeds each file
+    through the edit matcher and the ordering engine as a Write — so a
+    `cat > f <<EOF`, a `python - <<PY … write_text()` and a `sed -i` reach
+    an `event: edit` rule, which until 0.43 only the Edit/Write tools did
+    (and in auto mode the model is told not to use them)."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "bashrepo")
+        os.makedirs(os.path.join(repo, "alembic", "versions"))
+        os.makedirs(os.path.join(repo, "src"))
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        with open(os.path.join(repo, "src", "old.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write(".venv/\n")
+        _git(repo, "add", "-A")
+        assert _git(repo, "commit", "-q", "-m", "base").returncode == 0
+        seed_book(td, "bashrepo", [
+            _row("new-table-retention", {"event": "edit", "path_rx": r"alembic/versions/[^/]*\.py$",
+                                         "content_rx": r"create_table\("}),
+            _row("no-bare-ignore", {"event": "edit", "path_rx": r"\.py$",
+                                    "content_rx": r"type:\s*ignore(?!\[)"}),
+            {"id": "tests-before-push", "on": "ordering", "repo_scope": "any",
+             "ordering": {"required_command_rx": r"pytest", "gated_command_rx": r"git\s+push",
+                          "armed_by_events": ["edit", "write"], "min_edits": 1,
+                          "display_name": "the suite"},
+             "text": "Run the suite before pushing", "why": "w"},
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def write_file(path, text, *, append=False):
+            target = path if os.path.isabs(path) else os.path.join(repo, path)
+            with open(target, "a" if append else "w", encoding="utf-8") as f:
+                f.write(text)
+
+        def replace_file(path, old, new):
+            target = path if os.path.isabs(path) else os.path.join(repo, path)
+            with open(target, encoding="utf-8") as f:
+                text = f.read()
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(text.replace(old, new))
+
+        def bash(command, *, session="b1", run_it=True, pre=True, resp=None, mutate=None):
+            """pre → apply the command's file effect → post, the way a session does.
+
+            The hook receives the real shell syntax under test. Applying its
+            expected file effect in Python keeps this fixture independent of
+            whether the test host's ``shell=True`` means sh or cmd.exe.
+            """
+            n[0] += 1
+            tid = f"tu{n[0]}"
+            ev = {"cwd": repo, "session_id": session, "tool_name": "Bash", "tool_use_id": tid,
+                  "tool_input": {"command": command}}
+            if pre:
+                run("pre", ev, env)
+            if run_it:
+                if mutate is not None:
+                    mutate()
+                    resp = resp or {"stdout": "", "stderr": "", "exit_code": 0}
+                else:
+                    r = subprocess.run(command, shell=True, cwd=repo, capture_output=True, text=True)
+                    resp = resp or {"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.returncode}
+            return ctx(run("post", dict(ev, tool_response=resp or {"stdout": "", "exit_code": 0}), env)[1])
+
+        mig = "alembic/versions/20260902_user_logins.py"
+        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('user_logins')\nEOF",
+                 mutate=lambda: write_file(mig, "def upgrade():\n    op.create_table('user_logins')\n"))
+        check("bash-edit: a heredoc-created migration reaches the edit rule",
+              "[new-table-retention]" in c, c)
+        check("bash-edit: the fire names the file the command wrote", mig in c, c)
+
+        c = bash("python3 - <<'PY'\nimport pathlib\np = pathlib.Path('src/old.py')\n"
+                 "p.write_text(p.read_text() + 'y = f()  # type: ignore\\n')\nPY",
+                 mutate=lambda: write_file("src/old.py", "y = f()  # type: ignore\n", append=True))
+        check("bash-edit: a python write_text() edit reaches the edit rule",
+              "[no-bare-ignore]" in c, c)
+
+        c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && rm -f src/old.py.bak", session="b2",
+                 mutate=lambda: replace_file("src/old.py", "ignore", "ignore[x]"))
+        check("bash-edit: sed -i is an edit too — and the complied-with form does not fire",
+              "[no-bare-ignore]" not in c and "[new-table-retention]" not in c, c)
+        c = bash("sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak", session="b2",
+                 mutate=lambda: replace_file("src/old.py", "ignore[x]", "ignore"))
+        check("bash-edit: sed -i that reintroduces the pattern fires", "[no-bare-ignore]" in c, c)
+        # git decides what is a candidate, so a write that leaves the file byte-identical
+        # to HEAD is not an edit — nothing changed, nothing to advise on
+        _git(repo, "commit", "-qam", "committed bare ignore")
+        c = bash("sed -i.bak 's/ignore/ignore[x]/' src/old.py && sed -i.bak 's/ignore\\[x\\]/ignore/' src/old.py && rm -f src/old.py.bak",
+                 session="b2b", mutate=lambda: (
+                     replace_file("src/old.py", "ignore", "ignore[x]"),
+                     replace_file("src/old.py", "ignore[x]", "ignore")))
+        check("bash-edit: a write that leaves the file identical to HEAD is not an edit", c.strip() == "", c)
+
+        # a modified file is read as its ADDED lines, a new file whole — what the
+        # Edit and Write tools hand the matcher respectively
+        with open(os.path.join(repo, "src", "big.py"), "w", encoding="utf-8") as f:
+            f.write("a = 1  # type: ignore\nb = 2\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "big has a pre-existing hit")
+        c = bash("printf 'c = 3\\n' >> src/big.py", session="b2c",
+                 mutate=lambda: write_file("src/big.py", "c = 3\n", append=True))
+        check("bash-edit: a modified file is read as its added lines — a pre-existing hit does not fire",
+              "[no-bare-ignore]" not in c, c)
+        c = bash("printf 'd = 4  # type: ignore\\n' >> src/big.py", session="b2c",
+                 mutate=lambda: write_file("src/big.py", "d = 4  # type: ignore\n", append=True))
+        check("bash-edit: an added line that hits does fire", "[no-bare-ignore]" in c, c)
+        c = bash("printf 'e = 5  # type: ignore\\n' > src/fresh.py", session="b2d",
+                 mutate=lambda: write_file("src/fresh.py", "e = 5  # type: ignore\n"))
+        check("bash-edit: a new file is read whole", "[no-bare-ignore]" in c, c)
+
+        c = bash("echo hello && ls src", session="b3", mutate=lambda: None)
+        check("bash-edit: a command that wrote nothing is silent", c.strip() == "", c)
+
+        c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('again')\nEOF",
+                 mutate=lambda: write_file(mig, "def upgrade():\n    op.create_table('again')\n"))
+        check("bash-edit: the second write of a session-scoped rule is deduped like a Write",
+              "[new-table-retention]" not in c, c)
+
+        # no pre stamp (a host that only wires the post lane) → silent, never a crash
+        c = bash("printf 'z = 1  # type: ignore\\n' > src/nopre.py", session="b4", pre=False,
+                 mutate=lambda: write_file("src/nopre.py", "z = 1  # type: ignore\n"))
+        check("bash-edit: without a pre stamp the post lane reads nothing", c.strip() == "", c)
+
+        # a tree rewrite touches files nobody edited
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "wip")
+        _git(repo, "checkout", "-qb", "other")
+        with open(os.path.join(repo, "src", "theirs.py"), "w", encoding="utf-8") as f:
+            f.write("q = 1  # type: ignore\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "theirs")
+        _git(repo, "checkout", "-q", "main")
+        c = bash("git checkout -q other", session="b5",
+                 mutate=lambda: _git(repo, "checkout", "-q", "other"))
+        check("bash-edit: a checkout is not an edit (files change, nobody wrote them)",
+              "[no-bare-ignore]" not in c, c)
+
+        # ordering: a Bash-written file arms the obligation, like a Write would
+        wt2 = os.path.join(td, "orepo")
+        os.makedirs(os.path.join(wt2, "src"))
+        assert _git(wt2, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        _git(wt2, "commit", "-q", "--allow-empty", "-m", "base")
+        seed_book(td, "orepo", [
+            {"id": "tests-before-push", "on": "ordering", "repo_scope": "any",
+             "ordering": {"required_command_rx": r"pytest", "gated_command_rx": r"git\s+push",
+                          "armed_by_events": ["edit", "write"], "min_edits": 1,
+                          "display_name": "the suite"},
+             "text": "Run the suite before pushing", "why": "w"}])
+        push = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}}
+        rc, out = run("pre", push, env)
+        check("bash-edit ordering: nothing armed → push silent", out.strip() == "", out)
+        ev = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash", "tool_use_id": "w1",
+              "tool_input": {"command": "cat > src/gate.py <<'EOF'\nx=1\nEOF"}}
+        run("pre", ev, env)
+        with open(os.path.join(wt2, "src", "gate.py"), "w", encoding="utf-8") as f:
+            f.write("x=1\n")
+        run("post", dict(ev, tool_response={"stdout": "", "exit_code": 0}), env)
+        rc, out = run("pre", push, env)
+        check("bash-edit ordering: a heredoc write arms the obligation and the gate names the file",
+              "[tests-before-push]" in ctx(out) and "gate.py" in ctx(out), ctx(out))
+        ev2 = {"cwd": wt2, "session_id": "o1", "tool_name": "Bash", "tool_use_id": "w2",
+               "tool_input": {"command": "printf 'y=2\\n' > src/gate.py && pytest -q"}}
+        run("pre", ev2, env)
+        with open(os.path.join(wt2, "src", "gate.py"), "w", encoding="utf-8") as f:
+            f.write("y=2\n")
+        run("post", dict(ev2, tool_response={"stdout": "1 passed", "exit_code": 0}), env)
+        rc, out = run("pre", push, env)
+        check("bash-edit ordering: edit-then-green-receipt in ONE call discharges (edits are read first)",
+              out.strip() == "", ctx(out))
+
+        # a sibling worktree named in the command is scanned; one that is not, is not
+        sib = os.path.join(td, "sibling-wt")
+        assert _git(repo, "worktree", "add", "-q", "-b", "sib", sib).returncode == 0
+        c = bash(f"cat > {sib}/{mig} <<'EOF'\ndef upgrade():\n    op.create_table('t')\nEOF",
+                 session="b6", mutate=lambda: write_file(
+                     os.path.join(sib, mig), "def upgrade():\n    op.create_table('t')\n"))
+        check("bash-edit: a write into a sibling worktree the command names is seen",
+              "[new-table-retention]" in c, c)
+
+
+def diff_base_checks() -> None:
+    """What the diff probes measure: WHICH tree, and against WHICH base.
+
+    Both were guesses once, and both guessed wrong in the same session: the
+    base was `origin/main` in a repo whose PRs target `staging` (so a 260-line
+    PR measured the whole staging-vs-main delta), and the tree was the
+    session's cwd while the command ran in another worktree. Either one alone
+    makes `diff_lines_gt` fire on every PR.
+    """
+    sys.path.insert(0, os.path.dirname(HOOK))
+    import rulebook_hook as H  # noqa: E402
+
+    def git(root, *args):
+        subprocess.run(["git", "-C", root, *args], check=True,
+                       capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        # A repo whose long-lived base is `staging`, far ahead of `main`.
+        repo = os.path.join(td, "svc")
+        os.makedirs(repo)
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "t@t.t")
+        git(repo, "config", "user.name", "t")
+        with open(os.path.join(repo, "seed.txt"), "w") as f:
+            f.write("seed\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "seed")
+        git(repo, "checkout", "-qb", "staging")
+        with open(os.path.join(repo, "big.txt"), "w") as f:
+            f.write("".join(f"line {i}\n" for i in range(900)))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "900 lines of staging")
+        git(repo, "checkout", "-qb", "feature")
+        with open(os.path.join(repo, "small.txt"), "w") as f:
+            f.write("a\nb\nc\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "3 lines")
+        # A named base must be a real REMOTE branch, so the fixture has remotes.
+        for br in ("main", "staging", "feature"):
+            sha = subprocess.run(["git", "-C", repo, "rev-parse", br],
+                                 capture_output=True, text=True).stdout.strip()
+            git(repo, "update-ref", f"refs/remotes/origin/{br}", sha)
+
+        def lines(command):
+            return H.Probes(repo, "feature", command=command).diff_lines()
+
+        check("diff base: without the command's --base, the guess is `main` — "
+              "the branch measures the whole staging-vs-main delta",
+              lines("gh pr create") > 500, str(lines("gh pr create")))
+        n = lines("gh pr create --base staging --title x")
+        check("diff base: `--base staging` measures the branch, not the base branch",
+              n == 3, str(n))
+        check("diff base: `--base=staging` (equals form) reads the same",
+              lines("gh pr create --base=staging") == 3)
+        check("diff base: a quoted base reads the same",
+              lines("gh pr create --base 'staging'") == 3)
+
+        # MEMHUB_RULEBOOK_BASE_BRANCH still wins over the command.
+        os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"] = "main"
+        try:
+            check("diff base: the env override still outranks the command",
+                  lines("gh pr create --base staging") > 500)
+        finally:
+            del os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"]
+
+        # --- a named base is CHECKED, because the gated party writes it ------
+        # Every refusal falls through to the remote default, which OVER-measures:
+        # the safe direction for a size gate.
+        check("named base: your own branch is refused — `merge-base(base, HEAD) == HEAD` "
+              "measures zero, and a PR onto it would be empty",
+              lines("gh pr create --base feature") > 500, str(lines("gh pr create --base feature")))
+        for rev, why in [("HEAD", "rev, not a branch"),
+                         ("staging~1", "rev arithmetic reaches elsewhere in history"),
+                         ("../../etc/passwd", "path traversal"),
+                         ("-oProxyCommand=x", "leading dash")]:
+            check(f"named base: `{rev}` is refused ({why})",
+                  lines(f"gh pr create --base {rev}") > 500)
+        check("named base: a branch that is not on the remote is refused",
+              lines("gh pr create --base no-such-branch") > 500)
+        check("named base: two different bases in one command are refused — "
+              "`--base <mine> || --base staging` would probe one and open the other",
+              lines("gh pr create --base staging || gh pr create --base feature") > 500)
+        check("named base: the same base named twice is still honoured",
+              lines("gh pr create --base staging --base staging") == 3)
+
+        # --- which tree: a leading `cd` redirects the whole command ----------
+        other = os.path.join(td, "other")
+        os.makedirs(other)
+        git(other, "init", "-q", "-b", "main")
+        git(other, "config", "user.email", "t@t.t")
+        git(other, "config", "user.name", "t")
+        with open(os.path.join(other, "a.txt"), "w") as f:
+            f.write("a\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-qm", "seed")
+
+        check("probe root: a leading `cd <repo> &&` resolves to that worktree",
+              H.command_root(td, f"cd {other} && gh pr create") == other)
+        check("probe root: a relative `cd` resolves against the session cwd",
+              H.command_root(td, "cd other && gh pr create") == other)
+        check("probe root: a quoted path resolves",
+              H.command_root(td, f"cd '{other}' ; gh pr create") == other)
+        check("probe root: only a Bash call redirects it — another tool's input may hold a "
+              "field called `command` meaning something else, and reading it as shell would "
+              "point the probes at a tree the call never touches",
+              H.command_root(td, "") == "")
+        check("probe root: no `cd` keeps the session's tree",
+              H.command_root(td, "gh pr create") == "")
+        check("probe root: a `cd` buried mid-pipeline is not honoured — the "
+              "command may never reach it",
+              H.command_root(td, f"ls && cd {other} && gh pr create") == "")
+        check("probe root: a `cd` to somewhere that is not a repo keeps the session's tree",
+              H.command_root(td, f"cd {td} && gh pr create") == "")
+        check("probe root: a `cd` to a missing directory keeps the session's tree",
+              H.command_root(td, "cd /nope/nowhere && gh pr create") == "")
+
+
 def main() -> int:
+    portability_check()
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
         os.makedirs(os.path.join(repo, ".git"))
@@ -171,6 +1081,25 @@ def main() -> int:
                                    tool_response={"stdout": "BOOM-ERROR here"}), env)
         check("post: cmd_rx gates the result rule", out.strip() == "")
 
+        # A result long enough to need a window puts the traceback at the TOP
+        # and the summary at the bottom — pytest's own shape. A tail-only
+        # window silently missed every exception in exactly those runs.
+        head_only = "BOOM-ERROR at the top\n" + ("filler line\n" * 4000)
+        rc, out = run("post", dict(base, session_id="s8",
+                                   tool_input={"command": "uv run pytest tests/"},
+                                   tool_response={"stdout": head_only}), env)
+        check("post: fires when the match is only at the HEAD of a long result",
+              "[post-rule]" in ctx(out))
+
+        # …and the window is still bounded: the middle of a huge result is not
+        # scanned. This is the deliberate cost of not reading the whole thing.
+        buried = ("filler line\n" * 4000) + "BOOM-ERROR buried\n" + ("filler line\n" * 4000)
+        rc, out = run("post", dict(base, session_id="s9",
+                                   tool_input={"command": "uv run pytest tests/"},
+                                   tool_response={"stdout": buried}), env)
+        check("post: the window stays bounded — a match in the middle is still missed",
+              out.strip() == "")
+
         # --- ledger --------------------------------------------------------
         ledger = os.path.join(td, "ledger", "fires.jsonl")
         check("ledger written beside the relocated rulebook", os.path.isfile(ledger))
@@ -186,7 +1115,7 @@ def main() -> int:
                   {r["hook_phase"] for r in rows} >= {"pre", "post", "session"} and
                   all(r["mode"] == "advise" for r in rows))
             check("ledger v2: full session_id, rule_version, tz-aware fired_at",
-                  all(r["session_id"] in ("s1", "s2", "s6") for r in rows) and
+                  all(r["session_id"] in ("s1", "s2", "s6", "s8") for r in rows) and
                   all(r["rule_version"] == 1 for r in rows) and
                   all(re.search(r"([+-]\d\d:\d\d|Z)$", r["fired_at"]) for r in rows))
             check("ledger v2: schema_version file stamped",
@@ -489,11 +1418,13 @@ def main() -> int:
 
         rc, out = run("pre", dict(base, tool_input={"command": "advisory-cmd"}), genv)
         j = outj(out)
-        check("advisory: user sees an XTrace line naming the rule (systemMessage)",
-              j.get("systemMessage", "").startswith("XTrace") and "[adv]" in j.get("systemMessage", "")
+        check("advisory: the user's first line is the disclosure, the branded detail beneath it",
+              j.get("systemMessage", "").startswith("📏 Rule fired: ")
+              and "\n   XTrace ▸ [adv] " in j.get("systemMessage", "")
               and "Advisory text" in j["systemMessage"], out)
-        check("advisory: agent context header is branded, no ruler",
-              "XTrace Rulebook" in ctx(out) and "📏" not in ctx(out), ctx(out))
+        check("advisory: agent context header stays branded and carries the echo instruction",
+              "XTrace Rulebook" in ctx(out) and "📏 Rule fired: " in ctx(out)
+              and "Begin your next reply" in ctx(out), ctx(out))
         check("advisory: never blocks", "permissionDecision" not in j["hookSpecificOutput"])
 
         push = dict(base, tool_input={"command": "git push --force origin main"})
@@ -504,9 +1435,10 @@ def main() -> int:
         check("gate: deny reason carries the statement and the override line",
               "Never force-push" in hso.get("permissionDecisionReason", "")
               and "RULEBOOK_OVERRIDE=" in hso.get("permissionDecisionReason", ""), out)
-        check("gate: user line says blocked, branded",
-              j.get("systemMessage", "").startswith("XTrace") and "blocked" in j["systemMessage"]
-              and "[no-force-push]" in j["systemMessage"], out)
+        check("gate: the user's first line is the blocked disclosure, branded detail beneath it",
+              j.get("systemMessage", "").startswith("⛔️ Rule fired: ")
+              and "\n   XTrace ⛔ blocked by [no-force-push] " in j.get("systemMessage", "")
+              and "blocked" in j["systemMessage"], out)
         rc, out = run("pre", push, genv)
         check("gate: the SAME call is gated again — gates are never deduped",
               outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
@@ -578,6 +1510,20 @@ def main() -> int:
         j = outj(out)
         check("override: on a backslash-continued line it is honoured AND the token is still stripped",
               "permissionDecision" not in j.get("hookSpecificOutput", {}) and "overridden" in j.get("systemMessage", ""), out)
+        heredoc_pr = ("cd /tmp && RULEBOOK_OVERRIDE='blocked its own fix' gh pr create "
+                      "--base main --title \"t\" --body \"$(cat <<'EOF'\n"
+                      "body\nEOF\n)\" && git push --force origin main")
+        rc, out = run("pre", dict(base, tool_input={"command": heredoc_pr}), genv)
+        j = outj(out)
+        check("override: honoured on a `--body \"$(cat <<EOF\"` line — the quote closes on a LATER "
+              "physical line, and skipping it made the gate unbypassable on the commonest gated command",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "overridden" in j.get("systemMessage", ""), out)
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "gh pr create --body \"$(cat <<'EOF'\nbody\nEOF\n)\" && git push --force origin main"}), genv)
+        check("override: the same command WITHOUT an override is still denied — rejoining lines "
+              "reads the shell honestly, it does not open a hole",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
         rc, out = run("pre", dict(base, tool_input={"command": "grep RULEBOOK_OVERRIDE= hook.py"}), genv)
         check("override: the variable name inside an argument is not an override, and matches no gate",
               out.strip() == "", out)
@@ -592,13 +1538,14 @@ def main() -> int:
             rows = [json.loads(l) for l in f if l.strip()]
         gate_rows = [r for r in rows if r["rule_id"] == "no-force-push"]
         check("ledger: blocked, overridden and empty-override calls are all mode=gate fires",
-              len(gate_rows) == 19 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
+              len(gate_rows) == 21 and all(r["mode"] == "gate" for r in gate_rows), str(len(gate_rows)))
         reasons = [r.get("override_reason") for r in gate_rows]
         check("ledger: override_reason only on the overridden fires, secrets redacted",
               reasons[:3] == [None, None, "hotfix, approved by lead"] and reasons[3:6] == [None] * 3
               and reasons[6] and "ghp_ABCDEFGHIJ" not in reasons[6]
               and reasons[7:] == ["cd first", "after semicolon", "on line two", None,
-                                  None, None, None, "the real one", "after heredoc", None, "why", "cont"], str(reasons))
+                                  None, None, None, "the real one", "after heredoc", None, "why", "cont",
+                                  "blocked its own fix", None], str(reasons))
         cont = [r for r in gate_rows if r.get("override_reason") == "cont"][0]
         check("ledger: the continued-line token was stripped before rules matched (excerpt has no assignment)",
               "RULEBOOK_OVERRIDE=" not in cont["excerpt"], cont["excerpt"])
@@ -611,20 +1558,262 @@ def main() -> int:
         check("ledger: override_reason crosses the wire",
               rb.wire_row(gate_rows[2]).get("override_reason") == "hotfix, approved by lead")
 
-        # a stale book (>24 h) degrades the gate to advise and says so once
+        # there is no freshness timer: the cached book is the book, however old.
+        # A rule the server retired disappears at the next successful fetch (a
+        # session refreshes its own book once it is an hour old); a stale gate
+        # costs one RULEBOOK_OVERRIDE, a gate that stopped enforcing because the
+        # server was unreachable for a day is the failure a gate exists to prevent.
         import datetime as _dt
         bdir = os.path.join(td, "book")
         bp = os.path.join(bdir, [n for n in os.listdir(bdir) if n.startswith("gaterepo-")][0])
         with open(bp, encoding="utf-8") as f:
             book = json.load(f)
-        book["fetched_at"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=25)).isoformat()
+        book["fetched_at"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)).isoformat()
         with open(bp, "w", encoding="utf-8") as f:
             json.dump(book, f)
-        rc, out = run("pre", dict(push, session_id="g-stale"), genv)
+        rc, out = run("pre", dict(push, session_id="g-stale"), dict(genv, MEMHUB_RULEBOOK_FETCH="0"))
         j = outj(out)
-        check("gate: a book older than 24 h runs the gate as advise (no deny) and says so",
+        check("gate: a month-old cached book still denies — no freshness timer, no degrade note",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+              and "24 h" not in ctx(out), out)
+
+    # --- an EDIT gate blocks the write, and the override rides in the content --
+    # The hook matches an edit rule against `tool_input` in PreToolUse, so the
+    # write has not happened and can still be refused. A tool call carries no
+    # shell prefix, so the override is a marker in the content itself.
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "editgate")
+        os.makedirs(os.path.join(repo, "src"))
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "editgate", [
+            {"id": "no-hex", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"#[0-9a-fA-F]{6}\b",
+             "mode": "gate", "fire_scope": "session", "repo_scope": "any",
+             "text": "Never hardcode a colour", "why": "w", "version": 1},
+            {"id": "no-todo", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"TODO",
+             "fire_scope": "session", "repo_scope": "any", "text": "No TODOs", "why": "w",
+             "version": 1},
+            {"id": "no-inline-style", "on": "edit", "path_rx": r"\.tsx?$", "content_rx": r"style=\{\{",
+             "mode": "gate", "fire_scope": "session", "repo_scope": "any",
+             "text": "No inline styles", "why": "w", "version": 1},
+        ])
+        genv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        tsx = os.path.join(repo, "src", "Swatch.tsx")
+        base = {"cwd": repo, "session_id": "e1", "tool_name": "Write"}
+
+        def outj(out):
+            return json.loads(out) if out.strip() else {}
+
+        rc, out = run("pre", dict(base, tool_input={
+            "file_path": tsx, "content": 'const brand = "#1a1a1a";\n'}), genv)
+        j = outj(out)
+        hso = j.get("hookSpecificOutput", {})
+        check("edit gate: the Write is DENIED before it lands",
+              rc == 0 and hso.get("permissionDecision") == "deny", out)
+        check("edit gate: the deny reason carries the statement and the MARKER instruction, "
+              "not the shell prefix",
+              "Never hardcode a colour" in hso.get("permissionDecisionReason", "")
+              and "rulebook-override[no-hex]:" in hso.get("permissionDecisionReason", "")
+              and "RULEBOOK_OVERRIDE=" not in hso.get("permissionDecisionReason", ""), out)
+        check("edit gate: the user is told the write was blocked",
+              j.get("systemMessage", "").startswith("⛔️ Rule fired: ")
+              and "\n   XTrace ⛔ blocked by [no-hex] " in j.get("systemMessage", "")
+              and "blocked" in j["systemMessage"], out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "file_path": tsx, "content": 'const brand = "#1a1a1a";\n'}), genv)
+        check("edit gate: the same write is gated again — an edit gate is never deduped",
+              outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: vendor SVG, palette is fixed upstream\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: the marked write is ALLOWED",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+        check("edit override: the user line records the reason",
+              "overridden" in j.get("systemMessage", "")
+              and "vendor SVG" in j["systemMessage"], out)
+
+        # An UNNAMED marker excuses nothing, even with one gate on the call.
+        # It would mean a different rule the day a second edit gate covers the
+        # line, and it is the form copied content satisfies by accident.
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override: vendor SVG, palette is fixed upstream\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: an UNNAMED marker does not excuse even a LONE gate",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        check("edit override: the deny says an unnamed marker excuses nothing, and why",
+              "excuses nothing" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rulebook-override[no-hex]:"
+              in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+
+        for empty in ("// rulebook-override[no-hex]:\n", "// rulebook-override[no-hex]:    \n"):
+            rc, out = run("pre", dict(base, tool_input={
+                "file_path": tsx, "content": empty + 'const brand = "#1a1a1a";\n'}), genv)
+            check("edit override: an EMPTY reason is not an override — still denied",
+                  outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab rotated\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: the reason is redacted before it is recorded or shown",
               "permissionDecision" not in j.get("hookSpecificOutput", {})
-              and "refreshed >24 h ago" in ctx(out), out)
+              and "ghp_ABCDEFGHIJ" not in json.dumps(j), out)
+
+        # Two gates on one write: a marker naming one must not excuse the other.
+        two = 'const s = {"#1a1a1a"}; <div style={{color: s}} />\n'
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override: vendor SVG\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: an UNNAMED marker does not excuse a call with two gates on it — "
+              "a marker that LANDS in the file must not silence rules it never named",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+        check("edit override: the deny names each still-blocking rule and how to excuse it",
+              "rulebook-override[no-hex]:" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rulebook-override[no-inline-style]:"
+              in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: brand hex is fixed upstream\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: naming ONE rule leaves the other gate standing",
+              j.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+              and "[no-inline-style]" in j.get("systemMessage", "")
+              and "overridden" in j.get("systemMessage", ""), out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "// rulebook-override[no-hex]: brand hex is fixed upstream\n"
+            "// rulebook-override[no-inline-style]: measured, one-off\n" + two)}), genv)
+        j = outj(out)
+        check("edit override: naming BOTH lets the write through",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+
+        rc, out = run("pre", dict(base, tool_input={"file_path": tsx, "content": (
+            "/* rulebook-override[no-hex]: the palette lives in {tokens} */\n"
+            'const brand = "#1a1a1a";\n')}), genv)
+        j = outj(out)
+        check("edit override: a comment CLOSER is stripped but a reason that honestly ends "
+              "in one of those characters keeps it",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "lives in {tokens}" in j.get("systemMessage", ""), out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "file_path": tsx, "content": "// TODO: later\n"}), genv)
+        j = outj(out)
+        check("edit advisory: an advise-mode edit rule still only advises",
+              "[no-todo]" in ctx(out)
+              and "permissionDecision" not in j["hookSpecificOutput"], out)
+
+        # The post-hoc lane: a file written BY a shell command is discovered
+        # after the command ran, so the same gate rule can only advise there.
+        with open(os.path.join(repo, "src", "Panel.tsx"), "w", encoding="utf-8") as f:
+            f.write('const bg = "#2b2b2b";\n')
+        rc, out = run("post", {"cwd": repo, "session_id": "e2", "tool_name": "Bash",
+                               "tool_input": {"command": "printf '%s' x > src/Panel.tsx"},
+                               "tool_response": {"stdout": "", "exit_code": 0}}, genv)
+        j = outj(out)
+        check("edit gate: a file written by a SHELL command is post-hoc — it advises, never denies",
+              "permissionDecision" not in j.get("hookSpecificOutput", {}), out)
+
+        with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        hexr = [r for r in rows if r["rule_id"] == "no-hex"]
+        check("ledger: every blocked and overridden write is a mode=gate fire",
+              len(hexr) >= 6 and all(r["mode"] == "gate" for r in hexr), str(len(hexr)))
+        check("ledger: override_reason is set only on the overridden writes",
+              [r.get("override_reason") for r in hexr][:5]
+              == [None, None, "vendor SVG, palette is fixed upstream", None, None],
+              str([r.get("override_reason") for r in hexr]))
+        styler = [r for r in rows if r["rule_id"] == "no-inline-style"]
+        check("ledger: a row records the reason for ITS rule — one call excused one gate "
+              "and was blocked by the other",
+              [r.get("override_reason") for r in styler]
+              == [None, None, "measured, one-off"], str([r.get("override_reason") for r in styler]))
+
+    # --- an anchored rule is not bypassed by a leading env assignment -------
+    #
+    # `FOO=1 git push` execs `git push`: bash strips the assignment before it
+    # looks up the command. A matcher that disagrees lets an ANCHORED gate
+    # through with no deny AND no fire — silently, which is worse than either.
+    for src, want in (("FOO=1 git push", "git push"),
+                      ("FOO=1 BAR=2 git push", "git push"),       # a run goes whole
+                      ("cd /tmp && FOO=1 git push", "cd /tmp && git push"),
+                      ("RULEBOOK_OVERRIDE= git push", "git push"),
+                      ("echo 'A=1 git push'", "echo 'A=1 git push'"),   # quoted: data
+                      ("git commit -m 'A=1'", "git commit -m 'A=1'"),   # not at a start
+                      ("echo 'unbalanced", "echo 'unbalanced")):        # shlex refuses
+        check("normalise: %s" % src, rb.strip_leading_assignments(src) == want,
+              rb.strip_leading_assignments(src))
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "anchrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "anchrepo", [
+            {"id": "anchored-gate", "on": "bash", "rx": r"^git\s+push\s+--force", "mode": "gate",
+             "not_rx": "SKIP_GATE=",
+             "fire_scope": "session", "repo_scope": "any", "text": "Never force-push", "why": "w",
+             "version": 1},
+            {"id": "inline-secret", "on": "bash", "rx": r"AWS_SECRET_ACCESS_KEY=",
+             "fire_scope": "session", "repo_scope": "any", "text": "No inline secret", "why": "w",
+             "version": 1},
+        ])
+        genv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        base = {"cwd": repo, "session_id": "a1", "tool_name": "Bash"}
+
+        def denied(cmd):
+            rc, out = run("pre", dict(base, tool_input={"command": cmd}), genv)
+            return outj(out).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out
+
+        for cmd in ("git push --force origin main",
+                    "FOO=1 git push --force origin main",
+                    "FOO=1 BAR=2 git push --force origin main",
+                    "RULEBOOK_OVERRIDE= git push --force origin main",
+                    "RULEBOOK_OVERRIDE='' git push --force origin main"):
+            ok, out = denied(cmd)
+            check("anchored gate: still DENIES behind a prefix — %s" % cmd[:38], ok, out)
+
+        rc, out = run("pre", dict(base, tool_input={
+            "command": "RULEBOOK_OVERRIDE='approved by lead' git push --force origin main"}), genv)
+        j = outj(out)
+        check("anchored gate: a real override still passes exactly that call",
+              "permissionDecision" not in j.get("hookSpecificOutput", {})
+              and "approved by lead" in j.get("systemMessage", ""), out)
+
+        ok, out = denied("echo 'FOO=1 git push --force origin main'")
+        check("anchored gate: an assignment inside a quoted argument is data — no fire", not ok, out)
+
+        # monotonic: the RAW text is tried first, so a rule written to catch the
+        # assignment ITSELF keeps firing. Stripping is an extra form, never a
+        # replacement.
+        rc, out = run("pre", dict(base, session_id="a2", tool_input={
+            "command": "AWS_SECRET_ACCESS_KEY=abc123 aws s3 ls"}), genv)
+        check("anchored gate: a rule ABOUT an assignment still fires on the raw text",
+              "[inline-secret]" in ctx(out), out)
+
+        # not_rx is a VETO over BOTH forms. Stripping must never become a way to
+        # delete the token an author's exemption keys on — that would let
+        # `FOO=1 cmd` defeat an exemption `cmd` itself honours.
+        ok, out = denied("SKIP_GATE=1 git push --force origin main")
+        check("anchored gate: an exemption keyed on the assignment still exempts", not ok, out)
+
+        # KNOWN GAP, tracked separately: `^` is start-of-LINE, not
+        # start-of-segment, so a command after `cd x &&` is still unmatched.
+        # Stripping the assignment does not change that, and this locks it.
+        ok, out = denied("cd /tmp && FOO=1 git push --force origin main")
+        check("anchored gate: `^` is still line-anchored after `&&` (known gap)", not ok, out)
+
+    branch_name_checks()
+    repo_identity_checks()
+    given_and_scope_checks()
+    bash_edit_checks()
+    read_lane_checks()
+    diff_base_checks()
 
     print()
     if FAILURES:

@@ -7,7 +7,9 @@ Lanes (the mode argument):
            slot (measured 4% vs 88% for in-flight), so it carries worldview,
            never enforcement.
   pre      PreToolUse: proactive advisories at the violation moment (on="bash",
-           "edit", "write_stdlib") and the ordering-rule GATE (on="ordering").
+           "edit", "read", "write_stdlib") and the ordering-rule GATE (on="ordering").
+           A read rule sees the Read tool AND the shell forms that pull a file
+           into context (cat/head/tail/less/more/sed -n on a path).
   post     PostToolUse: reactive advisories on failing/erroring results
            (on="result"); ordering-rule ARM (edit-family) and RECEIPT (bash).
   fetch    Refresh the server book for one repo (GET /rules?view=hook with
@@ -17,26 +19,71 @@ Lanes (the mode argument):
            behind a sent-watermark (ledger/.sent). `flush final` ignores the
            every-N-fires / every-M-minutes throttle.
 
-Book = the server book, fetched once per session and cached with its ETag.
+Book = the server book, cached with its ETag. SessionStart re-fetches a stale
+one BEFORE the digest renders (a fresh one just spawns the detached child), and
+the pre lane refreshes it in the background once it is a minute old.
 Offline → the cached book; no cache → no rules. There is no local rule file:
 rules are authored through the memhub `create_rule` tool.
 
+One book, several rulebooks. A rulebook is a container with its own membership
+(container spec §3, §4), and one person can be bound by more than one — an
+org-wide book plus their team's. The fetched book is the union of the rules
+that bind them, and each rule carries `rulebook_id` and a `rulebook` block
+with the book's `name`, `scope` and `member_count`. The server computes no
+precedence and stores no conflict edges (D14): it ships those facts and the
+hook decides. Here, "wider wins" is an ORDERING and never a suppression —
+`book_rank` puts org-wide rules ahead of a three-person book's so that the
+per-call MAX_ADVISE cap and the session-start posture budget spend on the
+policy that binds the most people first. A rule cut by a cap is logged
+`mode="suppressed"`, exactly as before. A backend that predates the container
+change sends no book facts at all; every rule then ranks alike, both sorts are
+stable, and this build behaves as it did — which is what lets one plugin serve
+a migrated and an unmigrated backend.
+
 How a fire reaches people (spec §5.3):
-  * The agent gets `additionalContext` — the rule text under an XTrace Rulebook
-    header — and the USER gets a `systemMessage` line per rule (`XTrace ▸ …`),
-    the one hook field the terminal renders. Without it a fire is invisible to
-    the person the rule was written for.
-  * `mode: gate` rules BLOCK: a pre-hook Bash call matching a gate rule is
-    denied (`permissionDecision: deny`) with the statement and the override
-    line. `RULEBOOK_OVERRIDE='<why>' <command>` allows exactly that call and
-    records the fire with `override_reason`; the next matching call is gated
-    again. Gates are never deduped and never cut by the advisory cap. Only a
-    Bash rule can gate (an edit already happened; a result rule runs after the
-    fact), and only from a book fetched within 24 h — older caches run it as
-    `advise` and say so once per session.
+  * Every fire is DISCLOSED, on both channels, in one shape:
+    `📏 Rule fired: <the rule, in 20 words or fewer>` — `⛔️` when a gate
+    actually stopped the call. The USER sees it as the first line of the
+    `systemMessage` stanza, above the detail line this hook has always shown
+    (`XTrace ▸ …`); the AGENT is told, in `additionalContext`, to echo the
+    byte-identical line at the top of its reply. Both are needed: the first is
+    deterministic but invisible to everything downstream, and the second is the
+    only copy that reaches the transcript session capture, a handoff or a PR
+    comment can read. One function (`disclosure_line`) builds both, because a
+    terminal showing one string while the agent says another would be worse
+    than either channel alone.
+  * The agent also gets the rule text under an XTrace Rulebook header, as
+    before. Without the `systemMessage` a fire is invisible to the person the
+    rule was written for.
+  * `mode: gate` rules BLOCK: a pre-hook call matching a gate rule is denied
+    (`permissionDecision: deny`) with the statement and the override its lane
+    accepts. A Bash call takes `RULEBOOK_OVERRIDE='<why>' <command>`, which
+    allows exactly that call; an edit takes a `rulebook-override[<rule>]: <why>`
+    marker in the content, which allows that write and stays in the diff. The
+    edit marker must name its rule BECAUSE it stays: an unnamed one would mean
+    a different thing the day a second edit gate covers that line, and it is
+    the form that content copied from elsewhere satisfies by accident. A Read
+    tool call has neither a prefix nor content, so a blocked read is retried
+    narrower (`offset`/`limit`), delegated to a subagent, or — when the whole
+    file must enter THIS context — run as `RULEBOOK_OVERRIDE='<why>' cat
+    <path>`, which is the Bash lane's override and records like one. Either way the fire
+    records its own `override_reason`, and the next matching call is gated
+    again. Gates are never deduped and never cut by the advisory cap. All
+    three lanes gate because the hook sees them BEFORE they run — an edit rule
+    matches `tool_input`, the content the tool is about to write, and a read
+    rule the path a call is about to pull in. A result
+    rule runs after the fact and cannot gate, and neither can the synthetic
+    lane that finds files a shell command already wrote.
+  * A gate is honoured from whatever book is cached, however old. There is no
+    timer that turns a gate off: a rule retired on the server disappears at
+    the next successful fetch, and a running session refreshes its own book
+    once it is a minute old (pre lane, detached, throttled). A stale gate costs
+    one `RULEBOOK_OVERRIDE`; a gate that silently stops enforcing because the
+    server was unreachable for a day is the failure a gate exists to prevent.
 
 What leaves the machine, exactly:
-  * fetch  — the repo directory name, nothing else.
+  * fetch  — the repo name (the origin remote's basename, else the directory's),
+             nothing else.
   * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps.
              The matched `excerpt` is written to the LOCAL ledger and is
              stripped before the POST.
@@ -58,14 +105,27 @@ Two engines, one evaluate():
   * ordering rules — "run X after the last edit, before Y": an obligation
     state machine keyed by (worktree_root, branch, rule), never by session,
     so receipts from subagents and sibling sessions in the same checkout count.
+
+A matcher rule may also carry a `given` block — predicates the call must
+satisfy AFTER its regex matched: `repo` facts (branch, what the branch has
+changed against its base, a dirty tree), `user` facts (what the person
+typed this session), `file` facts (how much a read would pull into context)
+and `agent` facts (main agent or subagent). They are answered by `Probes`,
+lazily and once per hook call, from read-only git, the local transcript and
+the file the call names; a fact that cannot be established never satisfies a
+predicate, so the rule stays silent. `given_ok()` is pure over a Probes and
+the event's read facts, which is how the verifier feeds it fixtures.
 """
-import fcntl
+import fnmatch
 import hashlib
 import datetime as _dt
+import importlib.util
 import json
 import os
 import re
 import shlex
+import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -73,15 +133,59 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
+def _load_portable_lock():
+    """Load only the packaged lock shim without broadening module search."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portable_lock.py")
+    spec = importlib.util.spec_from_file_location("_memhub_rulebook_portable_lock", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load portable lock shim from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    portable_lock = _load_portable_lock()
+except Exception:
+    portable_lock = None
+
+
+def _load_repo_identity():
+    """Load only the packaged repo-name shim without broadening module search."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo_identity.py")
+    spec = importlib.util.spec_from_file_location("_memhub_rulebook_repo_identity", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load repo identity shim from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    repo_identity = _load_repo_identity()
+except Exception:
+    repo_identity = None
+
 BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
     os.path.expanduser("~/.config/memhub-plugin/rulebook")
 MAX_ADVISE = 2          # per tool call — habituation guard
 MAX_POSTURE = 15        # spec §2: session_context is hard-capped at 15 rules / ~2k tokens per scope
-POSTURE_BUDGET_CHARS = 8000   # ~2k tokens at ~4 chars/token
+# One budget with the session-start brief (MEMHUB_BRIEF_TOKEN_BUDGET, default
+# 2,500 tokens, split 2:1 brief:rulebook — navigation spec §4); this is the
+# rulebook's third. The literal fallback only covers a broken sibling import.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from brief_budget import rulebook_chars as _rulebook_chars
+    POSTURE_BUDGET_CHARS = _rulebook_chars()
+except Exception:
+    POSTURE_BUDGET_CHARS = 3333   # 2,500 tokens × 4 chars ÷ 3
+RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the tail
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
-BOOK_MAX_AGE_S = 24 * 3600   # §5.3: a gate from an older cache degrades to advise
+REFRESH_AFTER_S = 60         # pre lane: refresh a book this old in the background…
+REFRESH_RETRY_S = 60         # …and retry no more than this often while the server is down
+SESSION_FETCH_TIMEOUT_S = 1.0   # session lane: the ONE blocking fetch, and only on a stale book
 API_PATH = "/v1/team/rulebook"
 
 
@@ -100,6 +204,19 @@ FLUSH_EVERY_FIRES = 10       # Stop-hook throttle: flush when this many rows wai
 FLUSH_EVERY_S = 300          # …or this long has passed since the last flush
 FLUSH_BATCH = 200
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+READ_TOOLS = ("Read",)
+BASH_READ_MAX_FILES = 8            # read segments named per Bash call; past that it is a script, not a read
+READ_COUNT_MAX_BYTES = 64 << 20    # lines are counted this far; a file past it is over any threshold anyone sets
+# A Bash call that wrote files is an edit too (see `bash_written_files`).
+BASH_EDIT_MAX_FILES = 40            # more than this in one call is a generator, not an edit
+BASH_EDIT_MAX_BYTES = 512 * 1024    # per file; bigger is data, not source
+BASH_EDIT_MAX_STATUS = 4000         # `git status` entries; past that the tree is too noisy to read
+BASH_EDIT_MARKS_KEPT = 8            # pre-call timestamps kept per session (parallel calls)
+# Tree rewrites: every touched file has a new mtime but nobody EDITED it, and an
+# edit rule read against a checked-out file is a fire about someone else's code.
+_TREE_REWRITE_RX = re.compile(
+    r"(?:^|[;&|(]\s*)git\s+(?:-C\s+\S+\s+)?(?:checkout|switch|stash|merge|rebase|pull|reset"
+    r"|cherry-pick|revert|apply|am|restore|worktree)\b", re.M)
 STDLIB = set(getattr(sys, "stdlib_module_names", ())) or {
     "abc", "argparse", "ast", "asyncio", "base64", "collections", "contextlib",
     "csv", "dataclasses", "datetime", "enum", "functools", "glob", "hashlib",
@@ -141,6 +258,402 @@ def last_segment(shell):
     return parts[-1] if parts else ""
 
 
+# ── a leading assignment is not part of the command ─────────────────────────
+#
+# `FOO=1 git push` execs `git push` — bash strips the assignment before it
+# looks up the command, and a rule has to read it the same way. Otherwise an
+# ANCHORED rule is silently bypassed: `^git\s+push` never sees a command that
+# begins with an assignment, so the call runs with no deny and no fire, which
+# is the one outcome a gate exists to prevent.
+#
+# `strip_override` already makes exactly this statement about the single
+# RULEBOOK_OVERRIDE token ("rules match the command, not the assignment"). It
+# just cannot make it when `find_override` REFUSED the token — and the refused
+# shape is `RULEBOOK_OVERRIDE=` with an empty reason, which is what the deny
+# message invites the caller to type.
+_ASSIGN_TOKEN_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
+_ASSIGN_NAME_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_leading_assignments(shell):
+    """`shell` with the env assignments that BEGIN a segment removed, byte for
+    byte identical everywhere else.
+
+    Tokenised per line by the same shlex walk `find_override` uses, so an
+    assignment inside a quoted argument (`echo 'A=1 git push'`) is data and
+    stays put, and a line shlex cannot parse is handed back untouched. A run is
+    stripped whole (`FOO=1 BAR=2 git push` -> `git push`), because bash treats
+    all of it as the command's environment."""
+    out = []
+    for line in shell.split("\n"):
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            toks = list(lex)
+        except ValueError:                  # unbalanced quoting: not ours to rewrite
+            out.append(line)
+            continue
+        targets, at_start = [], True
+        for tok in toks:
+            if at_start and _ASSIGN_NAME_RX.match(tok):
+                targets.append(tok)         # stay at_start: assignments come in runs
+                continue
+            at_start = _segment_op(tok)
+        stripped = line
+        for val in targets:
+            for m in _ASSIGN_TOKEN_RX.finditer(stripped):
+                try:
+                    if shlex.split(m.group(0))[0] != val:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+                stripped = stripped[:m.start()] + stripped[m.end():]
+                break
+        out.append(stripped)
+    return "\n".join(out)
+
+
+def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
+    """Does `rx` match this command, given that a leading env assignment is not
+    part of it?
+
+    The command is read as BOTH forms — as written, and with the assignments
+    that begin a segment removed. `rx` fires when EITHER matches, so an anchored
+    rule stops being bypassed by a prefix while a rule written to catch the
+    assignment itself (`AWS_SECRET_ACCESS_KEY=`) still fires on the raw text.
+
+    `not_rx` is a VETO across the same pair, checked first: an exemption its
+    author wrote against either shape exempts the call. Testing it per-form
+    instead would let a prefix delete the very token the exemption keys on, so
+    `FOO=1 cmd` would defeat an exemption that `cmd` honours — stripping would
+    become a way to BREAK an exemption, which is the opposite of the point."""
+    forms = [text]
+    bare = strip_leading_assignments(text)
+    if bare != text:
+        forms.append(bare)
+    if not_rx and any(re.search(not_rx, f, re.I) for f in forms):
+        return False
+    return any(re.search(rx, f, flags) for f in forms)
+
+
+# ── files a Bash call wrote ─────────────────────────────────────────────────
+#
+# An edit rule says `event: edit`, and until now that meant the Edit/Write
+# tools only. But a model writes files through Bash all the time — `cat > f
+# <<EOF` to create, a `python - <<PY … write_text()` to modify, `sed -i` —
+# and in auto mode it is TOLD to. Measured on 302 local sessions: 1464 Bash
+# writes against 3035 Write/Edit calls; 6 of 22 alembic migrations were
+# created with a heredoc. None of those reached an edit rule.
+#
+# Reading the command line back cannot recover the write (the path lives
+# inside the Python program, not the shell), so this reads the DISK instead:
+# the pre lane stamps the call, the post lane asks git what changed since and
+# feeds each file through the same matcher a Write goes through. One
+# mechanism for every shape, including the ones not seen yet. It lands
+# AFTER the write, which is the only lane edit rules use anyway (they are
+# advise-only by decision; only shell rules gate).
+
+def _worktrees(root):
+    """Every worktree of `root`'s repository, `root` first. Empty on any failure."""
+    try:
+        p = subprocess.run(["git", "-C", root, "worktree", "list", "--porcelain"],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return [root]
+    if p.returncode != 0:
+        return [root]
+    seen, real = [root], {os.path.realpath(root)}
+    for line in p.stdout.splitlines():
+        if line.startswith("worktree ") and os.path.realpath(line[9:]) not in real:
+            seen.append(line[9:])
+            real.add(os.path.realpath(line[9:]))
+    return seen
+
+
+def _names_of(path):
+    """The spellings a command might use for `path`: as given, resolved, and —
+    macOS — with or without the `/private` prefix git resolves /tmp and /var to."""
+    names = {path, os.path.realpath(path)}
+    for n in list(names):
+        if n.startswith("/private/"):
+            names.add(n[len("/private"):])
+    return names
+
+
+def bash_written_files(root, cmd, since):
+    """(path, is_new) for each regular file a Bash call left modified or new.
+
+    Scanned: the session's worktree, plus any sibling worktree the command
+    names — a `cat > /tmp/wt-x/app/m.py <<EOF` into a scratch worktree is
+    the case that motivated this (the file was 30 directories away from
+    the session's cwd and in the same repository). Not every worktree: the
+    repos this serves carry twenty-odd, and one `git status` each per Bash
+    call is a cost nobody asked for.
+
+    `git status` decides what is a candidate (so .gitignore does the
+    exclusion — a `.venv` refresh or `node_modules` install is invisible),
+    the mtime decides what THIS call touched. Returns [] rather than a
+    partial list past BASH_EDIT_MAX_FILES: forty files in one call is a
+    generator or a tree rewrite, and forty fires is noise, not advice.
+    """
+    if not root or since is None or _TREE_REWRITE_RX.search(shell_only(cmd or "")):
+        return []
+    roots = [w for w in _worktrees(root)
+             if w == root or any(n in (cmd or "") for n in _names_of(w))]
+    out = []
+    for wt in roots:
+        try:
+            p = subprocess.run(["git", "-C", wt, "status", "--porcelain=v1", "-z",
+                                "--untracked-files=all"], capture_output=True, timeout=5)
+        except Exception:
+            continue
+        if p.returncode != 0:
+            continue
+        entries = p.stdout.split(b"\0")
+        if len(entries) > BASH_EDIT_MAX_STATUS:
+            continue
+        skip_next = False
+        for e in entries:
+            if skip_next:              # the OLD name of a rename/copy: a bare path, no code
+                skip_next = False
+                continue
+            if len(e) < 4:
+                continue
+            code, rel = e[:2], e[3:]
+            skip_next = code[0:1] in (b"R", b"C")
+            if b"D" in code:
+                continue
+            is_new = code == b"??" or code[0:1] == b"A"
+            path = os.path.join(wt, rel.decode("utf-8", "replace"))
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            # No slack on the stamp: mtimes are sub-second on APFS/ext4, and a
+            # slack would let the PREVIOUS tool call's file count as this one's
+            # (the two are often within a second). A coarse filesystem (HFS+,
+            # FAT) can miss a write that lands in the stamp's own second —
+            # under-count, the safe direction.
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime < since:
+                continue
+            out.append((path, is_new))
+            if len(out) > BASH_EDIT_MAX_FILES:
+                return []
+    return out
+
+
+# ── files a Bash call READS into context ────────────────────────────────────
+#
+# A read rule (`event: read`) is about what enters the model's context. The
+# Read tool is one door; `cat`, `head`, `tail`, `less`, `more` and `sed` on a
+# path are the other, and in auto mode the model is TOLD to use them.
+# Measured on 14 days of local sessions: 3,123 Read calls with a median file
+# of 22 lines, against 1,113 bare cat/head/tail segments — and 67 of the 80
+# largest tool results were whole-file shell dumps. A rule that watched only
+# the Read tool would have missed every one of those.
+#
+# Read from the COMMAND, not the disk after the fact: this lane must gate, and
+# a gate can only refuse a call it sees before it runs. A pipe (`cat f |
+# grep`) or a redirect (`cat f > out`) is not a read into context and is
+# skipped, and so is any form this parser cannot name — every doubt resolves
+# to "no read here", which under-counts and never false-fires. `cd` is
+# tracked segment by segment, because `cd <repo> && cat spec.md` is how a
+# real command reads a relative path, and it is the form a prefix-anchored
+# hook (`^cat`) misses entirely.
+
+_READ_CMDS = ("cat", "head", "tail", "less", "more", "sed")
+# stdout going somewhere other than the context: `> f`, `>> f`, `&> f`, and a
+# heredoc opener (its stdin is data). `2>/dev/null` and `2>&1` are not that.
+_REDIRECT_RX = re.compile(r"(?<![0-9&<])>(?!&)|&>|<<")
+_SED_RANGE_RX = re.compile(r"^(\d+)(?:,(\+)?(\d+|\$))?p$")
+_LINES_FLAG_RX = re.compile(r"^(?:-n|--lines=)(\d+)$|^-(\d+)$")
+
+
+def _head_tail_lines(args):
+    """(lines printed, indices of the flag VALUES) for `head`/`tail`: 10 by
+    default, `-N`, `-n N`, `-nN`, `--lines=N`. (None, None) for a form this
+    does not name (`-c` bytes, `-n +N`) — not a read this can measure."""
+    n, i, used = 10, 0, set()
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--bytes") or a.startswith("--bytes=") or a.startswith("-c"):
+            return None, None
+        if a in ("-n", "--lines"):
+            if i + 1 >= len(args) or not args[i + 1].isdigit():
+                return None, None
+            n, used, i = int(args[i + 1]), used | {i + 1}, i + 2
+            continue
+        m = _LINES_FLAG_RX.match(a)
+        if m:
+            n = int(m.group(1) or m.group(2))
+        i += 1
+    return n, used
+
+
+def _sed_lines(args):
+    """(lines printed, indices that are not files) for a `sed` that prints
+    to stdout. `-n 'A,Bp'` is a range, `-n 'Ap'` one line, `-n '1,$p'` the
+    whole file; `sed s/a/b/ f` with no -n prints every line. `-i` writes in
+    place and prints nothing, and a script this cannot read is not a read —
+    both answer (None, None)."""
+    if any(a == "-i" or a.startswith("-i") or a == "--in-place" for a in args):
+        return None, None
+    quiet, script, used, i = False, None, set(), 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-n", "--quiet", "--silent"):
+            quiet = True
+        elif a in ("-e", "--expression", "-f", "--file"):
+            if i + 1 < len(args):
+                used.add(i + 1)
+                if a in ("-e", "--expression"):
+                    script = args[i + 1]
+            i += 2
+            continue
+        elif a.startswith("-"):
+            pass
+        elif script is None:
+            script, used = a, used | {i}
+        i += 1
+    if script is None:
+        return None, None
+    if not quiet:
+        return None, used               # prints the whole file, transformed
+    m = _SED_RANGE_RX.match(script.replace(" ", ""))
+    if not m:
+        return None, None               # `/x/,/y/p` and friends: not a read we can measure
+    a, plus, b = int(m.group(1)), m.group(2), m.group(3)
+    if b is None:
+        return 1, used
+    if b == "$":
+        return None, used
+    return (int(b) + 1 if plus else max(int(b) - a + 1, 0)), used
+
+
+def bash_reads(cwd, cmd):
+    """(path, pulled) for each file a Bash call would print into the context;
+    `pulled` is the line count the form asks for, None meaning every line.
+    Relative paths resolve where the command runs, `cd` included. Anything
+    this cannot name is not a read — the list is empty on every doubt."""
+    out = []
+    here = os.path.expanduser(cwd or "") or os.getcwd()
+    for seg in re.split(r"&&|\|\||;|\n", shell_only(cmd or "")):
+        seg = strip_leading_assignments(seg.strip()).strip()
+        if not seg:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        if toks[0] == "cd":
+            target = os.path.expanduser(toks[1]) if len(toks) > 1 else os.path.expanduser("~")
+            here = target if os.path.isabs(target) else os.path.normpath(os.path.join(here, target))
+            continue
+        if "|" in seg or _REDIRECT_RX.search(seg):
+            continue
+        name = os.path.basename(toks[0])
+        if name not in _READ_CMDS:
+            continue
+        args, pulled, used = toks[1:], None, set()
+        if name in ("head", "tail"):
+            pulled, used = _head_tail_lines(args)
+            if used is None:
+                continue
+        elif name == "sed":
+            pulled, used = _sed_lines(args)
+            if used is None:
+                continue
+        # a token with `<` or `>` in it is a redirection operand (`2>/dev/null`),
+        # never a file to read
+        files = [a for i, a in enumerate(args)
+                 if i not in used and a != "-" and not a.startswith("-") and "<" not in a and ">" not in a]
+        for f in files:
+            path = os.path.expanduser(f)
+            if not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(here, path))
+            out.append((path, pulled))
+            if len(out) >= BASH_READ_MAX_FILES:
+                return out
+    return out
+
+
+def read_facts(path, pulled=None, offset=None, limit=None, total=None):
+    """{"lines": n, "bytes": b} — what this read would pull into the context:
+    the file's length, narrowed by the Read tool's `offset`/`limit` or by the
+    line count a shell form asks for. None when the path is not a regular
+    file, and None never satisfies a `given.file` predicate: a rule about a
+    file it cannot measure stays silent. `total` pre-answers the line count —
+    the verifier's way in, so a case needs no real file."""
+    try:
+        size = None
+        if total is None:
+            st = os.stat(path)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            size, total, seen, last = st.st_size, 0, 0, b"\n"
+            with open(path, "rb") as f:
+                while seen < READ_COUNT_MAX_BYTES:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += chunk.count(b"\n")
+                    seen += len(chunk)
+                    last = chunk[-1:]
+            if seen and last != b"\n":
+                total += 1                # a last line without a newline is still a line
+        total = int(total)
+        n = total
+        if offset is not None:
+            try:
+                n = max(total - max(int(offset), 1) + 1, 0)
+            except (TypeError, ValueError):
+                pass
+        for cap in (limit, pulled):
+            if cap is not None:
+                try:
+                    n = min(n, max(int(cap), 0))
+                except (TypeError, ValueError):
+                    pass
+        nbytes = None
+        if size is not None:
+            nbytes = size if n >= total else (int(size * n / total) if total else 0)
+        return {"lines": n, "bytes": nbytes}
+    except Exception:
+        return None
+
+
+def read_edit_body(path, is_new=True):
+    """What an edit rule reads for a Bash-written file, matching what it
+    reads for the tools: a NEW file is the whole file (a Write), a MODIFIED
+    file is the lines this change added (an Edit's new_string) — not the
+    file it landed in. Read whole, a one-line comment dropped into
+    config.py fired the camelCase rule on every snake_case name already
+    there. None when the file is binary (a NUL byte) or past
+    BASH_EDIT_MAX_BYTES, or when a modified file's diff cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(BASH_EDIT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > BASH_EDIT_MAX_BYTES or b"\0" in raw:
+        return None
+    if is_new:
+        return raw.decode("utf-8", "replace")
+    try:      # against HEAD, so a `git add` inside the same call changes nothing
+        p = subprocess.run(["git", "-C", os.path.dirname(path), "diff", "HEAD", "--no-color",
+                            "--no-ext-diff", "-U0", "--", path],
+                           capture_output=True, timeout=5)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    added = [l[1:] for l in p.stdout.decode("utf-8", "replace").split("\n")
+             if l.startswith("+") and not l.startswith("+++")]
+    return "\n".join(added)
+
+
 # ── matcher engine: pure ────────────────────────────────────────────────────
 def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text=""):
     """True if `rule` fires on this event. No I/O, no dedup. Ordering rules are not matchers (see
@@ -154,9 +667,7 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
             # Legacy `match_heredoc_body` without body_rx matches the whole string.
             shell = shell_only(cmd)
             target = cmd if (rule.get("match_heredoc_body") and not rule.get("body_rx")) else shell
-            if not re.search(rule["rx"], target, re.I | re.M):
-                return False
-            if rule.get("not_rx") and re.search(rule["not_rx"], target, re.I):
+            if not command_fires(rule["rx"], target, rule.get("not_rx")):
                 return False
             if rule.get("body_rx"):
                 kept = set(shell.split("\n"))
@@ -166,8 +677,26 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
         if hook_phase == "pre" and on == "edit" and tool in EDIT_TOOLS:
             if re.search(rule["path_rx"], file_path) and not (
                     rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)):
-                return "content_rx" not in rule or bool(re.search(rule["content_rx"], body, re.M))
+                if "content_rx" in rule and not re.search(rule["content_rx"], body, re.M):
+                    return False
+                # content_not_rx exempts the whole edit — the complied-with
+                # form (a suppression that carries its reason, say) must not
+                # keep firing once the author has done what the rule asked.
+                return not (rule.get("content_not_rx")
+                            and re.search(rule["content_not_rx"], body, re.M))
             return False
+        if hook_phase == "pre" and on == "read" and tool in READ_TOOLS and file_path:
+            # Which file, not how much: size is a `given.file` fact, answered
+            # per event, so the same rule reads the same on the Read tool and
+            # on a `cat`. A read that came through a shell command honours the
+            # rule's command exemption — the veto a bash rule gets.
+            if rule.get("path_rx") and not re.search(rule["path_rx"], file_path):
+                return False
+            if rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path):
+                return False
+            if cmd and rule.get("not_rx") and re.search(rule["not_rx"], cmd, re.I):
+                return False
+            return True
         if hook_phase == "pre" and on == "write_stdlib" and tool == "Write" \
                 and file_path.endswith(".py") and "scratchpad" not in file_path \
                 and not (rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)) \
@@ -177,12 +706,26 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
         if hook_phase == "post" and on == "result" and result_text:
             if rule.get("cmd_rx") and not re.search(rule["cmd_rx"], cmd, re.I):
                 return False
-            tail = result_text[-8000:]
-            m = re.search(rule["rx"], tail, re.M)
+            if rule.get("cmd_not_rx") and cmd and re.search(rule["cmd_not_rx"], cmd, re.I):
+                return False          # the server's command_not_rx, honoured on the post lane too
+            # A long result puts the two things a rule looks for at OPPOSITE
+            # ends: pytest prints the traceback at the top and the failure
+            # summary at the bottom, so a tail-only window silently misses
+            # every exception in a run long enough to need a window at all.
+            # Scan both ends, as separate spans so no pattern can match across
+            # the gap between them.
+            if len(result_text) <= 2 * RESULT_WINDOW_CHARS:
+                spans = (result_text,)
+            else:
+                spans = (result_text[:RESULT_WINDOW_CHARS],
+                         result_text[-RESULT_WINDOW_CHARS:])
             # exclude_rx exempts the whole result (an exempt test name usually
-            # sits outside the matched span), not just the matched substring
-            return bool(m) and not (
-                rule.get("exclude_rx") and re.search(rule["exclude_rx"], tail, re.M))
+            # sits outside the matched span), not just the matched substring —
+            # so it is checked over the same spans the match is drawn from
+            if rule.get("exclude_rx") and any(
+                    re.search(rule["exclude_rx"], sp, re.M) for sp in spans):
+                return False
+            return any(re.search(rule["rx"], sp, re.M) for sp in spans)
     except Exception:
         return False
     return False
@@ -207,11 +750,14 @@ class OrderingEngine:
         self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
+        if portable_lock is None:
+            # Matcher gates need no shared state; only ordering gates fail open.
+            return None
         lock = open(self.path + ".lock", "a+", encoding="utf-8")
         deadline = time.monotonic() + LOCK_WAIT_S
         while True:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                portable_lock.lock_exclusive(lock.fileno(), blocking=False)
                 return lock
             except OSError:
                 if time.monotonic() >= deadline:
@@ -244,7 +790,7 @@ class OrderingEngine:
                 rule_id, {"count": 0, "last_edit": None})["open_fire"] = fire_id
             self._write(st)
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            portable_lock.unlock(lock.fileno())
             lock.close()
 
     def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None):
@@ -267,7 +813,7 @@ class OrderingEngine:
             re.search(spec["required_command_rx"], last) and \
             "|" not in last and not last.rstrip().endswith("&")   # piped / backgrounded: status isn't the suite's
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
-            re.search(spec["gated_command_rx"], seg)
+            command_fires(spec["gated_command_rx"], seg, flags=0)
         if not (is_edit or is_receipt or is_gate):
             return None
 
@@ -301,7 +847,7 @@ class OrderingEngine:
                 return "fired"
             return "allowed"
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            portable_lock.unlock(lock.fileno())
             lock.close()
 
 
@@ -325,6 +871,363 @@ def bash_ok(resp, *, strict=False):
     return not re.search(
         r"(^|\n)(FAILED|ERROR)\b|\b\d+ (failed|errors?)\b|\nTraceback \(most recent call last\)"
         r"|(^|\n)npm ERR!|(^|\n)error(\[E\d+\])?:", txt)
+
+
+# ── given: predicates a matched rule must also satisfy ──────────────────────
+PROBE_TIMEOUT_S = 1.0        # per git call; a probe past it answers None, never blocks the call
+_TURNS_MAX_BYTES = 16 * 1024 * 1024   # transcript larger than this: only its tail is read
+_TURNS_KEEP = 200            # most recent user turns kept
+_TURN_CHARS = 2000           # per turn
+# value kinds per key — the same allowlist the server validates at authoring
+_GIVEN = {
+    "repo": {"branch_rx": "rx", "branch_not_rx": "rx", "diff_lines_gt": "int",
+             "diff_files_gt": "int", "diff_paths_rx": "rx", "diff_paths_none_rx": "rx",
+             "dirty": "bool"},
+    "user": {"said_rx": "rx", "not_said_rx": "rx"},
+    # what a read would pull into context — answered per EVENT (`read_facts`),
+    # not per call, so a `cat a b` is measured file by file
+    "file": {"lines_gt": "int", "bytes_gt": "int"},
+    # main agent vs subagent (transcript under <session>/subagents/). A rule
+    # about the main context's budget says `main: true`, and a subagent's
+    # reads pass — delegation is the way past the rule, so it must not gate
+    # the delegate.
+    "agent": {"main": "bool"},
+}
+
+
+def given_norm(g):
+    """Lint a rule's `given` block off the wire. Returns the block, or None on
+    an unknown sub-block, an unknown key, or a value of the wrong kind — and
+    None drops the RULE, as rx_ok does. A rule that passed the server's
+    allowlist yet fails here must not fire with its predicate silently
+    ignored: that is a rule firing when its author said it should not."""
+    if not isinstance(g, dict) or not g:
+        return None
+    out = {}
+    for block, spec in g.items():
+        kinds = _GIVEN.get(block)
+        if kinds is None or not isinstance(spec, dict) or not spec:
+            return None
+        for k, v in spec.items():
+            kind = kinds.get(k)
+            if kind == "rx":
+                if not rx_ok(v):
+                    return None
+            elif kind == "int":
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    return None
+            elif kind == "bool":
+                if not isinstance(v, bool):
+                    return None
+            else:
+                return None
+        out[block] = dict(spec)
+    return out
+
+
+def user_turns_of(tp):
+    """What the person typed this session, oldest first. A transcript `user`
+    record is also how tool results and injected context arrive, so this keeps
+    only real prompts: no `toolUseResult`, no `tool_result` block, no `isMeta`
+    row, no compaction summary. A substring pre-filter keeps it to one
+    json.loads per candidate line. None when there is no transcript — and
+    None never satisfies a `user` predicate."""
+    if not tp:
+        return None
+    try:
+        size = os.path.getsize(tp)
+        turns = []
+        with open(tp, "rb") as f:
+            if size > _TURNS_MAX_BYTES:
+                f.seek(size - _TURNS_MAX_BYTES)
+                f.readline()                       # the cut line
+            for raw in f:
+                if b'"user"' not in raw or b'"type"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except Exception:
+                    continue
+                if rec.get("type") != "user" or rec.get("isMeta") \
+                        or rec.get("isCompactSummary") or "toolUseResult" in rec:
+                    continue
+                c = (rec.get("message") or {}).get("content")
+                if isinstance(c, str):
+                    text = c
+                elif isinstance(c, list):
+                    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                        continue
+                    text = "\n".join((b.get("text") or "") for b in c
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    continue
+                text = text.strip()
+                if text:
+                    turns.append(text[:_TURN_CHARS])
+        return turns[-_TURNS_KEEP:]
+    except Exception:
+        return None
+
+
+_ARG = r"(?:'([^']*)'|\"([^\"]*)\"|([^\s;&|]+))"
+_BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
+# A plain branch name, and nothing that reaches elsewhere in history: no rev
+# syntax (`~ ^ : @{…}`), no path traversal, no leading dash.
+_BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
+_CD_PREFIX = re.compile(r"^\s*cd\s+" + _ARG + r"\s*(?:&&|;)")
+
+
+def command_root(cwd, command):
+    """The worktree the command actually runs in, when it says so itself.
+
+    A hook payload carries the SESSION's cwd, but an agent working across
+    worktrees runs `cd <other-repo> && …` in a single call — and then every
+    repo fact answered from the session's cwd describes the wrong tree. Only a
+    leading `cd` counts: it is the form that redirects the whole command, and
+    guessing at one buried mid-pipeline would answer with a directory the
+    command may never reach. Returns "" when there is no such prefix or it
+    does not resolve to a worktree, and the caller keeps the session's root.
+    """
+    m = _CD_PREFIX.match(command or "")
+    if not m:
+        return ""
+    path = next((g for g in m.groups() if g), "")
+    if not path:
+        return ""
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd or "", path)
+    if not os.path.isdir(path):
+        return ""
+    return repo_info(path)[1]
+
+
+class Probes:
+    """The facts a `given` block asks about, answered lazily and at most once
+    per hook call. Nothing runs unless a rule whose regex already matched
+    carries a `given`, each git call is read-only and bounded by
+    PROBE_TIMEOUT_S, and nothing here leaves the machine. A probe that fails
+    answers None, and None never satisfies a predicate: a rule with a `given`
+    it cannot check stays silent, which is the fail-open direction.
+    `fixture` pre-answers probes by name — the verifier's and the tests' way
+    in, so given_ok() never needs a real repo to be exercised."""
+
+    def __init__(self, root, branch, transcript_path=None, fixture=None, command="",
+                 agent_id=None):
+        self.root, self._branch, self.tp = root, branch, transcript_path
+        self._fix = dict(fixture or {})
+        self._memo = {}
+        self._cmd = command or ""
+        self._agent_id = agent_id
+
+    def _get(self, key, compute):
+        if key in self._fix:
+            return self._fix[key]
+        if key not in self._memo:
+            try:
+                self._memo[key] = compute()
+            except Exception:
+                self._memo[key] = None
+        return self._memo[key]
+
+    def _git(self, *args):
+        import subprocess
+        p = subprocess.run(["git", "-C", self.root, *args], capture_output=True,
+                           text=True, timeout=PROBE_TIMEOUT_S)
+        return p.stdout if p.returncode == 0 else None
+
+    def branch(self):
+        return self._get("branch", lambda: self._branch)
+
+    def _named_base(self):
+        """The base branch the in-flight command names (`--base staging`), when
+        it is a branch this rule may honestly be measured against.
+
+        Read off the command because that is the only place the answer exists —
+        but the command is written by the party the rule gates, so a named base
+        is CHECKED, never taken on trust. Three ways it is refused, each of
+        which falls through to the remote default and so OVER-measures rather
+        than under-measures:
+
+        * **Not a plain remote branch name.** Rev syntax (`HEAD`, `abc123`,
+          `main~40`) is not a base a PR can merge into, and would let the
+          comparison point be moved anywhere in history.
+        * **Nothing to merge into it** — `merge-base(base, HEAD) == HEAD`. This
+          is the bypass that matters: naming your OWN branch, or any descendant
+          of it, makes the diff measure zero and a 5,000-line branch reads as
+          empty. A PR onto such a base would be empty too, so no honest call
+          names one.
+        * **More than one distinct base named.** `… --base <mine> || … --base
+          staging` would probe the first and open the second. If a command
+          cannot say plainly what it merges into, it does not get to choose.
+
+        None of this makes the gate proof against the party running the shell —
+        nothing here could, and `RULEBOOK_OVERRIDE=` is the sanctioned way past
+        it precisely because it is RECORDED. What this closes is the silent
+        version: a bypass that leaves no fire and no reason behind it.
+        """
+        named = {next((g for g in m.groups() if g), "")
+                 for m in _BASE_ARG.finditer(self._cmd)}
+        named.discard("")
+        if len(named) != 1:
+            return ""
+        base = named.pop()
+        if not _BRANCH_NAME.match(base) or base == "HEAD":
+            return ""
+        # A real remote branch, not just any rev that happens to resolve.
+        if self._git("rev-parse", "--verify", "-q",
+                     f"refs/remotes/origin/{base}^{{commit}}") is None:
+            return ""
+        mb = (self._git("merge-base", f"origin/{base}", "HEAD") or "").strip()
+        head = (self._git("rev-parse", "HEAD") or "").strip()
+        return "" if not mb or not head or mb == head else base
+
+    def _remote_head(self):
+        """`refs/remotes/origin/HEAD` — the remote's own default branch, set by
+        clone. Absent in plenty of checkouts, hence the name list after it."""
+        out = self._git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        return (out or "").strip()
+
+    def base(self):
+        """Merge-base with the branch this one will be compared against, in the
+        order that gets it RIGHT rather than the order that is cheapest:
+        MEMHUB_RULEBOOK_BASE_BRANCH, the base the command itself names
+        (`gh pr create --base staging`), the remote's own default
+        (`refs/remotes/origin/HEAD`), then the usual names as a last guess.
+        None when no candidate exists (a fresh repo) — every diff probe then
+        answers None too.
+
+        Guessing `main` first was wrong wherever a repo merges into something
+        else: against `origin/main`, a PR onto a long-lived `staging` measures
+        the whole staging-vs-main delta instead of the branch, so a
+        `diff_lines_gt` rule fires on every PR in that repo no matter how small.
+        """
+        def compute():
+            env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
+            named = self._named_base()
+            cands = ([env] if env else [])
+            # `--base staging` names a branch, not a ref: try the remote's copy
+            # before the local one, which may be stale or absent.
+            cands += [f"origin/{named}", named] if named else []
+            cands += [r for r in [self._remote_head()] if r]
+            cands += ["origin/main", "origin/master", "origin/develop",
+                      "main", "master", "develop"]
+            for cand in cands:
+                if self._git("rev-parse", "--verify", "-q", cand + "^{commit}") is None:
+                    continue
+                mb = self._git("merge-base", cand, "HEAD")
+                return mb.strip() if mb and mb.strip() else None
+            return None
+        return self._get("base", compute)
+
+    def diff_paths(self):
+        """Paths the branch has changed against its base, working tree
+        included — committed, staged, unstaged, and untracked files (a new
+        test file is usually untracked when the rule asks about it)."""
+        def compute():
+            mb = self.base()
+            if mb is None:
+                return None
+            tracked = self._git("diff", "--name-only", mb)
+            untracked = self._git("ls-files", "--others", "--exclude-standard")
+            if tracked is None or untracked is None:
+                return None
+            return sorted({l.strip() for l in (tracked + "\n" + untracked).split("\n") if l.strip()})
+        return self._get("diff_paths", compute)
+
+    def diff_lines(self):
+        """Added + deleted lines against the base, working tree included;
+        untracked files count their line total (at most 200 files, 1 MiB each)."""
+        def compute():
+            mb = self.base()
+            if mb is None:
+                return None
+            out = self._git("diff", "--numstat", mb)
+            if out is None:
+                return None
+            n = 0
+            for line in out.split("\n"):
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    n += int(parts[0]) + int(parts[1])
+            untracked = self._git("ls-files", "--others", "--exclude-standard") or ""
+            for p in [l.strip() for l in untracked.split("\n") if l.strip()][:200]:
+                try:
+                    with open(os.path.join(self.root, p), "rb") as f:
+                        n += f.read(1 << 20).count(b"\n")
+                except Exception:
+                    pass
+            return n
+        return self._get("diff_lines", compute)
+
+    def dirty(self):
+        def compute():
+            out = self._git("status", "--porcelain")
+            return None if out is None else bool(out.strip())
+        return self._get("dirty", compute)
+
+    def user_turns(self):
+        return self._get("user_turns", lambda: user_turns_of(self.tp))
+
+    def agent_main(self):
+        """True for the main agent, False inside a subagent — read off the
+        transcript path, the one place the harness says which this is."""
+        return self._get("agent_main", lambda: self._agent_id is None)
+
+
+def given_ok(rule, probes, read=None):
+    """True when every predicate in the rule's `given` holds. Pure over the
+    Probes (which memoizes) and `read`, the event's own `read_facts`; a probe
+    answering None — or a `file` predicate with no facts — fails."""
+    g = rule.get("given")
+    if not g:
+        return True
+    for k, v in (g.get("file") or {}).items():
+        have = (read or {}).get({"lines_gt": "lines", "bytes_gt": "bytes"}.get(k, ""))
+        if have is None or not have > v:
+            return False
+    for k, v in (g.get("agent") or {}).items():
+        if k == "main":
+            m = probes.agent_main()
+            if m is None or m != v:
+                return False
+    for k, v in (g.get("repo") or {}).items():
+        if k == "branch_rx":
+            b = probes.branch()
+            if not b or not re.search(v, b):
+                return False
+        elif k == "branch_not_rx":
+            b = probes.branch()
+            if not b or re.search(v, b):
+                return False
+        elif k == "diff_lines_gt":
+            n = probes.diff_lines()
+            if n is None or not n > v:
+                return False
+        elif k == "diff_files_gt":
+            ps = probes.diff_paths()
+            if ps is None or not len(ps) > v:
+                return False
+        elif k == "diff_paths_rx":
+            ps = probes.diff_paths()
+            if ps is None or not any(re.search(v, p) for p in ps):
+                return False
+        elif k == "diff_paths_none_rx":
+            ps = probes.diff_paths()
+            if ps is None or any(re.search(v, p) for p in ps):
+                return False
+        elif k == "dirty":
+            d = probes.dirty()
+            if d is None or d != v:
+                return False
+    for k, v in (g.get("user") or {}).items():
+        turns = probes.user_turns()
+        if turns is None:
+            return False
+        said = any(re.search(v, t, re.I) for t in turns)
+        if (k == "said_rx" and not said) or (k == "not_said_rx" and said):
+            return False
+    return True
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -361,7 +1264,10 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
-_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label", "on", "repo_scope", "_scope_repos", "anchors", "ordering"})
+_RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
+                                 "on", "repo_scope", "_scope_repos", "_scope_paths",
+                                 "_scope_exclude_paths", "anchors", "ordering",
+                                 "_rulebook_id", "_book_name", "_book_scope", "_book_members"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -402,12 +1308,17 @@ def _version_of(v):
     return None
 
 
-def _clean_text(v):
+def _one_line(v):
     """Server rule prose is display data, not instructions: one line, no
-    control characters, length-capped before it enters the model context."""
-    t = re.sub(r"[\x00-\x1f\x7f]+", " ", str(v or ""))
-    t = re.sub(r"\s+", " ", t).strip()
-    return t[:_TEXT_MAX]
+    control characters. A newline would let a rule forge an advisory line of
+    its own, and a raw `\x1b[2J` clears the reader's terminal — this text
+    reaches both the model's context and the user's `systemMessage`."""
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]+", " ", str(v or ""))).strip()
+
+
+def _clean_text(v):
+    """`_one_line`, length-capped for the fields that enter the context."""
+    return _one_line(v)[:_TEXT_MAX]
 
 
 def _why(r):
@@ -416,34 +1327,121 @@ def _why(r):
     return f"  _(why: {r['why']})_" if r.get("why") else ""
 
 
+_BOOK_SCOPES = ("all_org", "explicit")
+_BOOK_NAME_MAX = 120
+_BOOK_ID_MAX = 64            # a UUID is 36; longer is rejected, never truncated
+# An id is rejected, not repaired: it is a dedup key and a ledger column, so a
+# cleaned one would silently be a different book.
+_ID_OK = re.compile(r"[^\x00-\x1f\x7f]{1,%d}" % _BOOK_ID_MAX)
+_BOOK_MEMBERS_MAX = 10 ** 9  # an org, not a number the server chose to render
+# Hook-internal, and derivable ONLY from the server's `rulebook` block. A row
+# is server data: left alone, a row that simply spells these keys itself would
+# name its own precedence — and `_book_members: "many"` would take the whole
+# lane down through book_rank. They are stripped on the way in.
+_BOOK_KEYS = ("_rulebook_id", "_book_name", "_book_scope", "_book_members")
+
+
+def _book_facts(row):
+    """The precedence facts the server puts on the wire (container spec §6.4a):
+    which rulebook a rule came from, how wide that book's membership is, and
+    what the book is called. The server computes NO precedence and stores no
+    conflict edges — it ships `scope` and `member_count` and the hook decides
+    what "wider" means (D14).
+
+    A backend that predates the rulebook container sends neither key. Every
+    rule then carries the same absent facts, `book_rank` returns one value for
+    all of them, and the stable sorts below leave book order exactly as it is
+    today — which is what makes one plugin build work against both backends."""
+    b = row.get("rulebook")
+    b = b if isinstance(b, dict) else {}
+    out = {}
+    rid = row.get("rulebook_id") or b.get("rulebook_id")
+    rid = rid.strip() if isinstance(rid, str) else ""
+    if _ID_OK.fullmatch(rid):        # `{1,64}` rejects the empty string itself
+        out["_rulebook_id"] = rid
+    name = _clean_text(b.get("name"))[:_BOOK_NAME_MAX]
+    if name:
+        out["_book_name"] = name
+    if b.get("scope") in _BOOK_SCOPES:
+        out["_book_scope"] = b["scope"]
+    mc = b.get("member_count")
+    # Bounded, because it is rendered: a four-thousand-digit member_count is
+    # valid JSON and would spend the session-start budget on digits alone.
+    if isinstance(mc, int) and not isinstance(mc, bool) and 0 <= mc <= _BOOK_MEMBERS_MAX:
+        out["_book_members"] = mc
+    return out
+
+
+def book_rank(rule):
+    """Precedence between books, and nothing else: a rule from a book that
+    binds the whole org outranks one from a book of three (§11 — "wider member
+    scope wins" is the hook's call to make, not the server's).
+
+    It orders; it never suppresses. Two rules that both fire both fire — the
+    rank only decides which one the MAX_ADVISE cap keeps, and the cut ones are
+    already logged `mode="suppressed"` to the ledger. Every sort using it is
+    STABLE, so rules within one book — and every rule from a backend that
+    sends no book facts — keep the order the book gave them."""
+    members = rule.get("_book_members")
+    return (0 if rule.get("_book_scope") == "all_org" else 1,
+            -members if isinstance(members, int) and not isinstance(members, bool) else 0)
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
-    Rows already in the pilot shape (an `on` key) pass through. Never raises
-    on a malformed row: returns None and the row is skipped."""
+    Rows already in the pilot shape (an `on` key) pass through. The book facts
+    (`_rulebook_id`, `_book_name`, `_book_scope`, `_book_members`) ride along
+    on both paths; they are absent, harmlessly, on a pre-container backend.
+    Never raises on a malformed row: returns None and the row is skipped."""
     try:
         if not isinstance(row, dict):
             return None
         if "on" in row:
-            r = dict(row)
+            r = {k: v for k, v in row.items() if k not in _BOOK_KEYS}
             r.setdefault("id", row.get("rule_id"))
             r.setdefault("_version", _version_of(row.get("version")))
+            r.update(_book_facts(row))   # the block is the only source of these
+            # Prose off the wire, on either shape: no control bytes reach a
+            # terminal. Length is capped too — EXCEPT `text`/`why` on a session
+            # rule, the one field pair POSTURE_BUDGET_CHARS actually measures,
+            # where truncating would serve an oversized rule the budget exists
+            # to drop. Every other field is measured by no budget at all: an
+            # advisory's text is rendered straight into the pre/post lane, a
+            # gate is never cut by the advisory cap, and a label is never
+            # measured — so they take the cap the server shape already gets.
+            _cap = _one_line if r.get("on") == "session" else _clean_text
+            for k in ("text", "why"):
+                if k in r:
+                    r[k] = _cap(r[k])
+            for k in ("_label", "_gate_msg"):
+                if k in r:
+                    r[k] = _clean_text(r[k])
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
             if isinstance(r.get("ordering"), dict) and not all(
                     rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
                 return None
+            if "given" in r:
+                r["given"] = given_norm(r["given"])
+                if r["given"] is None:
+                    return None
             return r
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
              "_label": _clean_text(row.get("title")) or None,
              "mode": row.get("mode", "advise"), "_version": _version_of(row.get("version"))}
+        r.update(_book_facts(row))   # built from scratch here, so nothing to strip
         if not r["id"]:
             return None
         scopes = [str(x) for x in (row.get("scope_repos") or []) if x]
         r["repo_scope"] = "any"
         if scopes:
             r["_scope_repos"] = scopes
+        for k in ("scope_paths", "scope_exclude_paths"):   # §3.1 globs; see path_in_scope
+            globs = [x for x in (row.get(k) or []) if isinstance(x, str) and x.strip()]
+            if globs:
+                r["_" + k] = globs[:64]
         # v2.4: anchor rules carry their own identifiers; session rules carry nothing
         if row.get("delivery") == "session_context":
             r["on"] = "session"
@@ -485,6 +1483,10 @@ def to_hook_rule(row):
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
+        if "given" in r:
+            r["given"] = given_norm(r["given"])
+            if r["given"] is None:      # unknown key or wrong kind: drop the RULE, as rx_ok does
+                return None
         return r
     except Exception:
         return None
@@ -503,20 +1505,64 @@ def load_rules(repo):
     return rules, "", (book or {}).get("fetched_at"), sources
 
 
-def effective_mode(rule, fetched_at, now=None):
-    """`gate` is honoured only from a book fetched (200 or 304) within the last
-    24 h (§5.3); anything else is `advise`. """
-    mode = rule.get("mode", "advise")
-    if mode != "gate":
-        return "advise"
+def _age_s(iso):
+    """Seconds since a stamp written by `_now()`; unparseable or missing → inf."""
     try:
-        ts = datetime.fromisoformat(str(fetched_at))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        now = now or datetime.now(timezone.utc)
-        return "gate" if (now - ts).total_seconds() <= BOOK_MAX_AGE_S else "advise"
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(str(iso))).total_seconds()
     except Exception:
-        return "advise"
+        return float("inf")
+
+
+def maybe_refresh(repo, fetched_at):
+    """A session outlives its SessionStart fetch — a /loop or an overnight
+    babysit runs for days on the book it started with, and a gate flipped
+    back to advise on the server would keep blocking it until restart. Once
+    the cache is a minute old, refresh it in the background: the child is
+    detached, so the lane never waits, and the stamp file keeps a dead server
+    from being probed more than once a minute. No cache at all
+    counts as infinitely old, so a session whose start-up fetch failed gets
+    retried here too."""
+    if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0":
+        return
+    if _age_s(fetched_at) < REFRESH_AFTER_S:
+        return
+    stamp = book_path(repo) + ".refresh"
+    try:
+        with open(stamp, encoding="utf-8") as f:
+            if _age_s(json.load(f).get("at")) < REFRESH_RETRY_S:
+                return
+    except Exception:
+        pass
+    try:
+        # The stamp records the ATTEMPT, so it goes first: a fork that fails
+        # under resource pressure must not be retried on every tool call, and
+        # a minute before the next try costs at most one override on a rule
+        # the server has since retired. The other order was tried and reverted.
+        _atomic_json(stamp, {"at": _now()})
+        spawn_fetch(repo)
+    except Exception:
+        pass
+
+
+def path_in_scope(rule, path, root=""):
+    """The server's §3.1 path scope, mirrored (crud.path_in_scope): in-scope AND
+    NOT excluded, fnmatch against the path relative to the worktree root and,
+    as the server does, against `*/<glob>`. A path-scoped rule needs a path
+    to match at all — a Bash call carries none, so an include-scoped rule
+    never fires there and an exclude-only one always may."""
+    inc = rule.get("_scope_paths") or []
+    exc = rule.get("_scope_exclude_paths") or []
+    if not inc and not exc:
+        return True
+    if not path:
+        return not inc
+    cands = {path}
+    if root and path.startswith(root.rstrip("/") + "/"):
+        cands.add(os.path.relpath(path, root))
+
+    def hit(g):
+        return any(fnmatch.fnmatch(c, g) or fnmatch.fnmatch(c, f"*/{g}") for c in cands)
+    return ((not inc) or any(hit(g) for g in inc)) and not any(hit(g) for g in exc)
 
 
 def scope_ok(rule, repo, gitdir):
@@ -524,7 +1570,15 @@ def scope_ok(rule, repo, gitdir):
     if rule.get("_scope_repos"):        # server list: this checkout's name or its main
         parts = gitdir.split("/") if gitdir else []   # checkout's (…/<main>/.git/worktrees/x)
         main = parts[parts.index(".git") - 1] if ".git" in parts and parts.index(".git") > 0 else ""
-        return any(s == repo or (main and s == main) for s in rule["_scope_repos"])
+        # Folded, and folded on the SERVER too (crud._rule_in_repo): the name
+        # in the rule was typed by a person, the name here was resolved from a
+        # remote URL on someone's machine. Matching them exactly makes
+        # "memhub-backend" and "MemHub-Backend" different repositories, and the
+        # rule then just never fires, with nothing anywhere saying why. Folding
+        # on one side only would be worse than neither: the server would ship a
+        # rule this would then discard.
+        here = {repo.casefold(), main.casefold()} - {""}
+        return any(s.casefold() in here for s in rule["_scope_repos"])
     if scope == "any":
         return True
     return scope in repo or (gitdir and f"/{scope}/" in gitdir)
@@ -544,7 +1598,7 @@ def _api():
     return pak.api_base(url), bearer, mcp_http
 
 
-def fetch_book(repo):
+def fetch_book(repo, timeout=None):
     """GET /rules?repo=<repo>&view=hook with If-None-Match.
 
     No `status=` param: `view=hook` serves ACTIVE rules on its own, and the
@@ -563,7 +1617,7 @@ def fetch_book(repo):
     q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
-                          timeout=FETCH_TIMEOUT_S)
+                          timeout=timeout or FETCH_TIMEOUT_S)
     except Exception as exc:          # keep the cache; say so where an operator can look
         _breadcrumb("fetch", exc)
         return
@@ -573,6 +1627,8 @@ def fetch_book(repo):
             and isinstance(reply.data.get("rules"), list):
         _atomic_json(book_path(repo), {"etag": reply.etag, "fetched_at": _now(),
                                        "rules": reply.data["rules"]})
+    else:                             # a 2xx with the wrong shape is a failure too — say so
+        _breadcrumb("fetch", f"HTTP {reply.status}: unexpected reply shape")
 
 
 # ── what leaves the machine on the recall path ─────────────────────────────
@@ -644,9 +1700,11 @@ RECALL_TIMEOUT_S = _timeout(1.5)   # inside the PreToolUse hook budget; fail ope
 def recall_anchor_rules(repo, tool, handles, already_fired):
     """POST /recall — the server runs the book's anchor rules through xmem's
     directive funnel (identifier extraction → exact anchor match → the SLM
-    relevance judge). Returns the kept rule ids, or [] on ANY failure: an
-    anchor being present is not relevance, and a judge outage is never a
-    reason to block or slow the call."""
+    relevance judge). Returns the kept server ROWS (not ids: the reply
+    carries title/statement/version/anchors, which is a whole rule, and the
+    caller needs them for a rule its cached book does not have yet), or [] on
+    ANY failure: an anchor being present is not relevance, and a judge outage
+    is never a reason to block or slow the call."""
     try:
         api = _api()
         if not api:
@@ -658,7 +1716,10 @@ def recall_anchor_rules(repo, tool, handles, already_fired):
                           timeout=RECALL_TIMEOUT_S)
         if reply.status != 200 or not isinstance(reply.data, dict):
             return []
-        return [str(r.get("rule_id")) for r in reply.data.get("rules") or []
+        # The lane's only record of working. Zero kept rules is still a success:
+        # what is being retracted is "recall is failing", not "a rule matched".
+        _breadcrumb_clear("recall")
+        return [r for r in reply.data.get("rules") or []
                 if isinstance(r, dict) and r.get("rule_id")]
     except Exception as exc:
         _breadcrumb("recall", exc)
@@ -716,6 +1777,29 @@ def _breadcrumb(what, exc):
         _atomic_json(os.path.join(_ledger_dir(), ".last_error"),
                      {"at": _now(), "what": what, "error": str(exc)[:300]})
     except Exception:
+        pass
+
+
+def _breadcrumb_clear(what):
+    """Retract the breadcrumb once ``what``'s own lane has worked again.
+
+    Without this a lane that records no success of its own — recall — leaves a
+    single blip standing until some OTHER lane happens to succeed. Recall runs
+    on PreToolUse and the book is only refetched at SessionStart, so one 1.5 s
+    timeout mid-session reliably produced a health banner at the next session
+    start, long after the lane had recovered. A warning that outlives its cause
+    is the failure mode this file exists to avoid.
+
+    Only clears a crumb this lane wrote: another lane's failure is still real.
+    """
+    path = os.path.join(_ledger_dir(), ".last_error")
+    try:
+        with open(path, encoding="utf-8") as f:
+            crumb = json.load(f)
+        if not isinstance(crumb, dict) or crumb.get("what") != what:
+            return
+        os.unlink(path)
+    except Exception:      # no crumb, unreadable, or already gone — all fine
         pass
 
 
@@ -867,10 +1951,13 @@ def flush_fires(final=False):
     a failed batch is retried, verbatim, on the next flush; `rejected` rows
     are logged locally and never retried (they sit behind the watermark).
     One flusher at a time via flock; a second caller simply leaves."""
+    if portable_lock is None:
+        # Retain the ledger rather than advancing it without process exclusivity.
+        return
     ldir = _ledger_dir()
     lock = open(os.path.join(ldir, ".flush.lock"), "a+", encoding="utf-8")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        portable_lock.lock_exclusive(lock.fileno(), blocking=False)
     except OSError:
         lock.close()
         return
@@ -936,31 +2023,151 @@ def flush_fires(final=False):
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
     finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        portable_lock.unlock(lock.fileno())
         lock.close()
 
 
 def repo_info(cwd):
-    """(repo_basename, worktree_root, gitdir_path, branch) via file reads only."""
-    d = cwd
-    while d and d != "/":
+    """(repo_name, worktree_root, gitdir_path, branch).
+
+    The name is the REPO's, not the directory's: a worktree directory is named
+    after the branch, so keying the book on it fetched one book per branch and
+    matched `scope_repos: ["xmem"]` in none of them (`repo_identity` carries
+    the resolution order). Every other field stays physical — `root` is what
+    path scope and the diff probes measure, and ordering state must key on
+    THIS checkout, not on the repo it belongs to."""
+    d = os.path.abspath(cwd or "")
+    while d:
         g = os.path.join(d, ".git")
         if os.path.isdir(g):
-            return os.path.basename(d), d, g, _branch(os.path.join(g, "HEAD"))
+            return _repo_name(d, g), d, g, _branch(os.path.join(g, "HEAD"))
         if os.path.isfile(g):   # worktree: "gitdir: /path/to/main/.git/worktrees/x"
             try:
                 gitdir = open(g, encoding="utf-8").read().split(":", 1)[1].strip()
+                if not os.path.isabs(gitdir):    # `git worktree --relative-paths`
+                    gitdir = os.path.normpath(os.path.join(d, gitdir))
             except Exception:
                 gitdir = ""
-            return os.path.basename(d), d, gitdir, _branch(os.path.join(gitdir, "HEAD"))
-        d = os.path.dirname(d)
+            return (_repo_name(d, gitdir), d, gitdir,
+                    _branch(os.path.join(gitdir, "HEAD")))
+        parent = os.path.dirname(d)
+        if parent == d:  # POSIX, drive, and UNC roots are fixed points.
+            break
+        d = parent
     return "", "", "", ""
 
 
+def _repo_name(root, gitdir):
+    """The repo `root` belongs to, degrading to its basename when the shim is
+    unavailable. A hook that cannot name the repo must still deliver every
+    rule that binds every repo."""
+    if repo_identity is None:
+        return os.path.basename(root)
+    try:
+        return repo_identity.repo_name(root, gitdir)
+    except Exception:
+        return os.path.basename(root)
+
+
+_SEED_MAX_HOPS = 64   # a Write names a new dir a few levels deep, never thousands
+
+
+def _under(path, base):
+    """True when `path` is `base` or sits beneath it. `join(base, "")` is the
+    only spelling of the prefix that is right at a POSIX root ("/"), a Windows
+    drive root ("C:\\") and an ordinary directory alike, and it keeps a sibling
+    that merely shares a name prefix (/a/bc vs /a/b) out."""
+    return path == base or path.startswith(os.path.join(base, ""))
+
+
+def _acted_on_dir(cwd, inp):
+    """The directory of the file this call acts on, in the SESSION's own path
+    space, or "" when the payload names none this session may reach.
+
+    Payload data must not steer where the hook looks, so the session cwd is
+    the trust boundary. Containment is checked TWICE, and both must hold:
+
+    * lexically, on the unresolved path — because that is the path
+      `repo_info` actually walks up from. A symlink OUTSIDE cwd whose target
+      is inside it passes a resolved-only check while its lexical parents
+      still lead somewhere else entirely, which would hand `root` (and so
+      `git -C root`, which honors a repo's local config) to a checkout the
+      session never opened;
+    * and again once symlinks are resolved — so a link UNDER cwd cannot
+      smuggle the lookup out of it.
+
+    Requiring both also pins the value to ONE path space per session: an
+    absolute path spelled differently from cwd (/var vs /private/var, an
+    automounted home) fails the lexical test and falls back to the cwd
+    answer. That matters because `root` keys OrderingEngine state
+    (`{rid}@{root}:{branch}`), and one worktree reached two ways would split
+    into two keys and silently re-arm its ordering rules."""
+    if not (isinstance(inp, dict) and cwd):
+        return ""
+    base = os.path.normpath(cwd)
+    for key in ("file_path", "notebook_path"):      # each judged on its own:
+        fp = inp.get(key)                           # a junk file_path must not
+        if not (isinstance(fp, str) and fp):        # hide a good notebook_path
+            continue
+        try:
+            d = os.path.dirname(fp.replace("\\", "/"))
+            if not os.path.isabs(d):    # relative to the SESSION's cwd, never ours
+                d = os.path.join(cwd, d)
+            d = os.path.normpath(d)
+            if not _under(d, base):
+                continue
+            probe, hops = d, 0          # a Write may name a directory not created yet
+            while not os.path.exists(probe) and os.path.dirname(probe) != probe \
+                    and hops < _SEED_MAX_HOPS:
+                probe, hops = os.path.dirname(probe), hops + 1
+            if _under(os.path.realpath(probe), os.path.realpath(cwd)):
+                return d
+        except (OSError, ValueError):   # payload strings are untrusted (NUL -> ValueError)
+            continue
+    return ""
+
+
+def repo_of_call(data):
+    """(repo, root, gitdir, branch) for the checkout this CALL works in: the
+    acted-on file's first, the session cwd's second, else all empty.
+
+    The acted-on path outranks cwd because of the worktree-parent workflow —
+    an agent running from a directory that CONTAINS many checkouts and editing
+    files inside them. cwd resolves nothing there, and gating the rulebook on
+    it alone left every rule silently inert for the whole session while the
+    edited file sat in a real worktree the entire time. Worktrees themselves
+    were never the problem: `repo_info` reads the `.git` FILE and `scope_ok`
+    maps the gitdir back to the main checkout, so a rule scoped to the repo
+    matches from any of its worktrees once the walk starts in the right place.
+
+    A Bash call carries no path and keeps the cwd answer, so a non-git cwd
+    with nothing acted on stays silent exactly as before."""
+    cwd = data.get("cwd") or os.getcwd()
+    seed = _acted_on_dir(cwd, data.get("tool_input") or {})
+    if seed:
+        info = repo_info(seed)
+        if info[0]:
+            return info
+    return repo_info(cwd)
+
+
+_HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")
+
+
 def _branch(head_path):
+    """The checked-out branch, whole. `refs/heads/feat/x` is the branch
+    `feat/x`, not `x`: splitting on the last slash truncated every branch
+    named with the usual `feat/` / `fix/` / `chore/` prefix. That was
+    invisible while the value only keyed dedup and rode along on fires, and
+    became load-bearing when `given.repo.branch_rx` started deciding whether
+    a rule fires — `^feat/` could never match."""
     try:
         h = open(head_path, encoding="utf-8").read().strip()
-        return h.rsplit("/", 1)[-1] if h.startswith("ref:") else "detached"
+        m = _HEAD_REF.match(h)
+        if m:
+            return m.group(1)
+        # a symbolic ref outside refs/heads (rare) still is not a detached HEAD
+        return h.split(":", 1)[1].strip() if h.startswith("ref:") else "detached"
     except Exception:
         return ""
 
@@ -1067,19 +2274,59 @@ def strip_override(cmd, found):
     return cmd
 
 
+def _tokens(text):
+    """shlex tokens for `text`, or None when it does not parse."""
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:                                 # unbalanced quoting
+        return None
+
+
+def _logical_lines(text):
+    """(text, tokens) per line, rejoining lines that only parse together.
+
+    A heredoc inside a command substitution splits one shell line across
+    several physical ones: `--body "$(cat <<'EOF'` leaves its double quote
+    open, and the closing `)"` sits after the body — so neither line parses
+    alone while the two together do. Joining is what the shell does anyway.
+
+    This matters because of what skipping an unparseable line COSTS. It was
+    silently dropping the override on the commonest gated command there is —
+    `gh pr create` with a heredoc body — so the gate denied the call and the
+    documented way past it did nothing. A gate whose override cannot be
+    reached is a wall.
+
+    A line that parses no better joined with everything after it yields
+    ``None`` tokens and the caller skips it: an override we cannot read as
+    shell is still not an override.
+    """
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        for j in range(i, len(lines)):
+            chunk = " ".join(lines[i:j + 1])
+            toks = _tokens(chunk)
+            if toks is not None:
+                yield chunk, toks
+                i = j + 1
+                break
+        else:
+            yield lines[i], None
+            i += 1
+
+
 def find_override(cmd):
     """(reason, line, raw_token) for the first `RULEBOOK_OVERRIDE=<why>` that
     begins a shell segment and is non-empty, else None. Tokenised per line of
     the shell-only text with shlex (POSIX quoting, operators as their own
-    tokens); a line shlex cannot parse contributes nothing. Every candidate is
-    tried, so an earlier empty or quoted one cannot shadow the real override."""
+    tokens); a line that parses nowhere, even joined with what follows it,
+    contributes nothing (see :func:`_logical_lines`). Every candidate is tried,
+    so an earlier empty or quoted one cannot shadow the real override."""
     text = re.sub(r"\\\n", " ", shell_only(cmd))        # join continuation lines
-    for line in text.split("\n"):
-        try:
-            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lex.whitespace_split = True
-            toks = list(lex)
-        except ValueError:                             # unbalanced quoting
+    for line, toks in _logical_lines(text):
+        if toks is None:
             continue
         at_start = True
         for tok in toks:
@@ -1089,6 +2336,116 @@ def find_override(cmd):
                     return reason, line, _raw_token(line, reason)
             at_start = _segment_op(tok)
     return None
+
+
+# `rulebook-override: <why>` — the edit lane's override. A tool call has no
+# prefix to carry a reason the way a shell command does, so it travels in the
+# only channel an edit already has: the content. Written as a comment in
+# whatever the file's language uses, anywhere in the new text.
+#
+# Unlike the shell prefix this one is NOT stripped before rules match. The
+# marker is part of the file the author is writing — a reviewer reads it in the
+# diff, and the next edit of that line is already answered. That is the trade:
+# a command override is one-shot, an edit override is a durable annotation.
+# An EMPTY reason is not an override, exactly as for the shell prefix, and the
+# reason is redacted before it is recorded or shown.
+_EDIT_OVERRIDE_RX = re.compile(
+    r"rulebook-override(?:\[([^\]\r\n]*)\])?\s*:[ \t]*(\S[^\r\n]*)", re.I)
+# One comment CLOSER, if the marker ends the line inside a block comment. A
+# blind `rstrip("*/->}")` ate the last character of any reason that honestly
+# ended in one of them ("the palette lives in {tokens}"), which is a silent
+# corruption of the one field a person wrote by hand.
+_COMMENT_CLOSE_RX = re.compile(r"\s*(?:\*/|-->|--\}\}|\}\}|#\}|\*\))\s*$")
+
+
+def find_edit_override(body):
+    """Every `rulebook-override[<rule>]: <why>` marker in the new content, as
+    ``{rule-name-lowered: reason}`` — first marker wins per name. Empty is not
+    an override, and neither is the UNNAMED form: it is returned under ``""``
+    only so the deny can tell the author to name the rule.
+
+    A marker must name its rule. The bare form is not shorthand the hook is
+    being strict about — its meaning is unstable. Excusing "the gate" reads
+    fine the day it is written and silently starts excusing a DIFFERENT rule
+    the day a teammate authors a second edit gate over the same line, and the
+    line it sits on is a standing exemption from then on. It is also the form
+    that content copied from somewhere else can satisfy by accident.
+
+    Deliberately loose about what precedes the word: `//`, `#`, `<!--` and `*`
+    are all comment openers somewhere, and a marker the author meant is worth
+    more than a syntax the hook guessed."""
+    found = {}
+    for m in _EDIT_OVERRIDE_RX.finditer(body or ""):
+        reason = _COMMENT_CLOSE_RX.sub("", m.group(2).strip()).strip()
+        if not reason:
+            continue
+        found.setdefault((m.group(1) or "").strip().lower(), reason)
+    return found
+
+
+# §3.2: one sentence, two symbols. `⛔️` keeps its existing meaning — this call
+# was STOPPED — and every other fire, including a gate someone overrode, takes
+# `📏`. The sentence is identical either way, so the shape is one recognisable
+# thing and the symbol is what says whether work was actually halted.
+DISCLOSE_ADVISORY = "📏"
+DISCLOSE_BLOCKED = "⛔️"
+DISCLOSE_PREFIX = "Rule fired: "
+_DESC_WORDS = 20
+_DESC_CHARS = 120
+# Backticks and asterisks are markup and are dropped; a code span's CONTENT is
+# what the reader wants. Underscores are NOT stripped: rule titles name files
+# and symbols far more often than they use underscore emphasis, and stripping
+# them turned "never edit `snake_case_name.py`" into "never edit
+# snakecasename.py" and `__init__.py` into `init.py` — a wrong statement, in
+# the terminal and in the transcript the agent echoes it into.
+_EMPHASIS_RX = re.compile(r"[*`]+")
+
+
+def disclosure_desc(rule):
+    """The rule in 20 words or fewer: its title, else its statement, else its
+    id. One line, never wrapped by us — the terminal and the transcript both
+    get exactly this."""
+    for key in ("_label", "text"):
+        raw = rule.get(key)
+        if isinstance(raw, str) and raw.strip():
+            break
+    else:
+        raw = str(rule.get("id") or "")
+    text = " ".join(_EMPHASIS_RX.sub("", raw).split())
+    words = text.split(" ")
+    clipped = len(words) > _DESC_WORDS
+    text = " ".join(words[:_DESC_WORDS])
+    if len(text) > _DESC_CHARS:
+        cut = text[:_DESC_CHARS].rsplit(" ", 1)[0] or text[:_DESC_CHARS]
+        text, clipped = cut, True
+    return (text + "…") if clipped and text else text
+
+
+def disclosure_line(rule, blocked=False):
+    """The line the user is shown AND the line the agent is told to echo.
+
+    ONE function for both on purpose (§3.4): the terminal showing one string
+    while the agent is told to say a different one would be worse than either
+    channel alone."""
+    marker = DISCLOSE_BLOCKED if blocked else DISCLOSE_ADVISORY
+    return f"{marker} {DISCLOSE_PREFIX}{disclosure_desc(rule)}"
+
+
+def disclosure_instruction(lines):
+    """What goes at the end of `additionalContext`, once per emitting call.
+
+    The `systemMessage` copy is deterministic but invisible to everything
+    downstream; this copy is the one that lands in the transcript, and so the
+    only one session capture, /memhub:rules-from-sessions, a handoff or a PR
+    comment can ever see. Neither alone is enough."""
+    quoted = "\n".join(lines)
+    return ("\n_Disclose these to the user. Begin your next reply with the following "
+            "line(s), verbatim and each on its own line, before anything else — including "
+            "before any tool call narration:_\n" + quoted +
+            "\n_This is how the team sees its rules working. Do not paraphrase, do not merge "
+            "them into a sentence, and do not omit one because it did not change what you were "
+            "going to do — a rule that fired and changed nothing is exactly the rule the team "
+            "needs to hear about._")
 
 
 def emit(event_name, text, *, user_line=None, deny=None):
@@ -1174,8 +2531,16 @@ def message_id_of(data):
 
 
 def agent_id_of(data):
-    """Subagent transcripts live at <session>/subagents/agent-<id>.jsonl;
-    the main agent's do not. NULL = main agent."""
+    """NULL = main agent. A subagent's call carries `agent_id` (and
+    `agent_type`) at the top of the hook input — verified live 2026-09-07,
+    where `transcript_path` is the PARENT session's file, so the path alone
+    says "main" for every subagent call. Older builds had no such field and
+    wrote the subagent's transcript at <session>/subagents/agent-<id>.jsonl;
+    that form is still read second. `given.agent.main` and the ledger's
+    `agent_id` both hang off this answer."""
+    aid = data.get("agent_id")
+    if isinstance(aid, str) and aid.strip():
+        return aid.strip()[:64]
     tp = str(data.get("transcript_path") or "")
     if "/subagents/" in tp:
         return os.path.basename(tp).rsplit(".", 1)[0]
@@ -1183,11 +2548,18 @@ def agent_id_of(data):
 
 
 def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None,
-              override_reason=None):
+              override_reasons=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
-    org opt-in. `override_reason` is set on a `mode='gate'` fire the caller
-    overrode (§5.3). Returns {rule_id: fire_id} so conversions can point back."""
+    org opt-in. `override_reasons` is {rule_id: why} for the gates this call
+    excused, so a row records the reason for ITS rule — one call can excuse one
+    gate and be blocked by another (§5.3). `rulebook_id` is local too — POST /fires carries no book
+    dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
+    it is here so a local reader can tell which book a fire came from.
+    Returns {rule_id: fire_id} so conversions can point back."""
+    if portable_lock is None:
+        # Enforcement still runs, but do not create telemetry that cannot drain.
+        return {}
     ids = {}
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
@@ -1197,6 +2569,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                 ids[r["id"]] = fid
                 f.write(json.dumps({
                     "fire_id": fid, "rule_id": r["id"],
+                    "rulebook_id": r.get("_rulebook_id"),
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
                     "source_message_id": ctx.get("source_message_id"),
@@ -1206,7 +2579,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
                     "fired_at": _now(),
                     "converted": None, "converted_at": None,
-                    "override_reason": override_reason,
+                    "override_reason": (override_reasons or {}).get(r["id"]),
                     "excerpt": excerpt[:160],
                 }) + "\n")
     except Exception:
@@ -1217,6 +2590,8 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
 def log_conversion(fire_id, how):
     """Append-only sidecar (the fires file is shared across sessions, so it
     is never rewritten in place). A reader merges by fire_id."""
+    if portable_lock is None:
+        return
     try:
         with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
                   encoding="utf-8") as f:
@@ -1226,15 +2601,82 @@ def log_conversion(fire_id, how):
         pass
 
 
+# §2. A CONSTANT, not a template: no rule counts, no repo name, nothing that
+# changes between sessions, so a reader who has seen it once can skip it.
+# ~65 words / ~420 chars, charged to every session that has any rule, and
+# deliberately NOT counted against POSTURE_BUDGET_CHARS — that budget bounds
+# rule CONTENT, and this framing is what makes the content usable. Do not let
+# it past ~500 chars without deciding that trade again.
+SESSION_PREAMBLE = (
+    "These are your team's engineering rules — standing instructions from your teammates, "
+    "carrying the same weight as this repo's CLAUDE.md. Follow them as you would CLAUDE.md: "
+    "they are how this team works, not suggestions to weigh. When one fires, you MUST disclose "
+    "it to the user on its own line, exactly `📏 Rule fired: <the rule, in 20 words or fewer>`, "
+    "before anything else in that reply."
+)
+
+MAX_BOOKS_NAMED = 6       # session-start roster: bounded, like every other context spend
+ROSTER_MAX_CHARS = 1000   # …and bounded again in bytes, since it is not charged to the budget
+
+
+def books_line(carried):
+    """"Which policies bind me?" — answered once, at session start, and only
+    when more than one book is in play. A single-book team sees exactly what
+    it saw before; in-flight fires never carry the book name, because the
+    name is not what makes the advice actionable and that slot is the scarce
+    one. Books are listed widest first, the same order precedence uses.
+
+    `carried` is what this session actually got — the posture rules that fit
+    the budget plus the armed rules — never the in-scope set. The budget is
+    spent widest-first, so a narrow book can contribute nothing; telling the
+    agent it is holding fifteen of that book's notes when it is holding none
+    is a worse failure than saying nothing at all."""
+    books, order = {}, []
+    for r in carried:
+        rid = r.get("_rulebook_id")
+        if not rid:
+            continue
+        if rid not in books:
+            books[rid] = {"name": r.get("_book_name"), "n": 0, "rank": book_rank(r),
+                          "scope": r.get("_book_scope"), "members": r.get("_book_members")}
+            order.append(rid)
+        books[rid]["n"] += 1
+    if len(books) < 2:
+        return None
+    parts = []
+    for rid in sorted(order, key=lambda i: (books[i]["rank"], (books[i]["name"] or "").casefold())):
+        b = books[rid]
+        if b["scope"] == "all_org":
+            who = "org-wide"
+        elif isinstance(b["members"], int):
+            who = f"{b['members']} member{'s' if b['members'] != 1 else ''}"
+        else:
+            who = None
+        bits = ", ".join([x for x in (who, f"{b['n']} rule{'s' if b['n'] != 1 else ''}") if x])
+        parts.append(f"{b['name'] or 'unnamed rulebook'} ({bits})")
+    extra = len(parts) - MAX_BOOKS_NAMED
+    shown = parts[:MAX_BOOKS_NAMED]
+    if extra > 0:
+        shown.append(f"and {extra} more")
+    # bounded like every other context spend: the budget above is a hard cap
+    # and this line is not charged to it
+    return ("- _From " + " · ".join(shown))[:ROSTER_MAX_CHARS] + "._"
+
+
 def session_digest(rules, repo, gitdir, ctx):
     in_scope = [r for r in rules if scope_ok(r, repo, gitdir) and r.get("status", "active") == "active"]
     if not in_scope:
         return
     # Spec §2: at most MAX_POSTURE session rules and ~2k tokens per scope.
-    # Deterministic (by title, then id) rather than book order, and every rule
-    # past either limit is logged SUPPRESSED so the ledger sees it.
+    # ONE budget across every book the caller is in (container spec §13.1) —
+    # books do not know about each other, so four of them could otherwise blow
+    # a cap each of them believes it is under. The wider book spends first
+    # (§11), then title, then id: deterministic rather than book order, and
+    # every rule past either limit is logged SUPPRESSED so the ledger sees it.
     posture_all = sorted((r for r in in_scope if r.get("on") == "session"),
-                         key=lambda r: (str(r.get("_label") or r.get("title") or r["id"]).casefold(), str(r["id"])))
+                         key=lambda r: (book_rank(r),
+                                        str(r.get("_label") or r.get("title") or r["id"]).casefold(),
+                                        str(r["id"])))
     posture, cut, used = [], [], 0
     for r in posture_all:
         cost = len(r.get("text") or "") + len(r.get("why") or "")
@@ -1243,7 +2685,7 @@ def session_digest(rules, repo, gitdir, ctx):
         else:
             cut.append(r)
     active = [r for r in in_scope if r.get("on") != "session"]
-    lines = [f"## {BRAND} Rulebook (team rules — advisory)"]
+    lines = [f"## {DISCLOSE_ADVISORY} Rulebook (team rules — advisory)", SESSION_PREAMBLE]
     for r in posture:
         lines.append(f"- {r['text']}{_why(r)}")
     if active:
@@ -1252,6 +2694,9 @@ def session_digest(rules, repo, gitdir, ctx):
             f"this repo — they fire inline as you work (proactive on tool "
             f"calls, reactive on errors). Treat a fire as a teammate's note, "
             f"not boilerplate.")
+    roster = books_line(posture + active)
+    if roster:
+        lines.append(roster)
     emit("SessionStart", "\n".join(lines))
     if posture:
         log_fires(ctx, posture, hook_phase="session", mode="advise", excerpt="")
@@ -1266,6 +2711,18 @@ def main():
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
         fetch_book(sys.argv[2])
         return 0
+    if mode == "book-path":
+        # For /memhub:create-rule's live forward-test (§4.2), which arms a
+        # candidate by editing this exact file. It asks the hook where the book
+        # is rather than recomputing the hash: a second implementation of
+        # book_path in a skill would drift from the one the hook reads, and the
+        # test would then doctor a file nothing loads.
+        repo = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not repo.strip():
+            print("usage: rulebook_hook.py book-path <repo>", file=sys.stderr)
+            return 2
+        print(book_path(repo))
+        return 0
     if mode == "flush":                # needs nothing from the event payload
         try:
             sys.stdin.read()
@@ -1277,10 +2734,13 @@ def main():
         data = json.loads(sys.stdin.read() or "{}")
     except Exception:
         return 0
-    cwd = data.get("cwd") or os.getcwd()
     session = data.get("session_id", "")
-    repo, root, gitdir, branch = repo_info(cwd)
-    if not repo:            # not in a git repo → no rules apply
+    # `repo_of_call` derives this too, but the probe root below still needs
+    # the SESSION's directory: a `cd` or `-C` in the command is resolved
+    # against where the terminal is, not against the edited file's checkout.
+    cwd = data.get("cwd") or os.getcwd()
+    repo, root, gitdir, branch = repo_of_call(data)
+    if not repo:            # nothing this call touches is in a git repo → no rules apply
         return 0
     if mode == "fetch":
         fetch_book(repo)
@@ -1290,19 +2750,52 @@ def main():
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data)}
+    # Repo facts answer about the tree the COMMAND runs in; which rules bind
+    # you is still the session's repo, and stays keyed on it.
+    #
+    # Only a Bash call carries a shell command, and only a shell command can
+    # `cd` or name a `--base`. Another tool's input may hold a field called
+    # `command` meaning something else entirely, and reading that one as shell
+    # would point the diff probes at a tree the call never touches. The gate
+    # and override paths below already restrict themselves to Bash; this reads
+    # the same field, so it is restricted the same way.
+    cmd_text = ((data.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
+    probe_root, probe_branch = root, branch
+    elsewhere = command_root(cwd, cmd_text)
+    if elsewhere and elsewhere != root:
+        probe_root = elsewhere
+        probe_branch = _branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
+    probes = Probes(probe_root, probe_branch, command=cmd_text,
+                    transcript_path=data.get("transcript_path"), agent_id=ctx["agent_id"])
 
     if mode == "session":
+        # Fetch BEFORE rendering, but only when the book is old enough to be
+        # wrong. The digest is a session's only view of the book, and rendering
+        # from the cache first made it show the PREVIOUS session's rules: a rule
+        # activated or paused on the server needed two session starts to appear
+        # or to go away. A book younger than the pre lane's refresh window is
+        # already current, so it keeps the detached spawn and SessionStart pays
+        # nothing — the common case, since the pre lane refreshed it minutes
+        # ago. Only a stale book is worth waiting for, and never longer than
+        # SESSION_FETCH_TIMEOUT_S: `fetch_book` leaves the cache untouched on
+        # every failure path, so a timeout renders exactly what we already had.
+        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
+            try:
+                if _age_s(fetched_at) >= REFRESH_AFTER_S:
+                    fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
+                    rules, _, fetched_at, sources = load_rules(repo)
+                else:
+                    spawn_fetch(repo)
+            except Exception:
+                pass
         try:        # which source each rule came from — the pilot's merge audit
             _atomic_json(book_path(repo) + ".sources", {"at": _now(), "sources": sources})
         except Exception:
             pass
         session_digest(rules, repo, gitdir, ctx)
-        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
-            try:
-                spawn_fetch(repo)
-            except Exception:
-                pass
         return 0
+    if mode == "pre":
+        maybe_refresh(repo, fetched_at)
 
     inp = data.get("tool_input") or {}
     sp = state_path(session)
@@ -1319,11 +2812,65 @@ def main():
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
+    # §5.3: the edit lane's own override. Which gates it actually excuses is
+    # decided once the gates are known — a marker naming a rule excuses that
+    # rule only.
+    edit_markers = ({k: redact_secrets(v)[:2000] for k, v in find_edit_override(body).items()}
+                    if mode == "pre" and tool in EDIT_TOOLS else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
     ordering = None
     dedup_keys = {}
     by_id = {r["id"]: r for r in rules}
+
+    # The events this call is. The tool call itself, always; and for a Bash
+    # call that wrote files, one synthetic Write per file, so an edit rule sees
+    # a heredoc / write_text() / sed -i the way it sees the Write tool. The
+    # edit lane of `evaluate` is a pre-phase lane and the ordering engine arms
+    # on a post-phase edit, so a synthetic event carries both phases.
+    # Synthetic edits go FIRST: inside the command the writes happened before
+    # its final segment, so a `python fix.py && pytest` must read as edit,
+    # then receipt — the other order would arm an obligation the same call
+    # already discharged.
+    real = {"tool": tool, "phase": mode, "order_phase": mode, "cmd": cmd, "fp": fp,
+            "body": body, "rtext": rtext, "resp": resp, "via": None, "read": None}
+    events = []
+    if tool == "Bash":
+        marks = st.setdefault("bash_t0", {})
+        call_key = str(data.get("tool_use_id") or "last")
+        if mode == "pre":
+            marks[call_key] = time.time()
+            for k in list(marks)[:-BASH_EDIT_MARKS_KEPT]:
+                marks.pop(k, None)
+        else:
+            t0 = marks.pop(call_key, None)
+            if t0 is None and call_key != "last":
+                t0 = marks.pop("last", None)
+            wants_edits = any(r.get("on") in ("edit", "ordering") and r.get("status", "active") == "active"
+                              for r in rules)
+            if t0 is not None and wants_edits:
+                for path, is_new in bash_written_files(root, cmd, t0):
+                    text = read_edit_body(path, is_new)
+                    if text is None:
+                        continue
+                    events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
+                                   "cmd": "", "fp": path, "body": text, "rtext": "",
+                                   "resp": None, "via": "bash"})
+    events.append(real)
+    # Reads (§5.1): what this call would pull into the context. The Read tool
+    # is the call itself; a Bash call contributes one synthetic Read per file
+    # a cat/head/tail/less/more/sed segment names, in the pre phase, because
+    # unlike a written file these have not happened yet and CAN be refused.
+    # Measured only when a read rule is armed: a line count is one file walk.
+    wants_reads = mode == "pre" and any(r.get("on") == "read" and r.get("status", "active") == "active"
+                                        for r in rules)
+    if wants_reads and tool in READ_TOOLS and fp:
+        real["read"] = read_facts(fp, offset=inp.get("offset"), limit=inp.get("limit"))
+    elif wants_reads and tool == "Bash" and cmd:
+        for path, pulled in bash_reads(cwd, cmd):
+            events.append({"tool": "Read", "phase": "pre", "order_phase": "pre", "cmd": cmd,
+                           "fp": path, "body": "", "rtext": "", "resp": None,
+                           "via": "bash-read", "read": read_facts(path, pulled=pulled)})
 
     # Conversions: did this call perform the action an earlier fire asked for?
     # Deterministic, under-counts, never over-counts (spec §5.1).
@@ -1337,12 +2884,18 @@ def main():
             log_conversion(fid, "converted_rx")
             del st["open"][rid]
             st.get("open_file", {}).pop(rid, None)
-        elif mode == "pre" and r.get("on") == "edit" and "content_rx" in r \
-                and tool in EDIT_TOOLS and fp == st.get("open_file", {}).get(rid) \
-                and not evaluate(r, hook_phase="pre", tool=tool, file_path=fp, body=body):
-            log_conversion(fid, "re-edit-clears")
-            del st["open"][rid]
-            st.get("open_file", {}).pop(rid, None)
+            continue
+        if r.get("on") != "edit" or "content_rx" not in r:
+            continue
+        for ev in events:
+            if ev["phase"] == "pre" and ev["tool"] in EDIT_TOOLS \
+                    and ev["fp"] == st.get("open_file", {}).get(rid) \
+                    and not evaluate(r, hook_phase="pre", tool=ev["tool"], file_path=ev["fp"],
+                                     body=ev["body"]):
+                log_conversion(fid, "re-edit-clears")
+                del st["open"][rid]
+                st.get("open_file", {}).pop(rid, None)
+                break
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -1357,121 +2910,265 @@ def main():
         handles["file_path"] = fp
     if mode == "pre" and anchor_rules and handles \
             and os.environ.get("MEMHUB_RULEBOOK_RECALL", "1") != "0":
-        for rid in recall_anchor_rules(repo, tool, handles, st["fired"]):
-            r = anchor_rules.get(rid)
-            if r is not None:
+        for row in recall_anchor_rules(repo, tool, handles, st["fired"]):
+            rid = str(row.get("rule_id"))
+            # Prefer the cached rule — it carries scope and the book facts the
+            # wire row omits. Otherwise build one from the reply: the server
+            # matched this rule, judged it relevant and scoped it to this repo,
+            # and dropping it because our book predates it is exactly how a
+            # newly activated anchor rule stayed silent until the next fetch.
+            # Safe unseen: recall rules can only advise (server §4.7) and
+            # `to_hook_rule` defaults `mode` to advise, so no gate arrives here.
+            r = anchor_rules.get(rid) or to_hook_rule(row)
+            if r is not None and r.get("on") == "anchor":
                 st["fired"].append(rid)
                 dedup_keys[rid] = rid
                 fired_now.append(r)
 
-    for r in rules:
-        if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
-                or r.get("status", "active") != "active":   # draft = not armed (§6)
-            continue
-        rid = r["id"]
-
-        if r.get("on") == "ordering":
-            try:
-                ordering = ordering or OrderingEngine(root, branch)
-                ok = bash_ok(resp, strict=r.get("mode") == "gate") if resp is not None else None
-                outcome = ordering.feed(r, hook_phase=mode, tool=tool, cmd=cmd,
-                                        file_path=fp, ok=ok)
-            except Exception:
-                outcome = None
-            if outcome == "discharged" and r.get("_converted_fire"):
-                log_conversion(r["_converted_fire"], "discharged")
-            elif outcome == "fired":
-                dedup_keys[rid] = f"{rid}@{root}:{branch}"
-                fired_now.append(r)
-            continue
-
-        scope = r.get("fire_scope", "session")
-        if mode == "pre" and tool == "Bash" and r.get("on") == "bash" \
-                and effective_mode(r, fetched_at) == "gate":
-            scope = "call"        # a gate blocks EVERY matching call — never deduped (§5.3)
-        key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
-        if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
-            if evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
-                        body=body, result_text=rtext):
-                st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
-            continue
-        if not evaluate(r, hook_phase=mode, tool=tool, cmd=cmd, file_path=fp,
-                        body=body, result_text=rtext):
-            continue
-        st["raw"][rid] = st["raw"].get(rid, 0) + 1
-        if scope.startswith("counter"):
-            try:
-                threshold = int(scope.split(":", 1)[1])
-            except (IndexError, ValueError):
-                threshold = 1               # a malformed scope must not silence the whole call
-            st["counts"][rid] = st["counts"].get(rid, 0) + 1
-            if st["counts"][rid] != threshold:   # fire exactly once, at the Nth hit
+    fired_on = {}          # rule id → the event that fired it (its path, for the ledger and the line)
+    for ev in events:
+        etool, ephase, ecmd, efp, ebody = ev["tool"], ev["phase"], ev["cmd"], ev["fp"], ev["body"]
+        for r in rules:
+            if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
+                    or r.get("status", "active") != "active":   # draft = not armed (§6)
                 continue
-        st["fired"].append(key)
-        dedup_keys[rid] = key
-        fired_now.append(r)
+            rid = r["id"]
+            if rid in fired_on:
+                continue
+
+            if r.get("on") == "ordering":
+                try:
+                    ordering = ordering or OrderingEngine(root, branch)
+                    ok = bash_ok(ev["resp"], strict=r.get("mode") == "gate") \
+                        if ev["resp"] is not None else None
+                    outcome = ordering.feed(r, hook_phase=ev["order_phase"], tool=etool, cmd=ecmd,
+                                            file_path=efp, ok=ok)
+                except Exception:
+                    outcome = None
+                if outcome == "discharged" and r.get("_converted_fire"):
+                    log_conversion(r["_converted_fire"], "discharged")
+                elif outcome == "fired":
+                    dedup_keys[rid] = f"{rid}@{root}:{branch}"
+                    fired_now.append(r)
+                    fired_on[rid] = ev
+                continue
+
+            if not path_in_scope(r, efp if etool in EDIT_TOOLS + READ_TOOLS else "", root):
+                continue
+            scope = r.get("fire_scope", "session")
+            # A gate blocks EVERY matching call — never deduped (§5.3), in
+            # any lane the hook can refuse: a Bash command, an edit the tool
+            # has not written yet, or a read — the Read tool's own, or one a
+            # Bash segment is about to make. `via` guards the difference: a
+            # synthetic EDIT event is a file a command ALREADY wrote, so it
+            # cannot be refused and keeps its rule's ordinary dedup; a
+            # synthetic READ has not happened, and refusing the command is
+            # refusing the read.
+            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") in (None, "bash-read") \
+                    and ((etool == "Bash" and r.get("on") == "bash")
+                         or (etool in EDIT_TOOLS and r.get("on") == "edit")
+                         or (etool in READ_TOOLS and r.get("on") == "read")):
+                scope = "call"
+            key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
+            # the regex first (pure, cheap), the given second (probes run only now)
+            matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
+                               body=ebody, result_text=ev["rtext"]) \
+                and given_ok(r, probes, read=ev.get("read"))
+            if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
+                if matched:
+                    st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
+                continue
+            if not matched:
+                continue
+            st["raw"][rid] = st["raw"].get(rid, 0) + 1
+            if scope.startswith("counter"):
+                try:
+                    threshold = int(scope.split(":", 1)[1])
+                except (IndexError, ValueError):
+                    threshold = 1               # a malformed scope must not silence the whole call
+                st["counts"][rid] = st["counts"].get(rid, 0) + 1
+                if st["counts"][rid] != threshold:   # fire exactly once, at the Nth hit
+                    continue
+            st["fired"].append(key)
+            dedup_keys[rid] = key
+            fired_now.append(r)
+            fired_on[rid] = ev
 
     if not fired_now:
         save_state(sp, st)
         return 0
 
-    # §5.3: which of this call's fires are GATES. Only a pre-hook Bash call can
-    # be blocked, and only by a rule the fresh book says is a gate.
-    gate_ids = {r["id"] for r in fired_now
-                if mode == "pre" and tool == "Bash" and r.get("on") in ("bash", "ordering")
-                and effective_mode(r, fetched_at) == "gate"}
+    # §5.3: which of this call's fires are GATES. Only a call the hook sees
+    # BEFORE it runs can be blocked — a pre-hook Bash command, or a pre-hook
+    # edit, which `evaluate` matches against `tool_input`, the content the tool
+    # is about to write. A fire from the synthetic lane (`via == "bash"`, a file
+    # discovered after a command wrote it) is post-hoc whatever its rule says,
+    # so it advises: there is nothing left to refuse.
+    def _gateable(r):
+        if mode != "pre" or r.get("mode") != "gate":
+            return False
+        via = (fired_on.get(r["id"]) or {}).get("via")
+        if via == "bash":
+            return False
+        if tool == "Bash":
+            return r.get("on") in ("bash", "ordering") or (r.get("on") == "read" and via == "bash-read")
+        if tool in READ_TOOLS:
+            return r.get("on") == "read"
+        return tool in EDIT_TOOLS and r.get("on") == "edit"
+
+    gate_ids = {r["id"] for r in fired_now if _gateable(r)}
+
+    # Which gates this call actually excused, and why — per RULE, not per call.
+    # A Bash override is a one-shot prefix on one command: it passes that call,
+    # every gate on it, and is gone. An edit marker LANDS in the file, so the
+    # same generosity would make one line a standing exemption from every edit
+    # gate that ever fires on it — including rules written after the marker,
+    # whose author never saw it. So an edit marker excuses only the rule it
+    # NAMES (`rulebook-override[no-hex]: …`, the label the deny line shows).
+    # The unnamed form never excuses anything, however few gates fired: it
+    # would mean a different thing on the day a second edit gate is authored
+    # over the same line, and it is the form that content copied from
+    # elsewhere satisfies by accident.
+    def _label_of(r):
+        return str(r.get("_label") or r["id"]).lower()
+
+    overridden = {}
+    if override_reason is not None:
+        overridden = {r["id"]: override_reason for r in fired_now if r["id"] in gate_ids}
+    elif edit_markers:
+        for r in (r for r in fired_now if r["id"] in gate_ids):
+            named = edit_markers.get(_label_of(r)) or edit_markers.get(str(r["id"]).lower())
+            if named:
+                overridden[r["id"]] = named
     gates = [r for r in fired_now if r["id"] in gate_ids]
-    advisories = [r for r in fired_now if r["id"] not in gate_ids]
+    # §11: precedence between books is the hook's, and it is an ORDERING —
+    # the wider book's rule is what MAX_ADVISE keeps when two books both fire
+    # on one call. Stable, so one book's rules keep their order and a backend
+    # with no book facts ranks every rule alike and is unaffected.
+    #
+    # An anchor rule outranks book width, and is not an exception to "wider
+    # wins" so much as a different question. A matcher rule fired because a
+    # regex matched; an anchor rule fired because the server spent a round trip
+    # and its relevance judge said THIS call. Letting two org-wide regexes
+    # displace it throws that judgment away — and the rule is already marked
+    # spent for the session by then, so it is not offered again.
+    advisories = sorted((r for r in fired_now if r["id"] not in gate_ids),
+                        key=lambda r: (0 if r.get("on") == "anchor" else 1, book_rank(r)))
     # the advisory cap never cuts a gate — a silently un-gated push is the one
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]
-    blocked = bool(gates) and override_reason is None
+    blocked = any(r["id"] not in overridden for r in gates)
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
     user_lines, deny_lines = [], []
+
+    def _where(r):
+        """A fire from a file the Bash call wrote names the file: the model
+        knows which file a Write was, but a heredoc's target is buried in
+        the command it just ran."""
+        ev = fired_on.get(r["id"])
+        if not ev or ev.get("via") not in ("bash", "bash-read"):
+            return ""
+        path = ev["fp"]
+        if root and path.startswith(root.rstrip("/") + "/"):
+            path = os.path.relpath(path, root)
+        if ev.get("via") == "bash-read":
+            n = (ev.get("read") or {}).get("lines")
+            return f" _(`{path}`, {n} lines, read by that command)_" if n is not None \
+                else f" _(`{path}`, read by that command)_"
+        return f" _(in `{path}`, written by that command)_"
+
+    # §3: every fire is disclosed, on BOTH channels. The disclosure line comes
+    # first and today's line is kept verbatim beneath it, indented — so nothing
+    # a user recognises is lost, and the brand stays off the line the agent is
+    # told to echo into the transcript.
+    disclosures = []
     for r in shown:
         label = r.get("_label") or r["id"]
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
+        blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
-            lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)}")
-            user_lines.append(f"{BRAND} ▸ [{label}] {r['text']}{detail}")
-        elif override_reason is not None:
-            lines.append(f"- **[{label}]** {r['text']}{detail}{_why(r)} "
-                         f"_(gate overridden: {override_reason})_")
-            user_lines.append(f"{BRAND} ⚠ gate overridden — [{label}] {override_reason}")
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
+            detail_line = f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}"
+        elif r["id"] in overridden:
+            why = overridden[r["id"]]
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)} "
+                         f"_(gate overridden: {why})_")
+            detail_line = f"{BRAND} ⚠ gate overridden — [{label}] {why}"
         else:
-            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_why(r)}")
-            user_lines.append(f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}")
-            deny_lines.append(f"[{label}] {r['text']}{detail}")
+            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
+            detail_line = f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}"
+            deny_lines.append(f"[{label}] {r['text']}{detail}{_where(r)}")
+        # A gate that was overridden still FIRED and the call still ran, so it
+        # takes 📏; ⛔️ is reserved for a call that was actually stopped.
+        line = disclosure_line(r, blocked=blocked_here)
+        disclosures.append(line)
+        user_lines.append(line)
+        user_lines.append("   " + detail_line)
     deny = None
     if blocked:
+        # Each lane names the override it actually accepts: an Edit tool call
+        # has no shell prefix to carry one, and telling the agent to re-run a
+        # command it never ran would leave the gate with no way past.
+        still = [r for r in gates if r["id"] not in overridden]
+        if tool == "Bash":
+            how = ("re-run the same command prefixed RULEBOOK_OVERRIDE='<why>' — that allows "
+                   "exactly that call and records why")
+        elif tool in READ_TOOLS:
+            # No prefix and no content on a Read call. The ways past are the
+            # ways the rule wants: a narrower read, or a delegate whose ANSWER
+            # comes back instead of the file. The recorded override rides the
+            # Bash lane, which is the one that can carry a reason.
+            how = ("read only the part you need (`offset`/`limit`), or hand the question to a "
+                   "subagent so its answer, not the file, enters this context; if the whole "
+                   "file must be read here, run RULEBOOK_OVERRIDE='<why>' cat <path> in Bash — "
+                   "that allows exactly that read and records why")
+        else:
+            # Always the named form: a marker stays in the file, so it has to
+            # say which rule it answers to the reader who finds it later.
+            named = ", ".join(f"`rulebook-override[{r.get('_label') or r['id']}]: <why>`"
+                              for r in still)
+            how = (f"add a comment naming the rule you are excusing ({named}) — each allows "
+                   "that one rule, records why, and stays in the diff for the next reader")
+            if "" in edit_markers:
+                how += (". A `rulebook-override:` with no rule in brackets excuses nothing — "
+                        "it would mean something different as soon as a second edit gate "
+                        "covers this line")
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
-                + "\nIf this is a legitimate exception, re-run the same command prefixed "
-                  "RULEBOOK_OVERRIDE='<why>' — that allows exactly that call and records why.")
-        lines.append("_This call was blocked. If it is a legitimate exception, re-run the "
-                     "same command prefixed `RULEBOOK_OVERRIDE='<why>'`._")
-    # §5.3: a gate from a stale book runs as advise and says so once per session.
-    degraded = [r["id"] for r in shown if r.get("mode") == "gate"
-                and effective_mode(r, fetched_at) == "advise"]
-    if degraded and not st.get("degrade_noted"):
-        st["degrade_noted"] = True
-        lines.append("- _(team rulebook last refreshed >24 h ago — gate rules "
-                     "run as advisories until the next successful fetch)_")
+                + f"\nIf this is a legitimate exception, {how}.")
+        lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")
+    # Last, so it is the instruction the agent reads on the way out — and after
+    # the override guidance, which is what it needs first when a gate stood.
+    if disclosures:
+        lines.append(disclosure_instruction(disclosures))
     try:
         emit("PreToolUse" if mode == "pre" else "PostToolUse", "\n".join(lines),
              user_line="\n".join(user_lines), deny=deny)
     except Exception:
         pass
     raw = {r["id"]: st["raw"].get(r["id"]) for r in fired_now}
-    excerpt = cmd or fp or ""
-    ids = log_fires(ctx, [r for r in shown if r["id"] not in gate_ids], hook_phase=mode,
-                    mode="advise", excerpt=excerpt, raw_counts=raw, dedup_keys=dedup_keys)
+
+    def _excerpt(r):
+        """Local-only (never on the wire). A fire from a Bash-written file
+        records the file, prefixed so a reader can count how many edits
+        arrive through Bash versus the Write tool."""
+        ev = fired_on.get(r["id"])
+        if ev and ev.get("via") == "bash":
+            return f"bash-edit {ev['fp']}"
+        if ev and ev.get("via") == "bash-read":
+            return f"bash-read {ev['fp']}"
+        return cmd or fp or ""
+
+    ids = {}
+    for r in (r for r in shown if r["id"] not in gate_ids):
+        ids.update(log_fires(ctx, [r], hook_phase=mode, mode="advise", excerpt=_excerpt(r),
+                             raw_counts=raw, dedup_keys=dedup_keys))
     if gates:      # a blocked call and an overridden one are both delivered gate fires
-        ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=excerpt,
+        ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
-                             override_reason=override_reason))
-    if cut:   # the per-call cap has a cost; make it visible, never silent
-        log_fires(ctx, cut, hook_phase=mode, mode="suppressed", excerpt=excerpt,
+                             override_reasons=overridden))
+    for r in cut:   # the per-call cap has a cost; make it visible, never silent
+        log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
@@ -1480,10 +3177,10 @@ def main():
         elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
             st["open"][r["id"]] = ids.get(r["id"])
             if r.get("on") == "edit":
-                st.setdefault("open_file", {})[r["id"]] = fp
+                ev = fired_on.get(r["id"])
+                st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
     save_state(sp, st)
     return 0
-
 
 if __name__ == "__main__":
     try:
