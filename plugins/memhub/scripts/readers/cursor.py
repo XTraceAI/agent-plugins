@@ -56,8 +56,15 @@ import datetime
 import json
 import re
 import sqlite3
+import sys
 import uuid as _uuid
 from pathlib import Path
+
+# See the same note in ``readers/codex.py`` — shared title rules, stdlib only.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from session_title import normalize_title  # noqa: E402
 
 HOST = "cursor"
 
@@ -444,7 +451,11 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
             if ask:
                 out.append(user(ask))
                 if title is None:
-                    title = ask.strip().splitlines()[0][:150]
+                    # Cursor exposes no host-generated name anywhere in its
+                    # artifacts, so the first ask is all there is — but it gets
+                    # the same shaping as every other derived title instead of
+                    # a ragged mid-word cut.
+                    title = normalize_title(ask)
             continue
 
         if role == "assistant":

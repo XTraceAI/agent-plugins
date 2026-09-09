@@ -50,7 +50,7 @@ from transcript_chunks import (  # noqa: E402
     DEFAULT_CHUNK_BYTES,
     slices as make_slices,
 )
-from redact import redact_records  # noqa: E402
+from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import (  # noqa: E402
     drop_command_wrappers,
     elide_oversized_tool_results,
@@ -375,7 +375,14 @@ async def main() -> int:
     # `--session X` import lands unnamed even when the client wrote a perfectly
     # good title into the file — and a headless session, which writes no title
     # record at all, is named by what it was asked to do.
-    title = args.title or custom_title(records) or generated_title(records) \
+    #
+    # The three derived titles read from `records`, which is redacted above, so
+    # they are already clean. `--title` is not: for Codex and Cursor it carries
+    # the reader's title straight from `capture.py`, derived from RAW records.
+    # Redacted here rather than at the send site so the terminal echo below is
+    # covered too — printing the secret is as much of a leak as sending it.
+    explicit = redact_text(args.title) if args.title else None
+    title = explicit or custom_title(records) or generated_title(records) \
         or prompt_title(records) or None
 
     url, headers, auth = resolve_url_and_auth(args.url)

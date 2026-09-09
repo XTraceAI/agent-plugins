@@ -43,13 +43,42 @@ from __future__ import annotations
 import glob
 import json
 import re
+import sys
 import uuid as _uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
+# The readers are imported both as a package and, by some callers, with
+# ``scripts/`` already on the path; pin the parent either way so the shared
+# title rules resolve. ``session_title`` is stdlib-only with no import-time
+# side effects, which is what makes it safe on the hook path. Guarded so
+# importing the package does not keep prepending the same entry.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from session_title import normalize_title  # noqa: E402
+
 HOST = "codex"
 
-_SESSIONS = Path.home() / ".codex" / "sessions"
+# Not $CODEX_HOME: this module has never read that variable, and
+# `sessions_root()` is a containment boundary for payload-supplied
+# paths, so widening it is a separate change with its own review.
+_CODEX_DIR = Path.home() / ".codex"
+_SESSIONS = _CODEX_DIR / "sessions"
+# Sidecar index of every thread Codex has named: one
+# {"id", "thread_name", "updated_at"} object per line. Strictly more complete
+# than the rollouts — a Codex Desktop session can be named here while its own
+# rollout carries no ``thread_name_updated`` record at all — so it is the
+# fallback when the rollout has none. See ``_sidecar_thread_name``.
+_SESSION_INDEX = _CODEX_DIR / "session_index.jsonl"
+# The index grows with every session the user has ever run and is read on a
+# hook path, so the scan is bounded rather than trusting the file to be small.
+_INDEX_MAX_LINES = 10_000
+# Matches the cap the send sites already apply, so `meta["title"]` cannot come
+# out longer on one capture path than another. The pre-change reader bounded
+# every title unconditionally (`[:150]`); the verbatim lane keeps that promise.
+_MAX_NAME = 200
 
 
 def sessions_root() -> Path:
@@ -129,9 +158,17 @@ def load_rollout(path) -> list[dict]:
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        # The return type says list[dict] and every consumer walks these with
+        # ``r.get(...)``. A line holding a bare JSON scalar (``null``, a number,
+        # a quoted string) parses fine and used to land in the list anyway, so
+        # one such line raised AttributeError deep in the transform — inside a
+        # Stop hook, where that surfaces as a traceback in the user's session.
+        # Dropped here, once, rather than guarded at every walk.
+        if isinstance(record, dict):
+            records.append(record)
     return records
 
 
@@ -174,6 +211,11 @@ def _tool_input(payload: dict) -> dict:
 
 def _session_meta(rollout: list[dict]) -> dict:
     for r in rollout:
+        # Non-dict guard: see _rollout_thread_name. This is the FIRST thing
+        # to touch a rollout, so an unguarded .get() here crashes the whole
+        # Stop hook before any of the later guards can matter.
+        if not isinstance(r, dict):
+            continue
         if r.get("type") == "session_meta" and isinstance(r.get("payload"), dict):
             return r["payload"]
     return {}
@@ -248,12 +290,124 @@ def _merge_usage(record: dict, usage: dict[str, int]) -> None:
         target[key] = target.get(key, 0) + value
 
 
-def _title(rollout: list[dict]) -> str | None:
-    """Best-effort title: the final ``task_complete`` summary, else the first
-    real user message's first line."""
+def _one_line(name: str) -> str | None:
+    """A host-generated name, made safe to carry without being reshaped.
+
+    "Verbatim" is about not *rewriting* Codex's name — spacing and length are
+    its own — but two invariants the old ``splitlines()[0][:150]`` provided for
+    free still have to hold. A title is one line: a ``\\r`` in it would let a
+    rollout overwrite the line ``import_session`` prints to the terminal. And
+    it is bounded: without a cap an absurd name reaches ``--title`` as argv and
+    the manual-import path dies with E2BIG before it can send anything.
+
+    Real names run 18-31 characters, so neither limit is reached in practice.
+    """
+    first = name.strip().splitlines()
+    return first[0].strip()[:_MAX_NAME] if first and first[0].strip() else None
+
+
+def _rollout_thread_name(rollout: list[dict]) -> str | None:
+    """The name CODEX gave this thread, as recorded in the rollout itself.
+
+    Codex names a substantive thread and shows that name in its own UI, writing
+    it as ``event_msg``/``thread_name_updated`` around line 8-10 — right after
+    the first turn's ``task_complete``, so it is already there on the first
+    ``Stop`` flush rather than only at session end.
+
+    The record type is ``_updated``, so it can repeat; the LAST one wins, which
+    is both how a regenerated name resolves and how a rename does. Same rule
+    ``session_title.generated_title`` applies to Claude's ``ai-title``.
+    """
+    found = None
+    for r in rollout:
+        # ``load_rollout`` appends whatever ``json.loads`` returns, so a line
+        # holding a bare scalar (``null``, a number) arrives as a non-dict.
+        # Titling runs inside a Stop hook; an AttributeError here is a
+        # traceback in the user's session.
+        if not isinstance(r, dict):
+            continue
+        pl = r.get("payload")
+        if not isinstance(pl, dict) or r.get("type") != "event_msg":
+            continue
+        if pl.get("type") != "thread_name_updated":
+            continue
+        name = pl.get("thread_name")
+        if isinstance(name, str) and name.strip():
+            found = _one_line(name) or found
+    return found
+
+
+def _sidecar_thread_name(session_id: str | None) -> str | None:
+    """The name Codex gave this thread, from the ``session_index.jsonl``
+    sidecar — for the sessions whose rollout does not carry one.
+
+    Measured: a Codex Desktop session was named "Add memhub claude plugin" in
+    the index while its rollout held no ``thread_name_updated`` record at all.
+    Without this lookup a Desktop session falls through to the prompt fallback
+    and MemHub disagrees with the name Codex is displaying.
+
+    Degrades to ``None`` on absolutely anything — a missing file is the normal
+    case on a fresh machine or a Codex build that writes no index, and this
+    runs inside a ``Stop`` hook where a raised exception is a user-visible
+    traceback.
+    """
+    if not session_id:
+        return None
+    try:
+        found = None
+        # utf-8 pinned for the same reason as ``load_rollout``: a bare read
+        # decodes with the OS locale codec and one em-dash kills the import.
+        with open(_SESSION_INDEX, encoding="utf-8", errors="replace") as fh:
+            # The TAIL, not the head. The index is append-ordered — oldest
+            # session first — so the row for the session being flushed is
+            # always among the newest. Bounding from the front would make the
+            # lane silently die on a long-time user's index and send every
+            # Codex Desktop session back to the prompt fallback, which is the
+            # bug this lane exists to fix. deque keeps memory bounded to the
+            # last N lines in one pass, and "last matching row wins" survives.
+            tail = deque(fh, maxlen=_INDEX_MAX_LINES)
+        for line in tail:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:  # noqa: BLE001 — a torn final line is normal
+                continue
+            if not isinstance(row, dict) or row.get("id") != session_id:
+                continue
+            name = row.get("thread_name")
+            if isinstance(name, str) and name.strip():
+                found = _one_line(name)
+        return found
+    except Exception:  # noqa: BLE001 — no index, unreadable, anything
+        return None
+
+
+def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
+    """What Codex calls this session, else the best name we can derive.
+
+    Precedence, and why: MemHub should show the title Codex's own UI shows.
+    So the name Codex generated wins outright — from the rollout first (it is
+    per-session and is the file we were handed), then from the global sidecar
+    index. Only when Codex never named the thread do we derive one, and then
+    the user's opening request beats the agent's closing summary because it
+    reads as a topic rather than as a report.
+
+    A host-generated name is passed through VERBATIM: it is already a title,
+    and reshaping it would reintroduce the very disagreement this ladder
+    exists to remove. Only the derived fallbacks are normalized.
+    """
+    thread_name = (_rollout_thread_name(rollout)
+                   or _sidecar_thread_name(session_id))
+    if thread_name:
+        return thread_name
+
     last_complete = None
     first_user = None
     for r in rollout:
+        if not isinstance(r, dict):  # see _rollout_thread_name
+            continue
         pl = r.get("payload")
         if not isinstance(pl, dict):
             continue
@@ -267,11 +421,7 @@ def _title(rollout: list[dict]) -> str | None:
             if txt:
                 first_user = txt
     # Prefer the user's opening request (topic-like) over the closing summary.
-    src = first_user or last_complete
-    if not src:
-        return None
-    line = src.strip().splitlines()[0]
-    return line[:150]
+    return normalize_title(first_user or last_complete)
 
 
 def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
@@ -286,6 +436,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
     for r in rollout:
+        if not isinstance(r, dict):  # see _rollout_thread_name
+            continue
         pl = r.get("payload")
         if isinstance(pl, dict) and r.get("type") == "turn_context" and pl.get("model"):
             model = pl["model"]
@@ -296,7 +448,7 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout),
+        "title": _title(rollout, sm.get("id")),
         "host": HOST,
     }
 
