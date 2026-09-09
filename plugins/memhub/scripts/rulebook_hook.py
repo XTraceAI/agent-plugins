@@ -321,6 +321,43 @@ def split_shell(shell):
     return [(j, seg) for j, seg in out if seg.strip()]
 
 
+# Commands that RUN what follows them. An allowlist, not a proof — and it is
+# an allowlist rather than a denylist of `echo`/`grep`/`printf` on purpose: an
+# unknown wrapper then fails to discharge, which costs an extra gate, while an
+# unknown data-command would let a call out of one.
+_RUNNERS = frozenset({
+    "uv", "uvx", "python", "python3", "py", "node", "npm", "npx", "yarn", "pnpm",
+    "poetry", "pipenv", "pdm", "rye", "hatch", "tox", "make", "just", "task",
+    "bash", "sh", "zsh", "env", "sudo", "time", "nohup", "nice", "command",
+    "exec", "xargs", "cargo", "go", "docker", "podman", "poe",
+})
+
+
+def executes(segment, rx):
+    """Does this segment RUN the command `rx` describes, or merely mention it?
+
+    `re.search` over a whole segment cannot tell the two apart, and on the
+    paths that let a call OUT of a gate that is the difference between a
+    receipt and a bypass: `echo git fetch && git log origin/main` and `grep
+    'git fetch' setup.sh && git log origin/main` both read the stale ref with
+    the obligation cleared. Blanking quotes closed the second and not the
+    first — the argument does not have to be quoted to be an argument.
+
+    So the pattern must match at the segment's COMMAND position: the start,
+    once leading `FOO=1` assignments are gone. The exception is a runner —
+    `uv run … pytest`, `sudo git fetch`, `make test` — where the real command
+    is an argument by construction, and there the pattern may match anywhere.
+    A wrapper not on that list simply does not discharge, which is an extra
+    gate rather than a missed one."""
+    text = strip_leading_assignments(unquoted(segment or "")).strip()
+    if not text:
+        return False
+    if re.match(rx, text):
+        return True
+    head = os.path.basename(text.split()[0]) if text.split() else ""
+    return head in _RUNNERS and bool(re.search(rx, text))
+
+
 def self_discharging(shell, spec):
     """Does this one call run the required command BEFORE the gated one, in a
     chain whose single exit status vouches for the required part?
@@ -330,12 +367,12 @@ def self_discharging(shell, spec):
     one already ran and passed. Anything else — a `||`, a `;`, a pipe, or the
     required command written after the gated one — is a command the gate is
     there for."""
-    segs = [unquoted(part) for part in and_only_segments(shell)]
+    segs = and_only_segments(shell)
     required = next((i for i, part in enumerate(segs)
-                     if re.search(spec["required_command_rx"], part)), None)
+                     if executes(part, spec["required_command_rx"])), None)
     if required is None:
         return False
-    return any(command_fires(spec["gated_command_rx"], part, flags=0)
+    return any(command_fires(spec["gated_command_rx"], unquoted(part), flags=0)
                for part in segs[required + 1:])
 
 
@@ -350,10 +387,10 @@ def receipt_segments(shell, whole_chain=False):
     if whole_chain:
         segs = and_only_segments(shell)
         if segs:
-            return [unquoted(part) for part in segs]
+            return segs
     last = last_segment(shell)
     if last and "|" not in last and not last.rstrip().endswith("&"):
-        return [unquoted(last)]
+        return [last]
     return []
 
 
@@ -919,7 +956,7 @@ class OrderingEngine:
         # (`receipt_segments`): its required command sits FIRST in that chain,
         # never last, and a chain that exits 0 vouches for every segment.
         is_receipt = hook_phase == "post" and tool == "Bash" and seg and \
-            any(re.search(spec["required_command_rx"], part)
+            any(executes(part, spec["required_command_rx"])
                 for part in receipt_segments(seg, whole_chain=by_call))
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             command_fires(spec["gated_command_rx"], seg, flags=0)
@@ -1283,11 +1320,17 @@ def command_root(cwd, command):
     would answer branch and diff predicates about a tree the shell never
     entered.
 
+    A `cd` to a directory that is not there leaves the shell where it was, so
+    the answer is the deepest directory the chain provably REACHED, not
+    nothing: `cd ../RepoA && cd missing || git diff` runs its recovery command
+    from RepoA, and falling back to the session's checkout answered about a
+    repo the command never mentioned.
+
     Returns "" when the command redirects nowhere, or nowhere that is a
     worktree, and the caller keeps the session's root.
     """
     segs = split_shell(shell_only(command or ""))
-    path = ""
+    path, reached = "", ""
     for joiner, seg in segs[:-1]:            # the last segment is the command, not a `cd`
         m = _CD_SEGMENT.match(seg.strip())
         if not m:
@@ -1299,9 +1342,17 @@ def command_root(cwd, command):
             return ""
         arg = os.path.expanduser(arg)
         path = arg if os.path.isabs(arg) else os.path.join(path or cwd or "", arg)
-    if not path or not os.path.isdir(path):
+        if os.path.isdir(path):
+            reached = path               # the deepest directory that exists
+        else:
+            # `cd A && cd missing || git diff` runs the recovery command from
+            # A: a `cd` to somewhere that is not there leaves the shell where
+            # it was. Falling all the way back to the session's checkout
+            # answered about a repo the command never mentioned.
+            break
+    if not reached:
         return ""
-    return repo_info(path)[1]
+    return repo_info(reached)[1]
 
 
 def named_repo(command):
@@ -1317,8 +1368,15 @@ def named_repo(command):
         bare = strip_leading_assignments(seg).strip()
         if not _GH_SEGMENT.match(bare):
             continue
-        for m in _REPO_ARG.finditer(bare):
-            value = next((g for g in m.groups() if g), "")
+        # The FLAG is looked for in the blanked copy, so a `--repo` written
+        # inside somebody's comment body (`gh pr comment -b "try --repo
+        # acme/other"`) is the data it is. The VALUE is then read from the
+        # ORIGINAL at the same offsets, so a legitimately quoted
+        # `-R "acme/other"` still parses — which is why `blank_quoted`
+        # preserves length.
+        for m in _REPO_ARG.finditer(blank_quoted(bare)):
+            hit = _REPO_ARG.match(bare[m.start():m.end()])
+            value = next((g for g in hit.groups() if g), "") if hit else ""
             if value and _SLUG.match(value):
                 named.add(value.casefold())
     return named.pop() if len(named) == 1 else ""
@@ -2714,7 +2772,7 @@ def state_path(session_id):
 
 
 def load_state(p):
-    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {}}
+    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {}, "armed_once": []}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2722,6 +2780,8 @@ def load_state(p):
         pass
     if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
         st["armed"] = {}
+    if not isinstance(st.get("armed_once"), list):
+        st["armed_once"] = []
     return st
 
 
@@ -2799,10 +2859,28 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
         return []
     sp = state_path(session)
     st = load_state(sp)
+    armed = []
     for rid in ids:
+        # SessionStart is not once per session. Claude Code fires it again on
+        # resume, on `/clear` and after a compaction, under the SAME session
+        # id — `capture_health._already_warned` exists for the same reason. A
+        # plain re-arm would resurrect an obligation the session had already
+        # discharged, so a rule the agent satisfied at the start blocks again
+        # an hour later with nothing having changed. Whether this session has
+        # EVER been armed by this event is recorded apart from whether it is
+        # armed right now.
+        #
+        # Only `session` is once-only. A second prompt that raises the subject
+        # again is a second question and deserves its own probe, so the prompt
+        # lane re-arms by design.
+        once = f"{event}:{rid}"
+        if event == "session" and once in st.setdefault("armed_once", []):
+            continue
+        st["armed_once"].append(once)
         st["armed"].setdefault(rid, event)   # first arming wins; re-arming is a no-op
+        armed.append(rid)
     save_state(sp, st)
-    return ids
+    return armed
 
 
 def result_text(resp):

@@ -418,6 +418,15 @@ def bash_target_checks() -> None:
         check("bash: `cd A ; cd B` (both run) is still followed",
               addressed(f"cd {plain} ; cd {other} ; git diff") == other,
               addressed(f"cd {plain} ; cd {other} ; git diff"))
+        # A `cd` to somewhere that is not there leaves the shell where it was,
+        # so the answer is the deepest directory the chain provably REACHED.
+        # `cd A && cd missing || git diff` runs its recovery command from A.
+        recover = f"cd {other} && cd nowhere-at-all || git diff"
+        check("bash: a failed later `cd` keeps the last directory reached, "
+              "not the session's checkout",
+              addressed(recover) == other, f"{recover!r} -> {addressed(recover)}")
+        check("bash: and with no directory ever reached it still keeps cwd's",
+              addressed("cd /nope/nowhere && git diff") == here)
 
         # --- 1. the repo the command NAMES ----------------------------------
         check("bash: `gh -R acme/other` measures the repo it addresses, not cwd",
@@ -480,6 +489,15 @@ def bash_target_checks() -> None:
               addressed(jq) == other, f"{jq!r} -> {addressed(jq)}")
         check("bash: a `;` inside quotes is data too",
               addressed('gh pr comment -b "one; two" -R acme/other') == other)
+        # A FLAG inside a quoted value is data as well. The flag is looked for
+        # in the blanked copy; the value is read from the original at the same
+        # offsets, which is why a legitimately quoted value still parses.
+        body = 'gh pr comment 1 -b "try --repo acme/other please"'
+        check("bash: a `--repo` inside a comment body names no repo",
+              addressed(body) == here, f"{body!r} -> {addressed(body)}")
+        check("bash: but a quoted VALUE still parses",
+              addressed('gh pr view 7 -R "acme/other"') == other,
+              addressed('gh pr view 7 -R "acme/other"'))
         check("bash: a repo named on a later `gh` segment still counts",
               addressed("git status && gh pr view 7 -R acme/other") == other)
 

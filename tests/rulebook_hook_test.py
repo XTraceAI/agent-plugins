@@ -1957,23 +1957,51 @@ def armed_lane_checks() -> None:
             check(f"session-armed: no self-discharge when the {why}",
                   "[fetch-first]" in c, f"{bad!r} -> {c}")
 
-        # A required command that is DATA, not a command. Everywhere else a
-        # regex over a whole segment only over-fires; on the two paths that
-        # let a call OUT of a gate it under-gates, which is the direction that
-        # must not happen.
-        for quoted in ("echo 'git fetch' && git log origin/main -5",
-                       'grep "git fetch" setup.sh && git log origin/main -5'):
-            sess = "q" + str(abs(hash(quoted)) % 9999)
+        # A required command that is an ARGUMENT, not a command. Everywhere
+        # else a regex over a whole segment only over-fires; on the two paths
+        # that let a call OUT of a gate it under-gates, which is the direction
+        # that must not happen. Quoting is irrelevant — an argument does not
+        # have to be quoted to be an argument — so the pattern has to match at
+        # the segment's COMMAND position.
+        for mention in ("echo 'git fetch' && git log origin/main -5",
+                        'grep "git fetch" setup.sh && git log origin/main -5',
+                        "echo git fetch && git log origin/main -5",
+                        "printf 'git fetch\\n' && git log origin/main -5"):
+            sess = "q" + str(abs(hash(mention)) % 99999)
             start(sess)
-            c = pre(sess, quoted)
-            check("session-armed: quoted text is not a command and does not "
-                  "excuse the gate", "[fetch-first]" in c, f"{quoted!r} -> {c}")
+            c = pre(sess, mention)
+            check("session-armed: a mention is not a command and does not "
+                  "excuse the gate", "[fetch-first]" in c, f"{mention!r} -> {c}")
 
-        start("s8")
-        post("s8", "echo 'git fetch --all'")
-        c = pre("s8", "git log origin/main -5")
-        check("session-armed: quoted text is not a receipt either",
-              "[fetch-first]" in c, c)
+        for mention in ("echo 'git fetch --all'", "echo git fetch --all"):
+            sess = "r" + str(abs(hash(mention)) % 99999)
+            start(sess)
+            post(sess, mention)
+            c = pre(sess, "git log origin/main -5")
+            check("session-armed: a mention is not a receipt either",
+                  "[fetch-first]" in c, f"{mention!r} -> {c}")
+
+        # A runner is the exception: `uv run … pytest` and `sudo git fetch`
+        # put the real command in an argument by construction. This is the
+        # shape the SHIPPED tests-before-push rule is written against, so
+        # anchoring without it would have broken a live rule.
+        start("s9")
+        post("s9", "sudo git fetch --all")
+        c = pre("s9", "git log origin/main -5")
+        check("session-armed: a runner still discharges — the real command is "
+              "its argument", c == "", c)
+
+        # SessionStart is NOT once per session: it fires again on resume, on
+        # `/clear` and after a compaction, under the same session id. A plain
+        # re-arm resurrects an obligation the session already discharged.
+        start("s10")
+        post("s10", "git fetch --all")
+        c = pre("s10", "git log origin/main -5")
+        check("session-armed: discharged", c == "", c)
+        start("s10")                       # the resume / clear / compact replay
+        c = pre("s10", "git log origin/main -5")
+        check("session-armed: a second SessionStart does not resurrect a "
+              "discharged obligation", c == "", c)
 
         start("s3")
         post("s3", "git fetch --all", exit_code=1)
