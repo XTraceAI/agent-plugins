@@ -1854,6 +1854,10 @@ def armed_lane_checks() -> None:
     the same checkout fetching does not answer for this one. So the arming
     lives in the session's own state file, and these checks pin that.
     """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as rb_mod
+
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "armedrepo")
         os.makedirs(repo)
@@ -1940,6 +1944,19 @@ def armed_lane_checks() -> None:
               "`&&` chain that exits 0 vouches for every segment, so the receipt "
               "need not be last", c == "", c)
 
+        # The exemption above is not "the required pattern appears somewhere".
+        # These two are exactly what the rule exists to catch: the first reads
+        # the stale ref and fetches afterwards, the second runs the stale read
+        # PRECISELY when the fetch failed.
+        for bad, why in ((f"git log origin/main -5 && git fetch -q", "required command comes AFTER the gated one"),
+                         (f"git fetch -q || git log origin/main -5", "`||` runs the read when the fetch FAILED"),
+                         (f"git fetch -q ; git log origin/main -5", "`;` vouches for nothing")):
+            start("bad" + str(abs(hash(bad)) % 9999))
+            sess = "bad" + str(abs(hash(bad)) % 9999)
+            c = pre(sess, bad)
+            check(f"session-armed: no self-discharge when the {why}",
+                  "[fetch-first]" in c, f"{bad!r} -> {c}")
+
         start("s3")
         post("s3", "git fetch --all", exit_code=1)
         c = pre("s3", "git log origin/main -5")
@@ -1997,6 +2014,21 @@ def armed_lane_checks() -> None:
         # injected above the person's own words, and an arming is not news.
         out = prompt("p4", "what about staging?")
         check("prompt lane: emits nothing", out.strip() == "", out)
+
+        # `armed_by_rx` runs in the prompt lane — synchronous, on a 5s hook
+        # timeout, before the person's words reach the model. An
+        # uncompilable or catastrophically backtracking one would raise or
+        # run out the clock, the outer handler would swallow it, and NOTHING
+        # would arm for that prompt — this rule and every valid rule after
+        # it. So it takes the same `rx_ok` lint the other two patterns do,
+        # and a rule carrying a bad one never reaches the lane.
+        for bad in ("(", "(a+)+$"):
+            check(f"prompt-armed: a rule whose armed_by_rx is {bad!r} is dropped at load",
+                  rb_mod.to_hook_rule(dict(probe_rule, id="bad-rx",
+                                           ordering=dict(probe_rule["ordering"],
+                                                         armed_by_rx=bad))) is None)
+        check("prompt-armed: a good armed_by_rx still loads",
+              rb_mod.to_hook_rule(dict(probe_rule)) is not None)
 
 
 def min_hook_version_checks() -> None:
@@ -2056,6 +2088,13 @@ def min_hook_version_checks() -> None:
              "ordering": {"required_command_rx": "pytest", "gated_command_rx": r"\bhotel\b",
                           "armed_by_events": ["session"], "phase_of_moon": "waxing"},
              "text": "unknown-ordering text", "why": "w"},
+            # Its ONLY arming event is one this hook has no lane for, so no
+            # lane can ever record it and it can never fire at a command.
+            {"id": "unarmable", "on": "ordering", "repo_scope": "any", "mode": "gate",
+             "_label": "moonrise-rule",
+             "ordering": {"required_command_rx": "pytest", "gated_command_rx": r"\bindia\b",
+                          "armed_by_events": ["moonrise"]},
+             "text": "unarmable text", "why": "w"},
         ])
         env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0",
                "MEMHUB_RULEBOOK_HOOK_VERSION": "0.53.0"}
@@ -2138,6 +2177,24 @@ def min_hook_version_checks() -> None:
 
         # An unknown arming event is version skew, not a rule that quietly
         # never arms.
+        # A rule whose only arming event is unknown fires NOWHERE — no lane
+        # records it, so `feed` never sees it armed and the advice-only fire
+        # that was supposed to carry the notice has nothing to ride on. It is
+        # surfaced at SESSION START instead: firing it at the gated command
+        # would mean firing a rule whose arming condition this hook cannot
+        # evaluate, which is the exact failure the degradation exists to
+        # prevent, and it would repeat on every matching call.
+        c, deny = pre("v3", "india")
+        check("unarmable: it cannot fire at the command, and does not",
+              c == "" and deny != "deny", c)
+        _, out = run("session", {"session_id": "v4", "cwd": repo,
+                                 "hook_event_name": "SessionStart"}, env)
+        digest = ctx(out)
+        check("unarmable: session start says the plugin is too old to run it",
+              "need a newer" in digest and "moonrise-rule" in digest, digest)
+        check("unarmable: and says it runs as advice and cannot gate",
+              "cannot gate" in digest, digest)
+
         moonrise = H.degradation({}, None, {"armed_by_events": ["moonrise"]})
         check("unknown key: an unrecognised arming event degrades",
               moonrise == "this hook does not understand "

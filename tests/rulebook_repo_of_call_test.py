@@ -20,7 +20,8 @@ Covers:
   before (the fail-open property the hook is built on);
 * and when a Bash command DOES say which repo it is about — `gh … -R
   owner/repo`, or a `cd` it runs first — the `given` probes measure that
-  checkout rather than wherever the shell happened to be;
+  checkout rather than wherever the shell happened to be; a named repo we
+  hold NO checkout of, or several, measures nothing at all;
 * the session cwd is the trust boundary: a path outside it is ignored, a
   symlink under it cannot smuggle the lookup out, and a relative path binds
   to the SESSION's cwd rather than this process's;
@@ -451,10 +452,26 @@ def bash_target_checks() -> None:
         wt = mkworktree(container, other, "Other-feature", "feat/y")
         check("origin slug: a linked worktree answers with its repo's remote",
               rb.origin_slug(wt) == "acme/other", rb.origin_slug(wt))
-        check("bash: and a named repo can resolve to a worktree of it",
-              rb.addressed_root(container, "", "gh pr view 7 -R acme/other")
-              in (other, wt),
+
+        # AMBIGUITY. `acme/other` is now TWO checkouts — the main one and its
+        # worktree. `-R` names a repository, and the probes read
+        # worktree-specific state (branch, dirty, the diff itself), so
+        # answering with either one answers a question nobody asked: a clean
+        # sibling silently passes a diff gate the real work would have
+        # tripped, a dirty one blocks a call over somebody else's branch.
+        # Silence is the honest answer, and it is the direction the whole
+        # hook fails in.
+        check("bash: a named repo with SEVERAL local checkouts resolves to none",
+              rb.addressed_root(container, "", "gh pr view 7 -R acme/other") == "",
               rb.addressed_root(container, "", "gh pr view 7 -R acme/other"))
+        # Two details do pin one, and both outrank the scan.
+        check("bash: standing in one of them disambiguates it",
+              rb.addressed_root(wt, wt, "gh pr view 7 -R acme/other") == wt)
+        check("bash: `cd`ing into one of them disambiguates it",
+              rb.addressed_root(container, "", f"cd {wt} && gh pr view 7 -R acme/other") == wt,
+              rb.addressed_root(container, "", f"cd {wt} && gh pr view 7 -R acme/other"))
+        check("bash: a repo with exactly ONE checkout still resolves",
+              addressed("gh pr view 7 -R acme/here") == here)
 
         # No root is not a crash: every probe answers None, which satisfies
         # no predicate.

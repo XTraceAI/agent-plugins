@@ -272,6 +272,24 @@ def and_only_segments(shell):
     return [x.strip() for x in rest.split("\x00") if x.strip()]
 
 
+def self_discharging(shell, spec):
+    """Does this one call run the required command BEFORE the gated one, in a
+    chain whose single exit status vouches for the required part?
+
+    `&&`-only, and the required segment must come first: those are the two
+    conditions under which the gated segment cannot run unless the required
+    one already ran and passed. Anything else — a `||`, a `;`, a pipe, or the
+    required command written after the gated one — is a command the gate is
+    there for."""
+    segs = and_only_segments(shell)
+    required = next((i for i, part in enumerate(segs)
+                     if re.search(spec["required_command_rx"], part)), None)
+    if required is None:
+        return False
+    return any(command_fires(spec["gated_command_rx"], part, flags=0)
+               for part in segs[required + 1:])
+
+
 def receipt_segments(shell, whole_chain=False):
     """The segments of `shell` whose success the call's exit status vouches
     for. Today's answer — the last segment, unpiped, not backgrounded — is
@@ -856,12 +874,21 @@ class OrderingEngine:
                 for part in receipt_segments(seg, whole_chain=by_call))
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             command_fires(spec["gated_command_rx"], seg, flags=0)
-        # One call that runs the required command AND the gated one discharges
-        # its own obligation (`git fetch -q && git log origin/main`). Blocking
-        # it would be a gate firing on the very call that satisfies it — and
-        # the miner's replay reads it the same way, so the two agree about
-        # which sessions a rule would have caught.
-        if is_gate and by_call and re.search(spec["required_command_rx"], seg):
+        # One call that runs the required command BEFORE the gated one
+        # discharges its own obligation (`git fetch -q && git log
+        # origin/main`), and blocking it would be a gate firing on the very
+        # call that satisfies it.
+        #
+        # ORDER and JOINER both have to hold. Accepting the required pattern
+        # anywhere in the string — which the miner's offline replay does, and
+        # which this did to agree with it — exempts two commands that are
+        # exactly what the rule exists to catch: `git log origin/main && git
+        # fetch` reads the stale ref and fetches afterwards, and `git fetch ||
+        # git log origin/main` runs the stale read PRECISELY when the fetch
+        # failed. Agreeing with a replay's approximation is not worth a hole
+        # in the gate; the replay counts a few more sessions than the engine
+        # gates, and that is the right direction for the two to differ in.
+        if is_gate and by_call and self_discharging(seg, spec):
             return None
         if not (is_edit or is_receipt or is_gate):
             return None
@@ -1276,7 +1303,7 @@ def origin_slug(root):
     return ""
 
 
-def checkout_of(cwd, root, slug):
+def checkout_of(cwd, root, slug, command=""):
     """A checkout of `slug` this machine holds and this session can reach: the
     session's own first, then a directory beside it — beside cwd, and beside
     the session's worktree, which is where the fleet layout puts its siblings.
@@ -1285,16 +1312,24 @@ def checkout_of(cwd, root, slug):
     repo that is not checked out here must be measured in no repo at all
     rather than in this one.
 
-    Several worktrees of the named repo are common, and this picks the first
-    by name. Deliberately under-specified: the command named a REPO, not a
-    worktree, and the alternative is guessing which one it meant. Any of them
-    is the right repository, which is the question that was asked — and all of
-    them beat the container directory that was being measured before."""
+    "" ALSO when more than one matches. `-R` names a repository, and the
+    probes read worktree-specific state — branch, dirty, the diff itself — so
+    picking one of a fleet's twelve worktrees of that repo answers a question
+    nobody asked: a clean sibling silently passes a diff gate the real work
+    would have tripped, and a dirty one blocks a call over a diff belonging to
+    somebody else's branch. Both are wrong answers wearing the shape of right
+    ones, which is worse than the silence the caller gets instead.
+
+    Two details do pin a checkout, and both are consulted first: the session
+    is standing in one, or the command `cd`s into one."""
     want = slug.casefold()
     if root and origin_slug(root).casefold() == want:
         return root
+    cd_root = command_root(cwd, command)
+    if cd_root and origin_slug(cd_root).casefold() == want:
+        return cd_root
     deadline = time.monotonic() + _SIBLINGS_BUDGET_S
-    seen = set()
+    hits, seen = [], set()
     for parent in (cwd, os.path.dirname(root) if root else ""):
         if not parent or parent in seen:
             continue
@@ -1312,9 +1347,11 @@ def checkout_of(cwd, root, slug):
             if looked > _SIBLINGS_MAX or time.monotonic() > deadline:
                 break
             cand = repo_info(d)[1]
-            if cand and origin_slug(cand).casefold() == want:
-                return cand
-    return ""
+            if cand and origin_slug(cand).casefold() == want and cand not in hits:
+                hits.append(cand)
+                if len(hits) > 1:       # ambiguous: stop looking, answer nothing
+                    return ""
+    return hits[0] if len(hits) == 1 else ""
 
 
 def addressed_root(cwd, root, command):
@@ -1330,8 +1367,8 @@ def addressed_root(cwd, root, command):
 
     Precedence, most explicit first:
 
-    1. a repo the command NAMES (`gh … -R owner/repo`), resolved to a checkout
-       we actually hold;
+    1. a repo the command NAMES (`gh … -R owner/repo`), resolved to the ONE
+       checkout of it we hold — or to none, when we hold none or several;
     2. the `cd` the command runs before it (`command_root`);
     3. the worktree containing cwd — what every command answered before.
 
@@ -1340,7 +1377,7 @@ def addressed_root(cwd, root, command):
     whose `given` cannot be checked stays silent."""
     slug = named_repo(command)
     if slug:
-        return checkout_of(cwd, root, slug)
+        return checkout_of(cwd, root, slug, command)
     return command_root(cwd, command) or root
 
 
@@ -1769,6 +1806,20 @@ def _degrade(row, r, given=None):
     return r
 
 
+def ordering_rx_ok(o):
+    """Every pattern in an `ordering` block passes the wire lint.
+
+    `armed_by_rx` is optional but is a pattern off the same wire as the other
+    two, and it runs in the PROMPT lane — synchronous, before the person's
+    words reach the model, on a five-second hook timeout. An uncompilable one
+    raises and a catastrophic one runs out the clock; either way the outer
+    handler swallows it and NOTHING arms for that prompt, this rule and every
+    valid rule after it. `rx_ok` already refuses both shapes."""
+    if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
+        return False
+    return rx_ok(o["armed_by_rx"]) if "armed_by_rx" in o else True
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. The book facts
@@ -1800,8 +1851,7 @@ def to_hook_rule(row):
                     r[k] = _clean_text(r[k])
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
-            if isinstance(r.get("ordering"), dict) and not all(
-                    rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
+            if isinstance(r.get("ordering"), dict) and not ordering_rx_ok(r["ordering"]):
                 return None
             raw_given = r.get("given")
             if "given" in r and not _norm_given(r):
@@ -1837,7 +1887,7 @@ def to_hook_rule(row):
             return _degrade(row, r)
         if isinstance(row.get("ordering"), dict):
             o = row["ordering"]
-            if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
+            if not ordering_rx_ok(o):
                 return None
             r["on"] = "ordering"
             r["ordering"] = o
@@ -3131,6 +3181,19 @@ def session_digest(rules, repo, gitdir, ctx):
         else:
             cut.append(r)
     active = [r for r in in_scope if r.get("on") != "session"]
+    # A rule this hook cannot read in full advises instead of gating and says
+    # so on its first fire — but a rule whose only `armed_by_events` value is
+    # an event this hook has no lane for never fires at all, so that notice
+    # has nowhere to land and the rule is exactly as silent as it was before
+    # `min_hook_version` existed.
+    #
+    # It is surfaced HERE rather than at the gated command. Firing it there
+    # would mean firing a rule whose arming condition this hook cannot
+    # evaluate — the precise failure the degradation machinery exists to
+    # prevent — and it would repeat on every matching call. Session start is
+    # where "once per session" already lives, and the fact the reader needs is
+    # not the rule, it is that their plugin is too old to run it.
+    stale = [r for r in in_scope if r.get("_degraded")]
     lines = [f"## {DISCLOSE_ADVISORY} Rulebook (team rules — advisory)", SESSION_PREAMBLE]
     for r in posture:
         lines.append(f"- {r['text']}{_why(r)}")
@@ -3140,6 +3203,14 @@ def session_digest(rules, repo, gitdir, ctx):
             f"this repo — they fire inline as you work (proactive on tool "
             f"calls, reactive on errors). Treat a fire as a teammate's note, "
             f"not boilerplate.")
+    if stale:
+        names = ", ".join(sorted(str(r.get("_label") or r["id"]) for r in stale)[:5])
+        lines.append(
+            f"- {len(stale)} rule{'s' if len(stale) != 1 else ''} in your book "
+            f"need{'' if len(stale) != 1 else 's'} a newer {BRAND} plugin than "
+            f"this one ({names}) — {'they run' if len(stale) != 1 else 'it runs'} "
+            f"as advice and cannot gate. Update the plugin to get "
+            f"{'them' if len(stale) != 1 else 'it'} back.")
     roster = books_line(posture + active)
     if roster:
         lines.append(roster)
