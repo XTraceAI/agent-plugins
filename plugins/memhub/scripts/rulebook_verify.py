@@ -171,7 +171,14 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
                         raise ValueError(
                             "step %r needs the rule to carry armed_by_rx — without one "
                             "a prompt-armed rule arms on nothing" % step)
-                    if H.arms_on(rule, kind, arg):
+                    # The live lane refuses to arm on a prompt the HARNESS
+                    # wrote, so the verifier has to as well — otherwise a
+                    # case passes here and the rule never arms in a session,
+                    # which is the one discrepancy `arms_on` exists to
+                    # prevent.
+                    if kind == "prompt" and H.harness_prompt(arg):
+                        pass
+                    elif H.arms_on(rule, kind, arg):
                         armed = kind
                 elif kind == "gate":
                     outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg,

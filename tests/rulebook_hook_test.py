@@ -2066,6 +2066,23 @@ def armed_lane_checks() -> None:
         c = pre("p3", "gh pr comment 7 --body ok")
         check("prompt-armed: a harness-generated prompt arms nothing", c == "", c)
 
+        # ...but only a STRUCTURED wrapper is harness-generated. An ordinary
+        # English prefix is not one however harness-like it reads, and
+        # silencing a genuine prompt is the worse error: the rule then never
+        # arms and nothing anywhere says why.
+        start("p5")
+        prompt("p5", "Approach this as a staging incident and tell me what broke")
+        c = pre("p5", "gh pr comment 7 --body ok")
+        check("prompt-armed: an English prefix that merely reads like a "
+              "wrapper still arms", "[probe-staging]" in c, c)
+        for text, want in (("Approach this as a staging incident", False),
+                           ("Approach this assignment about staging", False),
+                           ("<system-reminder>staging</system-reminder>", True),
+                           ("Base directory for this skill: /x staging", True),
+                           ("This session is being continued about staging", True)):
+            check(f"harness_prompt({text[:34]!r}...) is {want}",
+                  rb_mod.harness_prompt(text) is want, str(rb_mod.harness_prompt(text)))
+
         # The prompt lane says nothing itself: anything it printed would be
         # injected above the person's own words, and an arming is not news.
         out = prompt("p4", "what about staging?")

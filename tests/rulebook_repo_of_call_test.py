@@ -516,6 +516,21 @@ def bash_target_checks() -> None:
               addressed("GH_HOST=github.com gh pr view -R acme/other") == other)
         check("bash: an assignment that is not leading is not env",
               addressed("echo GH_REPO=acme/other") == here)
+        # `gh help environment`: GH_REPO applies to commands that would
+        # OTHERWISE use the local repo; `-R` selects one explicitly. The flag
+        # wins. Treating them as two candidates made this look ambiguous and
+        # fall back to the session's checkout.
+        check("bash: an explicit `-R` outranks GH_REPO",
+              addressed("GH_REPO=acme/here gh pr view -R acme/other") == other,
+              addressed("GH_REPO=acme/here gh pr view -R acme/other"))
+
+        # A double-quoted span honours backslash escapes, so ending it at the
+        # first `\"` put the rest of the argument back into the shell grammar
+        # and a `|` inside it became an operator.
+        esc = ('gh pr view --json title --jq "if .title == '
+               '\\"a|b\\" then .title else empty end" -R acme/other')
+        check("bash: an escaped quote inside a quoted jq expression does not "
+              "end the span", addressed(esc) == other, f"{esc!r} -> {addressed(esc)}")
         check("bash: a repo named on a later `gh` segment still counts",
               addressed("git status && gh pr view 7 -R acme/other") == other)
 

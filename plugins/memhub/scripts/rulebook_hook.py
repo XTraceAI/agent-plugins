@@ -277,7 +277,14 @@ def and_only_segments(shell):
 # needs the contents neutralised, not the tokens. Length-preserving on
 # purpose: `split_shell` finds separators in the blanked copy and slices the
 # ORIGINAL at those offsets, so a value that is legitimately quoted survives.
-_QUOTED_RX = re.compile(r"'[^']*'|\"[^\"]*\"")
+# A double-quoted span honours backslash escapes, so `"a \\"b\\" c"` is ONE
+# span — ending it at the first `\\"` put the rest of the argument back into
+# the shell grammar, where a `|` inside it became an operator. A
+# single-quoted span has no escapes at all in POSIX shell (a backslash is
+# literal and a `'` cannot appear), so it stays the simpler pattern.
+_QUOTED_SINGLE = r"'[^']*'"
+_QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
+_QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
 _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\|")
 
 
@@ -1415,7 +1422,7 @@ def named_repo(command):
     and more than one distinct repo named in one command — the same test
     `_named_base` applies to `--base`, for the same reason. A command that
     cannot say plainly which repo it is about does not get to choose one."""
-    named = set()
+    named, from_env = set(), set()
     for _, seg in split_shell(shell_only(command or "")):
         bare = strip_leading_assignments(seg).strip()
         if not _GH_SEGMENT.match(bare):
@@ -1429,8 +1436,8 @@ def named_repo(command):
         host = env.get("GH_HOST", "").strip().strip("\"'")
         repo_env = env.get("GH_REPO", "").strip().strip("\"'")
         if repo_env and _SLUG.match(repo_env):
-            named.add(("%s/%s" % (host, repo_env) if host and repo_env.count("/") == 1
-                       else repo_env).casefold())
+            from_env.add(("%s/%s" % (host, repo_env) if host and repo_env.count("/") == 1
+                          else repo_env).casefold())
         # The FLAG is looked for in the blanked copy, so a `--repo` written
         # inside somebody's comment body (`gh pr comment -b "try --repo
         # acme/other"`) is the data it is. The VALUE is then read from the
@@ -1443,7 +1450,13 @@ def named_repo(command):
             if value and _SLUG.match(value):
                 named.add(("%s/%s" % (host, value) if host and value.count("/") == 1
                            else value).casefold())
-    return named.pop() if len(named) == 1 else ""
+    # `gh help environment`: GH_REPO applies to commands that would OTHERWISE
+    # use the local repository, and `-R` selects one explicitly — so the flag
+    # wins where both appear. Treating them as two candidates made
+    # `GH_REPO=acme/here gh pr view -R acme/other` look ambiguous and fall
+    # back to the session's checkout, which is the failure this resolves.
+    chosen = named or from_env
+    return chosen.pop() if len(chosen) == 1 else ""
 
 
 def _slug_of_url(url):
@@ -2885,8 +2898,9 @@ def save_state(p, st):
 _HARNESS_PROMPT_RX = re.compile(
     r"\s*(?:<(?:command-name|command-message|command-args|local-command-stdout"
     r"|local-command-stderr|local-command-caveat|system-reminder|task-notification)>"
-    r"|This session is being continued|Caveat: The messages below"
-    r"|Base directory for this skill|Approach this as)")
+    r"|This session is being continued"
+    r"|Caveat: The messages below"
+    r"|Base directory for this skill:)")
 
 
 def harness_prompt(text):
@@ -2896,7 +2910,15 @@ def harness_prompt(text):
     "staging" in a prompt exists because someone said they were asking about
     staging, and a skill body or a loop wake-up that happens to contain the
     word said nothing of the kind. It would arm the rule for the rest of the
-    session with nobody having asked for it."""
+    session with nobody having asked for it.
+
+    Every marker here is STRUCTURED — a wrapper tag, or a sentence the client
+    emits verbatim. An ordinary English prefix is not a marker however
+    harness-like it reads: `Approach this as` was one, and it silenced
+    "Approach this as a staging incident", a real person asking exactly the
+    question a staging rule exists for. Suppressing a genuine prompt is the
+    worse error of the two, because the rule then never arms and nothing
+    anywhere says why."""
     return bool(_HARNESS_PROMPT_RX.match(text or ""))
 
 
