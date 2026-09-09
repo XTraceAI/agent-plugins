@@ -638,6 +638,28 @@ def bash_target_checks() -> None:
               rb.named_repo("/usr/bin/env GH_REPO=acme/other gh pr view"))
         check("bash: and by path WITH options it still refuses",
               rb.named_repo("/usr/bin/env -u CI GH_REPO=acme/other gh pr view") == "")
+        # `<wrapper> [options] <the real command>`: `command gh …` is a gh
+        # call, and calling it `local` was a confidently wrong answer rather
+        # than a refusal. Options put it back in `unknown`.
+        for cmd, want in (("command gh pr view -R acme/other", "acme/other"),
+                          ("sudo gh pr view -R acme/other", "acme/other"),
+                          ("sudo env GH_REPO=acme/other gh pr view", "acme/other"),
+                          ("nohup gh pr view -R acme/other", "acme/other"),
+                          ("sudo -u bob gh pr view -R acme/other", "unknown"),
+                          ("sudo git push", "local")):
+            check(f"segment target: {cmd!r} -> {want}",
+                  rb._segment_target(cmd) == want, rb._segment_target(cmd))
+
+        # A standalone `&` backgrounds the command to its left and the next
+        # one runs anyway, so this is TWO commands addressing two repos.
+        bg = "gh pr view -R acme/other & git push"
+        check("bash: a standalone `&` separates segments",
+              rb.named_repo(bg) == "", f"{bg!r} -> {rb.named_repo(bg)}")
+        # ...but a redirection `&` is not a separator.
+        for redir in ("gh pr view -R acme/other 2>&1", "gh pr view -R acme/other >&2",
+                      "gh pr view -R acme/other &> /tmp/log"):
+            check(f"bash: {redir.split(' ', 4)[-1]!r} is redirection, not a separator",
+                  rb.named_repo(redir) == "acme/other", rb.named_repo(redir))
 
         # `origin_slug` reads .git/config, never git — this decides a probe
         # root on every Bash call's hot path. It carries the HOST, because

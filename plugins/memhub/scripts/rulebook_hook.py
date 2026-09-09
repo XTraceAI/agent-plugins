@@ -302,7 +302,11 @@ def and_only_segments(shell):
 _QUOTED_SINGLE = r"'[^']*'"
 _QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
 _QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
-_SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\|")
+# `&&` and `||` first, so the lone-operator alternatives only see what is
+# left. A standalone `&` backgrounds the command to its left and the next one
+# runs anyway — `gh pr view -R other & git push` is TWO commands. The
+# lookarounds keep redirection out: `2>&1`, `cmd >&2`, `cmd &> log`.
+_SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
 
 
@@ -1042,9 +1046,20 @@ class OrderingEngine:
             if is_receipt:                                # handler 2: green receipt
                 if ok is True:                            # a red run never discharges
                     s["count"] = 0
-                    # conversion is (worktree, branch)-scoped: a subagent's or
-                    # sibling session's receipt converts whichever fire is open
-                    rule["_converted_fire"] = s.pop("open_fire", None)
+                    # For an EDIT-armed rule, conversion is (worktree,
+                    # branch)-scoped: a subagent's or sibling session's
+                    # receipt converts whichever fire is open, because the
+                    # obligation belongs to the checkout.
+                    #
+                    # A session- or prompt-armed one belongs to the SESSION,
+                    # so its open fire is not here to convert — the caller
+                    # holds it in session state. Popping the shared slot let
+                    # one session's compliance mark ANOTHER session's fire
+                    # converted, and two concurrent fires overwrote the single
+                    # slot so attribution followed execution order rather than
+                    # who complied.
+                    if not by_call:
+                        rule["_converted_fire"] = s.pop("open_fire", None)
                     self._write(st)
                     return "discharged"
                 return None
@@ -1395,10 +1410,11 @@ def command_root(cwd, command):
             break
         if joiner == "||":                   # conditional on a failure we cannot see
             return ""
-        if segs[i + 1][0] == "|":
-            # `cd ../Other | git diff` runs the `cd` in a subshell: the
-            # directory never reaches the right-hand side, which still runs
-            # where the shell already was.
+        if segs[i + 1][0] in ("|", "&"):
+            # `cd ../Other | git diff` runs the `cd` in a subshell and `cd
+            # ../Other & git diff` backgrounds it: either way the directory
+            # never reaches the command, which still runs where the shell
+            # already was.
             return ""
         arg = next((g for g in m.groups() if g), "")
         if not arg:                          # `cd` home, `cd -`: unknowable
@@ -1439,6 +1455,11 @@ def leading_env(segment):
         pos = m.end()
 
 
+_CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
+                           "nohup", "time", "nice", "stdbuf", "setsid"})
+_WRAPPER_MAX = 4        # `sudo env … gh` is two; four is already generous
+
+
 def _segment_target(seg):
     """What repo does ONE segment address? "" when it addresses none (a bare
     `cd`), "local" for the checkout the shell is in, "unknown" when this
@@ -1447,14 +1468,21 @@ def _segment_target(seg):
     if not bare or _CD_SEGMENT.match(bare):
         return ""
     env = leading_env(seg)
-    head = bare.split()[0] if bare.split() else ""
-    if os.path.basename(head) == "env":     # `/usr/bin/env …` is the same wrapper
+    # Wrappers whose grammar is "<wrapper> [options] <the real command>".
+    # `command gh …` (a bash builtin), `sudo gh …`, `/usr/bin/env GH_REPO=…
+    # gh …` are all `gh` calls, and treating them as `local` was a
+    # confidently wrong answer rather than a refusal. Unwrapped in a loop, so
+    # `sudo env GH_REPO=x gh …` resolves too.
+    for _ in range(_WRAPPER_MAX):
+        head = bare.split()[0] if bare.split() else ""
+        if os.path.basename(head) not in _CMD_WRAPPERS:
+            break
         rest = bare[len(head):].lstrip()
         if rest.startswith("-"):
-            # `env [OPTION]... [NAME=VALUE]... [COMMAND]` — `env -u CI gh …`
-            # is a `gh` call and `env -i sh -c …` is not. Reading option
-            # grammar is how this file got into trouble; not knowing is a
-            # legitimate answer and the caller refuses on it.
+            # `env [OPTION]...`, `sudo -u user …`, `nice -n 5 …`. Each has its
+            # own option grammar, and learning them one at a time is how this
+            # file spent six review rounds. Not knowing is a legitimate
+            # answer, and the caller refuses on it.
             return "unknown"
         # `env NAME=VALUE cmd` sets the environment FOR that command, so an
         # inner assignment beats the shell's outer one — including an inner
@@ -2948,7 +2976,8 @@ def state_path(session_id):
 
 
 def load_state(p):
-    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {}, "armed_once": []}
+    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {},
+          "armed_once": [], "armed_fire": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2958,6 +2987,8 @@ def load_state(p):
         st["armed"] = {}
     if not isinstance(st.get("armed_once"), list):
         st["armed_once"] = []
+    if not isinstance(st.get("armed_fire"), dict):
+        st["armed_fire"] = {}
     return st
 
 
@@ -3003,6 +3034,15 @@ def harness_prompt(text):
     worse error of the two, because the rule then never arms and nothing
     anywhere says why."""
     return bool(_HARNESS_PROMPT_RX.match(text or ""))
+
+
+def session_scoped(rule):
+    """Is this ordering rule's obligation the SESSION's rather than the
+    checkout's? True when it is armed by the session or by a prompt — the two
+    events that happen to one session and not to a worktree."""
+    spec = (rule.get("ordering") or {}) if rule.get("on") == "ordering" else {}
+    return any(k in tuple(spec.get("armed_by_events", ("edit", "write")))
+               for k in ("session", "prompt"))
 
 
 def arms_on(rule, event, prompt=""):
@@ -3858,8 +3898,13 @@ def main():
                     outcome = None
                 if outcome == "discharged":
                     # The session's own arming is discharged here, not in the
-                    # worktree state: it was never written there.
+                    # worktree state: it was never written there. Its open
+                    # fire lives beside it for the same reason — a sibling
+                    # session sharing the checkout must not convert it.
                     st["armed"].pop(rid, None)
+                    fid = st.setdefault("armed_fire", {}).pop(rid, None)
+                    if fid:
+                        log_conversion(fid, "discharged")
                 if outcome == "discharged" and r.get("_converted_fire"):
                     log_conversion(r["_converted_fire"], "discharged")
                 elif outcome == "fired":
@@ -4096,7 +4141,9 @@ def main():
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
-        if r.get("on") == "ordering" and ordering and ids.get(r["id"]):
+        if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
+            st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
+        elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):
             ordering.mark_fired(r["id"], ids[r["id"]])
         elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
             st["open"][r["id"]] = ids.get(r["id"])

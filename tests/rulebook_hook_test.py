@@ -2054,6 +2054,26 @@ def armed_lane_checks() -> None:
         check("session-armed: an edit does not re-arm a rule armed by the session",
               c == "", c)
 
+        # A session-armed obligation is the SESSION's, and so is its open
+        # fire. The worktree state is shared with every sibling session in the
+        # checkout, so keeping the fire there let one session's compliance
+        # mark another session's fire converted — and two concurrent fires
+        # overwrote the single slot, so attribution followed execution order
+        # rather than who complied.
+        start("x1")
+        start("x2")
+        c1 = pre("x1", "git log origin/main -5")
+        c2 = pre("x2", "git log origin/main -5")
+        check("session-armed: two sessions in one checkout each get their own "
+              "fire", "[fetch-first]" in c1 and "[fetch-first]" in c2, f"{c1}|{c2}")
+        post("x1", "git fetch --all")          # only x1 complied
+        c = pre("x2", "git log origin/main -5")
+        check("session-armed: a sibling session's receipt does not discharge "
+              "this one's obligation", "[fetch-first]" in c, c)
+        c = pre("x1", "git log origin/main -5")
+        check("session-armed: and the session that DID comply is discharged",
+              c == "", c)
+
         # --- prompt arming --------------------------------------------------
         start("p1")
         c = pre("p1", "gh pr comment 7 --body ok")
