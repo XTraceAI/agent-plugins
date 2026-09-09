@@ -420,9 +420,30 @@ def bash_target_checks() -> None:
         # `cd A || cd B` runs the second only when the FIRST failed, and the
         # command text cannot say which happened. Following it would answer
         # about a tree the shell may never have entered.
-        check("bash: a `cd` reached by `||` is refused, not followed",
-              addressed(f"cd {other} || cd {here} ; git diff") == here,
+        # A refusal is not "no redirect". `cd Other || cd Here; git diff` most
+        # likely diffs in Other (a successful `cd` returns zero, so the second
+        # is skipped), and answering with the session's tree was the
+        # confidently wrong answer — `command_root` returns None to refuse and
+        # "" only when the shell really did not move.
+        check("bash: a `cd` reached by `||` measures nothing",
+              addressed(f"cd {other} || cd {here} ; git diff") == "",
               addressed(f"cd {other} || cd {here} ; git diff"))
+        check("bash: `command_root` refuses with None, not \"\"",
+              rb.command_root(here, f"cd {other} || cd {here} ; git diff") is None)
+        # The shapes where the shell really does NOT move still answer "" and
+        # keep the session's tree: a failed `cd`, a piped one, a backgrounded
+        # one — in each the command runs where the shell already was.
+        for stays in (f"cd /nope/nowhere && git diff", f"cd {other} | git diff",
+                      f"cd {other} & git diff"):
+            check(f"bash: {stays.split('&&')[0].strip()!r} leaves the shell put",
+                  rb.command_root(here, stays) == "", repr(rb.command_root(here, stays)))
+
+        # `help builtin` / `help command`: both run the named builtin with its
+        # arguments, and both really do move the shell.
+        for wrapped in (f"builtin cd {other} && git diff",
+                        f"command cd {other} && git diff"):
+            check(f"bash: {wrapped.split(' cd')[0]!r} cd is still a cd",
+                  addressed(wrapped) == other, f"{wrapped!r} -> {addressed(wrapped)}")
         check("bash: `cd A ; cd B` (both run) is still followed",
               addressed(f"cd {plain} ; cd {other} ; git diff") == other,
               addressed(f"cd {plain} ; cd {other} ; git diff"))
@@ -709,6 +730,23 @@ def bash_target_checks() -> None:
             check(f"segment target: {cmd.split(' ')[1]!r} refuses",
                   rb._segment_target(cmd) == "unknown", rb._segment_target(cmd))
         check("segment target: a plain git command still answers local",
+              rb._segment_target("git diff --stat") == "local")
+        # Inherited counts too — `git rev-parse --local-env-vars` lists these
+        # as repository-local, so a session launched with GIT_DIR exported
+        # points every plain `git` at another checkout.
+        import os as _os2
+        saved = _os2.environ.get("GIT_DIR")
+        _os2.environ["GIT_DIR"] = "/somewhere/else/.git"
+        try:
+            check("segment target: an INHERITED GIT_DIR refuses",
+                  rb._segment_target("git diff --stat") == "unknown",
+                  rb._segment_target("git diff --stat"))
+        finally:
+            if saved is None:
+                _os2.environ.pop("GIT_DIR", None)
+            else:
+                _os2.environ["GIT_DIR"] = saved
+        check("segment target: and without it, local again",
               rb._segment_target("git diff --stat") == "local")
 
         # A substitution RUNS its body. Read rather than refused wholesale, so

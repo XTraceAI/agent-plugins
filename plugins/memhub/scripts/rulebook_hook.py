@@ -1454,7 +1454,16 @@ def command_root(cwd, command):
     repo the command never mentioned.
 
     Returns "" when the command redirects nowhere, or nowhere that is a
-    worktree, and the caller keeps the session's root.
+    worktree, and the caller keeps the session's root — which is the right
+    answer for those: a `cd` that fails, or one in a subshell or a background
+    job, leaves the shell exactly where it was.
+
+    Returns None to REFUSE, when the command redirects somewhere this cannot
+    name. "" and None were one value once, and `addressed_root` read the
+    refusal as "no redirect" and answered with the session's tree — so `cd
+    /work/Other || cd /work/Here; git diff`, which most likely diffs in
+    Other, was measured in Here. That is the same sentinel-for-two-answers
+    bug `_segment_target` had between "a bare cd" and "nothing here".
     """
     text = shell_only(command or "").strip()
     # `(cd ../Other && git push)` runs the push in the directory its own
@@ -1471,11 +1480,21 @@ def command_root(cwd, command):
     segs = split_shell(text)
     path, reached = "", ""
     for i, (joiner, seg) in enumerate(segs[:-1]):   # the last segment is the command
-        m = _CD_SEGMENT.match(seg.strip())
+        # `help builtin` / `help command`: both run the named builtin with its
+        # arguments, and both really do move the shell. `_segment_target`
+        # already unwrapped this shape; this loop had its own, narrower idea
+        # of what a `cd` looks like.
+        text = seg.strip()
+        while True:
+            head = text.split()[0] if text.split() else ""
+            if head not in _CD_WRAPPERS:
+                break
+            text = text[len(head):].lstrip()
+        m = _CD_SEGMENT.match(text)
         if not m:
             break
         if joiner == "||":                   # conditional on a failure we cannot see
-            return ""
+            return None                      # REFUSE — not "no redirect"
         if segs[i + 1][0] in ("|", "&"):
             # `cd ../Other | git diff` runs the `cd` in a subshell and `cd
             # ../Other & git diff` backgrounds it: either way the directory
@@ -1484,7 +1503,7 @@ def command_root(cwd, command):
             return ""
         arg = next((g for g in m.groups() if g), "")
         if not arg:                          # `cd` home, `cd -`: unknowable
-            return ""
+            return None
         arg = os.path.expanduser(arg)
         path = arg if os.path.isabs(arg) else os.path.join(path or cwd or "", arg)
         if os.path.isdir(path):
@@ -1523,6 +1542,9 @@ def leading_env(segment):
 
 _CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
                            "nohup", "time", "nice", "stdbuf", "setsid"})
+# `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
+# — `sudo cd x` cannot move this shell and `env cd x` fails outright.
+_CD_WRAPPERS = frozenset({"command", "builtin"})
 _WRAPPER_MAX = 4        # `sudo env … gh` is two; four is already generous
 
 
@@ -1569,8 +1591,13 @@ def _segment_target(seg):
         env = dict(env, **leading_env(rest))
         bare = strip_leading_assignments(rest).strip()
     head = bare.split()[0] if bare.split() else ""
-    if os.path.basename(head) == "git" and (_GIT_C_RX.search(blank_quoted(bare))
-                                            or any(v in env for v in _GIT_ENV)):
+    if os.path.basename(head) == "git" and (
+            _GIT_C_RX.search(blank_quoted(bare))
+            # Inherited counts too: `git rev-parse --local-env-vars` lists
+            # these as repository-local, and a session launched with GIT_DIR
+            # exported points every plain `git` at another checkout while the
+            # probes would still be initialised from cwd.
+            or any(v in env or os.environ.get(v) for v in _GIT_ENV)):
         # `git -h`: `git [-C <path>] …`. It selects a DIRECTORY, not a repo
         # this can name, and the call already knows more than `checkout_of`
         # could resolve from a slug. Refusing keeps it out of the wrong tree;
@@ -1794,7 +1821,7 @@ def checkout_of(cwd, root, slug, command=""):
     `cd` disambiguation work only when the session was somewhere else
     entirely."""
     want = slug.casefold()
-    cd_root = command_root(cwd, command)
+    cd_root = command_root(cwd, command) or ""
     if cd_root and slug_matches(origin_slug(cd_root), want):
         return cd_root
     if root and slug_matches(origin_slug(root), want):
@@ -1857,7 +1884,10 @@ def addressed_root(cwd, root, command):
     named = {t for t in targets if t not in ("local", "unknown")}
     if not named and "unknown" not in targets:
         # Nothing named a repo: the question is only where the shell runs.
-        return command_root(cwd, command) or root
+        where = command_root(cwd, command)
+        if where is None:               # redirected somewhere it cannot name
+            return ""
+        return where or root
     if len(targets) == 1 and named:
         return checkout_of(cwd, root, named.pop(), command)
     # Named, but not ONE thing — or named in a spelling this cannot read. Both
