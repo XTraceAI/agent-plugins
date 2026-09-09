@@ -1482,7 +1482,11 @@ _BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
 # A plain branch name, and nothing that reaches elsewhere in history: no rev
 # syntax (`~ ^ : @{…}`), no path traversal, no leading dash.
 _BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
-_CD_SEGMENT = re.compile(r"^\s*cd\s+" + _ARG + r"\s*$")
+# `help cd`: `cd [-L|[-P [-e]] [-@]] [dir]`. The options were being captured
+# AS the directory, so `cd -P ../Other` matched nothing and the call read as
+# local.
+_CD_SEGMENT = re.compile(r"^\s*cd(?:\s+-[LPe@]+)*\s+" + _ARG + r"\s*$")
+_CD_BARE = re.compile(r"^\s*cd(?:\s+-[LPe@]+)*\s*$")
 # `-R` / `--repo` is read only off a `gh` segment: to grep, cp and rsync the
 # same flag means --recursive, and `grep -R foo/bar .` would otherwise name a
 # repo nobody mentioned.
@@ -1585,6 +1589,12 @@ def command_root(cwd, command):
             if head not in _CD_WRAPPERS:
                 break
             text = text[len(head):].lstrip()
+        if _CD_BARE.match(text):
+            # `cd` with no directory goes HOME. The shell really moves, and
+            # matching nothing read it as "no redirect" and kept the session's
+            # tree. Found by auditing `help cd`'s grammar case by case after
+            # the options fix, not reported.
+            return None
         m = _CD_SEGMENT.match(text)
         if not m:
             break
@@ -1597,7 +1607,14 @@ def command_root(cwd, command):
             # already was.
             return ""
         arg = next((g for g in m.groups() if g), "")
-        if not arg:                          # `cd` home, `cd -`: unknowable
+        if not arg:                          # bare `cd`: home, unknowable
+            return None
+        if arg in ("-", "~-", "~+"):
+            # `help cd`: `-` is converted to $OLDPWD. It was being read as a
+            # literal path under cwd, which is not there, so it looked like a
+            # FAILED `cd` and kept the session's tree — while the shell really
+            # did move. The comment above claimed this branch handled `cd -`;
+            # it never did, because `-` is captured as the argument.
             return None
         if _EXPANSION_RX.search(arg):
             # `cd "$OTHER" && git diff` really moves; the literal `$OTHER` is
@@ -1622,6 +1639,13 @@ def command_root(cwd, command):
                 break
     if not reached:
         return ""
+    # NOT refused when `reached` is a real directory that is simply not a
+    # checkout (`cd /tmp && git diff`). Refusing there would be a THIRD
+    # meaning for this return value, and the caller cannot use it: a named
+    # repo (`cd /tmp && gh pr view -R acme/other`) is still the right answer
+    # however far the shell wandered, and only an UNKNOWABLE move can cast
+    # doubt on it. Tried it the other way and two existing tests caught the
+    # conflation immediately.
     return repo_info(reached)[1]
 
 
@@ -1988,7 +2012,15 @@ def checkout_of(cwd, root, slug, command=""):
     `cd` disambiguation work only when the session was somewhere else
     entirely."""
     want = slug.casefold()
-    cd_root = command_root(cwd, command) or ""
+    cd_root = command_root(cwd, command)
+    if cd_root is None:
+        # The command redirects somewhere this cannot name, so which checkout
+        # it addresses is unknown — and the session's, which the scan below
+        # would otherwise match, is exactly the wrong answer when the session
+        # sits in ANOTHER worktree of the same repo. The `or ""` here erased
+        # this refusal: it was added in round 17 to avoid comparing None, and
+        # it undid the distinction that round drew.
+        return None
     if cd_root and slug_matches(origin_slug(cd_root), want):
         return cd_root
     if root and slug_matches(origin_slug(root), want):
@@ -2056,7 +2088,7 @@ def addressed_root(cwd, root, command):
             return ""
         return where or root
     if len(targets) == 1 and named:
-        return checkout_of(cwd, root, named.pop(), command)
+        return checkout_of(cwd, root, named.pop(), command) or ""
     # Named, but not ONE thing — or named in a spelling this cannot read. Both
     # refuse, and refusing means every repo predicate on this call stays
     # silent. Falling back to the local checkout here would answer the `git

@@ -438,6 +438,17 @@ def bash_target_checks() -> None:
             check(f"bash: {stays.split('&&')[0].strip()!r} leaves the shell put",
                   rb.command_root(here, stays) == "", repr(rb.command_root(here, stays)))
 
+        # `help cd`: `cd [-L|[-P [-e]] [-@]] [dir]`. Every shape, audited case
+        # by case after the options fix — the options were being captured AS
+        # the directory, and the stateful targets read as failed changes.
+        for shape, want in ((f"cd -P {other}", other), (f"cd -L -e {other}", other),
+                            ("cd", None), ("cd -P", None), ("cd -", None),
+                            ("cd ~-", None), ("cd $X", None)):
+            got = rb.command_root(here, shape + " && git diff")
+            check(f"bash: `{shape.replace(other, '<dir>')}` -> "
+                  f"{'refuse' if want is None else 'that dir'}",
+                  got == want, repr(got))
+
         # `help builtin` / `help command`: both run the named builtin with its
         # arguments, and both really do move the shell.
         for wrapped in (f"builtin cd {other} && git diff",
