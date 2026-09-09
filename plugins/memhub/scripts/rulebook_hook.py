@@ -329,6 +329,7 @@ _QUOTED_SINGLE_RX = re.compile(_QUOTED_SINGLE)
 _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
 _ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
+_COMMENT_RX = re.compile(r"(?<![^\s;&|(){}])#[^\n]*")
 
 
 def blank_single_quoted(text):
@@ -353,7 +354,14 @@ def blank_quoted(text):
     only ever half of "this character is data"."""
     blanked = _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
                              + m.group(0)[-1], text or "")
-    return _ESCAPE_RX.sub("  ", blanked)
+    blanked = _ESCAPE_RX.sub("  ", blanked)
+    # A `#` that STARTS a word comments out the rest of the line, and every
+    # parser downstream was reading that text as code: `command true # git
+    # fetch` ran only `true` while `executes` found a fetch in the comment and
+    # took the call as a green receipt. Blanked last, so a `#` inside quotes
+    # or behind an escape is already gone and cannot start one — and mid-word
+    # (`%h#%s`, a URL fragment) is not a comment at all.
+    return _COMMENT_RX.sub(lambda m: " " * len(m.group(0)), blanked)
 
 
 def unquoted(text):
@@ -1537,11 +1545,15 @@ def command_root(cwd, command):
         if os.path.isdir(path):
             reached = path               # the deepest directory that exists
         else:
-            # `cd A && cd missing || git diff` runs the recovery command from
-            # A: a `cd` to somewhere that is not there leaves the shell where
-            # it was. Falling all the way back to the session's checkout
-            # answered about a repo the command never mentioned.
-            break
+            # A `cd` to somewhere that is not there leaves the shell where it
+            # was — it does not end the walk. `cd missing; cd ../Other; git
+            # diff` really does diff in Other, and breaking here answered
+            # about the session's checkout instead.
+            path = reached               # the failed `cd` moved nothing
+            if segs[i + 1][0] == "&&":
+                # ...but under `&&` the failure aborts the rest, so nothing
+                # after it runs and there is no command left to measure.
+                break
     if not reached:
         return ""
     return repo_info(reached)[1]
@@ -1718,8 +1730,19 @@ def segment_targets(command, _depth=0):
     where the shell runs, exactly as every ordinary command does; the second
     must refuse outright, because a `gh -R other && git push` answered with
     EITHER repo is wrong for one of its two segments."""
+    whole = shell_only(command or "").strip()
+    # A group that IS the whole command is unwrapped by `command_root` and
+    # read normally. A PARTIAL one is not, and when it carries a `cd` the
+    # call has two roots: `(cd ../Other && git diff) && git status` diffs in
+    # Other and statuses here. Neither is right for the other's segment.
+    inner_group = not (whole[:1] in "({" and whole[-1:] in ")}"
+                       and not any(c in whole[1:-1] for c in "(){}"))
     out, ran_something = set(), False
-    for _, seg in split_shell(shell_only(command or "")):
+    for _, seg in split_shell(whole):
+        if inner_group and seg.strip()[:1] in "({" \
+                and _CD_SEGMENT.match(seg.strip().strip("(){} \t")):
+            out.add("unknown")
+            continue
         target = _segment_target(seg)
         if not target:                      # nothing there: contributes nothing
             continue

@@ -151,6 +151,17 @@ Capture runs on independent paths that all feed one server-side watermark
    and read by every writer, capture included; until then, everything lands
    in personal memory instead of the repo's room.
 
+5. **Naming.** A captured session is called what its host calls it, so the
+   sessions list in MemHub reads the same as the one in the editor: Claude
+   Code's generated title (a rename by the user outranks it), and on Codex the
+   `thread_name` Codex itself generated — read from the rollout, or from
+   `~/.codex/session_index.jsonl` for the hosts that only record it there —
+   passed through verbatim. Only a session its host never named falls back to
+   a title derived from the first prompt, trimmed to one readable line. Codex
+   re-derives this on every flush, so a thread renamed mid-session updates on
+   its next turn; Cursor exposes no host-generated name, so its title stays the
+   one derived from the opening ask.
+
 All of the above authenticate with the plugin's own credential — separate
 from `/mcp`, provisioned by `/memhub:login` (see Install) — because they run
 as cold background processes that can never open a browser.

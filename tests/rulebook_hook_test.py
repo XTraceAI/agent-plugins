@@ -2068,6 +2068,17 @@ def armed_lane_checks() -> None:
                         "stdbuf -o0 git fetch --all"):
             check(f"receipt: {wrapped.split()[0]!r} still runs the fetch",
                   rb_mod.executes(wrapped, r"git\s+(fetch|pull)\b"), wrapped)
+        # `command true # git fetch` runs only `true`. Reading the comment as
+        # code found a fetch in it and took the call as a green receipt.
+        check("receipt: a `#` comment is not a command",
+              not rb_mod.executes("command true # git fetch", r"git\s+(fetch|pull)\b"))
+        check("receipt: and the command BEFORE the comment still counts",
+              rb_mod.executes("git fetch --all # done", r"git\s+(fetch|pull)\b"))
+        start("s16")
+        post("s16", "command true # git fetch")
+        c = pre("s16", "git log origin/main -5")
+        check("session-armed: a fetch inside a comment is no receipt",
+              "[fetch-first]" in c, c)
         check("last_segment: a separator inside quotes is data",
               rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
               rb_mod.last_segment("echo 'a; b'"))

@@ -56,6 +56,41 @@ _STRIP_ELEMENT = re.compile(
 _MAX_LEN = 80
 
 
+def normalize_title(text: str | None, limit: int = _MAX_LEN) -> str | None:
+    """One line of prose, fit to read as a title in a sessions list.
+
+    Whitespace runs — newlines included — collapse to single spaces, so a
+    multi-line prompt becomes one line and a pasted log's column padding stops
+    eating the budget. Over ``limit`` the cut backs up to a word boundary when
+    there is one past the halfway mark and marks itself with an ellipsis, so a
+    truncated title reads as truncated rather than as a sentence that stops.
+
+    Shared with the Codex and Cursor readers, which had each grown a cruder
+    ``splitlines()[0][:150]`` of their own. One rule, three hosts.
+
+    NOT applied to a title the HOST generated (Claude's ``ai-title``, Codex's
+    ``thread_name``): those are already titles, and reshaping one would make
+    MemHub disagree with the name the host's own UI shows.
+    """
+    if not isinstance(text, str):
+        return None
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    # Cut on a word boundary when there is one near the end, so the title
+    # does not break mid-word.
+    head = text[:limit - 1]
+    space = head.rfind(" ")
+    if space >= limit // 2:
+        head = head[:space]
+    # A prompt that opens with a separator line ("-----…") strips away to
+    # nothing and would title the session with a lone ellipsis; keep the raw
+    # head in that case, since a row of dashes is at least recognisable.
+    return (head.rstrip(" ,.;:—-") or head) + "…"
+
+
 def _last_of(records: list, record_type: str, field: str) -> str | None:
     """The last non-empty ``field`` among ``record_type`` records."""
     found = None
@@ -118,13 +153,5 @@ def prompt_title(records: list, limit: int = _MAX_LEN) -> str | None:
         # session with markup.
         if not text or text.startswith("<"):
             continue
-        if len(text) <= limit:
-            return text
-        # Cut on a word boundary when there is one near the end, so the title
-        # does not break mid-word.
-        head = text[:limit - 1]
-        space = head.rfind(" ")
-        if space >= limit // 2:
-            head = head[:space]
-        return head.rstrip(" ,.;:—-") + "…"
+        return normalize_title(text, limit)
     return None

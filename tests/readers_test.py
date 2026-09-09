@@ -31,6 +31,11 @@ sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 import readers  # noqa: E402
 from readers import claude, codex, cursor  # noqa: E402
 
+# The Codex title ladder falls back to ~/.codex/session_index.jsonl. Point it
+# somewhere that cannot exist so these fixtures never pick up a name from the
+# machine running the suite.
+codex._SESSION_INDEX = Path(tempfile.gettempdir()) / "no-such-codex-index.jsonl"
+
 
 def _line(t, payload):
     return {"timestamp": "2026-01-01T00:00:00Z", "type": t, "payload": payload}
@@ -108,6 +113,22 @@ def _write_jsonl(path: Path, records) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     return path
+
+
+def test_codex_thread_name_is_the_title():
+    """Codex names its own threads; MemHub must show that name.
+
+    The fixture below deliberately carries none, so it exercises the derived
+    fallback. Add the record Codex really writes and it must win outright —
+    verbatim, with no reshaping, because it is the string Codex's own UI
+    displays. Full ladder and robustness: codex_session_title_test.py.
+    """
+    named = CODEX_SYNTH + [_line("event_msg", {
+        "type": "thread_name_updated", "thread_id": "sess-abc",
+        "thread_name": "Fix the flaky parser"})]
+    _recs, meta = codex.rollout_to_claude_records(named)
+    assert meta["title"] == "Fix the flaky parser", meta
+    print("PASS test_codex_thread_name_is_the_title")
 
 
 def test_codex_transform():

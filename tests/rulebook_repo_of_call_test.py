@@ -456,6 +456,35 @@ def bash_target_checks() -> None:
               addressed(recover) == other, f"{recover!r} -> {addressed(recover)}")
         check("bash: and with no directory ever reached it still keeps cwd's",
               addressed("cd /nope/nowhere && git diff") == here)
+        # A failed `cd` leaves the shell where it was; it does not end the
+        # walk. Under `;` the next one still runs, so the diff really is in
+        # Other. Under `&&` the failure aborts the rest, and nothing after it
+        # runs at all.
+        check("bash: a `;` chain keeps resolving past a failed `cd`",
+              rb.command_root(here, f"cd missing; cd {other}; git diff") == other,
+              rb.command_root(here, f"cd missing; cd {other}; git diff"))
+        check("bash: an `&&` chain does not — the failure aborts it",
+              rb.command_root(here, f"cd missing && cd {other} && git diff") == "")
+
+        # A group that IS the whole command is unwrapped and read normally; a
+        # PARTIAL one carrying a `cd` gives the call two roots.
+        check("bash: a partial group with a `cd` measures nothing",
+              "unknown" in rb.segment_targets(f"(cd {other} && git diff) && git status"),
+              str(sorted(rb.segment_targets(f"(cd {other} && git diff) && git status"))))
+        check("bash: a WHOLE-command group is still resolved",
+              rb.command_root(here, f"(cd {other} && git push)") == other)
+        check("bash: a partial group with no `cd` is unaffected",
+              sorted(rb.segment_targets("(gh pr view -R acme/other) && git status"))
+              == ["acme/other", "local"])
+
+        # `#` starts a comment, and every parser downstream was reading that
+        # text as code — `gh pr view # -R acme/other` never passes the flag.
+        check("bash: a `#` comment names no repo",
+              rb.named_repo("gh pr view # -R acme/other") == "",
+              rb.named_repo("gh pr view # -R acme/other"))
+        for not_a_comment in ("git log --format=%h#%s", "curl http://x/#frag"):
+            check(f"bash: a mid-word `#` in {not_a_comment.split()[0]!r} is not a comment",
+                  "#" in rb.blank_quoted(not_a_comment), rb.blank_quoted(not_a_comment))
         # A `cd` on the LEFT of a pipeline runs in a subshell, so the
         # directory never reaches the right-hand side. `||` is refused because
         # we cannot see which branch ran; this is refused because we can.
