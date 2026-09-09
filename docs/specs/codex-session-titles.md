@@ -6,7 +6,7 @@ type: spec
 # Plugin Spec: a captured Codex session is called what Codex calls it
 
 **Repo:** `XTraceAI/agent-plugins`. **Client-only** — no MemHub server change is required, and
-none is assumed. **Target version:** `v0.52.1`.
+none is assumed. **Target version:** `v0.53.1`.
 
 **Goal, in the user's words:** *"all I care about is that the titles displayed on Codex's own UI
 align with the ones on MemHub."* Everything below follows from that one sentence. This is a
@@ -14,7 +14,7 @@ fidelity requirement, not a title-generation requirement: where Codex has named 
 must show that name, byte for byte. Where Codex has not, MemHub falls back to a derived name —
 but the fallback is a last resort, not a competing title generator.
 
-**Status:** implemented in v0.52.1. This document is the sole source of truth for the change;
+**Status:** implemented in v0.53.1. This document is the sole source of truth for the change;
 an implementer should need nothing else.
 
 ---
@@ -421,7 +421,7 @@ The second is the only one that covers the mcp-importing suites, which includes 
 
 ## 11. Version and manifests
 
-`0.52.0` → **`0.52.1`** (a fix; matches the `0.49.1` / `0.46.5` precedent).
+`0.53.0` → **`0.53.1`** (a fix; matches the `0.49.1` / `0.46.5` precedent).
 
 `tests/version_parity_test.py` enforces **five** version-bearing manifests, all of which must be
 bumped in the same commit:
@@ -456,7 +456,7 @@ The new test goes in `tests/`.
 | `plugins/memhub/scripts/capture.py` | redact the title before it becomes child argv |
 | `tests/codex_session_title_test.py` | new |
 | `tests/readers_test.py` | add the `thread_name` case |
-| five `plugin.json` manifests | `0.52.1` |
+| five `plugin.json` manifests | `0.53.1` |
 | `README.md`, `plugin.json` / `marketplace.json` descriptions | user-facing behavior changed |
 
 Descriptions are documentation, not metadata: the manifest text claims sessions are "named with
