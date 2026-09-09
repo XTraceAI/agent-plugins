@@ -1439,76 +1439,93 @@ def leading_env(segment):
         pos = m.end()
 
 
-def _unwrap_env(text):
-    """`text` with a leading `env NAME=VALUE …` wrapper removed.
-
-    `env --help`: `env [NAME=VALUE]... [COMMAND]` sets the variables and runs
-    that command, so `env GH_REPO=acme/other gh pr view` IS a `gh` call —
-    stripping the assignments left a segment starting with `env`, which no
-    longer looked like one."""
-    if not re.match(r"env(\s|$)", text or ""):
-        return text
-    return strip_leading_assignments(text[3:].lstrip()).strip()
+def _segment_target(seg):
+    """What repo does ONE segment address? "" when it addresses none (a bare
+    `cd`), "local" for the checkout the shell is in, "unknown" when this
+    cannot be read confidently, else the `[host/]owner/repo` it names."""
+    bare = strip_leading_assignments(seg).strip()
+    if not bare or _CD_SEGMENT.match(bare):
+        return ""
+    env = leading_env(seg)
+    if re.match(r"env(\s|$)", bare):
+        rest = bare[3:].lstrip()
+        if rest.startswith("-"):
+            # `env [OPTION]... [NAME=VALUE]... [COMMAND]` — `env -u CI gh …`
+            # is a `gh` call and `env -i sh -c …` is not. Reading option
+            # grammar is how this file got into trouble; not knowing is a
+            # legitimate answer and the caller refuses on it.
+            return "unknown"
+        env = dict(leading_env(rest), **env)
+        bare = strip_leading_assignments(rest).strip()
+    if not _GH_SEGMENT.match(bare):
+        return "local"          # runs in the checkout the shell is in
+    # An assignment written as `GH_REPO=` is an EXPLICIT empty value: the
+    # shell passes it and `gh` then uses the local repository. Presence
+    # decides, not truth, or the `or` fallback restores an inherited value
+    # the caller had just cleared.
+    host = (env["GH_HOST"] if "GH_HOST" in env
+            else os.environ.get("GH_HOST", "")).strip().strip("\"'")
+    named = set()
+    for m in _REPO_ARG.finditer(blank_quoted(bare)):
+        # The FLAG is found in the blanked copy, so a `--repo` inside a
+        # comment body is the data it is; the VALUE is read from the ORIGINAL
+        # at the same offsets, so a quoted `-R "acme/other"` still parses.
+        hit = _REPO_ARG.match(bare[m.start():m.end()])
+        value = next((g for g in hit.groups() if g), "") if hit else ""
+        if value:
+            named.add(value if _SLUG.match(value) else "unknown")
+    if "unknown" in named:
+        return "unknown"
+    if not named:               # `gh help environment`: GH_REPO applies to
+        repo_env = (env["GH_REPO"] if "GH_REPO" in env    # commands that would
+                    else os.environ.get("GH_REPO", "")).strip().strip("\"'")
+        if not repo_env:                                  # otherwise use the
+            return "local"                                # local repository
+        named = {repo_env if _SLUG.match(repo_env) else "unknown"}
+    if len(named) != 1:
+        return "unknown"        # one segment, two repos: it says nothing plain
+    slug = named.pop()
+    if slug == "unknown":
+        return "unknown"
+    return ("%s/%s" % (host, slug) if host and slug.count("/") == 1 else slug).casefold()
 
 
 def named_repo(command):
-    """The `owner/repo` a `gh` command names with `-R` / `--repo`, or "".
+    """The ONE repo every segment of this call addresses, or "".
 
-    Refused, each falling through to the `cd`/cwd answer rather than to a
-    guess: anything that is not a plain `owner/repo` (a URL, a flag, a path),
-    and more than one distinct repo named in one command — the same test
-    `_named_base` applies to `--base`, for the same reason. A command that
-    cannot say plainly which repo it is about does not get to choose one."""
-    named, from_env = set(), set()
-    for _, seg in split_shell(shell_only(command or "")):
-        bare = strip_leading_assignments(seg).strip()
-        # `gh help environment`: GH_REPO names the repo, in the same
-        # `[HOST/]OWNER/REPO` form, for commands that would otherwise use the
-        # local one — and GH_HOST supplies the host an unqualified `-R`
-        # leaves out. `strip_leading_assignments` had just thrown both away,
-        # so `GH_REPO=… gh pr view` fell back to the session's checkout.
-        # Written on the command first, then whatever the SESSION was
-        # launched with: `gh` reads both, and Claude Code hands the hook the
-        # same environment it hands the tool shell. An inherited GH_REPO
-        # silently retargets every plain `gh` call in the session, so not
-        # reading it left those calls measured against the cwd checkout.
-        env = leading_env(seg)
-        inner = _unwrap_env(bare)
-        if inner is not bare and inner != bare:
-            env = dict(leading_env(bare[3:].lstrip()), **env)   # `env A=1 gh …`
-            bare = inner
-        if not _GH_SEGMENT.match(bare):
-            continue
-        # An assignment written as `GH_REPO=` is an EXPLICIT empty value: the
-        # shell passes it, and `gh` then uses the local repository. Falling
-        # back on falsiness restored the inherited value and probed the wrong
-        # repo, so presence is what decides, not truth.
-        host = (env["GH_HOST"] if "GH_HOST" in env
-                else os.environ.get("GH_HOST", "")).strip().strip("\"'")
-        repo_env = (env["GH_REPO"] if "GH_REPO" in env
-                    else os.environ.get("GH_REPO", "")).strip().strip("\"'")
-        if repo_env and _SLUG.match(repo_env):
-            from_env.add(("%s/%s" % (host, repo_env) if host and repo_env.count("/") == 1
-                          else repo_env).casefold())
-        # The FLAG is looked for in the blanked copy, so a `--repo` written
-        # inside somebody's comment body (`gh pr comment -b "try --repo
-        # acme/other"`) is the data it is. The VALUE is then read from the
-        # ORIGINAL at the same offsets, so a legitimately quoted
-        # `-R "acme/other"` still parses — which is why `blank_quoted`
-        # preserves length.
-        for m in _REPO_ARG.finditer(blank_quoted(bare)):
-            hit = _REPO_ARG.match(bare[m.start():m.end()])
-            value = next((g for g in hit.groups() if g), "") if hit else ""
-            if value and _SLUG.match(value):
-                named.add(("%s/%s" % (host, value) if host and value.count("/") == 1
-                           else value).casefold())
-    # `gh help environment`: GH_REPO applies to commands that would OTHERWISE
-    # use the local repository, and `-R` selects one explicitly — so the flag
-    # wins where both appear. Treating them as two candidates made
-    # `GH_REPO=acme/here gh pr view -R acme/other` look ambiguous and fall
-    # back to the session's checkout, which is the failure this resolves.
-    chosen = named or from_env
-    return chosen.pop() if len(chosen) == 1 else ""
+    THE INVARIANT, stated once here rather than rediscovered at each site:
+    this answers only when the whole call unambiguously names a single repo.
+    Anything else — two `gh` segments naming different repos, a `gh -R` beside
+    a plain `git push` that still runs here, an `env` wrapper whose options
+    cannot be read, a spelling this does not recognise — is "", and "" means
+    the probes measure nothing and every rule with a repo predicate stays
+    silent.
+
+    That is deliberately not "cover as many spellings as possible". A command
+    this cannot read confidently must REFUSE, not guess: measuring the wrong
+    repo is the bug this whole path exists to remove, and a guess is how it
+    comes back. Coverage is not the goal; certainty is. `unknown` is therefore
+    a first-class answer, not a failure — the next `gh` spelling nobody has
+    thought of lands there and is harmless."""
+    targets = segment_targets(command)
+    if len(targets) != 1:
+        return ""
+    only = targets.pop()
+    return "" if only in ("local", "unknown") else only
+
+
+def segment_targets(command):
+    """The set of repos this call's segments address — `named_repo`'s working,
+    kept separate because two answers hide inside one empty string.
+
+    "no repo named anywhere" and "repos named, but not the same one" are
+    different facts with different consequences: the first falls through to
+    where the shell runs, exactly as every ordinary command does; the second
+    must refuse outright, because a `gh -R other && git push` answered with
+    EITHER repo is wrong for one of its two segments."""
+    return {t for t in (_segment_target(seg)
+                        for _, seg in split_shell(shell_only(command or "")))
+            if t}
 
 
 def _slug_of_url(url):
@@ -1666,34 +1683,19 @@ def addressed_root(cwd, root, command):
     "" keeps the fail-open property the hook rests on: `Probes` answers None
     for everything it cannot run, None satisfies no predicate, and a rule
     whose `given` cannot be checked stays silent."""
-    slug = named_repo(command)
-    if slug:
-        if not _all_segments_addressed(command):
-            # `gh pr view -R acme/other && git push` addresses TWO repos: the
-            # `-R` selects another repository for the `gh` call only, and the
-            # push still runs here. There is one probe root per Bash call, so
-            # there is no answer that is right for both segments — and a push
-            # rule measured against the other repo's branch and diff is the
-            # bug this function exists to remove, pointed the other way.
-            # Per-segment probes would be the complete answer; refusing is the
-            # honest one, and it is the same rule already applied to two `-R`
-            # values and to several worktrees.
-            return ""
-        return checkout_of(cwd, root, slug, command)
-    return command_root(cwd, command) or root
-
-
-def _all_segments_addressed(command):
-    """Is EVERY segment of this call either the `gh` call that named the repo
-    or a bare `cd`? A `cd` runs no repo-sensitive command, so it does not
-    disagree with anything; anything else does."""
-    for _, seg in split_shell(shell_only(command or "")):
-        bare = _unwrap_env(strip_leading_assignments(seg).strip())
-        if not bare or _CD_SEGMENT.match(bare):
-            continue
-        if not _GH_SEGMENT.match(bare):
-            return False
-    return True
+    targets = segment_targets(command)
+    named = {t for t in targets if t not in ("local", "unknown")}
+    if not named and "unknown" not in targets:
+        # Nothing named a repo: the question is only where the shell runs.
+        return command_root(cwd, command) or root
+    if len(targets) == 1 and named:
+        return checkout_of(cwd, root, named.pop(), command)
+    # Named, but not ONE thing — or named in a spelling this cannot read. Both
+    # refuse, and refusing means every repo predicate on this call stays
+    # silent. Falling back to the local checkout here would answer the `git
+    # push` half of `gh -R other && git push` correctly and the `gh` half
+    # wrongly, which is the same coin-flip the other way up.
+    return ""
 
 
 class Probes:

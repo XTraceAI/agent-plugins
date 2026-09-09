@@ -453,15 +453,22 @@ def bash_target_checks() -> None:
         # the fail-open property the hook rests on.
         check("bash: a repo this machine does not hold resolves to no checkout",
               addressed("gh pr create -R someone/elsewhere --fill") == "")
-        check("bash: two different repos named in one command are refused, "
-              "exactly as two `--base`es are",
-              addressed("gh pr view -R acme/other || gh pr view -R acme/here") == here)
+        # Refusing now means SILENCE, not a fall-back to the local checkout.
+        # A command that names a repo this cannot read must not be answered
+        # with the tree the shell happens to be in — that is a guess, and a
+        # guess is how the wrong-repo measurement comes back.
+        check("bash: two different repos named in one command measure nothing, "
+              "exactly as two `--base`es are refused",
+              addressed("gh pr view -R acme/other || gh pr view -R acme/here") == "",
+              addressed("gh pr view -R acme/other || gh pr view -R acme/here"))
         # `-R` is `--recursive` to grep, cp and rsync. Only a `gh` segment
         # gets to name a repo with it.
         check("bash: `grep -R foo/bar .` names no repo",
               addressed("grep -R foo/bar .") == here)
-        check("bash: a `-R` that is not a plain owner/repo is refused",
-              addressed("gh pr create -R https://github.com/acme/other") == here)
+        check("bash: a `-R` this cannot parse measures nothing rather than "
+              "falling back to the local tree",
+              addressed("gh pr create -R https://github.com/acme/other") == "",
+              addressed("gh pr create -R https://github.com/acme/other"))
         # `gh pr view --help`: `-R, --repo [HOST/]OWNER/REPO`. Missing a valid
         # spelling is not harmless — it falls back to the CWD checkout, which
         # is the bug this whole function exists to fix.
@@ -484,9 +491,9 @@ def bash_target_checks() -> None:
         check("bash: an unqualified `-R` still matches on owner/repo, the way "
               "`gh` resolves its default host",
               addressed("gh pr view 7 -R acme/other") == other)
-        check("bash: two spellings that are not provably one repo are refused",
+        check("bash: two spellings that are not provably one repo measure nothing",
               addressed("gh pr view -R ghe.corp/acme/other || "
-                        "gh pr view -R acme/other") == here)
+                        "gh pr view -R acme/other") == "")
 
         # A `|` inside a quoted argument is data, not a separator. `--jq` with
         # a pipe is the everyday case, and splitting there left the `-R` in a
@@ -571,7 +578,7 @@ def bash_target_checks() -> None:
         mixed = "gh pr view -R acme/other && git push"
         check("bash: a call that addresses two repos measures neither",
               addressed(mixed) == "", f"{mixed!r} -> {addressed(mixed)}")
-        check("bash: all-`gh` segments still resolve",
+        check("bash: all-`gh` segments naming the same repo still resolve",
               addressed("gh pr view -R acme/other && gh pr merge -R acme/other") == other)
         check("bash: a bare `cd` alongside a `gh` call is not a disagreement",
               addressed(f"cd {plain} && gh pr view -R acme/other") == other,
@@ -591,12 +598,32 @@ def bash_target_checks() -> None:
                '\\"a|b\\" then .title else empty end" -R acme/other')
         check("bash: an escaped quote inside a quoted jq expression does not "
               "end the span", addressed(esc) == other, f"{esc!r} -> {addressed(esc)}")
-        # A repo named on a later `gh` segment is SEEN — but the call also
-        # runs `git status` here, so it addresses two repos and measures
-        # neither (see the disagreement checks below). `named_repo` is the
-        # part being pinned here.
-        check("bash: a repo named on a later `gh` segment is still seen",
-              rb.named_repo("git status && gh pr view 7 -R acme/other") == "acme/other")
+        # THE INVARIANT: `named_repo` answers only when the WHOLE call names
+        # one repo. `git status` runs in the checkout the shell is in, so this
+        # call addresses two, and the answer is nothing. Agreement is
+        # `named_repo`'s own job now rather than a separate check downstream —
+        # the same rule reached five separate times as five bug fixes, stated
+        # once instead.
+        check("bash: a `gh -R` beside a command that runs HERE names nothing",
+              rb.named_repo("git status && gh pr view 7 -R acme/other") == "",
+              rb.named_repo("git status && gh pr view 7 -R acme/other"))
+        check("bash: two `gh` segments naming the SAME repo agree",
+              rb.named_repo("gh pr view -R acme/other && gh pr merge -R acme/other")
+              == "acme/other")
+        # An unflagged `gh` still targets the current checkout, so it disagrees
+        # with a flagged one just as `git push` does.
+        check("bash: a flagged `gh` beside an unflagged one names nothing",
+              rb.named_repo("gh pr view -R acme/other && gh pr create --fill") == "",
+              rb.named_repo("gh pr view -R acme/other && gh pr create --fill"))
+        # `env [OPTION]... [NAME=VALUE]... [COMMAND]`: `env -u CI gh …` is a
+        # gh call and `env -i sh -c …` is not. Not knowing is a legitimate
+        # answer — the next spelling nobody has thought of lands here and is
+        # harmless, instead of being guessed at.
+        check("bash: an `env` wrapper carrying options refuses rather than guesses",
+              rb.named_repo("env -u CI GH_REPO=acme/other gh pr view") == "",
+              rb.named_repo("env -u CI GH_REPO=acme/other gh pr view"))
+        check("bash: a plain `env` wrapper is still read",
+              rb.named_repo("env GH_REPO=acme/other gh pr view") == "acme/other")
 
         # `origin_slug` reads .git/config, never git — this decides a probe
         # root on every Bash call's hot path. It carries the HOST, because
