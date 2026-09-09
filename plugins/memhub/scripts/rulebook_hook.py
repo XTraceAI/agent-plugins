@@ -1447,15 +1447,20 @@ def _segment_target(seg):
     if not bare or _CD_SEGMENT.match(bare):
         return ""
     env = leading_env(seg)
-    if re.match(r"env(\s|$)", bare):
-        rest = bare[3:].lstrip()
+    head = bare.split()[0] if bare.split() else ""
+    if os.path.basename(head) == "env":     # `/usr/bin/env …` is the same wrapper
+        rest = bare[len(head):].lstrip()
         if rest.startswith("-"):
             # `env [OPTION]... [NAME=VALUE]... [COMMAND]` — `env -u CI gh …`
             # is a `gh` call and `env -i sh -c …` is not. Reading option
             # grammar is how this file got into trouble; not knowing is a
             # legitimate answer and the caller refuses on it.
             return "unknown"
-        env = dict(leading_env(rest), **env)
+        # `env NAME=VALUE cmd` sets the environment FOR that command, so an
+        # inner assignment beats the shell's outer one — including an inner
+        # `GH_REPO=`, which clears it, because presence decides here and not
+        # truth.
+        env = dict(env, **leading_env(rest))
         bare = strip_leading_assignments(rest).strip()
     if not _GH_SEGMENT.match(bare):
         return "local"          # runs in the checkout the shell is in

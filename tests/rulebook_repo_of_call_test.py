@@ -624,6 +624,20 @@ def bash_target_checks() -> None:
               rb.named_repo("env -u CI GH_REPO=acme/other gh pr view"))
         check("bash: a plain `env` wrapper is still read",
               rb.named_repo("env GH_REPO=acme/other gh pr view") == "acme/other")
+        # `env NAME=VALUE cmd` sets the environment FOR that command, so an
+        # inner assignment beats the shell's outer one.
+        check("bash: an inner `env` assignment beats the outer shell one",
+              rb.named_repo("GH_REPO=acme/here env GH_REPO=acme/other gh pr view")
+              == "acme/other",
+              rb.named_repo("GH_REPO=acme/here env GH_REPO=acme/other gh pr view"))
+        check("bash: an inner `GH_REPO=` clears an outer value",
+              rb.named_repo("GH_REPO=acme/other env GH_REPO= gh pr view") == "")
+        # The `env --help` contract holds however the executable was located.
+        check("bash: `/usr/bin/env` is the same wrapper",
+              rb.named_repo("/usr/bin/env GH_REPO=acme/other gh pr view") == "acme/other",
+              rb.named_repo("/usr/bin/env GH_REPO=acme/other gh pr view"))
+        check("bash: and by path WITH options it still refuses",
+              rb.named_repo("/usr/bin/env -u CI GH_REPO=acme/other gh pr view") == "")
 
         # `origin_slug` reads .git/config, never git — this decides a probe
         # root on every Bash call's hot path. It carries the HOST, because
