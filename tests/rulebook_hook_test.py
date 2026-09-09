@@ -2079,6 +2079,20 @@ def armed_lane_checks() -> None:
         c = pre("s16", "git log origin/main -5")
         check("session-armed: a fetch inside a comment is no receipt",
               "[fetch-first]" in c, c)
+        # The GATE matcher read raw text too, so a commented-out gated
+        # command blocked a compliant call. Fixed in `command_fires`, the one
+        # function both the matcher lane and the ordering gate go through —
+        # blanking it in `blank_quoted` had only reached callers that used it.
+        start("s17")
+        c = pre("s17", "git fetch --all # git log origin/main")
+        check("session-armed: a commented-out gated command does not gate the "
+              "fetch that complies", c == "", c)
+        c = pre("s17", "git log origin/main -5")
+        check("session-armed: ...and that fetch was still armed until it ran",
+              c == "" or "[fetch-first]" in c, c)
+        check("command_fires: quotes stay visible to a matcher — only comments go",
+              rb_mod.command_fires(r"rm\s+-rf", 'echo "rm -rf /"', flags=0)
+              and not rb_mod.command_fires(r"rm\s+-rf", "echo hi # rm -rf /", flags=0))
         check("last_segment: a separator inside quotes is data",
               rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
               rb_mod.last_segment("echo 'a; b'"))

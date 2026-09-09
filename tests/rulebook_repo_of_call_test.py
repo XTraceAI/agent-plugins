@@ -482,6 +482,20 @@ def bash_target_checks() -> None:
         check("bash: a `#` comment names no repo",
               rb.named_repo("gh pr view # -R acme/other") == "",
               rb.named_repo("gh pr view # -R acme/other"))
+        # `\ ` joins two words in bash, so the placeholder that stands in for
+        # an escape has to join them here too — blanking it to a real space
+        # made `#literal` look like the start of a comment and ate the `-R`.
+        esc_hash = r"gh pr view --jq .title\ #literal -R acme/other"
+        check("bash: an escaped space keeps `#` mid-word, so the `-R` survives",
+              rb.named_repo(esc_hash) == "acme/other", rb.named_repo(esc_hash))
+        # `!` negates a pipeline's status; `if`/`then`/`do` introduce one.
+        # None of them is the command.
+        for prefixed in ("! gh pr view -R acme/other", "if gh pr view -R acme/other",
+                         "then gh pr view -R acme/other"):
+            check(f"bash: {prefixed.split()[0]!r} prefixes a command, it is not one",
+                  rb._segment_target(prefixed) == "acme/other",
+                  rb._segment_target(prefixed))
+        check("bash: a block terminator runs nothing", rb._segment_target("fi") == "")
         for not_a_comment in ("git log --format=%h#%s", "curl http://x/#frag"):
             check(f"bash: a mid-word `#` in {not_a_comment.split()[0]!r} is not a comment",
                   "#" in rb.blank_quoted(not_a_comment), rb.blank_quoted(not_a_comment))

@@ -352,16 +352,20 @@ def blank_quoted(text):
     acme/other` is one command, and reading its escaped pipe as an operator
     left the `-R` in a fragment that no longer began with `gh`. Quoting was
     only ever half of "this character is data"."""
+    return _COMMENT_RX.sub(lambda m: " " * len(m.group(0)), blank_syntax(text))
+
+
+def blank_syntax(text):
+    """Quotes and escapes blanked, comments LEFT IN PLACE, length preserved.
+
+    The stage before comment blanking, exposed because `strip_comments` needs
+    to find comments and `blank_quoted`'s output no longer has any. Escapes
+    become a NON-space placeholder: blanking `\\ ` to a real space made
+    `--jq .title\\ #literal` look like `#literal` starts a word, and `\\ `
+    joins two words in bash, so the placeholder has to join them here too."""
     blanked = _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
                              + m.group(0)[-1], text or "")
-    blanked = _ESCAPE_RX.sub("  ", blanked)
-    # A `#` that STARTS a word comments out the rest of the line, and every
-    # parser downstream was reading that text as code: `command true # git
-    # fetch` ran only `true` while `executes` found a fetch in the comment and
-    # took the call as a green receipt. Blanked last, so a `#` inside quotes
-    # or behind an escape is already gone and cannot start one — and mid-word
-    # (`%h#%s`, a URL fragment) is not a comment at all.
-    return _COMMENT_RX.sub(lambda m: " " * len(m.group(0)), blanked)
+    return _ESCAPE_RX.sub("\x01\x01", blanked)
 
 
 def unquoted(text):
@@ -413,6 +417,8 @@ _CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
 # `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
 # — `sudo cd x` cannot move this shell and `env cd x` fails outright.
 _CD_WRAPPERS = frozenset({"command", "builtin"})
+_CMD_PREFIXES = frozenset({"!", "if", "elif", "then", "else", "while", "until", "do"})
+_BLOCK_END = frozenset({"fi", "done", "esac", "}", ";;"})
 
 
 _RUNNERS = frozenset({
@@ -586,9 +592,37 @@ def strip_leading_assignments(shell):
     return "\n".join(out)
 
 
+def strip_comments(text):
+    """`text` with `#` comments blanked and quotes left INTACT, length
+    preserved.
+
+    `blank_quoted` answers "which characters are syntax", and blanks quoted
+    content along the way — right for finding operators, wrong for matching a
+    rule, which is deliberately allowed to see inside quotes. This asks only
+    the comment question, off `blank_syntax` (which has not blanked comments
+    yet), then blanks that span in the original.
+
+    A `#` that STARTS a word comments out the rest of the line. `git fetch #
+    git log origin/main` runs only the fetch, and the gate was matching the
+    commented `git log` and blocking a compliant call. Mid-word — `%h#%s`, a
+    URL fragment — is not a comment at all."""
+    out = list(text or "")
+    for m in _COMMENT_RX.finditer(blank_syntax(text)):
+        for i in range(m.start(), m.end()):
+            out[i] = " "
+    return "".join(out)
+
+
 def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
     """Does `rx` match this command, given that a leading env assignment is not
-    part of it?
+    part of it, and that a `#` comment is not part of it either?
+
+    Comments are blanked HERE rather than at each caller: this is the one
+    function that answers "does this command match", for the matcher lane and
+    the ordering gate alike, and blanking in `blank_quoted` only reached the
+    callers that happened to use it. `git fetch # git log origin/main` runs
+    only the fetch, and the gate was reading the commented `git log` and
+    blocking a compliant call.
 
     The command is read as BOTH forms — as written, and with the assignments
     that begin a segment removed. `rx` fires when EITHER matches, so an anchored
@@ -600,6 +634,7 @@ def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
     instead would let a prefix delete the very token the exemption keys on, so
     `FOO=1 cmd` would defeat an exemption that `cmd` honours — stripping would
     become a way to BREAK an exemption, which is the opposite of the point."""
+    text = strip_comments(text)
     forms = [text]
     bare = strip_leading_assignments(text)
     if bare != text:
@@ -1601,6 +1636,17 @@ def _segment_target(seg):
     # segment that is nothing BUT the closing brace; that segment addresses
     # no repo, and calling it `local` made the group disagree with itself.
     bare = strip_leading_assignments(bare.strip("(){} \t")).strip()
+    # `! gh pr view -R x` runs the pipeline and negates its status; `if`,
+    # `then`, `do` and friends introduce one. None of them is the command, and
+    # reading them as one answered `local` for a call that addresses another
+    # repo. `fi`/`done`/`esac` close a block and run nothing at all.
+    while True:
+        head = bare.split()[0] if bare.split() else ""
+        if head in _BLOCK_END:
+            return ""
+        if head not in _CMD_PREFIXES:
+            break
+        bare = bare[len(head):].lstrip()
     if not bare:
         # An assignment-only segment (`GH_REPO=inner; gh pr view`) sets
         # variables for the commands AFTER it, and bash keeps the export
@@ -4088,7 +4134,7 @@ def main():
             continue
         crx = r.get("converted_rx")
         if mode == "post" and tool == "Bash" and crx and cmd \
-                and re.search(crx, shell_only(cmd), re.I | re.M):
+                and re.search(crx, strip_comments(shell_only(cmd)), re.I | re.M):
             log_conversion(fid, "converted_rx")
             del st["open"][rid]
             st.get("open_file", {}).pop(rid, None)
