@@ -417,6 +417,7 @@ _CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
 # `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
 # — `sudo cd x` cannot move this shell and `env cd x` fails outright.
 _CD_WRAPPERS = frozenset({"command", "builtin"})
+_MODAL_RUNNERS = frozenset({"command", "builtin", "exec"})
 _CMD_PREFIXES = frozenset({"!", "if", "elif", "then", "else", "while", "until", "do"})
 _BLOCK_END = frozenset({"fi", "done", "esac", "}", ";;"})
 
@@ -475,6 +476,19 @@ def executes(segment, rx):
     tokens = text.split()
     head = os.path.basename(tokens[0]) if tokens else ""
     if head not in _RUNNERS or any(t in _INLINE_CODE_FLAGS for t in tokens[1:]):
+        return False
+    # `command`, `builtin` and `exec` have MODES: `command -v pytest` prints
+    # where pytest is and runs nothing, so a successful `command -v pytest &&
+    # git push` was self-discharging a test obligation without testing. The
+    # rest of the list exists only to run what it is given — `sudo -u bob
+    # pytest`, `nice -n 5 pytest`, `python3 -m pytest` all really run it — so
+    # a flag disqualifies only the three that can mean something else.
+    #
+    # And only the token IMMEDIATELY after them, which is where their own
+    # options go. Scanning every token read `builtin git fetch --all` as
+    # flagged, when `--all` belongs to `git fetch`; the existing receipt test
+    # caught that.
+    if head in _MODAL_RUNNERS and tokens[1:2] and tokens[1].startswith("-"):
         return False
     return bool(re.search(rx, text))
 
@@ -2436,8 +2450,15 @@ def _norm_given(r):
     left is removed entirely rather than left as an empty block that would
     read as "no condition, all good"."""
     raw = r["given"]
-    kept = given_norm(given_supported(raw))
-    if kept is None and not given_unsupported(raw):
+    supported = given_supported(raw)
+    kept = given_norm(supported) if supported else None
+    # The two failures are judged separately, because a rule can carry both.
+    # A KNOWN key with a value of the wrong kind is malformed and drops the
+    # rule however new the hook — and an unsupported key sitting beside it
+    # used to suppress that, so `{"future_key": true, "branch_rx": 42}` had
+    # its whole `given` removed and fired unconditionally. Skew must not
+    # launder a malformed predicate.
+    if supported and kept is None:
         return False
     if kept:
         r["given"] = kept

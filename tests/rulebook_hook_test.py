@@ -2093,6 +2093,20 @@ def armed_lane_checks() -> None:
         check("command_fires: quotes stay visible to a matcher — only comments go",
               rb_mod.command_fires(r"rm\s+-rf", 'echo "rm -rf /"', flags=0)
               and not rb_mod.command_fires(r"rm\s+-rf", "echo hi # rm -rf /", flags=0))
+        # `command`, `builtin` and `exec` have MODES: `command -v pytest`
+        # prints where pytest is and runs nothing, so `command -v pytest &&
+        # git push` was self-discharging a test obligation without testing.
+        # The rest of the runner list exists only to run what it is given, so
+        # a flag disqualifies only those three.
+        _rx = r"pytest|run_all\.py"
+        for introspect in ("command -v pytest", "command -V pytest", "exec -a x pytest"):
+            check(f"receipt: {introspect!r} runs nothing",
+                  not rb_mod.executes(introspect, _rx))
+        for really_runs in ("command pytest", "python3 -m pytest", "sudo -u bob pytest",
+                            "nice -n 5 pytest",
+                            "uv run --with 'mcp<2' python tests/run_all.py"):
+            check(f"receipt: {really_runs[:28]!r} really runs it",
+                  rb_mod.executes(really_runs, _rx), really_runs)
         check("last_segment: a separator inside quotes is data",
               rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
               rb_mod.last_segment("echo 'a; b'"))
@@ -2359,6 +2373,24 @@ def min_hook_version_checks() -> None:
         c, _ = pre("v1", "foxtrot")
         check("wrong kind: a KNOWN key with a value of the wrong kind is a "
               "malformed rule and still drops it, as rx_ok does", c == "", c)
+
+        # A rule can carry BOTH failures, and they are judged separately. An
+        # unsupported key sitting beside a malformed known one used to
+        # suppress the malformed check, so the whole `given` was removed and
+        # the rule fired unconditionally. Skew must not launder a malformed
+        # predicate.
+        def _row_given(g):
+            return _row("mixed", {"event": "bash", "command_rx": "x", "given": g})
+        check("mixed: a malformed known key drops the rule even beside an "
+              "unsupported one",
+              H.to_hook_rule(_row_given({"repo": {"future_key": True,
+                                                  "branch_rx": 42}})) is None)
+        r = H.to_hook_rule(_row_given({"repo": {"branch_rx": "^main$",
+                                                "future_key": 1}}))
+        check("mixed: a WELL-FORMED known key beside an unsupported one is "
+              "kept and still checked",
+              r is not None and r.get("given") == {"repo": {"branch_rx": "^main$"}},
+              str(r and r.get("given")))
 
         # What the hook CAN check is still checked. `branch_rx: ^main$` holds
         # here, so the rule fires; the point is that the unknown key next to
