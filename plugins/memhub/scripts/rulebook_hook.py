@@ -272,11 +272,20 @@ def and_only_segments(shell):
     return [x.strip() for x in rest.split("\x00") if x.strip()]
 
 
-# Quoted spans, blanked. `shlex` would tokenise properly but throws on the
-# half-quoted strings real commands contain, and this only needs the contents
-# gone, not the tokens.
-_SQ_RX = re.compile(r"'[^']*'")
-_DQ_RX = re.compile(r'"[^"]*"')
+# Quoted spans, blanked to spaces IN PLACE. `shlex` would tokenise properly
+# but throws on the half-quoted strings real commands contain, and this only
+# needs the contents neutralised, not the tokens. Length-preserving on
+# purpose: `split_shell` finds separators in the blanked copy and slices the
+# ORIGINAL at those offsets, so a value that is legitimately quoted survives.
+_QUOTED_RX = re.compile(r"'[^']*'|\"[^\"]*\"")
+_SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\|")
+
+
+def blank_quoted(text):
+    """`text` with the contents of quoted spans replaced by spaces, character
+    for character, so every offset still points at the same place."""
+    return _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
+                          + m.group(0)[-1], text or "")
 
 
 def unquoted(text):
@@ -291,7 +300,25 @@ def unquoted(text):
     stale ref with the obligation cleared. Blanking quoted text costs a
     receipt whose command is genuinely quoted (`pytest "tests/x"`), and that
     costs an extra gate rather than a missed one."""
-    return _DQ_RX.sub('""', _SQ_RX.sub("''", text or ""))
+    return blank_quoted(text)
+
+
+def split_shell(shell):
+    """[(joiner_before, segment)] — split at shell separators that are really
+    separators, and say which one preceded each segment (`""` for the first).
+
+    A `|` or `;` INSIDE a quoted argument is data. `gh pr view --json title
+    --jq '.title | ascii_downcase' -R acme/other` is one command, and reading
+    the jq pipe as a separator left the `-R` in a fragment that no longer
+    began with `gh` — so the repo the command named went unseen and its
+    predicates were answered about the session's checkout instead."""
+    blank = blank_quoted(shell or "")
+    out, pos, joiner = [], 0, ""
+    for m in _SEPARATOR_RX.finditer(blank):
+        out.append((joiner, (shell or "")[pos:m.start()]))
+        joiner, pos = m.group(0), m.end()
+    out.append((joiner, (shell or "")[pos:]))
+    return [(j, seg) for j, seg in out if seg.strip()]
 
 
 def self_discharging(shell, spec):
@@ -1216,12 +1243,13 @@ _CD_SEGMENT = re.compile(r"^\s*cd\s+" + _ARG + r"\s*$")
 # usually ends up with.
 _REPO_ARG = re.compile(r"(?:^|\s)(?:-R\s*=?\s*|--repo\s*=?\s*)" + _ARG)
 _GH_SEGMENT = re.compile(r"^gh\b")
-# `[HOST/]OWNER/REPO`. The host is parsed so a GitHub Enterprise argument is
-# RECOGNISED, then dropped: `origin_slug` reads owner/repo out of a remote URL
-# and comparing hosts would mean teaching it to normalise every URL spelling
-# git accepts. Dropping it can only widen a match to a same-named repo on
-# another host — which is the ambiguity case, and that now answers nothing.
-_SLUG = re.compile(r"^(?:[A-Za-z0-9._-]+/)?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$")
+# `[HOST/]OWNER/REPO`, host KEPT. Dropping it was wrong in the one case the
+# host exists to distinguish: with a single local checkout of
+# `github.com/acme/repo`, `-R ghe.corp/acme/repo` matched it unambiguously and
+# its branch and diff answered for a repository on another server. Not
+# missing the repo, which is what the earlier spelling fix was about —
+# confidently naming the wrong one.
+_SLUG = re.compile(r"^(?:[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _ORIGIN_SECTION = re.compile(r'^\[\s*remote\s+"origin"\s*\]', re.I)
 _CONFIG_URL = re.compile(r"^url\s*=\s*(.+)$", re.I)
 _SIBLINGS_MAX = 128     # CHECKOUTS examined, not entries listed: a fleet parent
@@ -1244,20 +1272,28 @@ def command_root(cwd, command):
     Only the LEADING run of `cd`-only segments counts, each resolved against
     the one before it, so `cd a && cd ../b && git diff` measures `b` while a
     `cd` after a command that can fail is not honoured — that one the command
-    may never reach. Segments are the hook's own (`shell_only`, then the
-    `last_segment` splitter), which is what makes a `cd` on its own LINE count
-    exactly as one written `cd x && …`; it did not before, and a command
-    written across two lines is the ordinary way an agent spells this.
+    may never reach. Segments are the hook's own (`shell_only`, then
+    `split_shell`), which is what makes a `cd` on its own LINE count exactly
+    as one written `cd x && …`; it did not before, and a command written
+    across two lines is the ordinary way an agent spells this.
+
+    A `cd` reached by `||` is refused outright rather than followed: `cd
+    ../RepoA || cd ../RepoB; git diff` runs the second only when the FIRST
+    failed, and which happened is not visible from the command text. Guessing
+    would answer branch and diff predicates about a tree the shell never
+    entered.
 
     Returns "" when the command redirects nowhere, or nowhere that is a
     worktree, and the caller keeps the session's root.
     """
-    segs = [x.strip() for x in re.split(r"&&|\|\||;|\n", shell_only(command or "")) if x.strip()]
+    segs = split_shell(shell_only(command or ""))
     path = ""
-    for seg in segs[:-1]:                    # the last segment is the command, not a `cd`
-        m = _CD_SEGMENT.match(seg)
+    for joiner, seg in segs[:-1]:            # the last segment is the command, not a `cd`
+        m = _CD_SEGMENT.match(seg.strip())
         if not m:
             break
+        if joiner == "||":                   # conditional on a failure we cannot see
+            return ""
         arg = next((g for g in m.groups() if g), "")
         if not arg:                          # `cd` home, `cd -`: unknowable
             return ""
@@ -1277,29 +1313,57 @@ def named_repo(command):
     `_named_base` applies to `--base`, for the same reason. A command that
     cannot say plainly which repo it is about does not get to choose one."""
     named = set()
-    for seg in re.split(r"&&|\|\||;|\n|\|", shell_only(command or "")):
+    for _, seg in split_shell(shell_only(command or "")):
         bare = strip_leading_assignments(seg).strip()
         if not _GH_SEGMENT.match(bare):
             continue
         for m in _REPO_ARG.finditer(bare):
             value = next((g for g in m.groups() if g), "")
-            if value:
-                named.add(value)
-    slugs = {m.group(1) for m in (_SLUG.match(v) for v in named) if m}
-    return slugs.pop() if len(slugs) == 1 else ""
+            if value and _SLUG.match(value):
+                named.add(value.casefold())
+    return named.pop() if len(named) == 1 else ""
 
 
 def _slug_of_url(url):
-    """`owner/repo` from a remote URL, in every spelling git writes: scp-style
-    (`git@host:owner/repo.git`), URL-style, and with or without `.git`."""
+    """`[host/]owner/repo` from a remote URL, in every spelling git writes:
+    scp-style (`git@host:owner/repo.git`), URL-style, and with or without
+    `.git`. The host comes back when the URL carries one — a local path
+    remote has none, and then only owner/repo is known."""
     url = url.strip().rstrip("/").removesuffix(".git")
-    tail = url.split("://", 1)[1] if "://" in url else url.split(":")[-1]
-    parts = [p for p in tail.replace(":", "/").split("/") if p]
-    return "/".join(parts[-2:]) if len(parts) >= 2 else ""
+    host = ""
+    if "://" in url:
+        netloc, _, path = url.split("://", 1)[1].partition("/")
+        host = netloc.rsplit("@", 1)[-1].split(":", 1)[0]
+    elif ":" in url and not os.path.isabs(url):      # scp-style
+        netloc, _, path = url.partition(":")
+        host = netloc.rsplit("@", 1)[-1]
+    else:
+        path = url
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    slug = "/".join(parts[-2:])
+    return f"{host}/{slug}" if host else slug
+
+
+def slug_matches(have, want):
+    """Is `have` (a checkout's `[host/]owner/repo`) the repo `want` names?
+
+    Hosts are compared only when BOTH sides carry one. A command that says
+    `ghe.corp/acme/repo` must not match a checkout of `github.com/acme/repo` —
+    same owner and name, different server, entirely different code. A command
+    that says plain `acme/repo` names no host and matches on owner/repo, which
+    is what `gh` itself does with its default host."""
+    if not have or not want:
+        return False
+    h, w = have.casefold().split("/"), want.casefold().split("/")
+    if len(h) == 3 and len(w) == 3:
+        return h == w
+    return h[-2:] == w[-2:]
 
 
 def origin_slug(root):
-    """`owner/repo` from a checkout's `origin` remote, or "".
+    """`[host/]owner/repo` from a checkout's `origin` remote, or "".
 
     Read out of `.git/config` rather than asked of git: this decides a Bash
     call's probe root, and a subprocess per candidate directory is a cost the
@@ -1348,14 +1412,19 @@ def checkout_of(cwd, root, slug, command=""):
     somebody else's branch. Both are wrong answers wearing the shape of right
     ones, which is worse than the silence the caller gets instead.
 
-    Two details do pin a checkout, and both are consulted first: the session
-    is standing in one, or the command `cd`s into one."""
+    Two details do pin a checkout, and both are consulted first: the command
+    `cd`s into one, or the session is standing in one. In that order — a `cd`
+    is what the command SAYS, the session cwd is only where it happens to
+    start, so `cd ../Repo-feature && gh pr view -R acme/repo` run from `Repo`
+    measures `Repo-feature`. Checking the session first made the advertised
+    `cd` disambiguation work only when the session was somewhere else
+    entirely."""
     want = slug.casefold()
-    if root and origin_slug(root).casefold() == want:
-        return root
     cd_root = command_root(cwd, command)
-    if cd_root and origin_slug(cd_root).casefold() == want:
+    if cd_root and slug_matches(origin_slug(cd_root), want):
         return cd_root
+    if root and slug_matches(origin_slug(root), want):
+        return root
     deadline = time.monotonic() + _SIBLINGS_BUDGET_S
     hits, seen, truncated = [], set(), False
     for parent in (cwd, os.path.dirname(root) if root else ""):
@@ -1376,7 +1445,7 @@ def checkout_of(cwd, root, slug, command=""):
                 truncated = True     # a second worktree could be in the tail
                 break
             cand = repo_info(d)[1]
-            if cand and origin_slug(cand).casefold() == want and cand not in hits:
+            if cand and slug_matches(origin_slug(cand), want) and cand not in hits:
                 hits.append(cand)
                 if len(hits) > 1:       # ambiguous: stop looking, answer nothing
                     return ""

@@ -409,6 +409,15 @@ def bash_target_checks() -> None:
               addressed("ls && cd ../Other && git diff") == here)
         check("bash: a `cd` to somewhere that is not a checkout keeps cwd's",
               addressed(f"cd {plain} && git diff") == here)
+        # `cd A || cd B` runs the second only when the FIRST failed, and the
+        # command text cannot say which happened. Following it would answer
+        # about a tree the shell may never have entered.
+        check("bash: a `cd` reached by `||` is refused, not followed",
+              addressed(f"cd {other} || cd {here} ; git diff") == here,
+              addressed(f"cd {other} || cd {here} ; git diff"))
+        check("bash: `cd A ; cd B` (both run) is still followed",
+              addressed(f"cd {plain} ; cd {other} ; git diff") == other,
+              addressed(f"cd {plain} ; cd {other} ; git diff"))
 
         # --- 1. the repo the command NAMES ----------------------------------
         check("bash: `gh -R acme/other` measures the repo it addresses, not cwd",
@@ -440,30 +449,63 @@ def bash_target_checks() -> None:
         # `gh pr view --help`: `-R, --repo [HOST/]OWNER/REPO`. Missing a valid
         # spelling is not harmless — it falls back to the CWD checkout, which
         # is the bug this whole function exists to fix.
-        for spelling in ("gh pr view 7 -R ghe.corp/acme/other",     # GitHub Enterprise
-                         "gh pr view 7 -Racme/other",               # attached short form
+        for spelling in ("gh pr view 7 -Racme/other",               # attached short form
                          "gh pr view 7 --repo=acme/other",          # equals form
                          "gh pr view 7 --repo acme/other"):
             check(f"bash: {spelling.split(' ', 3)[3]!r} names the repo",
                   addressed(spelling) == other, f"{spelling!r} -> {addressed(spelling)}")
-        check("bash: a host-qualified and a bare spelling of ONE repo are not "
-              "two repos", addressed("gh pr view -R ghe.corp/acme/other || "
-                                     "gh pr view -R acme/other") == other)
+
+        # The HOST is part of the identity. `acme/other` here is on
+        # github.com; a command naming the same owner and name on another
+        # server is naming different code, and matching it would answer
+        # branch and diff predicates about the wrong repository entirely.
+        check("bash: a host-qualified `-R` does not match a checkout on "
+              "ANOTHER host", addressed("gh pr view 7 -R ghe.corp/acme/other") == "",
+              addressed("gh pr view 7 -R ghe.corp/acme/other"))
+        check("bash: and it does match when the hosts agree",
+              addressed("gh pr view 7 -R github.com/acme/other") == other,
+              addressed("gh pr view 7 -R github.com/acme/other"))
+        check("bash: an unqualified `-R` still matches on owner/repo, the way "
+              "`gh` resolves its default host",
+              addressed("gh pr view 7 -R acme/other") == other)
+        check("bash: two spellings that are not provably one repo are refused",
+              addressed("gh pr view -R ghe.corp/acme/other || "
+                        "gh pr view -R acme/other") == here)
+
+        # A `|` inside a quoted argument is data, not a separator. `--jq` with
+        # a pipe is the everyday case, and splitting there left the `-R` in a
+        # fragment that no longer began with `gh`.
+        jq = "gh pr view --json title --jq '.title | ascii_downcase' -R acme/other"
+        check("bash: a jq pipe inside quotes does not hide the named repo",
+              addressed(jq) == other, f"{jq!r} -> {addressed(jq)}")
+        check("bash: a `;` inside quotes is data too",
+              addressed('gh pr comment -b "one; two" -R acme/other') == other)
         check("bash: a repo named on a later `gh` segment still counts",
               addressed("git status && gh pr view 7 -R acme/other") == other)
 
         # `origin_slug` reads .git/config, never git — this decides a probe
-        # root on every Bash call's hot path.
-        check("origin slug: scp-style remote", rb.origin_slug(here) == "acme/here")
-        check("origin slug: https remote, `.git` or not", rb.origin_slug(other) == "acme/other")
+        # root on every Bash call's hot path. It carries the HOST, because
+        # owner/repo alone cannot tell two servers apart.
+        check("origin slug: scp-style remote keeps the host",
+              rb.origin_slug(here) == "github.com/acme/here", rb.origin_slug(here))
+        check("origin slug: https remote, `.git` or not",
+              rb.origin_slug(other) == "github.com/acme/other", rb.origin_slug(other))
         check("origin slug: a checkout with no remote answers nothing",
               rb.origin_slug(mkmain(container, "Bare")) == "")
+        for url, want in (("ssh://git@ghe.corp:22/acme/x", "ghe.corp/acme/x"),
+                          ("git@github.com:acme/x.git", "github.com/acme/x"),
+                          ("https://ghe.corp/acme/x/", "ghe.corp/acme/x"),
+                          ("/srv/git/x", "git/x")):          # a local remote has no host
+            check(f"origin slug: {url!r}", rb._slug_of_url(url) == want, rb._slug_of_url(url))
+        check("slug match: a local checkout with no known host still matches "
+              "a host-qualified name — one unknown is not a mismatch",
+              rb.slug_matches("acme/x", "ghe.corp/acme/x"))
 
         # A LINKED worktree has no config of its own; its `commondir` names
         # the main checkout's, which is where the remote actually lives.
         wt = mkworktree(container, other, "Other-feature", "feat/y")
         check("origin slug: a linked worktree answers with its repo's remote",
-              rb.origin_slug(wt) == "acme/other", rb.origin_slug(wt))
+              rb.origin_slug(wt) == "github.com/acme/other", rb.origin_slug(wt))
 
         # AMBIGUITY. `acme/other` is now TWO checkouts — the main one and its
         # worktree. `-R` names a repository, and the probes read
@@ -482,6 +524,14 @@ def bash_target_checks() -> None:
         check("bash: `cd`ing into one of them disambiguates it",
               rb.addressed_root(container, "", f"cd {wt} && gh pr view 7 -R acme/other") == wt,
               rb.addressed_root(container, "", f"cd {wt} && gh pr view 7 -R acme/other"))
+        # The command's own `cd` outranks the session's cwd: a `cd` is what
+        # the command SAYS, cwd is only where it happens to start. Checking
+        # the session first made this disambiguation work only when the
+        # session was somewhere else entirely.
+        check("bash: a `cd` into a SIBLING worktree beats the session's own "
+              "checkout of the same repo",
+              rb.addressed_root(other, other, f"cd {wt} && gh pr view 7 -R acme/other") == wt,
+              rb.addressed_root(other, other, f"cd {wt} && gh pr view 7 -R acme/other"))
         check("bash: a repo with exactly ONE checkout still resolves",
               addressed("gh pr view 7 -R acme/here") == here)
 
