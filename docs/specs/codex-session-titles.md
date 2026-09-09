@@ -169,21 +169,28 @@ failure source. Requirements:
   truncated final line from an interrupted write is normal.
 - `encoding="utf-8"`, explicitly — the same reason `load_rollout` pins it (a bare read decodes
   with the OS locale codec and one em-dash kills the import on a cp1252 box).
-- **Bound the read — from the TAIL.** This file grows with every session the user has ever run,
+- **Bound the read — SEEK to the TAIL.** This file grows with every session the user has ever run,
   and it is append-ordered (oldest first), so the row for the session being flushed is always among
-  the newest. Keep the last `_INDEX_MAX_LINES` (10,000) lines with
-  `collections.deque(fh, maxlen=…)`: one pass, bounded memory, and "last matching row wins"
-  unchanged. Bounding from the FRONT instead would silently kill this lane for any long-time Codex
-  user — every Desktop session would revert to the prompt fallback, which is the very bug the lane
-  exists to fix. Do not stop at the first match; the scan must see the whole window.
+  the newest. Bounding from the FRONT would silently kill this lane for any long-time Codex user —
+  every Desktop session would revert to the prompt fallback, which is the very bug the lane exists
+  to fix.
+
+  Seek to the last `_INDEX_TAIL_BYTES` (4 MB) rather than reading forward and keeping the last N
+  lines: a `deque(fh, maxlen=…)` bounds *memory* but still streams the whole file, and it is the
+  READ that has to be bounded — this runs on every flush of an unnamed rollout. Measured before and
+  after, on a synthetic index: 66 MB / 1M rows went from **594 ms to 28 ms**, flat with file size.
+  A byte bound also contains the one case a line count cannot — a single unterminated line.
+
+  Open binary (the offset is in bytes), decode with `errors="replace"`, and drop the first line: a
+  seek lands mid-character and mid-record. `_INDEX_MAX_LINES` (10,000) stays as a second cap. Do
+  not stop at the first match; the scan must see the whole window, because "last matching row wins".
 - Match on the `id` field against the session id the reader already resolved from `session_meta`
   (`sm.get("id")`). If `session_id` is `None`, skip step 2 entirely.
 - Last matching row wins — the index records an update by appending.
 
-Known limit, accepted: the bound counts LINES, so a single unterminated line (an index symlinked
-to `/dev/zero`) is still unbounded, and a FIFO in its place blocks until the hook's timeout. Both
-require a hostile file inside the user's own `~/.codex`, which is not a boundary this reader
-defends.
+The byte bound closes the unterminated-line case. A FIFO in place of the index would still block
+until the hook's timeout; that requires a hostile file inside the user's own `~/.codex`, which is
+not a boundary this reader defends.
 
 ### 3.4 A non-dict record must not crash the hook
 

@@ -74,7 +74,11 @@ _SESSIONS = _CODEX_DIR / "sessions"
 _SESSION_INDEX = _CODEX_DIR / "session_index.jsonl"
 # The index grows with every session the user has ever run and is read on a
 # hook path, so the scan is bounded rather than trusting the file to be small.
+# The byte bound is the real one (the read is seeked to the tail); the line cap
+# is the belt-and-braces second limit. 10k rows of this shape is ~1.4 MB, so
+# 4 MB comfortably holds the window even if Codex widens the record.
 _INDEX_MAX_LINES = 10_000
+_INDEX_TAIL_BYTES = 4 * 1024 * 1024
 # Matches the cap the send sites already apply, so `meta["title"]` cannot come
 # out longer on one capture path than another. The pre-change reader bounded
 # every title unconditionally (`[:150]`); the verbatim lane keeps that promise.
@@ -355,18 +359,29 @@ def _sidecar_thread_name(session_id: str | None) -> str | None:
         return None
     try:
         found = None
-        # utf-8 pinned for the same reason as ``load_rollout``: a bare read
-        # decodes with the OS locale codec and one em-dash kills the import.
-        with open(_SESSION_INDEX, encoding="utf-8", errors="replace") as fh:
-            # The TAIL, not the head. The index is append-ordered — oldest
-            # session first — so the row for the session being flushed is
-            # always among the newest. Bounding from the front would make the
-            # lane silently die on a long-time user's index and send every
-            # Codex Desktop session back to the prompt fallback, which is the
-            # bug this lane exists to fix. deque keeps memory bounded to the
-            # last N lines in one pass, and "last matching row wins" survives.
-            tail = deque(fh, maxlen=_INDEX_MAX_LINES)
-        for line in tail:
+        # The TAIL, not the head. The index is append-ordered — oldest session
+        # first — so the row for the session being flushed is always among the
+        # newest. Bounding from the front would make the lane silently die on a
+        # long-time user's index and send every Codex Desktop session back to
+        # the prompt fallback, which is the bug this lane exists to fix.
+        #
+        # SEEK to the tail rather than reading forward and keeping the last N
+        # lines: that bounds memory but not the READ, and the read is what has
+        # to be bounded — this runs on every flush of an unnamed rollout. A
+        # byte bound also contains a pathological index (a single unterminated
+        # line) that a line count cannot. Opened binary so the offset is in
+        # bytes; a seek can land mid-character and mid-record, hence
+        # errors="replace" and dropping the first partial line.
+        with open(_SESSION_INDEX, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            start = max(0, size - _INDEX_TAIL_BYTES)
+            fh.seek(start)
+            blob = fh.read()
+        lines = blob.decode("utf-8", errors="replace").splitlines()
+        if start and lines:
+            lines = lines[1:]   # the seek landed mid-row; that is not a record
+        for line in deque(lines, maxlen=_INDEX_MAX_LINES):
             line = line.strip()
             if not line:
                 continue

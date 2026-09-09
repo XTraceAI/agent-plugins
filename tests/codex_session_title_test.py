@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -214,10 +215,40 @@ set_index(raw=over + json.dumps({"id": SID, "thread_name": "Newest row"}) + "\n"
 check("a row past the bound is still found when it is the newest",
       title_of([meta_line()]) == "Newest row")
 # ...and the bound still holds: a row older than the window is out of reach.
-set_index(raw=json.dumps({"id": SID, "thread_name": "Too old"}) + "\n"
-          + "".join(json.dumps({"id": "filler", "thread_name": "x"}) + "\n"
-                    for _ in range(codex_reader._INDEX_MAX_LINES)))
+old_far = json.dumps({"id": SID, "thread_name": "Too old"}) + "\n"
+padding = "".join(json.dumps({"id": "filler", "thread_name": "x"}) + "\n"
+                  for _ in range(codex_reader._INDEX_MAX_LINES))
+set_index(raw=old_far + padding * 2)
 check("the scan is bounded", title_of([meta_line()]) is None)
+
+# The bound is on BYTES READ, not just lines retained: the read seeks to the
+# tail, so a huge index costs the same as a small one. A line-count bound would
+# still stream the whole file from disk on every unnamed-rollout flush.
+big = "x" * (codex_reader._INDEX_TAIL_BYTES + 2_000_000)
+set_index(raw=big + "\n" + json.dumps({"id": SID, "thread_name": "Newest"}) + "\n")
+_t0 = time.perf_counter()
+_got = title_of([meta_line()])
+_elapsed = time.perf_counter() - _t0
+check("a huge index is still read from the tail", _got == "Newest")
+check("one unterminated line cannot blow the read up", _elapsed < 1.0)
+check("the byte bound comfortably covers the line cap",
+      codex_reader._INDEX_TAIL_BYTES > codex_reader._INDEX_MAX_LINES * 141)
+
+# A seek lands mid-record on any real index; the leading fragment is half a
+# row and must not be parsed as one. Build it so the seam falls inside the
+# filler rows, with the wanted row intact after it.
+filler_row = json.dumps({"id": "filler", "thread_name": "x" * 40}) + "\n"
+seam = filler_row * ((codex_reader._INDEX_TAIL_BYTES // len(filler_row)) + 50)
+set_index(raw=seam + json.dumps({"id": SID,
+                                 "thread_name": "After the seam"}) + "\n")
+check("a row split by the seek point is not mistaken for a record",
+      title_of([meta_line()]) == "After the seam")
+
+# A multi-byte character straddling the seek offset must not raise.
+set_index(raw=("é" * codex_reader._INDEX_TAIL_BYTES) + "\n"
+          + json.dumps({"id": SID, "thread_name": "Après"}) + "\n")
+check("a character split by the seek point does not raise",
+      title_of([meta_line()]) == "Après")
 
 
 # ── 4. verbatim vs normalized ─────────────────────────────────────────
