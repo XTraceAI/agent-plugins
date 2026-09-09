@@ -333,6 +333,11 @@ _RUNNERS = frozenset({
 })
 
 
+# A runner given code inline runs THAT, and everything after is the program's
+# own argv. One general shape, not a per-tool grammar.
+_INLINE_CODE_FLAGS = frozenset({"-c", "--command", "-e", "--eval", "--exec"})
+
+
 def executes(segment, rx):
     """Does this segment RUN the command `rx` describes, or merely mention it?
 
@@ -348,14 +353,32 @@ def executes(segment, rx):
     `uv run … pytest`, `sudo git fetch`, `make test` — where the real command
     is an argument by construction, and there the pattern may match anywhere.
     A wrapper not on that list simply does not discharge, which is an extra
-    gate rather than a missed one."""
+    gate rather than a missed one.
+
+    Except when the runner was handed INLINE CODE (`python -c …`, `bash -c …`,
+    `node -e …`): the tokens after that are the program's own `argv`, not a
+    command line, so `python -c 'pass' git fetch` runs no fetch at all.
+
+    KNOWN AND ACCEPTED RESIDUAL: this is not a shell parser, and a caller who
+    WANTS past a gate does not need one — `RULEBOOK_OVERRIDE=` is the
+    sanctioned way, and it is sanctioned precisely because it is RECORDED
+    (the same statement `Probes._named_base` makes about `--base`). What this
+    closes is the ACCIDENTAL bypass: `echo git fetch`, a grep for it, a commit
+    message quoting it. Teaching this function each runner's own argument
+    grammar — which token is `python -m`'s module, which is `npm run`'s
+    script — would be a per-tool parser that is wrong for the next tool, and
+    it would buy nothing against a deliberate bypass that has an approved
+    door already."""
     text = strip_leading_assignments(unquoted(segment or "")).strip()
     if not text:
         return False
     if re.match(rx, text):
         return True
-    head = os.path.basename(text.split()[0]) if text.split() else ""
-    return head in _RUNNERS and bool(re.search(rx, text))
+    tokens = text.split()
+    head = os.path.basename(tokens[0]) if tokens else ""
+    if head not in _RUNNERS or any(t in _INLINE_CODE_FLAGS for t in tokens[1:]):
+        return False
+    return bool(re.search(rx, text))
 
 
 def self_discharging(shell, spec):
@@ -1175,7 +1198,15 @@ def degradation(row, given=None, ordering=None):
     A rule that says so itself (`min_hook_version`) and one that merely
     carries a key we do not know are the same fact, so they degrade the same
     way: the rule advises, never gates, and says once per session that this is
-    what happened."""
+    what happened.
+
+    SCOPE, stated plainly: this protects FORWARD skew — this hook reading a
+    rule written for a later one. It cannot protect a hook OLDER than the
+    field itself, because the check is code that only the newer hook has: 0.53
+    loads a rule floored at 0.54 and its ordering engine ignores the condition
+    it cannot read. Closing that needs the server to serve an advice-only
+    representation to a hook below the floor, which is why `fetch_book` sends
+    `hook_version`; the server half is not in this repo."""
     want_raw = row.get("min_hook_version")
     if want_raw is not None:
         have = hook_version()
@@ -1355,6 +1386,27 @@ def command_root(cwd, command):
     return repo_info(reached)[1]
 
 
+# `.match(text, pos)` anchors at pos on its own; Python's `re` has no \G.
+_LEADING_ASSIGN_RX = re.compile(
+    r"\s*([A-Za-z_][A-Za-z0-9_]*)=('[^']*'|\"[^\"]*\"|[^\s;&|]*)")
+
+
+def leading_env(segment):
+    """{NAME: value} for the assignments that BEGIN a segment.
+
+    `strip_leading_assignments` removes them because bash does — they are the
+    command's environment, not its name. But two of them ARE the argument for
+    `gh`'s purposes, so the values have to be read before they go."""
+    out, pos = {}, 0
+    text = segment or ""
+    while True:
+        m = _LEADING_ASSIGN_RX.match(text, pos)
+        if not m:
+            return out
+        out[m.group(1)] = m.group(2).strip("\"'")
+        pos = m.end()
+
+
 def named_repo(command):
     """The `owner/repo` a `gh` command names with `-R` / `--repo`, or "".
 
@@ -1368,6 +1420,17 @@ def named_repo(command):
         bare = strip_leading_assignments(seg).strip()
         if not _GH_SEGMENT.match(bare):
             continue
+        # `gh help environment`: GH_REPO names the repo, in the same
+        # `[HOST/]OWNER/REPO` form, for commands that would otherwise use the
+        # local one — and GH_HOST supplies the host an unqualified `-R`
+        # leaves out. `strip_leading_assignments` had just thrown both away,
+        # so `GH_REPO=… gh pr view` fell back to the session's checkout.
+        env = leading_env(seg)
+        host = env.get("GH_HOST", "").strip().strip("\"'")
+        repo_env = env.get("GH_REPO", "").strip().strip("\"'")
+        if repo_env and _SLUG.match(repo_env):
+            named.add(("%s/%s" % (host, repo_env) if host and repo_env.count("/") == 1
+                       else repo_env).casefold())
         # The FLAG is looked for in the blanked copy, so a `--repo` written
         # inside somebody's comment body (`gh pr comment -b "try --repo
         # acme/other"`) is the data it is. The VALUE is then read from the
@@ -1378,7 +1441,8 @@ def named_repo(command):
             hit = _REPO_ARG.match(bare[m.start():m.end()])
             value = next((g for g in hit.groups() if g), "") if hit else ""
             if value and _SLUG.match(value):
-                named.add(value.casefold())
+                named.add(("%s/%s" % (host, value) if host and value.count("/") == 1
+                           else value).casefold())
     return named.pop() if len(named) == 1 else ""
 
 
@@ -2199,7 +2263,20 @@ def fetch_book(repo, timeout=None):
     Not sending the parameter is the one form no grammar change can break.
     200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
     current, which is what §5.3 gate freshness measures); anything else →
-    the cache is left exactly as it was."""
+    the cache is left exactly as it was.
+
+    `hook_version` rides along so the SERVER can enforce a rule's
+    `min_hook_version`. That floor cannot be enforced only here, and saying so
+    plainly: the check lives in code that exists only in the hook it is
+    protecting against. A 0.53 hook does not know the field, loads the rule
+    anyway, and its ordering engine ignores the condition it cannot read — the
+    exact 0.40.1 shape. What the local check buys is FORWARD skew (this hook
+    reading a rule written for a later one); the backstop for hooks already
+    installed has to be the server serving them an advice-only representation,
+    and it cannot do that without being told who is asking. An older hook
+    sends no version, which is itself the signal that it predates the field.
+    Unknown query parameters are ignored by every backend this has run
+    against, so sending it costs nothing while the server side is unbuilt."""
     api = _api()
     if not api:
         return
@@ -2207,6 +2284,9 @@ def fetch_book(repo, timeout=None):
     old = load_book(repo) or {}
     hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
     q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    have = hook_version()
+    if have:
+        q += "&hook_version=" + ".".join(str(n) for n in have)
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
                           timeout=timeout or FETCH_TIMEOUT_S)

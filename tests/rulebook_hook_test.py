@@ -1991,6 +1991,16 @@ def armed_lane_checks() -> None:
         check("session-armed: a runner still discharges — the real command is "
               "its argument", c == "", c)
 
+        # ...but a runner handed INLINE CODE runs that, and the tokens after
+        # it are the program's own argv.
+        start("s11")
+        c = pre("s11", "python -c 'pass' git fetch && git log origin/main -5")
+        check("session-armed: `python -c … git fetch` runs no fetch and does "
+              "not excuse the gate", "[fetch-first]" in c, c)
+        post("s11", "python -c 'pass' git fetch")
+        c = pre("s11", "git log origin/main -5")
+        check("session-armed: nor is it a receipt", "[fetch-first]" in c, c)
+
         # SessionStart is NOT once per session: it fires again on resume, on
         # `/clear` and after a compaction, under the same session id. A plain
         # re-arm resurrects an obligation the session already discharged.

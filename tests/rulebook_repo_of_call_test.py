@@ -498,6 +498,24 @@ def bash_target_checks() -> None:
         check("bash: but a quoted VALUE still parses",
               addressed('gh pr view 7 -R "acme/other"') == other,
               addressed('gh pr view 7 -R "acme/other"'))
+
+        # `gh help environment`: GH_REPO names the repo in the same
+        # `[HOST/]OWNER/REPO` form, and GH_HOST supplies the host an
+        # unqualified `-R` leaves out. `strip_leading_assignments` threw both
+        # away before `named_repo` could look, so the call fell back to the
+        # session's checkout — the bug this function exists to remove.
+        check("bash: `GH_REPO=` names the repo just as `-R` does",
+              addressed("GH_REPO=acme/other gh pr view 7") == other,
+              addressed("GH_REPO=acme/other gh pr view 7"))
+        check("bash: a host-qualified GH_REPO on another host matches nothing",
+              addressed("GH_REPO=ghe.corp/acme/other gh pr view 7") == "")
+        check("bash: `GH_HOST=` qualifies an unqualified `-R`",
+              addressed("GH_HOST=ghe.corp gh pr view -R acme/other") == "",
+              addressed("GH_HOST=ghe.corp gh pr view -R acme/other"))
+        check("bash: and the matching host still resolves",
+              addressed("GH_HOST=github.com gh pr view -R acme/other") == other)
+        check("bash: an assignment that is not leading is not env",
+              addressed("echo GH_REPO=acme/other") == here)
         check("bash: a repo named on a later `gh` segment still counts",
               addressed("git status && gh pr view 7 -R acme/other") == other)
 
