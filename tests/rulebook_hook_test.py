@@ -2020,6 +2020,23 @@ def armed_lane_checks() -> None:
         c = pre("s13", "git log origin/main -5")
         check("session-armed: a redirected fetch is still a receipt", c == "", c)
 
+        # A segment reached through `||` ran only if the one before it FAILED.
+        # `true || git fetch` exits 0 from `true` and never fetches, so taking
+        # its textual last segment as a receipt discharged the obligation with
+        # the required command unrun. This one predates the branch: the same
+        # hole discharges the shipped tests-before-push rule via `make test ||
+        # pytest`.
+        start("s14")
+        post("s14", "true || git fetch --all")
+        c = pre("s14", "git log origin/main -5")
+        check("session-armed: a receipt reached through `||` is refused — it "
+              "may never have run", "[fetch-first]" in c, c)
+        # `;` and `&&` both guarantee the last segment ran.
+        start("s15")
+        post("s15", "echo hi ; git fetch --all")
+        c = pre("s15", "git log origin/main -5")
+        check("session-armed: after `;` the last segment did run", c == "", c)
+
         start("s9")
         post("s9", "sudo git fetch --all")
         c = pre("s9", "git log origin/main -5")

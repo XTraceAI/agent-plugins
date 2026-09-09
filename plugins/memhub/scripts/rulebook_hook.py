@@ -252,9 +252,12 @@ def shell_only(cmd):
     return "\n".join(out)
 
 
+_LAST_SEG_SPLIT_RX = re.compile(r"&&|\|\||;|\n")
+
+
 def last_segment(shell):
     """The final command segment of a shell string (split on ;, &&, ||, newline)."""
-    parts = [x.strip() for x in re.split(r"&&|\|\||;|\n", shell) if x.strip()]
+    parts = [x.strip() for x in _LAST_SEG_SPLIT_RX.split(shell) if x.strip()]
     return parts[-1] if parts else ""
 
 
@@ -454,6 +457,17 @@ def receipt_segments(shell, whole_chain=False):
         segs = and_only_segments(shell)
         if segs:
             return segs
+    # The last segment is a receipt only if it NECESSARILY ran. Reached
+    # through `||` it ran only when the one before it FAILED, so `true || git
+    # fetch` exits 0 from `true` and never fetches — and taking that as a
+    # receipt discharged the obligation with the required command unrun. `&&`
+    # and `;` both guarantee it ran, and then the call's status is its own.
+    #
+    # Joiners are read with `last_segment`'s own splitter (single `|` is not
+    # one of them, which is what the pipe test below still relies on).
+    joiners = [m.group(0) for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(shell or ""))]
+    if joiners and joiners[-1] == "||":
+        return []
     last = last_segment(shell)
     if last and "|" not in last and not last.rstrip().endswith("&"):
         return [last]
