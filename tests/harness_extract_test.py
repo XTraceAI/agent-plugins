@@ -183,6 +183,18 @@ def test_an_unusable_engine_is_a_refusal_not_a_partial_row():
     row, why = _build(_row(matcher={"event": "bash", "command_rx": "git push",
                                     "command_not_rx": "(("}))
     assert row and "command_not_rx" not in row["matcher"]
+
+    # An ordering armed by an event no lane emits is filed, reviewed,
+    # activated — and never fires. `armed_by_events: ["bash"]` looks
+    # reasonable and killed an otherwise-correct row on the S0 corpus.
+    ordering = {"required_command_rx": "gh pr view",
+                "gated_command_rx": "gh pr merge",
+                "armed_by_events": ["bash"], "display_name": "d"}
+    row, why = _build(_row(engine="ordering", matcher=None, ordering=ordering))
+    assert row is None and why == "ordering_armed_by_unknown"
+    ordering["armed_by_events"] = ["bash", "prompt"]
+    row, why = _build(_row(engine="ordering", matcher=None, ordering=ordering))
+    assert row and row["ordering"]["armed_by_events"] == ["prompt"]
     print("PASS test_an_unusable_engine_is_a_refusal_not_a_partial_row")
 
 
@@ -195,6 +207,59 @@ def test_a_stampless_draft_is_refused_client_side():
         row, why = _build(_row(), state)
         assert row is None and why == f"state_missing_{key}", (key, why)
     print("PASS test_a_stampless_draft_is_refused_client_side")
+
+
+def test_a_cross_repo_turn_carries_its_ambiguity():
+    """§4.2 resolves the stamp per ACTION, and `engine_target` picks the action
+    the authored engine matched — which on a cross-repo turn is routinely the
+    wrong one. A lesson about the plugin repo, drafted from a turn whose first
+    matching Bash call had `cd …/other-repo`, stamps the other repo, files into
+    its rulebook, and scopes the lesson to a repo it does not apply to.
+
+    The stamp cannot tell which repo the lesson is *about*. It can tell that
+    the turn touched two, and say so.
+    """
+    here = str(ROOT)
+    other = str(ROOT.parent)
+    turn = {"n": 1, "user": "u", "asst": "a", "results": [], "tools": [
+        {"tool": "Bash", "target": f"cd {here} && git status"},
+        {"tool": "Bash", "target": f"cd {other} && ls"},
+    ]}
+    state = hx.stamp_state(session="s", turn=turn,
+                           row_engine_target=("Bash", f"cd {here} && git status"),
+                           cwd="", hook_version="0.53.0", env_name="staging")
+    touched = state.get("touched_repos")
+    # Either the machine resolves both directories to repos (then the
+    # ambiguity must be carried) or it resolves at most one (then there is
+    # none to carry) — never a confident single value hiding a second repo.
+    resolved = {hx.resolve_repo("Bash", t["target"], "")[0] for t in turn["tools"]}
+    resolved.discard("")
+    if len(resolved) > 1:
+        assert touched and len(touched) > 1, state
+    assert state["session_id"] == "s" and state["turn"] == 1
+
+    # A single-repo turn stays clean — no noise field for the reviewer.
+    solo = {"n": 1, "user": "u", "asst": "a", "results": [],
+            "tools": [{"tool": "Bash", "target": f"cd {here} && git status"}]}
+    state = hx.stamp_state(session="s", turn=solo, row_engine_target=("", ""),
+                           cwd="", hook_version="0.53.0", env_name="staging")
+    assert "touched_repos" not in state
+    print("PASS test_a_cross_repo_turn_carries_its_ambiguity")
+
+
+def test_a_staging_replay_never_stamps_the_replaying_machines_repo():
+    """A teammate's session has no local cwd. Resolving from `""` must not fall
+    through to `os.path.abspath("")`, which is wherever the replay happens to
+    be running — that would stamp every teammate's lesson with the reviewer's
+    own repo."""
+    assert hx.resolve_repo("", "", "") == ("", "")
+    state = hx.stamp_state(
+        session="s", turn={"n": 2, "tools": [], "results": []},
+        row_engine_target=("", ""), cwd="", hook_version="0.53.0",
+        env_name="staging", default_repo="XTraceAI/MemHub-Backend")
+    assert state["repo"] == "XTraceAI/MemHub-Backend"
+    assert state["branch"] == "" and state["head_sha"] == ""
+    print("PASS test_a_staging_replay_never_stamps_the_replaying_machines_repo")
 
 
 # ------------------------------------------------------------------- twins

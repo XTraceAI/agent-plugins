@@ -270,6 +270,12 @@ ROUTER_KINDS = ("retraction", "claim_no_receipt", "standing_rule_request",
 # refusals for rows the spec says cannot exist.
 NOT_AUTHORED = {"claim_no_receipt"}
 
+# What can arm an `ordering` rule. "edit" is what the hook understands today;
+# "session" and "prompt" arrive with the §4.5 hook fixes. Anything else is the
+# author inventing an event, and an ordering armed by an event no lane emits
+# never fires.
+ARMED_BY_EVENTS = ("edit", "session", "prompt")
+
 
 def error_arcs(turn: dict) -> list[dict]:
     """Closed error arcs (§4.1): a tool error on target T, then a later
@@ -544,9 +550,17 @@ def validate_engine(raw: dict) -> tuple[str, dict, str]:
             return "", {}, "ordering_required_rx_unusable"
         if not _rx_ok(o.get("gated_command_rx")):
             return "", {}, "ordering_gated_rx_unusable"
-        events = o.get("armed_by_events")
-        if not isinstance(events, list) or not events:
-            o["armed_by_events"] = ["edit"]
+        # Only three events can arm an ordering: "edit" today, plus "session"
+        # and "prompt" from the §4.5 hook fixes. The author invents others —
+        # `armed_by_events: ["bash"]` looks reasonable and is silently never
+        # armed, so the rule is filed, reviewed, activated, and then never
+        # fires. Found on the S0 corpus: a confirm-review-threads-before-merge
+        # row, correct in every other respect, was dead on arrival.
+        events = [e for e in (o.get("armed_by_events") or [])
+                  if e in ARMED_BY_EVENTS]
+        if not events:
+            return "", {}, "ordering_armed_by_unknown"
+        o["armed_by_events"] = events
         return "agent_hook", {"ordering": o}, ""
     if engine == "anchors":
         anchors = [a.strip() for a in (raw.get("anchors") or [])
@@ -724,11 +738,19 @@ def stamp_state(*, session: str, turn: dict, row_engine_target: tuple[str, str],
         "at": _dt.datetime.now(_dt.timezone.utc)
               .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
-    # §4.2: when a turn touches two repos and the lesson names neither, carry
-    # the ambiguity so the reviewer sees it instead of a confident wrong value.
-    if len(touched) > 1 and repo in ("", None):
-        state["touched_repos"] = touched
-    elif len(touched) > 1 and target == "":
+    # §4.2 says to carry `touched_repos` when a turn touches two repos and the
+    # lesson names neither. We carry it whenever the turn touched more than
+    # one, which is broader, on purpose: "the lesson names neither" is exactly
+    # the judgement this code cannot make. `engine_target` picks the action the
+    # authored engine matched, and on a cross-repo turn that is routinely the
+    # wrong one — a lesson about the plugin repo, drafted from a turn whose
+    # first matching Bash call had `cd …/xmem`, stamps `repo: xmem` and would
+    # file into xmem's rulebook. Measured on the S0 corpus: 6 of 7 early rows
+    # from cross-repo sessions carried a repo the lesson was not about.
+    #
+    # A reviewer who sees the list can fix the scope in one click. A reviewer
+    # shown one confident wrong repo has no signal that anything is wrong.
+    if len(touched) > 1:
         state["touched_repos"] = touched
     return state
 
