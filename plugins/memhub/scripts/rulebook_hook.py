@@ -1028,7 +1028,23 @@ _BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
 # A plain branch name, and nothing that reaches elsewhere in history: no rev
 # syntax (`~ ^ : @{…}`), no path traversal, no leading dash.
 _BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
-_CD_PREFIX = re.compile(r"^\s*cd\s+" + _ARG + r"\s*(?:&&|;)")
+_CD_SEGMENT = re.compile(r"^\s*cd\s+" + _ARG + r"\s*$")
+# `-R` / `--repo` is read only off a `gh` segment: to grep, cp and rsync the
+# same flag means --recursive, and `grep -R foo/bar .` would otherwise name a
+# repo nobody mentioned.
+_REPO_ARG = re.compile(r"(?:^|\s)(?:-R|--repo)[=\s]+" + _ARG)
+_GH_SEGMENT = re.compile(r"^gh\b")
+_SLUG = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_ORIGIN_SECTION = re.compile(r'^\[\s*remote\s+"origin"\s*\]', re.I)
+_CONFIG_URL = re.compile(r"^url\s*=\s*(.+)$", re.I)
+_SIBLINGS_MAX = 128     # CHECKOUTS examined, not entries listed: a fleet parent
+                        # holds sixty-odd worktrees beside a pile of scratch
+                        # directories, and capping the listing cut the tail of
+                        # it alphabetically
+_SIBLINGS_BUDGET_S = 0.5   # measured: 5.6 ms warm over 68 worktrees, ~1 s the
+                           # first time the directory is walked at all. Past
+                           # this the scan gives up and answers "no checkout",
+                           # which is silence — never a slow tool call.
 
 
 def command_root(cwd, command):
@@ -1036,24 +1052,166 @@ def command_root(cwd, command):
 
     A hook payload carries the SESSION's cwd, but an agent working across
     worktrees runs `cd <other-repo> && …` in a single call — and then every
-    repo fact answered from the session's cwd describes the wrong tree. Only a
-    leading `cd` counts: it is the form that redirects the whole command, and
-    guessing at one buried mid-pipeline would answer with a directory the
-    command may never reach. Returns "" when there is no such prefix or it
-    does not resolve to a worktree, and the caller keeps the session's root.
+    repo fact answered from the session's cwd describes the wrong tree.
+
+    Only the LEADING run of `cd`-only segments counts, each resolved against
+    the one before it, so `cd a && cd ../b && git diff` measures `b` while a
+    `cd` after a command that can fail is not honoured — that one the command
+    may never reach. Segments are the hook's own (`shell_only`, then the
+    `last_segment` splitter), which is what makes a `cd` on its own LINE count
+    exactly as one written `cd x && …`; it did not before, and a command
+    written across two lines is the ordinary way an agent spells this.
+
+    Returns "" when the command redirects nowhere, or nowhere that is a
+    worktree, and the caller keeps the session's root.
     """
-    m = _CD_PREFIX.match(command or "")
-    if not m:
-        return ""
-    path = next((g for g in m.groups() if g), "")
-    if not path:
-        return ""
-    path = os.path.expanduser(path)
-    if not os.path.isabs(path):
-        path = os.path.join(cwd or "", path)
-    if not os.path.isdir(path):
+    segs = [x.strip() for x in re.split(r"&&|\|\||;|\n", shell_only(command or "")) if x.strip()]
+    path = ""
+    for seg in segs[:-1]:                    # the last segment is the command, not a `cd`
+        m = _CD_SEGMENT.match(seg)
+        if not m:
+            break
+        arg = next((g for g in m.groups() if g), "")
+        if not arg:                          # `cd` home, `cd -`: unknowable
+            return ""
+        arg = os.path.expanduser(arg)
+        path = arg if os.path.isabs(arg) else os.path.join(path or cwd or "", arg)
+    if not path or not os.path.isdir(path):
         return ""
     return repo_info(path)[1]
+
+
+def named_repo(command):
+    """The `owner/repo` a `gh` command names with `-R` / `--repo`, or "".
+
+    Refused, each falling through to the `cd`/cwd answer rather than to a
+    guess: anything that is not a plain `owner/repo` (a URL, a flag, a path),
+    and more than one distinct repo named in one command — the same test
+    `_named_base` applies to `--base`, for the same reason. A command that
+    cannot say plainly which repo it is about does not get to choose one."""
+    named = set()
+    for seg in re.split(r"&&|\|\||;|\n|\|", shell_only(command or "")):
+        bare = strip_leading_assignments(seg).strip()
+        if not _GH_SEGMENT.match(bare):
+            continue
+        for m in _REPO_ARG.finditer(bare):
+            value = next((g for g in m.groups() if g), "")
+            if value:
+                named.add(value)
+    if len(named) != 1:
+        return ""
+    slug = named.pop()
+    return slug if _SLUG.match(slug) else ""
+
+
+def _slug_of_url(url):
+    """`owner/repo` from a remote URL, in every spelling git writes: scp-style
+    (`git@host:owner/repo.git`), URL-style, and with or without `.git`."""
+    url = url.strip().rstrip("/").removesuffix(".git")
+    tail = url.split("://", 1)[1] if "://" in url else url.split(":")[-1]
+    parts = [p for p in tail.replace(":", "/").split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else ""
+
+
+def origin_slug(root):
+    """`owner/repo` from a checkout's `origin` remote, or "".
+
+    Read out of `.git/config` rather than asked of git: this decides a Bash
+    call's probe root, and a subprocess per candidate directory is a cost the
+    answer does not justify. A linked worktree has no config of its own — its
+    `commondir` names the main checkout's `.git`, the same walk
+    `repo_identity._main_worktree_basename` makes."""
+    gitdir = repo_info(root)[2]
+    if not gitdir:
+        return ""
+    if os.path.basename(os.path.dirname(gitdir)) == "worktrees":
+        try:
+            with open(os.path.join(gitdir, "commondir"), encoding="utf-8") as f:
+                gitdir = os.path.normpath(os.path.join(gitdir, f.read().strip()))
+        except OSError:
+            return ""
+    section = False
+    try:
+        with open(os.path.join(gitdir, "config"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    section = bool(_ORIGIN_SECTION.match(line))
+                elif section:
+                    m = _CONFIG_URL.match(line)
+                    if m:
+                        return _slug_of_url(m.group(1))
+    except OSError:
+        return ""
+    return ""
+
+
+def checkout_of(cwd, root, slug):
+    """A checkout of `slug` this machine holds and this session can reach: the
+    session's own first, then a directory beside it — beside cwd, and beside
+    the session's worktree, which is where the fleet layout puts its siblings.
+
+    "" when none matches, and that is the honest answer: a command about a
+    repo that is not checked out here must be measured in no repo at all
+    rather than in this one.
+
+    Several worktrees of the named repo are common, and this picks the first
+    by name. Deliberately under-specified: the command named a REPO, not a
+    worktree, and the alternative is guessing which one it meant. Any of them
+    is the right repository, which is the question that was asked — and all of
+    them beat the container directory that was being measured before."""
+    want = slug.casefold()
+    if root and origin_slug(root).casefold() == want:
+        return root
+    deadline = time.monotonic() + _SIBLINGS_BUDGET_S
+    seen = set()
+    for parent in (cwd, os.path.dirname(root) if root else ""):
+        if not parent or parent in seen:
+            continue
+        seen.add(parent)
+        try:
+            names = sorted(os.listdir(parent))
+        except OSError:
+            continue
+        looked = 0
+        for name in names:
+            d = os.path.join(parent, name)
+            if d == root or not os.path.exists(os.path.join(d, ".git")):
+                continue        # one stat; only a real checkout costs a read
+            looked += 1
+            if looked > _SIBLINGS_MAX or time.monotonic() > deadline:
+                break
+            cand = repo_info(d)[1]
+            if cand and origin_slug(cand).casefold() == want:
+                return cand
+    return ""
+
+
+def addressed_root(cwd, root, command):
+    """The checkout a Bash COMMAND addresses, or "" when it addresses none we
+    hold.
+
+    Every other tool answers this with the acted-on file's checkout
+    (`repo_of_call`). A Bash call carries no path, so until now the `given`
+    probes ran wherever the shell happened to be — measured consequence: a
+    500-line diff gate read 32,910 lines, the untracked files of sibling
+    agents' worktrees, because the session's cwd was the directory that
+    CONTAINS the checkouts rather than the one the command was about.
+
+    Precedence, most explicit first:
+
+    1. a repo the command NAMES (`gh … -R owner/repo`), resolved to a checkout
+       we actually hold;
+    2. the `cd` the command runs before it (`command_root`);
+    3. the worktree containing cwd — what every command answered before.
+
+    "" keeps the fail-open property the hook rests on: `Probes` answers None
+    for everything it cannot run, None satisfies no predicate, and a rule
+    whose `given` cannot be checked stays silent."""
+    slug = named_repo(command)
+    if slug:
+        return checkout_of(cwd, root, slug)
+    return command_root(cwd, command) or root
 
 
 class Probes:
@@ -1085,6 +1243,11 @@ class Probes:
         return self._memo[key]
 
     def _git(self, *args):
+        # No root is the answer `addressed_root` gives for a command about a
+        # repo this machine does not hold. `git -C ""` would resolve against
+        # the HOOK process's cwd, which is nobody's checkout in particular.
+        if not self.root:
+            return None
         import subprocess
         p = subprocess.run(["git", "-C", self.root, *args], capture_output=True,
                            text=True, timeout=PROBE_TIMEOUT_S)
@@ -2890,10 +3053,19 @@ def main():
     # the same field, so it is restricted the same way.
     cmd_text = ((data.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
     probe_root, probe_branch = root, branch
-    elsewhere = command_root(cwd, cmd_text)
-    if elsewhere and elsewhere != root:
-        probe_root = elsewhere
-        probe_branch = _branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
+    # Resolving which checkout a command addresses can cost a directory walk
+    # (`checkout_of`), so it is paid only when some active rule actually asks
+    # a question about a repo — the same shape as `wants_reads` / `wants_edits`
+    # below, which gate the other two measurements this lane can make.
+    wants_repo = cmd_text and any(
+        isinstance(r.get("given"), dict) and "repo" in r["given"]
+        and r.get("status", "active") == "active" for r in rules)
+    if wants_repo:
+        elsewhere = addressed_root(cwd, root, cmd_text)
+        if elsewhere != root:
+            probe_root = elsewhere
+            probe_branch = (_branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
+                            if elsewhere else "")
     probes = Probes(probe_root, probe_branch, command=cmd_text,
                     transcript_path=data.get("transcript_path"), agent_id=ctx["agent_id"])
 

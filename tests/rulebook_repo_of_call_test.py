@@ -18,6 +18,9 @@ Covers:
   was wrong;
 * a Bash call carries no path, so a non-git cwd stays silent exactly as
   before (the fail-open property the hook is built on);
+* and when a Bash command DOES say which repo it is about — `gh … -R
+  owner/repo`, or a `cd` it runs first — the `given` probes measure that
+  checkout rather than wherever the shell happened to be;
 * the session cwd is the trust boundary: a path outside it is ignored, a
   symlink under it cannot smuggle the lookup out, and a relative path binds
   to the SESSION's cwd rather than this process's;
@@ -348,8 +351,121 @@ def hook_checks() -> None:
               rc == 0 and out.strip() == "", out)
 
 
+def bash_target_checks() -> None:
+    """Which checkout a BASH call's `given` predicates measure.
+
+    `repo_of_call`'s own docstring named the hole: "A Bash call carries no
+    path and keeps the cwd answer." So the diff and branch probes ran wherever
+    the shell happened to be. Measured consequence, and the reason this
+    exists: a `diff_lines_gt: 500` gate read 32,910 lines — the untracked
+    files of sibling agents' worktrees — because the session's cwd was the
+    directory that CONTAINS the checkouts rather than the one the command was
+    actually about.
+
+    A command says which repo it is about in two ways, and both now outrank
+    cwd: a repo it NAMES (`gh … -R owner/repo`) and a `cd` it runs first.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        container = os.path.join(td, "container")       # holds checkouts, is not one
+        os.makedirs(container)
+        here = mkmain(container, "Here")
+        other = mkmain(container, "Other")
+        plain = os.path.join(container, "notarepo")
+        os.makedirs(plain)
+
+        def set_origin(root, url):
+            with open(os.path.join(root, ".git", "config"), "w", encoding="utf-8") as f:
+                f.write('[core]\n\trepositoryformatversion = 0\n'
+                        '[remote "origin"]\n\turl = %s\n\tfetch = +refs/heads/*\n' % url)
+
+        set_origin(here, "git@github.com:acme/here.git")
+        set_origin(other, "https://github.com/acme/other")
+
+        def addressed(command, cwd=here):
+            return rb.addressed_root(cwd, rb.repo_info(cwd)[1], command)
+
+        # --- 3. the default: the worktree containing cwd, exactly as before --
+        check("bash: a command that says nothing keeps the session's checkout",
+              addressed("git diff --stat") == here)
+        check("bash: and from a container cwd it still resolves nothing",
+              addressed("git diff --stat", cwd=container) == "")
+
+        # --- 2. the `cd` the command runs before it --------------------------
+        check("bash: `cd ../other && git diff` measures the repo it cd'd into",
+              addressed("cd ../Other && git diff --stat") == other,
+              addressed("cd ../Other && git diff --stat"))
+        check("bash: an absolute `cd` too", addressed(f"cd {other} && git diff") == other)
+        # A `cd` on its own LINE is the ordinary way an agent writes this, and
+        # the old prefix regex required a `&&` or `;` right after the path.
+        check("bash: a `cd` on its own line counts as much as one before `&&`",
+              addressed(f"cd {other}\ngit diff --stat") == other,
+              addressed(f"cd {other}\ngit diff --stat"))
+        check("bash: chained `cd`s resolve against each other",
+              addressed("cd ../Other && cd ../Here && git diff") == here,
+              addressed("cd ../Other && cd ../Here && git diff"))
+        check("bash: a `cd` after a command that can fail is still not honoured "
+              "— the command may never reach it",
+              addressed("ls && cd ../Other && git diff") == here)
+        check("bash: a `cd` to somewhere that is not a checkout keeps cwd's",
+              addressed(f"cd {plain} && git diff") == here)
+
+        # --- 1. the repo the command NAMES ----------------------------------
+        check("bash: `gh -R acme/other` measures the repo it addresses, not cwd",
+              addressed("gh pr create -R acme/other --fill") == other,
+              addressed("gh pr create -R acme/other --fill"))
+        check("bash: `--repo` reads the same",
+              addressed("gh pr view 7 --repo acme/other") == other)
+        check("bash: the case of the slug does not decide it",
+              addressed("gh pr view 7 -R ACME/Other") == other)
+        check("bash: naming cwd's OWN repo keeps cwd's checkout",
+              addressed("gh pr create -R acme/here --fill") == here)
+        check("bash: a named repo outranks a `cd`",
+              addressed(f"cd {here} && gh pr view 7 -R acme/other") == other)
+        # The whole point: a command about a repo we do not hold must be
+        # measured in NO repo rather than in this one. Every probe then
+        # answers None, no predicate is satisfied, and the rule stays silent —
+        # the fail-open property the hook rests on.
+        check("bash: a repo this machine does not hold resolves to no checkout",
+              addressed("gh pr create -R someone/elsewhere --fill") == "")
+        check("bash: two different repos named in one command are refused, "
+              "exactly as two `--base`es are",
+              addressed("gh pr view -R acme/other || gh pr view -R acme/here") == here)
+        # `-R` is `--recursive` to grep, cp and rsync. Only a `gh` segment
+        # gets to name a repo with it.
+        check("bash: `grep -R foo/bar .` names no repo",
+              addressed("grep -R foo/bar .") == here)
+        check("bash: a `-R` that is not a plain owner/repo is refused",
+              addressed("gh pr create -R https://github.com/acme/other") == here)
+        check("bash: a repo named on a later `gh` segment still counts",
+              addressed("git status && gh pr view 7 -R acme/other") == other)
+
+        # `origin_slug` reads .git/config, never git — this decides a probe
+        # root on every Bash call's hot path.
+        check("origin slug: scp-style remote", rb.origin_slug(here) == "acme/here")
+        check("origin slug: https remote, `.git` or not", rb.origin_slug(other) == "acme/other")
+        check("origin slug: a checkout with no remote answers nothing",
+              rb.origin_slug(mkmain(container, "Bare")) == "")
+
+        # A LINKED worktree has no config of its own; its `commondir` names
+        # the main checkout's, which is where the remote actually lives.
+        wt = mkworktree(container, other, "Other-feature", "feat/y")
+        check("origin slug: a linked worktree answers with its repo's remote",
+              rb.origin_slug(wt) == "acme/other", rb.origin_slug(wt))
+        check("bash: and a named repo can resolve to a worktree of it",
+              rb.addressed_root(container, "", "gh pr view 7 -R acme/other")
+              in (other, wt),
+              rb.addressed_root(container, "", "gh pr view 7 -R acme/other"))
+
+        # No root is not a crash: every probe answers None, which satisfies
+        # no predicate.
+        p = rb.Probes("", "")
+        check("probes: with no checkout every git-backed probe answers None",
+              p.diff_lines() is None and p.diff_paths() is None and p.dirty() is None)
+
+
 def main() -> int:
     unit_checks()
+    bash_target_checks()
     hook_checks()
     print()
     if FAILURES:
