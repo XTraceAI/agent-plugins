@@ -277,9 +277,15 @@ def and_only_segments(shell):
     one people learn to ignore — the same point `rulebook_verify` presses on
     every author."""
     blank = blank_quoted(shell or "")
-    # Length-preserving throughout, so every offset still indexes the
-    # original: `&&` becomes two spaces rather than one sentinel.
-    if any(ch in _AND_RX.sub("  ", blank) for ch in "|;&\n"):
+    # Any separator that is NOT `&&` disqualifies the chain — asked of
+    # `_SEPARATOR_RX`, the one place that knows what a separator is. The raw
+    # character scan this replaces called `git fetch 2>&1 && git log
+    # origin/main` a broken chain, because a redirection `&` looks like a
+    # background `&` to a scan that only reads characters. That gated a call
+    # whose fetch had run and passed — the same false gate on a complying
+    # caller that the quoted-operator fix removed two rounds ago, from the
+    # other direction.
+    if any(m.group(0) != "&&" for m in _SEPARATOR_RX.finditer(blank)):
         return []
     out, pos = [], 0
     for m in _AND_RX.finditer(blank):
@@ -1474,6 +1480,13 @@ def _segment_target(seg):
     `cd`), "local" for the checkout the shell is in, "unknown" when this
     cannot be read confidently, else the `[host/]owner/repo` it names."""
     bare = strip_leading_assignments(seg).strip()
+    # `( gh pr view -R … )` and `{ gh …; }` run the command in a group; the
+    # grouping token is not part of its name. Stripped rather than refused,
+    # because `(gh …)` is unambiguous — what it groups is right there.
+    # Unconditional, because `{ …; }` splits at its own `;` and leaves a
+    # segment that is nothing BUT the closing brace; that segment addresses
+    # no repo, and calling it `local` made the group disagree with itself.
+    bare = strip_leading_assignments(bare.strip("(){} \t")).strip()
     if not bare or _CD_SEGMENT.match(bare):
         return ""
     env = leading_env(seg)

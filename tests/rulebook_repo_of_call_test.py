@@ -666,6 +666,16 @@ def bash_target_checks() -> None:
               addressed("git -C ../Other diff"))
         check("bash: a plain git command is unaffected",
               addressed("git diff --stat") == here)
+        # A grouping token is not part of a command's name. Stripped rather
+        # than refused, because `(gh …)` is unambiguous — what it groups is
+        # right there. Command substitution is deliberately untouched: it is
+        # everywhere, and sweeping it into `unknown` would stop measuring
+        # ordinary commands.
+        for grouped in ("(gh pr view -R acme/other)", "{ gh pr view -R acme/other; }"):
+            check(f"bash: {grouped!r} is still a gh call",
+                  addressed(grouped) == other, f"{grouped!r} -> {addressed(grouped)}")
+        check("bash: command substitution is not grouping",
+              rb._segment_target("git checkout $(git branch --show-current)") == "local")
 
         # A standalone `&` backgrounds the command to its left and the next
         # one runs anyway, so this is TWO commands addressing two repos.

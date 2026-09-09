@@ -2001,6 +2001,24 @@ def armed_lane_checks() -> None:
               str(rb_mod.and_only_segments("npm test -- --grep 'a|b' && git push")))
         check("and_only_segments: a REAL pipe still disqualifies the chain",
               rb_mod.and_only_segments("a | b && c") == [])
+        # A redirection `&` is not a background `&`. A raw character scan
+        # could not tell them apart and called this a broken chain, gating a
+        # call whose fetch had run and passed — the same false gate on a
+        # complying caller as the quoted-operator case, from the other side.
+        # Asked of `_SEPARATOR_RX` now: one definition of "separator".
+        for chain in ("git fetch 2>&1 && git log origin/main",
+                      "git fetch >&2 && git log origin/main",
+                      "git fetch &> /tmp/l && git log origin/main"):
+            check(f"and_only_segments: {chain.split(' &&')[0]!r} is a chain",
+                  len(rb_mod.and_only_segments(chain)) == 2,
+                  str(rb_mod.and_only_segments(chain)))
+        for broken in ("a & b", "a | b", "a ; b"):
+            check(f"and_only_segments: {broken!r} is not a chain",
+                  rb_mod.and_only_segments(broken) == [])
+        start("s13")
+        post("s13", "git fetch --all 2>&1")
+        c = pre("s13", "git log origin/main -5")
+        check("session-armed: a redirected fetch is still a receipt", c == "", c)
 
         start("s9")
         post("s9", "sudo git fetch --all")
