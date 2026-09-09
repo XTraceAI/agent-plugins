@@ -404,9 +404,17 @@ def bash_target_checks() -> None:
         check("bash: chained `cd`s resolve against each other",
               addressed("cd ../Other && cd ../Here && git diff") == here,
               addressed("cd ../Other && cd ../Here && git diff"))
-        check("bash: a `cd` after a command that can fail is still not honoured "
-              "— the command may never reach it",
-              addressed("ls && cd ../Other && git diff") == here)
+        # A `cd` AFTER a command has already run means the call worked in two
+        # trees, and there is one probe root. `command_root` still declines to
+        # follow that `cd` — it may never be reached — but declining now means
+        # the call measures NOTHING rather than the session's tree, because
+        # `git diff` here most likely runs in `../Other` and answering with
+        # `Here` would be the confidently wrong answer.
+        check("bash: a `cd` after a command means the call measures nothing",
+              addressed("ls && cd ../Other && git diff") == "",
+              addressed("ls && cd ../Other && git diff"))
+        check("bash: a LEADING `cd` run is still followed",
+              addressed(f"cd {other} && git diff") == other)
         check("bash: a `cd` to somewhere that is not a checkout keeps cwd's",
               addressed(f"cd {plain} && git diff") == here)
         # `cd A || cd B` runs the second only when the FIRST failed, and the
@@ -690,6 +698,38 @@ def bash_target_checks() -> None:
               rb.command_root(here, f"(cd {other}) && git push") == "")
         check("bash: `(cd ../Other && x) && y` does NOT — only `x` moved",
               rb.command_root(here, f"(cd {other} && x) && git push") == "")
+
+        # `git -h` lists three global selectors, and GIT_DIR / GIT_WORK_TREE
+        # do the same from the environment. Each points git at a tree this
+        # cannot name as a repo, so each refuses rather than answering with
+        # the session's.
+        for cmd in ("git -C ../Other diff",
+                    "git --git-dir=../Other/.git --work-tree=../Other diff",
+                    "GIT_DIR=../Other/.git git diff"):
+            check(f"segment target: {cmd.split(' ')[1]!r} refuses",
+                  rb._segment_target(cmd) == "unknown", rb._segment_target(cmd))
+        check("segment target: a plain git command still answers local",
+              rb._segment_target("git diff --stat") == "local")
+
+        # A substitution RUNS its body. Read rather than refused wholesale, so
+        # the everyday `$(git branch --show-current)` keeps its precision.
+        check("bash: a `gh -R` inside `$( )` is seen and disagrees with the "
+              "assignment around it",
+              sorted(rb.segment_targets("x=$(gh pr view -R acme/other)"))
+              == ["acme/other", "local"],
+              str(sorted(rb.segment_targets("x=$(gh pr view -R acme/other)"))))
+        check("bash: ordinary command substitution stays local",
+              sorted(rb.segment_targets("git checkout $(git branch --show-current)"))
+              == ["local"])
+        check("bash: a substitution inside quotes is data",
+              sorted(rb.segment_targets("echo '$(gh pr view -R acme/other)'")) == ["local"])
+        check("bash: a NESTED substitution refuses rather than guessing",
+              "unknown" in rb.segment_targets("x=$(echo $(gh pr view -R acme/other))"))
+
+        # The shell worked in two trees, and there is one probe root.
+        check("bash: a `cd` partway through the call measures nothing",
+              addressed("cd /tmp && git push && cd /var && git diff") == "",
+              addressed("cd /tmp && git push && cd /var && git diff"))
 
         # A standalone `&` backgrounds the command to its left and the next
         # one runs anyway, so this is TWO commands addressing two repos.

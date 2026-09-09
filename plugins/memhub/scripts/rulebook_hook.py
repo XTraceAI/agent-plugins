@@ -483,7 +483,14 @@ def receipt_segments(shell, whole_chain=False):
     # is right: `git fetch &` exits 0 from launching the job, not from the
     # fetch, which may still be running or about to fail.
     last = last_segment(shell)
-    if last and "|" not in last:
+    # On the blanked copy, like everything else that asks whether a character
+    # is an operator. `npm test -- --grep 'a|b'` is not a pipeline, and
+    # reading it as one refused a receipt for a test that had passed —
+    # leaving the obligation armed and blocking the push. This is the FOURTH
+    # finding from raw-vs-blanked (rounds 7, 13, 15, 16); `last_segment`
+    # itself was fixed last round and this line beside it was left reading
+    # raw.
+    if last and "|" not in blank_quoted(last):
         return [last]
     return []
 
@@ -1393,7 +1400,11 @@ _CD_SEGMENT = re.compile(r"^\s*cd\s+" + _ARG + r"\s*$")
 # usually ends up with.
 _REPO_ARG = re.compile(r"(?:^|\s)(?:-R\s*=?\s*|--repo\s*=?\s*)" + _ARG)
 _GH_SEGMENT = re.compile(r"^gh\b")
-_GIT_C_RX = re.compile(r"(?:^|\s)-C(?:[=\s]|$)")
+# `git -h`: `git [-C <path>] [--git-dir=<path>] [--work-tree=<path>] …`, and
+# GIT_DIR / GIT_WORK_TREE do the same from the environment. Each points git at
+# a tree this cannot name as a repo, so each refuses.
+_GIT_C_RX = re.compile(r"(?:^|\s)(?:-C(?:[=\s]|$)|--git-dir\b|--work-tree\b)")
+_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 # `[HOST/]OWNER/REPO`, host KEPT. Dropping it was wrong in the one case the
 # host exists to distinguish: with a single local checkout of
 # `github.com/acme/repo`, `-R ghe.corp/acme/repo` matched it unambiguously and
@@ -1516,9 +1527,12 @@ _WRAPPER_MAX = 4        # `sudo env … gh` is two; four is already generous
 
 
 def _segment_target(seg):
-    """What repo does ONE segment address? "" when it addresses none (a bare
-    `cd`), "local" for the checkout the shell is in, "unknown" when this
-    cannot be read confidently, else the `[host/]owner/repo` it names."""
+    """What repo does ONE segment address? "" when there is nothing there at
+    all (a stray `}` left by splitting a group at its own `;`), "cd" for a
+    bare `cd` — which addresses no repo but MOVES the shell, and so matters
+    to where later segments run — "local" for the checkout the shell is in,
+    "unknown" when this cannot be read confidently, else the
+    `[host/]owner/repo` it names."""
     bare = strip_leading_assignments(seg).strip()
     # `( gh pr view -R … )` and `{ gh …; }` run the command in a group; the
     # grouping token is not part of its name. Stripped rather than refused,
@@ -1527,8 +1541,10 @@ def _segment_target(seg):
     # segment that is nothing BUT the closing brace; that segment addresses
     # no repo, and calling it `local` made the group disagree with itself.
     bare = strip_leading_assignments(bare.strip("(){} \t")).strip()
-    if not bare or _CD_SEGMENT.match(bare):
-        return ""
+    if not bare:
+        return ""               # nothing here at all: a stray `}`, an empty
+    if _CD_SEGMENT.match(bare):
+        return "cd"             # addresses no repo, but MOVES the shell
     env = leading_env(seg)
     # Wrappers whose grammar is "<wrapper> [options] <the real command>".
     # `command gh …` (a bash builtin), `sudo gh …`, `/usr/bin/env GH_REPO=…
@@ -1553,7 +1569,8 @@ def _segment_target(seg):
         env = dict(env, **leading_env(rest))
         bare = strip_leading_assignments(rest).strip()
     head = bare.split()[0] if bare.split() else ""
-    if os.path.basename(head) == "git" and _GIT_C_RX.search(blank_quoted(bare)):
+    if os.path.basename(head) == "git" and (_GIT_C_RX.search(blank_quoted(bare))
+                                            or any(v in env for v in _GIT_ENV)):
         # `git -h`: `git [-C <path>] …`. It selects a DIRECTORY, not a repo
         # this can name, and the call already knows more than `checkout_of`
         # could resolve from a slug. Refusing keeps it out of the wrong tree;
@@ -1626,9 +1643,59 @@ def segment_targets(command):
     where the shell runs, exactly as every ordinary command does; the second
     must refuse outright, because a `gh -R other && git push` answered with
     EITHER repo is wrong for one of its two segments."""
-    return {t for t in (_segment_target(seg)
-                        for _, seg in split_shell(shell_only(command or "")))
-            if t}
+    out, ran_something = set(), False
+    for _, seg in split_shell(shell_only(command or "")):
+        target = _segment_target(seg)
+        if not target:                      # nothing there: contributes nothing
+            continue
+        if target == "cd":
+            if ran_something:
+                # `cd A && git push && cd B && git diff` moves the shell
+                # after a command has already run in A, so A and B are both
+                # right for part of the call and wrong for the rest — and
+                # there is one probe root. `command_root` stops at the first
+                # non-`cd` segment and never sees the second move.
+                out.add("unknown")
+            continue
+        ran_something = True
+        out.add(target)
+        # `result=$(gh pr view -R acme/other)` RUNS that `gh`. The assignment
+        # is local and the substitution is not, which is a disagreement like
+        # any other. Reading the bodies keeps `git checkout $(git branch
+        # --show-current)` local, where a blanket refusal on `$(` would have
+        # stopped measuring it.
+        bodies = _substitutions(seg)
+        if bodies is None:
+            out.add("unknown")
+        else:
+            for body in bodies:
+                inner = _segment_target(body)
+                if inner:
+                    out.add(inner)
+    return out
+
+
+_SUBST_RX = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|[<>]\(([^()]*)\)")
+_NESTED_SUBST_RX = re.compile(r"\$\((?=[^()]*\()")
+
+
+def _substitutions(seg):
+    """The command bodies a segment executes through substitution, or None
+    when there is a NESTED one this cannot bracket-match — None means the
+    caller refuses rather than guessing.
+
+    Located in the blanked copy, so `echo '$(gh pr view -R x)'` is the string
+    it is; the bodies are then sliced out of the ORIGINAL at those offsets."""
+    blank = blank_quoted(seg or "")
+    if _NESTED_SUBST_RX.search(blank):
+        return None
+    out = []
+    for m in _SUBST_RX.finditer(blank):
+        for i in range(1, 4):
+            if m.group(i) is not None:
+                out.append((seg or "")[m.start(i):m.end(i)])
+                break
+    return out
 
 
 def _slug_of_url(url):

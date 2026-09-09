@@ -2053,6 +2053,15 @@ def armed_lane_checks() -> None:
               rb_mod.last_segment("git fetch & true") == "true"
               and rb_mod.last_segment("git fetch 2>&1") == "git fetch 2>&1",
               rb_mod.last_segment("git fetch & true"))
+        # The pipe test beside `last_segment` was still reading RAW text, so
+        # a quoted `|` in the last segment refused a receipt for a test that
+        # had passed — leaving the obligation armed and blocking the push.
+        check("receipt: a quoted `|` in the last segment is not a pipeline",
+              rb_mod.receipt_segments("npm test -- --grep 'a|b'")
+              == ["npm test -- --grep 'a|b'"],
+              str(rb_mod.receipt_segments("npm test -- --grep 'a|b'")))
+        check("receipt: a REAL pipeline is still refused",
+              rb_mod.receipt_segments("pytest | tail") == [])
         check("last_segment: a separator inside quotes is data",
               rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
               rb_mod.last_segment("echo 'a; b'"))
