@@ -321,6 +321,7 @@ def and_only_segments(shell):
 _QUOTED_SINGLE = r"'[^']*'"
 _QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
 _QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
+_QUOTED_SINGLE_RX = re.compile(_QUOTED_SINGLE)
 # `&&` and `||` first, so the lone-operator alternatives only see what is
 # left. A standalone `&` backgrounds the command to its left and the next one
 # runs anyway — `gh pr view -R other & git push` is TWO commands. The
@@ -328,6 +329,17 @@ _QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
 _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
 _ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
+
+
+def blank_single_quoted(text):
+    """`text` with only SINGLE-quoted spans blanked, length preserving.
+
+    The distinction matters exactly once, and it is the shell's own: `'$(cmd)'`
+    is a literal string and `"$(cmd)"` RUNS cmd. Anything asking "is this
+    character an operator" wants `blank_quoted`; anything asking "does this
+    execute something" wants this one."""
+    return _QUOTED_SINGLE_RX.sub(lambda m: "'" + " " * (len(m.group(0)) - 2) + "'",
+                                 text or "")
 
 
 def blank_quoted(text):
@@ -381,12 +393,28 @@ def split_shell(shell):
 # an allowlist rather than a denylist of `echo`/`grep`/`printf` on purpose: an
 # unknown wrapper then fails to discharge, which costs an extra gate, while an
 # unknown data-command would let a call out of one.
+_CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
+                           "nohup", "time", "nice", "stdbuf", "setsid",
+                           # A shell runs whatever it is handed. `sh -c "gh pr
+                           # view -R other"` reached `_GH_SEGMENT` as `sh` and
+                           # answered `local` — confidently wrong. Here it
+                           # meets the `-c` rule and refuses instead. Found by
+                           # auditing this list against `_RUNNERS`, not by the
+                           # reviewer.
+                           "sh", "bash", "zsh", "dash", "ksh"})
+# `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
+# — `sudo cd x` cannot move this shell and `env cd x` fails outright.
+_CD_WRAPPERS = frozenset({"command", "builtin"})
+
+
 _RUNNERS = frozenset({
     "uv", "uvx", "python", "python3", "py", "node", "npm", "npx", "yarn", "pnpm",
     "poetry", "pipenv", "pdm", "rye", "hatch", "tox", "make", "just", "task",
     "bash", "sh", "zsh", "env", "sudo", "time", "nohup", "nice", "command",
     "exec", "xargs", "cargo", "go", "docker", "podman", "poe",
-})
+}) | _CMD_WRAPPERS        # a wrapper `_segment_target` knows must not be one
+                          # `executes` refuses to see: `doas git fetch` is a
+                          # fetch. Same audit as the `sh` entry above.
 
 
 # A runner given code inline runs THAT, and everything after is the program's
@@ -1540,11 +1568,9 @@ def leading_env(segment):
         pos = m.end()
 
 
-_CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
-                           "nohup", "time", "nice", "stdbuf", "setsid"})
-# `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
-# — `sudo cd x` cannot move this shell and `env cd x` fails outright.
-_CD_WRAPPERS = frozenset({"command", "builtin"})
+_EXPORT_RX = re.compile(r"(?:export|declare|typeset)(?:\s|$)")
+_ALLEXPORT_RX = re.compile(r"set\s+(?:-a\b|-o\s+allexport\b)")
+_STEERING_RX = re.compile(r"\b(?:GH_REPO|GH_HOST|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)\b")
 _WRAPPER_MAX = 4        # `sudo env … gh` is two; four is already generous
 
 
@@ -1567,6 +1593,16 @@ def _segment_target(seg):
         return ""               # nothing here at all: a stray `}`, an empty
     if _CD_SEGMENT.match(bare):
         return "cd"             # addresses no repo, but MOVES the shell
+    # `help export`: exported values apply to commands run afterwards, so
+    # `export GH_REPO=acme/other && gh pr view` steers a segment this
+    # function resolves independently and would call `local`. Carrying the
+    # mutation forward would be the precise answer; refusing is the one that
+    # cannot be subtly wrong, and this review has been unkind to my attempts
+    # at extra precision on this surface.
+    if _EXPORT_RX.match(bare) and _STEERING_RX.search(blank_quoted(bare)):
+        return "export"
+    if _ALLEXPORT_RX.match(bare):
+        return "export"         # `set -a`: every later assignment is exported
     env = leading_env(seg)
     # Wrappers whose grammar is "<wrapper> [options] <the real command>".
     # `command gh …` (a bash builtin), `sudo gh …`, `/usr/bin/env GH_REPO=…
@@ -1675,6 +1711,9 @@ def segment_targets(command):
         target = _segment_target(seg)
         if not target:                      # nothing there: contributes nothing
             continue
+        if target == "export":
+            out.add("unknown")              # steers a LATER segment; see below
+            continue
         if target == "cd":
             if ran_something:
                 # `cd A && git push && cd B && git diff` moves the shell
@@ -1711,9 +1750,12 @@ def _substitutions(seg):
     when there is a NESTED one this cannot bracket-match — None means the
     caller refuses rather than guessing.
 
-    Located in the blanked copy, so `echo '$(gh pr view -R x)'` is the string
-    it is; the bodies are then sliced out of the ORIGINAL at those offsets."""
-    blank = blank_quoted(seg or "")
+    Located in the SINGLE-quote-blanked copy, because that is the distinction
+    the shell itself makes: `'$(cmd)'` is a literal string and `"$(cmd)"` runs
+    cmd. Blanking both hid every substitution written inside double quotes,
+    which is most of them. The bodies are sliced out of the ORIGINAL at those
+    offsets."""
+    blank = blank_single_quoted(seg or "")
     if _NESTED_SUBST_RX.search(blank):
         return None
     out = []

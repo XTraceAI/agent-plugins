@@ -2062,6 +2062,12 @@ def armed_lane_checks() -> None:
               str(rb_mod.receipt_segments("npm test -- --grep 'a|b'")))
         check("receipt: a REAL pipeline is still refused",
               rb_mod.receipt_segments("pytest | tail") == [])
+        # Found by auditing the wrapper lists against each other: a wrapper
+        # `_segment_target` knows must not be one `executes` refuses to see.
+        for wrapped in ("doas git fetch --all", "builtin git fetch --all",
+                        "stdbuf -o0 git fetch --all"):
+            check(f"receipt: {wrapped.split()[0]!r} still runs the fetch",
+                  rb_mod.executes(wrapped, r"git\s+(fetch|pull)\b"), wrapped)
         check("last_segment: a separator inside quotes is data",
               rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
               rb_mod.last_segment("echo 'a; b'"))

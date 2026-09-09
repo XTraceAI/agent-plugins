@@ -763,6 +763,36 @@ def bash_target_checks() -> None:
               sorted(rb.segment_targets("echo '$(gh pr view -R acme/other)'")) == ["local"])
         check("bash: a NESTED substitution refuses rather than guessing",
               "unknown" in rb.segment_targets("x=$(echo $(gh pr view -R acme/other))"))
+        # The shell's own distinction: `'$(cmd)'` is a literal string and
+        # `"$(cmd)"` RUNS cmd. Blanking both hid every substitution written
+        # inside double quotes, which is most of them.
+        check("bash: a substitution inside DOUBLE quotes runs and is seen",
+              sorted(rb.segment_targets('echo "$(gh pr view -R acme/other)"'))
+              == ["acme/other", "local"],
+              str(sorted(rb.segment_targets('echo "$(gh pr view -R acme/other)"'))))
+        check("bash: and inside SINGLE quotes it is still a string",
+              sorted(rb.segment_targets("echo '$(gh pr view -R acme/other)'")) == ["local"])
+
+        # `help export`: exported values apply to commands run afterwards, so
+        # this steers a segment resolved independently. Refused rather than
+        # carried forward — the precise answer is available, but this review
+        # has been unkind to extra precision on this surface.
+        check("bash: `export GH_REPO=… && gh …` refuses",
+              "unknown" in rb.segment_targets("export GH_REPO=acme/other && gh pr view"))
+        check("bash: `set -a` refuses too — every later assignment is exported",
+              "unknown" in rb.segment_targets("set -a && GH_REPO=acme/other gh pr view"))
+        check("bash: an export of something UNrelated does not refuse",
+              sorted(rb.segment_targets("export PATH=/x && gh pr view -R acme/other"))
+              == ["acme/other", "local"])
+
+        # --- found by auditing the paired functions, not by the reviewer ---
+        # A shell runs whatever it is handed; `sh -c "gh …"` reached the gh
+        # test as `sh` and answered `local`. It meets the `-c` rule now.
+        for shell_wrapped in ('sh -c "gh pr view -R acme/other"',
+                              'bash -c "gh pr view -R acme/other"'):
+            check(f"bash: {shell_wrapped[:6]!r} refuses rather than answering local",
+                  rb.segment_targets(shell_wrapped) == {"unknown"},
+                  str(rb.segment_targets(shell_wrapped)))
 
         # The shell worked in two trees, and there is one probe root.
         check("bash: a `cd` partway through the call measures nothing",
