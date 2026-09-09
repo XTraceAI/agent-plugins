@@ -201,9 +201,13 @@ def _load_failure(rule: dict, out: list[str]) -> None:
                 else "does not compile, or backtracks catastrophically"
             out.append("             %s: %s" % (key, why))
     given = matcher.get("given")
-    if given is not None and H.given_norm(given) is None:
+    if given is not None and (H.given_norm(given) is None or H.given_unsupported(given)):
         known = ", ".join("%s.%s" % (b, k) for b, ks in H._GIVEN.items() for k in ks)
         out.append("             given: unknown key or wrong value kind (known: %s)" % known)
+    unknown = H.ordering_unsupported(rule.get("ordering"))
+    if unknown:
+        out.append("             %s: not a key this hook knows (known: %s)"
+                   % (unknown, ", ".join(sorted(H._ORDERING_KEYS))))
     if not any(l.startswith("             ") for l in out):
         out.append("             no engine block, or two of them, or a missing id")
 
@@ -219,9 +223,21 @@ def verify(rule: dict, fires: list, silent: list,
 
     # 1. The load gate. A rule that does not survive this never runs at all,
     #    and the hook says nothing when it drops one.
-    hook_rule = H.to_hook_rule(_hook_row(rule))
-    if hook_rule is None:
-        out.append("LOAD   FAIL  the hook would drop this rule at load time")
+    #
+    #    A key the hook does not know is refused HERE even though the hook now
+    #    degrades it to advice rather than dropping it. The two answer
+    #    different questions: to a hook reading a book it did not write, an
+    #    unknown key is a rule from a newer plugin and running it as advice is
+    #    the honest outcome; to an author checking a rule they are about to
+    #    file, it is a typo, and filing a rule that can never gate on the
+    #    machine that just linted it is not an outcome anyone wants.
+    row = _hook_row(rule)
+    hook_rule = H.to_hook_rule(row)
+    unknown = H.given_unsupported((row.get("matcher") or {}).get("given")) \
+        or H.ordering_unsupported(row.get("ordering"))
+    if hook_rule is None or unknown:
+        out.append("LOAD   FAIL  the hook would drop this rule at load time" if hook_rule is None
+                   else "LOAD   FAIL  this hook does not understand `%s`" % unknown)
         _load_failure(rule, out)
         return False, False, out
     out.append("LOAD   ok    the hook loads it (patterns compile, within bounds)")

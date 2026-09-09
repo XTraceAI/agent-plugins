@@ -140,6 +140,14 @@ the rule would bind nobody), `scope_paths` / `scope_exclude_paths` (globs — th
 edit rules by file path; a Bash call carries no path, so an include-scoped
 rule never fires on one).
 
+**A rule that needs a newer hook.** If the rule uses a key an older installed
+hook would not understand, pass `min_hook_version: "<major.minor.patch>"`.
+Where the installed hook is older it runs the rule as ADVICE, never as a gate,
+and says so once per session naming the version it wanted — instead of
+ignoring the condition and firing as if it held. A key the hook does not know
+degrades the same way even without the field, so `min_hook_version` is how you
+make the message say what is actually missing.
+
 **Advise, or stop the command?** A rule advises by default: its sentence is
 shown and the call goes through. Pass `mode: "gate"` and the rule DENIES a
 matching command before it runs — the person can still run that exact command

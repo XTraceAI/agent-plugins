@@ -18,6 +18,9 @@ Covers the properties that make this safe to ship in everyone's harness:
 * an obligation can also be armed by the SESSION or by what the person typed
   (`armed_by_events: ["session"] / ["prompt"]`), and that arming is the
   session's own — a sibling session's receipt does not discharge it;
+* a rule this hook cannot read in full — `min_hook_version` newer than us, or
+  a `given`/`ordering` key we do not know — advises, never gates, and says so
+  once per session instead of firing as if the condition held;
 * the post lane fires on failing result text, gated by cmd_rx;
 * repo_scope filters rules to the repo the session is in;
 * MEMHUB_RULEBOOK_BASE relocates the book cache, state and ledger together, so
@@ -463,7 +466,13 @@ def given_and_scope_checks() -> None:
 
         # --- a bad given drops the RULE at load, never the hook --------------
         c = pre("Bash", {"command": "bad-given-cmd"})
-        check("given: an unknown key drops the rule", "[bad-given]" not in c, c)
+        # An unknown key used to drop the rule silently — a rule vanishing
+        # because the hook is older than it is, with nothing anywhere saying
+        # so. It now degrades instead: the rule advises, it cannot gate, and
+        # it names the key this hook could not read (min_hook_version_checks
+        # covers the rest of that behaviour).
+        check("given: an unknown key degrades the rule to advice and says so",
+              "[bad-given]" in c and "repo.nope" in c and "BLOCKED" not in c, c)
         check("given: a wrong value kind drops the rule", "[bad-given-kind]" not in c, c)
 
         # --- given.repo diff probes against a real repository ----------------
@@ -1818,6 +1827,7 @@ def main() -> int:
     read_lane_checks()
     diff_base_checks()
     armed_lane_checks()
+    min_hook_version_checks()
 
     print()
     if FAILURES:
@@ -1825,6 +1835,7 @@ def main() -> int:
     else:
         print("all rulebook hook checks passed")
     return 1 if FAILURES else 0
+
 
 
 def armed_lane_checks() -> None:
@@ -1988,5 +1999,148 @@ def armed_lane_checks() -> None:
         check("prompt lane: emits nothing", out.strip() == "", out)
 
 
+def min_hook_version_checks() -> None:
+    """A rule can be newer than the hook reading it, and that used to be
+    silent in the worst direction.
+
+    The engine reads an `ordering` block with `spec.get(...)` and `given_ok`
+    walks the keys it knows, so a condition the installed hook does not
+    understand was ignored and the rule fired as if it were satisfied. That is
+    the 0.40.1 incident: a stale hook ignored a `given` and produced five
+    spurious overrides in one session, and nothing said so.
+
+    Now such a rule advises, never gates, and says which key it could not read
+    — once per session, through the same `st["fired"]` dedup every
+    `fire_scope: session` rule uses.
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    check("version: three ASCII-digit components parse",
+          H.version_tuple("0.53.0") == (0, 53, 0))
+    check("version: ordering is numeric, not lexical",
+          H.version_tuple("0.9.0") < H.version_tuple("0.53.0"))
+    for bad in ("1.2", "1.2.3.4", "1.2.3-rc1", "v1.2.3", "1.2.x", " ", 3, None, "01.2.3.4"):
+        check(f"version: {bad!r} is refused (no prerelease grammar to get wrong)",
+              H.version_tuple(bad) is None, repr(H.version_tuple(bad)))
+    check("version: the hook reads its own from the plugin manifest beside it",
+          H.hook_version() is not None and len(H.hook_version()) == 3, str(H.hook_version()))
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "verrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+
+        # One rule per COMMAND. MAX_ADVISE keeps two advisories per call, so
+        # six rules firing on one command would hide four of them and the
+        # assertions would be reading the cap, not the degradation.
+        def gate(rid, word, given=None, **extra):
+            matcher = {"event": "bash", "command_rx": rf"\b{word}\b",
+                       "warn_once_per": "turn"}
+            if given is not None:       # a `given` rides inside the matcher block
+                matcher["given"] = given
+            return _row(rid, matcher, mode="gate", **extra)
+
+        seed_book(td, "verrepo", [
+            gate("needs-newer", "alpha", min_hook_version="99.0.0"),
+            gate("needs-this", "bravo", min_hook_version="0.53.0"),
+            gate("bad-version", "charlie", min_hook_version="1.2"),
+            gate("unknown-given", "delta", given={"repo": {"commits_since_base_gt": 3}}),
+            gate("unknown-given-block", "echo", given={"weather": {"raining": True}}),
+            gate("wrong-kind", "foxtrot", given={"repo": {"diff_lines_gt": "lots"}}),
+            gate("half-known", "golf",
+                 given={"repo": {"branch_rx": "^main$", "commits_since_base_gt": 3}}),
+            {"id": "unknown-ordering", "on": "ordering", "repo_scope": "any", "mode": "gate",
+             "ordering": {"required_command_rx": "pytest", "gated_command_rx": r"\bhotel\b",
+                          "armed_by_events": ["session"], "phase_of_moon": "waxing"},
+             "text": "unknown-ordering text", "why": "w"},
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0",
+               "MEMHUB_RULEBOOK_HOOK_VERSION": "0.53.0"}
+        n = [0]
+
+        def pre(session, word):
+            n[0] += 1
+            rc, out = run("pre", {"session_id": session, "cwd": repo, "tool_name": "Bash",
+                                  "tool_use_id": f"v{n[0]}",
+                                  "tool_input": {"command": f"run {word} --now"}}, env)
+            deny = ""
+            if out.strip():
+                deny = json.loads(out)["hookSpecificOutput"].get("permissionDecision", "")
+            return ctx(out), deny
+
+        c, deny = pre("v1", "alpha")
+        check("min_hook_version: a rule needing a newer hook still FIRES",
+              "[needs-newer]" in c, c)
+        check("min_hook_version: it advises — the call is not blocked",
+              deny != "deny" and "BLOCKED" not in c, c + " " + deny)
+        check("min_hook_version: and says which version it wanted",
+              "advice only" in c and "needs hook 99.0.0" in c and "this is 0.53.0" in c, c)
+
+        c2, _ = pre("v1", "alpha")
+        check("min_hook_version: the notice is once per session, not per fire",
+              "[needs-newer]" in c2 and "advice only" not in c2, c2)
+
+        c3, _ = pre("v2", "alpha")
+        check("min_hook_version: a NEW session hears it again", "advice only" in c3, c3)
+
+        c, deny = pre("v1", "bravo")
+        check("min_hook_version: a rule needing exactly this hook is unaffected "
+              "and still gates", "**BLOCKED [needs-this]**" in c and deny == "deny", c)
+
+        c, deny = pre("v1", "charlie")
+        check("min_hook_version: a malformed version degrades — it is not "
+              "silently ignored",
+              "[charlie]" not in c and "is not major.minor.patch" in c
+              and deny != "deny", c)
+
+        c, deny = pre("v1", "delta")
+        check("unknown key: an unrecognised `given` key degrades the rule to advice",
+              "repo.commits_since_base_gt" in c and deny != "deny", c)
+
+        c, _ = pre("v1", "echo")
+        check("unknown key: an unrecognised `given` BLOCK degrades it too",
+              "`weather`" in c, c)
+
+        # An ordering rule needs its arming event first; this one says
+        # `session`, so the session lane has to have run.
+        run("session", {"session_id": "v1", "cwd": repo,
+                        "hook_event_name": "SessionStart"}, env)
+        c, deny = pre("v1", "hotel")
+        check("unknown key: an unrecognised `ordering` key degrades it too",
+              "ordering.phase_of_moon" in c and deny != "deny", c)
+
+        c, _ = pre("v1", "foxtrot")
+        check("wrong kind: a KNOWN key with a value of the wrong kind is a "
+              "malformed rule and still drops it, as rx_ok does", c == "", c)
+
+        # What the hook CAN check is still checked. `branch_rx: ^main$` holds
+        # here, so the rule fires; the point is that the unknown key next to
+        # it neither dropped the rule nor let it gate.
+        c, deny = pre("v1", "golf")
+        check("unknown key: the predicates the hook does understand still bind",
+              "[half-known]" in c and deny != "deny", c)
+        seed_book(td, "verrepo2", [gate("half-known", "golf",
+                                        given={"repo": {"branch_rx": "^nope$",
+                                                        "commits_since_base_gt": 3}})])
+        repo2 = os.path.join(td, "verrepo2")
+        os.makedirs(os.path.join(repo2, ".git"))
+        with open(os.path.join(repo2, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        n[0] += 1
+        _, out = run("pre", {"session_id": "v9", "cwd": repo2, "tool_name": "Bash",
+                             "tool_use_id": f"v{n[0]}",
+                             "tool_input": {"command": "run golf --now"}}, env)
+        check("unknown key: and a known predicate that FAILS still keeps the "
+              "rule silent — degrading is not a licence to fire", ctx(out) == "", ctx(out))
+
+        # An unknown arming event is version skew, not a rule that quietly
+        # never arms.
+        moonrise = H.degradation({}, None, {"armed_by_events": ["moonrise"]})
+        check("unknown key: an unrecognised arming event degrades",
+              moonrise == "this hook does not understand "
+                          "`ordering.armed_by_events:moonrise`", moonrise)
 if __name__ == "__main__":
     sys.exit(main())

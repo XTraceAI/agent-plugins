@@ -949,6 +949,136 @@ _GIVEN = {
 }
 
 
+_VERSION_RX = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_HOOK_VERSION = []          # memo: the manifest is read at most once per process
+
+
+def version_tuple(v):
+    """`major.minor.patch` as a comparable tuple, or None.
+
+    Strict on purpose: three ASCII-digit components and nothing else. There is
+    no prerelease in this plugin's history to support, and a grammar that
+    admits one buys a pile of ordering questions ("is 1.0.0-rc older than
+    1.0.0?") to answer a version string nobody publishes."""
+    m = _VERSION_RX.match(v.strip()) if isinstance(v, str) else None
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def hook_version():
+    """This hook's own version, from the plugin manifest beside it.
+
+    None when the manifest is missing, unreadable, or does not carry a
+    `major.minor.patch` — and an unknown version satisfies no
+    `min_hook_version`, so a hook that cannot say what it is degrades a rule
+    rather than gating on a condition it may not understand."""
+    if not _HOOK_VERSION:
+        override = os.environ.get("MEMHUB_RULEBOOK_HOOK_VERSION")
+        if override is not None:
+            _HOOK_VERSION.append(version_tuple(override))
+        else:
+            try:
+                manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", ".claude-plugin", "plugin.json")
+                with open(manifest, encoding="utf-8") as f:
+                    _HOOK_VERSION.append(version_tuple(json.load(f).get("version")))
+            except Exception:
+                _HOOK_VERSION.append(None)
+    return _HOOK_VERSION[0]
+
+
+# Every key of an `ordering` block this hook knows how to honour. A rule may
+# be written for a NEWER one: the engine reads a block with `spec.get(...)`,
+# so an unknown key is silently ignored and the rule runs as if the author
+# had not written it. That is the 0.40.1 shape — see `degradation`.
+_ORDERING_KEYS = frozenset({"required_command_rx", "gated_command_rx", "armed_by_events",
+                            "armed_by_rx", "min_edits", "display_name", "path_rx"})
+_ARMED_BY_EVENTS = frozenset({"edit", "write", "session", "prompt"})
+
+
+def given_unsupported(g):
+    """The first `block.key` of a `given` this hook does not know, or "".
+
+    A different question from `given_norm`'s: that one refuses a value of the
+    wrong KIND, which is a malformed rule however new the hook. This one finds
+    a predicate written for a hook we are not, which is version skew — and the
+    same `_GIVEN` table answers both, so there is no second list to drift."""
+    if not isinstance(g, dict):
+        return ""
+    for block, spec in g.items():
+        kinds = _GIVEN.get(block)
+        if kinds is None:
+            return str(block)[:40]
+        if isinstance(spec, dict):
+            for k in spec:
+                if k not in kinds:
+                    return f"{block}.{str(k)[:40]}"
+    return ""
+
+
+def given_supported(g):
+    """`g` with the blocks and keys this hook does not know removed. What is
+    left is checked; the rule is advise-only and says why (`degradation`), so
+    nothing is dropped quietly."""
+    out = {}
+    for block, spec in g.items():
+        kinds = _GIVEN.get(block)
+        if kinds is None or not isinstance(spec, dict):
+            continue
+        kept = {k: v for k, v in spec.items() if k in kinds}
+        if kept:
+            out[block] = kept
+    return out
+
+
+def ordering_unsupported(o):
+    """The first `ordering` key — or arming event — this hook does not know."""
+    if not isinstance(o, dict):
+        return ""
+    for k in o:
+        if k not in _ORDERING_KEYS:
+            return f"ordering.{str(k)[:40]}"
+    events = o.get("armed_by_events")
+    if isinstance(events, (list, tuple)):
+        for ev in events:
+            if ev not in _ARMED_BY_EVENTS:
+                return f"ordering.armed_by_events:{str(ev)[:40]}"
+    return ""
+
+
+def degradation(row, given=None, ordering=None):
+    """Why this hook cannot honour `row` in full, or "" when it can.
+
+    `given` and `ordering` are the rule's RAW blocks. Only the caller knows
+    where they sit: a server row keeps `given` inside its `matcher`, a pilot
+    row at the top level.
+
+    A rule may be newer than the hook reading it, and until now that was
+    silent in the worst direction: the engine reads an `ordering` block with
+    `spec.get(...)`, so a key it does not know is ignored and the rule runs as
+    if the condition were satisfied. Version 0.40.1 did exactly that with a
+    `given` — five spurious overrides in one session, and nothing anywhere
+    said the hook had not read the rule it was enforcing.
+
+    A rule that says so itself (`min_hook_version`) and one that merely
+    carries a key we do not know are the same fact, so they degrade the same
+    way: the rule advises, never gates, and says once per session that this is
+    what happened."""
+    want_raw = row.get("min_hook_version")
+    if want_raw is not None:
+        have = hook_version()
+        want = version_tuple(want_raw)
+        if want is None:
+            return f"min_hook_version {str(want_raw)[:20]!r} is not major.minor.patch"
+        if have is None:
+            return (f"this rule needs hook {'.'.join(map(str, want))} and this hook "
+                    "cannot read its own version")
+        if have < want:
+            return (f"this rule needs hook {'.'.join(map(str, want))}; this is "
+                    f"{'.'.join(map(str, have))}")
+    unknown = given_unsupported(given) or ordering_unsupported(ordering)
+    return f"this hook does not understand `{unknown}`" if unknown else ""
+
+
 def given_norm(g):
     """Lint a rule's `given` block off the wire. Returns the block, or None on
     an unknown sub-block, an unknown key, or a value of the wrong kind — and
@@ -1484,7 +1614,8 @@ _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
                                  "on", "repo_scope", "_scope_repos", "_scope_paths",
                                  "_scope_exclude_paths", "anchors", "ordering",
-                                 "_rulebook_id", "_book_name", "_book_scope", "_book_members"})
+                                 "_rulebook_id", "_book_name", "_book_scope", "_book_members",
+                                 "min_hook_version", "_degraded"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -1604,6 +1735,40 @@ def book_rank(rule):
             -members if isinstance(members, int) and not isinstance(members, bool) else 0)
 
 
+def _norm_given(r):
+    """Normalise `r["given"]` in place; False when the RULE must be dropped.
+
+    A value of the wrong kind is a malformed rule and drops it, exactly as
+    `rx_ok` does — the hook's age changes nothing about it. A block or key
+    this hook does not know is version skew instead: what it can check stays
+    and is checked, what it cannot is removed, and `_degrade` makes the rule
+    advise-only and says which key it could not read. A `given` with nothing
+    left is removed entirely rather than left as an empty block that would
+    read as "no condition, all good"."""
+    raw = r["given"]
+    kept = given_norm(given_supported(raw))
+    if kept is None and not given_unsupported(raw):
+        return False
+    if kept:
+        r["given"] = kept
+    else:
+        r.pop("given", None)
+    return True
+
+
+def _degrade(row, r, given=None):
+    """Mark `r` advise-only when this hook cannot honour `row` in full."""
+    if r is None:
+        return None
+    r.pop("min_hook_version", None)      # answered here; never a matcher field
+    why = degradation(row, given, r.get("ordering"))
+    if not why:
+        return r
+    r["_degraded"] = why
+    r["mode"] = "advise"        # §5.3: a gate the hook cannot fully read is not a gate
+    return r
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. The book facts
@@ -1638,11 +1803,10 @@ def to_hook_rule(row):
             if isinstance(r.get("ordering"), dict) and not all(
                     rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
                 return None
-            if "given" in r:
-                r["given"] = given_norm(r["given"])
-                if r["given"] is None:
-                    return None
-            return r
+            raw_given = r.get("given")
+            if "given" in r and not _norm_given(r):
+                return None
+            return _degrade(row, r, raw_given)
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
@@ -1662,7 +1826,7 @@ def to_hook_rule(row):
         # v2.4: anchor rules carry their own identifiers; session rules carry nothing
         if row.get("delivery") == "session_context":
             r["on"] = "session"
-            return r
+            return _degrade(row, r)
         if isinstance(row.get("anchors"), list) and row["anchors"]:
             anchors = [_clean_text(a) for a in row["anchors"] if isinstance(a, str) and a.strip()]
             if not anchors:
@@ -1670,14 +1834,14 @@ def to_hook_rule(row):
             r["on"] = "anchor"
             r["anchors"] = anchors[:64]
             r["fire_scope"] = "session"
-            return r
+            return _degrade(row, r)
         if isinstance(row.get("ordering"), dict):
             o = row["ordering"]
             if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
                 return None
             r["on"] = "ordering"
             r["ordering"] = o
-            return r
+            return _degrade(row, r)
         m = row.get("matcher")
         if not isinstance(m, dict):
             return None
@@ -1700,11 +1864,10 @@ def to_hook_rule(row):
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
-        if "given" in r:
-            r["given"] = given_norm(r["given"])
-            if r["given"] is None:      # unknown key or wrong kind: drop the RULE, as rx_ok does
-                return None
-        return r
+        raw_given = r.get("given")
+        if "given" in r and not _norm_given(r):
+            return None
+        return _degrade(row, r, raw_given)
     except Exception:
         return None
 
@@ -3392,6 +3555,15 @@ def main():
     for r in shown:
         label = r.get("_label") or r["id"]
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
+        # A rule this hook could not read in full ran as advice. Say so with
+        # the fire, once per session per rule — through `st["fired"]`, the
+        # same dedup every `fire_scope: session` rule already uses, so this
+        # cannot disagree with it about what "once per session" means.
+        stale_key = f"_degraded:{r['id']}"
+        if r.get("_degraded") and stale_key not in st["fired"]:
+            st["fired"].append(stale_key)
+            lines.append(f"  _(advice only — {r['_degraded']}. Update the "
+                         f"{BRAND} plugin to let this rule gate.)_")
         blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
