@@ -154,6 +154,29 @@ def main() -> int:
             "ordering": {"required_command_rx": r"git\s+(fetch|pull)\b",
                          "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
                          "armed_by_events": ["session"], "display_name": "git fetch"}}
+    # A rule this hook cannot honour in full is forced to `advise` at load, so
+    # a GATE carrying one cannot block on the runtime being tested — and
+    # create-rule would file it as verified. The lint checks `_degraded`
+    # itself rather than any one of its causes, so a malformed floor, a floor
+    # ABOVE this hook, and an unknown key all land in the same place.
+    floored = dict(bash(command_rx=r"rm\s+-rf"), mode="gate")
+    for floor, why in (("1.2", "malformed"), ("99.0.0", "above this hook")):
+        rc, out = run(dict(floored, min_hook_version=floor), "--fires", "rm -rf ./x")
+        check(f"degraded gate: a floor {why} fails the load gate",
+              rc == 1 and "would block nothing" in out, out)
+    rc, out = run(dict(floored, mode="advise", min_hook_version="99.0.0"),
+                  "--fires", "rm -rf ./x", "--no-self-mention")
+    check("degraded advise: the same floor passes, with a note saying it will "
+          "gate once the plugin is new enough",
+          rc == 0 and "NOTE" in out and "still advises" in out, out)
+    rc, out = run(dict(floored, min_hook_version="0.54.0"), "--fires", "rm -rf ./x",
+                  "--no-self-mention")
+    check("degraded gate: a floor this hook MEETS loads normally", rc == 0, out)
+    rc, out = run(dict(bash(command_rx="x", given={"repo": {"future_key": True}}),
+                       mode="gate"), "--fires", "x")
+    check("degraded gate: an unknown `given` key fails the same way",
+          rc == 1, out)
+
     rc, out = run(sess, "--fires", "session >> gate:git log origin/main",
                   "--silent", "session >> ok:git fetch -q >> gate:git log origin/main",
                   "--no-self-mention")

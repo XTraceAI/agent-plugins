@@ -293,16 +293,25 @@ def verify(rule: dict, fires: list, silent: list,
     hook_rule = H.to_hook_rule(row)
     unknown = H.given_unsupported((row.get("matcher") or {}).get("given")) \
         or H.ordering_unsupported(row.get("ordering"))
-    # A malformed `min_hook_version` degrades the rule to advice at load, so a
-    # gate carrying one never gates. The author has to hear that HERE — the
-    # verifier reported LOAD ok and exited 0, and create-rule would then file
-    # a "verified" gate that blocks nothing, ever.
-    floor = row.get("min_hook_version")
-    if floor is not None and H.version_tuple(floor) is None:
-        out.append("LOAD   FAIL  min_hook_version %r is not major.minor.patch "
-                   "— a rule carrying it can only advise" % (floor,))
+    # ANY degradation costs a gate its teeth: `to_hook_rule` forces
+    # `mode: advise` on a rule this hook cannot honour in full, so a gate
+    # carrying one cannot block on the runtime being tested. The author has to
+    # hear that HERE, or create-rule files a "verified" gate that blocks
+    # nothing, ever.
+    #
+    # A malformed floor and a floor simply ABOVE this hook degrade
+    # identically, and checking only the malformed one was a distinction with
+    # no difference to the author. `_degraded` is the fact itself rather than
+    # one of its causes, so an unknown key or arming event lands here too.
+    degraded = (hook_rule or {}).get("_degraded")
+    if degraded and str(rule.get("mode", "advise")) == "gate":
+        out.append("LOAD   FAIL  %s — so this GATE can only advise on this "
+                   "runtime, and would block nothing" % degraded)
         _load_failure(rule, out)
         return False, False, out
+    if degraded:
+        out.append("NOTE         %s — it still advises, and will gate once the "
+                   "plugin is new enough" % degraded)
     if hook_rule is None or unknown:
         out.append("LOAD   FAIL  the hook would drop this rule at load time" if hook_rule is None
                    else "LOAD   FAIL  this hook does not understand `%s`" % unknown)
