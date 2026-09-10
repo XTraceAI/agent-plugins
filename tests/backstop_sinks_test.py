@@ -73,8 +73,16 @@ def test_missing_surface_and_legacy_non_durable_cloud_are_explicit():
         home=Path(td);data=cases.payload(home);data.pop("entrypoint");cases.configure(home,local[0]);cloud[2]["ack"]=False
         backstop(home,cloud[0],data)
         assert all("source_surface" not in batch for batch in cases.routing.imports(local[1])+cases.routing.imports(cloud[1]))
-        assert state(home,"cloud",local[0])["last_ok_at"]
-        local[2]["ack"]=False;backstop(home,cloud[0],data)
+        assert state(home,"cloud",local[0])["last_error"]=="unrecognized_response"
+        assert not state(home,"cloud",local[0]).get("last_ok_at")
+        installed=home/"installed";installed.mkdir()
+        (installed/"scripts").symlink_to(cases.routing.SCRIPTS,target_is_directory=True)
+        (installed/".mcp.json").write_text(json.dumps({"mcpServers":{"memhub":{"url":cases.CLOUD}}}))
+        extra={"CLAUDE_PLUGIN_ROOT":str(installed)}
+        backstop(home,cloud[0],data,extra=extra)
+        legacy=home/f".config/memhub-plugin/turnflush/{SID}.sessionflush.json"
+        assert json.loads(legacy.read_text())["last_ok_at"]
+        local[2]["ack"]=False;backstop(home,cloud[0],data,extra=extra)
         assert state(home,"local",local[0])["last_error"]=="unrecognized_response"
 
 
