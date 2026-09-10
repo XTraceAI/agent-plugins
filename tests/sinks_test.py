@@ -323,6 +323,23 @@ def test_trailing_dns_dot_remains_a_distinct_credential_origin():
         assert sinks.resolve_capture_auth(sink,refresh=False)==(selected,"dotted-key")
 
 
+def test_noncanonical_numeric_ipv4_endpoints_reject_before_credentials():
+    with isolated():
+        installed = "https://127.0.0.1/mcp"
+        with patch.object(auth, "_plugin_mcp_config", return_value={"url": installed}):
+            pak.CACHE_DIR.mkdir()
+            pak.key_path(installed).write_text(json.dumps({"secret": "installed-key"}))
+            for host in ["127.1", "127.0.1", "2130706433", "0177.0.0.1", "127.00.0.1",
+                         "0x7f000001", "0x7f.0.0.1", "127.0.0.1."]:
+                with patch.object(auth, "resolve_bearer", side_effect=AssertionError("no credential lookup")):
+                    rejected(lambda: sinks.Sink("selected", "https://" + host + "/mcp"))
+            selected = "https://127.0.0.1:443/custom/mcp"
+            assert sinks.resolve_capture_auth(sinks.Sink("selected", selected), refresh=False) == (selected, "installed-key")
+            for host in ["127.0.0.2", "1.example.test", "0x7f.example.test"]:
+                selected = "https://" + host + "/mcp"
+                assert sinks.resolve_capture_auth(sinks.Sink("selected", selected), refresh=False) == (selected, None)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

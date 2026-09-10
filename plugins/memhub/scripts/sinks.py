@@ -55,6 +55,11 @@ def _endpoint(value) -> str:
             # DNS names cannot contain '_', so refusing non-hostname URL forms
             # also prevents one origin from naming another origin's cache file.
             raise ValueError()
+        if re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*\.?", host):
+            # Platform resolvers accept shortened, octal and hexadecimal IPv4
+            # aliases. Admit only dotted-decimal literals so origin comparison
+            # and credential lookup cannot disagree about those spellings.
+            ipaddress.IPv4Address(host)
         mcp_http.require_secure(value)
     except (ValueError, mcp_http.McpError):
         raise SinkConfigError("capture endpoint requires a standard ASCII hostname or IP and HTTPS or literal loopback HTTP") from None

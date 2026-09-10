@@ -177,6 +177,10 @@ A trailing DNS dot remains part of the URL host, so `https://example.test`
 and `https://example.test.` require their own credentials even if DNS resolves
 them to the same address ([URL Standard](https://url.spec.whatwg.org/#host-equivalence)).
 
+Numeric IPv4 capture endpoints use canonical dotted-decimal addresses. Shortened,
+octal, hexadecimal and trailing-dot numeric aliases are rejected before credential
+lookup; DNS names and valid IPv6 literals keep their existing behavior.
+
 File-based capture selection does not change `default_url()`, unqualified
 `resolve_bearer()` or `resolve_url_and_auth()`. Login, recall, brain overview and
 artifact consumers continue using their existing cloud-service resolver.
