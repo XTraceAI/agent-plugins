@@ -460,6 +460,16 @@ def test_single_destination_keeps_legacy_backstop_dormancy():
         assert len(cloud[1])==3
 
 
+def test_drop_receipts_count_uuid_records_before_the_acknowledgement():
+    for records in [[{}, {"uuid":"accepted"}], [{}, {"uuid":"accepted"}, {}],
+                    [{"uuid":"first"}, {}, {"uuid":"accepted"}]]:
+        dropped=sum(not row.get("uuid") for row in records)
+        response={"conversation_id":SID,"messages_received":len(records),
+                  "records_dropped":dropped,"ack_through":"accepted"}
+        assert capture_context.acknowledges(response,SID,records),records
+        assert not capture_context.acknowledges({**response,"records_dropped":dropped-1},SID,records)
+
+
 if __name__ == "__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
