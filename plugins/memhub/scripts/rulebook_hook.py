@@ -3686,11 +3686,12 @@ def main():
         return 0
     rules, rule_version, fetched_at, sources = load_rules(repo)
     tool = data.get("tool_name", "")
+    from capture_context import observed_surface
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data),
-           "source_platform": data.get("source_platform"),
-           "source_surface": data.get("source_surface")}
+           "source_platform": "claude",  # This executable is registered only for Claude hooks.
+           "source_surface": observed_surface(data)}
     if mode == "prompt":
         # UserPromptSubmit. It arms and says nothing: anything printed here is
         # injected above the person's own words, and an arming is not news —

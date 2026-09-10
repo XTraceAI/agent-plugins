@@ -391,7 +391,10 @@ requests may additionally carry `origin_sink`, `rule_source_id`,
 `source_platform`, `source_surface`, and `excerpt`. Evaluation source and rule
 version are recorded when the fire is created; uploading a cloud-evaluated fire
 to local storage never relabels it as locally evaluated. Older rows without
-source evidence remain unknown. Excerpts are redacted using the existing token
+source evidence remain unknown. Newly evaluated fires record the known Claude
+platform; an explicit source surface or entrypoint is preserved through the same
+helper as conversation capture, while an unobserved surface remains unknown.
+Excerpts are redacted using the existing token
 redactor before being capped at 2,048 Unicode characters. This is shape-based
 redaction, not a guarantee against arbitrary sensitive text. Projection never
 rewrites the shared ledger, and remote payloads never include excerpts or these

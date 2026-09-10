@@ -295,6 +295,34 @@ def test_duplicate_rows_keep_their_own_fields_until_a_conversion_is_observed():
         assert row["converted"] is True and row["converted_at"]=="2026-01-02T00:00:00Z"
 
 
+def test_executable_claude_hook_records_known_platform_and_observed_entrypoint():
+    with tempfile.TemporaryDirectory() as td,receiver() as local,receiver() as cloud:
+        home=Path(td);cases.configure(home,local[0]);repo=home/"synthetic"
+        (repo/".git").mkdir(parents=True);(repo/".git/HEAD").write_text("ref: refs/heads/main\n")
+        base=home/".config/memhub-plugin/rulebook"
+        with patch.object(hook,"BOOK_DIR",str(base/"book")):cache=Path(hook.book_path(repo.name))
+        cache.parent.mkdir(parents=True,exist_ok=True)
+        cache.write_text(json.dumps({"fetched_at":"2026-01-01T00:00:00Z","rules":[{
+            "rule_id":"rule-provenance","statement":"Synthetic advice","mode":"advise","version":1,
+            "status":"active","scope_repos":[],"matcher":{"event":"bash","command_rx":"synthetic-command"}}]}))
+        observations=[({},None),({"entrypoint":"Future Claude Desktop"},"Future Claude Desktop"),
+                      ({"source_surface":"Explicit surface","entrypoint":"fallback"},"Explicit surface"),
+                      ({"source_surface":[],"entrypoint":"cli"},"cli")]
+        for index,(extra,expected) in enumerate(observations):
+            payload={"session_id":f"synthetic-{index}","cwd":str(repo),"tool_name":"Bash",
+                     "tool_input":{"command":"synthetic-command"},**extra}
+            cases.routing.invoke(home,"rulebook_hook.py",payload,"pre",override={
+                "MEMHUB_RULEBOOK_BASE":str(base),"MEMHUB_RULEBOOK_FETCH":"0"})
+            row=json.loads((ledger(home)/"fires.jsonl").read_text().splitlines()[-1])
+            assert row["session_id"]==payload["session_id"] and row["source_platform"]=="claude"
+            assert row["source_surface"]==expected and row["origin_sink"]=="cloud"
+        invoke(home,cloud[0])
+        rows=local[1][0][2]["fires"]
+        assert len(rows)==4 and all(row["source_platform"]=="claude" for row in rows)
+        assert [row.get("source_surface") for row in rows]==[value for _,value in observations]
+        assert all(set(row)==set(hook.WIRE_KEYS) for row in cloud[1][0][2]["fires"])
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

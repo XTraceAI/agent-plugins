@@ -154,6 +154,14 @@ async def resolve_repo_brain(session, cwd, env):
     return await brain_resolve.resolve_repo_brain(session, cwd, env)
 
 
+def observed_surface(payload, metadata=None):
+    """Preserve the first explicit native surface observation verbatim."""
+    metadata = metadata or {}
+    return next((source for source in (payload.get("source_surface"), payload.get("entrypoint"),
+                                      metadata.get("source_surface"))
+                 if isinstance(source, str) and source.strip()), None)
+
+
 def identity(native_id: str, metadata=None, *, include_cloud=False) -> dict:
     """Add local identity without changing older cloud import envelopes."""
     sink = _current.get()
@@ -165,11 +173,9 @@ def identity(native_id: str, metadata=None, *, include_cloud=False) -> dict:
         metadata = metadata() if callable(metadata) else (metadata or {})
     except (OSError, ValueError, TypeError, OverflowError):
         metadata = {}
-    for source in (payload.get("source_surface"), payload.get("entrypoint"),
-                   metadata.get("source_surface")):
-        if isinstance(source, str) and source.strip():
-            result["source_surface"] = source
-            break
+    source = observed_surface(payload, metadata)
+    if source is not None:
+        result["source_surface"] = source
     return result
 
 
