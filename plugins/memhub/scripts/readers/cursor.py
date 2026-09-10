@@ -554,7 +554,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 _MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
 
 
-def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
+def _load_transcript(path: Path, *, strict_utf8: bool = False) -> list[tuple[dict, str | None]]:
     """Read Cursor hook JSONL, ignoring only an unfinished final line.
 
     A message's clock is its OWN embedded ``<timestamp>`` tag (user turns
@@ -580,11 +580,12 @@ def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
             try:
                 entry = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if not terminated:
+                if not terminated and not (strict_utf8 and isinstance(exc, UnicodeDecodeError)):
                     # Cursor appends records. A hook can race the writer, so a
                     # genuinely unfinished tail is deferred to the next event.
                     # A complete final JSON object needs no trailing newline
                     # and is accepted by the same parse above.
+                    # Strict consumers defer incomplete JSON, never bad UTF-8.
                     break
                 raise ValueError(
                     f"cursor transcript {path} line {line_no} is invalid JSON") from exc
@@ -610,7 +611,7 @@ def to_canonical(path, *, session_id: str | None = None,
     source = Path(path)
     if source.name != "store.db":
         sid = session_id or source.stem
-        messages = _load_transcript(source)
+        messages = _load_transcript(source, strict_utf8=strict_utf8)
         # The banner's clock: the first embedded user-turn tag — the earliest
         # source-carried instant the transcript offers (None when it offers
         # none; the flush's first-seen stamp covers live sessions).

@@ -367,6 +367,22 @@ os._exit(0)
         assert {file.name: file.read_bytes() for file in path.parent.iterdir()} == before
 
 
+def test_cursor_unterminated_tail_rejects_decoding_errors_only_in_strict_mode():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=transcript(home)
+        expected,_=cursor.to_canonical(path)
+        original=path.read_bytes()
+        path.write_bytes(original + b'{"role":"assistant","message":{"content":"bad\xfftext"}}')
+        legacy,_=cursor.to_canonical(path)
+        assert legacy==expected
+        result,rows=run(home,"cursor")
+        assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
+        assert "bad" not in result.stderr and "Traceback" not in result.stderr
+        path.write_bytes(original + b'{"role":"assistant","message":')
+        result,rows=run(home,"cursor")
+        assert result.returncode==0 and rows[1:]==expected, result.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
