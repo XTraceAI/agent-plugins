@@ -66,6 +66,34 @@ def redact(value):
     return value
 
 
+# ── identities, for a window bound for a MODEL — not for the archive ───────
+#
+# The capture pipeline above deliberately eats only prefixed credentials, so
+# the archive stays trustworthy. The harness window (harness-tied-memory-spec
+# §4.2 step 1) is a different object: an ephemeral prompt whose tool output is
+# untrusted and shapes a rule the whole team reads. S0's Finding 1 was the
+# author baking a colleague's username — read out of an org-members query in
+# the replayed session — into a rule regex. Over-redacting here costs at worst
+# one over-general draft; publishing a teammate's identity cannot be undone.
+#
+# Two shapes, coarse on purpose: a home directory (`/Users/<name>/…`,
+# `/home/<name>/…`, `C:\Users\<name>\…`) becomes `~`, which is how the
+# path reads to every teammate anyway, and an e-mail address becomes
+# `<email>`. Usernames that appear as bare words cannot be recognised by
+# shape and are the server's second layer (`_pii_in_trigger`).
+_HOME_DIR = re.compile(r"(?<![\w.~-])(?:/(?:Users|home)/|[A-Za-z]:\\Users\\)"
+                       r"[^/\\\s'\"`:;,)]+")
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def redact_identities(text: str) -> str:
+    """Home directories → ``~``, e-mail addresses → ``<email>``. For text that
+    is about to reach a model, never for records being captured."""
+    if not text:
+        return text
+    return _EMAIL.sub("<email>", _HOME_DIR.sub("~", text))
+
+
 def redact_records(records: list) -> list:
     """Redact a batch of transcript records. Never raises.
 

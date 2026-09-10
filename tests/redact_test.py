@@ -112,9 +112,30 @@ def test_batch():
     check("clean record identical", out[1]["text"], "clean")
 
 
+def test_identities_for_a_model_bound_window():
+    """`redact_identities` is for the harness window (S0 Finding 1), NOT for
+    captured records: it over-redacts on purpose, and the archive must not."""
+    print("\nidentities (window only)")
+    check("home dir becomes ~",
+          r.redact_identities("cd /Users/colleague/dev/x && ls /home/dana/y"),
+          "cd ~/dev/x && ls ~/y")
+    check("windows home too", r.redact_identities(r"C:\Users\dana\dev"), "~\dev")
+    check("email becomes <email>",
+          r.redact_identities("owner dana.k+x@example.co.uk here"),
+          "owner <email> here")
+    check("a URL path segment is not a home dir",
+          r.redact_identities("https://h.io/Users/list"), "https://h.io/Users/list")
+    check("already ~ is untouched", r.redact_identities("~/xtrace/ok"), "~/xtrace/ok")
+    check("empty in, empty out", r.redact_identities(""), "")
+    # the capture path is unchanged: records keep their paths and addresses
+    rec = {"t": "/Users/colleague/dev/x dana@example.com"}
+    check("capture redaction leaves identities alone", r.redact(rec), rec)
+
+
 if __name__ == "__main__":
     for test in (test_secrets_are_removed, test_ordinary_content_survives,
-                 test_structure_is_preserved, test_never_raises, test_batch):
+                 test_structure_is_preserved, test_never_raises, test_batch,
+                 test_identities_for_a_model_bound_window):
         test()
     if failures:
         print("\nFAILED:")
