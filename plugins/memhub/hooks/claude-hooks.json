@@ -138,16 +138,6 @@
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" session; fi"
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 5,
-            "statusMessage": "MemHub: checking harness drafts",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py\" session; fi"
-          }
-        ]
       }
     ],
     "UserPromptSubmit": [
@@ -168,6 +158,16 @@
             "timeout": 5,
             "statusMessage": "MemHub: arming team rules on this prompt",
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" prompt; fi"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "statusMessage": "MemHub: handing a flagged moment to the agent",
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py\" prompt; fi"
           }
         ]
       }

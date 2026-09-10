@@ -1,44 +1,35 @@
 #!/usr/bin/env python3
-"""The Stop sensor for harness-tied memory (spec §4.1–§4.4) — FLAGGED OFF.
+"""The Stop sensor for harness-tied memory (spec §4.1–§4.2) — FLAGGED OFF.
 
 Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on. With it on,
-a session drafts lessons at each turn's Stop, a post-session review turns the
-drafts into proposals, and the proposals are filed `proposed` for a human to
-activate. Nothing here fires a rule and nothing here activates one.
+the server classifies each turn's moment and the LIVE AGENT mines the lesson:
 
-Modes (argv[1]):
+  Stop(turn N)         `stop`     returns in milliseconds; a detached `extract`
+                                  child builds the redacted window, asks the
+                                  server classifier, and — on a signal — writes
+                                  the MOMENT (turn, kind, router hint, the
+                                  nine-field stamp) to <session>.moments.jsonl
+  next user prompt     `prompt`   hands the newest un-handed moment to the agent
+                                  in ONE injected line: which turn, what kind,
+                                  the stamp to pass — and the agent that lived
+                                  the turn decides whether there is a lesson,
+                                  asks the person if unsure, and files it with
+                                  the memhub `create_rule` tool. It lands
+                                  `proposed`; a human activates in Studio.
 
-  stop      Stop hook entry — returns in milliseconds. Checks the flag, spawns
-            `extract` DETACHED for the turn that just ended, and, once per
-            session, the `idle` waiter. Stdin: the host's Stop payload.
-  session   SessionStart hook entry. Drafts left un-reviewed by an earlier
-            session in this repo → spawns `review`; reviewed rows left unsent
-            → spawns `sync`; and tells the author, in one systemMessage line,
-            what an earlier review proposed (§4.3 step 5).
-  pr-open   Spawned by `pr_babysit_trigger.py` after a `gh pr create` that
-            returned a URL: review this session's drafts now, stamped with
-            the PR number.
-  extract   (child) one turn: router → window → POST → stamp → local draft.
-            Shares `harness_extract.extract_turn` with the replay, so what the
-            scorecard measured is what runs.
-  idle      (child) waits for 30 minutes of transcript silence, then reviews.
-  review    (child) the post-session review — headless `claude -p` over the
-            session's drafts, its digest and the cached book. Keeps or drops;
-            never rewrites a row and never activates. Runs under
-            `MEMHUB_HARNESS_CHILD=1` so `claude_hook_guard.py` disarms every
-            hook for it — without that the review captures itself into the
-            repo brain and shows on the fleet board (it has happened).
-  sync      (child) reviewed rows → `create_rule(state=…)` over MCP, behind a
-            per-row watermark (the reply's `rule_id` is written back). Rows
-            land `proposed`. `activate` is never passed.
+That is the whole loop. There is no post-session miner, no idle waiter and no
+sync: a moment nobody handed to the agent (the terminal closed, a host with no
+prompt lane) is left in its file, and the row the agent files goes through the
+same `create_rule` any authored rule does — the server stamps, twin-checks and
+refuses there. Nothing here fires a rule and nothing here activates one.
 
 Files, under $MEMHUB_HARNESS_DRAFTS (default ~/.config/memhub-plugin/drafts):
 
-  <session>.jsonl            drafts, append-only (harness_extract.append_draft)
-  <session>.meta.json        what the sensor knows about the session: repo,
-                             cwd, transcript, last extracted turn, how many
-                             drafts the review has seen, the PR number
-  <session>.reviewed.jsonl   rows the review kept, each with its sync status
+  <session>.moments.jsonl   classifier-flagged moments; `handed_at` once nudged
+  <session>.meta.json       last extracted turn, repo, cwd, nudge count
+  <session>.jsonl           what the server's author drafted (kept for the
+                            replay's measurements; the live path reads only
+                            moments — see `judge_only` in the scorecard)
 
 Every path fails open and silent (§6): a broken sensor must never touch the
 tool call or the session. Stdlib only.
@@ -48,8 +39,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -60,21 +49,9 @@ if str(HERE) not in sys.path:
 
 import harness_extract as hx  # noqa: E402
 
-IDLE_S = int(os.environ.get("MEMHUB_HARNESS_IDLE_S", "1800"))      # §4.3: 30 min
-IDLE_POLL_S = int(os.environ.get("MEMHUB_HARNESS_IDLE_POLL_S", "60"))
-IDLE_GIVE_UP_S = 12 * 3600      # a waiter that never sees silence still exits
-REVIEW_TIMEOUT_S = int(os.environ.get("MEMHUB_HARNESS_REVIEW_TIMEOUT", "180"))
-REVIEW_GIVE_UP_AFTER = 3        # failed review attempts before the drafts are let go
-REVIEW_MODEL = os.environ.get("MEMHUB_HARNESS_REVIEW_MODEL", "sonnet")
-REVIEW_DIGEST_CHARS = 20000     # the session, as the reviewer sees it
-REVIEW_BOOK_ROWS = 60           # cached rules offered for `supersedes_rule_id`
-SYNC_TIMEOUT_S = float(os.environ.get("MEMHUB_HARNESS_SYNC_TIMEOUT", "30"))
-SYNC_BATCH = 20                 # rows per sync child
-STATE_KEYS = ("repo", "session_id", "turn", "hook_version", "at")   # §5.1
-# What the sync sends, and nothing else. Local bookkeeping (`_reason`,
-# `_rationale`, `_kind`, `_review`, `_sync*`) never crosses the wire.
-WIRE_KEYS = ("title", "statement", "delivery", "matcher", "ordering", "anchors",
-             "source", "source_ref", "state", "scope_repos", "supersedes_rule_id")
+NUDGE_MAX_AGE_TURNS = 3      # a moment older than this is left in its file, never nudged stale
+NUDGE_CAP_PER_SESSION = 8    # the same bound §4.3 puts on drafts
+NUDGES_PER_PROMPT = 1        # one line, the newest moment
 
 
 # --------------------------------------------------------------- plumbing
@@ -100,13 +77,9 @@ def meta_path(session: str) -> Path:
     return _base() / f"{_safe(session)}.meta.json"
 
 
-def reviewed_path(session: str) -> Path:
-    return _base() / f"{_safe(session)}.reviewed.jsonl"
-
-
 def moments_path(session: str) -> Path:
-    """Classifier-flagged moments (window + stamp), appended by the extract
-    child, mined by the review."""
+    """Classifier-flagged moments (stamp + redacted window), appended by the
+    extract child, handed to the agent by the prompt lane."""
     return _base() / f"{_safe(session)}.moments.jsonl"
 
 
@@ -143,17 +116,9 @@ def write_rows(path: Path, rows: list[dict]) -> None:
                            for r in rows))
 
 
-def _spawn(mode: str, *args: str, log_name: str = "stop.log") -> int:
+def _spawn(mode: str, *args: str) -> int:
     return hx.spawn_detached([mode, *args], script=Path(__file__).resolve(),
-                             log_name=log_name)
-
-
-def _alive(pid) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, TypeError, ValueError):
-        return False
-    return True
+                             log_name="stop.log")
 
 
 def env_name() -> str:
@@ -197,8 +162,7 @@ def _args(**over) -> argparse.Namespace:
 
 # --------------------------------------------------------------- stop lane
 def cmd_stop(payload: dict) -> int:
-    """Millisecond budget: two Popen calls at most, no reading of the
-    transcript, no network."""
+    """Millisecond budget: one Popen, no reading of the transcript, no network."""
     session = str(payload.get("session_id") or "").strip()
     transcript = str(payload.get("transcript_path") or "").strip()
     cwd = str(payload.get("cwd") or "").strip()
@@ -208,17 +172,17 @@ def cmd_stop(payload: dict) -> int:
         # The host re-entered Stop because a Stop hook asked it to continue.
         # The turn is the same turn; the first firing already spawned for it.
         return 0
-    _spawn("extract", "--session", session, "--transcript", transcript,
-           "--cwd", cwd)
-    if not _alive(load_meta(session).get("idle_pid")):
-        _spawn("idle", "--session", session, "--transcript", transcript,
-               "--cwd", cwd)
+    if str(payload.get("agent_id") or "").strip():
+        # A subagent's Stop. Its turn is not the person's turn, and a moment
+        # from it would be nudged into the main agent's prompt.
+        return 0
+    _spawn("extract", "--session", session, "--transcript", transcript, "--cwd", cwd)
     return 0
 
 
 def cmd_extract(session: str, transcript: str, cwd: str) -> int:
-    """The child. One turn — the last one in the transcript — through the
-    same path the replay measures."""
+    """The child. The last turn in the transcript through the same path the
+    replay measures; the classifier's verdict lands as a moment."""
     try:
         turns = hx.turns_from_transcript(transcript)
     except (OSError, ValueError) as exc:
@@ -243,577 +207,92 @@ def cmd_extract(session: str, transcript: str, cwd: str) -> int:
     trace = hx.Trace(str(hx.log_path("extract.log")), quiet=True)
     try:
         hx.extract_turn(last, prev, doc=doc, args=_args(moments=str(moments_path(session))),
-                        kept=kept, stats=stats, trace=trace, out_path=out_path,
-                        arcs=arcs, pr_number=meta.get("pr_number"))
+                        kept=kept, stats=stats, trace=trace, out_path=out_path, arcs=arcs)
     finally:
         trace.close()
     save_meta(session, repo=repo, cwd=doc["cwd"], transcript_path=transcript,
-              last_extracted=marker, last_turn=last.get("n"),
-              last_stop_at=time.time(), drafts=len(hx.read_drafts(out_path)))
+              last_extracted=marker, last_turn=last.get("n"), last_stop_at=time.time())
     _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
-         f"rows={stats['rows']} refusals={stats['refusals']} arcs={len(arcs)}")
+         f"moment={stats.get('moments', 0)} refusals={stats['refusals']} arcs={len(arcs)}")
     return 0
 
 
-def cmd_idle(session: str, transcript: str, cwd: str) -> int:
-    """Wait for IDLE_S of transcript silence, review once, exit."""
-    save_meta(session, idle_pid=os.getpid())
-    started = time.time()
-    while True:
-        time.sleep(IDLE_POLL_S)
-        try:
-            mtime = os.path.getmtime(transcript)
-        except OSError:
-            break                         # the transcript is gone: nothing to wait for
-        if time.time() - mtime >= IDLE_S:
-            break
-        if time.time() - started > IDLE_GIVE_UP_S:
-            _log(f"idle {session[:8]}: gave up after {IDLE_GIVE_UP_S}s")
-            return 0
-    review_and_sync(session, moment="idle")
-    return 0
+# ------------------------------------------------------------- prompt lane
+def nudge_line(session: str, moment: dict, repo: str) -> str:
+    """The one line the agent reads. It names the turn and the kind, and
+    carries the stamp verbatim so the row the agent files is a
+    `session_draft` like any other — stamped by the harness, never typed."""
+    kind = moment.get("kind") or "a signal"
+    hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
+    stamp = json.dumps(moment.get("state") or {}, ensure_ascii=False, default=str)
+    return (
+        f"MemHub harness: your previous turn (turn {moment.get('turn')}) was classified as "
+        f"{kind}{hint}. If it carries a lesson that would change what an agent DOES next "
+        f"time, is not already in the repo, its docs, CLAUDE.md or the rulebook, is not "
+        f"project state, and will still be true next month, propose it now with the memhub "
+        f"create_rule tool: title (a short noun phrase naming the trap), statement (one "
+        f"when-X-then-Y sentence with the why), exactly one engine — delivery=agent_hook "
+        f"with matcher {{event: bash|edit|output|read, …_rx}} or ordering, or "
+        f"delivery=anchor_recall with 1-8 concrete identifiers — plus "
+        f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
+        f"scope_repos={json.dumps([repo] if repo else [])}, state={stamp}. Never pass "
+        f"activate; it lands proposed for a human. Never put a person's name, home "
+        f"directory or e-mail in a row. Ask the user first if unsure; if there is no "
+        f"lesson, say nothing about this."
+    )
 
 
-# ------------------------------------------------------------- the review
-_NULLABLE_STR = {"type": ["string", "null"]}
-REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "keep": {"type": "array", "items": {"type": "object", "properties": {
-            "index": {"type": "integer"},
-            "supersedes_rule_id": {"type": ["string", "null"]},
-            "why": {"type": "string"}},
-            "required": ["index", "supersedes_rule_id", "why"]}},
-        "drop": {"type": "array", "items": {"type": "object", "properties": {
-            "index": {"type": "integer"}, "why": {"type": "string"}},
-            "required": ["index", "why"]}},
-        # Rows the local agent authors from the classifier-flagged moments —
-        # the same fields the server author produces, so one `build_row`
-        # and one PII check serve both.
-        "author": {"type": "array", "items": {"type": "object", "properties": {
-            "moment": {"type": "integer"},
-            "title": {"type": "string"},
-            "statement": {"type": "string"},
-            "engine": {"type": "string", "enum": ["matcher", "ordering", "anchors"]},
-            "matcher": {"type": ["object", "null"], "properties": {
-                "event": {"type": ["string", "null"]},
-                "command_rx": _NULLABLE_STR, "command_not_rx": _NULLABLE_STR,
-                "path_rx": _NULLABLE_STR, "path_not_rx": _NULLABLE_STR,
-                "content_rx": _NULLABLE_STR}},
-            "ordering": {"type": ["object", "null"], "properties": {
-                "required_command_rx": _NULLABLE_STR, "gated_command_rx": _NULLABLE_STR,
-                "armed_by_events": {"type": ["array", "null"], "items": {"type": "string"}},
-                "display_name": _NULLABLE_STR}},
-            "anchors": {"type": ["array", "null"], "items": {"type": "string"}},
-            "supersedes_rule_id": {"type": ["string", "null"]},
-            "rationale": {"type": "string"}},
-            "required": ["moment", "title", "statement", "engine", "matcher",
-                         "ordering", "anchors", "supersedes_rule_id", "rationale"]}},
-    },
-    "required": ["keep", "drop", "author"],
-}
-
-REVIEW_PROMPT = """\
-You are the post-session reviewer for an engineering team's coding-agent \
-harness. A session drafted lessons — proposed team rules — one at a time, \
-without seeing the whole session. You see all of them, a digest of the \
-session, and the team's current rulebook. Decide, for each draft, KEEP or DROP.
-
-DROP a draft when:
-- the session later abandoned or reversed the path it came from;
-- it records project state or narrative (what this PR does, what was decided \
-for this ticket) rather than a behaviour that repeats;
-- it duplicates another draft in this set — keep the one with the better \
-trigger, drop the rest;
-- it restates a rule already in the rulebook without changing it.
-
-KEEP a draft that updates or corrects an existing rule, and set \
-`supersedes_rule_id` to that rule's id (only an id from the rulebook you were \
-shown; otherwise null).
-
-You also receive MOMENTS: turns a classifier flagged as carrying a lesson, \
-each with the window around it. You are the author for these. For a moment \
-that carries a lesson no kept draft and no rulebook rule already states, \
-AUTHOR one row in `author`; otherwise leave it. Most moments are not lessons \
-— refuse silently when: no engine below can be filled with something a \
-program can match next time; the point is derivable from the repo, its tests, \
-docs or CLAUDE.md; the fix is already in the error output the agent saw; it \
-is project state or narrative (what this PR does, what was decided for this \
-ticket) rather than a behaviour that repeats; it is task narration; it is \
-true only of one file, one line, one PR that will merge. Ask yourself, for \
-every row: which next command, edit or read does this change, and is it still \
-true next month? If you cannot name both, do not author it.
-
-A row fills exactly ONE engine, the shape of the ACTION it must fire on:
-- engine="matcher": {{"event":"bash","command_rx":…}} / {{"event":"edit","path_rx":…}} / \
-{{"event":"output","content_rx":…}} / {{"event":"read","path_rx":…}}. Python `re`; the SHAPE \
-of the command, never the literal; narrow enough not to fire on every member \
-of that family (a rule that nags on every `git status` is worse than none).
-- engine="ordering": {{"required_command_rx":…,"gated_command_rx":…,"armed_by_events":["edit"],"display_name":…}} \
-— run X after edits, before Y.
-- engine="anchors": 1-8 CONCRETE identifiers — file paths, symbol names, env \
-var names, table names. Never a bare English word, never a repo name, never a \
-phrase; an anchor that appears in every call recalls everywhere.
-`statement` is one when-X-then-Y sentence a teammate could be held to, \
-carrying the WHY in a clause. `title` is a short noun phrase naming the trap. \
-NEVER put a person's name, username, home directory or e-mail in a row.
-
-Kept drafts plus authored rows together stay within the budget stated. You \
-never rewrite a draft and you never activate anything: a human reads every \
-row. Answer with JSON only, by calling the StructuredOutput tool; never ask a \
-question."""
-
-
-def session_digest(session: str, meta: dict) -> str:
-    """The session as prose the reviewer can read in one pass: each human
-    turn and the agent's final words, most recent last, bounded."""
-    tp = meta.get("transcript_path") or ""
-    turns_path = meta.get("turns_path") or ""      # a replayed session: canonical turns JSON
-    turns: list[dict] = []
-    if turns_path and os.path.isfile(turns_path):
-        try:
-            turns = json.loads(Path(turns_path).read_text(encoding="utf-8")).get("turns") or []
-        except (OSError, ValueError):
-            turns = []
-    elif tp and os.path.isfile(tp):
-        try:
-            turns = hx.turns_from_transcript(tp)
-        except (OSError, ValueError):
-            turns = []
-    lines = []
-    for t in turns:
-        lines.append(f"t{t.get('n')} USER: {(t.get('user') or '')[:300]}\n"
-                     f"     AGENT: {(t.get('asst') or '')[-300:]}")
-    text = "\n".join(lines)
-    if len(text) > REVIEW_DIGEST_CHARS:
-        text = "…\n" + text[-REVIEW_DIGEST_CHARS:]
-    return hx.redact_window(text) if text else "(no transcript available)"
-
-
-def cached_book(repo: str) -> list[dict]:
-    rh = hx._hook()
-    if rh is None or not repo:
-        return []
-    try:
-        rules, _v, _at, _src = rh.load_rules(repo)
-    except Exception:
-        return []
-    out = []
-    for r in rules[:REVIEW_BOOK_ROWS]:
-        if not isinstance(r, dict) or not r.get("id"):
-            continue
-        out.append({"id": str(r["id"]), "title": str(r.get("_label") or r["id"])[:80],
-                    "statement": str(r.get("text") or "")[:200],
-                    "status": r.get("status", "active")})
-    return out
-
-
-MOMENT_WINDOW_CHARS = 3500    # per moment, inside the review's own input
-
-
-def review_input(drafts: list[dict], digest: str, book: list[dict],
-                 budget: int, moments: list[dict] | None = None) -> str:
-    L = [f"BUDGET: keep at most {budget} rows in total — kept drafts plus "
-         f"authored rows — from the {len(drafts)} drafts and "
-         f"{len(moments or [])} moments.", "", "DRAFTS:"]
-    if not drafts:
-        L.append("  (none)")
-    for i, r in enumerate(drafts, 1):
-        engine = {k: r[k] for k in ("matcher", "ordering", "anchors") if k in r}
-        L += [f"[{i}] {r.get('title', '')}",
-              f"    statement: {r.get('statement', '')}",
-              f"    trigger: {json.dumps(engine, ensure_ascii=False)}",
-              f"    from: {r.get('source_ref', '')} ({r.get('_reason', '')})"]
-    L += ["", "MOMENTS (classifier-flagged; author from these):"]
+def cmd_prompt(payload: dict) -> int:
+    """UserPromptSubmit, ≤10 ms: the newest un-handed moment becomes one line
+    of context. Marks it handed whether or not the agent files anything —
+    the agent had its chance, and a second nudge for one moment is noise."""
+    session = str(payload.get("session_id") or "").strip()
+    prompt = str(payload.get("prompt") or "")
+    if not session or hx.is_harness_text(prompt.strip()):
+        return 0
+    path = moments_path(session)
+    if not path.is_file():
+        return 0
+    moments = hx.read_drafts(path)
     if not moments:
-        L.append("  (none)")
-    for i, m in enumerate(moments or [], 1):
-        L += [f"[M{i}] turn {m.get('turn')} · classifier: {m.get('kind') or '-'}"
-              f"{' · router: ' + m['hint'] if m.get('hint') else ''}",
-              (m.get("window") or "")[:MOMENT_WINDOW_CHARS], ""]
-    L += ["RULEBOOK (existing rules, for supersedes_rule_id):"]
-    L += [f"- {b['id']} [{b['status']}] {b['title']}: {b['statement']}" for b in book] \
-        or ["  (none cached)"]
-    L += ["", "SESSION DIGEST:", digest]
-    return "\n".join(L)
-
-
-class ReviewError(Exception):
-    """A bounded review that produced nothing usable. Drafts stay put."""
-
-
-def call_review(user: str, cwd: str = "", timeout: int = 0) -> dict:
-    """ONE headless `claude -p` attempt, disarmed twice over.
-
-    `--safe-mode` keeps the child from loading this plugin (and every other
-    customization); `MEMHUB_HARNESS_CHILD=1` in the environment is honoured by
-    `claude_hook_guard.py` on every host. Both, because the first is a
-    Claude-Code-only flag and the second is what survives a host that drops it.
-    """
-    cmd = ["claude", "-p", "--model", REVIEW_MODEL, "--safe-mode",
-           "--output-format", "json", "--json-schema", json.dumps(REVIEW_SCHEMA),
-           "--no-session-persistence",
-           "--disallowedTools", "Bash", "Read", "Edit", "Write", "MultiEdit",
-           "Agent", "Grep", "Glob", "WebSearch", "WebFetch",
-           "--append-system-prompt", REVIEW_PROMPT]
-    kwargs = {"input": user, "capture_output": True, "text": True,
-              "timeout": timeout or REVIEW_TIMEOUT_S, "env": hx.child_env()}
-    if cwd and os.path.isdir(cwd):
-        kwargs["cwd"] = cwd
-    try:
-        proc = subprocess.run(cmd, **kwargs)
-    except subprocess.TimeoutExpired:
-        raise ReviewError(f"timeout after {kwargs['timeout']}s")
-    except (OSError, ValueError) as exc:
-        raise ReviewError(f"spawn failed: {exc!r}")
-    if proc.returncode != 0:
-        raise ReviewError(f"exit {proc.returncode}: {(proc.stderr or '')[-200:].strip()}")
-    try:
-        envelope = json.loads(proc.stdout)
-    except ValueError:
-        raise ReviewError(f"unparseable stdout: {(proc.stdout or '')[:200]}")
-    if not isinstance(envelope, dict) or envelope.get("is_error"):
-        raise ReviewError(f"cli error: {str(envelope)[:200]}")
-    payload = envelope.get("structured_output")
-    if payload is None:
-        payload = envelope.get("result")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            raise ReviewError(f"result not JSON: {payload[:200]}")
-    if not isinstance(payload, dict) or not isinstance(payload.get("keep"), list):
-        raise ReviewError("off-contract reply")
-    return payload
-
-
-def apply_review(drafts: list[dict], verdict: dict, book: list[dict],
-                 budget: int, pr_number=None) -> tuple[list[dict], list[dict]]:
-    """(kept rows, dropped rows). Rows are never rewritten — a kept row is the
-    server-validated row plus `supersedes_rule_id` (an id from the cached
-    book only), the PR number when known, and a `_review` note."""
-    known = {b["id"] for b in book}
-    kept, dropped = [], []
-    seen = set()
-    for item in verdict.get("keep") or []:
-        if not isinstance(item, dict):
-            continue
-        idx = item.get("index")
-        if not isinstance(idx, int) or not 1 <= idx <= len(drafts) or idx in seen:
-            continue
-        seen.add(idx)
-        if len(kept) >= budget:
-            break
-        row = dict(drafts[idx - 1])
-        sup = item.get("supersedes_rule_id")
-        row["supersedes_rule_id"] = sup if isinstance(sup, str) and sup in known else None
-        if pr_number is not None:
-            row["state"] = dict(row.get("state") or {}, pr_number=pr_number)
-        row["_review"] = {"index": idx, "why": str(item.get("why") or "")[:300],
-                          "at": time.time()}
-        kept.append(row)
-    for i, row in enumerate(drafts, 1):
-        if i not in seen:
-            why = next((str(d.get("why") or "")[:300] for d in (verdict.get("drop") or [])
-                        if isinstance(d, dict) and d.get("index") == i), "not kept")
-            dropped.append(dict(row, _review={"index": i, "why": why}))
-    return kept, dropped
-
-
-def apply_mining(moments: list[dict], verdict: dict, book: list[dict], *,
-                 session: str, repo: str, kept: list[dict], budget: int,
-                 pr_number=None) -> tuple[list[dict], dict]:
-    """Rows the local agent authored from the flagged moments, as complete
-    stamped rows or nothing — the same `build_row` contract the server path
-    uses, plus the identity check the server would have run. Returns
-    (rows, refusal counts)."""
-    known = {b["id"] for b in book}
-    out: list[dict] = []
-    refused: dict[str, int] = {}
-
-    def refuse(why: str) -> None:
-        refused[why] = refused.get(why, 0) + 1
-
-    used = set()
-    for item in verdict.get("author") or []:
-        if not isinstance(item, dict):
-            continue
-        idx = item.get("moment")
-        if not isinstance(idx, int) or not 1 <= idx <= len(moments):
-            refuse("moment_out_of_range")
-            continue
-        if idx in used:
-            refuse("moment_reused")        # one row per moment; the second is dropped
-            continue
-        used.add(idx)
-        if len(kept) + len(out) >= budget:
-            refuse("budget")
-            break
-        raw = {"title": item.get("title"), "statement": item.get("statement"),
-               "engine": item.get("engine"), "matcher": item.get("matcher"),
-               "ordering": item.get("ordering"), "anchors": item.get("anchors"),
-               "derivable": False, "rationale": item.get("rationale")}
-        if hx.pii_in_row(raw):
-            refuse("pii_in_row")          # never logged with the fragment
-            continue
-        moment = moments[idx - 1]
-        state = dict(moment.get("state") or {})
-        if pr_number is not None:
-            state["pr_number"] = pr_number
-        row, why = hx.build_row(raw, state=state, session=session,
-                                turn_n=moment.get("turn"),
-                                reason=f"local:{moment.get('kind') or 'judge'}",
-                                scope_repos=[repo] if repo else [])
-        if row is None:
-            refuse(why)
-            continue
-        if hx.is_twin(row, kept + out):
-            refuse("twin_in_run")
-            continue
-        sup = item.get("supersedes_rule_id")
-        row["supersedes_rule_id"] = sup if isinstance(sup, str) and sup in known else None
-        row["_kind"] = moment.get("kind")
-        row["_review"] = {"authored": True, "moment": idx, "at": time.time()}
-        out.append(row)
-    return out, refused
-
-
-def review(session: str, *, moment: str, pr_number=None) -> int:
-    """§4.3. Returns the number of rows kept, or -1 when nothing was reviewed."""
+        return 0
     meta = load_meta(session)
-    if pr_number is not None:
-        meta = save_meta(session, pr_number=pr_number)
-    drafts = hx.read_drafts(hx.drafts_path(session))
-    seen = int(meta.get("reviewed_through") or 0)
-    new = drafts[seen:]
-    moments = hx.read_drafts(moments_path(session))
-    mined = int(meta.get("mined_through") or 0)
-    new_moments = moments[mined:]
-    if not new and not new_moments:
-        return -1
-    already = len(hx.read_drafts(reviewed_path(session)))
-    budget = max(0, hx.DEFAULT_BUDGET - already)
-    repo = meta.get("repo") or ""
-    book = cached_book(repo)
-    digest = session_digest(session, meta)
-    try:
-        verdict = call_review(review_input(new, digest, book, budget, new_moments),
-                              cwd=meta.get("cwd") or "")
-    except ReviewError as exc:
-        failures = int(meta.get("review_failures") or 0) + 1
-        _log(f"review {session[:8]} ({moment}): {exc} [attempt {failures}]")
-        if failures >= REVIEW_GIVE_UP_AFTER:
-            # Three bounded attempts is the retry budget. The drafts stay in
-            # their file for a human; the review stops spending on them.
-            save_meta(session, reviewed_through=len(drafts), mined_through=len(moments),
-                      review_failures=0, reviewed_at=time.time(), review_gave_up=True)
-        else:
-            save_meta(session, review_failures=failures)
-        return -1
-    try:        # the raw verdict, for a reader of a refusal count — scratch, never synced
-        _publish(_base() / f"{_safe(session)}.verdict.json",
-                 json.dumps(verdict, ensure_ascii=False, default=str))
-    except Exception:
-        pass
-    kept, dropped = apply_review(new, verdict, book, budget, pr_number=meta.get("pr_number"))
-    authored, refused = apply_mining(new_moments, verdict, book, session=session,
-                                     repo=repo, kept=kept, budget=budget,
-                                     pr_number=meta.get("pr_number"))
-    rows = kept + authored
-    if rows:
-        with reviewed_path(session).open("a", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-    save_meta(session, reviewed_through=len(drafts), mined_through=len(moments),
-              reviewed_at=time.time(), review_failures=0, review_moment=moment,
-              dropped=int(meta.get("dropped") or 0) + len(dropped),
-              mining_refused=refused)
-    _log(f"review {session[:8]} ({moment}): {len(new)} new drafts, kept {len(kept)}, "
-         f"dropped {len(dropped)}; {len(new_moments)} moments, authored {len(authored)}, "
-         f"refused {refused}")
-    return len(rows)
-
-
-# ------------------------------------------------------------------- sync
-def _rulebook_for(repo: str) -> str | None:
-    """§3.3: the client picks from its cached book — the book most of the
-    repo's active rules live in. None when the cache carries no book facts
-    (an older backend), and the server then decides."""
-    rh = hx._hook()
-    if rh is None or not repo:
-        return None
-    try:
-        rules, _v, _at, _src = rh.load_rules(repo)
-    except Exception:
-        return None
-    counts: dict[str, int] = {}
-    for r in rules:
-        rid = r.get("_rulebook_id") if isinstance(r, dict) else None
-        if rid:
-            counts[str(rid)] = counts.get(str(rid), 0) + 1
-    if not counts:
-        return None
-    return max(counts, key=lambda k: counts[k])
-
-
-def wire_row(row: dict, rulebook_id: str | None) -> dict:
-    body = {k: row[k] for k in WIRE_KEYS if k in row and row[k] not in (None, [], {})}
-    body["source"] = "session_draft"
-    if rulebook_id:
-        body["rulebook_id"] = rulebook_id
-    # `activate` is never sent, whatever the row says: activation is a human act.
-    body.pop("activate", None)
-    return body
-
-
-_PERMANENT = re.compile(r"state_required|hook_version|twin|already|validation|invalid"
-                        r"|refused|not allowed|too long|unknown rulebook|not a member", re.I)
-
-
-def _rule_id_of(res) -> str | None:
-    structured = getattr(res, "structured", None)
-    if isinstance(structured, dict):
-        for key in ("rule_id", "id"):
-            if structured.get(key):
-                return str(structured[key])
-        inner = structured.get("result")
-        if isinstance(inner, dict) and inner.get("rule_id"):
-            return str(inner["rule_id"])
-    for text in (getattr(b, "text", None) for b in getattr(res, "content", []) or []):
-        if not text:
-            continue
-        try:
-            got = json.loads(text)
-        except ValueError:
-            m = re.search(r"rule_id[\"']?\s*[:=]\s*[\"']?([0-9a-f-]{36})", text)
-            if m:
-                return m.group(1)
-            continue
-        if isinstance(got, dict):
-            for key in ("rule_id", "id"):
-                if got.get(key):
-                    return str(got[key])
-    return None
-
-
-def sync(session: str) -> int:
-    """Reviewed rows → create_rule, each once. Returns rows filed this pass."""
-    path = reviewed_path(session)
-    rows = hx.read_drafts(path)
-    pending = [r for r in rows if not r.get("rule_id") and not r.get("_sync_refused")]
-    if not pending:
+    if int(meta.get("nudges") or 0) >= NUDGE_CAP_PER_SESSION:
         return 0
-    try:
-        from _memhub_auth import resolve_bearer  # noqa: PLC0415
-        import mcp_http  # noqa: PLC0415
-        url, bearer = resolve_bearer(refresh=False)
-    except Exception as exc:
-        _log(f"sync {session[:8]}: no credential ({exc!r})")
+    last_turn = int(meta.get("last_turn") or moments[-1].get("turn") or 0)
+    fresh = [m for m in moments if not m.get("handed_at")
+             and isinstance(m.get("turn"), int)
+             and last_turn - m["turn"] < NUDGE_MAX_AGE_TURNS]
+    if not fresh:
         return 0
-    if not bearer:
-        _log(f"sync {session[:8]}: no credential")
-        return 0
-    repo = (load_meta(session).get("repo") or "")
-    rulebook_id = _rulebook_for(repo)
-    filed = 0
-    for row in pending[:SYNC_BATCH]:
-        state = row.get("state") or {}
-        missing = [k for k in STATE_KEYS if state.get(k) in (None, "")]
-        if missing:
-            row["_sync_refused"] = f"state_missing:{','.join(missing)}"
-            continue
-        try:
-            res = mcp_http.call_tool(url, bearer, "create_rule",
-                                     wire_row(row, rulebook_id), timeout=SYNC_TIMEOUT_S)
-        except Exception as exc:          # transport: leave it for the next Stop
-            row["_sync_error"] = str(exc)[:200]
-            _log(f"sync {session[:8]}: {row.get('source_ref')} transport: {str(exc)[:120]}")
-            continue
-        if getattr(res, "is_error", False):
-            text = " ".join(mcp_http.texts_of(res))[:300]
-            if _PERMANENT.search(text):
-                row["_sync_refused"] = text
-            else:
-                row["_sync_error"] = text
-            _log(f"sync {session[:8]}: {row.get('source_ref')} refused: {text[:120]}")
-            continue
-        rid = _rule_id_of(res)
-        row["rule_id"] = rid or "filed"
-        row["synced_at"] = time.time()
-        row.pop("_sync_error", None)
-        filed += 1
-    write_rows(path, rows)
-    if filed:
-        _log(f"sync {session[:8]}: filed {filed} row(s) as proposed")
-    return filed
-
-
-def review_and_sync(session: str, *, moment: str, pr_number=None) -> None:
-    review(session, moment=moment, pr_number=pr_number)
-    sync(session)
-
-
-# ---------------------------------------------------------- session start
-def _sessions_in(repo: str) -> list[dict]:
-    out = []
-    try:
-        for p in _base().glob("*.meta.json"):
-            meta = load_meta(p.name[:-len(".meta.json")])
-            if meta.get("session_id") and (not repo or meta.get("repo") == repo):
-                out.append(meta)
-    except OSError:
-        pass
-    return out
-
-
-def cmd_session(payload: dict) -> int:
-    cwd = str(payload.get("cwd") or "").strip() or os.getcwd()
-    repo = repo_of(cwd)
-    if not repo:
-        return 0
-    announce = []
-    for meta in _sessions_in(repo):
-        sid = meta["session_id"]
-        if sid == payload.get("session_id"):
-            continue
-        drafts = int(meta.get("drafts") or 0)
-        moments = len(hx.read_drafts(moments_path(sid)))
-        if drafts > int(meta.get("reviewed_through") or 0) \
-                or moments > int(meta.get("mined_through") or 0):
-            _spawn("review", "--session", sid, "--moment", "session-start")
-            continue
-        rows = hx.read_drafts(reviewed_path(sid))
-        if any(not r.get("rule_id") and not r.get("_sync_refused") for r in rows):
-            _spawn("sync", "--session", sid)
-        filed = [r for r in rows if r.get("rule_id")]
-        if filed and not meta.get("announced"):
-            announce += [str(r.get("title") or "")[:60] for r in filed]
-            save_meta(sid, announced=True)
-    if announce:
-        titles = "; ".join(announce[:5]) + ("; …" if len(announce) > 5 else "")
-        line = (f"MemHub harness: {len(announce)} rule(s) proposed from an earlier "
-                f"session in this repo, waiting for a reviewer in Studio — {titles}")
-        print(json.dumps({"systemMessage": line}))
+    chosen = fresh[-NUDGES_PER_PROMPT:]
+    now = time.time()
+    for m in chosen:
+        m["handed_at"] = now
+    write_rows(path, moments)
+    save_meta(session, nudges=int(meta.get("nudges") or 0) + len(chosen))
+    lines = [nudge_line(session, m, meta.get("repo") or (m.get("state") or {}).get("repo") or "")
+             for m in chosen]
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                             "additionalContext": "\n".join(lines)}}))
+    _log(f"prompt {session[:8]}: handed turn(s) {[m.get('turn') for m in chosen]}")
     return 0
 
 
 # ------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("mode", choices=("stop", "session", "pr-open", "extract",
-                                    "idle", "review", "sync"))
+    p.add_argument("mode", choices=("stop", "prompt", "extract"))
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
     p.add_argument("--cwd", default="")
-    p.add_argument("--pr", type=int, default=None)
-    p.add_argument("--moment", default="manual")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     if not hx.extract_enabled():
-        if args.mode in ("stop", "session", "pr-open"):
+        if args.mode in ("stop", "prompt"):
             try:
                 sys.stdin.read()          # drain the hook payload, say nothing
             except Exception:
@@ -821,24 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.mode == "stop":
         return cmd_stop(_read_payload())
-    if args.mode == "session":
-        return cmd_session(_read_payload())
-    if args.mode == "pr-open":
-        if args.session and args.pr:
-            review_and_sync(args.session, moment="pr-open", pr_number=args.pr)
-        return 0
-    if not args.session:
-        return 0
-    if args.mode == "extract":
+    if args.mode == "prompt":
+        return cmd_prompt(_read_payload())
+    if args.mode == "extract" and args.session:
         return cmd_extract(args.session, args.transcript, args.cwd)
-    if args.mode == "idle":
-        return cmd_idle(args.session, args.transcript, args.cwd)
-    if args.mode == "review":
-        review_and_sync(args.session, moment=args.moment, pr_number=args.pr)
-        return 0
-    if args.mode == "sync":
-        sync(args.session)
-        return 0
     return 0
 
 

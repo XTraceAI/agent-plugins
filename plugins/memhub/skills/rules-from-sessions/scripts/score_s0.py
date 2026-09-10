@@ -19,6 +19,13 @@ Three modes, three of the scorecard's rows:
           often each regex fires and — once you have judged the corpus — what
           fraction of its hits produced a row a human would activate.
 
+  judge   a second reader (fresh headless model, blind) over a run's rows,
+          with agreement against the first judge's verdicts.
+
+  The post-session miner and its `review --variant review|mine` measurement
+  were removed with path B (the live agent mines in session now); they are
+  at commit 1fa1e48 on the S1 branch if the numbers need re-running.
+
   corpus  the whole pipeline over a corpus directory of canonical turns JSON
           (what `staging_sessions.py corpus` writes), N sessions at a time.
           Reports drafts per session, duplicates, refusal reasons, timeouts,
@@ -167,297 +174,6 @@ def cmd_gold(args) -> None:
             "false_negatives": fns, "false_positives": fps,
         }, indent=1), encoding="utf-8")
         print(f"\n-> {args.out}")
-
-
-# ----------------------------------------------------------------- review
-def _load_stop():
-    scripts = plugin_scripts()
-    sys.path.insert(0, str(scripts))
-    import harness_stop                                     # noqa: PLC0415
-    return harness_stop
-
-
-_TRACE_TURN = re.compile(r"^== turn (\d+) \|")
-_TRACE_SERVER = re.compile(r"^   server \(([\d.]+)s\): (\S+)(?: — .*?)?(?: \| judge=(\S+))?$")
-
-
-def moments_from_trace(hx, doc: dict, trace_path: Path, rows: list[dict]) -> list[dict]:
-    """The classifier-flagged moments of a finished `corpus` run, rebuilt
-    from its trace: a turn was a signal when the server ran the author on it
-    (any reason but no_signal / an outage), whether or not a row came back.
-    Runs made after this mode existed record moments directly
-    (`--moments`); this reads the ones that did not."""
-    kind_of = {r["source_ref"]: r.get("_kind") for r in rows}
-    sent: dict[int, tuple[bool, str]] = {}
-    turn_n = None
-    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        m = _TRACE_TURN.match(line)
-        if m:
-            turn_n = int(m.group(1))
-            continue
-        if turn_n is None or turn_n in sent:
-            continue
-        m = _TRACE_SERVER.match(line)
-        if m:
-            sent[turn_n] = (hx.judge_said_signal(m.group(2)), m.group(3) or "")
-        elif line.startswith(("   DRAFT (", "   server drafted, client refused", "   twin of")):
-            sent[turn_n] = (True, kind_of.get(f"{doc.get('session')}#{turn_n}") or "")
-    turns = doc.get("turns") or []
-    session = doc.get("session") or ""
-    out = []
-    for i, turn in enumerate(turns):
-        flagged = sent.get(turn.get("n"))
-        if not flagged or not flagged[0]:
-            continue
-        prev = turns[i - 1] if i else None
-        state = hx.stamp_state(session=session, turn=turn, row_engine_target=("", ""),
-                               cwd="", hook_version=hx.plugin_version(), env_name="staging",
-                               default_repo=doc.get("repo") or "")
-        hits = hx.route(turn, prev)
-        out.append({"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
-                    "hint": hx.router_hint(hits), "kind": flagged[1], "reason": "replay",
-                    "window": hx.redact_window(hx.build_window(turn, prev, state)),
-                    "state": state})
-    return out
-
-
-def cmd_review(args) -> None:
-    """The post-session review (§4.3) over a corpus run — the stage AFTER
-    the classifier, where an agent with the whole session decides what a
-    human sees. The activate ratio a reviewer meets is the ratio after this
-    stage, not before it. Two variants, one headless `claude -p` per session
-    each, disarmed (`--safe-mode`, MEMHUB_HARNESS_CHILD=1):
-
-      --variant review   keep/drop over the rows the SERVER author drafted
-      --variant mine     the local agent AUTHORS from the classifier-flagged
-                         moments, with no server drafts in front of it
-
-    Nothing is synced or filed: rows land in `<run>/<variant>/`. With
-    `--verdicts` (the hand judgement over `rows.json` indices) the
-    after-review ratio of the `review` variant is computed here; `mine`
-    writes a fresh judge sheet, since its rows are new.
-    """
-    hx = _load_extract()
-    hs = _load_stop()
-    run = Path(args.run)
-    corpus = Path(args.corpus)
-    out = run / args.variant
-    drafts_dir = out / "state"
-    if drafts_dir.exists():
-        import shutil                                       # noqa: PLC0415
-        shutil.rmtree(drafts_dir)
-    drafts_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["MEMHUB_HARNESS_DRAFTS"] = str(drafts_dir)
-    rows_all = json.loads((run / "rows.json").read_text(encoding="utf-8"))
-    index_of: dict = collections.defaultdict(list)
-    for i, r in enumerate(rows_all, 1):
-        index_of[(r["source_ref"], r["title"])].append(i)
-
-    jobs = []
-    for doc_path in sorted(corpus.glob("*.json")):
-        if doc_path.name == "index.json":
-            continue
-        name = doc_path.stem
-        doc = json.loads(doc_path.read_text(encoding="utf-8"))
-        drafts = run / f"{name}.drafts.jsonl"
-        rows = hx.read_drafts(drafts) if drafts.is_file() else []
-        # Two corpus files can carry one session id (the same session
-        # captured twice); the replay keys its state by corpus file so they
-        # never share a drafts or reviewed file. `source_ref` keeps the id.
-        key = name
-        n_moments = 0
-        if args.variant == "review":
-            if not rows:
-                continue
-            hx.drafts_path(key).write_text(drafts.read_text(encoding="utf-8"), encoding="utf-8")
-        else:
-            trace = run / f"{name}.trace.log"
-            moments = moments_from_trace(hx, doc, trace, rows) if trace.is_file() else []
-            if not moments:
-                continue
-            for m in moments:
-                hx.append_draft(hs.moments_path(key), m)
-            n_moments = len(moments)
-        repo = doc.get("repo") or ((rows[0].get("state") or {}).get("repo") if rows else "") or ""
-        hs.save_meta(key, repo=repo, turns_path=str(doc_path), cwd="",
-                     drafts=len(rows) if args.variant == "review" else 0,
-                     reviewed_through=0, mined_through=0)
-        jobs.append((name, key, len(rows) if args.variant == "review" else 0, n_moments))
-    print(f"{len(jobs)} sessions, variant={args.variant}, {args.jobs} reviews at a time")
-
-    def one(job):
-        name, key, n, n_moments = job
-        t0 = time.time()
-        got = hs.review(key, moment="replay")
-        reviewed = hx.read_drafts(hs.reviewed_path(key))
-        (out / f"{name}.reviewed.jsonl").write_text(
-            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in reviewed), encoding="utf-8")
-        meta = hs.load_meta(key)
-        print(f"  {name}: {n} drafts, {n_moments} moments -> {len(reviewed)} rows"
-              f"{' (review failed)' if got < 0 else ''} {round(time.time() - t0)}s"
-              f"{' refused ' + json.dumps(meta.get('mining_refused')) if meta.get('mining_refused') else ''}",
-              flush=True)
-        return {"name": name, "drafts": n, "moments": n_moments,
-                "kept": len(reviewed), "failed": got < 0,
-                "gave_up": bool(meta.get("review_gave_up")),
-                "refused": meta.get("mining_refused") or {}, "kept_rows": reviewed}
-
-    t0 = time.time()
-    results = []
-    with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        for res in pool.map(one, jobs):
-            results.append(res)
-
-    kept_rows = [r for res in results for r in res["kept_rows"]]
-    kept_idx = sorted({i for r in kept_rows for i in index_of.get((r["source_ref"], r["title"]), [])})
-    refused = collections.Counter()
-    for res in results:
-        for why, n in res["refused"].items():
-            refused[why] += n
-    summary = {
-        "variant": args.variant,
-        "sessions_reviewed": len(results),
-        "reviews_failed": sum(1 for r in results if r["failed"]),
-        "drafts_in": sum(r["drafts"] for r in results),
-        "moments_in": sum(r["moments"] for r in results),
-        "rows_out": len(kept_rows),
-        "rows_per_session_max": max((r["kept"] for r in results), default=0),
-        "rows_per_session_mean": round(sum(r["kept"] for r in results) / max(len(results), 1), 2),
-        "kept_indices": kept_idx,
-        "mining_refused": dict(refused.most_common()),
-        "supersedes_set": sum(1 for r in kept_rows if r.get("supersedes_rule_id")),
-        "by_engine": dict(collections.Counter(
-            next(k for k in ("matcher", "ordering", "anchors") if k in r) for r in kept_rows)),
-        "wall_s": round(time.time() - t0, 1),
-    }
-    if args.variant == "mine":
-        engineer_of = {}
-        idx = corpus / "index.json"
-        if idx.is_file():
-            engineer_of = {s["file"]: s["engineer"]
-                           for s in json.loads(idx.read_text()).get("sessions", [])}
-        for res in results:
-            for r in res["kept_rows"]:
-                r["_engineer"] = engineer_of.get(f"{res['name']}.json", res["name"].split("__")[0])
-        (out / "rows.json").write_text(json.dumps(kept_rows, indent=1), encoding="utf-8")
-        write_judge_sheet(out / "judge_sheet.md", kept_rows,
-                          {"sessions": len(results), "engineers": sorted({r["_engineer"] for r in kept_rows})},
-                          [], [])
-    if args.verdicts and args.variant == "review":
-        v = json.loads(Path(args.verdicts).read_text(encoding="utf-8"))
-        A = set(v["A"])
-        R = {i: why for why, ids in v["R"].items() for i in ids}
-        kept_set = set(kept_idx)
-        summary.update({
-            "activatable_before": len(A), "drafted_before": len(rows_all),
-            "ratio_before": round(len(A) / max(len(rows_all), 1), 3),
-            "activatable_after": len(A & kept_set), "kept_after": len(kept_set),
-            "ratio_after": round(len(A & kept_set) / max(len(kept_set), 1), 3),
-            "activatable_dropped_by_review": sorted(A - kept_set),
-            "rejects_kept_by_review": {str(i): R[i] for i in sorted(kept_set - A)},
-            "rejects_dropped_by_reason": dict(collections.Counter(
-                R[i] for i in R if i not in kept_set).most_common()),
-        })
-    (out / "summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
-    print("\n" + "=" * 62)
-    for k, v in summary.items():
-        if k not in ("kept_indices",):
-            print(f"{k:32} {v}")
-    print(f"\n-> {out}/summary.json")
-
-
-# ------------------------------------------------------------------ judge
-JUDGE_RUBRIC = """\
-You are the second judge of a set of drafted team rules. Judge each row AS A \
-SET MEMBER, by five criteria; a row is ACTIVATABLE (verdict "A") only if all \
-five hold, otherwise REJECT ("R") with one reason word.
-
-1. It would change an action: a reader can name the next command, edit or \
-read it would alter. Not a summary, not an observation. (reject: no_action)
-2. The trigger can actually match: the regex or anchors would fire on the \
-shape of a real future action and would NOT fire on every member of that \
-family. Anchors must be identifiers or paths — a bare English word, a repo \
-name, or an identifier present in every call recalls everywhere. A trigger \
-that matches nothing and one that matches everything are the same reject. \
-(reject: unmatchable)
-3. It is not derivable: a new engineer would not learn it from the repo, its \
-tests, its docs or CLAUDE.md, and it is not already a team rule. (reject: \
-derivable)
-4. It is not project state: not "PR #N does X", not "we decided Y for this \
-ticket", not a restatement of an error message. (reject: project_state)
-5. It outlives the session: still true next month; not tied to one line, one \
-branch, one PR that will merge, one bug. (reject: one_off)
-Also reject a row that duplicates another row in the set (reject: duplicate, \
-keep the better-triggered one) or that states something false (reject: wrong).
-
-Be strict: an activated rule fires in every teammate's sessions. Answer for \
-every row by calling the StructuredOutput tool; never ask a question."""
-
-JUDGE_SCHEMA = {"type": "object", "properties": {"verdicts": {"type": "array", "items": {
-    "type": "object", "properties": {
-        "index": {"type": "integer"}, "verdict": {"type": "string", "enum": ["A", "R"]},
-        "reason": {"type": "string", "enum": ["", "no_action", "unmatchable", "derivable",
-                                              "project_state", "one_off", "duplicate", "wrong"]},
-        "why": {"type": "string"}},
-    "required": ["index", "verdict", "reason", "why"]}}},
-    "required": ["verdicts"]}
-
-
-def cmd_judge(args) -> None:
-    """A second judge over a run's rows: a fresh headless model with the
-    rubric and nothing else — no session, no first judge's verdicts — so the
-    pass is independent of whoever built the pipeline. Reports the score
-    under each judge and their agreement. Not a human; the scorecard says so."""
-    hs = _load_stop()
-    rows = json.loads(Path(args.rows).read_text(encoding="utf-8"))
-    L = [f"{len(rows)} ROWS:"]
-    for i, r in enumerate(rows, 1):
-        engine = {k: r[k] for k in ("matcher", "ordering", "anchors") if k in r}
-        L += [f"[{i}] {r.get('title', '')}", f"    statement: {r.get('statement', '')}",
-              f"    trigger: {json.dumps(engine, ensure_ascii=False)}", ""]
-    cmd = ["claude", "-p", "--model", args.model, "--safe-mode", "--output-format", "json",
-           "--json-schema", json.dumps(JUDGE_SCHEMA), "--no-session-persistence",
-           "--disallowedTools", "Bash", "Read", "Edit", "Write", "MultiEdit", "Agent",
-           "Grep", "Glob", "WebSearch", "WebFetch", "--append-system-prompt", JUDGE_RUBRIC]
-    hx = _load_extract()
-    t0 = time.time()
-    proc = subprocess.run(cmd, input="\n".join(L), capture_output=True, text=True,
-                          timeout=args.timeout, env=hx.child_env())
-    if proc.returncode != 0:
-        sys.exit(f"judge failed: exit {proc.returncode}: {proc.stderr[-300:]}")
-    env = json.loads(proc.stdout)
-    verdicts = (env.get("structured_output") or {}).get("verdicts") or []
-    got = {v["index"]: v for v in verdicts if isinstance(v, dict) and isinstance(v.get("index"), int)}
-    missing = [i for i in range(1, len(rows) + 1) if i not in got]
-    A2 = {i for i, v in got.items() if v.get("verdict") == "A"}
-    out = {"model": args.model, "rows": len(rows), "judged": len(got), "missing": missing,
-           "A": sorted(A2), "R": {}, "why": {str(i): v.get("why", "")[:200] for i, v in got.items()},
-           "score": round(len(A2) / max(len(rows), 1), 3), "seconds": round(time.time() - t0, 1)}
-    for i, v in got.items():
-        if v.get("verdict") != "A":
-            out["R"].setdefault(v.get("reason") or "unspecified", []).append(i)
-    print(f"judge 2 ({args.model}): {len(A2)}/{len(rows)} activatable = {out['score']}"
-          f" | rejects {({k: len(v) for k, v in out['R'].items()})} | {out['seconds']}s")
-    if args.against:
-        v1 = json.loads(Path(args.against).read_text(encoding="utf-8"))
-        A1 = set(v1["A"])
-        both = A1 & A2
-        agree = len(both) + len(set(range(1, len(rows) + 1)) - A1 - A2)
-        p_o = agree / len(rows)
-        p1, p2 = len(A1) / len(rows), len(A2) / len(rows)
-        p_e = p1 * p2 + (1 - p1) * (1 - p2)
-        kappa = (p_o - p_e) / (1 - p_e) if p_e < 1 else 1.0
-        out.update({"judge1_A": sorted(A1), "agreement": round(p_o, 3), "kappa": round(kappa, 3),
-                    "both_A": sorted(both), "only_judge1": sorted(A1 - A2), "only_judge2": sorted(A2 - A1),
-                    "score_judge1": round(len(A1) / len(rows), 3),
-                    "score_both_agree": round(len(both) / len(rows), 3),
-                    "score_either": round(len(A1 | A2) / len(rows), 3)})
-        print(f"judge 1: {len(A1)}/{len(rows)} = {out['score_judge1']} | agreement {out['agreement']}"
-              f" kappa {out['kappa']} | both agree {len(both)} ({out['score_both_agree']})"
-              f" | only judge 1 {sorted(A1 - A2)} | only judge 2 {sorted(A2 - A1)}")
-    if args.out:
-        Path(args.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
-        print(f"-> {args.out}")
 
 
 # ----------------------------------------------------------------- router
@@ -772,13 +488,6 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("--timeout", type=int, default=600)
     j.add_argument("--out", default="")
 
-    rv = sub.add_parser("review", help="the post-session review over a corpus run's drafts")
-    rv.add_argument("--run", required=True, help="a `corpus` run directory (rows.json, *.drafts.jsonl)")
-    rv.add_argument("--corpus", required=True)
-    rv.add_argument("--verdicts", default="", help="hand judgement JSON over rows.json indices")
-    rv.add_argument("--jobs", type=int, default=3)
-    rv.add_argument("--variant", choices=("review", "mine"), default="review")
-
     c = sub.add_parser("corpus", help="the whole pipeline over a corpus")
     c.add_argument("--corpus", required=True)
     c.add_argument("--out", required=True)
@@ -797,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     {"gold": cmd_gold, "router": cmd_router, "corpus": cmd_corpus,
-     "review": cmd_review, "judge": cmd_judge}[args.mode](args)
+     "judge": cmd_judge}[args.mode](args)
     return 0
 
 

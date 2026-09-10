@@ -225,18 +225,19 @@ into the overview cache, throttled to once per 6 hours.
 
 ### Harness-tied memory (S1 — flagged off)
 
-With `MEMHUB_HARNESS_EXTRACT=1` in the environment, a Stop hook drafts a
-*lesson* from each turn that looks like a correction, a retraction, a reuse
-complaint, a gate override or a closed error arc: the hook returns in
-milliseconds, a detached child sends a redacted window of that moment to
-MemHub (`POST /v1/team/rulebook/harness/draft`, where the judge and the
-author run), and a drafted row lands in a local file. A post-session review
-(at `gh pr create`, after 30 minutes of silence, or at the next session start
-in the repo) keeps or drops the drafts, and the survivors are filed as
-`proposed` rules a human activates in Studio. Nothing fires from a draft and
-nothing is activated by the plugin. With the variable unset — the default —
-none of this runs. Measurements: `docs/harness-s0-scorecard.md` and
-`docs/harness-s1-scorecard.md`.
+With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin turns a
+correction in a session into a proposed team rule in two hook lanes. At each
+turn's Stop a detached child sends a redacted window of the moment to MemHub
+(`POST /v1/team/rulebook/harness/draft`), whose classifier says whether the
+moment matters; a flagged moment is written locally with the nine-field state
+stamp. At the next user prompt, one injected line hands that moment to the
+agent that lived the turn: if there is a lesson that would change what an
+agent does next time, the agent proposes it with the memhub `create_rule`
+tool, asking the person first if unsure. The row lands `proposed` for a human
+to activate in Studio; nothing fires from a draft and nothing is activated by
+the plugin. With the variable unset — the default — none of this runs.
+Measurements and the reasoning behind the shape: `docs/harness-s0-scorecard.md`
+and `docs/harness-s1-scorecard.md`.
 
 ### Rulebooks
 

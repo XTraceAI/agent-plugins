@@ -113,10 +113,10 @@ def test_with_the_flag_off_nothing_happens():
         os.environ["MEMHUB_HARNESS_EXTRACT"] = "0"
         tp = env.base / "s.jsonl"
         _transcript(tp, [("i mean staging", "ok", [])])
-        for mode in ("stop", "session", "extract", "review", "sync", "idle", "pr-open"):
+        for mode in ("stop", "prompt", "extract"):
             proc = subprocess.run(
                 [sys.executable, str(SCRIPTS / "harness_stop.py"), mode,
-                 "--session", "s", "--transcript", str(tp), "--pr", "1"],
+                 "--session", "s", "--transcript", str(tp)],
                 input=json.dumps({"session_id": "s", "transcript_path": str(tp),
                                   "cwd": str(ROOT)}),
                 capture_output=True, text=True, timeout=30,
@@ -131,8 +131,8 @@ def test_with_the_flag_off_nothing_happens():
         hx.subprocess.Popen = lambda *a, **k: seen.append(a)
         sys.stdin = io.StringIO("{}")     # the flag-off path drains the payload
         try:
-            assert hs.main(["stop"]) == 0 and hs.main(["extract", "--session", "s",
-                                                        "--transcript", str(tp)]) == 0
+            assert hs.main(["stop"]) == 0 and hs.main(["prompt"]) == 0 and \
+            hs.main(["extract", "--session", "s", "--transcript", str(tp)]) == 0
         finally:
             hx.subprocess.Popen, sys.stdin = real, real_stdin
         assert not seen and not (env.base / "drafts").exists()
@@ -156,22 +156,13 @@ def test_stop_spawns_detached_and_returns():
             hx.subprocess.Popen = real
         assert rc == 0 and dt < 0.5, dt
         modes = [a[2] for a, _ in seen]
-        assert modes == ["extract", "idle"], modes
+        assert modes == ["extract"], modes
         for args, kw in seen:
             assert args[1].endswith("harness_stop.py")
             assert "--session" in args and "sess" in args
             assert kw["env"]["MEMHUB_HARNESS_CHILD"] == "1"
             if hasattr(os, "setsid"):
                 assert kw["start_new_session"] is True
-        # a live idle waiter is not spawned twice
-        hs.save_meta("sess", idle_pid=os.getpid())
-        seen.clear()
-        hx.subprocess.Popen = lambda args, **kw: seen.append((args, kw))
-        try:
-            hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp), "cwd": ""})
-        finally:
-            hx.subprocess.Popen = real
-        assert [a[2] for a, _ in seen] == ["extract"]
         # a re-entered Stop (stop_hook_active) is the same turn: nothing
         seen.clear()
         hx.subprocess.Popen = lambda args, **kw: seen.append((args, kw))
@@ -217,7 +208,7 @@ def test_extract_drafts_the_last_turn_once():
         assert state["branch"] and state["head_sha"], state
         assert state["env"] in ("staging", "production", "unknown")
         meta = hs.load_meta("sess")
-        assert meta["last_turn"] == 2 and meta["drafts"] == 1
+        assert meta["last_turn"] == 2
         assert meta["repo"] == "repo"
         # a third turn is a new moment
         _transcript(tp, [
@@ -290,190 +281,13 @@ def test_a_failure_and_its_fix_are_one_moment():
     print("PASS test_a_failure_and_its_fix_are_one_moment")
 
 
-# ------------------------------------------------------------- the review
-class _Proc:
-    def __init__(self, stdout="", returncode=0, stderr=""):
-        self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
-
-
-def _drafts(session, rows):
-    path = hx.drafts_path(session)
-    for r in rows:
-        hx.append_draft(path, r)
-    return path
-
-
-def _draft_row(n, session="sess"):
-    row, why = hx.build_row(_row(n), state={"repo": "repo", "session_id": session,
-                                            "turn": n, "hook_version": "0.53.0",
-                                            "at": "2026-09-09T00:00:00Z", "branch": "b",
-                                            "head_sha": "abc", "pr_number": None,
-                                            "env": "staging"},
-                            session=session, turn_n=n, reason="router:x",
-                            scope_repos=["repo"])
-    assert row, why
-    return row
-
-
-def test_the_review_keeps_or_drops_and_never_rewrites_or_activates():
-    with _Env() as env:
-        hs.save_meta("sess", repo="repo", cwd=str(env.base))
-        _drafts("sess", [_draft_row(1), _draft_row(2), _draft_row(3)])
-        seen = {}
-        real = hs.subprocess.run
-
-        def fake(cmd, **kw):
-            seen.update(cmd=cmd, kw=kw)
-            return _Proc(stdout=json.dumps({"structured_output": {
-                "keep": [{"index": 3, "supersedes_rule_id": "not-in-book", "why": "good"},
-                         {"index": 1, "supersedes_rule_id": None, "why": "fine"},
-                         {"index": 9, "supersedes_rule_id": None, "why": "bogus"}],
-                "drop": [{"index": 2, "why": "duplicate of 1"}]}}))
-
-        hs.subprocess.run = fake
-        try:
-            kept = hs.review("sess", moment="test", pr_number=42)
-        finally:
-            hs.subprocess.run = real
-        assert kept == 2
-        cmd = seen["cmd"]
-        assert cmd[:2] == ["claude", "-p"] and "--safe-mode" in cmd
-        assert "--json-schema" in cmd and "--no-session-persistence" in cmd
-        assert seen["kw"]["env"]["MEMHUB_HARNESS_CHILD"] == "1"
-        assert "CLAUDECODE" not in seen["kw"]["env"]
-        assert seen["kw"]["timeout"] == hs.REVIEW_TIMEOUT_S
-        assert "BUDGET: keep at most 8" in seen["kw"]["input"]
-        assert "[3] T3" in seen["kw"]["input"]
-        rows = hx.read_drafts(hs.reviewed_path("sess"))
-        assert [r["source_ref"] for r in rows] == ["sess#3", "sess#1"]
-        # never rewritten, never activated, stamped with the PR
-        assert rows[0]["statement"] == _draft_row(3)["statement"]
-        assert rows[0]["supersedes_rule_id"] is None, "an id not in the book is dropped"
-        assert all("activate" not in r for r in rows)
-        assert all(r["state"]["pr_number"] == 42 for r in rows)
-        meta = hs.load_meta("sess")
-        assert meta["reviewed_through"] == 3 and meta["dropped"] == 1
-        assert meta["pr_number"] == 42
-        # nothing new: no second model call
-        hs.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no"))
-        try:
-            assert hs.review("sess", moment="again") == -1
-        finally:
-            hs.subprocess.run = real
-    print("PASS test_the_review_keeps_or_drops_and_never_rewrites_or_activates")
-
-
-def test_a_failed_review_leaves_the_drafts_and_gives_up_after_three():
-    with _Env():
-        hs.save_meta("sess", repo="repo")
-        _drafts("sess", [_draft_row(1)])
-        real = hs.subprocess.run
-        hs.subprocess.run = lambda *a, **k: _Proc(returncode=1, stderr="boom")
-        try:
-            for attempt in (1, 2):
-                assert hs.review("sess", moment="t") == -1
-                meta = hs.load_meta("sess")
-                assert meta.get("reviewed_through", 0) == 0
-                assert meta["review_failures"] == attempt
-            assert hs.review("sess", moment="t") == -1
-        finally:
-            hs.subprocess.run = real
-        meta = hs.load_meta("sess")
-        assert meta["reviewed_through"] == 1 and meta.get("review_gave_up")
-        assert not hs.reviewed_path("sess").exists()
-        assert len(hx.read_drafts(hx.drafts_path("sess"))) == 1, "drafts stay for a human"
-        # an off-contract reply is a failure too, never a partial review
-        _drafts("sess", [_draft_row(2)])
-        for out in (_Proc(stdout="not json"),
-                    _Proc(stdout=json.dumps({"result": "I would need more context"})),
-                    _Proc(stdout=json.dumps({"is_error": True, "result": "rate limited"}))):
-            hs.subprocess.run = lambda *a, **k: out
-            try:
-                assert hs.review("sess", moment="t") == -1
-            finally:
-                hs.subprocess.run = real
-        assert not hs.reviewed_path("sess").exists()
-    print("PASS test_a_failed_review_leaves_the_drafts_and_gives_up_after_three")
-
-
-def test_the_review_mines_rows_from_flagged_moments():
-    """Direction from the owner: the classifier is the server's, the lesson
-    mining is the LOCAL agent's. The review receives the flagged moments and
-    authors rows itself; each row is stamped from its moment, PII-checked
-    and twin-checked exactly like a server row, and the budget is shared
-    with kept drafts."""
-    with _Env() as env:
-        hs.save_meta("sess", repo="repo", cwd=str(env.base))
-        state = {"repo": "repo", "session_id": "sess", "turn": 5, "hook_version": "0.53.0",
-                 "at": "2026-09-10T00:00:00Z", "branch": "b", "head_sha": "abc",
-                 "pr_number": None, "env": "staging"}
-        for n in (5, 6, 7):
-            hx.append_draft(hs.moments_path("sess"), {
-                "turn": n, "source_ref": f"sess#{n}", "hint": "", "kind": "correction",
-                "reason": "no_engine", "window": f"USER'S NEW MESSAGE: moment {n}",
-                "state": dict(state, turn=n)})
-        seen = {}
-        real = hs.subprocess.run
-
-        def fake(cmd, **kw):
-            seen.update(kw=kw)
-            return _Proc(stdout=json.dumps({"structured_output": {
-                "keep": [], "drop": [],
-                "author": [
-                    {"moment": 1, "title": "Fetch before origin reads",
-                     "statement": "When reading origin/* refs, run git fetch first because a stale ref answers wrong.",
-                     "engine": "matcher",
-                     "matcher": {"event": "bash", "command_rx": "git\\s+log\\s+\\S*origin/",
-                                 "command_not_rx": None, "path_rx": None, "path_not_rx": None, "content_rx": None},
-                     "ordering": None, "anchors": None, "supersedes_rule_id": None, "rationale": "r"},
-                    {"moment": 2, "title": "Colleague path",
-                     "statement": "When editing /Users/colleague/dev/x, stop because it is not yours to edit.",
-                     "engine": "anchors", "matcher": None, "ordering": None,
-                     "anchors": ["/Users/colleague/dev/x"], "supersedes_rule_id": None, "rationale": "r"},
-                    {"moment": 3, "title": "No engine",
-                     "statement": "When doing the thing, do the other thing first because reasons abound.",
-                     "engine": "anchors", "matcher": None, "ordering": None,
-                     "anchors": ["the staging database"], "supersedes_rule_id": None, "rationale": "r"},
-                    {"moment": 9, "title": "Bogus", "statement": "x" * 30, "engine": "anchors",
-                     "matcher": None, "ordering": None, "anchors": ["a.py"],
-                     "supersedes_rule_id": None, "rationale": "r"},
-                ]}}))
-
-        hs.subprocess.run = fake
-        try:
-            got = hs.review("sess", moment="test")
-        finally:
-            hs.subprocess.run = real
-        assert got == 1, got
-        assert "[M1] turn 5" in seen["kw"]["input"] and "moment 7" in seen["kw"]["input"]
-        rows = hx.read_drafts(hs.reviewed_path("sess"))
-        assert len(rows) == 1
-        row = rows[0]
-        assert row["source_ref"] == "sess#5" and row["state"]["turn"] == 5
-        assert row["_reason"] == "local:correction" and row["_review"]["authored"]
-        assert row["matcher"] == {"event": "bash", "command_rx": "git\\s+log\\s+\\S*origin/"}
-        assert all(row["state"].get(k) for k in hs.STATE_KEYS)
-        meta = hs.load_meta("sess")
-        assert meta["mined_through"] == 3
-        assert meta["mining_refused"] == {"pii_in_row": 1, "anchors_not_identifiers": 1,
-                                           "moment_out_of_range": 1}, meta["mining_refused"]
-        assert (Path(os.environ["MEMHUB_HARNESS_DRAFTS"]) / "sess.verdict.json").exists()
-        # nothing new: no second call
-        hs.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no"))
-        try:
-            assert hs.review("sess", moment="again") == -1
-        finally:
-            hs.subprocess.run = real
-    print("PASS test_the_review_mines_rows_from_flagged_moments")
-
-
-def test_extract_records_the_flagged_moment_for_the_local_miner():
+def test_extract_records_the_flagged_moment_for_the_agent():
     with _Env() as env:
         repo = _git_repo(env.base)
         tp = env.base / "s.jsonl"
         _transcript(tp, [("do it", "done", []), ("no, i mean on staging", "ok", [])])
         real = hx.server_draft
-        # the server's author refused — the moment is still the local agent's to mine
+        # the server's author refused — the moment is still the agent's to mine
         hx.server_draft = lambda w, hint="", repo="", timeout=0: (
             {"drafted": False, "reason": "project_state", "kind": "correction"}, 0.1)
         try:
@@ -484,8 +298,8 @@ def test_extract_records_the_flagged_moment_for_the_local_miner():
         assert len(moments) == 1 and moments[0]["turn"] == 2
         assert moments[0]["kind"] == "correction" and moments[0]["hint"] == "wrong_target"
         assert "USER'S NEW MESSAGE: no, i mean on staging" in moments[0]["window"]
-        assert moments[0]["state"]["repo"] == "repo"
-        assert not hx.drafts_path("sess").exists()
+        assert moments[0]["state"]["repo"] == "repo" and moments[0]["state"]["turn"] == 2
+        assert hs.load_meta("sess")["last_turn"] == 2
         # a no_signal turn records nothing
         _transcript(tp, [("do it", "done", []), ("no, i mean on staging", "ok", []),
                          ("thanks", "np", [])])
@@ -496,193 +310,101 @@ def test_extract_records_the_flagged_moment_for_the_local_miner():
         finally:
             hx.server_draft = real
         assert len(hx.read_drafts(hs.moments_path("sess"))) == 1
-    print("PASS test_extract_records_the_flagged_moment_for_the_local_miner")
+    print("PASS test_extract_records_the_flagged_moment_for_the_agent")
 
 
-# ---------------------------------------------------------------- the sync
-class _Block:
-    def __init__(self, text):
-        self.text = text
+# ------------------------------------------------------------- prompt lane
+def _moment(n, kind="correction", hint="wrong_target", session="sess"):
+    return {"turn": n, "source_ref": f"{session}#{n}", "hint": hint, "kind": kind,
+            "reason": "no_engine", "window": f"USER'S NEW MESSAGE: moment {n}",
+            "state": {"repo": "repo", "session_id": session, "turn": n, "hook_version": "0.54.0",
+                      "at": "2026-09-10T00:00:00Z", "branch": "b", "head_sha": "abc",
+                      "pr_number": None, "env": "staging"}}
 
 
-class _Res:
-    def __init__(self, structured=None, text=None, is_error=False):
-        self.structured = structured
-        self.content = [_Block(text)] if text else []
-        self.is_error = is_error
+def _prompt(payload):
+    import io  # noqa: PLC0415
+    out, real_stdout, real_stdin = io.StringIO(), sys.stdout, sys.stdin
+    sys.stdout, sys.stdin = out, io.StringIO(json.dumps(payload))
+    try:
+        rc = hs.main(["prompt"])
+    finally:
+        sys.stdout, sys.stdin = real_stdout, real_stdin
+    return rc, out.getvalue()
 
 
-def test_sync_files_rows_proposed_with_the_stamp_and_never_activates():
+def test_the_next_prompt_hands_the_flagged_moment_to_the_agent_once():
+    """Path A: the agent that lived the turn is the miner. One line, the
+    stamp verbatim, the moment marked handed whether or not it files."""
     with _Env():
-        hs.save_meta("sess", repo="repo")
-        rows = [dict(_draft_row(1), _review={"index": 1}),
-                dict(_draft_row(2), _review={"index": 2}),
-                dict(_draft_row(3), _review={"index": 3})]
-        rows[2]["state"] = dict(rows[2]["state"], hook_version="")   # a stampless row
-        hs.write_rows(hs.reviewed_path("sess"), rows)
-        import mcp_http  # noqa: PLC0415
-        calls = []
-        answers = iter([
-            _Res(structured={"rule_id": "11111111-1111-1111-1111-111111111111",
-                             "status": "proposed"}),
-            _Res(text="twin of rule 2222", is_error=True),
-        ])
-        real_call, real_auth = mcp_http.call_tool, hs.sync.__globals__.get("resolve_bearer")
-        mcp_http.call_tool = lambda url, bearer, name, args, timeout=0: (
-            calls.append((name, args, timeout)), next(answers))[1]
-        import _memhub_auth  # noqa: PLC0415
-        real_resolve = _memhub_auth.resolve_bearer
-        _memhub_auth.resolve_bearer = lambda url=None, refresh=True: ("https://h/mcp", "mhk_x")
-        try:
-            filed = hs.sync("sess")
-        finally:
-            mcp_http.call_tool = real_call
-            _memhub_auth.resolve_bearer = real_resolve
-        assert filed == 1
-        assert [c[0] for c in calls] == ["create_rule", "create_rule"]
-        body = calls[0][1]
-        assert body["source"] == "session_draft" and body["source_ref"] == "sess#1"
-        assert "activate" not in body and "status" not in body and "mode" not in body
-        assert all(body["state"].get(k) for k in hs.STATE_KEYS)
-        assert body["delivery"] == "agent_hook" and body["matcher"]["command_rx"] == "cmd1\\b"
-        assert not any(k.startswith("_") for k in body), body
-        assert calls[0][2] == hs.SYNC_TIMEOUT_S
-        after = hx.read_drafts(hs.reviewed_path("sess"))
-        assert after[0]["rule_id"] == "11111111-1111-1111-1111-111111111111"
-        assert after[1].get("_sync_refused", "").startswith("twin")
-        assert after[2]["_sync_refused"].startswith("state_missing:hook_version")
-        # the watermark holds: a second pass sends nothing
-        mcp_http.call_tool = lambda *a, **k: (_ for _ in ()).throw(AssertionError("resent"))
-        _memhub_auth.resolve_bearer = lambda url=None, refresh=True: ("https://h/mcp", "mhk_x")
-        try:
-            assert hs.sync("sess") == 0
-        finally:
-            mcp_http.call_tool = real_call
-            _memhub_auth.resolve_bearer = real_resolve
-        # a transport failure is retried next time, not marked refused
-        hs.write_rows(hs.reviewed_path("sess"), [dict(_draft_row(4), _review={"index": 4})])
-        mcp_http.call_tool = lambda *a, **k: (_ for _ in ()).throw(OSError("down"))
-        _memhub_auth.resolve_bearer = lambda url=None, refresh=True: ("https://h/mcp", "mhk_x")
-        try:
-            assert hs.sync("sess") == 0
-        finally:
-            mcp_http.call_tool = real_call
-            _memhub_auth.resolve_bearer = real_resolve
-        row = hx.read_drafts(hs.reviewed_path("sess"))[0]
-        assert row.get("_sync_error") and not row.get("rule_id") and not row.get("_sync_refused")
-    print("PASS test_sync_files_rows_proposed_with_the_stamp_and_never_activates")
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_draft(hs.moments_path("sess"), _moment(2))
+        rc, out = _prompt({"session_id": "sess", "prompt": "ok now run the migration"})
+        assert rc == 0
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "turn 2" in ctx and "correction" in ctx and "router: wrong_target" in ctx
+        assert '"session_id": "sess"' in ctx and '"turn": 2' in ctx, "the stamp rides verbatim"
+        assert 'source_ref="sess#2"' in ctx and 'scope_repos=["repo"]' in ctx
+        assert "Never pass activate" in ctx and "proposed" in ctx
+        assert "create_rule" in ctx
+        moments = hx.read_drafts(hs.moments_path("sess"))
+        assert moments[0].get("handed_at"), "handed, so it is never nudged twice"
+        assert hs.load_meta("sess")["nudges"] == 1
+        # the next prompt: nothing left to hand
+        rc, out = _prompt({"session_id": "sess", "prompt": "and the tests"})
+        assert rc == 0 and out == ""
+    print("PASS test_the_next_prompt_hands_the_flagged_moment_to_the_agent_once")
 
 
-# ---------------------------------------------------------------- idle
-def test_the_idle_waiter_reviews_after_silence_and_exits():
-    """§4.3: a session silent for IDLE_S is reviewed once; a transcript that
-    keeps moving keeps the waiter waiting; a deleted one ends the wait."""
+def test_a_stale_moment_a_harness_prompt_and_the_cap_are_never_nudged():
+    with _Env():
+        # stale: the session moved on NUDGE_MAX_AGE_TURNS turns before the prompt lane saw it
+        hs.save_meta("sess", repo="repo", last_turn=9)
+        hx.append_draft(hs.moments_path("sess"), _moment(2))
+        assert _prompt({"session_id": "sess", "prompt": "next"}) == (0, "")
+        assert not hx.read_drafts(hs.moments_path("sess"))[0].get("handed_at")
+        # fresh, but the prompt is the harness talking to itself
+        hs.save_meta("sess", last_turn=3)
+        hx.append_draft(hs.moments_path("sess"), _moment(3))
+        assert _prompt({"session_id": "sess", "prompt": "Skill /loop is running"}) == (0, "")
+        # the newest fresh moment is the one handed, one per prompt
+        hx.append_draft(hs.moments_path("sess"), _moment(4, kind="error_arc", hint="error_arc"))
+        hs.save_meta("sess", last_turn=4)
+        rc, out = _prompt({"session_id": "sess", "prompt": "go on"})
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "turn 4" in ctx and "turn 3" not in ctx
+        # the per-session cap
+        hs.save_meta("sess", nudges=hs.NUDGE_CAP_PER_SESSION, last_turn=5)
+        hx.append_draft(hs.moments_path("sess"), _moment(5))
+        assert _prompt({"session_id": "sess", "prompt": "more"}) == (0, "")
+        # no session, no file: silence
+        assert _prompt({"prompt": "x"}) == (0, "")
+        assert _prompt({"session_id": "nobody", "prompt": "x"}) == (0, "")
+    print("PASS test_a_stale_moment_a_harness_prompt_and_the_cap_are_never_nudged")
+
+
+def test_a_subagents_stop_never_becomes_a_nudge():
     with _Env() as env:
         tp = env.base / "s.jsonl"
         tp.write_text("", encoding="utf-8")
-        old = (hs.IDLE_S, hs.IDLE_POLL_S, hs.review_and_sync)
-        moments = []
-        hs.IDLE_S, hs.IDLE_POLL_S = 0.3, 0.05
-        hs.review_and_sync = lambda session, moment, pr_number=None: moments.append(moment)
-        try:
-            t0 = time.time()
-            os.utime(tp, (t0 - 10, t0 - 10))          # already silent
-            assert hs.cmd_idle("sess", str(tp), "") == 0
-            assert moments == ["idle"] and time.time() - t0 < 5
-            assert hs.load_meta("sess")["idle_pid"] == os.getpid()
-            # a transcript still being written is not idle yet
-            moments.clear()
-            tp.unlink()
-            assert hs.cmd_idle("sess", str(tp), "") == 0
-            assert moments == ["idle"], "a vanished transcript ends the wait with one review"
-        finally:
-            hs.IDLE_S, hs.IDLE_POLL_S, hs.review_and_sync = old
-    print("PASS test_the_idle_waiter_reviews_after_silence_and_exits")
-
-
-def test_the_sensor_never_spells_activate():
-    """Activation is a human act (§2, §5.1). The word must not be in the
-    sensor at all, so no future edit can pass it by accident."""
-    src = (SCRIPTS / "harness_stop.py").read_text(encoding="utf-8")
-    import re  # noqa: PLC0415
-    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
-    assert not re.search(r"[\"']activate[\"']\s*:", code), "activate must never be a sent key"
-    assert "activate=" not in code
-    print("PASS test_the_sensor_never_spells_activate")
-
-
-# ------------------------------------------------------------ session start
-def test_session_start_reviews_syncs_and_announces_once():
-    with _Env() as env:
-        repo = _git_repo(env.base)
-        name = hs.repo_of(str(repo))
-        assert name == "repo", name
-        # an earlier session with un-reviewed drafts → review spawned
-        hs.save_meta("old1", repo=name, drafts=2, reviewed_through=0)
-        # one with reviewed rows not yet sent → sync spawned
-        hs.save_meta("old2", repo=name, drafts=1, reviewed_through=1)
-        hs.write_rows(hs.reviewed_path("old2"), [dict(_draft_row(1, "old2"))])
-        # one filed and not yet announced → one systemMessage line
-        hs.save_meta("old3", repo=name, drafts=1, reviewed_through=1)
-        hs.write_rows(hs.reviewed_path("old3"),
-                      [dict(_draft_row(1, "old3"), rule_id="r-1", title="Fetch before origin reads")])
-        # another repo's session is not this repo's business
-        hs.save_meta("other", repo="elsewhere", drafts=5, reviewed_through=0)
         seen = []
         real = hx.subprocess.Popen
         hx.subprocess.Popen = lambda args, **kw: seen.append(args)
-        import io  # noqa: PLC0415
-        out = io.StringIO()
-        real_stdout = sys.stdout
-        sys.stdout = out
         try:
-            rc = hs.cmd_session({"session_id": "new", "cwd": str(repo)})
+            hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp),
+                         "cwd": "", "agent_id": "agent-7f"})
         finally:
-            sys.stdout = real_stdout
             hx.subprocess.Popen = real
-        assert rc == 0
-        spawned = sorted((a[2], a[a.index("--session") + 1]) for a in seen)
-        assert spawned == [("review", "old1"), ("sync", "old2")], spawned
-        msg = json.loads(out.getvalue())["systemMessage"]
-        assert "1 rule(s) proposed" in msg and "Fetch before origin reads" in msg
-        assert hs.load_meta("old3")["announced"] is True
-        # second start: announced already, nothing printed
-        out = io.StringIO()
-        sys.stdout = out
-        hx.subprocess.Popen = lambda args, **kw: None
-        try:
-            hs.cmd_session({"session_id": "new2", "cwd": str(repo)})
-        finally:
-            sys.stdout = real_stdout
-            hx.subprocess.Popen = real
-        assert out.getvalue() == ""
-    print("PASS test_session_start_reviews_syncs_and_announces_once")
-
-
-# -------------------------------------------------------------- PR open
-def test_pr_create_spawns_the_review_only_with_the_flag_on():
-    import pr_babysit_trigger as pt  # noqa: PLC0415
-    seen = []
-    real = pt.subprocess.Popen
-    pt.subprocess.Popen = lambda args, **kw: seen.append((args, kw))
-    try:
-        payload = {"session_id": "sess", "tool_input": {"command": "gh pr create -f"},
-                   "tool_response": {"stdout": "https://github.com/o/r/pull/77\n"}}
-        os.environ.pop("MEMHUB_HARNESS_EXTRACT", None)
-        pt._harness_review(payload, "https://github.com/o/r/pull/77")
         assert not seen
-        os.environ["MEMHUB_HARNESS_EXTRACT"] = "1"
-        pt._harness_review(payload, "https://github.com/o/r/pull/77")
-        pt._harness_review({"session_id": ""}, "https://github.com/o/r/pull/77")
-    finally:
-        pt.subprocess.Popen = real
-        os.environ.pop("MEMHUB_HARNESS_EXTRACT", None)
-    assert len(seen) == 1
-    args, kw = seen[0]
-    assert args[1].endswith("harness_stop.py") and args[2] == "pr-open"
-    assert args[args.index("--pr") + 1] == "77"
-    assert kw["env"]["MEMHUB_HARNESS_CHILD"] == "1"
-    print("PASS test_pr_create_spawns_the_review_only_with_the_flag_on")
+    print("PASS test_a_subagents_stop_never_becomes_a_nudge")
+
+
+def test_the_nudge_line_carries_no_identity_and_no_activate():
+    line = hs.nudge_line("sess", _moment(2), "repo")
+    assert "activate" in line and "Never pass activate" in line
+    assert "/Users/" not in line and "@" not in line
+    assert len(line) < 1600, "one line of context, not a prompt"
+    print("PASS test_the_nudge_line_carries_no_identity_and_no_activate")
 
 
 def test_the_hooks_are_wired_behind_the_guard():
@@ -694,15 +416,26 @@ def test_the_hooks_are_wired_behind_the_guard():
             for handler in group["hooks"]:
                 if "harness_stop.py" in handler["command"]:
                     wired[event] = handler
-    assert set(wired) == {"Stop", "SessionStart"}, set(wired)
+    assert set(wired) == {"Stop", "UserPromptSubmit"}, set(wired)
     assert wired["Stop"].get("async") is True
-    assert '"stop"' not in wired["Stop"]["command"]   # the mode is a bare word
     assert wired["Stop"]["command"].rstrip("; fi").endswith("harness_stop.py\" stop")
-    assert wired["SessionStart"]["command"].rstrip("; fi").endswith("harness_stop.py\" session")
-    assert wired["SessionStart"]["timeout"] <= 5
+    assert wired["UserPromptSubmit"]["command"].rstrip("; fi").endswith("harness_stop.py\" prompt")
+    assert wired["UserPromptSubmit"]["timeout"] <= 5
     for h in wired.values():
         assert "claude_hook_guard.py\" ignore" in h["command"]
     print("PASS test_the_hooks_are_wired_behind_the_guard")
+
+
+def test_the_sensor_never_spells_activate_as_a_sent_key():
+    """Activation is a human act (§2, §5.1). The sensor sends nothing itself
+    now — the agent files through create_rule — and the one place the word
+    appears is the line telling the agent never to pass it."""
+    src = (SCRIPTS / "harness_stop.py").read_text(encoding="utf-8")
+    import re  # noqa: PLC0415
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert not re.search(r"[\"']activate[\"']\s*:", code)
+    assert "activate=" not in code and "call_tool" not in code
+    print("PASS test_the_sensor_never_spells_activate_as_a_sent_key")
 
 
 if __name__ == "__main__":

@@ -355,31 +355,39 @@ a personal access key is one human's throughput. Median 5.9 s for judge +
 author against S0's 15.1 s for the judge alone. S0 Finding 3 (the CLI
 transport lost 15–21% of judgements) is closed.
 
-## What S1 says about turning it on
+## What S1 ships, and why
 
-**The sensor should ship with the local agent as the author.** That is
-now the default shape of `harness_stop.py`: the extract child records every
-classifier-flagged moment beside the drafts, and the review — the local
-agent with the whole session — authors from those moments, in the same row
-contract, through the same `build_row`, twin check and identity test. On
-this corpus that pipeline clears every gate S0 set: 0.70 activatable,
-under one row per session, no duplicates, no identities.
+**The live agent mines the lessons (path A).** After the readers' result the
+owner chose the in-session path over the post-session miner: the server is
+the classifier only, and when it flags a turn, the next user prompt carries
+one injected line — the turn, the kind, the router hint and the stamp — and
+the agent that lived the turn decides whether there is a lesson, asks the
+person if unsure, and files it with `create_rule`. That agent has more
+context than the miner measured above (it knows what it was trying to do),
+and the person's one-word answer at the moment is the adjudication three
+transcript readers could not agree on afterwards.
 
-Before `MEMHUB_HARNESS_EXTRACT` goes on anywhere but a dogfood machine:
+What that removed: the post-session review child, the idle waiter, the sync
+queue and the PR-open trigger — path B. The numbers above for the miner
+(0.50 by majority, 0.83 rows per session) are the measurement that argued
+for a local author with session context; the code that produced them is at
+commit `1fa1e48` on this branch, not in the tree. A moment nobody hands to
+the agent — the terminal closed, a host with no prompt lane — stays in its
+file.
+
+What path A cannot be measured by: replay. Whether the live agent proposes
+good rules, and whether people say yes to them, only a week of dogfood with
+the flag on shows. Before that:
 
 1. **A `judge_only` mode on the draft endpoint** (MemHub-Backend, Felix's
    call). Today the server author still runs and bills on every flagged
-   moment and its rows are then ignored; the classifier alone is ~2 s and
-   a fraction of the spend.
-2. **Drop the keep/drop review over server rows** from the design (§4.3
-   steps 1–2 as written): measured, it does not filter. The review moment
-   stays; its job is mining.
-3. **`state_missing_repo` for repo-less sessions** — 17 mined rows and 131
-   server rows were lost to it in the replay. A live session has a `cwd`;
-   the replay adapter should carry the corpus file's engineer/repo label
-   as the fallback stamp so the number is measured on every drafted row.
-4. **Second judge.** One pass by the pipeline's author, again — now over
-   137 rows.
+   moment; the client reads only the classification.
+2. **Two human judges** on the rows the dogfood produces, judged
+   independently, then adjudicated — the readers section says why one
+   reader of any kind is not enough.
+3. **The dogfood gate from spec §7:** proposed rows a reviewer activated
+   ≥ 3, zero self-captured harness sessions in the brain, p90 hook cost
+   ≤ 10 ms.
 
 ## Reproducing this
 
@@ -390,8 +398,8 @@ export MEMHUB_MCP_BASE_URL=https://api.staging.memhub.xtrace.ai   # the staging 
 python3 $S/score_s0.py router --corpus $SP/corpus                  # free, no server
 python3 $S/score_s0.py corpus --corpus $SP/corpus --out $SP/s1-run --jobs 2 --pace 1.0
 python3 $S/score_s0.py gold   --jobs 2 --out $SP/s1-gold.json
-python3 $S/score_s0.py review --run $SP/s1-run --corpus $SP/corpus --variant review --verdicts verdicts.json
-python3 $S/score_s0.py review --run $SP/s1-run --corpus $SP/corpus --variant mine    # fresh judge sheet
+python3 $S/score_s0.py judge  --rows $SP/s1-run/rows.json --against verdicts.json --model opus
+# the review/mine variants: `git checkout 1fa1e48 -- plugins/memhub/skills/rules-from-sessions/scripts/score_s0.py plugins/memhub/scripts/harness_stop.py`
 ```
 
 `--pace 1.0` with at most two workers is not optional: a personal access

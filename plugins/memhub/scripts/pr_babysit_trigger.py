@@ -5,9 +5,7 @@ new PR. Emits nothing (hook is a no-op) unless the command was a PR creation
 whose output contains a PR URL."""
 
 import json
-import os
 import re
-import subprocess
 import sys
 
 PR_URL = re.compile(r"https?://[^/\s\"\\]+/[^/\s\"\\]+/[^/\s\"\\]+/pull/\d+")
@@ -68,36 +66,6 @@ def is_pr_create(command: str) -> bool:
     return bool(GH_PR_CREATE.search(QUOTED.sub(" ", strip_heredocs(command))))
 
 
-# Harness-tied memory (spec §4.3): a PR being opened is the first of the three
-# post-session review moments. Flag-gated and detached — `harness_stop.py
-# pr-open` reviews this session's drafts stamped with the PR number, in a
-# child that returns nothing here. A subprocess rather than an import: this
-# module is a hook entry point, and a cross-hook import is a coupling neither
-# side wants (see pr_link above). Any failure is silent; the babysit context
-# below is unaffected either way.
-def _harness_review(payload: dict, url: str) -> None:
-    if os.environ.get("MEMHUB_HARNESS_EXTRACT", "").strip().lower() not in ("1", "on", "true", "yes"):
-        return
-    session = str(payload.get("session_id") or "").strip()
-    number = url.rsplit("/", 1)[-1]
-    if not session or not number.isdigit():
-        return
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness_stop.py")
-    env = dict(os.environ, MEMHUB_HARNESS_CHILD="1")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-              "stderr": subprocess.DEVNULL, "env": env, "close_fds": True}
-    if os.name == "nt":
-        kwargs["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                                   | getattr(subprocess, "DETACHED_PROCESS", 0))
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        subprocess.Popen([sys.executable, script, "pr-open", "--session", session,
-                          "--pr", number], **kwargs)
-    except OSError:
-        pass
-
-
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
@@ -130,7 +98,6 @@ def main() -> None:
     if not match:
         return
     url = match.group(0)
-    _harness_review(payload, url)
 
     context = (
         f"A pull request was just created: {url} . MemHub PR-babysit policy: "

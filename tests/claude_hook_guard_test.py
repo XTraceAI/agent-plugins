@@ -82,7 +82,7 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
     assert len(commands) == 22   # + UserPromptSubmit (brain_brief.py prompt,
                                  # and rulebook_hook.py prompt — the lane that
                                  # arms a prompt-armed obligation),
-                                 # + Stop and SessionStart (harness_stop.py, S1;
+                                 # + Stop and UserPromptSubmit (harness_stop.py, S1;
                                  # both no-ops unless MEMHUB_HARNESS_EXTRACT),
                                  # + PostToolUse (pr_link_trigger.py); SessionEnd
                                  # carries capture AND the fire flush in ONE
