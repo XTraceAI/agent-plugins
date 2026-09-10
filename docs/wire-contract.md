@@ -27,7 +27,11 @@ the next header or end of stream:
 
 Canonical records retain their existing UUIDs, message blocks and usage rules.
 Cursor records also restore saved hook usage and timestamp pins through the
-existing read-only helper. Missing usage remains missing. Restored pins are
+existing read-only helper. Saved observations are bound to their recorded native
+representation: enumeration and ID selection honor a saved transcript path, while
+an explicitly different or ambiguous source is rejected. Observations without
+usable source provenance are reported as incomplete instead of attached by
+matching record indexes. Missing usage remains missing. Restored pins are
 observations, not proof that this reader performed a hook capture.
 
 `--metadata-only` emits headers without records or prompt-derived titles. The
