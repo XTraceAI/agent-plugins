@@ -192,9 +192,8 @@ Each delivery freezes its selected destination for authentication, state,
 room routing and async work. Empty or invalid selection skips delivery. Cursor
 still preserves local per-generation usage and timestamp observations for a
 later read or configured delivery; this does not authenticate or upload.
-Claude per-turn and SessionEnd/commit/PR backstops, plus Codex capture, support
-multiple active destinations. Cursor still requires one destination until its
-delivery path supports independent progress.
+Claude per-turn and SessionEnd/commit/PR backstops, Codex and Cursor capture
+support multiple active destinations.
 The installed endpoint keeps its existing room-cache namespace. Other remote
 endpoints use a digest of their complete URL, so one server cannot read or
 overwrite another server's cached room ID. Loopback never resolves cloud rooms.
@@ -210,14 +209,17 @@ re-send an existing session once; server UUID deduplication handles that replay.
 Cursor usage observations, native source metadata and first-seen timestamp pins
 remain in the original shared session file consumed by the reader CLI. Only
 upload watermarks, accepted provenance and failures belong to the destination.
-Its existing per-session flush lock still serializes native observation updates;
-this change supports one selected destination, not concurrent fan-out.
+A short shared observation lock serializes native reads and pin updates before
+network work. Destination upload locks are independent. Observations are saved
+before selection and upload locking, including when capture is disabled or
+every destination is busy. Destination files cannot override shared pins.
 
 Literal loopback capture skips cloud room resolution and adds native session ID
 plus an observed raw surface when available. Claude reads explicit `source_surface`
 or `entrypoint`; Codex reads native `originator`; Cursor reads explicit metadata
-or its recognized native source location. Missing surfaces remain omitted. The single-destination Cursor path retains its existing cloud envelope. Canonical host-prefixed conversation IDs and record UUIDs retain
-the existing reader convention.
+or its recognized native source location. Missing surfaces remain omitted. An explicit old-cloud optional-field rejection
+permits one compatibility retry. Canonical host-prefixed conversation IDs and
+record UUIDs retain the existing reader convention.
 
 Capture health reads failures only from the selected destination. A success at
 another destination cannot clear that failure, and a constant local token cannot
@@ -322,3 +324,29 @@ Canonical usage deltas and record UUIDs match the existing Codex reader.
 Run `python3 tests/codex_sinks_test.py` for independent failure and recovery,
 per-destination dormancy, native identity and usage parity, old-cloud fallback,
 legacy state ownership, partial-batch retry, lock deadlines and write failures.
+
+
+### Cursor delivery to multiple destinations
+
+Cursor hooks retain native usage, source choice and timestamp observations once
+per session, then deliver independently to frozen active destinations with
+loopback first. Each endpoint owns its upload revision/blob set, acknowledged
+usage generations, provenance, backoff, dormancy and long-running upload lock.
+A held or slow cloud upload cannot block local capture or shared observations.
+The overall 240-second budget includes lock waits and reserves time for every
+remaining destination. Authentication and transport use cancellable waits.
+
+The existing canonical reader supplies records; redaction is cached within the
+invocation. Requests retain byte-sized slices and contain at most 2,000 records.
+Every slice must acknowledge its final record before that destination advances
+its whole-source watermark. A later failure retains the previous watermark;
+replay uses the same UUIDs and shared pins. Late exact hook usage enriches those
+same records, whether the initial read or the usage event arrives first.
+An unobserved value stays unknown. Native identity and a known raw surface are
+preserved; old-cloud optional-field fallback does not alter record content.
+
+Run `python3 tests/cursor_sinks_test.py` for failure/recovery, both late-usage
+arrival orders, canonical parity, raw/unknown surfaces, legacy cloud dormancy,
+partial batches, bounded slow responses, busy destination locks and concurrent
+observation updates during an in-flight upload. Existing Cursor capture, usage
+and timestamp suites remain part of the full plugin check.

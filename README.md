@@ -579,9 +579,9 @@ To point at a different MemHub instance, edit `plugins/memhub/.mcp.json`
 
 Automatic Claude, Codex and Cursor conversation capture reads the separate
 [capture destination configuration](docs/wire-contract.md#capture-destination-api).
-Claude per-turn and SessionEnd/commit/PR backstops, plus Codex capture, deliver
-independently to active local and cloud destinations without changing cloud
-services. Cursor currently requires one active destination.
+Claude per-turn and SessionEnd/commit/PR backstops, Codex and Cursor capture
+deliver independently to active local and cloud destinations without changing
+cloud services.
 New destinations keep independent upload progress; Cursor native usage and
 timestamp observations stay shared.
 

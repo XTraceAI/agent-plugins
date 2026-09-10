@@ -66,7 +66,7 @@ import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
-from redact import redact_records, redact_text  # noqa: E402
+from redact import redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import git_env, git_readonly  # noqa: E402
 
@@ -1095,7 +1095,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # runaway length is capped so it can't bloat every re-send.
         #
         # Redacted HERE because the title is derived from RAW records -- the
-        # `redact_records` above covers only `sendable`, so a session whose
+        # Record redaction above covers only `sendable`, so a session whose
         # first prompt is `export MEMHUB_TOKEN=mhk_...` would otherwise ship
         # its key as the conversation's NAME, the most visible field there is.
         # Redact BEFORE the cap. Capping first can chop a straddling key
@@ -1272,20 +1272,9 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
                 _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
                 return 0
 
-            # Persist source identity and exact usage BEFORE any network work —
-            # on EVERY event, flushing or not, so a dormant boundary's usage
-            # sample survives to the eventual send. afterAgentResponse and stop
-            # duplicate the same generation; replacing that dictionary key makes
-            # delivery idempotent, while a later hook can retry an auth/server
-            # failure without needing Cursor to repeat usage. Timestamp pins are
-            # different: they are minted and persisted ONLY on the flush path
-            # below (still before the network call, so a failed send retries
-            # with identical stamps) — a declined event must not rewrite a large
-            # pin map for nothing (review finding). The only event that reads
-            # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
-            # exit in main() before reading — see _event_can_flush), and a
-            # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
-            # by the next flushing hook at most that interval later.
+            # Native observations are shared before destination selection or
+            # upload locks. The short observation lock serializes this read,
+            # generation binding and timestamp pins; network work runs later.
             fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
             if source_kind == "transcript":
                 fields["transcript_path"] = str(source_path)
@@ -1307,7 +1296,7 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
                     # This hook explicitly dates that record: its generation ended
                     # NOW, so it gets a real clock even in a first-observation
                     # backlog (where everything else stays unmeasured).
-                    boundary_uuids = {target}
+                    boundary_uuids = {usage_events[generation]["target_uuid"]}
             elif (event in ("afterAgentResponse", "stop") and
                   any(key in payload for key in _HOOK_USAGE_KEYS)):
                 _log(f"{event}: malformed token counters or generation_id — "
@@ -1320,8 +1309,7 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
                 # pin was minted or upgraded (stamps ride along on whatever send
                 # happens, and pending usage forces its own send via
                 # usage_pending). Hashing post-stamp would couple the gate's
-                # stability to the pin map's — the fragility a review round
-                # already caught once on the pin-eviction path.
+                # stability to the pin map rather than the source content.
                 source_revision = _records_revision(records)
 
             applied_usage = _apply_usage(records, usage_events)

@@ -165,7 +165,7 @@ def test_real_platform_is_unconditional():
     seen: list[dict] = []
     originals = {
         "current_blob_ids": cursor_flush.current_blob_ids,
-        "redact_records": cursor_flush.redact_records,
+        "redact_once": cursor_flush.redact_once,
         "resolve_bearer": cursor_flush.resolve_bearer,
         "session": cursor_flush.mcp_http.Session,
         "save_state": cursor_flush._save_state,
@@ -193,7 +193,7 @@ def test_real_platform_is_unconditional():
     meta = {"cwd": None, "title": None}
     try:
         cursor_flush.current_blob_ids = lambda _path: {"blob-1"}
-        cursor_flush.redact_records = lambda records: records
+        cursor_flush.redact_once = lambda records: records
         cursor_flush.mcp_http.Session = Session
         cursor_flush._save_state = lambda *_args, **_kwargs: None
         cursor_flush._log = lambda *_args, **_kwargs: None
@@ -205,7 +205,7 @@ def test_real_platform_is_unconditional():
                 records=records, meta=meta))
     finally:
         cursor_flush.current_blob_ids = originals["current_blob_ids"]
-        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.redact_once = originals["redact_once"]
         cursor_flush.resolve_bearer = originals["resolve_bearer"]
         cursor_flush.mcp_http.Session = originals["session"]
         cursor_flush._save_state = originals["save_state"]
@@ -220,7 +220,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
     state: dict = {}
     seen: list[dict] = []
     originals = {
-        "redact_records": cursor_flush.redact_records,
+        "redact_once": cursor_flush.redact_once,
         "resolve_bearer": cursor_flush.resolve_bearer,
         "session": cursor_flush.mcp_http.Session,
         "read_state": cursor_flush._read_state,
@@ -269,7 +269,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
             }]}},
     ]
     try:
-        cursor_flush.redact_records = lambda value: value
+        cursor_flush.redact_once = lambda value: value
         cursor_flush.resolve_bearer = lambda: (
             "https://example.test/mcp", "token")
         cursor_flush.mcp_http.Session = Session
@@ -297,7 +297,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         ))
         old_server_state = dict(state)
     finally:
-        cursor_flush.redact_records = originals["redact_records"]
+        cursor_flush.redact_once = originals["redact_once"]
         cursor_flush.resolve_bearer = originals["resolve_bearer"]
         cursor_flush.mcp_http.Session = originals["session"]
         cursor_flush._read_state = originals["read_state"]
