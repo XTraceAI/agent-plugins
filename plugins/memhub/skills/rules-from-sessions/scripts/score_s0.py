@@ -224,6 +224,8 @@ def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
            "--budget", str(args.budget), "--env", args.env, "--quiet"]
     if args.draft_timeout:
         cmd += ["--draft-timeout", str(args.draft_timeout)]
+    if args.pace:
+        cmd += ["--pace", str(args.pace)]
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
     try:
@@ -472,6 +474,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--env", default="staging")
     c.add_argument("--draft-timeout", type=float, default=0,
                    help="seconds for the one server call per turn")
+    c.add_argument("--pace", type=float, default=1.0,
+                   help="seconds between server calls per session (a personal "
+                        "key is capped at 60/min; with --jobs 1 this keeps under it)")
     return p
 
 

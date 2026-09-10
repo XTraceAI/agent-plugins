@@ -945,6 +945,12 @@ def extract_turn(turn: dict, prev: dict | None, *, doc: dict, args,
     window = redact_window(build_window(turn, prev, state_probe, arcs))
     reply, dt = server_draft(window, hint, repo=state_probe.get("repo", ""),
                              timeout=args.draft_timeout)
+    if getattr(args, "pace", 0):
+        # Replay only. A personal access key is capped at one human's
+        # throughput (60/min); a replay is not a human and must not look
+        # like ten of them. The live sensor makes one call per turn and
+        # never needs this.
+        time.sleep(args.pace)
     stats["server_calls"] += 1
     stats["turns_sent"] += 1
     stats["hinted_calls"] += bool(hint)
@@ -1100,6 +1106,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="hook version for the state stamp (default: plugin.json)")
     p.add_argument("--draft-timeout", type=float, default=0,
                    help=f"seconds for the one server call (default {DRAFT_TIMEOUT_S:g})")
+    p.add_argument("--pace", type=float, default=0,
+                   help="seconds to wait after each server call (replay only; "
+                        "a personal key is capped at 60 calls/min)")
     p.add_argument("--no-model", "--router-only", dest="no_model",
                    action="store_true",
                    help="router only — no server calls, nothing drafted")
