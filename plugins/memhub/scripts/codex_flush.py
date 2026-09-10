@@ -46,7 +46,7 @@ import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
-from redact import redact_records, redact_text  # noqa: E402
+from redact import redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import git_env, git_readonly  # noqa: E402
 
@@ -549,7 +549,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         # runaway length is capped so it can't bloat every re-send.
         #
         # Redacted HERE because the title is derived from RAW records -- the
-        # `redact_records` above covers only `sendable`, so a session whose
+        # Record redaction above covers only `sendable`, so a session whose
         # first prompt is `export MEMHUB_TOKEN=mhk_...` would otherwise ship
         # its key as the conversation's NAME, the most visible field there is.
         # Redact BEFORE the cap. Capping first can chop a straddling key

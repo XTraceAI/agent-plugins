@@ -246,7 +246,7 @@ def test_real_platform_is_unconditional():
     seen: list[dict] = []
     originals = {
         "to_canonical": codex_flush.codex_reader.to_canonical,
-        "redact_records": codex_flush.redact_records,
+        "redact_once": codex_flush.redact_once,
         "resolve_bearer": codex_flush.resolve_bearer,
         "session": codex_flush.mcp_http.Session,
         "save_state": codex_flush._save_state,
@@ -271,7 +271,7 @@ def test_real_platform_is_unconditional():
             "type": "user", "uuid": "record-1",
             "message": {"role": "user", "content": "hello"},
         }], {"cwd": None, "title": None})
-        codex_flush.redact_records = lambda records: records
+        codex_flush.redact_once = lambda records: records
         codex_flush.mcp_http.Session = Session
         codex_flush._save_state = lambda *_args, **_kwargs: None
         codex_flush._log = lambda *_args, **_kwargs: None
@@ -282,7 +282,7 @@ def test_real_platform_is_unconditional():
                 "session-1", Path("/tmp/rollout.jsonl"), 100))
     finally:
         codex_flush.codex_reader.to_canonical = originals["to_canonical"]
-        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.redact_once = originals["redact_once"]
         codex_flush.resolve_bearer = originals["resolve_bearer"]
         codex_flush.mcp_http.Session = originals["session"]
         codex_flush._save_state = originals["save_state"]
@@ -300,7 +300,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         "to_canonical": codex_flush.codex_reader.to_canonical,
         "read_state": codex_flush._read_state,
         "save_state": codex_flush._save_state,
-        "redact_records": codex_flush.redact_records,
+        "redact_once": codex_flush.redact_once,
         "resolve_bearer": codex_flush.resolve_bearer,
         "session": codex_flush.mcp_http.Session,
         "log": codex_flush._log,
@@ -349,7 +349,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         ], {"cwd": None, "title": None})
         codex_flush._read_state = lambda _sid: dict(state)
         codex_flush._save_state = save_state
-        codex_flush.redact_records = lambda records: records
+        codex_flush.redact_once = lambda records: records
         codex_flush.resolve_bearer = lambda: (
             "https://example.test/mcp", "token")
         codex_flush.mcp_http.Session = Session
@@ -369,7 +369,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
         codex_flush.codex_reader.to_canonical = originals["to_canonical"]
         codex_flush._read_state = originals["read_state"]
         codex_flush._save_state = originals["save_state"]
-        codex_flush.redact_records = originals["redact_records"]
+        codex_flush.redact_once = originals["redact_once"]
         codex_flush.resolve_bearer = originals["resolve_bearer"]
         codex_flush.mcp_http.Session = originals["session"]
         codex_flush._log = originals["log"]
