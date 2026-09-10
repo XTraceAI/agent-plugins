@@ -591,17 +591,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _mark_failure(session_id, "server_rejected", detail)
         return
 
-    out = getattr(res, "structuredContent", None)
-    if isinstance(out, dict) and "conversation_id" not in out \
-            and isinstance(out.get("result"), dict):
-        out = out["result"]  # FastMCP wraps some returns
-    if not isinstance(out, dict):
-        for text in texts:
-            try:
-                out = json.loads(text)
-                break
-            except json.JSONDecodeError:
-                continue
+    out = mcp_http.ack_of(res, session_id)
     if not isinstance(out, dict) or "conversation_id" not in out:
         # Unrecognized body: do NOT advance. Re-sending is free.
         detail = (texts[0] if texts else "")[:120]
