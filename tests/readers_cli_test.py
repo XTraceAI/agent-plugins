@@ -475,7 +475,7 @@ def test_codex_title_sidecar_changes_participate_in_since_and_revision_checks():
         real=codex.to_canonical
         def changing(*args,**kwargs):
             value=real(*args,**kwargs)
-            index.write_text(index.read_text()+"\n")
+            index.write_text(index.read_text()+json.dumps({"id":sid,"thread_name":"Changed during read"})+"\n")
             return value
         stdout,stderr=io.StringIO(),io.StringIO()
         with patch.object(codex,"_SESSION_INDEX",index), patch.object(codex,"to_canonical",side_effect=changing), \
@@ -635,6 +635,59 @@ def test_historical_export_keeps_titles_outside_the_capture_tail_window():
             handle.write(json.dumps({"id":sid,"thread_name":"Latest native title"})+"\n")
         result,rows=run(home,"codex","--session",sid)
         assert result.returncode==0 and rows[0]["title"]=="Latest native title",result.stderr
+
+
+def test_rollout_titles_do_not_consult_or_inherit_unrelated_index_changes():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home)
+        with path.open("a") as handle:
+            handle.write(json.dumps({"type":"event_msg","payload":{
+                "type":"thread_name_updated","thread_name":"Native rollout title"}})+"\n")
+        os.utime(path,(MTIME,MTIME));index=home/".codex/session_index.jsonl"
+        for data in [b"{bad}\n",b"invalid\xff\n"]:
+            index.write_bytes(data);os.utime(index,(MTIME+200,MTIME+200))
+            result,rows=run(home,"codex")
+            assert result.returncode==0 and rows[0]["title"]=="Native rollout title",result.stderr
+            assert rows[0]["mtime"]==MTIME
+            result,rows=run(home,"codex","--since","2026-09-08T00:01:00Z")
+            assert result.returncode==0 and not rows,result.stderr
+
+
+def test_fallback_revision_and_timestamp_are_scoped_to_the_matching_title():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home);sid=codex.session_metadata(path)["session_id"]
+        index=write_jsonl(home/".codex/session_index.jsonl",[{
+            "id":sid,"thread_name":"Selected title","updated_at":"2026-09-08T00:00:20Z"},
+            {"id":"unrelated","thread_name":"Newer title","updated_at":"2026-09-08T00:02:00Z"}])
+        os.utime(index,(MTIME+200,MTIME+200))
+        result,rows=run(home,"codex","--since","2026-09-08T00:01:00Z")
+        assert result.returncode==0 and not rows,result.stderr
+        real=codex.to_canonical
+        def changing(*args,**kwargs):
+            value=real(*args,**kwargs)
+            with index.open("a") as handle:
+                handle.write(json.dumps({"id":"unrelated","thread_name":"Changed elsewhere"})+"\n")
+            return value
+        stdout,stderr=io.StringIO(),io.StringIO()
+        with patch.object(codex,"_SESSION_INDEX",index),patch.object(codex,"to_canonical",side_effect=changing), \
+                contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+            code=readers_cli.main(["--host","codex","--session",str(path)])
+        assert code==0 and not stderr.getvalue(),stderr.getvalue()
+        header=json.loads(stdout.getvalue().splitlines()[0])
+        assert header["title"]=="Selected title" and header["mtime"]==MTIME+20
+
+
+def test_cursor_uuid_selection_does_not_parse_unrelated_saved_state():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=transcript(home);other="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        write_jsonl(home/f".cursor/projects/synthetic/agent-transcripts/{other}/{other}.jsonl",[None])
+        state=home/f".config/memhub-plugin/cursorflush/{other}.json"
+        state.parent.mkdir(parents=True);state.write_text("{broken")
+        result,rows=run(home,"cursor","--session",SID)
+        assert result.returncode==0 and rows[0]["native_session_id"]==SID,result.stderr
+        assert path.read_bytes() and state.read_text()=="{broken"
+        result,rows=run(home,"cursor")
+        assert result.returncode==2 and "session_unreadable" in result.stderr
 
 
 if __name__ == "__main__":

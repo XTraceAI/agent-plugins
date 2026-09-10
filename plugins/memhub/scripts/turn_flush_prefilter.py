@@ -103,7 +103,7 @@ def main() -> int:
             offset = int(state.get("offset", 0))
         except (OSError, ValueError, TypeError):
             return 0
-        if not state.get("unsupported") and size != offset:
+        if (len(selected) > 1 or not state.get("unsupported")) and size != offset:
             return 0
     return 1  # Every active destination is caught up, dormant or already flushing.
 
