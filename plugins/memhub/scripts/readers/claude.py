@@ -33,8 +33,8 @@ def load(path) -> list[dict]:
     line from a crash mid-write). Explicit utf-8: a bare read_text() decodes
     with the OS locale codec and one em-dash kills the import on a cp950 box."""
     records: list[dict] = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
+    for encoded in Path(path).read_bytes().splitlines():
+        line = encoded.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -74,11 +74,11 @@ def session_cwd(path) -> str | None:
             if size > _CWD_TAIL_BYTES:
                 handle.seek(size - _CWD_TAIL_BYTES)
                 handle.readline()          # drop a line the seek cut in half
-            tail = handle.read().decode("utf-8", errors="replace")
+            tail = handle.read()
     except OSError:
         return None
-    for line in reversed(tail.splitlines()[-_CWD_MAX_RECORDS:]):
-        line = line.strip()
+    for encoded in reversed(tail.splitlines()[-_CWD_MAX_RECORDS:]):
+        line = encoded.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
