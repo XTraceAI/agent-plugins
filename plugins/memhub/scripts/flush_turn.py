@@ -57,6 +57,8 @@ from session_title import (  # noqa: E402
     prompt_title,
 )
 from capture_redaction import CACHE as _REDACTION_CACHE, redact_once as _redact_once
+from contextvars import ContextVar
+import sinks
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import (  # noqa: E402
     drop_command_wrappers,
