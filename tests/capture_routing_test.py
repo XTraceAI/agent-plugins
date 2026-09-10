@@ -391,7 +391,7 @@ def test_same_named_endpoint_changes_do_not_suppress_new_health_warnings():
             patch.object(capture_health,"_recent_failure",return_value=("timeout",time.time())):
         for sink,expected in [(first,True),(first,False),(second,True),(second,False)]:
             output=io.StringIO()
-            with patch.object(sinks,"resolve_capture_sink",return_value=sink), \
+            with patch.object(sinks,"resolve_capture_sinks",return_value=(sink,)), \
                     patch.object(sys,"stdin",io.StringIO(json.dumps({"session_id":SID}))), \
                     contextlib.redirect_stdout(output):
                 assert capture_health.main()==0
