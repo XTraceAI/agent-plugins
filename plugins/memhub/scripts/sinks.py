@@ -72,7 +72,10 @@ def _token(value) -> str | None:
 
 def _origin(url: str) -> tuple[str, str, int]:
     parts = urlsplit(_endpoint(url))
-    return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    host = parts.hostname
+    if ":" in host:
+        host = str(ipaddress.IPv6Address(host))
+    return parts.scheme, host, parts.port or (443 if parts.scheme == "https" else 80)
 
 
 @dataclass(frozen=True)
@@ -93,7 +96,7 @@ class Sink:
 
     @property
     def is_local(self) -> bool:
-        return urlsplit(self.url).hostname in {"localhost", "127.0.0.1", "::1"}
+        return _origin(self.url)[1] in {"localhost", "127.0.0.1", "::1"}
 
 
 def _unique_object(pairs):
