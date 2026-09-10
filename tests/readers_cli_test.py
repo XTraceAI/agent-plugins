@@ -406,6 +406,23 @@ def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted(
                 assert result.returncode==2 and "discovery_incomplete" in result.stderr
                 headers=[row for row in rows if row.get("type")=="session"]
                 assert len(headers)==1 and headers[0]["path"]==str(healthy.resolve())
+            # Latest retains native ordering, but cannot hide another copy of
+            # its actual identity. Both metadata and full reads fail closed.
+            os.utime(original,(MTIME+100,MTIME+100))
+            if host=="cursor":
+                meta_path=original.parent/"meta.json";meta=json.loads(meta_path.read_text())
+                meta["updatedAtMs"]=int((MTIME+100)*1000);meta_path.write_text(json.dumps(meta))
+                healthy_meta=healthy.parent/"meta.json";meta=json.loads(healthy_meta.read_text())
+                meta["updatedAtMs"]=int(MTIME*1000);healthy_meta.write_text(json.dumps(meta))
+                duplicate_meta=duplicate/"meta.json";meta=json.loads(duplicate_meta.read_text())
+                meta["updatedAtMs"]=int(MTIME*1000);duplicate_meta.write_text(json.dumps(meta))
+            for mode in ([],["--metadata-only"]):
+                result,rows=run(home,host,"--session","latest",*mode)
+                assert result.returncode==2 and rows==[] and "discovery_incomplete" in result.stderr,result.stderr
+            if host=="cursor":shutil.rmtree(duplicate)
+            else:duplicate.unlink()
+            result,rows=run(home,host,"--session","latest")
+            assert result.returncode==0 and rows[0]["path"]==str(original.resolve()),result.stderr
             # An explicit native path remains an unambiguous request.
             result,rows=run(home,host,"--session",str(original),"--metadata-only")
             assert result.returncode==0 and len(rows)==1,result.stderr
