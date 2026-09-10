@@ -321,6 +321,67 @@ def test_missing_or_corrupt_file_keeps_installed_endpoint_capture():
         imports(requests)
 
 
+def test_remote_room_lookup_keeps_installed_cloud_cache_separate():
+    import asyncio
+    import types
+    import room_map
+    import brain_resolve
+    remote=sinks.Sink("remote","https://another.example.test/mcp","remote")
+    cloud="https://cloud.example.test/mcp"
+    room_name="Repo: example/project"
+    class Session:
+        async def call_tool(self,name,arguments):
+            if name=="list_orgs":
+                result={"orgs":[{"org_id":"remote-org","is_default":True}]}
+            else:
+                result={"agent_brains":[{"id":"remote-brain","name":room_name}]}
+            return types.SimpleNamespace(structuredContent=result,content=[],isError=False)
+    @capture_context.entrypoint
+    def run():
+        env=capture_context.env_for_url(remote.url)
+        assert env.startswith("capture-")
+        resolved=asyncio.run(capture_context.resolve_repo_brain(Session(),"/synthetic",env))
+        assert resolved["brain_id"]=="remote-brain"
+        assert room_map.read_room("/synthetic",env)["brain_id"]=="remote-brain"
+        assert room_map.read_room("/synthetic","production")["brain_id"]=="installed-brain"
+        with patch.object(auth,"_plugin_mcp_config",return_value={"url":remote.url}):
+            assert capture_context.env_for_url(remote.url)==env,"room routing is frozen"
+    with tempfile.TemporaryDirectory() as td, patch.object(room_map,"ROOMS_PATH",Path(td)/"rooms.json"), \
+            patch.object(room_map,"room_name",return_value=room_name), \
+            patch.object(brain_resolve,"room_name",return_value=room_name), \
+            patch.object(auth,"_plugin_mcp_config",return_value={"url":cloud}), \
+            patch.object(capture_context,"resolve_capture_sink",return_value=remote):
+        room_map.write_room("installed-brain",name=room_name,env="production",org_id="installed-org")
+        run()
+
+
+def test_renewable_capture_health_is_silent_without_network_or_cross_origin_trust():
+    import base64
+    expired="header."+base64.urlsafe_b64encode(json.dumps({"exp":1}).encode()).decode().rstrip("=")+".signature"
+    cloud="https://cloud.example.test/mcp"
+    selected=sinks.Sink("alias","https://CLOUD.example.test:443/mcp")
+    installed={"url":cloud,"oauth":{"clientId":"synthetic","authServerMetadataUrl":"https://auth.example.test/metadata"}}
+    with tempfile.TemporaryDirectory() as td, patch.dict(os.environ,{},clear=True), \
+            patch.object(auth,"_CACHE_DIR",Path(td)),patch.object(auth,"_plugin_mcp_config",return_value=installed), \
+            patch.object(auth,"_refresh_cached_token_if_stale",side_effect=AssertionError("health cannot refresh")), \
+            patch.object(capture_health,"STATE_DIR",Path(td)/"turnflush"):
+        cache=auth.token_cache_path(cloud)
+        cache.write_text(json.dumps({"access_token":expired,"refresh_token":"renewable"}))
+        message,_=capture_health._separate_capture_health(None,selected)
+        assert not message
+        for value in [None,"",{},17]:
+            cache.write_text(json.dumps({"access_token":expired,"refresh_token":value}))
+            message,_=capture_health._separate_capture_health(None,selected)
+            assert "no usable credential" in message
+        cache.write_text(json.dumps({"access_token":expired,"refresh_token":"renewable"}))
+        message,_=capture_health._separate_capture_health(None,sinks.Sink("other","https://other.example.test/mcp"))
+        assert "no usable credential" in message
+        directory=capture_context.state_directory(capture_health.STATE_DIR,selected);directory.mkdir(parents=True)
+        (directory/f"{SID}.json").write_text(json.dumps({"last_error":"timeout","last_error_at":time.time()}))
+        message,_=capture_health._separate_capture_health(None,selected)
+        assert "'alias'" in message and "no usable credential" not in message
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

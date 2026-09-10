@@ -383,6 +383,84 @@ def test_cursor_unterminated_tail_rejects_decoding_errors_only_in_strict_mode():
         assert result.returncode==0 and rows[1:]==expected, result.stderr
 
 
+def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted():
+    import shutil
+    for host in ("codex","cursor"):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td)
+            if host == "cursor":
+                original=fixtures._make_cursor_store(home/".cursor/chats")
+                duplicate=home/".cursor/chats/another-workspace"/original.parent.name
+                shutil.copytree(original.parent,duplicate)
+                healthy=fixtures._make_cursor_store(home/".cursor/chats",uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            else:
+                original=rollout(home)
+                duplicate=original.with_name("rollout-another.jsonl")
+                shutil.copyfile(original,duplicate)
+                rows=[json.loads(line) for line in original.read_text().splitlines()]
+                rows[0]["payload"]["id"]="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                healthy=write_jsonl(original.with_name("rollout-healthy.jsonl"),rows)
+            for mode in ([],["--metadata-only"]):
+                result,rows=run(home,host,*mode)
+                assert result.returncode==2 and "discovery_incomplete" in result.stderr
+                headers=[row for row in rows if row.get("type")=="session"]
+                assert len(headers)==1 and headers[0]["path"]==str(healthy.resolve())
+            # An explicit native path remains an unambiguous request.
+            result,rows=run(home,host,"--session",str(original),"--metadata-only")
+            assert result.returncode==0 and len(rows)==1,result.stderr
+
+
+def test_complete_malformed_native_json_fails_while_unfinished_codex_tail_waits():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home);original=path.read_bytes()
+        expected,_=codex.to_canonical(path)
+        for malformed in (b'{"type":broken}\n',b'null\n',b'17\n'):
+            path.write_bytes(original+malformed)
+            legacy,_=codex.to_canonical(path)
+            assert legacy==expected
+            result,rows=run(home,"codex")
+            assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
+            assert "broken" not in result.stderr
+        path.write_bytes(original+b'{"type":"response_item","payload":')
+        result,rows=run(home,"codex")
+        assert result.returncode==0 and rows[1:]==expected,result.stderr
+        path.write_bytes(original+b'{"type":"future_extension"}')
+        result,rows=run(home,"codex")
+        assert result.returncode==0 and rows[1:]==expected,result.stderr
+        store=fixtures._make_cursor_store(home/".cursor/chats")
+        with sqlite3.connect(store) as db:
+            leaf=db.execute("SELECT id FROM blobs WHERE substr(data,1,1)=? LIMIT 1",(b'{',)).fetchone()[0]
+            db.execute("UPDATE blobs SET data=? WHERE id=?",(b'{"role":broken}',leaf))
+        cursor.to_canonical(store)  # Legacy capture remains tolerant.
+        result,rows=run(home,"cursor")
+        assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
+
+
+def test_codex_title_sidecar_changes_participate_in_since_and_revision_checks():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home)
+        original=[json.loads(line) for line in path.read_text().splitlines()]
+        sid=original[0]["payload"]["id"]
+        index=write_jsonl(home/".codex/session_index.jsonl",[{"id":sid,"thread_name":"Native title"}])
+        os.utime(index,(MTIME+100,MTIME+100))
+        result,rows=run(home,"codex","--since","2026-09-08T00:01:00Z")
+        assert result.returncode==0 and rows[0]["mtime"]==MTIME+100,result.stderr
+        assert rows[0]["title"]=="Native title"
+        write_jsonl(index,[{"id":sid,"thread_name":"Renamed title"}]);os.utime(index,(MTIME+200,MTIME+200))
+        result,rows=run(home,"codex","--since","2026-09-08T00:02:00Z")
+        assert result.returncode==0 and rows[0]["title"]=="Renamed title"
+        real=codex.to_canonical
+        def changing(*args,**kwargs):
+            value=real(*args,**kwargs)
+            index.write_text(index.read_text()+"\n")
+            return value
+        stdout,stderr=io.StringIO(),io.StringIO()
+        with patch.object(codex,"_SESSION_INDEX",index), patch.object(codex,"to_canonical",side_effect=changing), \
+                contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+            code=readers_cli.main(["--host","codex","--session",str(path)])
+        assert code==2 and stdout.getvalue()=="" and "source_changed" in stderr.getvalue()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
