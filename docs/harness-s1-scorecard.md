@@ -355,6 +355,101 @@ a personal access key is one human's throughput. Median 5.9 s for judge +
 author against S0's 15.1 s for the judge alone. S0 Finding 3 (the CLI
 transport lost 15–21% of judgements) is closed.
 
+## Path A, replayed without the person
+
+Path A cannot be replayed whole: its filter is the person saying yes or no.
+What can be replayed is the agent's half. `score_s0.py nudge` gives a
+headless agent (sonnet, disarmed) each of the 426 classifier-flagged moments
+as the session up to that turn plus the exact line the prompt lane injects,
+and records what it would propose. Every row goes through the same
+`build_row`, identity and in-session twin checks the live `create_rule` call
+meets. The agent was told to fill in the row even where it would have asked
+the person first, so this is the upper bound on what a person would be shown.
+
+| | server author | post-session miner (removed) | **path A, agent without the person** |
+|---|---|---|---|
+| moments in | 550 sent turns | 426 | 426 |
+| rows out | 117 | 20 | **85** (97 proposed; 12 refused by the client checks) |
+| rows per session | 4.88 | 0.83 | **3.54**; two sessions over the live cap of 8 (16, 12) |
+| judge 1 | 0.32 | 0.70 | 0.33 |
+| opus, blind | 0.15 | 0.20 | 0.46 |
+| sonnet, blind | 0.89 | 0.70 | 0.69 |
+| **majority of three** | 0.36 (42 rows) | 0.50 (10 rows) | **0.49 (42 rows)** |
+| all three | 0.09 | 0.15 | 0.21 (18 rows) |
+| pairwise κ | 0.04–0.24 | −0.19–0.19 | **0.19–0.36** |
+| duplicates by hand | 5 | 0 | **9** (the in-session twin check caught 4 more) |
+| identities in a row | 0 | 0 | 0 |
+
+What it says:
+
+1. **On the gate, at four times the miner's yield.** 42 rows a majority of
+   readers would activate, the same count as the server author at a higher
+   ratio, and 32 more than the miner, for 0.49 against the miner's 0.50.
+   Per session: 1.75 activatable rows against the miner's 0.42.
+2. **The readers agree more on these rows than on any earlier set** (κ up to
+   0.36). The agent writes command-shaped, narrow rows — 30 of 49 matcher
+   rows pass the majority, 12 of 36 anchor rows — and those are easier to
+   agree about.
+3. **Duplicates are path A's own failure.** An agent nudged one turn at a
+   time re-proposes a lesson it already proposed: `| tail` masks exit status
+   three times across two sessions, "don't poll with sleep + tail" twice
+   across engineers, "check for an existing URL env var" twice in one
+   session, the bot-review resolve fact twice. The client's Jaccard twin
+   check caught 4 and missed 9. The cheap fix is in the nudge itself: carry
+   the titles the session already proposed, so the agent sees them.
+4. **Volume concentrates.** Two sessions would have been cut by the cap of
+   8 nudges; 12 rows. The cap is doing real work on long sessions.
+5. **What the replay cannot include** is the person. Every row above is one
+   the agent would at least have *asked* about; in a live session a "no"
+   removes it, and nothing here measures how often that happens.
+
+The 42 rows a majority would activate:
+
+| # | title | engine | readers |
+|---|---|---|---|
+| 1 | login.py --status false-fails on missing mcp module | `matcher` | two of three |
+| 4 | Bare `ruff` isn't on PATH — use `uv run ruff` | `matcher` | two of three |
+| 6 | Redundant URL/base env var added as required | `matcher` | all three |
+| 7 | Bot PR-level review summaries have no resolve action | `matcher` | all three |
+| 8 | Plugin script via uv run rebuilds memhub-backend | `matcher` | two of three |
+| 11 | Raw-catting internal task-output files instead of TaskOutput | `matcher` | two of three |
+| 12 | Staging DB may contain real prod emails | `matcher` | two of three |
+| 14 | New spec docs must not duplicate owns: frontmatter | `matcher` | all three |
+| 15 | Undocumented secret-rotation blast radius in token-auth docs | `matcher` | two of three |
+| 18 | Raw secret echoed during generation | `matcher` | all three |
+| 19 | uv install hits dead CodeArtifact index (401) | `matcher` | all three |
+| 21 | Flag data loss before finalizing drop-column migrations | `matcher` | all three |
+| 22 | Verify diff before confirming a PR is safe to close | `matcher` | two of three |
+| 27 | share_agent_brain default permission demotes existing grant | `anchors` | all three |
+| 29 | Strip session-specific jargon from generalizable prompts/examples | `anchors` | all three |
+| 30 | Model-swap request: benchmark placement, not blanket swap | `anchors` | two of three |
+| 31 | Unquoted pip/uv extras brackets fail in zsh | `matcher` | two of three |
+| 33 | Reddit access requires old.reddit.com | `anchors` | all three |
+| 35 | SKILL.md: use ${CLAUDE_SKILL_DIR}, not a custom shorthand | `matcher` | two of three |
+| 38 | zsh unmatched-glob aborts chained bash command | `matcher` | two of three |
+| 40 | Recheck feature flag at job execution, not enqueue | `matcher` | all three |
+| 47 | Artifact links are unshareable outside the session | `anchors` | two of three |
+| 50 | Slack reach is default-deny, not implied by absence | `matcher` | two of three |
+| 51 | Local-schema type-check is not proof of a working integration | `anchors` | all three |
+| 52 | Stale old_string in multi-op Linear patches | `anchors` | two of three |
+| 55 | AsyncMock coroutine masks silently-swallowed test failure | `matcher` | all three |
+| 59 | Don't poll a background task's output with sleep+tail | `matcher` | two of three |
+| 61 | Slack query wrong-target trap (Claude config vs product feature) | `matcher` | two of three |
+| 63 | gh deployments confirms the build, not the staging alias | `matcher` | all three |
+| 65 | Workspace scope-bind skips membership check | `anchors` | two of three |
+| 66 | Slack bot refusal text isn't diagnostic evidence | `anchors` | two of three |
+| 68 | OAuth exchange errors: log the response body, never the form | `anchors` | two of three |
+| 69 | HubSpot missing_hub_id has two distinct causes | `matcher` | two of three |
+| 72 | gh auth login hangs in bare scripted pty | `matcher` | all three |
+| 73 | git config --global identity from unverified file | `matcher` | all three |
+| 74 | Memory-sourced "live" status claims need re-verification | `matcher` | two of three |
+| 76 | Vercel check stuck behind team-invite gate | `matcher` | all three |
+| 77 | Credential requests must avoid transcript paste | `matcher` | two of three |
+| 79 | Live secret values pasted into chat/Slack drafts | `matcher` | all three |
+| 81 | Deal stage: HubSpot ID vs Salesforce free text | `anchors` | two of three |
+| 83 | Brace-counting scripts corrupt OpenAPI path-key type files | `matcher` | two of three |
+| 85 | Unattended automation: default to read-only, gate writes separately | `anchors` | all three |
+
 ## What S1 ships, and why
 
 **The live agent mines the lessons (path A).** After the readers' result the
@@ -375,9 +470,10 @@ commit `1fa1e48` on this branch, not in the tree. A moment nobody hands to
 the agent — the terminal closed, a host with no prompt lane — stays in its
 file.
 
-What path A cannot be measured by: replay. Whether the live agent proposes
-good rules, and whether people say yes to them, only a week of dogfood with
-the flag on shows. Before that:
+Replay measures path A only without its person (the section above): 0.49
+by a majority of three readers, 42 activatable rows, and duplicates as its
+own weakness. Whether people say yes to what the agent proposes only a week
+of dogfood with the flag on shows. Before that:
 
 1. **A `judge_only` mode on the draft endpoint** (MemHub-Backend, Felix's
    call). Today the server author still runs and bills on every flagged
@@ -388,6 +484,9 @@ the flag on shows. Before that:
 3. **The dogfood gate from spec §7:** proposed rows a reviewer activated
    ≥ 3, zero self-captured harness sessions in the brain, p90 hook cost
    ≤ 10 ms.
+4. **Stop in-session re-proposals:** put the titles this session already
+   proposed into the nudge line. 9 of 85 replayed rows were duplicates the
+   twin check missed.
 
 ## Reproducing this
 
@@ -399,6 +498,7 @@ python3 $S/score_s0.py router --corpus $SP/corpus                  # free, no se
 python3 $S/score_s0.py corpus --corpus $SP/corpus --out $SP/s1-run --jobs 2 --pace 1.0
 python3 $S/score_s0.py gold   --jobs 2 --out $SP/s1-gold.json
 python3 $S/score_s0.py judge  --rows $SP/s1-run/rows.json --against verdicts.json --model opus
+python3 $S/score_s0.py nudge  --run $SP/s1-run --corpus $SP/corpus --jobs 6      # path A, agent without the person
 # the review/mine variants: `git checkout 1fa1e48 -- plugins/memhub/skills/rules-from-sessions/scripts/score_s0.py plugins/memhub/scripts/harness_stop.py`
 ```
 
