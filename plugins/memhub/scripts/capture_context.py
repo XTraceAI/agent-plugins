@@ -65,6 +65,11 @@ def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None,
         _current.reset(token)
 
 
+def current_sink():
+    """The immutable destination bound to this delivery, if any."""
+    return _current.get()
+
+
 def is_legacy():
     """Whether this call owns the unchanged installed cloud destination."""
     return _legacy.get()
