@@ -58,7 +58,9 @@ the consumer to discard its incomplete stream.
 Full reads reject invalid UTF-8 instead of replacing text. The existing capture
 readers retain their tolerant defaults. Cursor SQLite files and journals are
 copied into a private, temporary snapshot before opening SQLite; the native
-directory is never used for shared-memory files or journal recovery. Source
+directory is never used for shared-memory files or journal recovery. A hot
+rollback journal is recovered with writes allowed only in the private copy
+before the existing read-only normalizer runs. Source
 revisions are compared across the read, and changed sources are reported as
 incomplete. Numeric overflow in native metadata rejects that session while
 preserving healthy peers.

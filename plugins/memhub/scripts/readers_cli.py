@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import datetime
 import json
 import math
@@ -100,6 +100,11 @@ def source_snapshot(path: Path, host: str):
             except FileNotFoundError:
                 if name in {"store.db", "meta.json"}:
                     raise
+        # A hot rollback journal needs writes to recover the last committed
+        # state. Permit recovery only in this owned copy, then let the existing
+        # read-only native normalizer consume the recovered database.
+        with closing(sqlite3.connect(directory / path.name)) as database:
+            database.execute("PRAGMA schema_version").fetchone()
         yield directory / path.name
 
 
