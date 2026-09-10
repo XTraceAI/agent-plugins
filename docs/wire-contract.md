@@ -394,8 +394,8 @@ requests may additionally carry `origin_sink`, `rule_source_id`,
 version are recorded when the fire is created; uploading a cloud-evaluated fire
 to local storage never relabels it as locally evaluated. Older rows without
 source evidence remain unknown. Newly evaluated fires record the known Claude
-platform; an explicit source surface or entrypoint is preserved through the same
-helper as conversation capture, while an unobserved surface remains unknown.
+platform; an explicit source surface or entrypoint is preserved with the same
+field precedence as conversation capture, while an unobserved surface remains unknown.
 Excerpts are redacted using the existing token
 redactor before being capped at 2,048 Unicode characters. This is shape-based
 redaction, not a guarantee against arbitrary sensitive text. Projection never
