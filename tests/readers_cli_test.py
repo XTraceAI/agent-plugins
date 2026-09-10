@@ -779,6 +779,27 @@ def test_latest_never_reintroduces_symlinked_discovery_directories():
                 assert len(headers)==1 and headers[0]["path"]==str(safe.resolve()),headers
 
 
+def test_metadata_only_rejects_nonfinite_cursor_metadata():
+    for value in ("NaN", "Infinity", "-Infinity", "1e999"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            store = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+            metadata = store.parent / "meta.json"
+            original = json.loads(metadata.read_text())
+            invalid = json.dumps(original).replace(
+                str(original["createdAtMs"]), value, 1).encode()
+            metadata.write_bytes(invalid)
+            before = {p.name: p.read_bytes() for p in store.parent.iterdir() if p.is_file()}
+            for mode in ([], ["--metadata-only"]):
+                result, rows = run(home, "cursor", "--session", str(store), *mode)
+                assert result.returncode == 2 and rows == [], (value, result.stdout, result.stderr)
+                assert "session_unreadable" in result.stderr and "Traceback" not in result.stderr
+            assert before == {p.name: p.read_bytes() for p in store.parent.iterdir() if p.is_file()}
+            metadata.write_text(json.dumps(original))
+            result, rows = run(home, "cursor", "--session", str(store), "--metadata-only")
+            assert result.returncode == 0 and len(rows) == 1 and rows[0]["started_at"]
+
+
 def test_latest_cursor_reports_unreadable_ranking_metadata():
     for data in [b"{broken", b"null", b"[]", b'{"updatedAtMs":"later"}', b"{}",
                  b'{"updatedAtMs":NaN}', b'{"updatedAtMs":1e999}',

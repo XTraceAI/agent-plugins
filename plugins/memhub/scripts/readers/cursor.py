@@ -371,6 +371,13 @@ def _validate_message(message):
             raise ValueError("Cursor message has unsupported content block")
         if kind in ("text", "reasoning") and not isinstance(block.get("text"), str):
             raise ValueError("Cursor message text must be a string")
+        if kind == "tool-result" and not isinstance(block.get("result"), str):
+            fallback = block.get("experimental_content")
+            if fallback is not None and not isinstance(fallback, str):
+                if not isinstance(fallback, list) or any(
+                        not isinstance(item, dict) or item.get("type") != "text"
+                        or not isinstance(item.get("text"), str) for item in fallback):
+                    raise ValueError("Cursor tool result has unsupported fallback content")
         if kind in ("tool-call", "tool_use", "tool-result"):
             for key in ("toolCallId", "id", "toolName", "name"):
                 if block.get(key) is not None and not isinstance(block[key], str):
@@ -725,7 +732,7 @@ def session_metadata(path) -> dict:
     source = Path(path)
     if source.name == "store.db":
         with (source.parent / "meta.json").open(encoding="utf-8") as handle:
-            meta = json.load(handle)
+            meta = load_json(handle.read(), strict=True)
         if not isinstance(meta, dict) or meta.get("schemaVersion") != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
         created = meta.get("createdAtMs")
