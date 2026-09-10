@@ -84,9 +84,10 @@ How a fire reaches people (spec §5.3):
 What leaves the machine, exactly:
   * fetch  — the repo name (the origin remote's basename, else the directory's),
              nothing else.
-  * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps.
-             The matched `excerpt` is written to the LOCAL ledger and is
-             stripped before the POST.
+  * fires  — remote destinations receive identifiers only: rule id, session,
+             repo, branch, tool and timestamps. Explicit loopback destinations
+             additionally receive source metadata and a redacted excerpt capped
+             at 2,048 characters. The receiver owns its retention policy.
   * recall — the anchor lane, and the one exception: the server's relevance
              judge needs the call itself, so it gets the file path, or the
              command line (heredoc bodies dropped, credential shapes redacted,
@@ -199,6 +200,7 @@ def _timeout(default):
 
 
 FETCH_TIMEOUT_S = _timeout(5.0)    # detached child; bounds how long a dead server is probed
+FIRE_FLUSH_BUDGET_S = 60.0
 FLUSH_TIMEOUT_S = _timeout(20.0)   # per batch, inside an async 60 s hook
 FLUSH_EVERY_FIRES = 10       # Stop-hook throttle: flush when this many rows wait…
 FLUSH_EVERY_S = 300          # …or this long has passed since the last flush
@@ -2080,6 +2082,8 @@ def load_rules(repo):
     for row in (book or {}).get("rules", []):
         r = to_hook_rule(row)
         if r and r["id"] not in sources:
+            r["_origin_sink"] = "cloud"
+            r["_rule_source_id"] = r.get("_rulebook_id")
             rules.append(r)
             sources[r["id"]] = "server"
     return rules, "", (book or {}).get("fetched_at"), sources
@@ -2336,13 +2340,44 @@ WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "re
              "source_message_id", "override_reason")
 
 
-def wire_row(row):
-    """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
-    opt-in for excerpts is a server setting the hook does not consult)."""
-    return {k: row.get(k) for k in WIRE_KEYS}
+def wire_row(row, *, local=None):
+    """Project a ledger row without changing its evaluation source or contents."""
+    import capture_context
+    from redact import redact_text
+    if local is None:
+        sink = capture_context.current_sink()
+        local = sink is not None and sink.is_local
+    result = {key: row.get(key) for key in WIRE_KEYS}
+    if local:
+        for key in ("origin_sink", "rule_source_id", "source_platform", "source_surface"):
+            if isinstance(row.get(key), str) and row[key]:
+                result[key] = row[key]
+        if isinstance(row.get("excerpt"), str):
+            result["excerpt"] = redact_text(row["excerpt"])[:2048]
+    return result
 
 
-def _read_rows(path, start=0, offsets=None):
+def _fire_state_dir():
+    from pathlib import Path
+    import capture_context
+    directory = capture_context.state_directory(Path(_ledger_dir()))
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory)
+
+
+def _capture_api():
+    import capture_context
+    import mcp_http
+    import pak
+    from sinks import resolve_capture_auth
+    sink = capture_context.current_sink()
+    if sink is None:
+        return _api()  # Direct legacy callers retain their existing resolver.
+    url, bearer = resolve_capture_auth(sink)
+    return (pak.api_base(url), bearer, mcp_http) if bearer else None
+
+
+def _read_rows(path, start=0, offsets=None, stop=None):
     """Complete JSON lines from byte `start`; returns (rows, end_offset) where
     end_offset stops before any partial trailing line. `offsets`, if given,
     receives each row's end offset so a caller can watermark per row."""
@@ -2353,6 +2388,8 @@ def _read_rows(path, start=0, offsets=None):
         with open(path, "rb") as f:
             f.seek(end)
             for line in f:
+                if stop is not None and end + len(line) > stop:
+                    break
                 if not line.endswith(b"\n"):
                     break
                 end += len(line)
@@ -2370,8 +2407,9 @@ def _read_rows(path, start=0, offsets=None):
 def _breadcrumb(what, exc):
     """ledger/.last_error — the one place a silent backstop failure is visible."""
     try:
-        _atomic_json(os.path.join(_ledger_dir(), ".last_error"),
-                     {"at": _now(), "what": what, "error": str(exc)[:300]})
+        _atomic_json(os.path.join(_fire_state_dir() if what == "flush" else _ledger_dir(), ".last_error"),
+                     {"at": datetime.now(timezone.utc).isoformat() if what == "flush" else _now(),
+                      "what": what, "error": str(exc)[:300]})
     except Exception:
         pass
 
@@ -2388,7 +2426,7 @@ def _breadcrumb_clear(what):
 
     Only clears a crumb this lane wrote: another lane's failure is still real.
     """
-    path = os.path.join(_ledger_dir(), ".last_error")
+    path = os.path.join(_fire_state_dir() if what == "flush" else _ledger_dir(), ".last_error")
     try:
         with open(path, encoding="utf-8") as f:
             crumb = json.load(f)
@@ -2400,7 +2438,7 @@ def _breadcrumb_clear(what):
 
 
 def _sent_path():
-    return os.path.join(_ledger_dir(), ".sent")
+    return os.path.join(_fire_state_dir(), ".sent")
 
 
 def load_sent():
@@ -2430,7 +2468,31 @@ def _older_than(iso, seconds):
     return (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() > seconds
 
 
-def pending_batches(sent):
+def pending_batches(sent, observation=None):
+    """Replay a stalled prefix independently of later ledger appends."""
+    stall = sent.get("stall") or {}
+    boundary = stall.get("read") if isinstance(stall, dict) else None
+    if isinstance(boundary, dict):
+        valid = True
+        for kind in ("fires", "conversions"):
+            end = boundary.get(kind + "_offset")
+            try:
+                size = os.path.getsize(os.path.join(_ledger_dir(), kind + ".jsonl"))
+            except FileNotFoundError:
+                size = 0
+            if type(end) is not int or not sent.get(kind + "_offset", 0) <= end <= size:
+                valid = False
+        if valid:
+            frozen, _ = _pending_batches(sent, boundary)
+            if frozen:
+                remainder = dict(frozen[0][1])
+                remainder.pop("stall", None)
+                later, new_sent = _pending_batches(remainder, observation=observation)
+                return frozen[:1] + later, new_sent
+    return _pending_batches(sent, observation=observation)
+
+
+def _pending_batches(sent, boundary=None, observation=None):
     """Rows to POST = fires past the watermark ∪ fires named by conversions past
     THEIR watermark (each re-sent with converted/converted_at merged — the
     ingest is an upsert on fire_id, so a re-send is an update, never a dup).
@@ -2443,16 +2505,24 @@ def pending_batches(sent):
     ldir = _ledger_dir()
     fpath, cpath = os.path.join(ldir, "fires.jsonl"), os.path.join(ldir, "conversions.jsonl")
     f_offsets = []
-    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets)
+    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets,
+                                boundary.get("fires_offset") if boundary else None)
     c_offsets = []
-    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets)
+    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets,
+                                boundary.get("conversions_offset") if boundary else None)
+    if observation is not None:
+        observation.update(fires_offset=f_end, conversions_offset=c_end)
     if not new_fires and not new_convs:
         return [], dict(sent, fires_offset=f_end, conversions_offset=c_end)
     # New fires carry their own rows. A NEW conversion may name a fire behind
     # the watermark; only THOSE ids are looked up, streaming the ledger without
     # holding it (bounded by the number of new conversions, not by history).
-    by_id = {r["fire_id"]: r for r in new_fires if isinstance(r, dict) and r.get("fire_id")}
-    wanted = {c.get("fire_id") for c in new_convs if isinstance(c, dict)} - set(by_id)
+    def fire_id(row):
+        value = row.get("fire_id") if isinstance(row, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    by_id = {fire_id(r): dict(r) for r in new_fires if fire_id(r)}
+    wanted = {fire_id(c) for c in new_convs if fire_id(c)} - set(by_id)
     if wanted:
         try:
             with open(fpath, "rb") as f:
@@ -2463,7 +2533,7 @@ def pending_batches(sent):
                         r = json.loads(line.decode("utf-8"))
                     except Exception:
                         continue
-                    if isinstance(r, dict) and r.get("fire_id") in wanted:
+                    if fire_id(r) in wanted:
                         by_id[r["fire_id"]] = r
                         wanted.discard(r["fire_id"])
                         if not wanted:
@@ -2479,7 +2549,7 @@ def pending_batches(sent):
     # never stall the conversions behind it.
     c_start = sent.get("conversions_offset", 0)
     for i, c in enumerate(new_convs):
-        if isinstance(c, dict) and c.get("fire_id") and c["fire_id"] not in by_id \
+        if fire_id(c) and fire_id(c) not in by_id \
                 and not _older_than(c.get("converted_at"), CONVERSION_HOLD_S):
             c_end = c_offsets[i - 1] if i else c_start
             new_convs = new_convs[:i]
@@ -2487,19 +2557,26 @@ def pending_batches(sent):
     new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
     # Only conversions past THEIR watermark need merging: the two offsets
     # advance together, so an older conversion was shipped with its fire.
+    converted_ids = set()
     for c in new_convs:
-        if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
+        if fire_id(c) in by_id and c.get("converted"):
+            converted_ids.add(fire_id(c))
             by_id[c["fire_id"]]["converted"] = True
             by_id[c["fire_id"]]["converted_at"] = c.get("converted_at")
     # (row, fires_offset once this row is accepted); conversion re-sends carry
     # no fires progress of their own, so they inherit the last fire's offset.
     items, seen = [], set()
     for r, off in zip(new_fires, f_offsets):
-        if isinstance(r, dict) and r.get("fire_id") and r["fire_id"] not in seen:
-            items.append((wire_row(by_id.get(r["fire_id"], r)), off))
-            seen.add(r["fire_id"])
+        # Preserve every input row, including duplicate IDs and malformed
+        # objects, so the receiver accounts for acceptance/rejection per row.
+        value = dict(r) if isinstance(r, dict) else {}
+        if fire_id(r) in converted_ids:
+            for key in ("converted", "converted_at"):
+                value[key] = by_id[fire_id(r)].get(key)
+        items.append((wire_row(value), off))
+        seen.add(fire_id(r))
     for c in new_convs:
-        fid = c.get("fire_id") if isinstance(c, dict) else None
+        fid = fire_id(c)
         if fid in by_id and fid not in seen:
             items.append((wire_row(by_id[fid]), None))
             seen.add(fid)
@@ -2508,9 +2585,9 @@ def pending_batches(sent):
     # conversions are credited once the last batch that carries ANY converted
     # row (a re-send, or a new fire whose conversion was merged in) is
     # accepted — a later failed batch must still re-merge its conversions
-    conv_ids = {c.get("fire_id") for c in new_convs if isinstance(c, dict)}
+    conv_ids = {fire_id(c) for c in new_convs if fire_id(c)}
     last_conv = max([-1] + [i for i, (r, o) in enumerate(items)
-                            if o is None or r.get("fire_id") in conv_ids])
+                            if o is None or fire_id(r) in conv_ids])
     for i in range(0, len(items), FLUSH_BATCH):
         chunk = items[i:i + FLUSH_BATCH]
         fo = max([fo] + [o for _, o in chunk if o is not None])
@@ -2535,14 +2612,14 @@ def _log_rejected(rejected, batch):
         else:
             items = []
         if items:
-            with open(os.path.join(_ledger_dir(), "rejected.jsonl"), "a", encoding="utf-8") as f:
+            with open(os.path.join(_fire_state_dir(), "rejected.jsonl"), "a", encoding="utf-8") as f:
                 for it in items:
                     f.write(json.dumps(dict(it, at=_now())) + "\n")
     except Exception:
         pass
 
 
-def flush_fires(final=False):
+async def _flush_fires(final=False):
     """POST unsent rows in batches. The watermark advances ONLY on a 2xx, so
     a failed batch is retried, verbatim, on the next flush; `rejected` rows
     are logged locally and never retried (they sit behind the watermark).
@@ -2550,7 +2627,9 @@ def flush_fires(final=False):
     if portable_lock is None:
         # Retain the ledger rather than advancing it without process exclusivity.
         return
-    ldir = _ledger_dir()
+    import capture_async
+    from functools import partial
+    ldir = _fire_state_dir()
     lock = open(os.path.join(ldir, ".flush.lock"), "a+", encoding="utf-8")
     try:
         portable_lock.lock_exclusive(lock.fileno(), blocking=False)
@@ -2559,7 +2638,8 @@ def flush_fires(final=False):
         return
     try:
         sent = load_sent()
-        batches, new_sent = pending_batches(sent)
+        observation = {}
+        batches, new_sent = pending_batches(sent, observation)
         n = sum(len(b) for b, _ in batches)
         if not n:
             return
@@ -2571,37 +2651,49 @@ def flush_fires(final=False):
                 age = float("inf")
             if n < FLUSH_EVERY_FIRES and age < FLUSH_EVERY_S:
                 return
-        api = _api()
+        api = await capture_async.blocking(_capture_api)
         if not api:
+            _breadcrumb("flush", "no usable capture credential")
             return
         base, bearer, http = api
         accepted = 0
         for batch, after in batches:
             try:
-                reply = http.rest(f"{base}{API_PATH}/fires", bearer, "POST",
-                                  body={"fires": batch}, timeout=FLUSH_TIMEOUT_S)
+                reply = await capture_async.blocking(partial(
+                    http.rest, f"{base}{API_PATH}/fires", bearer, "POST",
+                    body={"fires": batch}, timeout=FLUSH_TIMEOUT_S))
             except Exception as exc:      # transport/envelope error: retry next flush,
                 _breadcrumb("flush", exc)  # but say so where an operator can look
                 return
             if reply.status not in (200, 201, 202):
+                _breadcrumb("flush", f"HTTP {reply.status}")
                 return                    # watermark stays at the last accepted batch
             data = reply.data if isinstance(reply.data, dict) else {}
-            if not isinstance(data.get("accepted"), int):
+            if type(data.get("accepted")) is not int or not 0 <= data["accepted"] <= len(batch):
+                _breadcrumb("flush", "invalid accepted count")
                 return                    # not the §4.3 reply → do not trust it as a receipt
-            rej = data.get("rejected")
-            n_rej = len(rej) if isinstance(rej, list) else (rej if isinstance(rej, int) else 0)
+            rej = data.get("rejected", 0)
+            n_rej = len(rej) if isinstance(rej, list) else (rej if type(rej) is int else -1)
+            if not 0 <= n_rej <= len(batch) or data["accepted"] + n_rej > len(batch):
+                _breadcrumb("flush", "invalid rejected count")
+                return
+            batch_key = hashlib.sha256(json.dumps(batch, sort_keys=True).encode("utf-8")).hexdigest()
             if data["accepted"] + n_rej < len(batch):
                 # Short-counted: retry — but not forever. The same batch (same
-                # first fire_id) short-counting STALL_QUARANTINE_AFTER times in
+                # projected rows) short-counting STALL_QUARANTINE_AFTER times in
                 # a row is a poison batch: log it as rejected and move past it,
                 # so one bad row can never strand every fire behind it.
-                key = batch[0].get("fire_id")
                 cur = load_sent()             # the on-disk state, including any
                 stall = cur.get("stall") or {}  # progress written by earlier batches
-                n = (stall.get("n", 0) + 1) if stall.get("key") == key else 1
+                n = (stall.get("n", 0) + 1) if stall.get("key") == batch_key else 1
                 if n < STALL_QUARANTINE_AFTER:
-                    cur["stall"] = {"key": key, "n": n}
+                    # Read bounds include conversion lookahead whose progress
+                    # cannot commit until a later batch has also succeeded.
+                    read = stall.get("read") if stall.get("key") == batch_key else None
+                    cur["stall"] = {"key": batch_key, "n": n,
+                                    "read": read or observation}
                     _atomic_json(_sent_path(), cur)
+                    _breadcrumb("flush", "receiver did not account for every input row")
                     return
                 _log_rejected([{"fire_id": r.get("fire_id"), "reason": "quarantined: short-counted "
                                 f"{n}x (accepted {data['accepted']}, rejected {n_rej} of {len(batch)})"}
@@ -2609,18 +2701,40 @@ def flush_fires(final=False):
             else:
                 _log_rejected(rej, batch)
             accepted += data["accepted"]
-            if (sent.get("stall") or {}).get("key") != batch[0].get("fire_id"):
+            if (sent.get("stall") or {}).get("key") != batch_key:
                 after["stall"] = sent.get("stall")   # an accepted batch clears only ITS OWN marker
             else:
                 after.pop("stall", None)
             if after.get("stall") is None:
                 after.pop("stall", None)
-            after["last_flush_at"] = _now()
+            after["last_flush_at"] = datetime.now(timezone.utc).isoformat()
             after["last_accepted"] = accepted
             _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
+            sent = after
+            _breadcrumb_clear("flush")
     finally:
         portable_lock.unlock(lock.fileno())
         lock.close()
+
+
+def _flush_fires_for_sink(final=False):
+    import asyncio
+    import capture_context
+    try:
+        asyncio.run(asyncio.wait_for(_flush_fires(final),
+                    timeout=capture_context.time_budget() or FIRE_FLUSH_BUDGET_S))
+    except Exception as error:
+        _breadcrumb("flush", type(error).__name__)
+
+
+def flush_fires(final=False):
+    """Deliver the shared immutable ledger with independent destination state."""
+    import capture_context
+    try:
+        capture_context.deliver({}, lambda _: _flush_fires_for_sink(final), FIRE_FLUSH_BUDGET_S)
+    except Exception as error:
+        # Configuration errors cannot silently select a different destination.
+        print(f"[memhub-capture] rule-fire delivery deferred ({type(error).__name__})", file=sys.stderr)
 
 
 def repo_info(cwd):
@@ -3357,16 +3471,17 @@ def agent_id_of(data):
 def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None,
               override_reasons=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
-    `excerpt` stays in this LOCAL file and never crosses the wire without
-    org opt-in. `override_reasons` is {rule_id: why} for the gates this call
+    `excerpt` is redacted and stays local: only an explicitly configured
+    loopback destination receives it. `override_reasons` is {rule_id: why} for the gates this call
     excused, so a row records the reason for ITS rule — one call can excuse one
-    gate and be blocked by another (§5.3). `rulebook_id` is local too — POST /fires carries no book
-    dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
-    it is here so a local reader can tell which book a fire came from.
+    gate and be blocked by another (§5.3). The legacy cloud envelope excludes
+    book dimensions; loopback projection carries rule_source_id when known.
+    Evaluation source is recorded here, never inferred from the upload target.
     Returns {rule_id: fire_id} so conversions can point back."""
     if portable_lock is None:
         # Enforcement still runs, but do not create telemetry that cannot drain.
         return {}
+    from redact import redact_text
     ids = {}
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
@@ -3377,6 +3492,10 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                 f.write(json.dumps({
                     "fire_id": fid, "rule_id": r["id"],
                     "rulebook_id": r.get("_rulebook_id"),
+                    "origin_sink": r.get("_origin_sink"),
+                    "rule_source_id": r.get("_rule_source_id"),
+                    "source_platform": ctx.get("source_platform"),
+                    "source_surface": ctx.get("source_surface"),
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
                     "source_message_id": ctx.get("source_message_id"),
@@ -3387,7 +3506,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "fired_at": _now(),
                     "converted": None, "converted_at": None,
                     "override_reason": (override_reasons or {}).get(r["id"]),
-                    "excerpt": excerpt[:160],
+                    "excerpt": redact_text(excerpt)[:2048],
                 }) + "\n")
     except Exception:
         pass
@@ -3604,7 +3723,12 @@ def main():
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
-           "source_message_id": message_id_of(data)}
+           "source_message_id": message_id_of(data),
+           "source_platform": "claude",  # This executable is registered only for Claude hooks.
+           # Same explicit-field precedence as conversation capture, without
+           # making foreground matcher enforcement depend on capture modules.
+           "source_surface": next((value for value in (data.get("source_surface"), data.get("entrypoint"))
+                                   if isinstance(value, str) and value.strip()), None)}
     if mode == "prompt":
         # UserPromptSubmit. It arms and says nothing: anything printed here is
         # injected above the person's own words, and an arming is not news —
@@ -3787,6 +3911,8 @@ def main():
             # `to_hook_rule` defaults `mode` to advise, so no gate arrives here.
             r = anchor_rules.get(rid) or to_hook_rule(row)
             if r is not None and r.get("on") == "anchor":
+                r["_origin_sink"] = "cloud"
+                r["_rule_source_id"] = r.get("_rulebook_id")
                 st["fired"].append(rid)
                 dedup_keys[rid] = rid
                 fired_now.append(r)

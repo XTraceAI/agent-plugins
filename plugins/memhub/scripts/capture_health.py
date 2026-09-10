@@ -348,7 +348,7 @@ def _succeeded_since(path: Path, when: float) -> bool:
 LANES = ("fetch", "flush", "recall")
 
 
-def _rulebook_problem() -> tuple[str, float] | None:
+def _rulebook_problem(*, include_flush=True) -> tuple[str, float] | None:
     """``(what, when)`` for a rulebook lane that is failing right now.
 
     The rulebook fails SILENTLY by construction: every lane exits 0 and the
@@ -369,7 +369,7 @@ def _rulebook_problem() -> tuple[str, float] | None:
     if not isinstance(crumb, dict):
         return None
     what, at = crumb.get("what"), crumb.get("at")
-    if what not in LANES or not isinstance(at, str):
+    if what not in LANES or (what == "flush" and not include_flush) or not isinstance(at, str):
         return None
     try:                       # the hook writes a local-offset ISO stamp
         when = datetime.fromisoformat(at).timestamp()
@@ -574,9 +574,30 @@ def _renewable_capture_credential(sink: sinks.Sink) -> bool:
     return False
 
 
+def _fire_capture_problem(sink):
+    directory = capture_context.state_directory(RULEBOOK_DIR / "ledger", sink)
+    try:
+        crumb = json.loads((directory / ".last_error").read_text(encoding="utf-8"))
+        if not isinstance(crumb, dict) or crumb.get("what") != "flush":
+            return False
+        when = datetime.fromisoformat(crumb["at"]).timestamp()
+        if when < time.time() - _STALE_AFTER_S:
+            return False
+        try:
+            sent = json.loads((directory / ".sent").read_text(encoding="utf-8"))
+            if datetime.fromisoformat(sent["last_flush_at"]).timestamp() >= when:
+                return False
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def _failure_category(reason: str) -> str:
     category = reason.split(":", 1)[0]
     return category if category in _REASONS else "error"
+
 
 
 def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
@@ -599,6 +620,10 @@ def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
             messages.append(f"Capture destination '{sink.name}': {reason}. "
                             "Its upload progress is retained for retry.")
             causes.append(f"capture:{sink.name}:{endpoint}:{category}")
+        if _fire_capture_problem(sink):
+            messages.append(f"Rule-fire capture destination '{sink.name}' could not complete its last upload. Its ledger is retained.")
+            causes.append(f"capture:{sink.name}:{endpoint}:fires")
+
     if host:
         problem = _token_problem(host)
         if problem:
@@ -606,7 +631,7 @@ def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
                             "Run /memhub:login --status. Local capture does not establish "
                             "cloud authentication.")
             causes.append(f"cloud:{host}:{problem}")
-        rulebook = _rulebook_problem()
+        rulebook = _rulebook_problem(include_flush=False)
         if rulebook:
             message = _message(host, None, None, rulebook)
             if message:

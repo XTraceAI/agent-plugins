@@ -392,3 +392,58 @@ for the session's lifetime, like timestamp pins. They are not evicted after a
 fixed number of generations: a destination that was offline, or is configured
 later, must still be able to receive earlier measured usage. Destination
 acknowledgements remain separate from this authoritative evidence.
+
+## Rule-event capture destinations
+
+The existing `rulebook_hook.py flush [final]` entrypoint delivers the shared
+append-only fire/conversion ledger to each active capture destination. Each
+gets its own URL-scoped watermark, nonblocking upload lock, throttle, failure
+breadcrumb and rejection log. Only the unchanged installed destination named
+`cloud` inherits the legacy flat ledger progress. Foreground rule fetching,
+recall and login keep the cloud-service resolver.
+
+Delivery reserves each destination part of one 60-second budget, with loopback
+first. A blocked lock or timed-out cloud response cannot hold local progress.
+The existing REST client and credential resolver are reused; no new transport
+or dependency is introduced. Fire hooks remain attached to the existing Claude
+Stop/SessionEnd events; this does not add fire hooks to other hosts.
+
+Every parsed ledger row participates in receiver accounting, including
+unchanged duplicate fire IDs. Three input rows with two unique IDs must yield
+`accepted: 3, rejected: 0` when all are valid, while storage stays at two fires.
+The client advances a batch only when accepted plus rejected accounts for every
+input row. Counts must be nonnegative integers and cannot exceed the batch size;
+an absent rejected count means zero. Malformed rows are individually rejected
+by the receiver. Repeated short-counted batches retain the existing three-attempt
+quarantine policy, independently per destination. A final flush bypasses the
+ordinary count/time throttle, and each accepted batch saves progress before the
+next request.
+
+Remote requests contain exactly the legacy `WIRE_KEYS`. Explicit loopback
+requests may additionally carry `origin_sink`, `rule_source_id`,
+`source_platform`, `source_surface`, and `excerpt`. Evaluation source and rule
+version are recorded when the fire is created; uploading a cloud-evaluated fire
+to local storage never relabels it as locally evaluated. Older rows without
+source evidence remain unknown. Newly evaluated fires record the known Claude
+platform; an explicit source surface or entrypoint is preserved with the same
+field precedence as conversation capture, while an unobserved surface remains unknown.
+Excerpts are redacted using the existing token
+redactor before being capped at 2,048 Unicode characters. This is shape-based
+redaction, not a guarantee against arbitrary sensitive text. Projection never
+rewrites the shared ledger, and remote payloads never include excerpts or these
+local extensions.
+
+The local receiver owns retention: metadata-only mode must reject new excerpt
+and ask-result content even on enrichment, without erasing existing content.
+The disposable receivers in `tests/rulebook_sinks_test.py` model that contract;
+they do not implement or certify the desktop's rule-event intake. Installing
+this plugin change alone does not provide a local server or alter its policy.
+
+Validation: `python3 tests/rulebook_sinks_test.py` covers real executable hooks,
+replay accounting, rejected rows, independent recovery/quarantine/throttling,
+legacy state adoption, both projection orders, bounded/redacted excerpts,
+metadata-only receiver behavior and slow/locked cloud isolation. Existing
+`rulebook_client_test.py` keeps the direct legacy transport contract, and
+`capture_health_test.py` keeps cloud-service warnings covered. The complete
+`bash scripts/check-plugin.sh` gate exercises all suites with bare Python and
+the MCP SDK.

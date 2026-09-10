@@ -121,7 +121,13 @@ class Fake:
 
 
 def run(mode, payload, env, extra_args=()):
-    p = subprocess.run([sys.executable, HOOK, mode, *extra_args], input=json.dumps(payload),
+    command = [sys.executable, HOOK, mode, *extra_args]
+    if mode == "flush":
+        # Keep the original legacy transport contract isolated here; the real
+        # multi-destination entrypoint is covered by rulebook_sinks_test.py.
+        code = "import sys;sys.path.insert(0," + repr(os.path.dirname(HOOK)) + ");import rulebook_hook as h;h._flush_fires_for_sink(final='final' in sys.argv[1:])"
+        command = [sys.executable, "-c", code, *extra_args]
+    p = subprocess.run(command, input=json.dumps(payload),
                        capture_output=True, text=True, env=dict(os.environ, **env), timeout=60)
     if p.stderr.strip():
         print("STDERR:", p.stderr[-800:])
@@ -423,7 +429,7 @@ def main():
             check(f"flush: 2xx with {bad} leaves the watermark",
                   json.load(open(sent_p, encoding="utf-8"))["fires_offset"] == before_off)
         check("flush: an envelope error leaves a breadcrumb in ledger/.last_error",
-              "forbidden" in json.load(open(os.path.join(td, "ledger", ".last_error"), encoding="utf-8"))["error"])
+              json.load(open(os.path.join(td, "ledger", ".last_error"), encoding="utf-8"))["what"] == "flush")
         fake.post_reply = {"accepted": None, "rejected": 0}
         run("flush", {"session_id": "f6"}, env, ("final",))
         n_posts = len(fake.posts())
@@ -533,16 +539,16 @@ def main():
                 f.write(json.dumps({"fire_id": f"pb-{i}", "rule_id": "srv-bash", "fired_at": "t"}) + "\n")
         calls = {"n": 0}
         class _R:
-            def __init__(self, ok): self.status = 202 if ok else 500; self.data = {"accepted": 2, "rejected": 0} if ok else None
+            def __init__(self, ok, count): self.status = 202 if ok else 500; self.data = {"accepted": count, "rejected": 0} if ok else None
         class _Http:
             @staticmethod
             def rest(url, bearer, method, body=None, headers=None, timeout=None):
                 calls["n"] += 1
-                return _R(calls["n"] != 2)
+                return _R(calls["n"] != 2, len(body["fires"]))
         H._api = lambda: ("http://x", "t", _Http)
-        H.flush_fires(final=True)
+        H._flush_fires_for_sink(final=True)
         after1 = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
-        H.flush_fires(final=True)
+        H._flush_fires_for_sink(final=True)
         after2 = json.load(open(sent_p, encoding="utf-8"))["fires_offset"]
         check("flush: per-batch watermark — an accepted batch is never re-sent after a later batch fails",
               after1 < after2 == os.path.getsize(ledger) and calls["n"] == 4, f"{after1} {after2} {calls}")
