@@ -1,4 +1,6 @@
-# Native reader stream
+# Plugin wire contracts
+
+## Native reader stream
 
 `python3 plugins/memhub/scripts/readers_cli.py --host codex|cursor` reads native
 session files and emits JSON Lines on stdout. It uses the same canonical record
@@ -70,3 +72,75 @@ tests under isolated bare Python and MCP SDK environments. Existing reader,
 Cursor usage and timestamp suites continue to cover cumulative usage,
 deduplication and unobserved usage. No network or MCP import is needed by the
 reader CLI; subprocess tests reject both.
+
+## Capture destination API
+
+`plugins/memhub/scripts/sinks.py` provides a read-only destination resolver for
+capture consumers. Callers must explicitly adopt it. Existing hooks and the
+cloud-service functions in `_memhub_auth` keep their current routing; adding
+this configuration file alone does not change a running capture pipeline.
+
+The resolver reads `~/.config/memhub-plugin/config.json`:
+
+```json
+{
+  "version": 1,
+  "sinks": [
+    {"name": "local", "url": "http://127.0.0.1:47421", "token": "local"}
+  ],
+  "active": ["local"]
+}
+```
+
+`sinks` is a registry; `active` is its ordered membership. Adding an entry does
+not activate it. Names contain 1–64 ASCII letters, digits, underscores or
+hyphens, and must be unique. The optional `mcp_path` defaults to
+`/mcp-server/mcp` and is appended to the base URL. A base URL cannot contain
+userinfo, a query or fragment. Remote destinations require HTTPS; HTTP is
+accepted only for literal `localhost`, `127.0.0.1` or `::1`. Tokens are optional
+nonempty ASCII bearer values without whitespace/control characters.
+
+Selection follows this order:
+
+1. `MEMHUB_MCP_BASE_URL` selects one explicit endpoint, with the existing
+   `MEMHUB_MCP_SERVER_PATH` behavior, ignoring file and named selection.
+2. Otherwise `MEMHUB_SINKS` selects comma-separated registry names when present.
+3. Otherwise the file's `active` names are used.
+4. A missing, unreadable or corrupt file preserves the legacy cloud destination
+   from the installed `.mcp.json` and existing install-path fallback.
+
+Selecting the name `cloud` without a registry entry synthesizes that legacy
+destination. Repeated selected names are deduplicated. An explicitly empty
+active list or empty `MEMHUB_SINKS` disables selection. Unknown names, unsupported
+integer configuration versions, unsafe endpoints, duplicate sink names and
+invalid explicit destinations raise `SinkConfigError` without selecting another
+destination. Files are bounded to 64 KiB; malformed JSON, duplicate JSON keys
+and malformed outer structure are treated as corrupt-file fallback.
+
+`resolve_capture_sink()` returns an immutable `Sink` or `None` when explicitly
+disabled. It rejects multiple active destinations until a caller implements
+independent delivery. `active_sink_names()` exposes the validated ordered names.
+A `Sink.url` is the complete MCP endpoint, `mcp_path` retains its path/query,
+and `is_local` describes a literal loopback destination. Its representation
+omits URLs and credentials.
+
+`resolve_capture_auth(sink)` returns `(endpoint, bearer)` with this precedence:
+explicit `MEMHUB_TOKEN`, selected sink token, then existing credentials looked
+up for the selected endpoint. Existing caches remain keyed by backend host and
+port; this does not add path-specific credential storage. The resolver never
+borrows the default cloud host's credential for a different host. OAuth refresh
+uses installed-plugin metadata only for that same backend origin; another
+origin can use its own stored PAK or still-valid cached token without sending
+its refresh token to the installed backend's authorization server.
+
+File-based capture selection does not change `default_url()`, unqualified
+`resolve_bearer()` or `resolve_url_and_auth()`. Login, recall, brain overview and
+artifact consumers continue using their existing cloud-service resolver.
+The explicit environment variables retain their existing global semantics.
+
+`python3 tests/sinks_test.py` checks precedence, corruption fallback, explicit
+disablement, invalid/unknown selections, loopback/TLS restrictions, distinct
+stored backend credentials, refresh-origin isolation and unchanged service
+resolution. It checks configuration bytes and absence of account writes, and
+runs under bare Python while rejecting MCP imports and network access.
+Hook delivery and capture-health integration are separate acceptance work.
