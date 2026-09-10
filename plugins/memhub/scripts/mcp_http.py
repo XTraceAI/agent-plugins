@@ -384,7 +384,7 @@ def texts_of(res) -> list[str]:
                         for b in getattr(res, "content", []) or []) if t]
 
 
-def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
+def ack_of(res, expected_conversation_id: str | None = None, *, prefer=None) -> dict | None:
     """The import ack carried by a tool result, or None if it carries none.
 
     A server may answer with structuredContent, a FastMCP ``result`` wrapper,
@@ -444,6 +444,12 @@ def ack_of(res, expected_conversation_id: str | None = None) -> dict | None:
         # safe direction.
         acks = [c for c in acks
                 if c.get("conversation_id") == expected_conversation_id]
+    # A batch-aware caller can recognize complete drop accounting even when
+    # both the envelope and the actual receipt carry a null ack_through.
+    if prefer is not None:
+        for candidate in acks:
+            if prefer(candidate):
+                return candidate
     for c in acks:
         if c.get("ack_through"):
             return c
