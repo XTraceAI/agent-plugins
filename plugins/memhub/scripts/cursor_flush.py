@@ -1390,7 +1390,14 @@ def main() -> int:
         if not isinstance(payload, dict):
             return 0
         started = time.monotonic()
-        selected = capture_context.resolve_capture_sinks()
+        try:
+            selected = capture_context.resolve_capture_sinks()
+        except Exception:
+            # Native usage remains observable even when delivery configuration
+            # is invalid; do not make this local evidence depend on auth/routing.
+            _run_sink(payload, observations_only=True,
+                      timeout=max(0.0, FLUSH_TIMEOUT_S - (time.monotonic() - started)))
+            raise
         # Reserve source observation a share too, so a slow first read cannot
         # consume every destination's chance. Selection stays fixed for this hook.
         _run_sink(payload, observations_only=True,
