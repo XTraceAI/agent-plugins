@@ -159,12 +159,14 @@ def test_codex_one_unwritable_destination_does_not_abort_the_other():
 
 
 def test_codex_slow_local_preparation_preserves_cloud_budget_without_late_progress():
-    for operation in ["canonicalize","redact"]:
+    for operation in ["canonicalize","redact","locate"]:
         order=[]
         with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
             home=Path(td);payload,path=source(home);cases.configure(home,local[0])
             env=cases.environment(home,cloud[0]);guard=home/"guard/sitecustomize.py"
-            target="codex_flush.codex_reader.to_canonical" if operation=="canonicalize" else "codex_flush.redact_once"
+            target={"canonicalize":"codex_flush.codex_reader.to_canonical",
+                    "redact":"codex_flush.redact_once", "locate":"codex_flush.codex_reader.locate"}[operation]
+            if operation=="locate": payload={"session_id":SID}
             with guard.open("a") as output:
                 output.write("\nimport time,codex_flush,capture_context\n"
                     f"original_prepare={target}\n"
@@ -181,7 +183,10 @@ def test_codex_slow_local_preparation_preserves_cloud_budget_without_late_progre
             assert order==["cloud"],(operation,order)
             assert state(home,"cloud",local[0])["rollout_size"]==path.stat().st_size
             assert not state(home,"local",local[0]).get("rollout_size")
-            assert "TimeoutError" in state(home,"local",local[0])["last_error"]
+            if operation!="locate":
+                assert "TimeoutError" in state(home,"local",local[0])["last_error"]
+            assert not state(home,"local",local[0]).get("fail_streak")
+            assert not state(home,"local",local[0]).get("unsupported")
 
 
 def test_codex_reuses_prepared_metadata_without_a_second_filesystem_probe():

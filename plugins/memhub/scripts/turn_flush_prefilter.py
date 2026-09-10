@@ -94,12 +94,13 @@ def main() -> int:
         return 1
 
     selected = sinks.resolve_capture_sinks()
+    key = capture_context.session_file_key(session_id)
     for sink in selected:
         state_dir = capture_context.state_directory(STATE_DIR, sink)
-        if _lock_is_held(state_dir / f"{session_id}.lock"):
+        if _lock_is_held(state_dir / f"{key}.lock"):
             continue
         try:
-            state = json.loads((state_dir / f"{session_id}.json").read_text(encoding="utf-8"))
+            state = json.loads((state_dir / f"{key}.json").read_text(encoding="utf-8"))
             offset = int(state.get("offset", 0))
         except (OSError, ValueError, TypeError):
             return 0
