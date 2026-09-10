@@ -149,7 +149,7 @@ def clean_user_text(text: str) -> str | None:
     return t
 
 
-def load_rollout(path) -> list[dict]:
+def load_rollout(path, *, strict_utf8: bool = False) -> list[dict]:
     """Parse a Codex rollout .jsonl tolerantly (skip malformed lines, e.g. a
     truncated final line from an interrupted write).
 
@@ -157,7 +157,8 @@ def load_rollout(path) -> list[dict]:
     are UTF-8, a bare read_text() decodes with the OS locale codec, and one
     em-dash then kills the whole import on a cp950/cp1252 box."""
     records: list[dict] = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+    errors = "strict" if strict_utf8 else "replace"
+    for line in Path(path).read_text(encoding="utf-8", errors=errors).splitlines():
         line = line.strip()
         if not line:
             continue
@@ -746,6 +747,6 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path) -> tuple[list[dict], dict]:
+def to_canonical(path, *, strict_utf8: bool = False) -> tuple[list[dict], dict]:
     """Load a rollout and transform it to Claude-shaped records."""
-    return rollout_to_claude_records(load_rollout(path))
+    return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8))

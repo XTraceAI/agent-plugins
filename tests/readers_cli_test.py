@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -231,13 +232,13 @@ def test_reader_errors_never_emit_partial_session_records():
         path = rollout(Path(td))
         original = codex.to_canonical
 
-        def malformed(source):
-            records, native = original(source)
+        def malformed(source, **kwargs):
+            records, native = original(source, **kwargs)
             records[-1]["synthetic_invalid_number"] = float("nan")
             return records, native
 
-        def changing(source):
-            result = original(source)
+        def changing(source, **kwargs):
+            result = original(source, **kwargs)
             with source.open("a") as handle:
                 handle.write('{}\n')
             return result
@@ -258,6 +259,84 @@ def test_store_paths_with_uri_characters_remain_read_only():
         result, rows = run(home, "cursor")
         assert result.returncode == 0 and len(rows) > 1, result.stderr
         assert path.read_bytes() == before
+
+
+def test_invalid_utf8_is_incomplete_without_changing_legacy_reader_tolerance():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        path = rollout(home)
+        lines = path.read_bytes().splitlines(keepends=True)
+        padding = json.dumps({"type": "synthetic-padding", "value": "x" * 9000}).encode() + b"\n"
+        path.write_bytes(lines[0] + padding + b"".join(lines[1:]).replace(b"On it.", b"bad\xfftext"))
+        legacy, _ = codex.to_canonical(path)
+        assert "\ufffd" in json.dumps(legacy, ensure_ascii=False)
+        result, rows = run(home, "codex")
+        assert result.returncode == 2 and rows == [] and "session_unreadable" in result.stderr
+        assert "bad" not in result.stderr and "Traceback" not in result.stderr
+        store = fixtures._make_cursor_store(home / ".cursor/chats")
+        with sqlite3.connect(store) as connection:
+            identity, data = next((key, value) for key, value in connection.execute("SELECT id,data FROM blobs")
+                                  if isinstance(value, bytes) and b'"role": "assistant"' in value)
+            message = json.loads(data)
+            message["content"] = [{"type": "text", "text": "badXtext"}]
+            invalid = json.dumps(message).encode().replace(b"badXtext", b"bad\xfftext")
+            connection.execute("UPDATE blobs SET data=? WHERE id=?", (invalid, identity))
+        legacy, _ = cursor.to_canonical(store)
+        assert "\ufffd" in json.dumps(legacy, ensure_ascii=False)
+        result, rows = run(home, "cursor")
+        assert result.returncode == 2 and rows == [] and "session_unreadable" in result.stderr
+
+
+def test_oversized_native_start_keeps_healthy_peer_sessions():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        path = fixtures._make_cursor_store(home / ".cursor/chats", uuid="bad-start")
+        meta_path = path.parent / "meta.json"
+        meta = json.loads(meta_path.read_text());meta["createdAtMs"] = 10 ** 400
+        meta_path.write_text(json.dumps(meta))
+        transcript(home)
+        result, rows = run(home, "cursor", "--metadata-only")
+        assert result.returncode == 2 and "session_unreadable" in result.stderr
+        assert [row["native_session_id"] for row in rows] == [SID]
+        assert "Traceback" not in result.stderr
+
+
+def test_wal_snapshot_reads_latest_records_without_native_sidecar_writes():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        path = fixtures._make_cursor_store(home / ".cursor/chats")
+        script = '''import hashlib,json,os,sqlite3,sys
+con=sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA journal_mode=WAL")
+con.execute("PRAGMA wal_autocheckpoint=0")
+body=json.dumps({"role":"assistant","content":[{"type":"text","text":"WAL_ONLY_REPLY"}]}).encode()
+identity=hashlib.sha256(body).hexdigest()
+con.execute("INSERT INTO blobs(id,data) VALUES (?,?)",(identity,body))
+con.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
+con.commit()
+os._exit(0)
+'''
+        result = subprocess.run([sys.executable, "-c", script, str(path)],
+                                env={"HOME": td, "USERPROFILE": td}, capture_output=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+        wal = path.with_name("store.db-wal")
+        assert wal.exists()
+        path.with_name("store.db-shm").unlink(missing_ok=True)
+        files = list(path.parent.iterdir())
+        before = {file.name: file.read_bytes() for file in files}
+        for file in files:
+            file.chmod(0o400)
+        path.parent.chmod(0o500)
+        try:
+            result, rows = run(home, "cursor")
+            assert result.returncode == 0 and "WAL_ONLY_REPLY" in result.stdout, result.stderr
+            again, replay = run(home, "cursor")
+            assert again.returncode == 0 and replay == rows
+            assert {file.name: file.read_bytes() for file in path.parent.iterdir()} == before
+        finally:
+            path.parent.chmod(0o700)
+            for file in path.parent.iterdir():
+                file.chmod(0o600)
 
 
 if __name__ == "__main__":
