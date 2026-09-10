@@ -725,7 +725,7 @@ def session_metadata(path) -> dict:
     source = Path(path)
     if source.name == "store.db":
         with (source.parent / "meta.json").open(encoding="utf-8") as handle:
-            meta = json.load(handle)
+            meta = load_json(handle.read(), strict=True)
         if not isinstance(meta, dict) or meta.get("schemaVersion") != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
         created = meta.get("createdAtMs")
