@@ -79,9 +79,9 @@ def time_budget():
     return _budget.get()
 
 
-def deliver(payload, run_sink, timeout):
+def deliver(payload, run_sink, timeout, *, selected=None):
     """Freeze active destinations and reserve each a share of one deadline."""
-    selected = resolve_capture_sinks()
+    selected = resolve_capture_sinks() if selected is None else selected
     if not isinstance(payload, dict) or not selected:
         return
     try:
