@@ -128,6 +128,14 @@ def valid_session_id(value) -> bool:
                     for character in value))
 
 
+def session_file_key(value: str) -> str:
+    """Keep legacy names where bounded; reserve suffix/temp room for long IDs."""
+    if not valid_session_id(value):
+        raise ValueError("invalid native session identity")
+    # @ is excluded from native IDs, so a literal short ID cannot alias a hash.
+    return value if len(value) <= 200 else "@" + hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
 def resolve_bearer():
     sink = _current.get()
     return resolve_capture_auth(sink) if sink is not None else _memhub_auth.resolve_bearer()
