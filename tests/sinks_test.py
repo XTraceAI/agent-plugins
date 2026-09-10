@@ -188,6 +188,24 @@ def test_oauth_refresh_metadata_cannot_cross_backend_origins():
             assert refreshed == [CLOUD], "legacy backend refresh remains available"
 
 
+def test_equivalent_backend_origins_keep_refresh_available():
+    with isolated():
+        for installed, selected in [
+            ("https://cloud.example.test/mcp-server/mcp", "https://CLOUD.example.test:443/mcp-server/mcp"),
+            ("http://localhost/mcp", "http://LOCALHOST:80/mcp"),
+            ("http://[::1]/mcp", "http://[::1]:80/mcp")]:
+            refreshed = []
+            with patch.object(auth, "_plugin_mcp_config", return_value={"url": installed}), \
+                    patch.object(auth, "_refresh_cached_token_if_stale", side_effect=refreshed.append), \
+                    patch.object(auth, "_cached_access_token", return_value="cached"):
+                assert sinks.resolve_capture_auth(sinks.Sink("selected", selected)) == (selected, "cached")
+                assert refreshed == [selected]
+        with patch.object(auth, "_refresh_cached_token_if_stale", side_effect=AssertionError("different origin")), \
+                patch.object(auth, "_cached_access_token", return_value="cached"):
+            selected = "https://cloud.example.test:8443/mcp"
+            assert sinks.resolve_capture_auth(sinks.Sink("other", selected)) == (selected, "cached")
+
+
 def test_bare_python_resolution_needs_no_network_or_mcp_sdk():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
