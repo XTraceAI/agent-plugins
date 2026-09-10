@@ -194,13 +194,16 @@ def test_equivalent_backend_origins_keep_refresh_available():
         for installed, selected in [
             ("https://cloud.example.test/mcp-server/mcp", "https://CLOUD.example.test:443/mcp-server/mcp"),
             ("http://localhost/mcp", "http://LOCALHOST:80/mcp"),
-            ("http://[::1]/mcp", "http://[::1]:80/mcp")]:
+            ("http://[::1]/mcp", "http://[::1]:80/mcp"),
+            ("https://[::1]/mcp", "https://[0:0:0:0:0:0:0:1]:443/mcp"),
+            ("https://[2001:db8::1]/mcp", "https://[2001:0db8:0:0:0:0:0:1]:443/mcp")]:
             refreshed = []
             with patch.object(auth, "_plugin_mcp_config", return_value={"url": installed}), \
                     patch.object(auth, "_refresh_cached_token_if_stale", side_effect=refreshed.append), \
                     patch.object(auth, "_cached_access_token", return_value="cached"):
                 assert sinks.resolve_capture_auth(sinks.Sink("selected", selected)) == (selected, "cached")
                 assert refreshed == [selected]
+                assert sinks.Sink("selected",selected).is_local == sinks.Sink("installed",installed).is_local
         with patch.object(auth, "_refresh_cached_token_if_stale", side_effect=AssertionError("different origin")), \
                 patch.object(auth, "_cached_access_token", return_value="cached"):
             selected = "https://cloud.example.test:8443/mcp"
@@ -284,6 +287,24 @@ def test_environment_base_query_is_rejected_before_path_composition():
         os.environ["MEMHUB_MCP_BASE_URL"]="http://localhost:47421"
         os.environ["MEMHUB_MCP_SERVER_PATH"]="/custom/mcp?mode=local"
         assert sinks.resolve_capture_sink().url=="http://localhost:47421/custom/mcp?mode=local"
+
+
+def test_ipv6_origin_forms_share_only_the_same_backends_credentials():
+    with isolated():
+        installed="https://[2001:db8::1]/mcp"
+        selected="https://[2001:0db8:0:0:0:0:0:1]:443/custom/mcp"
+        with patch.object(auth,"_plugin_mcp_config",return_value={"url":installed}):
+            pak.CACHE_DIR.mkdir()
+            pak.key_path(installed).write_text(json.dumps({"secret":"installed-key"}))
+            assert sinks.resolve_capture_auth(sinks.Sink("selected",selected),refresh=False)==(selected,"installed-key")
+            pak.key_path(installed).unlink()
+            auth.token_cache_path(installed).write_text(json.dumps({"access_token":"installed-access"}))
+            refreshed=[]
+            with patch.object(auth,"_refresh_cached_token_if_stale",side_effect=refreshed.append):
+                assert sinks.resolve_capture_auth(sinks.Sink("selected",selected))==(selected,"installed-access")
+            assert refreshed==[selected,installed]
+            for other in ["https://[2001:db8::2]/mcp","https://[2001:db8::1]:8443/mcp"]:
+                assert sinks.resolve_capture_auth(sinks.Sink("other",other),refresh=False)==(other,None)
 
 
 if __name__ == "__main__":
