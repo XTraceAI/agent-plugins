@@ -106,6 +106,8 @@ Cursor usage and timestamp suites continue to cover cumulative usage,
 deduplication and unobserved usage. No network or MCP import is needed by the
 reader CLI; subprocess tests reject both.
 
+Cursor `--session latest` prepares only the resolved native UUID after counting same-ID copies. Invalid metadata or state from an unrelated UUID cannot fail a healthy selected export; whole-host exports still report those damaged sessions.
+
 ## Capture destination API
 
 `plugins/memhub/scripts/sinks.py` provides a read-only destination resolver for
@@ -179,6 +181,13 @@ its refresh token to the installed backend's authorization server.
 A trailing DNS dot remains part of the URL host, so `https://example.test`
 and `https://example.test.` require their own credentials even if DNS resolves
 them to the same address ([URL Standard](https://url.spec.whatwg.org/#host-equivalence)).
+
+Sink names cannot be Windows device basenames such as `CON` or `COM1`,
+regardless of platform, because they also identify capture-state directories.
+
+Numeric IPv4 capture endpoints use canonical dotted-decimal addresses. Shortened,
+octal, hexadecimal and trailing-dot numeric aliases are rejected before credential
+lookup; DNS names and valid IPv6 literals keep their existing behavior.
 
 File-based capture selection does not change `default_url()`, unqualified
 `resolve_bearer()` or `resolve_url_and_auth()`. Login, recall, brain overview and
@@ -353,7 +362,11 @@ loopback first. Each endpoint owns its upload revision/blob set, acknowledged
 usage generations, provenance, backoff, dormancy and long-running upload lock.
 A held or slow cloud upload cannot block local capture or shared observations.
 The overall 240-second budget includes lock waits and reserves time for every
-remaining destination. Authentication and transport use cancellable waits.
+remaining destination. Initial observation gets a reserved share too. Source
+lookup, store/blob reads, canonicalization, redaction, metadata lookup,
+authentication and transport use cancellable daemon-worker waits. Workers only
+prepare values; the waiting owner publishes observations and delivery progress,
+so completion after a timeout cannot write late state or initiate an upload.
 
 The existing canonical reader supplies records; redaction is cached within the
 invocation. Requests retain byte-sized slices and contain at most 2,000 records.
@@ -366,7 +379,8 @@ preserved; old-cloud optional-field fallback does not alter record content.
 
 Run `python3 tests/cursor_sinks_test.py` for failure/recovery, both late-usage
 arrival orders, canonical parity, raw/unknown surfaces, legacy cloud dormancy,
-partial batches, bounded slow responses, busy destination locks and concurrent
+partial batches, slow preparation without late writes, bounded slow responses,
+busy destination locks and concurrent
 observation updates during an in-flight upload. Existing Cursor capture, usage
 and timestamp suites remain part of the full plugin check.
 

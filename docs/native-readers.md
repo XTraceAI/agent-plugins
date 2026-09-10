@@ -36,3 +36,5 @@ change adds no standalone stream command, destination selection or network call.
 Run `python3 tests/readers_validation_test.py` for strict/legacy parity, malformed
 rows, incomplete tails, byte decoding, saved observations, discovery errors and
 native metadata. Existing reader, usage and timestamp suites remain required.
+
+Strict Cursor validation also checks user text blocks in both store leaves and hook transcripts. Unsupported block kinds or non-string text reject the read. Store metadata honors JSON and UTF-8 strictness independently; JSON-only mode permits replacement-decoded text while UTF-8 strict mode rejects invalid bytes. Default capture behavior remains unchanged.

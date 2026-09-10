@@ -234,6 +234,38 @@ def test_delayed_destination_recovers_usage_older_than_five_hundred_twelve_gener
         assert json.loads(shared_path(home).read_text())['usage_events'][GEN]==original
 
 
+def test_cursor_slow_preparation_preserves_deadline_and_has_no_late_state_writes():
+    for operation in ["observation", "canonicalize", "redact", "store", "metadata"]:
+        order=[]
+        with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
+            home=Path(td);payload,path=source(home);cases.configure(home,local[0])
+            if operation=="store":
+                path=cases.routing.fixtures._make_cursor_store(home/".cursor/chats",uuid=SID)
+                payload={"session_id":SID}
+            env=cases.environment(home,cloud[0]);guard=home/"guard/sitecustomize.py"
+            target={"redact":"cursor_flush.redact_once", "store":"cursor_flush.current_blob_ids", "metadata":"cursor_flush.cursor_reader.session_metadata"}.get(operation,"cursor_flush.cursor_reader.to_canonical")
+            with guard.open("a") as output:
+                output.write("\nimport time,cursor_flush,capture_context\n"
+                    f"original_prepare={target}\n"
+                    "def slow_prepare(*args,**kwargs):\n"
+                    "    selected=capture_context._current.get()\n"
+                    f"    if (selected is None if {operation!r}=='observation' else selected is not None and selected.is_local): time.sleep(1.2)\n"
+                    "    return original_prepare(*args,**kwargs)\n"
+                    f"{target}=slow_prepare\n")
+            result=subprocess.run([sys.executable,"-c",
+                "import cursor_flush,time,sys;cursor_flush.FLUSH_TIMEOUT_S=0.8;sys.argv=['cursor_flush.py','stop'];"
+                "started=time.monotonic();cursor_flush.main();assert time.monotonic()-started<1.1;"
+                "saved={p:p.read_bytes() for p in cursor_flush.STATE_DIR.rglob('*.json')};time.sleep(1.3);"
+                "assert saved=={p:p.read_bytes() for p in cursor_flush.STATE_DIR.rglob('*.json')},'late state write'"],
+                env=env,input=json.dumps(measured(payload)),text=True,capture_output=True,timeout=5)
+            assert result.returncode==0 and "Traceback" not in result.stderr,(operation,result.stderr)
+            assert order==(["local","cloud"] if operation=="observation" else ["cloud"]),(operation,order)
+            assert state(home,"cloud",local[0]).get("transcript_revision") or state(home,"cloud",local[0]).get("blob_ids")
+            if operation!="observation":
+                assert not state(home,"local",local[0]).get("transcript_revision")
+                assert not state(home,"local",local[0]).get("blob_ids")
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
