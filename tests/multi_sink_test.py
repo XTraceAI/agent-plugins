@@ -373,6 +373,28 @@ def test_nested_and_text_acknowledgements_confirm_only_the_submitted_batch():
         assert state(home,"local",local[0])["offset"]==confirmed
 
 
+def test_large_native_records_are_elided_without_stranding_later_turns():
+    for tool in (False,True):
+        with tempfile.TemporaryDirectory() as td,receiver("local",[]) as local,receiver("cloud",[]) as cloud:
+            home=Path(td);data=payload(home);path=Path(data["transcript_path"])
+            configure(home,local[0],active=["local"])
+            content="x"*(17*1024*1024)
+            if tool:content=[{"type":"tool_result","tool_use_id":"large-call","content":content}]
+            row={"uuid":"large-record","type":"user","message":{"role":"user","content":content}}
+            with path.open("a") as handle:handle.write(json.dumps(row))
+            before=path.stat().st_size
+            invoke(home,cloud[0],data)
+            assert state(home,"local",local[0])["offset"]<before
+            with path.open("a") as handle:handle.write("\n")
+            append(path,99)
+            invoke(home,cloud[0],data)
+            received=[r for batch in routing.imports(local[1]) for r in batch["messages"]]
+            large=next(r for r in received if r["uuid"]=="large-record")
+            assert len(json.dumps(large))<3_500_000 and "elided" in json.dumps(large)
+            assert any(r["uuid"]=="record-99" for r in received)
+            assert state(home,"local",local[0])["offset"]==path.stat().st_size
+
+
 if __name__ == "__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
