@@ -184,6 +184,22 @@ def test_codex_slow_local_preparation_preserves_cloud_budget_without_late_progre
             assert "TimeoutError" in state(home,"local",local[0])["last_error"]
 
 
+def test_codex_reuses_prepared_metadata_without_a_second_filesystem_probe():
+    order=[]
+    with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
+        home=Path(td);payload,path=source(home);cases.configure(home,local[0])
+        env=cases.environment(home,cloud[0]);guard=home/"guard/sitecustomize.py"
+        with guard.open("a") as output:
+            output.write("\nimport codex_flush\n"
+                         "def forbidden_probe(*args,**kwargs): raise AssertionError('metadata was already prepared')\n"
+                         "codex_flush.codex_reader.session_metadata=forbidden_probe\n")
+        result=subprocess.run([sys.executable,str(cases.routing.SCRIPTS/"codex_flush.py"),"Stop"],
+            env=env,input=json.dumps(payload),text=True,capture_output=True,timeout=8)
+        assert result.returncode==0 and order==["local","cloud"],(order,result.stderr)
+        for receiver in [local,cloud]:
+            assert cases.routing.imports(receiver[1])[0].get("source_surface")==json.loads(path.read_text().splitlines()[0])["payload"].get("originator")
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
