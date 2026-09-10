@@ -158,6 +158,32 @@ def test_codex_one_unwritable_destination_does_not_abort_the_other():
         assert state(home,"cloud",local[0])["rollout_size"]==path.stat().st_size
 
 
+def test_codex_slow_local_preparation_preserves_cloud_budget_without_late_progress():
+    for operation in ["canonicalize","redact"]:
+        order=[]
+        with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
+            home=Path(td);payload,path=source(home);cases.configure(home,local[0])
+            env=cases.environment(home,cloud[0]);guard=home/"guard/sitecustomize.py"
+            target="codex_flush.codex_reader.to_canonical" if operation=="canonicalize" else "codex_flush.redact_once"
+            with guard.open("a") as output:
+                output.write("\nimport time,codex_flush,capture_context\n"
+                    f"original_prepare={target}\n"
+                    "def slow_prepare(*args,**kwargs):\n"
+                    "    if capture_context._current.get().is_local: time.sleep(1.2)\n"
+                    "    return original_prepare(*args,**kwargs)\n"
+                    f"{target}=slow_prepare\n")
+            started=time.monotonic()
+            result=subprocess.run([sys.executable,"-c",
+                "import codex_flush,time,sys;codex_flush.FLUSH_TIMEOUT_S=0.8;sys.argv=['codex_flush.py','Stop'];codex_flush.main();time.sleep(1.3)"],
+                env=env,input=json.dumps(payload),text=True,capture_output=True,timeout=5)
+            assert result.returncode==0 and "Traceback" not in result.stderr,result.stderr
+            assert time.monotonic()-started<2.5
+            assert order==["cloud"],(operation,order)
+            assert state(home,"cloud",local[0])["rollout_size"]==path.stat().st_size
+            assert not state(home,"local",local[0]).get("rollout_size")
+            assert "TimeoutError" in state(home,"local",local[0])["last_error"]
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -443,6 +443,11 @@ def _git_remote_basename(cwd: str) -> str | None:
     return None
 
 
+def _prepare_transcript(rollout: Path):
+    records, meta = codex_reader.to_canonical(rollout)
+    return records, meta, redact_once(elide_oversized_tool_results(records))
+
+
 async def _flush(sid: str, rollout: Path, size: int) -> None:
     # NB on shrink: the watermark is NOT reset here (before the send). Doing
     # so would drop the truncated rollout's content on a failed send —
@@ -451,7 +456,9 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # send simply retries; the retry is bounded by the 60s cooldown (non-Stop)
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
-    records, meta = codex_reader.to_canonical(rollout)
+    # Preparation can outlive this destination's budget. The worker only
+    # returns values; all state changes remain after the cancellable await.
+    records, meta, sendable = await capture_async.blocking(_prepare_transcript, rollout)
     state = _read_state(sid)
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
         pr_provenance.queued_urls(state, records)
@@ -465,7 +472,6 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             pending_pr_urls=pending_pr_urls,
             accepted_pr_urls=accepted_pr_urls,
         )
-    sendable = redact_once(elide_oversized_tool_results(records))
     if not sendable:
         # Nothing to send. Empty is normal for a rollout with no user turns
         # yet — but records>0 with sendable==0 means EVERYTHING redacted
