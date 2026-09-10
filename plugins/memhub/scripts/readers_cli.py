@@ -65,6 +65,27 @@ def source_revision(path: Path, host: str) -> tuple:
     return tuple(revision)
 
 
+def cursor_source(path: Path, *, select_saved=False) -> Path:
+    """Never restore index-derived pins onto a different representation."""
+    from cursor_flush import _read_state, _UUID_RE, _source_for
+    sid = path.parent.name if path.name == "store.db" else path.stem
+    if not _UUID_RE.fullmatch(sid):
+        return path
+    state = _read_state(sid, strict=True)
+    kind = state.get("source_kind")
+    if kind is None:
+        if state.get("usage_events") or any(state.get("record_ts", {}).values()):
+            raise ValueError("saved observations have no source provenance")
+        return path
+    if kind in {"store", "transcript"}:
+        _, saved, error = _source_for(sid, {}, state)
+        if saved is not None:
+            saved = saved.resolve(strict=True)
+            if select_saved or saved == path:
+                return saved
+    raise ValueError("saved observations belong to another source")
+
+
 def header_for(reader, path: Path, mtime: float) -> dict:
     native = reader.session_metadata(path)
     sid = native_text(native.get("session_id"), required=True)
@@ -147,6 +168,10 @@ def main(argv=None) -> int:
         path = Path(session["path"])
         try:
             path = path.resolve(strict=True)
+            if args.host == "cursor":
+                from cursor_flush import _UUID_RE
+                select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
+                path = cursor_source(path, select_saved=select_saved)
             revision = source_revision(path, args.host)
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
@@ -174,6 +199,7 @@ def main(argv=None) -> int:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
                     from cursor_flush import apply_session_state
+                    cursor_source(path)  # Revalidate against the state covered by this revision.
                     apply_session_state(records, header["native_session_id"], strict=True)
                 if records and validate_canonical(records):
                     raise ValueError("reader emitted invalid canonical records")
