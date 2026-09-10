@@ -152,6 +152,34 @@ def test_metadata_preserves_native_surface_start_and_unknowns_without_titles():
             assert cursor.session_metadata(native)['source_surface']=='cursor-ide'
 
 
+def test_strict_cursor_tree_rejects_missing_references_and_cycles_but_allows_shared_nodes():
+    for damage in ("missing_root", "missing_leaf", "missing_root_pointer", "cycle", "shared"):
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            with sqlite3.connect(store) as connection:
+                meta=json.loads(connection.execute("SELECT value FROM meta").fetchone()[0])
+                root=meta["latestRootBlobId"]
+                data=connection.execute("SELECT data FROM blobs WHERE id=?",(root,)).fetchone()[0]
+                children,_=cursor._parse_node(data)
+                if damage=="missing_root":
+                    connection.execute("DELETE FROM blobs WHERE id=?",(root,))
+                elif damage=="missing_leaf":
+                    connection.execute("DELETE FROM blobs WHERE id=?",(children[-1],))
+                elif damage=="missing_root_pointer":
+                    meta.pop("latestRootBlobId")
+                    connection.execute("UPDATE meta SET value=?",(json.dumps(meta),))
+                else:
+                    reference=root if damage=="cycle" else children[0]
+                    connection.execute("UPDATE blobs SET data=? WHERE id=?",(data+b"\x0a\x20"+bytes.fromhex(reference),root))
+            before=store.read_bytes()
+            expected=cursor.to_canonical(store)
+            if damage=="shared":
+                assert cursor.to_canonical(store,strict_json=True)==expected
+            else:
+                rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            assert store.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
