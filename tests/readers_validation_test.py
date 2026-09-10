@@ -98,6 +98,19 @@ def test_title_index_strictness_is_opt_in_and_preserves_incomplete_tail():
             assert codex.to_canonical(path,strict_utf8=True,strict_json=True)[1]['title']=='native title'
 
 
+def test_title_index_utf8_and_json_flags_are_independent():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=sources(home)[0][1];index=home/'session_index.jsonl'
+        with patch.object(codex,'_SESSION_INDEX',index):
+            for body in [b'{bad}\n',b'null\n']:
+                index.write_bytes(body)
+                codex.to_canonical(path,strict_utf8=True)
+                rejected(lambda:codex.to_canonical(path,strict_json=True))
+            index.write_bytes(b'{"thread_name":"invalid\xfftext"}\n')
+            codex.to_canonical(path,strict_json=True)
+            rejected(lambda:codex.to_canonical(path,strict_utf8=True))
+
+
 def test_saved_observations_are_strict_only_when_requested_and_never_written():
     with tempfile.TemporaryDirectory() as td,patch.object(cursor_flush,'STATE_DIR',Path(td)):
         path=Path(td)/f'{SID}.json'

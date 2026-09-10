@@ -71,6 +71,11 @@ def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None,
         _current.reset(token)
 
 
+def is_legacy():
+    """Whether this call owns the unchanged installed cloud destination."""
+    return _legacy.get()
+
+
 def time_budget():
     return _budget.get()
 

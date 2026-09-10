@@ -548,7 +548,8 @@ async def _send(session, arguments, room, title, namespace,
                 continue
     if isinstance(out, dict) and "conversation_id" in out:
         if not capture_context.acknowledges(out, arguments.get("conversation_id"),
-                                            arguments["messages"], require_durable=env == "local"):
+                                            arguments["messages"],
+                                            require_durable=env == "local" or not capture_context.is_legacy()):
             _breadcrumb(arguments.get("conversation_id"), "unrecognized_response",
                         "acknowledgement does not cover this slice")
             return False, room
