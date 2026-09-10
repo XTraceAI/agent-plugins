@@ -186,6 +186,7 @@ async def import_conversation(session, arguments, *, timeout=None):
         return await session.call_tool("import_conversation", arguments=legacy, **kwargs)
     return result
 
+
 def acknowledges(out, conversation_id, records, *, require_durable=True):
     """Validate an echoed batch, including explicit stored-or-dropped accounting."""
     if out.get("conversation_id") != conversation_id:

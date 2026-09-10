@@ -233,7 +233,8 @@ Catch-up uses at most 2,000 native records or approximately 3.5 MB of source per
 batch; a single source line is limited to 16 MiB and existing tool-result elision
 runs before transmission. A final partial line waits for its newline. Each
 successful batch commits its own cursor; later failures retain earlier progress.
-The acknowledgement must match the conversation and final sent record UUID.
+The acknowledgement must match the conversation and final sent record UUID,
+or explicitly account for records the server received and deliberately dropped.
 
 Redaction reuses a bounded invocation-local cache across destinations. Payloads
 get separate copies, and endpoint-specific fields cannot mutate shared content.
