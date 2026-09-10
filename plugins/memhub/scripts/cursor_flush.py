@@ -559,21 +559,16 @@ def _usage_events_with(state: dict, generation: str, target_uuid: str,
         # then-current "last assistant" is not authoritative. Once observed,
         # a generation stays bound to its original deterministic record UUID.
         target_uuid = prior["target_uuid"]
-    # Updating an existing dict key preserves its old insertion position.
-    # Pop first so even an oversized recovered state cannot evict the sample
-    # being refreshed when the bounded map drops its oldest entries below.
-    events.pop(generation, None)
     # If Cursor regenerates a visible turn onto the same deterministic record,
     # retain the latest exact sample rather than summing unlike attempts.
     events = {key: value for key, value in events.items()
               if not (isinstance(value, dict) and
                       value.get("target_uuid") == target_uuid)}
     events[generation] = {"target_uuid": target_uuid, "usage": usage}
-    # Long-running chats must not grow hook state without bound. Removing old
-    # entries cannot corrupt server totals: confirmed UUIDs are immutable and
-    # a later re-send is folded by server dedup.
-    while len(events) > 512:
-        events.pop(next(iter(events)))
+    # These are native observations, not one destination's retry cache. Keep
+    # one exact sample per measured record for the session's lifetime: another
+    # destination may recover or be added after any number of generations.
+    # Like timestamp pins, this state scales with the native session.
     return events
 
 

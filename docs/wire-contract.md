@@ -353,3 +353,9 @@ arrival orders, canonical parity, raw/unknown surfaces, legacy cloud dormancy,
 partial batches, bounded slow responses, busy destination locks and concurrent
 observation updates during an in-flight upload. Existing Cursor capture, usage
 and timestamp suites remain part of the full plugin check.
+
+Shared Cursor usage observations retain one exact sample per measured record
+for the session's lifetime, like timestamp pins. They are not evicted after a
+fixed number of generations: a destination that was offline, or is configured
+later, must still be able to receive earlier measured usage. Destination
+acknowledgements remain separate from this authoritative evidence.
