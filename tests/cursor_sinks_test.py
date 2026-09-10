@@ -153,7 +153,9 @@ def test_cursor_partial_batch_retry_holds_destination_progress_and_shared_pins()
         local[2]['wrong_ack_at']=2;invoke(home,cloud[0],payload)
         assert not state(home,'local',local[0]).get('transcript_revision')
         before=json.loads(shared_path(home).read_text())['record_ts']
-        local[2].pop('wrong_ack_at');local[1].clear();invoke(home,cloud[0],payload)
+        local[2].pop('wrong_ack_at');local[1].clear()
+        local[2].update(all_dropped_at=1,nested_ack=True,text_ack=True)
+        invoke(home,cloud[0],payload)
         lengths=[len(batch['messages']) for batch in cases.routing.imports(local[1])]
         assert lengths==[2000,7],lengths
         assert state(home,'local',local[0])['transcript_revision']

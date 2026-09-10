@@ -840,7 +840,7 @@ def _event_can_flush(event: str, payload: dict) -> bool:
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today. Verified: a repo whose
 # core.fsmonitor is a command runs it under plain git and does not here.
-def _verdict(res, expected_conversation_id: str | None = None) -> str:
+def _verdict(res, expected_conversation_id: str | None = None, *, records=None) -> str:
     """``"ok"`` | ``"unconfirmed"`` | ``"unsupported"`` for an import reply.
 
     MCP reports tool failure through isError, not an exception, and this
@@ -860,7 +860,13 @@ def _verdict(res, expected_conversation_id: str | None = None) -> str:
     if getattr(res, "isError", False):
         _log(f"server rejected the import: {mcp_http.texts_of(res)[:1]}")
         return "unconfirmed"
-    ack = mcp_http.ack_of(res, expected_conversation_id)
+    # Batch-aware calls may accept explicit complete stored-or-dropped
+    # accounting. A bare 200/null ack still cannot advance native progress.
+    confirms = (lambda candidate: capture_context.acknowledges(
+        candidate, expected_conversation_id, records)) if records is not None else None
+    ack = mcp_http.ack_of(res, expected_conversation_id, prefer=confirms)
+    if ack is not None and confirms is not None and confirms(ack):
+        return "ok"
     if ack is None:
         _log("import response unrecognized — holding the watermark")
         return "unconfirmed"
@@ -1112,13 +1118,14 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
             _log(f"import failed: {e}")
             _note_failure(uuid, f"mcp_error: {str(e)[:80]}")
             return
-        verdict = _verdict(res, f"cursor-{uuid}")
+        verdict = _verdict(res, f"cursor-{uuid}", records=batch)
         if verdict == "unsupported":
             _log("server does not report ack_through — capture deferred for this destination")
             _save_state(uuid, last_flush_at=time.time(), unsupported=True,
                         unsupported_at=time.time(), fail_streak=0)
             return
-        ack = mcp_http.ack_of(res, f"cursor-{uuid}")
+        ack = mcp_http.ack_of(res, f"cursor-{uuid}", prefer=lambda candidate:
+                             capture_context.acknowledges(candidate, f"cursor-{uuid}", batch))
         if verdict != "ok" or not capture_context.acknowledges(ack or {}, f"cursor-{uuid}", batch):
             _note_failure(uuid, "unconfirmed_import")
             return
