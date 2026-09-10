@@ -76,6 +76,8 @@ Existing malformed Cursor observation files or invalid saved timestamp/usage
 values also report incomplete coverage. Missing files and explicit unmeasured
 timestamp pins remain optional. Full reads validate the Codex title-index text
 when that fallback is needed; ordinary capture retains its tolerant defaults.
+Complete non-object Cursor transcript rows and malformed recognized message bodies
+also reject the session. Native validation is described in [native readers](native-readers.md).
 
 ## Verification
 
