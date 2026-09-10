@@ -138,6 +138,31 @@ def test_nested_and_text_acknowledgements_confirm_the_backstop_slice():
         assert state(home,"local",local[0])["last_error"]=="unrecognized_response"
 
 
+def test_slow_local_preparation_preserves_cloud_budget_and_cannot_commit_late():
+    order=[]
+    with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
+        home=Path(td);data=cases.payload(home);cases.configure(home,local[0])
+        env=cases.environment(home,cloud[0]);env["MEMHUB_FLUSH_DEADLINE_S"]="0.8"
+        guard=home/"guard/sitecustomize.py"
+        with guard.open("a") as output:
+            output.write("\nimport time,flush_session,capture_context\n"
+                         "original_prepare=flush_session._prepare_transcript\n"
+                         "def slow_prepare(path):\n"
+                         "    if capture_context._current.get().is_local: time.sleep(1.2)\n"
+                         "    return original_prepare(path)\n"
+                         "flush_session._prepare_transcript=slow_prepare\n")
+        started=time.monotonic()
+        result=subprocess.run([sys.executable,"-c",
+            "import flush_session,time; flush_session.main(); time.sleep(1.3)"],
+            env=env,input=json.dumps(data),text=True,capture_output=True,timeout=5)
+        assert result.returncode==0 and "Traceback" not in result.stderr,result.stderr
+        assert time.monotonic()-started<2.5
+        assert order==["cloud"],order
+        assert state(home,"cloud",local[0])["last_ok_at"]
+        assert state(home,"local",local[0])["last_error"]=="timeout"
+        assert not state(home,"local",local[0]).get("last_ok_at")
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
