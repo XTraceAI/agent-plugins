@@ -62,6 +62,12 @@ def receiver(label, order):
                 error = "unexpected keyword argument 'native_session_id'"
             tool_result = ({"isError": True, "content": [{"type": "text", "text": error}]}
                            if error else {"content": [], "structuredContent": result})
+            if controls.get("nested_ack") and not error:
+                wrapper={"conversation_id":args.get("conversation_id"), "ack_through":None, "result":result}
+                if controls.get("text_ack"):
+                    tool_result={"content":[{"type":"text","text":json.dumps({"diagnostic":True})},
+                                             {"type":"text","text":json.dumps(wrapper)}]}
+                else:tool_result={"content":[],"structuredContent":wrapper}
             body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": tool_result}).encode()
             if controls["release"] is not None:
                 controls["release"].wait(3)
@@ -346,6 +352,22 @@ def test_partial_ack_and_insufficient_drop_count_leave_the_destination_cursor_pi
         assert state(home,"cloud",local[0]).get("offset",0)==0
         cloud[2]["partial_ack"]=False;invoke(home,cloud[0],data)
         assert state(home,"cloud",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
+
+
+def test_nested_and_text_acknowledgements_confirm_only_the_submitted_batch():
+    order=[]
+    with tempfile.TemporaryDirectory() as td,receiver("local",order) as local,receiver("cloud",order) as cloud:
+        home=Path(td);data=payload(home);configure(home,local[0],active=["local"])
+        local[2]["nested_ack"]=True
+        invoke(home,cloud[0],data)
+        assert state(home,"local",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
+        local[2]["text_ack"]=True;append(Path(data["transcript_path"]),1)
+        confirmed=Path(data["transcript_path"]).stat().st_size
+        invoke(home,cloud[0],data)
+        assert state(home,"local",local[0])["offset"]==confirmed
+        append(Path(data["transcript_path"]),2);local[2]["wrong_ack"]=True
+        invoke(home,cloud[0],data)
+        assert state(home,"local",local[0])["offset"]==confirmed
 
 
 if __name__ == "__main__":
