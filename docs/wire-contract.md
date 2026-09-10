@@ -72,6 +72,10 @@ before the existing read-only normalizer runs. Source
 revisions are compared across the read, and changed sources are reported as
 incomplete. Numeric overflow in native metadata rejects that session while
 preserving healthy peers.
+Existing malformed Cursor observation files or invalid saved timestamp/usage
+values also report incomplete coverage. Missing files and explicit unmeasured
+timestamp pins remain optional. Full reads validate the Codex title-index text
+when that fallback is needed; ordinary capture retains its tolerant defaults.
 
 ## Verification
 
@@ -116,6 +120,11 @@ hyphens, and must be unique. The optional `mcp_path` defaults to
 userinfo, a query or fragment. Remote destinations require HTTPS; HTTP is
 accepted only for literal `localhost`, `127.0.0.1` or `::1`. Tokens are optional
 nonempty ASCII bearer values without whitespace/control characters.
+Endpoints require standard ASCII DNS names (IDNs use their ASCII form) or IP
+literals. Underscore/escaped host spellings are refused before credential
+lookup, preventing collisions in the existing host/port cache naming format.
+An independent loopback service requires an explicit token; it cannot borrow
+a legacy token cached for another protocol on the same host/port.
 
 Selection follows this order:
 
