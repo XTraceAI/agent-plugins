@@ -625,7 +625,8 @@ def main() -> int:
     host = _env_host()
     try:
         selected = sinks.resolve_capture_sinks()
-        separate = len(selected) != 1 or capture_context.state_directory(STATE_DIR, selected[0]) != STATE_DIR
+        separate = (len(selected) != 1 or selected[0].token is not None
+                    or capture_context.state_directory(STATE_DIR, selected[0]) != STATE_DIR)
         if separate:
             reports = [_separate_capture_health(host if index == 0 else None, sink)
                        for index, sink in enumerate(selected or (None,))]

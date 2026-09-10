@@ -126,6 +126,18 @@ def test_concurrent_backstops_own_separate_destination_locks():
         assert state(home,"local",local[0])["last_ok_at"] and state(home,"cloud",local[0])["last_ok_at"]
 
 
+def test_nested_and_text_acknowledgements_confirm_the_backstop_slice():
+    order=[]
+    with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
+        home=Path(td);data=cases.payload(home);cases.configure(home,local[0],active=["local"])
+        for text in (False,True):
+            local[2].update(nested_ack=True,text_ack=text)
+            backstop(home,cloud[0],data)
+            assert state(home,"local",local[0])["last_ok_at"] and not state(home,"local",local[0]).get("last_error")
+        local[2]["wrong_ack"]=True;backstop(home,cloud[0],data)
+        assert state(home,"local",local[0])["last_error"]=="unrecognized_response"
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

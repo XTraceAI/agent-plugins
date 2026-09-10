@@ -428,6 +428,23 @@ def test_disabled_or_invalid_delivery_keeps_shared_cursor_observations_for_later
             assert after["record_ts"]==saved["record_ts"] and after["usage_events"]==saved["usage_events"]
 
 
+def test_configured_installed_cloud_token_is_healthy_without_account_login():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);installed=home/"installed";installed.mkdir()
+        (installed/"scripts").symlink_to(SCRIPTS,target_is_directory=True)
+        cloud="https://cloud.example.test/mcp-server/mcp"
+        (installed/".mcp.json").write_text(json.dumps({"mcpServers":{"memhub":{"url":cloud}}}))
+        config=home/".config/memhub-plugin/config.json";config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"version":1,"sinks":[{"name":"cloud","url":cloud,"token":"explicit-capture"}],"active":["cloud"]}))
+        env={"PATH":os.environ.get("PATH",""),"HOME":str(home),"USERPROFILE":str(home),
+             "CLAUDE_PLUGIN_ROOT":str(installed),"PYTHONDONTWRITEBYTECODE":"1"}
+        result=subprocess.run([sys.executable,str(SCRIPTS/"capture_health.py")],env=env,
+                              input=json.dumps({"session_id":SID}),text=True,capture_output=True,timeout=8)
+        assert result.returncode==0 and "Traceback" not in result.stderr,result.stderr
+        assert "Cloud services" in result.stdout,result.stdout
+        assert "Capture destination" not in result.stdout and "session is not being saved" not in result.stdout,result.stdout
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
