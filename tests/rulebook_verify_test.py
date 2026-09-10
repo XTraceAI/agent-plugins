@@ -176,6 +176,17 @@ def main() -> int:
                        mode="gate"), "--fires", "x")
     check("degraded gate: an unknown `given` key fails the same way",
           rc == 1, out)
+    # An unknown MATCHER key on an ADVISORY rule: the hook degrades it (to
+    # advice, which it already is) and ignores the predicate, so without this
+    # check the rule verified clean and was filed firing outside its scope.
+    rc, out = run(bash(command_rx=r"^git push$", cwd_rx="^/prod$"), "--fires", "git push",
+                  "--no-self-mention")
+    check("unknown matcher key: an advisory rule fails the load gate and names the key",
+          rc == 1 and "LOAD   FAIL" in out and "matcher.cwd_rx" in out, out)
+    rc, out = run(bash(command_rx=r"^git push$", min_chars=10, predicts_rx="x"), "--fires",
+                  "git push", "--no-self-mention")
+    check("unknown matcher key: every key on the server allowlist loads",
+          rc == 0 and "LOAD   ok" in out, out)
 
     rc, out = run(sess, "--fires", "session >> gate:git log origin/main",
                   "--silent", "session >> ok:git fetch -q >> gate:git log origin/main",

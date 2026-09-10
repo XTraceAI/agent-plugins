@@ -293,6 +293,12 @@ def verify(rule: dict, fires: list, silent: list,
     hook_rule = H.to_hook_rule(row)
     unknown = H.given_unsupported((row.get("matcher") or {}).get("given")) \
         or H.ordering_unsupported(row.get("ordering"))
+    if not unknown and H.matcher_unsupported(row.get("matcher")):
+        # A matcher predicate the hook has no code for. The hook degrades the
+        # rule to advice and ignores the predicate; to the author that is a
+        # rule firing outside the scope they wrote, and an ADVISORY one would
+        # otherwise verify clean and be filed that way.
+        unknown = "matcher." + H.matcher_unsupported(row.get("matcher"))
     # ANY degradation costs a gate its teeth: `to_hook_rule` forces
     # `mode: advise` on a rule this hook cannot honour in full, so a gate
     # carrying one cannot block on the runtime being tested. The author has to

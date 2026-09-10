@@ -1755,6 +1755,15 @@ _MATCHER_KNOWN = frozenset({
     "converted_rx", "predicts_rx", "min_chars", "result_rx",
     "given",            # rides inside the matcher block; linted by `given_norm` below
 })
+
+
+def matcher_unsupported(m):
+    """The first matcher key this hook has no code for, or "". The hook
+    degrades such a rule to advice; the verifier refuses it outright, since
+    to an author it is a typo. One list, asked from both places."""
+    if not isinstance(m, dict):
+        return ""
+    return next((k for k in m if k not in _MATCHER_KNOWN), "")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
                                  "on", "repo_scope", "_scope_repos", "_scope_paths",
@@ -2029,16 +2038,16 @@ def to_hook_rule(row):
         ev = m.get("event") or "bash"
         r["on"] = {"output": "result", "write": "edit"}.get(ev, ev)
         keys = _RESULT_KEYS if r["on"] == "result" else _MATCHER_KEYS
-        unknown = ""
+        # A predicate this hook has no code for. Copying it through and
+        # letting `evaluate` ignore it would run the rule as if the condition
+        # held — the forward-skew failure `degradation` exists to name. Same
+        # treatment as an unknown `given` key; `matcher_unsupported` is the
+        # one statement of "known", and the verifier asks it too.
+        unknown = matcher_unsupported(m)
         for k, v in m.items():
             if k == "event":
                 continue
             if k not in _MATCHER_KNOWN:
-                # A predicate this hook has no code for. Copying it through
-                # and letting `evaluate` ignore it would run the rule as if
-                # the condition held — the forward-skew failure `degradation`
-                # exists to name. Same treatment as an unknown `given` key.
-                unknown = unknown or k
                 continue
             if k == "result_rx" and "content_rx" in m:
                 continue              # content_rx is the schema key; result_rx is a legacy alias
