@@ -5,7 +5,7 @@ The contract these protect: a bounded, fail-open, detached extractor that
 emits COMPLETE rows or none at all, never fires anything, never files a rule,
 and never writes anywhere but its local drafts file.
 
-No test here reaches a server. The network boundary is `server_draft` (one
+No test here reaches a server. The network boundary is `server_classify` (one
 POST), and every test that needs a verdict substitutes one — a test suite
 that spends money and needs a network is a test suite people stop running.
 """
@@ -323,44 +323,6 @@ def test_a_staging_replay_never_stamps_the_replaying_machines_repo():
     print("PASS test_a_staging_replay_never_stamps_the_replaying_machines_repo")
 
 
-def test_the_engine_target_is_the_action_the_engine_would_fire_on():
-    """Codex on #191: an edit rule stamped against the first file action of
-    ANY kind picked a Read in another checkout, and the row filed into the
-    wrong repo. The target must be the event's own tool AND match the regex."""
-    turn = _turn(tools=[_tool("Read", "/other/repo/notes.md"),
-                        _tool("Bash", "git status"),
-                        _tool("Edit", "/here/app/config.py"),
-                        _tool("Edit", "/here/tests/test_x.py")])
-    edit = {"engine": "matcher", "matcher": {"event": "edit", "path_rx": r"tests/.*\.py$"}}
-    assert hx.engine_target(edit, turn) == ("Edit", "/here/tests/test_x.py")
-    read = {"engine": "matcher", "matcher": {"event": "read", "path_rx": r"\.md$"}}
-    assert hx.engine_target(read, turn) == ("Read", "/other/repo/notes.md")
-    bash = {"engine": "matcher", "matcher": {"event": "bash", "command_rx": r"git st"}}
-    assert hx.engine_target(bash, turn) == ("Bash", "git status")
-    # no action of the event's kind matches: the tool is known, the target is not
-    miss = {"engine": "matcher", "matcher": {"event": "edit", "path_rx": r"nope"}}
-    assert hx.engine_target(miss, turn) == ("Edit", "")
-    print("PASS test_the_engine_target_is_the_action_the_engine_would_fire_on")
-
-
-def test_an_identity_in_a_locally_authored_row_is_refused():
-    """The server's `_pii_in_trigger` never sees a row the local agent
-    authors, so the same coarse test runs client-side."""
-    ok = {"title": "T", "statement": "When X then Y.", "matcher": {"event": "bash",
-          "command_rx": r"/Users/[^/]+/dev"}, "anchors": None}
-    assert hx.pii_in_row(ok) == ""
-    for bad in ({"statement": "see /Users/felixmeng/xtrace"},
-                {"matcher": {"command_rx": r"/Users/(?!felixmeng)[A-Za-z0-9_]+/dev"}},
-                {"anchors": ["dana@example.com"]},
-                {"title": "mail dana@example\\.com"},
-                {"ordering": {"gated_command_rx": "/home/dana/x"}}):
-        assert hx.pii_in_row(bad), bad
-    assert hx.judge_said_signal("project_state") and hx.judge_said_signal("drafted")
-    for r in ("no_signal", "judge_failed", "disabled", "transport_error", ""):
-        assert not hx.judge_said_signal(r), r
-    print("PASS test_an_identity_in_a_locally_authored_row_is_refused")
-
-
 # ------------------------------------------------------------------- twins
 def test_twins_are_dropped_within_a_run():
     a = {"statement": "When running git worktree add -b, check the branch "
@@ -411,64 +373,60 @@ def _with_api(http, bearer="mhk_x"):
     return real
 
 
-def test_the_server_gets_one_bounded_post_and_never_raises():
-    http = _Http(answer=_Reply({"drafted": False, "reason": "no_signal",
-                                "kind": None, "row": None}))
+def test_the_classifier_gets_one_bounded_post_and_never_raises():
+    http = _Http(answer=_Reply({"signal": False, "reason": "classified", "kind": None}))
     real = _with_api(http)
     try:
-        reply, dt = hx.server_draft("W", hint="wrong_target", repo="R", timeout=7)
+        reply, dt = hx.server_classify("W", hint="wrong_target", repo="R", timeout=7)
     finally:
         hx._api = real
-    assert reply["reason"] == "no_signal" and not reply["drafted"]
+    assert reply["signal"] is False and reply["reason"] == "classified"
     assert len(http.calls) == 1, "one attempt, never a retry"
     call = http.calls[0]
-    assert call["method"] == "POST" and call["url"].endswith(hx.DRAFT_PATH)
+    assert call["method"] == "POST" and call["url"].endswith(hx.CLASSIFY_PATH)
+    assert hx.CLASSIFY_PATH == "/v1/team/rulebook/harness/classify"
     assert call["body"] == {"window": "W", "hint": "wrong_target", "repo": "R"}
     assert call["timeout"] == 7
 
-    # a transport failure, a wrong-shaped reply, and a drafted reply with no
-    # row are all a refusal the caller can count — never an exception
+    # a transport failure, a wrong-shaped reply — including the removed draft
+    # contract — are all "no signal" with a reason the caller can count
     for http, expected in (
         (_Http(raise_exc=RuntimeError("POST failed (503)")), "transport_error"),
         (_Http(answer=_Reply({"ok": True})), "bad_reply"),
-        (_Http(answer=_Reply({"drafted": True, "reason": "drafted"})), "bad_reply"),
+        (_Http(answer=_Reply({"drafted": True, "reason": "drafted", "row": {}})), "bad_reply"),
         (_Http(answer=_Reply("not an object")), "bad_reply"),
     ):
         real = _with_api(http)
         try:
-            reply, _ = hx.server_draft("W")
+            reply, _ = hx.server_classify("W")
         finally:
             hx._api = real
-        assert reply == dict(reply, drafted=False, reason=expected), reply
+        assert reply["signal"] is False and reply["reason"] == expected, reply
         assert reply["reason"] in hx.CLIENT_REASONS
         assert len(http.calls) == 1
-    # no credential: no call at all
     real = _with_api(None)
     try:
-        reply, _ = hx.server_draft("W")
+        reply, _ = hx.server_classify("W")
     finally:
         hx._api = real
-    assert reply["reason"] == "no_credential"
-    # the server's bound on the body is honoured client-side
-    http = _Http(answer=_Reply({"drafted": False, "reason": "no_signal"}))
+    assert reply == {"signal": False, "reason": "no_credential"}
+    http = _Http(answer=_Reply({"signal": False, "reason": "classified"}))
     real = _with_api(http)
     try:
-        hx.server_draft("x" * (hx.WINDOW_MAX_CHARS + 500))
+        hx.server_classify("x" * (hx.WINDOW_MAX_CHARS + 500))
     finally:
         hx._api = real
     assert len(http.calls[0]["body"]["window"]) == hx.WINDOW_MAX_CHARS
-    print("PASS test_the_server_gets_one_bounded_post_and_never_raises")
+    print("PASS test_the_classifier_gets_one_bounded_post_and_never_raises")
 
 
-def _args(td, **over):
-    argv = ["--turns", str(Path(td) / "t.json"), "--quiet",
-            "--out", str(Path(td) / "d.jsonl")]
-    for k, v in over.items():
-        argv += [f"--{k.replace('_', '-')}", str(v)]
-    return hx.build_parser().parse_args(argv)
+def _args(td, *extra):
+    return hx.build_parser().parse_args(
+        ["--turns", str(Path(td) / "t.json"), "--quiet",
+         "--out", str(Path(td) / "m.jsonl"), *extra])
 
 
-def test_a_drafted_reply_becomes_a_stamped_row_and_a_refusal_becomes_a_count():
+def test_a_signal_becomes_a_stamped_moment_and_no_signal_writes_nothing():
     with tempfile.TemporaryDirectory() as td:
         doc = {"session": "sess", "repo": "R", "turns": [
             _turn(1, user="hello", asst="hi"),
@@ -477,11 +435,10 @@ def test_a_drafted_reply_becomes_a_stamped_row_and_a_refusal_becomes_a_count():
         ]}
         (Path(td) / "t.json").write_text(json.dumps(doc), encoding="utf-8")
         answers = iter([
-            _Reply({"drafted": False, "reason": "no_signal", "kind": "none"}),
-            _Reply({"drafted": True, "reason": "drafted", "kind": "correction",
-                    "row": _row()}),
-            _Reply({"drafted": False, "reason": "project_state",
-                    "kind": "correction"}),
+            _Reply({"signal": False, "reason": "classified"}),
+            _Reply({"signal": True, "reason": "classified", "kind": "correction",
+                    "derivable": True}),
+            _Reply({"signal": False, "reason": "judge_failed"}),
         ])
         http = _Http()
         http.rest = lambda *a, **k: (http.calls.append(k), next(answers))[1]
@@ -491,25 +448,24 @@ def test_a_drafted_reply_becomes_a_stamped_row_and_a_refusal_becomes_a_count():
             stats = hx.run(hx.load_session(args), args)
         finally:
             hx._api = real
-        assert stats["server_calls"] == 3 and stats["rows"] == 1
-        assert stats["refusals"] == {"no_signal": 1, "project_state": 1}
+        assert stats["server_calls"] == 3 and stats["moments"] == 1
+        assert stats["reasons"] == {"classified": 2, "judge_failed": 1}
         assert stats["transport_errors"] == 0
-        assert stats["router_authored"] == {"wrong_target": 1}
-        assert stats["router_refused"] == {"reuse_correction": 1}
-        assert stats["hinted_calls"] == 2
-        # the hint rode along as a label, and the window was sent redacted
+        assert stats["hinted_calls"] == 2 and stats["hinted_signals"] == 1
         assert http.calls[1]["body"]["hint"] == "wrong_target"
         assert "STATE:" in http.calls[1]["body"]["window"]
-        rows = hx.read_drafts(Path(td) / "d.jsonl")
-        assert len(rows) == 1
-        assert rows[0]["source_ref"] == "sess#2"
-        assert rows[0]["state"]["repo"] == "R" and rows[0]["state"]["turn"] == 2
-        assert rows[0]["_reason"] == "router:wrong_target"
-        assert rows[0]["_kind"] == "correction"
-    print("PASS test_a_drafted_reply_becomes_a_stamped_row_and_a_refusal_becomes_a_count")
+        moments = hx.read_drafts(Path(td) / "m.jsonl")
+        assert len(moments) == 1
+        m = moments[0]
+        assert m["turn"] == 2 and m["source_ref"] == "sess#2"
+        assert m["kind"] == "correction" and m["hint"] == "wrong_target"
+        assert m["derivable"] is True
+        assert m["state"]["repo"] == "R" and m["state"]["turn"] == 2
+        assert "USER'S NEW MESSAGE: no, i mean staging" in m["window"]
+    print("PASS test_a_signal_becomes_a_stamped_moment_and_no_signal_writes_nothing")
 
 
-def test_an_outage_is_counted_apart_from_a_refusal():
+def test_an_outage_is_counted_apart_from_a_quiet_moment():
     with tempfile.TemporaryDirectory() as td:
         doc = {"session": "sess", "repo": "R",
                "turns": [_turn(1, user="i mean staging", asst="ok")]}
@@ -521,44 +477,20 @@ def test_an_outage_is_counted_apart_from_a_refusal():
             stats = hx.run(hx.load_session(args), args)
         finally:
             hx._api = real
-        assert stats["transport_errors"] == 1 and stats["rows"] == 0
-        assert stats["refusals"] == {"transport_error": 1}
-        assert not (Path(td) / "d.jsonl").exists()
-    print("PASS test_an_outage_is_counted_apart_from_a_refusal")
+        assert stats["transport_errors"] == 1 and stats["moments"] == 0
+        assert stats["reasons"] == {"transport_error": 1}
+        assert not (Path(td) / "m.jsonl").exists()
+    print("PASS test_an_outage_is_counted_apart_from_a_quiet_moment")
 
 
-STATEMENTS = (
-    "When pushing a branch, fetch origin first because a stale ref answers wrong.",
-    "When editing the ECS task definition, redeploy or nothing changes.",
-    "When running alembic upgrade, check heads is one because two heads stall.",
-    "When opening a worktree, cut it from staging because main lags releases.",
-)
-
-
-def test_the_budget_stops_the_calls_not_just_the_rows():
-    with tempfile.TemporaryDirectory() as td:
-        doc = {"session": "sess", "repo": "R", "turns": [
-            _turn(n, user=f"i mean staging {n}", asst="ok") for n in range(1, 5)]}
-        (Path(td) / "t.json").write_text(json.dumps(doc), encoding="utf-8")
-        n = [0]
-
-        def drafted(*a, **k):
-            n[0] += 1
-            return _Reply({"drafted": True, "reason": "drafted", "kind": "correction",
-                           "row": _row(statement=STATEMENTS[n[0] - 1],
-                                       matcher={"event": "bash",
-                                                "command_rx": f"cmd{n[0]}"})})
-        http = _Http()
-        http.rest = drafted
-        real = _with_api(http)
-        try:
-            args = _args(td, budget=2)
-            stats = hx.run(hx.load_session(args), args)
-        finally:
-            hx._api = real
-        assert stats["rows"] == 2 and stats["server_calls"] == 2
-        assert stats["budget_stops"] == 2
-    print("PASS test_the_budget_stops_the_calls_not_just_the_rows")
+def test_there_is_no_author_on_either_side():
+    """The larger model was removed from the server (MemHub-Backend, the
+    classify endpoint). The client must not call the old route or expect a
+    row from it: the agent that lived the turn is the author."""
+    src = (PLUGIN / "scripts" / "harness_extract.py").read_text(encoding="utf-8")
+    for token in ("server_draft", "harness/draft", "DRAFT_PATH", "reply[\"row\"]"):
+        assert token not in src, token
+    print("PASS test_there_is_no_author_on_either_side")
 
 
 # ------------------------------------------------------------------ drafts
@@ -619,7 +551,7 @@ def test_router_only_mode_spends_nothing():
             stats = hx.run(hx.load_session(args), args)
         finally:
             hx._api = real
-        assert stats["rows"] == 0 and stats["server_calls"] == 0
+        assert stats["moments"] == 0 and stats["server_calls"] == 0
         assert stats["router_hit_turns"] == 1
     print("PASS test_router_only_mode_spends_nothing")
 
@@ -686,7 +618,7 @@ def test_cli_smoke_runs_without_a_model():
              "--stats", str(Path(td) / "s.json")],
             capture_output=True, text=True, timeout=60)
         assert proc.returncode == 0, proc.stderr
-        assert json.loads((Path(td) / "s.json").read_text())["rows"] == 0
+        assert json.loads((Path(td) / "s.json").read_text())["moments"] == 0
     print("PASS test_cli_smoke_runs_without_a_model")
 
 

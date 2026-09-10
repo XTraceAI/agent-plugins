@@ -37,20 +37,22 @@ def test_read_calls_are_replayed():
     print("PASS test_read_calls_are_replayed")
 
 
-def test_a_corpus_rerun_does_not_count_last_runs_drafts():
-    """`append_draft` appends; a rerun into the same --out must start clean
+def test_a_corpus_rerun_does_not_count_last_runs_moments():
+    """The extractor appends; a rerun into the same --out must start clean
     (Codex, #191/#192)."""
     with tempfile.TemporaryDirectory() as td:
         corpus, out = Path(td) / "corpus", Path(td) / "out"
         corpus.mkdir(); out.mkdir()
         (corpus / "s.json").write_text(json.dumps({"session": "s", "repo": "R", "turns": [
             {"n": 1, "user": "hello", "asst": "hi", "tools": [], "results": []}]}))
-        stale = out / "s.drafts.jsonl"
-        stale.write_text(json.dumps({"title": "old", "statement": "old row"}) + "\n")
+        stale = out / "s.moments.jsonl"
+        stale.write_text(json.dumps({"turn": 1}) + "\n")
+        old_drafts = out / "s.drafts.jsonl"
+        old_drafts.write_text("{}\n")
         (out / "s.stats.json").write_text("{}")
 
         class Args:
-            budget, env, draft_timeout, pace = 8, "staging", 0, 0
+            env, classify_timeout, pace = "staging", 0, 0
 
         real = sc.subprocess.run
         seen = []
@@ -60,10 +62,11 @@ def test_a_corpus_rerun_does_not_count_last_runs_drafts():
             stats = sc.run_one(sc.plugin_scripts(), corpus / "s.json", out, Args())
         finally:
             sc.subprocess.run = real
-        assert not stale.exists(), "last run's drafts were left for the aggregate to re-count"
-        assert seen and "--turns" in seen[0]
-        assert stats["rows"] == 0
-    print("PASS test_a_corpus_rerun_does_not_count_last_runs_drafts")
+        assert not stale.exists() and not old_drafts.exists()
+        assert seen and "--turns" in seen[0] and "--budget" not in seen[0]
+        assert seen[0][seen[0].index("--out") + 1].endswith("s.moments.jsonl")
+        assert stats["moments"] == 0
+    print("PASS test_a_corpus_rerun_does_not_count_last_runs_moments")
 
 
 if __name__ == "__main__":

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for the Stop sensor (harness-tied-memory-spec §4.1–§4.4).
+"""Tests for the Stop sensor (harness-tied-memory-spec §4.1–§4.2, path A).
 
 What these protect: with the flag off nothing happens at all; with it on the
-hook returns in milliseconds and every piece of work happens in a detached
-child; a failure and its fix are one moment; the review keeps or drops rows
-and never rewrites or activates one; the sync files rows `proposed` with the
-five-key stamp and never passes `activate`. No test reaches a server or a
-model — the two boundaries (`server_draft`, `subprocess.run` for the review,
-`mcp_http.call_tool` for the sync) are substituted.
+Stop hook returns in milliseconds and the classifier call happens in a
+detached child; a failure and its fix are one moment; a flagged moment is
+handed to the agent once, at the next prompt, with its stamp; nothing in the
+sensor sends `activate`. No test reaches a server — the one boundary,
+`harness_extract.server_classify`, is substituted.
 """
 from __future__ import annotations
 
@@ -177,7 +176,12 @@ def test_stop_spawns_detached_and_returns():
     print("PASS test_stop_spawns_detached_and_returns")
 
 
-def test_extract_drafts_the_last_turn_once():
+def _classify(calls, reply):
+    return lambda w, hint="", repo="", timeout=0: (
+        calls.append({"window": w, "hint": hint, "repo": repo}), (reply, 0.1))[1]
+
+
+def test_extract_classifies_the_last_turn_once():
     with _Env() as env:
         repo = _git_repo(env.base)
         tp = env.base / "s.jsonl"
@@ -187,46 +191,43 @@ def test_extract_drafts_the_last_turn_once():
              [("Bash", {"command": "git status"}, "clean", False)]),
         ])
         calls = []
-        real = hx.server_draft
-        hx.server_draft = lambda w, hint="", repo="", timeout=0: (
-            calls.append({"window": w, "hint": hint, "repo": repo}),
-            ({"drafted": True, "reason": "drafted", "kind": "correction", "row": _row()}, 0.1))[1]
+        real = hx.server_classify
+        hx.server_classify = _classify(calls, {"signal": True, "reason": "classified",
+                                               "kind": "correction", "derivable": False})
         try:
             assert hs.cmd_extract("sess", str(tp), str(repo)) == 0
             # Stop fired twice for the same turn: no second call
             assert hs.cmd_extract("sess", str(tp), str(repo)) == 0
         finally:
-            hx.server_draft = real
+            hx.server_classify = real
         assert len(calls) == 1
         assert calls[0]["hint"] == "wrong_target"
         assert "USER'S NEW MESSAGE: no, i mean on staging" in calls[0]["window"]
         assert "PREVIOUS USER MESSAGE: do the thing" in calls[0]["window"]
-        rows = hx.read_drafts(hx.drafts_path("sess"))
-        assert len(rows) == 1 and rows[0]["source_ref"] == "sess#2"
-        state = rows[0]["state"]
+        moments = hx.read_drafts(hs.moments_path("sess"))
+        assert len(moments) == 1 and moments[0]["source_ref"] == "sess#2"
+        state = moments[0]["state"]
         assert state["repo"] == "repo" and state["turn"] == 2
         assert state["branch"] and state["head_sha"], state
         assert state["env"] in ("staging", "production", "unknown")
         meta = hs.load_meta("sess")
-        assert meta["last_turn"] == 2
-        assert meta["repo"] == "repo"
-        # a third turn is a new moment
+        assert meta["last_turn"] == 2 and meta["repo"] == "repo"
+        assert not hx.drafts_path("sess").exists(), "nothing is drafted any more"
+        # a third turn is a new moment to classify
         _transcript(tp, [
             ("do the thing", "done", []),
             ("no, i mean on staging", "right", []),
             ("we already have one of those", "ah", []),
         ])
-        hx.server_draft = lambda w, hint="", repo="", timeout=0: (
-            calls.append({"hint": hint}),
-            ({"drafted": False, "reason": "project_state", "kind": "correction"}, 0.1))[1]
+        hx.server_classify = _classify(calls, {"signal": False, "reason": "classified"})
         try:
             hs.cmd_extract("sess", str(tp), str(repo))
         finally:
-            hx.server_draft = real
+            hx.server_classify = real
         assert len(calls) == 2 and calls[1]["hint"] == "reuse_correction"
         assert hs.load_meta("sess")["last_turn"] == 3
-        assert len(hx.read_drafts(hx.drafts_path("sess"))) == 1
-    print("PASS test_extract_drafts_the_last_turn_once")
+        assert len(hx.read_drafts(hs.moments_path("sess"))) == 1
+    print("PASS test_extract_classifies_the_last_turn_once")
 
 
 # ------------------------------------------------------------ error arcs
@@ -286,29 +287,29 @@ def test_extract_records_the_flagged_moment_for_the_agent():
         repo = _git_repo(env.base)
         tp = env.base / "s.jsonl"
         _transcript(tp, [("do it", "done", []), ("no, i mean on staging", "ok", [])])
-        real = hx.server_draft
-        # the server's author refused — the moment is still the agent's to mine
-        hx.server_draft = lambda w, hint="", repo="", timeout=0: (
-            {"drafted": False, "reason": "project_state", "kind": "correction"}, 0.1)
+        calls = []
+        real = hx.server_classify
+        hx.server_classify = _classify(calls, {"signal": True, "reason": "classified",
+                                               "kind": "correction", "derivable": True})
         try:
             hs.cmd_extract("sess", str(tp), str(repo))
         finally:
-            hx.server_draft = real
+            hx.server_classify = real
         moments = hx.read_drafts(hs.moments_path("sess"))
         assert len(moments) == 1 and moments[0]["turn"] == 2
         assert moments[0]["kind"] == "correction" and moments[0]["hint"] == "wrong_target"
+        assert moments[0]["derivable"] is True
         assert "USER'S NEW MESSAGE: no, i mean on staging" in moments[0]["window"]
         assert moments[0]["state"]["repo"] == "repo" and moments[0]["state"]["turn"] == 2
-        assert hs.load_meta("sess")["last_turn"] == 2
-        # a no_signal turn records nothing
+        # an outage on the next turn records nothing — it is not a quiet moment,
+        # and it is not a signal either
         _transcript(tp, [("do it", "done", []), ("no, i mean on staging", "ok", []),
                          ("thanks", "np", [])])
-        hx.server_draft = lambda w, hint="", repo="", timeout=0: (
-            {"drafted": False, "reason": "no_signal", "kind": None}, 0.1)
+        hx.server_classify = _classify(calls, {"signal": False, "reason": "judge_failed"})
         try:
             hs.cmd_extract("sess", str(tp), str(repo))
         finally:
-            hx.server_draft = real
+            hx.server_classify = real
         assert len(hx.read_drafts(hs.moments_path("sess"))) == 1
     print("PASS test_extract_records_the_flagged_moment_for_the_agent")
 
@@ -405,6 +406,13 @@ def test_the_nudge_line_carries_no_identity_and_no_activate():
     assert "/Users/" not in line and "@" not in line
     assert len(line) < 1600, "one line of context, not a prompt"
     print("PASS test_the_nudge_line_carries_no_identity_and_no_activate")
+
+
+def test_the_nudge_says_when_the_classifier_thinks_it_is_already_written_down():
+    with_opinion = hs.nudge_line("sess", dict(_moment(2), derivable=True), "repo")
+    assert "may already be written down in the repo" in with_opinion
+    assert "may already be written down" not in hs.nudge_line("sess", _moment(2), "repo")
+    print("PASS test_the_nudge_says_when_the_classifier_thinks_it_is_already_written_down")
 
 
 def test_the_hooks_are_wired_behind_the_guard():

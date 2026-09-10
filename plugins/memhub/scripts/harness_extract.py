@@ -2,29 +2,26 @@
 """Harness-tied extraction (harness-tied-memory-spec §4.2) — the client half.
 
 A *lesson* is a rule an agent proposed from a session and a human activates.
-This module drafts one. It never activates anything, never fires anything, and
-never files a rule: drafts land in a local JSONL that the post-session review
-(§4.3, `harness_stop.py review`) reads.
+This module does not write one. It decides which moments of a session are
+worth the coding agent's attention and records them; the agent that lived the
+turn writes the lesson at the next prompt (`harness_stop.py prompt`).
 
 The pipeline, cheapest first:
 
     router       deterministic regexes over the turn — no model, no cost, and
                  never a decision (S0 measured it at 0.015 precision): it
-                 decides which turns are worth a call and labels the ones it
-                 sends, that is all
+                 labels the moments it sends, that is all
     window       §4.2 step 1, REDACTED before it leaves the machine
-    server       ONE bounded POST to MemHub `/v1/team/rulebook/harness/draft`
-                 — the judge and the author run there (MemHub #1249); the
-                 reply is a row shaped for `create_rule`, or a one-word refusal
-    stamp        the nine-field state the harness writes and nobody types
-    row          complete, or it does not exist
+    classifier   ONE bounded POST to MemHub `/v1/team/rulebook/harness/classify`:
+                 is this moment worth handing to the agent, and of what kind
+    moment       on a signal, the turn, kind, router hint and the nine-field
+                 stamp, appended locally for the prompt lane to hand over
 
-S0 ran the judge and author through the headless `claude` CLI from this file.
-That half is gone: no API key, no structured output, no author bound and no
-token accounting live on the client any more. A refusal from the server —
-`no_signal`, `derivable`, `bad_anchors`, `matches_everything`,
-`project_state`, `judge_failed`, `author_failed`, `disabled` — is the ordinary
-outcome (198 of 229 author calls in S0) and is recorded, never retried.
+There is no author here and none on the server: S0 authored rows with
+`claude -p`, S1 briefly with a server model, and both were removed once the
+live agent — which has the whole session and the person — became the author.
+`build_row`, `pii_in_row` and `is_twin` stay, because `score_s0.py nudge`
+measures the agent's rows against the same checks `create_rule` applies.
 
 Run modes (the replay CLI; the live Stop sensor is `harness_stop.py`):
 
@@ -53,27 +50,26 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-DEFAULT_BUDGET = 8            # §4.3 step 4: drafts per session
-
-# The server's own bounds are judge 20 s + author 90 s. One attempt, and this
-# is the whole wait: a call that outlives it produced nothing usable, and a
-# missing draft is recoverable (the next review moment re-runs) while a
-# half-parsed one is not.
-DRAFT_TIMEOUT_S = float(os.environ.get("MEMHUB_HARNESS_DRAFT_TIMEOUT", "120"))
-DRAFT_PATH = "/v1/team/rulebook/harness/draft"
+# The server's judge is bounded at 20 s. One attempt, and this is the whole
+# wait: a call that outlives it produced nothing, and a moment the classifier
+# never answered for is simply not handed to the agent.
+CLASSIFY_TIMEOUT_S = float(os.environ.get("MEMHUB_HARNESS_CLASSIFY_TIMEOUT", "30"))
+CLASSIFY_PATH = "/v1/team/rulebook/harness/classify"
 WINDOW_MAX_CHARS = 24576      # the server refuses a longer body (schema max)
 
-# Everything else the server may answer is a REFUSAL — the machinery working.
-# These three are the client failing to ask, and are counted apart so an
-# outage is never read as "the author refused".
+# The client failing to ask, counted apart from the server's own
+# `judge_failed` / `disabled`, so an outage is never read as "nothing here".
 CLIENT_REASONS = ("no_credential", "transport_error", "bad_reply")
-# Reasons that mean the judge never said yes: every other reason is an
-# author outcome (a refusal or a draft) and the moment was a signal.
+# Every reason that means no verdict was reached.
 NOT_A_SIGNAL = ("no_signal", "judge_failed", "disabled") + CLIENT_REASONS
 
 
 def judge_said_signal(reason: str) -> bool:
-    return bool(reason) and reason not in NOT_A_SIGNAL
+    """For traces written before the author was removed (`score_s0.py nudge`
+    reads old runs): any reason but these was an author outcome, so the judge
+    had said signal. A current reply carries `signal` itself."""
+    return bool(reason) and reason not in NOT_A_SIGNAL + ("classified",)
+
 
 FLAG = "MEMHUB_HARNESS_EXTRACT"
 _ON = ("1", "on", "true", "yes")
@@ -465,15 +461,15 @@ def _api():
     return pak.api_base(url), bearer, mcp_http
 
 
-def server_draft(window: str, hint: str = "", repo: str = "",
-                 timeout: float = 0) -> tuple[dict, float]:
-    """ONE bounded POST. Returns ({drafted, reason, kind?, row?}, seconds).
+def server_classify(window: str, hint: str = "", repo: str = "",
+                    timeout: float = 0) -> tuple[dict, float]:
+    """ONE bounded POST. Returns ({signal, reason, kind?, derivable?}, seconds).
 
-    Fail-open by construction: every failure is a reply with `drafted: false`
+    Fail-open by construction: every failure is a reply with `signal: false`
     and a CLIENT_REASONS reason, so a caller counts an outage apart from a
-    refusal and never has to catch anything. No retry — the caller is a
-    detached best-effort extractor, and a second attempt doubles the cost of
-    the failure it is trying to avoid.
+    quiet moment and never has to catch anything. No retry — the caller is a
+    detached best-effort child, and a second attempt doubles the cost of the
+    failure it is trying to avoid.
     """
     t0 = time.time()
     body = {"window": window[:WINDOW_MAX_CHARS]}
@@ -484,27 +480,23 @@ def server_draft(window: str, hint: str = "", repo: str = "",
     try:
         api = _api()
     except Exception as exc:                 # noqa: BLE001 — a hook path
-        return ({"drafted": False, "reason": "no_credential",
+        return ({"signal": False, "reason": "no_credential",
                  "detail": repr(exc)[:200]}, round(time.time() - t0, 1))
     if not api:
-        return ({"drafted": False, "reason": "no_credential"},
-                round(time.time() - t0, 1))
+        return ({"signal": False, "reason": "no_credential"}, round(time.time() - t0, 1))
     base, bearer, http = api
     try:
-        reply = http.rest(f"{base}{DRAFT_PATH}", bearer, "POST", body=body,
-                          timeout=timeout or DRAFT_TIMEOUT_S)
+        reply = http.rest(f"{base}{CLASSIFY_PATH}", bearer, "POST", body=body,
+                          timeout=timeout or CLASSIFY_TIMEOUT_S)
     except Exception as exc:                 # noqa: BLE001 — one attempt
-        return ({"drafted": False, "reason": "transport_error",
+        return ({"signal": False, "reason": "transport_error",
                  "detail": str(exc)[:200]}, round(time.time() - t0, 1))
     dt = round(time.time() - t0, 1)
     data = reply.data
-    if not (isinstance(data, dict) and isinstance(data.get("drafted"), bool)
+    if not (isinstance(data, dict) and isinstance(data.get("signal"), bool)
             and isinstance(data.get("reason"), str)):
-        return ({"drafted": False, "reason": "bad_reply",
+        return ({"signal": False, "reason": "bad_reply",
                  "detail": f"HTTP {reply.status}: {str(data)[:120]}"}, dt)
-    if data["drafted"] and not isinstance(data.get("row"), dict):
-        return ({"drafted": False, "reason": "bad_reply",
-                 "detail": "drafted without a row"}, dt)
     return data, dt
 
 
@@ -844,6 +836,11 @@ def drafts_path(session: str, override: str = "") -> Path:
     return Path(base) / f"{safe}.jsonl"
 
 
+def moments_file(session: str) -> Path:
+    """Where a session's classifier-flagged moments live."""
+    return drafts_path(session).with_name(f"{drafts_path(session).stem}.moments.jsonl")
+
+
 def append_draft(path: Path, row: dict) -> None:
     """Append-only, one row per line, never the cached book — `fetch_book`
     rewrites that file wholesale on every 200 (§4.2 step 5)."""
@@ -903,69 +900,28 @@ _EVENT_TOOLS = {"bash": ("Bash",), "output": ("Bash",),
                 "read": ("Read",)}
 
 
-def engine_target(raw: dict, turn: dict) -> tuple[str, str]:
-    """The action the lesson is about, for the per-action state stamp.
-
-    The action must be one the ENGINE would fire on: the event's own tools,
-    and the regex the author wrote matching it. Picking the first file action
-    of any kind stamped an edit rule with a Read in another checkout, and the
-    row then filed into and scoped to the wrong repo (Codex, #191).
-    """
-    engine = raw.get("engine")
-    if engine == "matcher":
-        m = raw.get("matcher") or {}
-        event = m.get("event")
-        tools = _EVENT_TOOLS.get(event, ())
-        rx_key = "command_rx" if event in ("bash", "output") else "path_rx"
-        rx = m.get(rx_key) if _rx_ok(m.get(rx_key)) else None
-        for action in turn.get("tools", []):
-            if action.get("tool") not in tools:
-                continue
-            target = action.get("target", "")
-            if rx is None or re.search(rx, target, re.I):
-                return action["tool"], target
-        return (tools[0] if tools else ""), ""
-    if engine == "anchors":
-        anchors = [a for a in (raw.get("anchors") or []) if isinstance(a, str)]
-        for action in turn.get("tools", []):
-            tgt = action.get("target", "")
-            if any(a in tgt for a in anchors):
-                return action.get("tool", ""), tgt
-    return "", ""
-
-
 def new_stats(doc: dict) -> dict:
     return {
         "session": doc.get("session") or "unknown", "engineer": doc.get("engineer", ""),
         "source": doc.get("source", ""), "turns": len(doc.get("turns") or []),
         "router_hits": 0, "router_hit_turns": 0, "stop_check_moments": {},
-        "turns_sent": 0, "turns_spared": 0, "hinted_calls": 0,
-        "server_calls": 0, "rows": 0, "kinds": {},
-        "refusals": {}, "router_authored": {}, "router_refused": {},
-        "transport_errors": 0, "twins": 0, "budget_stops": 0,
-        "latencies": [], "seconds": 0.0,
+        "turns_sent": 0, "turns_spared": 0, "hinted_calls": 0, "hinted_signals": 0,
+        "server_calls": 0, "moments": 0, "kinds": {}, "reasons": {},
+        "transport_errors": 0, "latencies": [], "seconds": 0.0,
     }
 
 
 def extract_turn(turn: dict, prev: dict | None, *, doc: dict, args,
-                 kept: list[dict], stats: dict, trace, out_path: Path,
-                 arcs: list[dict] | None = None,
-                 pr_number=None) -> dict | None:
-    """One turn through router → window → server → stamp → row.
+                 stats: dict, trace, out_path: Path,
+                 arcs: list[dict] | None = None) -> dict | None:
+    """One turn through router → window → classifier → moment.
 
-    Returns the drafted row, or None. Shared by the replay loop below and the
-    live Stop sensor, so what is measured is what runs.
+    Returns the moment written to `out_path`, or None. Shared by the replay
+    loop below and the live Stop sensor, so what is measured is what runs.
     """
     session = doc.get("session") or "unknown"
     cwd = doc.get("cwd") or ""
     hook_version = args.hook_version or plugin_version()
-    declared_repo = doc.get("repo") or ""
-
-    def note_refusal(reason: str, router_kind: str) -> None:
-        stats["refusals"][reason] = stats["refusals"].get(reason, 0) + 1
-        if router_kind:
-            stats["router_refused"][router_kind] = \
-                stats["router_refused"].get(router_kind, 0) + 1
 
     hits = route(turn, prev, arcs)
     if hits:
@@ -980,115 +936,71 @@ def extract_turn(turn: dict, prev: dict | None, *, doc: dict, args,
     hint = router_hint(hits)
     if hits and not hint:
         # The claim-shaped moment is the built-in Stop check (spec §1), not a
-        # rules row: counted, and the call spared.
+        # lesson: counted, and the call spared.
         stats["turns_spared"] += 1
         trace("   -> claim-shaped: counted for the built-in Stop check, not sent")
         return None
     if args.no_model:
         trace(f"   -> router-only mode, not sent (hint={hint or '-'})")
         return None
-    if len(kept) >= args.budget:
-        stats["budget_stops"] += 1
-        trace(f"   budget {args.budget} reached, not sent")
-        return None
 
-    state_probe = stamp_state(
-        session=session, turn=turn, row_engine_target=("", ""),
-        cwd=cwd, hook_version=hook_version, env_name=args.env,
-        default_repo=declared_repo, pr_number=pr_number)
-    window = redact_window(build_window(turn, prev, state_probe, arcs))
-    reply, dt = server_draft(window, hint, repo=state_probe.get("repo", ""),
-                             timeout=args.draft_timeout)
+    state = stamp_state(session=session, turn=turn, row_engine_target=("", ""),
+                        cwd=cwd, hook_version=hook_version, env_name=args.env,
+                        default_repo=doc.get("repo") or "")
+    window = redact_window(build_window(turn, prev, state, arcs))
+    reply, dt = server_classify(window, hint, repo=state.get("repo", ""),
+                                timeout=getattr(args, "classify_timeout", 0))
     if getattr(args, "pace", 0):
         # Replay only. A personal access key is capped at one human's
-        # throughput (60/min); a replay is not a human and must not look
-        # like ten of them. The live sensor makes one call per turn and
-        # never needs this.
+        # throughput (60/min); a replay is not a human and must not look like
+        # ten of them. The live sensor makes one call per turn.
         time.sleep(args.pace)
     stats["server_calls"] += 1
     stats["turns_sent"] += 1
     stats["hinted_calls"] += bool(hint)
     stats["latencies"].append(dt)
+    reason = str(reply.get("reason") or "")
+    stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+    if reason in CLIENT_REASONS:
+        stats["transport_errors"] += 1
+    if not reply.get("signal"):
+        trace(f"   classifier ({dt}s): no signal [{reason}]"
+              f"{' — ' + str(reply.get('detail'))[:120] if reply.get('detail') else ''}")
+        return None
     kind = reply.get("kind")
-    if kind:
-        stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
-    reason = str(reply.get("reason") or "refused")
-    if getattr(args, "moments", "") and judge_said_signal(reason):
-        # The classifier flagged this moment. Whatever the server's author
-        # did with it, the local mining pass (harness_stop.py review) gets
-        # the same redacted window, with the stamp it would carry.
-        stats["moments"] = stats.get("moments", 0) + 1
-        append_draft(Path(args.moments), {
-            "turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
-            "hint": hint, "kind": kind, "reason": reason,
-            "window": window, "state": state_probe})
-    if not reply.get("drafted"):
-        note_refusal(reason, hint)
-        if reason in CLIENT_REASONS:
-            stats["transport_errors"] += 1
-        trace(f"   server ({dt}s): {reason}"
-              f"{' — ' + str(reply.get('detail'))[:120] if reply.get('detail') else ''}"
-              f"{' | judge=' + str(kind) if kind else ''}")
-        return None
-
-    raw = reply["row"]
-    state = stamp_state(
-        session=session, turn=turn,
-        row_engine_target=engine_target(raw, turn), cwd=cwd,
-        hook_version=hook_version, env_name=args.env,
-        default_repo=declared_repo, pr_number=pr_number)
-    scope = [state["repo"]] if state.get("repo") else []
-    reason = f"router:{hint}" if hint else f"judge:{kind}"
-    row, refusal = build_row(raw, state=state, session=session,
-                             turn_n=turn.get("n"), reason=reason,
-                             scope_repos=scope)
-    if row is None:
-        note_refusal(refusal, hint)
-        trace(f"   server drafted, client refused ({dt}s) [{refusal}]: "
-              f"{str(raw.get('title', ''))[:100]}")
-        return None
-    twin = is_twin(row, kept)
-    if twin:
-        stats["twins"] += 1
-        note_refusal("twin_in_run", hint)
-        trace(f"   twin of {twin['source_ref']} — dropped: {row['title'][:70]}")
-        return None
-    row["_kind"] = kind
-    kept.append(row)
-    stats["rows"] += 1
-    if hint:
-        stats["router_authored"][hint] = stats["router_authored"].get(hint, 0) + 1
-    append_draft(out_path, row)
-    trace(f"   DRAFT ({dt}s) [{row['delivery']}] {row['title'][:80]}\n"
-          f"      {row['statement'][:220]}\n"
-          f"      repo={state['repo']} branch={state['branch']} "
-          f"engine={ {k: v for k, v in row.items() if k in ('matcher', 'ordering', 'anchors')} }")
-    return row
+    stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
+    stats["moments"] += 1
+    stats["hinted_signals"] += bool(hint)
+    moment = {"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
+              "hint": hint, "kind": kind, "derivable": reply.get("derivable"),
+              "window": window, "state": state}
+    append_draft(out_path, moment)
+    trace(f"   classifier ({dt}s): SIGNAL {kind}{' (derivable?)' if reply.get('derivable') else ''}"
+          f" → moment for the agent")
+    return moment
 
 
 def run(doc: dict, args) -> dict:
     trace = Trace(args.trace, quiet=args.quiet)
     session = doc.get("session") or "unknown"
     turns = doc.get("turns") or []
-    out_path = drafts_path(session, args.out)
+    out_path = Path(args.out) if args.out else moments_file(session)
     stats = new_stats(doc)
     t_start = time.time()
-    kept: list[dict] = []
     trace(f"session {session[:12]} | {len(turns)} turns | source "
-          f"{doc.get('source')} | drafts -> {out_path}")
+          f"{doc.get('source')} | moments -> {out_path}")
 
     for i, turn in enumerate(turns):
         if args.turn and turn.get("n") != args.turn:
             continue
         prev = turns[i - 1] if i else None
-        extract_turn(turn, prev, doc=doc, args=args, kept=kept, stats=stats,
-                     trace=trace, out_path=out_path)
+        extract_turn(turn, prev, doc=doc, args=args, stats=stats, trace=trace,
+                     out_path=out_path)
 
     stats["seconds"] = round(time.time() - t_start, 1)
-    trace(f"\nROWS {stats['rows']} | sent {stats['turns_sent']} "
-          f"| spared {stats['turns_spared']} | refusals {stats['refusals']} "
-          f"| transport errors {stats['transport_errors']} "
-          f"| twins {stats['twins']} | {stats['seconds']}s")
+    trace(f"\nMOMENTS {stats['moments']} | sent {stats['turns_sent']} "
+          f"| spared {stats['turns_spared']} | reasons {stats['reasons']} "
+          f"| transport errors {stats['transport_errors']} | {stats['seconds']}s")
     trace.close()
     if args.stats:
         Path(args.stats).write_text(
@@ -1158,26 +1070,22 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--turns", help="canonical turns JSON (staging adapter)")
     p.add_argument("--session", default="", help="session id (default: filename)")
     p.add_argument("--turn", type=int, help="only this turn index")
-    p.add_argument("--out", default="", help="drafts file (default: ~/.config/memhub-plugin/drafts/<session>.jsonl)")
+    p.add_argument("--out", default="",
+                   help="moments file (default: ~/.config/memhub-plugin/drafts/<session>.moments.jsonl)")
     p.add_argument("--stats", default="", help="write a JSON run summary here")
     p.add_argument("--trace", default="", help="append the trace to this file")
-    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
-                   help=f"max drafts per session (default {DEFAULT_BUDGET})")
     p.add_argument("--env", default=os.environ.get("MEMHUB_ENV", "staging"),
                    help="environment name for the state stamp")
     p.add_argument("--hook-version", default="",
                    help="hook version for the state stamp (default: plugin.json)")
-    p.add_argument("--draft-timeout", type=float, default=0,
-                   help=f"seconds for the one server call (default {DRAFT_TIMEOUT_S:g})")
-    p.add_argument("--moments", default="",
-                   help="also append every classifier-flagged moment (window + stamp) "
-                        "to this JSONL, for the local mining pass")
+    p.add_argument("--classify-timeout", type=float, default=0,
+                   help=f"seconds for the one server call (default {CLASSIFY_TIMEOUT_S:g})")
     p.add_argument("--pace", type=float, default=0,
                    help="seconds to wait after each server call (replay only; "
                         "a personal key is capped at 60 calls/min)")
     p.add_argument("--no-model", "--router-only", dest="no_model",
                    action="store_true",
-                   help="router only — no server calls, nothing drafted")
+                   help="router only — no server calls")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--spawn", action="store_true",
                    help="detach and return immediately (hook callers)")

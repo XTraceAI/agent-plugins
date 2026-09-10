@@ -27,9 +27,6 @@ Files, under $MEMHUB_HARNESS_DRAFTS (default ~/.config/memhub-plugin/drafts):
 
   <session>.moments.jsonl   classifier-flagged moments; `handed_at` once nudged
   <session>.meta.json       last extracted turn, repo, cwd, nudge count
-  <session>.jsonl           what the server's author drafted (kept for the
-                            replay's measurements; the live path reads only
-                            moments — see `judge_only` in the scorecard)
 
 Every path fails open and silent (§6): a broken sensor must never touch the
 tool call or the session. Stdlib only.
@@ -80,7 +77,7 @@ def meta_path(session: str) -> Path:
 def moments_path(session: str) -> Path:
     """Classifier-flagged moments (stamp + redacted window), appended by the
     extract child, handed to the agent by the prompt lane."""
-    return _base() / f"{_safe(session)}.moments.jsonl"
+    return hx.moments_file(session)
 
 
 def load_meta(session: str) -> dict:
@@ -153,9 +150,9 @@ def _read_payload() -> dict:
 
 def _args(**over) -> argparse.Namespace:
     """The replay's argument shape, for `extract_turn`."""
-    base = {"hook_version": "", "env": env_name(), "budget": hx.DEFAULT_BUDGET,
-            "no_model": False, "draft_timeout": 0, "out": "", "quiet": True,
-            "trace": "", "stats": "", "turn": None, "moments": "", "pace": 0}
+    base = {"hook_version": "", "env": env_name(), "no_model": False,
+            "classify_timeout": 0, "out": "", "quiet": True, "trace": "",
+            "stats": "", "turn": None, "pace": 0}
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -201,19 +198,17 @@ def cmd_extract(session: str, transcript: str, cwd: str) -> int:
     repo = repo_of(cwd or last.get("cwd") or "")
     doc = {"session": session, "cwd": cwd or last.get("cwd") or "",
            "repo": repo, "source": "claude-live", "turns": turns}
-    out_path = hx.drafts_path(session)
-    kept = hx.read_drafts(out_path)
     stats = hx.new_stats(doc)
     trace = hx.Trace(str(hx.log_path("extract.log")), quiet=True)
     try:
-        hx.extract_turn(last, prev, doc=doc, args=_args(moments=str(moments_path(session))),
-                        kept=kept, stats=stats, trace=trace, out_path=out_path, arcs=arcs)
+        hx.extract_turn(last, prev, doc=doc, args=_args(), stats=stats, trace=trace,
+                        out_path=moments_path(session), arcs=arcs)
     finally:
         trace.close()
     save_meta(session, repo=repo, cwd=doc["cwd"], transcript_path=transcript,
               last_extracted=marker, last_turn=last.get("n"), last_stop_at=time.time())
     _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
-         f"moment={stats.get('moments', 0)} refusals={stats['refusals']} arcs={len(arcs)}")
+         f"moment={stats['moments']} reasons={stats['reasons']} arcs={len(arcs)}")
     return 0
 
 
@@ -224,10 +219,12 @@ def nudge_line(session: str, moment: dict, repo: str) -> str:
     `session_draft` like any other — stamped by the harness, never typed."""
     kind = moment.get("kind") or "a signal"
     hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
+    derivable = (" — the classifier thinks it may already be written down in the repo, "
+                 "so check before proposing") if moment.get("derivable") else ""
     stamp = json.dumps(moment.get("state") or {}, ensure_ascii=False, default=str)
     return (
         f"MemHub harness: your previous turn (turn {moment.get('turn')}) was classified as "
-        f"{kind}{hint}. If it carries a lesson that would change what an agent DOES next "
+        f"{kind}{hint}{derivable}. If it carries a lesson that would change what an agent DOES next "
         f"time, is not already in the repo, its docs, CLAUDE.md or the rulebook, is not "
         f"project state, and will still be true next month, propose it now with the memhub "
         f"create_rule tool: title (a short noun phrase naming the trap), statement (one "

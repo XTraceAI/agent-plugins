@@ -10,10 +10,8 @@ Three modes, three of the scorecard's rows:
           positive costs one author call, a false negative is a lesson that
           never exists. Precision is measured at the END of the pipeline, by
           the activate-ratio row, not here.
-          Since S1 the judge runs on the server behind `POST …/harness/draft`
-          (MemHub #1249) and is not separately callable: a moment is "signal"
-          when the reply is anything but `no_signal`, and a positive also runs
-          the author, so this mode spends author calls too.
+          Since S1 the judge runs on the server behind
+          `POST …/harness/classify`, one call per moment.
 
   router  the router alone over a corpus, no model calls, no cost. Reports how
           often each regex fires and — once you have judged the corpus — what
@@ -26,11 +24,15 @@ Three modes, three of the scorecard's rows:
   were removed with path B (the live agent mines in session now); they are
   at commit 1fa1e48 on the S1 branch if the numbers need re-running.
 
-  corpus  the whole pipeline over a corpus directory of canonical turns JSON
-          (what `staging_sessions.py corpus` writes), N sessions at a time.
-          Reports drafts per session, duplicates, refusal reasons, timeouts,
-          cost and wall time, and writes `judge_sheet.md` — every drafted row,
-          numbered, for the hand judgement the gate actually turns on.
+  corpus  router + redacted window + one classifier call per sent turn over a
+          corpus directory of canonical turns JSON (what `staging_sessions.py
+          corpus` writes). Records each session's flagged moments and reports
+          signal rate, kinds, latency and transport errors.
+
+  nudge   what the coding agent would propose from those moments, given the
+          session up to the turn and the exact nudge line; writes
+          `judge_sheet.md` — every row, numbered, for the hand judgement the
+          gate actually turns on.
 
 Nothing here activates a rule or writes to a server.
 """
@@ -96,14 +98,11 @@ def cmd_gold(args) -> None:
         lines.append(f"USER'S NEW MESSAGE: {it['user'][:900]}")
         if it.get("last_error"):
             lines.append(f"  ! error just before: {str(it['last_error'])[:250]}")
-        reply, dt = hx.server_draft("\n".join(lines), timeout=args.timeout)
+        reply, dt = hx.server_classify("\n".join(lines), timeout=args.timeout)
         reason = str(reply.get("reason") or "")
-        if reason in hx.CLIENT_REASONS or reason in ("judge_failed", "disabled"):
+        if reason != "classified":
             return item_id, None, 0.0, reason
-        # The judge said yes whenever the author ran — every reason but
-        # `no_signal` is an author outcome, refusal or draft.
-        verdict = {"signal": reason != "no_signal", "kind": reply.get("kind") or "none",
-                   "reason": reason}
+        verdict = {"signal": bool(reply.get("signal")), "kind": reply.get("kind") or "none"}
         return item_id, verdict, dt, ""
 
     out, errors, lat = {}, [], []
@@ -275,12 +274,18 @@ def cmd_nudge(args) -> None:
             continue
         name = doc_path.stem
         doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        recorded = run / f"{name}.moments.jsonl"
         trace = run / f"{name}.trace.log"
-        if not trace.is_file():
+        if recorded.is_file():
+            moments = hx.read_drafts(recorded)
+        elif trace.is_file():
+            # A run from before the author was removed recorded no moments;
+            # rebuild them from its trace.
+            drafts = run / f"{name}.drafts.jsonl"
+            rows = hx.read_drafts(drafts) if drafts.is_file() else []
+            moments = moments_from_trace(hx, doc, trace, rows)
+        else:
             continue
-        drafts = run / f"{name}.drafts.jsonl"
-        rows = hx.read_drafts(drafts) if drafts.is_file() else []
-        moments = moments_from_trace(hx, doc, trace, rows)
         if args.per_session:
             moments = moments[:args.per_session]
         for m in moments:
@@ -535,22 +540,21 @@ def cmd_router(args) -> None:
 # ----------------------------------------------------------------- corpus
 def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
     name = path.stem
-    # A rerun into the same --out must measure THIS run: the extractor opens
-    # its drafts file in append mode, and the aggregate below reads every
-    # line, so last run's rows would be counted again (Codex, #191/#192).
-    for suffix in (".drafts.jsonl", ".stats.json", ".trace.log"):
+    # A rerun into the same --out must measure THIS run: the extractor appends
+    # its moments, and `nudge` reads every line.
+    for suffix in (".moments.jsonl", ".drafts.jsonl", ".stats.json", ".trace.log"):
         try:
             (out_dir / f"{name}{suffix}").unlink()
         except FileNotFoundError:
             pass
     cmd = [sys.executable, str(scripts / "harness_extract.py"),
            "--turns", str(path),
-           "--out", str(out_dir / f"{name}.drafts.jsonl"),
+           "--out", str(out_dir / f"{name}.moments.jsonl"),
            "--stats", str(out_dir / f"{name}.stats.json"),
            "--trace", str(out_dir / f"{name}.trace.log"),
-           "--budget", str(args.budget), "--env", args.env, "--quiet"]
-    if args.draft_timeout:
-        cmd += ["--draft-timeout", str(args.draft_timeout)]
+           "--env", args.env, "--quiet"]
+    if args.classify_timeout:
+        cmd += ["--classify-timeout", str(args.classify_timeout)]
     if args.pace:
         cmd += ["--pace", str(args.pace)]
     t0 = time.time()
@@ -558,10 +562,10 @@ def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
     try:
         stats = json.loads((out_dir / f"{name}.stats.json").read_text())
     except (OSError, ValueError):
-        stats = {"session": name, "rows": 0, "error": (proc.stderr or "")[-200:]}
+        stats = {"session": name, "moments": 0, "error": (proc.stderr or "")[-200:]}
     stats["file"] = path.name
     stats["wall_s"] = round(time.time() - t0, 1)
-    print(f"  done {name}: {stats.get('rows', 0)} rows, "
+    print(f"  done {name}: {stats.get('moments', 0)} moments, "
           f"{stats.get('server_calls', 0)} calls, "
           f"{stats.get('transport_errors', 0)} transport errors, {stats['wall_s']}s",
           flush=True)
@@ -569,6 +573,9 @@ def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
 
 
 def cmd_corpus(args) -> None:
+    """The client pipeline over a corpus: router, redacted window, one
+    classifier call per sent turn, and the flagged moments per session. What
+    the agent would do with those moments is `nudge`'s job."""
     scripts = plugin_scripts()
     corpus = Path(args.corpus)
     out_dir = Path(args.out)
@@ -587,107 +594,48 @@ def cmd_corpus(args) -> None:
     t0 = time.time()
     results = []
     with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = [pool.submit(run_one, scripts, f, out_dir, args)
-                   for f in files]
+        futures = [pool.submit(run_one, scripts, f, out_dir, args) for f in files]
         for fut in cf.as_completed(futures):
             results.append(fut.result())
 
-    # ---- aggregate
-    rows_all = []
-    for res in results:
-        drafts = out_dir / f"{Path(res['file']).stem}.drafts.jsonl"
-        if not drafts.exists():
-            continue
-        for line in drafts.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                row = json.loads(line)
-                row["_session_file"] = res["file"]
-                row["_engineer"] = engineer_of.get(res["file"], "?")
-                rows_all.append(row)
-
-    refusals = collections.Counter()
-    for res in results:
-        for reason, n in (res.get("refusals") or {}).items():
-            refusals[reason] += n
-    per_session = {r["file"]: r.get("rows", 0) for r in results}
-    over_budget = {f: n for f, n in per_session.items() if n > args.budget}
-
-    # Duplicates ACROSS the whole run, not just within one session: two
-    # engineers hitting the same trap is exactly the twin the server-side
-    # check exists for, and the scorecard should say whether it happens.
-    # Two passes, both reported: the lexical one the in-run twin check uses
-    # (statement Jaccard), and a looser one over what the rows would DO — the
-    # same trigger regex or a shared anchor, or a near-identical title — which
-    # is what S0's hand judgement found and the lexical pass missed (Finding 5).
-    hx = _load_extract()
-    dupes, near = [], []
-    for i, a in enumerate(rows_all):
-        for b in rows_all[i + 1:]:
-            pair = (a["source_ref"], b["source_ref"], a["title"][:60], b["title"][:60])
-            if hx.similarity(a["statement"], b["statement"]) > hx.TWIN_THRESHOLD:
-                dupes.append(pair)
-            elif _same_trigger(a, b) or hx.similarity(a["title"], b["title"]) >= 0.6:
-                near.append(pair)
-    latencies = [x for r in results for x in (r.get("latencies") or [])]
-    latencies.sort()
-
-    engineers = sorted({r["_engineer"] for r in rows_all}) or ["?"]
-    router_authored = dict(collections.Counter(
-        k for r in results for k, n in (r.get("router_authored") or {}).items()
-        for _ in range(n)).most_common())
-    router_refused = dict(collections.Counter(
-        k for r in results for k, n in (r.get("router_refused") or {}).items()
-        for _ in range(n)).most_common())
+    latencies = sorted(x for r in results for x in (r.get("latencies") or []))
+    per_session = {r["file"]: r.get("moments", 0) for r in results}
     hinted = sum(r.get("hinted_calls", 0) for r in results)
+    sent = sum(r.get("turns_sent", 0) for r in results)
+    moments = sum(per_session.values())
+    reasons = collections.Counter()
+    kinds = collections.Counter()
+    for r in results:
+        reasons.update(r.get("reasons") or {})
+        kinds.update(r.get("kinds") or {})
     summary = {
         "sessions": len(results),
         "engineers": sorted(set(engineer_of.values())) or ["?"],
-        "engineers_with_rows": engineers,
         "turns": sum(r.get("turns", 0) for r in results),
-        "turns_sent": sum(r.get("turns_sent", 0) for r in results),
+        "turns_sent": sent,
         "turns_spared_by_router": sum(r.get("turns_spared", 0) for r in results),
-        "rows": len(rows_all),
-        "rows_per_session_max": max(per_session.values() or [0]),
-        "rows_per_session_mean": round(
-            sum(per_session.values()) / max(len(per_session), 1), 2),
-        "sessions_over_budget": over_budget,
-        "duplicate_pairs_lexical": len(dupes),
-        "duplicate_pairs_trigger_or_title": len(near),
+        "moments": moments,
+        "signal_rate": round(moments / sent, 3) if sent else None,
+        "moments_per_session_mean": round(moments / max(len(results), 1), 2),
+        "moments_per_session_max": max(per_session.values() or [0]),
         "server_calls": sum(r.get("server_calls", 0) for r in results),
         "transport_errors": sum(r.get("transport_errors", 0) for r in results),
+        "reasons": dict(reasons.most_common()),
+        "judge_kinds": dict(kinds.most_common()),
         "latency_p50_s": round(latencies[len(latencies) // 2], 1) if latencies else None,
         "latency_p90_s": round(latencies[int(len(latencies) * .9)], 1) if latencies else None,
-        "judge_kinds": dict(collections.Counter(
-            k for r in results for k, n in (r.get("kinds") or {}).items()
-            for _ in range(n)).most_common()),
-        "twins_dropped_in_run": sum(r.get("twins", 0) for r in results),
-        "refusals": dict(refusals.most_common()),
         "router_hinted_calls": hinted,
-        "router_authored": router_authored,
-        "router_refused": router_refused,
-        # rows from router-hinted turns ÷ router-hinted calls: the scorecard's
-        # "router regex precision" row, measured the same way as S0's
-        "router_precision": round(sum(router_authored.values()) / hinted, 3) if hinted else None,
+        # a hinted call the classifier agreed with ÷ hinted calls
+        "router_hint_signal_rate": round(sum(r.get("hinted_signals", 0) for r in results) / hinted, 3)
+        if hinted else None,
         "wall_s": round(time.time() - t0, 1),
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=1), encoding="utf-8")
-    (out_dir / "rows.json").write_text(
-        json.dumps(rows_all, indent=1), encoding="utf-8")
-    write_judge_sheet(out_dir / "judge_sheet.md", rows_all, summary, dupes, near)
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
 
     print("\n" + "=" * 62)
-    for key in ("sessions", "engineers", "turns", "turns_sent",
-                "turns_spared_by_router", "rows",
-                "rows_per_session_max", "rows_per_session_mean",
-                "sessions_over_budget", "duplicate_pairs_lexical",
-                "duplicate_pairs_trigger_or_title", "server_calls",
-                "transport_errors", "latency_p50_s", "latency_p90_s",
-                "router_hinted_calls", "router_precision",
-                "twins_dropped_in_run", "wall_s"):
-        print(f"{key:32} {summary[key]}")
-    print(f"{'refusals':26} {summary['refusals']}")
-    print(f"\n-> {out_dir}/judge_sheet.md   (hand-judge this; the gate turns on it)")
+    for key, value in summary.items():
+        print(f"{key:28} {value}")
+    print(f"\n-> {out_dir}  (next: `score_s0.py nudge --run {out_dir}` for the agent's rows)")
 
 
 JUDGE_SHEET_HEADER = """# S0 judge sheet
@@ -808,18 +756,17 @@ def build_parser() -> argparse.ArgumentParser:
     j.add_argument("--timeout", type=int, default=600)
     j.add_argument("--out", default="")
 
-    c = sub.add_parser("corpus", help="the whole pipeline over a corpus")
+    c = sub.add_parser("corpus", help="router + classifier over a corpus, moments per session")
     c.add_argument("--corpus", required=True)
     c.add_argument("--out", required=True)
-    c.add_argument("--jobs", type=int, default=6)
+    c.add_argument("--jobs", type=int, default=2)
     c.add_argument("--limit", type=int, default=0)
-    c.add_argument("--budget", type=int, default=8)
     c.add_argument("--env", default="staging")
-    c.add_argument("--draft-timeout", type=float, default=0,
+    c.add_argument("--classify-timeout", type=float, default=0,
                    help="seconds for the one server call per turn")
     c.add_argument("--pace", type=float, default=1.0,
                    help="seconds between server calls per session (a personal "
-                        "key is capped at 60/min; with --jobs 1 this keeps under it)")
+                        "key is capped at 60/min; keep --jobs at 2 or fewer)")
     return p
 
 

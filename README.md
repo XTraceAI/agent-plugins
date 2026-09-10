@@ -228,7 +228,7 @@ into the overview cache, throttled to once per 6 hours.
 With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin turns a
 correction in a session into a proposed team rule in two hook lanes. At each
 turn's Stop a detached child sends a redacted window of the moment to MemHub
-(`POST /v1/team/rulebook/harness/draft`), whose classifier says whether the
+(`POST /v1/team/rulebook/harness/classify`), whose classifier says whether the
 moment matters; a flagged moment is written locally with the nine-field state
 stamp. At the next user prompt, one injected line hands that moment to the
 agent that lived the turn: if there is a lesson that would change what an

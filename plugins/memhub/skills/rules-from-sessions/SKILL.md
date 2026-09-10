@@ -360,8 +360,8 @@ to a server.
 
 | script | what it answers |
 |---|---|
-| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_extract.py` | the pipeline itself: router → redacted window → one server call (judge + author, MemHub `POST /v1/team/rulebook/harness/draft`) → stamp → drafts |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py` | the LIVE sensor (S1): the Stop hook, the three-moment review, the sync — every path a no-op unless `MEMHUB_HARNESS_EXTRACT` is on |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_extract.py` | the client pipeline: router → redacted window → one classifier call (MemHub `POST /v1/team/rulebook/harness/classify`) → a stamped moment for the agent |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py` | the LIVE sensor (S1): the Stop hook, and the next-prompt nudge that hands a flagged moment to the agent — every path a no-op unless `MEMHUB_HARNESS_EXTRACT` is on |
 | `scripts/replay_hooks.py` | one command: replay a session through the installed hook AND the extractor |
 | `scripts/staging_sessions.py` | read-only adapter: a teammate's staging-captured session → the replay window |
 | `scripts/score_s0.py` | the scorecard: judge recall on gold, router hits, whole-pipeline over a corpus |
@@ -423,20 +423,21 @@ activate ratio, not at the judge.
 
 ## What runs a model, and how it is kept out of your session
 
-Since S1 the judge and the author run **on the server** (MemHub #1249): the
-client sends one redacted window per turn to `POST /v1/team/rulebook/harness/draft`
-on the plugin's own credential, and gets back a row shaped for `create_rule`
-or a one-word refusal. No API key, no model and no prompt live on the laptop.
-Point the replay at the backend you mean — `MEMHUB_MCP_BASE_URL=https://api.staging.memhub.xtrace.ai`
-selects the staging plugin's credential — because the call is metered against
-that org's compute credits. The endpoint creates nothing; drafts still go to a
-local file only.
+Since S1 only the **classifier** runs on a model the plugin calls: one
+redacted window per sent turn to `POST /v1/team/rulebook/harness/classify` on
+the plugin's own credential, answered with `signal`, `kind` and a reason. No
+API key, no author and no prompt live on the laptop, and there is no author on
+the server either — the coding agent that lived the turn writes the lesson at
+the next prompt. Point a replay at the backend you mean —
+`MEMHUB_MCP_BASE_URL=https://api.staging.memhub.xtrace.ai` selects the staging
+plugin's credential — because the call is metered against that org's compute
+credits, and a personal key is capped at 60 calls a minute.
 
-The one model call left on the client is the post-session review
-(`harness_stop.py review`), a headless `claude -p` over a session's drafts. It
-runs under `--safe-mode` (no plugins, no hooks, no CLAUDE.md) **and** carries
-`MEMHUB_HARNESS_CHILD=1`, which `claude_hook_guard.py` honours by disarming
-every hook. Both, because the first is a Claude-Code-only flag and the second
-works on every host. Without them the review's own session gets captured into
-the repo brain and shows up on the fleet board — that happened while S0 was
-being measured.
+The measurement modes that do run a local model — `score_s0.py nudge` (the
+agent's decision on each flagged moment) and `judge` (a blind second reader) —
+run headless `claude -p` under `--safe-mode` (no plugins, no hooks, no
+CLAUDE.md) **and** with `MEMHUB_HARNESS_CHILD=1`, which `claude_hook_guard.py`
+honours by disarming every hook. Both, because the first is a
+Claude-Code-only flag and the second works on every host. Without them a
+replay's own sessions get captured into the repo brain and show up on the
+fleet board — that happened while S0 was being measured.
