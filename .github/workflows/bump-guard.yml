@@ -14,7 +14,6 @@
 name: bump-guard
 on:
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 concurrency:
   group: plugin-checks-${{ github.event.pull_request.number }}
