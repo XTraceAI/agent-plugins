@@ -290,6 +290,54 @@ def test_redaction_reuses_values_without_shared_mutation_and_is_bounded():
         ft._REDACTION_CACHE.reset(token)
 
 
+def test_overlapping_redaction_workers_keep_local_results_after_eviction():
+    import linecache
+    row={"uuid":"old","content":"synthetic"}
+    cache={"items":{},"bytes":0};token=ft._REDACTION_CACHE.set(cache)
+    paused=threading.Event();release=threading.Event();result=[];errors=[]
+    def worker():
+        worker_token=ft._REDACTION_CACHE.set(cache)
+        def trace(frame,event,arg):
+            if (event=="line" and frame.f_code.co_name=="redact_once" and
+                    "result.append(copy.deepcopy(" in linecache.getline(frame.f_code.co_filename,frame.f_lineno)):
+                paused.set();assert release.wait(3)
+            return trace
+        try:
+            sys.settrace(trace);result.extend(ft._redact_once([row]))
+        except BaseException as error:errors.append(error)
+        finally:sys.settrace(None);ft._REDACTION_CACHE.reset(worker_token)
+    thread=threading.Thread(target=worker)
+    try:
+        with patch.object(capture_redaction,"redact_records",side_effect=copy.deepcopy):
+            ft._redact_once([row]);thread.start();assert paused.wait(3)
+            ft._redact_once([{"content":"x"*(8*1024*1024-20)}])
+            release.set();thread.join(3)
+        assert not thread.is_alive() and not errors,errors
+        assert result==[row] and cache["bytes"]<=8*1024*1024
+    finally:
+        release.set()
+        if thread.ident is not None:thread.join(3)
+        ft._REDACTION_CACHE.reset(token)
+
+
+def test_simultaneous_redaction_cache_misses_count_one_entry():
+    row={"uuid":"same","content":"synthetic"};cache={"items":{},"bytes":0}
+    barrier=threading.Barrier(2);errors=[];results=[]
+    def redact(rows):
+        barrier.wait(timeout=3);return copy.deepcopy(rows)
+    def worker():
+        token=ft._REDACTION_CACHE.set(cache)
+        try:results.append(ft._redact_once([row]))
+        except BaseException as error:errors.append(error)
+        finally:ft._REDACTION_CACHE.reset(token)
+    with patch.object(capture_redaction,"redact_records",side_effect=redact):
+        threads=[threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(4)
+    assert not errors and results==[[row],[row]],errors
+    assert cache["bytes"]==len(json.dumps(row,sort_keys=True,separators=(",",":")))
+
+
 def test_cancelled_auth_worker_cannot_keep_loop_alive_or_write_delivery_state():
     marker=[];release=threading.Event()
     async def run():
