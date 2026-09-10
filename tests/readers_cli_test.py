@@ -779,6 +779,21 @@ def test_latest_never_reintroduces_symlinked_discovery_directories():
                 assert len(headers)==1 and headers[0]["path"]==str(safe.resolve()),headers
 
 
+def test_latest_cursor_reports_unreadable_ranking_metadata():
+    for data in [b"{broken", b"null", b"[]", b'{"updatedAtMs":"later"}', b"{}",
+                 b'{"updatedAtMs":NaN}', b'{"updatedAtMs":1e999}',
+                 b'{"updatedAtMs":0,"extra":"bad\xff"}',
+                 ('{"updatedAtMs":'+'9'*310+'}').encode()]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);transcript(home)
+            store=fixtures._make_cursor_store(home/".cursor/chats",uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            metadata=store.parent/"meta.json";metadata.write_bytes(data)
+            for mode in [[],["--metadata-only"]]:
+                result,rows=run(home,"cursor","--session","latest",*mode)
+                assert result.returncode==2 and rows==[] and "discovery_incomplete" in result.stderr,(data,result.stdout,result.stderr)
+                assert "Traceback" not in result.stderr and metadata.read_bytes()==data
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
