@@ -167,6 +167,9 @@ hostname casing or an explicit default port can reuse the installed URL's
 credential; requests still use the selected endpoint. A different
 origin can use its own stored PAK or still-valid cached token without sending
 its refresh token to the installed backend's authorization server.
+A trailing DNS dot remains part of the URL host, so `https://example.test`
+and `https://example.test.` require their own credentials even if DNS resolves
+them to the same address ([URL Standard](https://url.spec.whatwg.org/#host-equivalence)).
 
 File-based capture selection does not change `default_url()`, unqualified
 `resolve_bearer()` or `resolve_url_and_auth()`. Login, recall, brain overview and
