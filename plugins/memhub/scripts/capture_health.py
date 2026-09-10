@@ -550,6 +550,29 @@ def _already_warned(session_id: str, signature: str) -> bool:
     return False
 
 
+def _renewable_capture_credential(sink: sinks.Sink) -> bool:
+    """Read renewal capability without contacting an authorization server."""
+    import _memhub_auth as auth
+    try:
+        installed = auth._plugin_mcp_config()
+        if sinks._origin(installed["url"]) != sinks._origin(sink.url):
+            return False
+        oauth = installed.get("oauth") or {}
+        if not oauth.get("clientId") or urlparse(oauth.get("authServerMetadataUrl", "")).scheme != "https":
+            return False
+        for url in dict.fromkeys((sink.url, installed["url"])):
+            try:
+                cached = json.loads(auth.token_cache_path(url).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            refresh = cached.get("refresh_token") if isinstance(cached, dict) else None
+            if isinstance(refresh, str) and refresh.strip():
+                return True
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
+        pass
+    return False
+
+
 def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
     """No network and no success inference from a constant local credential."""
     messages, causes = [], []
@@ -559,7 +582,7 @@ def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
                                             STATE_DIR.parent / "cursorflush")
                     if (failure := _recent_failure(capture_context.state_directory(family, sink)))]
         failure = max(failures, key=lambda item: item[1]) if failures else None
-        if not bearer:
+        if not bearer and not _renewable_capture_credential(sink):
             messages.append(f"Capture destination '{sink.name}' has no usable credential. "
                             "Check its configuration or saved login.")
             causes.append(f"capture:{sink.name}:auth")

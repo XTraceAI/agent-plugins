@@ -18,6 +18,7 @@ from sinks import Sink, SinkConfigError, resolve_capture_auth, resolve_capture_s
 
 _current: ContextVar[Sink | None] = ContextVar("capture_destination", default=None)
 _legacy: ContextVar[bool] = ContextVar("capture_legacy_state", default=True)
+_room_env: ContextVar[str | None] = ContextVar("capture_room_env", default=None)
 _payload: ContextVar[dict | None] = ContextVar("capture_hook_payload", default=None)
 
 
@@ -37,11 +38,13 @@ def entrypoint(function):
             return 0
         token = _current.set(sink)
         legacy_token = _legacy.set(legacy)
+        room_token = _room_env.set(_capture_room_env(sink))
         payload_token = _payload.set(None)
         try:
             return function(*args, **kwargs)
         finally:
             _payload.reset(payload_token)
+            _room_env.reset(room_token)
             _legacy.reset(legacy_token)
             _current.reset(token)
     return selected
@@ -71,9 +74,20 @@ def resolve_bearer():
     return resolve_capture_auth(sink) if sink is not None else _memhub_auth.resolve_bearer()
 
 
+def _capture_room_env(sink: Sink) -> str:
+    if sink.is_local:
+        return "local"
+    try:
+        if sink.url == _memhub_auth._plugin_mcp_config()["url"]:
+            return room_map.env_for_url(sink.url)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
+        pass
+    return "capture-" + hashlib.sha256(sink.url.encode("utf-8")).hexdigest()
+
+
 def env_for_url(url: str) -> str:
     sink = _current.get()
-    return "local" if sink is not None and sink.is_local else room_map.env_for_url(url)
+    return (_room_env.get() or _capture_room_env(sink)) if sink else room_map.env_for_url(url)
 
 
 async def resolve_repo_brain(session, cwd, env):

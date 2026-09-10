@@ -174,6 +174,9 @@ shared Cursor pins and separate capture/cloud-service health.
 Each invocation freezes one selected destination for its authentication, state,
 room routing and async work. Empty selection skips delivery. Multiple active
 names remain unsupported and are reported without selecting another endpoint.
+The installed endpoint keeps its existing room-cache namespace. Other remote
+endpoints use a digest of their complete URL, so one server cannot read or
+overwrite another server's cached room ID. Loopback never resolves cloud rooms.
 The existing installed cloud retains its legacy state. Other named or explicit
 environment destinations store progress under the hook state directory, then
 sink name and a digest of the full endpoint. Changing an endpoint under the same
@@ -201,3 +204,6 @@ another destination cannot clear that failure, and a constant local token cannot
 certify cloud login. Cloud-service authentication and rulebook issues are reported
 separately. The health hook does not contact either destination or report a
 connection as proven merely because credentials exist.
+An expired access token with same-origin renewal metadata and a saved refresh
+token does not produce a missing-credential warning. This is a local capability
+check; it makes no network request and does not clear a recorded delivery error.
