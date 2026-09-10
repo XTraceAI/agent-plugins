@@ -833,7 +833,13 @@ def read_drafts(path: Path) -> list[dict]:
 # --------------------------------------------------------------------- run
 class Trace:
     def __init__(self, path: str = "", quiet: bool = False):
-        self.fh = open(path, "a", encoding="utf-8") if path else None
+        self.fh = None
+        if path:
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                self.fh = open(path, "a", encoding="utf-8")
+            except OSError:
+                self.fh = None            # a trace that cannot be written is no trace
         self.quiet = quiet
         self.lines: list[str] = []
 

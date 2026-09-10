@@ -873,6 +873,66 @@ def bash_ok(resp, *, strict=False):
         r"|(^|\n)npm ERR!|(^|\n)error(\[E\d+\])?:", txt)
 
 
+# ── error-arc pairing (harness-tied-memory-spec §4.1) ───────────────────────
+#
+# A tool error on target T and a later success on the same T are ONE moment —
+# what broke and what fixed it — not two. The post lane already sees every
+# Bash result, so the pair is recorded here, into the session state the Stop
+# sensor (`harness_stop.py`) drains at the end of the turn: a closed arc is
+# routed as a signal, an arc still open at Stop was just a failure, and the
+# open set is emptied so nothing pairs across turns. Behind the harness flag
+# because it is harness bookkeeping: with the flag off the lane is byte-for-byte
+# what it was. +≤5 ms — a dict update, no I/O beyond the state file already
+# being saved.
+HARNESS_FLAG = "MEMHUB_HARNESS_EXTRACT"    # the one S1 switch; `harness_extract.extract_enabled` is the same test
+ARCS_OPEN_MAX = 20            # distinct failing targets tracked per session
+ARCS_CLOSED_MAX = 20          # closed arcs waiting for the Stop sensor
+
+
+def harness_extract_on(environ=None):
+    env = os.environ if environ is None else environ
+    return str(env.get(HARNESS_FLAG, "")).strip().lower() in ("1", "on", "true", "yes")
+
+
+def pair_error_arc(st, cmd, resp):
+    """Record a Bash failure on `cmd`, or close the arc a success on the same
+    command completes. `cost` is the number of Bash results between the two —
+    the spec routes an arc that cost ≥ 5 calls whatever its signature."""
+    key = shell_only(cmd or "").strip()[:200]
+    if not key:
+        return
+    n = st["arc_calls"] = int(st.get("arc_calls") or 0) + 1
+    opened = st.setdefault("arcs_open", {})
+    if bash_ok(resp):
+        first = opened.pop(key, None)
+        if first is not None:
+            closed = st.setdefault("arcs_closed", [])
+            closed.append({"signature": first.get("signature", ""), "target": key,
+                           "fix": key, "cost": n - int(first.get("call") or n),
+                           "at": _now()})
+            del closed[:-ARCS_CLOSED_MAX]
+        return
+    if key not in opened:
+        opened[key] = {"signature": result_text(resp)[:200], "call": n}
+        for stale in list(opened)[:-ARCS_OPEN_MAX]:
+            opened.pop(stale, None)
+
+
+def take_error_arcs(session_id):
+    """The closed arcs since the last take, and a fresh open set — called by the
+    Stop sensor once per turn. Never raises; an unreadable state is no arcs."""
+    try:
+        sp = state_path(session_id)
+        st = load_state(sp)
+        closed = list(st.pop("arcs_closed", None) or [])
+        had_open = bool(st.pop("arcs_open", None))
+        if closed or had_open:
+            save_state(sp, st)
+        return closed
+    except Exception:
+        return []
+
+
 # ── given: predicates a matched rule must also satisfy ──────────────────────
 PROBE_TIMEOUT_S = 1.0        # per git call; a probe past it answers None, never blocks the call
 _TURNS_MAX_BYTES = 16 * 1024 * 1024   # transcript larger than this: only its tail is read
@@ -2819,6 +2879,11 @@ def main():
                     if mode == "pre" and tool in EDIT_TOOLS else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
+    if resp is not None and cmd and harness_extract_on():
+        try:
+            pair_error_arc(st, cmd, resp)     # §4.1; drained by harness_stop.py at Stop
+        except Exception:
+            pass
     ordering = None
     dedup_keys = {}
     by_id = {r["id"]: r for r in rules}

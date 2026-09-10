@@ -79,7 +79,9 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 19   # + UserPromptSubmit (brain_brief.py prompt),
+    assert len(commands) == 21   # + UserPromptSubmit (brain_brief.py prompt),
+                                 # + Stop and SessionStart (harness_stop.py, S1;
+                                 # both no-ops unless MEMHUB_HARNESS_EXTRACT),
                                  # + PostToolUse (pr_link_trigger.py); SessionEnd
                                  # carries capture AND the fire flush in ONE
                                  # handler, because they must run in that order.
