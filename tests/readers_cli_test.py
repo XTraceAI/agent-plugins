@@ -618,6 +618,25 @@ def test_since_filter_checks_the_final_source_revision():
         assert result.returncode==0 and not rows and not result.stderr,result.stderr
 
 
+def test_historical_export_keeps_titles_outside_the_capture_tail_window():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home);sid=codex.session_metadata(path)["session_id"]
+        index=home/".codex/session_index.jsonl"
+        with index.open("w") as handle:
+            handle.write(json.dumps({"id":sid,"thread_name":"Original native title"})+"\n")
+            for n in range(10001):
+                handle.write(json.dumps({"id":f"other-{n}","thread_name":"x"*500})+"\n")
+        assert index.stat().st_size>codex._INDEX_TAIL_BYTES
+        with patch.object(codex,"_SESSION_INDEX",index):
+            assert codex.to_canonical(path)[1]["title"]!="Original native title"
+        result,rows=run(home,"codex")
+        assert result.returncode==0 and rows[0]["title"]=="Original native title",result.stderr
+        with index.open("a") as handle:
+            handle.write(json.dumps({"id":sid,"thread_name":"Latest native title"})+"\n")
+        result,rows=run(home,"codex","--session",sid)
+        assert result.returncode==0 and rows[0]["title"]=="Latest native title",result.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
