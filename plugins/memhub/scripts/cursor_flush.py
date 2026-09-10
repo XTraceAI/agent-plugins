@@ -57,6 +57,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_context  # noqa: E402
+import capture_async  # noqa: E402
+from capture_redaction import CACHE as _REDACTION_CACHE, redact_once  # noqa: E402
+from transcript_chunks import slices as make_slices  # noqa: E402
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
@@ -259,7 +262,8 @@ def _read_state(uuid: str, *, strict: bool = False) -> dict:
     if _delivery_path(uuid) == _state_path(uuid):
         return shared
     return {**{key: value for key, value in shared.items() if key in _SHARED_STATE_FIELDS},
-            **_state_at(_delivery_path(uuid), strict=strict)}
+            **{key: value for key, value in _state_at(_delivery_path(uuid), strict=strict).items()
+               if key not in _SHARED_STATE_FIELDS}}
 
 
 def _save_state(uuid: str, **fields) -> None:
@@ -309,7 +313,8 @@ def _save_state(uuid: str, **fields) -> None:
             fh.close()
 
 
-def _acquire(uuid: str, blocking: bool = False) -> int | None:
+def _acquire(uuid: str, blocking: bool = False, *, observations: bool = False,
+             timeout: float | None = None) -> int | None:
     """Per-session flock. Non-blocking returns None when held; blocking WAITS.
 
     Turn-boundary events (stop / beforeSubmitPrompt) pass blocking=True: a
@@ -334,13 +339,15 @@ def _acquire(uuid: str, blocking: bool = False) -> int | None:
     description, so taking both on one path would deadlock this process
     against itself.
     """
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    directory = STATE_DIR if observations else capture_context.state_directory(STATE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    suffix = "observations.lock" if observations else "flush.lock"
     # O_CLOEXEC is belt-and-braces: CPython has made os.open fds
     # non-inheritable by default since PEP 446 (3.4), so a subprocess cannot
     # already pin this lock past our exit — the flag states the invariant in
     # code so a future refactor cannot quietly drop it. getattr because the
     # constant is Unix-only and the capture scripts run on native Windows.
-    fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.flush.lock",
+    fd = os.open(directory / f"{_safe_uuid(uuid)}.{suffix}",
                  os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
     if not blocking:
         try:
@@ -357,7 +364,8 @@ def _acquire(uuid: str, blocking: bool = False) -> int | None:
     # normal concurrent flush, short enough to cap a stuck one — then give up
     # (the import-session sweep is the backstop). A dead peer releases the
     # flock via the kernel, so this returns the instant that happens.
-    deadline = time.monotonic() + LOCK_WAIT_S
+    budget = capture_context.time_budget() if timeout is None else timeout
+    deadline = time.monotonic() + min(LOCK_WAIT_S, budget if budget is not None else LOCK_WAIT_S)
     while True:
         try:
             portable_lock.lock_exclusive(fd, blocking=False)
@@ -974,7 +982,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
             pending_pr_urls=pending_pr_urls,
             accepted_pr_urls=accepted_pr_urls,
         )
-    sendable = redact_records(elide_oversized_tool_results(records))
+    sendable = redact_once(elide_oversized_tool_results(records))
     if not sendable:
         if records:
             _log(f"all {len(records)} record(s) redacted away — nothing to "
@@ -992,7 +1000,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         return
 
     try:
-        url, bearer = await asyncio.to_thread(resolve_bearer)
+        url, bearer = await capture_async.blocking(resolve_bearer)
     except Exception as e:  # noqa: BLE001
         # Auth resolution is LOCAL (token cache, refresh) — a failure here is
         # the no_credential case, not a contacted-server failure, so it must
@@ -1009,7 +1017,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         _save_state(uuid, last_error="no_credential", fail_streak=0)
         return
     env = env_for_url(url)
-    session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
+    session = capture_context.session(url, bearer, timeout=min(FLUSH_TIMEOUT_S / 2,
+                                      capture_context.time_budget() or FLUSH_TIMEOUT_S))
 
     cwd = meta.get("cwd")
     # Both derive from cwd alone and neither feeds the other, so they run
@@ -1024,7 +1033,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         try:
             room, namespace = await asyncio.gather(
                 resolve_repo_brain(session, cwd, env),
-                asyncio.to_thread(_namespace_of, cwd),
+                capture_async.blocking(_namespace_of, cwd),
             )
         except Exception as e:  # noqa: BLE001
             # resolve_repo_brain is documented never to raise (its body is a
@@ -1065,7 +1074,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
         "source_platform": cursor_reader.HOST,
-        **capture_context.identity(uuid, lambda: cursor_reader.session_metadata(source_path)),
+        **capture_context.identity(uuid, lambda: cursor_reader.session_metadata(source_path), include_cloud=True),
         "flush": flush_mode,
     }
     if room:
@@ -1094,54 +1103,33 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # matches nothing and ships in the clear. Verified both ways.
         arguments["title"] = redact_text(title.strip())[:200]
 
-    try:
-        res = await session.call_tool("import_conversation",
-                                      arguments=arguments)
-    except mcp_http.McpRateLimited as e:
-        _log(f"rate limited: {e}")
-        _note_failure(uuid, "rate_limited")
-        return
-    except mcp_http.McpError as e:
-        _log(f"import failed: {e}")
-        _note_failure(uuid, f"mcp_error: {str(e)[:80]}")
-        return
+    payloads = [part[start:start + 2000] for part in make_slices(sendable)
+                for start in range(0, len(part), 2000)]
+    for batch in payloads:
+        batch_args = {**arguments, "messages": batch}
+        try:
+            res = await capture_context.import_conversation(session, batch_args)
+        except mcp_http.McpRateLimited as e:
+            _log(f"rate limited: {e}")
+            _note_failure(uuid, "rate_limited")
+            return
+        except mcp_http.McpError as e:
+            _log(f"import failed: {e}")
+            _note_failure(uuid, f"mcp_error: {str(e)[:80]}")
+            return
+        verdict = _verdict(res, f"cursor-{uuid}")
+        if verdict == "unsupported":
+            _log("server does not report ack_through — capture deferred for this destination")
+            _save_state(uuid, last_flush_at=time.time(), unsupported=True,
+                        unsupported_at=time.time(), fail_streak=0)
+            return
+        ack = mcp_http.ack_of(res, f"cursor-{uuid}")
+        if verdict != "ok" or not capture_context.acknowledges(ack or {}, f"cursor-{uuid}", batch):
+            _note_failure(uuid, "unconfirmed_import")
+            return
+        pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge_confirmed_import(
+            pending_pr_urls, accepted_pr_urls, ack)
 
-    # A returned call is NOT a persisted call. MCP signals tool failure with
-    # isError rather than an exception, and this backend has shipped a
-    # 200-with-nothing-stored mode before (records dedup-registered without
-    # persisting: records_dropped>0, ack_through null — the same failure that
-    # hid Cursor sessions for months). Advancing the watermark on such a reply
-    # marks the blobs shipped, and since a session's LAST flush has no later
-    # event to re-send it, that is a silently lost conversation. So: confirm
-    # the ack, or hold the watermark and let the next event re-send. Mirrors
-    # flush_turn's discipline on the Claude path.
-    verdict = _verdict(res, f"cursor-{uuid}")
-    if verdict == "unsupported":
-        # Dormant for this session rather than looping: the watermark stays
-        # put (nothing is claimed shipped) and no further flush runs, so an
-        # unconfirmable server costs redundant work exactly once instead of
-        # on every event. /memhub:import-session still captures the session.
-        _log("server does not report ack_through — per-event flush is "
-             "dormant for this session; run /memhub:import-session to "
-             "capture it, or upgrade the server")
-        _save_state(uuid, last_flush_at=time.time(), unsupported=True,
-                    unsupported_at=time.time(), fail_streak=0)
-        return
-    if verdict != "ok":
-        _note_failure(uuid, "unconfirmed_import")
-        return
-
-    # `shipped` was fixed at the end of the transcript read (see above), NOT
-    # re-read here: a post-send read would span the whole network round trip.
-    # The timestamps land either way — the debounce must still hold after a
-    # successful send — but blob_ids only when we could actually verify it.
-    ack = mcp_http.ack_of(res, f"cursor-{uuid}")
-    reconciled = pr_provenance.acknowledge_confirmed_import(
-        pending_pr_urls,
-        accepted_pr_urls,
-        ack,
-    )
-    pending_pr_urls, accepted_pr_urls = reconciled
     if pending_pr_urls:
         # The transcript committed, but its optional URL write did not. Keep
         # the source watermark pinned and retry through the existing bounded
@@ -1177,14 +1165,10 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
-@capture_context.entrypoint
-def main() -> int:
+def _capture_sink(payload: dict) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-        capture_context.observe(payload)
-    except json.JSONDecodeError:
-        payload = {}
+    started = time.monotonic()
+    capture_context.observe(payload)
 
     uuid = session_uuid(payload)
     if not uuid:
@@ -1229,132 +1213,145 @@ def main() -> int:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
-        state = _read_state(uuid)
-        accepted_pr_urls = pr_provenance.merge_urls(
-            state.get("accepted_pr_urls") or [])
-        accepted_pr_set = set(accepted_pr_urls)
-        prior_pending = pr_provenance.merge_urls(
-            state.get("pending_pr_urls") or [])
-        pending_pr_urls = [
-            url for url in pr_provenance.merge_urls(
-                prior_pending, event_pr_urls)
-            if url not in accepted_pr_set
-        ]
-        if pending_pr_urls != prior_pending:
-            # Cursor's transcript omits shell results. Persist the hook-only
-            # evidence before source reads and network work so any later event
-            # can retry it after a crash, missing source, or failed send.
-            _save_state(
-                uuid,
-                pending_pr_urls=pending_pr_urls,
-                accepted_pr_urls=accepted_pr_urls,
-            )
-            state = {
-                **state,
-                "pending_pr_urls": pending_pr_urls,
-                "accepted_pr_urls": accepted_pr_urls,
-            }
-        source_kind, source_path, err = _source_for(uuid, payload, state)
-        if source_kind is None or source_path is None:
-            _log(f"{event}: {err or 'no readable Cursor source'}")
+        budget = capture_context.time_budget() or FLUSH_TIMEOUT_S
+        remaining = max(0.0, budget - (time.monotonic() - started))
+        if remaining <= 0:
             return 0
-
-        cursor_meta = _payload_meta(payload, state)
-        blob_ids: set[str] = set()
-        source_revision: str | None = None
+        observation_fd = _acquire(uuid, blocking=True, observations=True, timeout=remaining)
+        if observation_fd is None:
+            return 0
         try:
-            if source_kind == "store":
-                blob_ids = current_blob_ids(source_path)
-                if not blob_ids:
-                    # A readable empty store is mid-rebuild. Leave every
-                    # watermark untouched so the next hook retries it.
-                    _log(f"{event}: store reports zero blobs (rebuilding?) — "
-                         "skipping")
-                    return 0
-                records, meta = cursor_reader.to_canonical(source_path)
-            else:
-                records, meta = cursor_reader.to_canonical(
-                    source_path, session_id=uuid,
-                    cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
-        except Exception as e:  # locked/partial/corrupt source — next hook retries
-            _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
-            return 0
+            state = _read_state(uuid)
+            accepted_pr_urls = pr_provenance.merge_urls(
+                state.get("accepted_pr_urls") or [])
+            accepted_pr_set = set(accepted_pr_urls)
+            prior_pending = pr_provenance.merge_urls(
+                state.get("pending_pr_urls") or [])
+            pending_pr_urls = [
+                url for url in pr_provenance.merge_urls(
+                    prior_pending, event_pr_urls)
+                if url not in accepted_pr_set
+            ]
+            if pending_pr_urls != prior_pending:
+                # Cursor's transcript omits shell results. Persist the hook-only
+                # evidence before source reads and network work so any later event
+                # can retry it after a crash, missing source, or failed send.
+                _save_state(
+                    uuid,
+                    pending_pr_urls=pending_pr_urls,
+                    accepted_pr_urls=accepted_pr_urls,
+                )
+                state = {
+                    **state,
+                    "pending_pr_urls": pending_pr_urls,
+                    "accepted_pr_urls": accepted_pr_urls,
+                }
+            source_kind, source_path, err = _source_for(uuid, payload, state)
+            if source_kind is None or source_path is None:
+                _log(f"{event}: {err or 'no readable Cursor source'}")
+                return 0
 
-        # Persist source identity and exact usage BEFORE any network work —
-        # on EVERY event, flushing or not, so a dormant boundary's usage
-        # sample survives to the eventual send. afterAgentResponse and stop
-        # duplicate the same generation; replacing that dictionary key makes
-        # delivery idempotent, while a later hook can retry an auth/server
-        # failure without needing Cursor to repeat usage. Timestamp pins are
-        # different: they are minted and persisted ONLY on the flush path
-        # below (still before the network call, so a failed send retries
-        # with identical stamps) — a declined event must not rewrite a large
-        # pin map for nothing (review finding). The only event that reads
-        # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
-        # exit in main() before reading — see _event_can_flush), and a
-        # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
-        # by the next flushing hook at most that interval later.
-        fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
-        if source_kind == "transcript":
-            fields["transcript_path"] = str(source_path)
-        usage_events = state.get("usage_events")
-        usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
-        boundary_uuids: set[str] = set()
-        sample = _hook_usage(event, payload)
-        if sample is not None:
-            generation, usage = sample
-            expected_text = payload.get("text") if event == "afterAgentResponse" else None
-            target = _last_assistant_uuid(records, expected_text)
-            if target is None:
-                _log(f"{event}: exact usage has no matching final assistant "
-                     "record — leaving this turn unmeasured")
-            else:
-                usage_events = _usage_events_with(
-                    state, generation, target, usage)
-                fields["usage_events"] = usage_events
-                # This hook explicitly dates that record: its generation ended
-                # NOW, so it gets a real clock even in a first-observation
-                # backlog (where everything else stays unmeasured).
-                boundary_uuids = {target}
-        elif (event in ("afterAgentResponse", "stop") and
-              any(key in payload for key in _HOOK_USAGE_KEYS)):
-            _log(f"{event}: malformed token counters or generation_id — "
-                 "leaving this turn unmeasured")
+            cursor_meta = _payload_meta(payload, state)
+            blob_ids: set[str] = set()
+            source_revision: str | None = None
+            try:
+                if source_kind == "store":
+                    blob_ids = current_blob_ids(source_path)
+                    if not blob_ids:
+                        # A readable empty store is mid-rebuild. Leave every
+                        # watermark untouched so the next hook retries it.
+                        _log(f"{event}: store reports zero blobs (rebuilding?) — "
+                             "skipping")
+                        return 0
+                    records, meta = cursor_reader.to_canonical(source_path)
+                else:
+                    records, meta = cursor_reader.to_canonical(
+                        source_path, session_id=uuid,
+                        cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
+            except Exception as e:  # locked/partial/corrupt source — next hook retries
+                _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
+                return 0
 
-        if source_kind == "transcript":
-            # Content identity only — computed BEFORE _stamp_records and
-            # _apply_usage mutate the records. The send gate answers "is
-            # there new CONTENT?"; it must never re-fire because a timestamp
-            # pin was minted or upgraded (stamps ride along on whatever send
-            # happens, and pending usage forces its own send via
-            # usage_pending). Hashing post-stamp would couple the gate's
-            # stability to the pin map's — the fragility a review round
-            # already caught once on the pin-eviction path.
-            source_revision = _records_revision(records)
+            # Persist source identity and exact usage BEFORE any network work —
+            # on EVERY event, flushing or not, so a dormant boundary's usage
+            # sample survives to the eventual send. afterAgentResponse and stop
+            # duplicate the same generation; replacing that dictionary key makes
+            # delivery idempotent, while a later hook can retry an auth/server
+            # failure without needing Cursor to repeat usage. Timestamp pins are
+            # different: they are minted and persisted ONLY on the flush path
+            # below (still before the network call, so a failed send retries
+            # with identical stamps) — a declined event must not rewrite a large
+            # pin map for nothing (review finding). The only event that reads
+            # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
+            # exit in main() before reading — see _event_can_flush), and a
+            # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
+            # by the next flushing hook at most that interval later.
+            fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
+            if source_kind == "transcript":
+                fields["transcript_path"] = str(source_path)
+            usage_events = state.get("usage_events")
+            usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
+            boundary_uuids: set[str] = set()
+            sample = _hook_usage(event, payload)
+            if sample is not None:
+                generation, usage = sample
+                expected_text = payload.get("text") if event == "afterAgentResponse" else None
+                target = _last_assistant_uuid(records, expected_text)
+                if target is None:
+                    _log(f"{event}: exact usage has no matching final assistant "
+                         "record — leaving this turn unmeasured")
+                else:
+                    usage_events = _usage_events_with(
+                        state, generation, target, usage)
+                    fields["usage_events"] = usage_events
+                    # This hook explicitly dates that record: its generation ended
+                    # NOW, so it gets a real clock even in a first-observation
+                    # backlog (where everything else stays unmeasured).
+                    boundary_uuids = {target}
+            elif (event in ("afterAgentResponse", "stop") and
+                  any(key in payload for key in _HOOK_USAGE_KEYS)):
+                _log(f"{event}: malformed token counters or generation_id — "
+                     "leaving this turn unmeasured")
 
-        applied_usage = _apply_usage(records, usage_events)
-        sent_usage = set(state.get("sent_usage_generations") or [])
-        usage_pending = bool(applied_usage - sent_usage)
+            if source_kind == "transcript":
+                # Content identity only — computed BEFORE _stamp_records and
+                # _apply_usage mutate the records. The send gate answers "is
+                # there new CONTENT?"; it must never re-fire because a timestamp
+                # pin was minted or upgraded (stamps ride along on whatever send
+                # happens, and pending usage forces its own send via
+                # usage_pending). Hashing post-stamp would couple the gate's
+                # stability to the pin map's — the fragility a review round
+                # already caught once on the pin-eviction path.
+                source_revision = _records_revision(records)
 
-        # should_flush reads only watermark/backoff state (transcript_revision,
-        # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
-        # the decision comes FIRST and a quiet event saves only the small
-        # fields, leaving the pin map untouched on disk. A duplicate
-        # afterShellExecution can also reach this point: pending URL telemetry
-        # retries through the same bounded send path until acknowledged.
-        if not should_flush(
-                event, payload, state, blob_ids, time.time(),
-                source_kind=source_kind, source_revision=source_revision,
-                usage_pending=usage_pending,
-                provenance_pending=bool(pending_pr_urls)):
+            applied_usage = _apply_usage(records, usage_events)
+            sent_usage = set(state.get("sent_usage_generations") or [])
+            usage_pending = bool(applied_usage - sent_usage)
+
+            # should_flush reads only watermark/backoff state (transcript_revision,
+            # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
+            # the decision comes FIRST and a quiet event saves only the small
+            # fields, leaving the pin map untouched on disk. A duplicate
+            # afterShellExecution can also reach this point: pending URL telemetry
+            # retries through the same bounded send path until acknowledged.
+            if not should_flush(
+                    event, payload, state, blob_ids, time.time(),
+                    source_kind=source_kind, source_revision=source_revision,
+                    usage_pending=usage_pending,
+                    provenance_pending=bool(pending_pr_urls)):
+                _save_state(uuid, **fields)
+                return 0
+
+            fields["record_ts"] = _stamp_records(
+                records, state.get("record_ts"), _now_iso(),
+                first_observation="record_ts" not in state,
+                boundary_uuids=boundary_uuids)
             _save_state(uuid, **fields)
+        finally:
+            os.close(observation_fd)  # Never hold shared observation ownership during delivery.
+        remaining = max(0.0, budget - (time.monotonic() - started))
+        if remaining <= 0:
             return 0
-
-        fields["record_ts"] = _stamp_records(
-            records, state.get("record_ts"), _now_iso(),
-            first_observation="record_ts" not in state,
-            boundary_uuids=boundary_uuids)
-        _save_state(uuid, **fields)
         try:
             mode = _FLUSH_MODE.get(event, "now")
             asyncio.run(asyncio.wait_for(
@@ -1362,7 +1359,7 @@ def main() -> int:
                     uuid, source_path, blob_ids, mode,
                     source_kind=source_kind, source_revision=source_revision,
                     records=records, meta=meta, applied_usage=applied_usage),
-                timeout=FLUSH_TIMEOUT_S))
+                timeout=remaining))
         except Exception as e:
             # A timeout or any raise past _flush's own handlers (the broad
             # case, including asyncio.wait_for firing) counts toward dormancy
@@ -1373,6 +1370,27 @@ def main() -> int:
             _note_failure(uuid, f"flush_error: {type(e).__name__}")
     finally:
         os.close(lock_fd)  # releases the flock
+    return 0
+
+
+def _run_sink(payload: dict) -> int:
+    try:
+        return _capture_sink(payload)
+    except Exception as error:
+        _log(f"destination capture deferred ({type(error).__name__})")
+    return 0
+
+
+def main() -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
+        try:
+            capture_context.deliver(payload, _run_sink, FLUSH_TIMEOUT_S)
+        finally:
+            _REDACTION_CACHE.reset(token)
+    except Exception as error:
+        _log(f"capture deferred ({type(error).__name__})")
     return 0
 
 
