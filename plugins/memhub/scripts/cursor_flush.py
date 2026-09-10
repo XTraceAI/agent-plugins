@@ -1165,7 +1165,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
-def _capture_sink(payload: dict) -> int:
+def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     started = time.monotonic()
     capture_context.observe(payload)
@@ -1205,11 +1205,11 @@ def _capture_sink(payload: dict) -> int:
     # rather than skip and never run again. Mid-turn events (edits, milestone
     # shell) skip when busy: another will follow. Once acquired, should_flush
     # re-checks new-blobs, so a waited boundary ships only the delta or no-ops.
-    lock_fd = _acquire(
+    lock_fd = None if observations_only else _acquire(
         uuid, blocking=(event in ("afterAgentResponse", "stop",
                                   "beforeSubmitPrompt", "sessionEnd",
                                   "afterShellExecution")))
-    if lock_fd is None:
+    if lock_fd is None and not observations_only:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
@@ -1232,7 +1232,7 @@ def _capture_sink(payload: dict) -> int:
                     prior_pending, event_pr_urls)
                 if url not in accepted_pr_set
             ]
-            if pending_pr_urls != prior_pending:
+            if not observations_only and pending_pr_urls != prior_pending:
                 # Cursor's transcript omits shell results. Persist the hook-only
                 # evidence before source reads and network work so any later event
                 # can retry it after a crash, missing source, or failed send.
@@ -1334,7 +1334,7 @@ def _capture_sink(payload: dict) -> int:
             # fields, leaving the pin map untouched on disk. A duplicate
             # afterShellExecution can also reach this point: pending URL telemetry
             # retries through the same bounded send path until acknowledged.
-            if not should_flush(
+            if not observations_only and not should_flush(
                     event, payload, state, blob_ids, time.time(),
                     source_kind=source_kind, source_revision=source_revision,
                     usage_pending=usage_pending,
@@ -1349,6 +1349,8 @@ def _capture_sink(payload: dict) -> int:
             _save_state(uuid, **fields)
         finally:
             os.close(observation_fd)  # Never hold shared observation ownership during delivery.
+        if observations_only:
+            return 0
         remaining = max(0.0, budget - (time.monotonic() - started))
         if remaining <= 0:
             return 0
@@ -1369,13 +1371,14 @@ def _capture_sink(payload: dict) -> int:
             _log(f"{event}: flush error: {e}")
             _note_failure(uuid, f"flush_error: {type(e).__name__}")
     finally:
-        os.close(lock_fd)  # releases the flock
+        if lock_fd is not None:
+            os.close(lock_fd)  # releases the destination flock
     return 0
 
 
-def _run_sink(payload: dict) -> int:
+def _run_sink(payload: dict, *, observations_only: bool = False) -> int:
     try:
-        return _capture_sink(payload)
+        return _capture_sink(payload, observations_only=observations_only)
     except Exception as error:
         _log(f"destination capture deferred ({type(error).__name__})")
     return 0
@@ -1384,9 +1387,15 @@ def _run_sink(payload: dict) -> int:
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(payload, dict):
+            return 0
+        started = time.monotonic()
+        _run_sink(payload, observations_only=True)
         token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
         try:
-            capture_context.deliver(payload, _run_sink, FLUSH_TIMEOUT_S)
+            remaining = max(0.0, FLUSH_TIMEOUT_S - (time.monotonic() - started))
+            if remaining:
+                capture_context.deliver(payload, _run_sink, remaining)
         finally:
             _REDACTION_CACHE.reset(token)
     except Exception as error:
