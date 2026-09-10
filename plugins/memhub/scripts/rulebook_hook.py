@@ -2808,12 +2808,77 @@ def drop_arming(st, rid):
     return st.setdefault("armed_fire", {}).pop(rid, None)
 
 
-def save_state(p, st):
+# The session's obligation keys. A hook process reads the whole state file,
+# works, and writes the whole file back; two hooks of ONE session can overlap
+# (parallel tool calls, a sub-agent's calls), and the second writer's
+# snapshot used to put back an arming the first had just discharged — so a
+# gated command stayed blocked after its required command had run. These
+# keys are therefore merged by DELTA under a lock: what this process armed
+# is added, what it discharged is removed, and everything else is whatever
+# is on disk now.
+_ARMING_KEYS = ("armed", "armed_fire", "armed_version")
+_APPEND_KEYS = ("armed_once",)      # only ever appended to
+
+
+def snapshot_arming(st):
+    """What the arming keys looked like when this process loaded the state —
+    the baseline `save_state` diffs against."""
+    return {k: dict(st.get(k) or {}) for k in _ARMING_KEYS}
+
+
+def _state_lock(p):
+    """Exclusive lock on the session state's sidecar, or None past
+    LOCK_WAIT_S (the hook fails open — a plain write, today's behaviour)."""
+    if portable_lock is None:
+        return None
     try:
+        lock = open(p + ".lock", "a+", encoding="utf-8")
+    except Exception:
+        return None
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            portable_lock.lock_exclusive(lock.fileno(), blocking=False)
+            return lock
+        except OSError:
+            if time.monotonic() >= deadline:
+                lock.close()
+                return None
+            time.sleep(0.005)
+
+
+def save_state(p, st, before=None):
+    """Write the session state. With `before` (a `snapshot_arming` taken at
+    load), the arming keys are merged by delta against the file as it is NOW,
+    under the session lock, so a concurrent hook's write cannot resurrect an
+    obligation this one discharged, nor drop one this one armed."""
+    lock = _state_lock(p) if before is not None else None
+    try:
+        if lock is not None:
+            cur = load_state(p)
+            for k in _ARMING_KEYS:
+                merged = dict(cur.get(k) or {})
+                for rid in before[k]:
+                    if rid not in st[k]:
+                        merged.pop(rid, None)          # discharged by this process
+                for rid, v in st[k].items():
+                    if rid not in before[k] or before[k][rid] != v:
+                        merged[rid] = v                # armed or re-versioned here
+                st[k] = merged
+            for k in _APPEND_KEYS:
+                seen = list(cur.get(k) or [])
+                st[k] = seen + [x for x in st[k] if x not in seen]
         with open(p, "w", encoding="utf-8") as f:
             json.dump(st, f)
     except Exception:
         pass
+    finally:
+        if lock is not None:
+            try:
+                portable_lock.unlock(lock.fileno())
+            except Exception:
+                pass
+            lock.close()
 
 
 # The wrappers Claude Code puts around a prompt IT generated rather than one a
@@ -2900,6 +2965,7 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
         return []
     sp = state_path(session)
     st = load_state(sp)
+    before = snapshot_arming(st)
     armed = []
     for r in arming:
         rid = r["id"]
@@ -2928,7 +2994,7 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
         # than block a call no prompt ever armed for the new text.
         st.setdefault("armed_version", {})[rid] = r.get("_version")
         armed.append(rid)
-    save_state(sp, st)
+    save_state(sp, st, before=before)
     return armed
 
 
@@ -3593,6 +3659,7 @@ def main():
     inp = data.get("tool_input") or {}
     sp = state_path(session)
     st = load_state(sp)
+    before = snapshot_arming(st)      # `save_state` merges the arming keys by delta
     fired_now = []
 
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
@@ -3802,7 +3869,7 @@ def main():
             fired_on[rid] = ev
 
     if not fired_now:
-        save_state(sp, st)
+        save_state(sp, st, before=before)
         return 0
 
     # §5.3: which of this call's fires are GATES. Only a call the hook sees
@@ -3997,7 +4064,7 @@ def main():
             if r.get("on") == "edit":
                 ev = fired_on.get(r["id"])
                 st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
-    save_state(sp, st)
+    save_state(sp, st, before=before)
     return 0
 
 if __name__ == "__main__":

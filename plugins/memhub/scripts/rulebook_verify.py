@@ -316,8 +316,11 @@ def verify(rule: dict, fires: list, silent: list,
         _load_failure(rule, out)
         return False, False, out
     if degraded:
-        out.append("NOTE         %s — it still advises, and will gate once the "
-                   "plugin is new enough" % degraded)
+        # Only an ADVISORY rule reaches here (a degraded gate failed above),
+        # and an authored `advise` stays advise once the floor is met — the
+        # upgrade restores the condition, not a gate the author never wrote.
+        out.append("NOTE         %s — it still advises; once the plugin is new "
+                   "enough the whole rule is evaluated" % degraded)
     if hook_rule is None or unknown:
         out.append("LOAD   FAIL  the hook would drop this rule at load time" if hook_rule is None
                    else "LOAD   FAIL  this hook does not understand `%s`" % unknown)

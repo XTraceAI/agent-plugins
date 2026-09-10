@@ -2097,6 +2097,37 @@ def armed_lane_checks() -> None:
               and not rb_mod.command_fires(r"git\s+push\b", "true # git push", flags=0)
               and not rb_mod.command_fires(r"git\s+push\b", "{ # git push", flags=0),
               rb_mod.strip_comments("git push # done"))
+
+        # Two hooks of ONE session overlap (parallel tool calls, a
+        # sub-agent). Each loads the whole state and writes the whole state
+        # back; the later writer's stale snapshot used to put back an arming
+        # the earlier one had just discharged, so the gated command stayed
+        # blocked after its required command had run. The arming keys merge
+        # by delta against the file as it is at save time.
+        with tempfile.TemporaryDirectory() as td2:
+            p = os.path.join(td2, "s.json")
+            st0 = rb_mod.load_state(p)
+            st0["armed"]["r"] = "session"
+            st0["armed_version"]["r"] = 1
+            st0["armed_fire"]["r"] = "f1"
+            rb_mod.save_state(p, st0)
+            a = rb_mod.load_state(p); ba = rb_mod.snapshot_arming(a)    # hook A loads
+            b = rb_mod.load_state(p); bb = rb_mod.snapshot_arming(b)    # hook B loads
+            rb_mod.drop_arming(b, "r"); rb_mod.save_state(p, b, before=bb)   # B discharges
+            a["fired"].append("x"); rb_mod.save_state(p, a, before=ba)       # A writes after
+            final = rb_mod.load_state(p)
+            check("armed state: a concurrent hook's stale snapshot does not resurrect "
+                  "a discharged obligation",
+                  "r" not in final["armed"] and "r" not in final["armed_fire"]
+                  and "r" not in final["armed_version"] and "x" in final["fired"],
+                  str(final))
+            c = rb_mod.load_state(p); bc = rb_mod.snapshot_arming(c)
+            d = rb_mod.load_state(p); bd = rb_mod.snapshot_arming(d)
+            d["armed"]["q"] = "prompt"; rb_mod.save_state(p, d, before=bd)  # D arms
+            rb_mod.save_state(p, c, before=bc)                               # C writes after
+            check("armed state: ...nor drop an obligation the other hook armed",
+                  rb_mod.load_state(p)["armed"].get("q") == "prompt",
+                  str(rb_mod.load_state(p)["armed"]))
         # Any wrapper — on `CMD_WRAPPERS` or not — is seen through, because
         # `executes` reads syntax and carries no list of runners.
         for wrapped in ("doas git fetch --all", "builtin git fetch --all",
@@ -2350,8 +2381,19 @@ def armed_lane_checks() -> None:
         check("prompt-armed: repeated prompts leave no markers in the once-only list",
               not any(m.startswith("prompt:") for m in st["armed_once"]), st["armed_once"])
         json.dump({**book, "fetched_at": stale}, open(bp, "w"))   # restore for what follows
-        check("refresh_if_stale: honours MEMHUB_RULEBOOK_FETCH=0",
-              rb_mod.refresh_if_stale("x", ["r"], stale, {"a": 1}) == (["r"], stale, {"a": 1}))
+        # In-process call: `env` above reaches only the subprocess lanes, so
+        # the opt-out has to be set here or a plain `python3 tests/…` run
+        # takes the fetch path and reloads the book.
+        _prev = os.environ.get("MEMHUB_RULEBOOK_FETCH")
+        os.environ["MEMHUB_RULEBOOK_FETCH"] = "0"
+        try:
+            check("refresh_if_stale: honours MEMHUB_RULEBOOK_FETCH=0",
+                  rb_mod.refresh_if_stale("x", ["r"], stale, {"a": 1}) == (["r"], stale, {"a": 1}))
+        finally:
+            if _prev is None:
+                os.environ.pop("MEMHUB_RULEBOOK_FETCH", None)
+            else:
+                os.environ["MEMHUB_RULEBOOK_FETCH"] = _prev
 
         # `armed_by_rx` runs in the prompt lane — synchronous, on a 5s hook
         # timeout, before the person's words reach the model. An
