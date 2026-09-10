@@ -255,8 +255,9 @@ def main(argv=None) -> int:
                         return path.parent.name if path.name == "store.db" else path.stem
                     matches = [row for row in sessions
                                if cursor_id(row["path"]) == cursor_id(latest)]
-                    if len(matches) == 1:
-                        sessions[sessions.index(matches[0])] = {"path": str(latest)}
+                    # Same-ID copies were counted above. Other UUIDs are not
+                    # part of this request and must not prepare metadata/state.
+                    sessions = ([{"path": str(latest)}] if len(matches) == 1 else matches)
                 if not any(Path(row["path"]).resolve() == latest for row in sessions):
                     sessions.append({"path": str(latest)})
     except (OSError, ValueError, TypeError, AttributeError):
