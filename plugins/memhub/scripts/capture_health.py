@@ -574,6 +574,11 @@ def _renewable_capture_credential(sink: sinks.Sink) -> bool:
     return False
 
 
+def _failure_category(reason: str) -> str:
+    category = reason.split(":", 1)[0]
+    return category if category in _REASONS else "error"
+
+
 def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
     """No network and no success inference from a constant local credential."""
     messages, causes = [], []
@@ -589,10 +594,11 @@ def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
                             "Check its configuration or saved login.")
             causes.append(f"capture:{sink.name}:{endpoint}:auth")
         elif failure:
-            reason = _REASONS.get(failure[0], _REASONS["error"])
+            category = _failure_category(failure[0])
+            reason = _REASONS[category]
             messages.append(f"Capture destination '{sink.name}': {reason}. "
                             "Its upload progress is retained for retry.")
-            causes.append(f"capture:{sink.name}:{endpoint}:{failure[0]}")
+            causes.append(f"capture:{sink.name}:{endpoint}:{category}")
     if host:
         problem = _token_problem(host)
         if problem:
@@ -636,7 +642,7 @@ def main() -> int:
             failure = _recent_failure()
             rulebook = _rulebook_problem()
             message = _message(host, token_problem, failure, rulebook)
-            signature = (f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
+            signature = (f"{host}|{token_problem or ''}|{_failure_category(failure[0]) if failure else ''}"
                          f"|{rulebook[0] if rulebook else ''}")
     except sinks.SinkConfigError as error:
         message = f"Capture configuration: {error}. No capture destination was selected."

@@ -461,6 +461,27 @@ def test_changed_configuration_failure_warns_once_for_each_new_cause():
         assert "Capture configuration" in changed.stdout and not repeat.stdout
 
 
+def test_dynamic_capture_errors_share_a_private_stable_warning_marker():
+    with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
+        root=Path(td)/"turnflush"
+        sink=sinks.Sink("local","http://127.0.0.1:47421/mcp","local")
+        directory=capture_context.state_directory(root,sink);directory.mkdir(parents=True)
+        state=directory/f"{SID}.json"
+        with patch.object(capture_health,"STATE_DIR",root):
+            signatures=[]
+            for detail in ["mcp_error: request-a private response","mcp_error: request-b private response"]:
+                state.write_text(json.dumps({"last_error":detail,"last_error_at":time.time()}))
+                message,signature=capture_health._separate_capture_health(None,sink)
+                assert "private response" not in message and "request-" not in signature,signature
+                signatures.append(signature)
+            assert signatures[0]==signatures[1]
+            assert not capture_health._already_warned(SID,signatures[0])
+            assert capture_health._already_warned(SID,signatures[1])
+            state.write_text(json.dumps({"last_error":"timeout","last_error_at":time.time()}))
+            _,changed=capture_health._separate_capture_health(None,sink)
+            assert changed!=signatures[0] and not capture_health._already_warned(SID,changed)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
