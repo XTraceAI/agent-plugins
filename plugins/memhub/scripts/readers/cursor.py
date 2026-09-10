@@ -396,6 +396,9 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
                 if not isinstance(content, (str, list)) or (isinstance(content, list)
                         and any(not isinstance(block, dict) for block in content)):
                     raise ValueError("Cursor store message has invalid content")
+                if msg["role"] == "tool" and (not isinstance(content, list) or
+                        any(block.get("type") != "tool-result" for block in content)):
+                    raise ValueError("Cursor tool message has invalid result blocks")
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
