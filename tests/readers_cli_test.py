@@ -611,10 +611,10 @@ def test_since_filter_checks_the_final_source_revision():
         with patch.object(codex,"_SESSION_INDEX",home/"index.jsonl"), \
              patch.object(readers_cli,"header_for",changing), \
              contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
-            code=readers_cli.main(["--host","codex","--session",str(path),"--since",str(MTIME+100)])
+            code=readers_cli.main(["--host","codex","--session",str(path),"--since","2026-09-08T00:01:40Z"])
         assert code==2 and not stdout.getvalue() and "source_changed" in stderr.getvalue(),stderr.getvalue()
         os.utime(path,(MTIME,MTIME))
-        result,rows=run(home,"codex","--session",str(path),"--since",str(MTIME+100))
+        result,rows=run(home,"codex","--session",str(path),"--since","2026-09-08T00:01:40Z")
         assert result.returncode==0 and not rows and not result.stderr,result.stderr
 
 
