@@ -69,7 +69,7 @@ class FakeSession:
         return self.result
 
 
-OK = FakeResult(structured={"conversation_id": "c1", "messages_received": 3,
+OK = FakeResult(structured={"conversation_id": "s1", "messages_received": 3,
                             "path": "agentic"})
 
 
@@ -248,10 +248,10 @@ ok, room_after, sent, forgot, timeouts = send_seq(
 check("an unbudgeted slice still retries", len(sent) == 2)
 check("an unbudgeted retry stays unbounded", timeouts[1] is None)
 
-ok, _ = send(FakeResult(texts=['{"conversation_id": "c1"}']))
+ok, _ = send(FakeResult(texts=['{"conversation_id": "s1"}']))
 check("a JSON text body is understood", ok is True)
 
-ok, _ = send(FakeResult(structured={"result": {"conversation_id": "c1"}}))
+ok, _ = send(FakeResult(structured={"result": {"conversation_id": "s1"}}))
 check("a FastMCP-wrapped body is unwrapped", ok is True)
 
 

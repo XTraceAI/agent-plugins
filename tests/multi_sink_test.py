@@ -24,6 +24,7 @@ from unittest.mock import patch
 import capture_routing_test as routing
 import capture_async
 import capture_context
+import capture_redaction
 import capture_health
 import flush_turn as ft
 import mcp_http
@@ -261,7 +262,7 @@ def test_redaction_reuses_values_without_shared_mutation_and_is_bounded():
     rows=[{"uuid":"one","message":{"content":"synthetic"}},{"uuid":"two","message":{"content":"synthetic"}}]
     token=ft._REDACTION_CACHE.set({"items":{},"bytes":0})
     try:
-        with patch.object(ft,"redact_records",side_effect=lambda records:copy.deepcopy(records)) as redactor:
+        with patch.object(capture_redaction,"redact_records",side_effect=lambda records:copy.deepcopy(records)) as redactor:
             first=ft._redact_once(rows);first[0]["message"]["content"]="mutated"
             second=ft._redact_once(rows)
             assert second==rows and redactor.call_count==2

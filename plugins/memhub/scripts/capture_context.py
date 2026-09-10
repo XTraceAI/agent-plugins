@@ -10,12 +10,14 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 from functools import wraps
 import hashlib
+import time
 from pathlib import Path
 
 import _memhub_auth
 import brain_resolve
 import room_map
 from sinks import Sink, SinkConfigError, resolve_capture_auth, resolve_capture_sink
+from sinks import resolve_capture_sinks
 
 _current: ContextVar[Sink | None] = ContextVar("capture_destination", default=None)
 _legacy: ContextVar[bool] = ContextVar("capture_legacy_state", default=True)
@@ -44,12 +46,13 @@ def entrypoint(function):
 
 
 @contextmanager
-def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None):
+def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None,
+         room_env: str | None = None):
     if legacy is None:
         legacy = sink.name == "cloud" and sink.url == _memhub_auth.default_url()
     token = _current.set(sink)
     legacy_token = _legacy.set(legacy)
-    room_token = _room_env.set(_capture_room_env(sink))
+    room_token = _room_env.set(room_env or _capture_room_env(sink))
     budget_token = _budget.set(budget)
     payload_token = _payload.set(None)
     try:
@@ -64,6 +67,28 @@ def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None)
 
 def time_budget():
     return _budget.get()
+
+
+def deliver(payload, run_sink, timeout):
+    """Freeze active destinations and reserve each a share of one deadline."""
+    selected = resolve_capture_sinks()
+    if not isinstance(payload, dict) or not selected:
+        return
+    try:
+        installed_url = _memhub_auth.default_url()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
+        installed_url = None
+    destinations = [(sink, sink.name == "cloud" and sink.url == installed_url,
+                     _capture_room_env(sink))
+                    for sink in sorted(selected, key=lambda sink: not sink.is_local)]
+    deadline = time.monotonic() + timeout
+    for index, (sink, legacy, room_env) in enumerate(destinations):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        with bind(sink, legacy=legacy, room_env=room_env,
+                  budget=remaining / (len(destinations) - index)):
+            run_sink(payload)
 
 
 def session(url, bearer, timeout):
@@ -138,10 +163,12 @@ def identity(native_id: str, metadata=None, *, include_cloud=False) -> dict:
     return result
 
 
-async def import_conversation(session, arguments):
+async def import_conversation(session, arguments, *, timeout=None):
     """Retry explicit old-cloud argument rejection once with its legacy envelope."""
     import mcp_http
-    result = await session.call_tool("import_conversation", arguments=arguments)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    result = await session.call_tool("import_conversation", arguments=arguments, **kwargs)
     sink = _current.get()
     if sink is None or sink.is_local or not getattr(result, "isError", False):
         return result
@@ -151,5 +178,27 @@ async def import_conversation(session, arguments):
             "unexpected keyword argument", "extra inputs are not permitted",
             "extra inputs not permitted", "unknown argument", "additional properties")):
         legacy = {key: value for key, value in arguments.items() if key not in fields}
-        return await session.call_tool("import_conversation", arguments=legacy)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            kwargs["timeout"] = remaining
+        return await session.call_tool("import_conversation", arguments=legacy, **kwargs)
     return result
+
+def acknowledges(out, conversation_id, records, *, require_durable=True):
+    """Validate an echoed batch, including explicit stored-or-dropped accounting."""
+    if out.get("conversation_id") != conversation_id:
+        return False
+    if "ack_through" not in out:
+        return not require_durable  # Only a legacy whole-session backstop allows this.
+    ids = [record.get("uuid") for record in records
+           if isinstance(record, dict) and record.get("uuid")]
+    ack = out["ack_through"]
+    if ids and ack == ids[-1]:
+        return True
+    dropped = out.get("records_dropped")
+    received = out.get("messages_received")
+    if type(dropped) is not int or not 0 < dropped <= len(records) or received != len(records):
+        return False
+    return (ack is None and dropped == len(records)) or (ack is not None and ack in ids)

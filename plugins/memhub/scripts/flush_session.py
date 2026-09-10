@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -50,6 +51,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_context  # noqa: E402
+import capture_async  # noqa: E402
+import portable_lock  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 import pr_provenance  # noqa: E402
@@ -63,7 +66,7 @@ from session_title import (  # noqa: E402
     prompt_title,
 )
 from transcript_chunks import slices as make_slices  # noqa: E402
-from redact import redact_records  # noqa: E402
+from capture_redaction import CACHE as _REDACTION_CACHE, redact_once as redact_records  # noqa: E402
 from transcript_filter import (  # noqa: E402
     drop_command_wrappers,
     elide_oversized_tool_results,
@@ -166,6 +169,9 @@ def _deadline_s() -> float:
     hook quiet exists. Zero or negative is rejected rather than honoured — it
     would abandon every session after one slice.
     """
+    budget = capture_context.time_budget()
+    if budget is not None:
+        return budget
     raw = (os.environ.get("MEMHUB_FLUSH_DEADLINE_S") or "").strip()
     if not raw:
         return _DEFAULT_DEADLINE_S
@@ -173,7 +179,7 @@ def _deadline_s() -> float:
         value = float(raw)
     except ValueError:
         return _DEFAULT_DEADLINE_S
-    return value if value > 0 else _DEFAULT_DEADLINE_S
+    return value if value > 0 and math.isfinite(value) else _DEFAULT_DEADLINE_S
 
 
 async def _flush(session_id: str, transcript_path: str) -> None:
@@ -267,7 +273,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # In a thread: resolving may renew the token with blocking urllib calls
     # (~25s of socket timeout), and a synchronous call cannot be cancelled by
     # the deadline this flush runs under.
-    url, bearer = await asyncio.to_thread(resolve_bearer)
+    url, bearer = await capture_async.blocking(resolve_bearer)
     if not bearer:
         # Breadcrumb BEFORE raising. The raise is caught by main()'s catch-all,
         # which logs to an async hook's discarded stdout and records nothing —
@@ -306,8 +312,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # stop the run cleanly. A per-call limit larger than the total is not a
     # limit.
     deadline = _deadline_s()
-    session = mcp_http.Session(url, bearer,
-                               timeout=min(deadline, max(30.0, deadline / 4)))
+    session = capture_context.session(url, bearer,
+                                      timeout=min(deadline, max(30.0, deadline / 4)))
     # Cached hit is a dict lookup; a miss asks the server once and
     # caches the answer, so this is not a per-flush round-trip.
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
@@ -319,7 +325,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # failing on the biggest sessions is failing where it matters most.
     # Slices are disjoint and sent in order against one conversation,
     # so the server's watermark sees a normal incremental import.
-    payloads = make_slices(records)
+    payloads = [part[start:start + 2000] for part in make_slices(records)
+                for start in range(0, len(part), 2000)]
 
     # Bounded by wall clock, not just by slice count. The hook's own
     # budget is 300s; a many-slice session can exceed it, and being
@@ -339,12 +346,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                  f"slices; {remaining} record(s) not sent. Re-run "
                  f"/memhub:import-session --session {session_id} to "
                  "finish (it resumes from the server's watermark).")
+            _breadcrumb(session_id, "budget_exhausted", "capture stopped before the remaining slices")
             return
         arguments = {
             "messages": payload,
             "conversation_id": session_id,
             "source_platform": "claude",
-            **capture_context.identity(session_id),
+            **capture_context.identity(session_id, include_cloud=True),
         }
         if provenance:
             arguments["provenance"] = provenance
@@ -437,8 +445,7 @@ async def _send(session, arguments, room, title, namespace,
         when the slice started.
         """
         try:
-            return await session.call_tool("import_conversation",
-                                           arguments=args, timeout=timeout)
+            return await capture_context.import_conversation(session, args, timeout=timeout)
         except mcp_http.McpRateLimited as e:
             wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
             _log(f"{label}rate limited{wait}; slices already sent are stored")
@@ -540,6 +547,11 @@ async def _send(session, arguments, room, title, namespace,
             except json.JSONDecodeError:
                 continue
     if isinstance(out, dict) and "conversation_id" in out:
+        if not capture_context.acknowledges(out, arguments.get("conversation_id"),
+                                            arguments["messages"], require_durable=env == "local"):
+            _breadcrumb(arguments.get("conversation_id"), "unrecognized_response",
+                        "acknowledgement does not cover this slice")
+            return False, room
         # Name the destination: "flushed N records" alone can't distinguish a
         # room write from a personal one, which is the failure mode this
         # routing exists to fix.
@@ -588,8 +600,7 @@ def _auth_required(e: BaseException) -> bool:
     return False
 
 
-@capture_context.entrypoint
-def main() -> int:
+def _run_sink(hook_input: dict) -> int:
     # Bound BEFORE the try, because the handler reads them. Assigned inside it,
     # any failure earlier in the block — a malformed stdin payload is enough —
     # would make the handler itself raise NameError, and this script's one hard
@@ -597,14 +608,21 @@ def main() -> int:
     session_id = ""
     timeout_s = _deadline_s()
     started = time.monotonic()
+    lock_fd = None
     try:
-        hook_input = json.loads(sys.stdin.read() or "{}")
         capture_context.observe(hook_input)
         session_id = hook_input.get("session_id")
         transcript_path = hook_input.get("transcript_path")
         if not capture_context.valid_session_id(session_id) or not transcript_path or not Path(transcript_path).exists():
             _log("missing session_id/transcript_path; skipping")
             return 0
+        directory = capture_context.state_directory(_SESSION_STATE_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(directory / f"{session_id}.sessionflush.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            portable_lock.lock_exclusive(lock_fd, blocking=False)
+        except OSError:
+            return 0  # Another backstop owns this destination/session only.
         # SessionEnd carries no tool_input; it reports its reason instead.
         cmd = str((hook_input.get("tool_input") or {}).get("command", ""))[:120]
         reason = str(hook_input.get("reason") or "")[:40]
@@ -635,6 +653,7 @@ def main() -> int:
         # whole budget.
         if isinstance(e, (TimeoutError, asyncio.TimeoutError)) \
                 and time.monotonic() - started >= timeout_s * 0.99:
+            _breadcrumb(session_id, "timeout", "backstop deadline reached")
             # Slices already sent are durable and deduped, so this is a
             # partial capture rather than a lost one — say which it is.
             _log(f"timed out after {timeout_s:.0f}s; slices already sent "
@@ -642,10 +661,28 @@ def main() -> int:
                  f"{session_id} to finish (it resumes from the server's "
                  "watermark).")
         elif _auth_required(e):
+            _breadcrumb(session_id, "auth", "no usable credential")
             _log("no cached OAuth token; run /memhub:login "
                  "(or set MEMHUB_TOKEN) to enable commit flush — skipping")
         else:
+            _breadcrumb(session_id, "error", type(e).__name__)
             _log(f"skipped ({type(e).__name__}: {e})")
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    return 0
+
+
+def main() -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
+        try:
+            capture_context.deliver(payload, _run_sink, min(240.0, _deadline_s()))
+        finally:
+            _REDACTION_CACHE.reset(token)
+    except BaseException as error:
+        _log(f"skipped ({type(error).__name__})")
     return 0
 
 

@@ -37,8 +37,6 @@ pop a browser, so it can only consume a token ``/memhub:login`` already minted.
 from __future__ import annotations
 
 import asyncio
-import copy
-from contextvars import ContextVar
 import math
 import json
 import os
@@ -58,6 +56,7 @@ from session_title import (  # noqa: E402
     generated_title,
     prompt_title,
 )
+from capture_redaction import CACHE as _REDACTION_CACHE, redact_once as _redact_once
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import (  # noqa: E402
     drop_command_wrappers,
@@ -71,7 +70,6 @@ from transcript_filter import (  # noqa: E402
 # Nothing here needs the SDK any more, so the indirection went with it.
 import capture_context  # noqa: E402
 import capture_async  # noqa: E402
-import sinks  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
@@ -790,33 +788,6 @@ def _run_sink(hook_input: dict) -> int:
     return 0
 
 
-# Bounded cache shared across destinations during this one invocation. Each
-# projection gets its own copy, so endpoint-specific arguments cannot mutate it.
-_REDACTION_CACHE: ContextVar[dict | None] = ContextVar("turn_redaction_cache", default=None)
-
-
-def _redact_once(records):
-    cache = _REDACTION_CACHE.get()
-    if cache is None:
-        return redact_records(records)
-    result = []
-    items = cache["items"]
-    for record in records:
-        key = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        if key not in items:
-            redacted = redact_records([record])[0]
-            # Keep memory bounded for long catch-up sessions. Eviction only
-            # repeats redaction; it can never skip or change a record.
-            if len(key) > 8 * 1024 * 1024:
-                result.append(redacted)
-                continue
-            if cache["bytes"] + len(key) > 8 * 1024 * 1024:
-                items.clear()
-                cache["bytes"] = 0
-            items[key] = redacted
-            cache["bytes"] += len(key)
-        result.append(copy.deepcopy(items[key]))
-    return result
 
 
 async def _drain(session_id, transcript_path):
@@ -833,37 +804,14 @@ def main() -> int:
         return 0
     try:
         payload = json.loads(sys.stdin.read() or "{}")
-        selected = sinks.resolve_capture_sinks()
-        if not isinstance(payload, dict) or not selected:
-            return 0
-        # Local first, stable within each class. Inactive registry entries are
-        # absent. Reserve a share for every remaining destination.
-        installed_url = _default_capture_url()
-        selected = [(sink, sink.name == "cloud" and sink.url == installed_url)
-                    for sink in sorted(selected, key=lambda sink: not sink.is_local)]
-        deadline = time.monotonic() + min(60.0, _flush_timeout_s())
         cache_token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
         try:
-            for index, (sink, legacy) in enumerate(selected):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                budget = remaining / (len(selected) - index)
-                with capture_context.bind(sink, legacy=legacy, budget=budget):
-                    _run_sink(payload)
+            capture_context.deliver(payload, _run_sink, min(60.0, _flush_timeout_s()))
         finally:
             _REDACTION_CACHE.reset(cache_token)
     except BaseException:
         _log("capture selection unavailable; upload progress retained")
     return 0
-
-
-def _default_capture_url():
-    import _memhub_auth
-    try:
-        return _memhub_auth.default_url()
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
-        return None  # An independent configured destination needs no cloud setup.
 
 
 if __name__ == "__main__":
