@@ -317,6 +317,19 @@ def test_wrong_batch_acknowledgement_does_not_advance_that_destination():
         assert state(home,"cloud",local[0])["offset"] > 0
 
 
+def test_acknowledgements_account_for_explicit_drops_without_accepting_a_wrong_batch():
+    records=[{"uuid":"accepted"},{"uuid":"rejected"}]
+    response={"conversation_id":SID,"messages_received":2,"records_dropped":1,"ack_through":"accepted"}
+    assert capture_context.acknowledges(response,SID,records)
+    assert not capture_context.acknowledges({**response,"records_dropped":0},SID,records)
+    assert not capture_context.acknowledges({**response,"messages_received":1},SID,records)
+    assert not capture_context.acknowledges({**response,"ack_through":"other"},SID,records)
+    all_dropped={**response,"records_dropped":2,"ack_through":None}
+    assert capture_context.acknowledges(all_dropped,SID,[{},{}])
+    assert not capture_context.acknowledges({**all_dropped,"conversation_id":"other"},SID,[{},{}])
+    assert not capture_context.acknowledges({**all_dropped,"records_dropped":True},SID,[{},{}])
+
+
 if __name__ == "__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

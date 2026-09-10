@@ -153,3 +153,21 @@ async def import_conversation(session, arguments):
         legacy = {key: value for key, value in arguments.items() if key not in fields}
         return await session.call_tool("import_conversation", arguments=legacy)
     return result
+
+
+def acknowledges(out, conversation_id, records, *, require_durable=True):
+    """Validate an echoed batch, including explicit stored-or-dropped accounting."""
+    if out.get("conversation_id") != conversation_id:
+        return False
+    if "ack_through" not in out:
+        return not require_durable  # Only a legacy whole-session backstop allows this.
+    ids = [record.get("uuid") for record in records
+           if isinstance(record, dict) and record.get("uuid")]
+    ack = out["ack_through"]
+    if ids and ack == ids[-1]:
+        return True
+    dropped = out.get("records_dropped")
+    received = out.get("messages_received")
+    if type(dropped) is not int or not 0 < dropped <= len(records) or received != len(records):
+        return False
+    return (ack is None and dropped == len(records)) or (ack is not None and ack in ids)

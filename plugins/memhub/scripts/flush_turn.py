@@ -665,10 +665,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                     last_error_detail=None, last_error_at=None)
         return
 
-    expected_ack = next((record.get("uuid") for record in reversed(sendable)
-                         if isinstance(record, dict) and record.get("uuid")), None)
-    if (out.get("conversation_id") != session_id or expected_ack is None
-            or out.get("ack_through") != expected_ack):
+    if not capture_context.acknowledges(out, session_id, sendable):
         _mark_failure(session_id, "unrecognized_response",
                       "durable acknowledgement does not cover this batch")
         return
