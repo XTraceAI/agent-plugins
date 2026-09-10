@@ -1362,13 +1362,14 @@ def _capture_sink(payload: dict, *, observations_only: bool = False,
                     records=records, meta=meta, applied_usage=applied_usage),
                 timeout=remaining))
         except Exception as e:
-            # A timeout or any raise past _flush's own handlers (the broad
-            # case, including asyncio.wait_for firing) counts toward dormancy
-            # too — otherwise a hard-down backend re-parses and re-uploads the
-            # whole store on every event forever, and Stop is cooldown-exempt
-            # so nothing else bounds it.
+            # Preparation timeouts defer locally. Only attempted imports may
+            # increase a destination's contacted-server failure count.
             _log(f"{event}: flush error: {e}")
-            _note_failure(uuid, f"flush_error: {type(e).__name__}")
+            reason = f"flush_error: {type(e).__name__}"
+            if capture_context.import_was_attempted():
+                _note_failure(uuid, reason)
+            else:
+                _save_state(uuid, last_flush_at=time.time(), last_error=reason, fail_streak=0)
     finally:
         if lock_fd is not None:
             os.close(lock_fd)  # releases the destination flock

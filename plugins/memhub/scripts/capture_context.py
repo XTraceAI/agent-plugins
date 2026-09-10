@@ -193,6 +193,8 @@ async def import_conversation(session, arguments, *, timeout=None):
     kwargs = {} if timeout is None else {"timeout": timeout}
     state = _import_state.get()
     if state is not None:
+        rejected = state.get("rejected_fields", ())
+        arguments = {key: value for key, value in arguments.items() if key not in rejected}
         state["contacted"] = True
     result = await session.call_tool("import_conversation", arguments=arguments, **kwargs)
     sink = _current.get()
@@ -204,6 +206,8 @@ async def import_conversation(session, arguments, *, timeout=None):
             "unexpected keyword argument", "extra inputs are not permitted",
             "extra inputs not permitted", "unknown argument", "additional properties")):
         legacy = {key: value for key, value in arguments.items() if key not in fields}
+        if state is not None:
+            state.setdefault("rejected_fields", set()).update(fields)
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

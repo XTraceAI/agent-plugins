@@ -162,6 +162,48 @@ def test_cursor_partial_batch_retry_holds_destination_progress_and_shared_pins()
         assert json.loads(shared_path(home).read_text())['record_ts']==before
 
 
+def test_cursor_multibatch_legacy_fallback_is_remembered_per_destination():
+    with tempfile.TemporaryDirectory() as td,cases.receiver('local',[]) as local,cases.receiver('cloud',[]) as cloud:
+        home=Path(td);payload,path=source(home);cases.configure(home,local[0])
+        for index in range(1000): append(path,index)
+        original=path.read_bytes();cloud[2]['reject_extensions']=True
+        invoke(home,cloud[0],payload)
+        a=cases.routing.imports(local[1]);b=cases.routing.imports(cloud[1])
+        assert [len(batch['messages']) for batch in a]==[2000,7]
+        assert len(b)==3, len(b)
+        assert all('native_session_id' in batch for batch in a)
+        assert 'native_session_id' in b[0]
+        assert all('native_session_id' not in batch and 'source_surface' not in batch for batch in b[1:])
+        assert a[0]['messages']==b[0]['messages']==b[1]['messages'] and a[1]['messages']==b[2]['messages']
+        assert state(home,'local',local[0])['transcript_revision'] and state(home,'cloud',local[0])['transcript_revision']
+        assert path.read_bytes()==original
+        # A later invocation probes extensions again; no persistent downgrade.
+        cloud[2]['reject_extensions']=False;local[1].clear();cloud[1].clear();append(path,1002)
+        invoke(home,cloud[0],payload)
+        assert all('native_session_id' in batch for batch in cases.routing.imports(cloud[1]))
+
+
+def test_cursor_local_timeouts_never_make_a_healthy_receiver_dormant():
+    with tempfile.TemporaryDirectory() as td,cases.receiver('local',[]) as local,cases.receiver('cloud',[]) as cloud:
+        home=Path(td);payload,path=source(home);cases.configure(home,local[0])
+        env=cases.environment(home,cloud[0]);guard=home/'guard/sitecustomize.py'
+        with guard.open('a') as output:
+            output.write("\nimport cursor_flush,capture_context,time\n"
+                         "original=cursor_flush.redact_once\n"
+                         "def slow(*args,**kwargs):\n"
+                         "    if capture_context._current.get().is_local: time.sleep(1.2)\n"
+                         "    return original(*args,**kwargs)\n"
+                         "cursor_flush.redact_once=slow\n")
+        for _ in range(5):
+            result=subprocess.run(command(0.8),env=env,input=json.dumps(payload),text=True,capture_output=True,timeout=5)
+            assert result.returncode==0 and 'Traceback' not in result.stderr,result.stderr
+            saved=state(home,'local',local[0])
+            assert not saved.get('fail_streak') and not saved.get('unsupported'),saved
+            assert not saved.get('transcript_revision') and not local[1]
+        invoke(home,cloud[0],payload)
+        assert state(home,'local',local[0])['transcript_revision']
+
+
 def test_cursor_slow_cloud_uses_its_budget_after_local_capture():
     with tempfile.TemporaryDirectory() as td,cases.receiver('local',[]) as local,cases.receiver('cloud',[]) as cloud:
         home=Path(td);payload,path=source(home);cases.configure(home,local[0]);cloud[2]['drip']=True
