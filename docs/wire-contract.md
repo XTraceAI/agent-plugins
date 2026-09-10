@@ -41,7 +41,7 @@ headers still contain structural information such as local paths and branches.
 `--since <timestamp-with-timezone>` includes sessions whose `mtime` is at least
 that instant. It is a modification-time prefilter; consumers apply their own
 event-time selection. `--session <native-id-or-path>` selects one session using
-the existing host reader's locator instead of enumerating all sessions.
+the existing native identity rules. Candidate identities are checked for ambiguity; unrelated Cursor UUIDs are excluded before their content or saved state is parsed.
 
 Exit code `0` means enumeration completed, including a legitimately empty
 existing store or a filter matching no sessions. Exit code `2` means arguments
@@ -65,8 +65,12 @@ Full reads reject invalid UTF-8 and malformed complete JSON rows instead of
 silently replacing or skipping content. An unfinished final JSON row can wait
 for a later read. Enumeration excludes all candidates with duplicate native
 identities before emitting any of them; an explicit path can select one.
-Codex's title index participates in source revisions and `--since`, so a title
-assignment or rename is observable even when its rollout has not changed.
+Codex reads the complete title index lazily only when a rollout needs its fallback.
+Only that session's matching title observation participates in revision checks.
+Its native `updated_at` contributes to full-read `mtime` and `--since`; older
+index rows without a valid timestamp conservatively use the index file mtime.
+A rollout-native title and metadata-only reads never consult this fallback.
+Full Codex reads resolve the title before applying the modification-time filter.
 The existing capture
 readers retain their tolerant defaults. Cursor SQLite files and journals are
 copied into a private, temporary snapshot before opening SQLite; the native

@@ -37,9 +37,6 @@ def native_text(value, *, required=False):
 
 def source_revision(path: Path, host: str) -> tuple:
     paths = [path]
-    if host == "codex":
-        from readers.codex import _SESSION_INDEX
-        paths.append(_SESSION_INDEX)  # Desktop title changes need a new revision.
     if path.name == "store.db":
         # SQLite can keep current changes in WAL; --since must not skip them.
         paths += [path.with_name("store.db-wal"), path.with_name("store.db-journal"),
@@ -128,8 +125,42 @@ def historical_titles(reader, session_ids):
                 raise ValueError("Codex title index row is not an object")
             sid, name = row.get("id"), row.get("thread_name")
             if isinstance(sid, str) and sid in session_ids and isinstance(name, str) and name.strip():
-                found[sid] = reader._one_line(name)
+                found[sid] = (reader._one_line(name), row.get("updated_at"))
     return found
+
+
+class TitleIndex:
+    """Lazy complete lookup; revisions compare only the used fallback row."""
+    def __init__(self, reader, session_ids):
+        self.reader, self.session_ids = reader, session_ids
+        self.stamp, self.rows = object(), {}
+
+    def current_stamp(self):
+        try:
+            stat = self.reader._SESSION_INDEX.stat()
+            return stat.st_size, stat.st_mtime_ns, stat.st_ino
+        except FileNotFoundError:
+            return None
+
+    def get(self, sid):
+        stamp = self.current_stamp()
+        if stamp != self.stamp:
+            rows = historical_titles(self.reader, self.session_ids)
+            if stamp != self.current_stamp():
+                raise ValueError("title index changed while reading")
+            self.rows, self.stamp = rows, stamp
+        return self.rows.get(sid, (None, None))
+
+    def mtime(self, observation):
+        title, updated = observation
+        if title is None:
+            return 0
+        try:
+            return since_instant(updated)
+        except (TypeError, AttributeError, argparse.ArgumentTypeError):
+            # Older index rows carry no per-session timestamp. Only those
+            # fallback consumers conservatively use the index file's mtime.
+            return self.stamp[1] / 1_000_000_000 if self.stamp else 0
 
 
 @contextmanager
@@ -215,6 +246,13 @@ def main(argv=None) -> int:
         diagnostic("discovery_incomplete")
         return 2
 
+    if args.host == "cursor" and args.session and args.session != "latest" and not explicit_path:
+        # Cursor identities are defined by the native path, unlike Codex.
+        # Keep all same-ID copies for ambiguity checks, but never parse an
+        # unrelated session's saved state merely to select one UUID.
+        sessions = [row for row in sessions if (Path(row["path"]).parent.name
+                    if Path(row["path"]).name == "store.db" else Path(row["path"]).stem) == args.session]
+
     prepared = []
     for session in sessions:
         path = Path(session["path"])
@@ -253,26 +291,27 @@ def main(argv=None) -> int:
         if not prepared:
             diagnostic("session_unavailable")
             return 2
-    titles = None
-    if args.host == "codex" and not args.metadata_only and prepared:
-        try:
-            titles = historical_titles(reader, {item[2]["native_session_id"] for item in prepared})
-        except (OSError, ValueError, TypeError, RecursionError):
-            diagnostic("session_unreadable", reader._SESSION_INDEX)
-            return 2
+    titles = (TitleIndex(reader, {item[2]["native_session_id"] for item in prepared})
+              if args.host == "codex" and not args.metadata_only else None)
     for path, revision, header in prepared:
         if counts[header["conversation_id"]] > 1:
             diagnostic("discovery_incomplete", path)
             continue
         try:
-            if args.since is not None and header["mtime"] < args.since:
+            if titles is None and args.since is not None and header["mtime"] < args.since:
                 if source_revision(path, args.host) != revision:
                     diagnostic("source_changed", path)
                 continue
             records = []
+            used_title = []
             if not args.metadata_only:
                 with source_snapshot(path, args.host) as snapshot:
-                    options = {"title_index": titles} if args.host == "codex" else {}
+                    def fallback_title(sid):
+                        observation = titles.get(sid)
+                        used_title.append(observation)
+                        header["mtime"] = max(header["mtime"], titles.mtime(observation))
+                        return observation[0]
+                    options = {"title_index": fallback_title} if titles is not None else {}
                     records, native = reader.to_canonical(snapshot, strict_utf8=True, strict_json=True, **options)
                 if native.get("session_id") != header["native_session_id"]:
                     raise ValueError("native identity changed during read")
@@ -283,8 +322,13 @@ def main(argv=None) -> int:
                 if records and validate_canonical(records):
                     raise ValueError("reader emitted invalid canonical records")
                 header["title"] = native_text(native.get("title"))
+            if used_title and titles.get(header["native_session_id"]) != used_title[0]:
+                diagnostic("source_changed", path)
+                continue
             if source_revision(path, args.host) != revision:
                 diagnostic("source_changed", path)
+                continue
+            if args.since is not None and header["mtime"] < args.since:
                 continue
             # Validate the entire session before emitting its header. A bad
             # number or unsupported value cannot leave a partial session behind.
