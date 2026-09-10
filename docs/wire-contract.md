@@ -411,4 +411,3 @@ metadata-only receiver behavior and slow/locked cloud isolation. Existing
 `capture_health_test.py` keeps cloud-service warnings covered. The complete
 `bash scripts/check-plugin.sh` gate exercises all suites with bare Python and
 the MCP SDK.
-
