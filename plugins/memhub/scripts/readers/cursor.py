@@ -60,6 +60,7 @@ import sqlite3
 import sys
 import uuid as _uuid
 from pathlib import Path
+from .strict_json import loads as load_json
 
 # See the same note in ``readers/codex.py`` — shared title rules, stdlib only.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
@@ -156,12 +157,14 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return normalize_usage(raw)
 
 
-def _read_meta_json(session_dir: Path) -> dict | None:
+def _read_meta_json(session_dir: Path, *, strict_json=False) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        value = json.loads(p.read_text(encoding="utf-8"))
+        value = load_json(p.read_text(encoding="utf-8"), strict=strict_json)
         return value if isinstance(value, dict) else None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        if strict_json:
+            raise
         return None
 
 
@@ -344,6 +347,31 @@ def _parse_node(data: bytes, *, strict: bool = False) -> tuple[list[str], int | 
     return out, ts
 
 
+def _validate_message(message):
+    if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
+        raise ValueError("Cursor source has no supported message role")
+    content = message.get("content")
+    if not isinstance(content, (str, list)) or (isinstance(content, list)
+            and any(not isinstance(block, dict) for block in content)):
+        raise ValueError("Cursor message has invalid content")
+    role = message["role"]
+    if role == "tool" and not isinstance(content, list):
+        raise ValueError("Cursor tool message has invalid result blocks")
+    if role not in ("assistant", "tool") or isinstance(content, str):
+        return
+    for block in content:
+        kind = block.get("type")
+        allowed = ("reasoning", "text", "tool-call", "tool_use") if role == "assistant" else ("tool-result",)
+        if kind not in allowed:
+            raise ValueError("Cursor message has unsupported content block")
+        if kind in ("text", "reasoning") and block.get("text") is not None and not isinstance(block["text"], str):
+            raise ValueError("Cursor message text must be a string")
+        if kind in ("tool-call", "tool_use", "tool-result"):
+            for key in ("toolCallId", "id", "toolName", "name"):
+                if block.get(key) is not None and not isinstance(block[key], str):
+                    raise ValueError("Cursor tool identity must be a string")
+
+
 def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, int | None]]:
     """Walk the hash tree from latestRootBlobId; return ordered JSON leaves
     paired with their nearest ancestor node's wall clock (ms epoch, or None).
@@ -355,7 +383,7 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
         root = None
         for (value,) in con.execute("SELECT value FROM meta"):
             try:
-                m = json.loads(value)
+                m = load_json(value, strict=strict_json)
             except (TypeError, json.JSONDecodeError):
                 if strict_json:
                     raise
@@ -387,21 +415,13 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
             raise ValueError("Cursor blob content does not match its hash")
         if data[:1] == b"{":
             try:
-                msg = json.loads(data.decode("utf-8", errors="strict" if strict_utf8 else "replace"))
+                msg = load_json(data.decode("utf-8", errors="strict" if strict_utf8 else "replace"), strict=strict_json)
             except json.JSONDecodeError:
                 if strict_json:
                     raise
                 return
             if strict_json:
-                if not isinstance(msg, dict) or msg.get("role") not in ("system", "user", "assistant", "tool"):
-                    raise ValueError("Cursor store leaf has no supported message role")
-                content = msg.get("content")
-                if not isinstance(content, (str, list)) or (isinstance(content, list)
-                        and any(not isinstance(block, dict) for block in content)):
-                    raise ValueError("Cursor store message has invalid content")
-                if msg["role"] == "tool" and (not isinstance(content, list) or
-                        any(block.get("type") != "tool-result" for block in content)):
-                    raise ValueError("Cursor tool message has invalid result blocks")
+                _validate_message(msg)
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
@@ -625,7 +645,7 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
                 # JSON-only validation permits replacement decoding. Leaving
                 # both flags off retains legacy unfinished-byte-tail handling.
                 errors = "replace" if strict_json and not strict_utf8 else "strict"
-                entry = json.loads(raw.decode("utf-8", errors=errors))
+                entry = load_json(raw.decode("utf-8", errors=errors), strict=strict_json)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 if not terminated and not (strict_utf8 and isinstance(exc, UnicodeDecodeError)):
                     # Cursor appends records. A hook can race the writer, so a
@@ -650,6 +670,8 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
                 continue
             message = dict(body)
             message["role"] = entry["role"]
+            if strict_json:
+                _validate_message(message)
             own_ts = (_embedded_timestamp(_text_of(message.get("content")))
                       if entry["role"] == "user" else None)
             messages.append((message, own_ts))
@@ -674,7 +696,7 @@ def to_canonical(path, *, session_id: str | None = None,
             created_ts=created_ts)
 
     session_dir = source.parent
-    mj = _read_meta_json(session_dir) or {}
+    mj = _read_meta_json(session_dir, strict_json=strict_json) or {}
     version = mj.get("schemaVersion")
     if version != _SCHEMA_VERSION:
         raise ValueError(

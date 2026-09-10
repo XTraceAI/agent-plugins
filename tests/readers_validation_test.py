@@ -260,6 +260,82 @@ def test_strict_cursor_hashes_reject_structurally_valid_modified_blobs():
             assert store.read_bytes()==before
 
 
+
+def test_strict_json_rejects_nonstandard_numbers_on_all_opted_in_loaders():
+    for constant in ["NaN", "Infinity", "-Infinity", "1e999"]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td)
+            for reader,path in sources(home):
+                original=path.read_bytes()
+                row=({"type":"event_msg","payload":{"type":"unknown"}} if reader is codex else
+                     {"role":"assistant","message":{"content":"synthetic output"}})
+                raw=json.dumps(row)[:-1]+',"extra":'+constant+'}'
+                for ending in ["\n", ""]:
+                    path.write_bytes(original+raw.encode()+ending.encode())
+                    reader.to_canonical(path)
+                    rejected(lambda:reader.to_canonical(path,strict_json=True))
+            index=home/"session_index.jsonl"
+            rollout=fixtures._write_jsonl(home/"rollout-index.jsonl",copy.deepcopy(fixtures.CODEX_SYNTH))
+            for ending in ["\n", ""]:
+                index.write_text('{"id":"synthetic","extra":'+constant+'}'+ending)
+                with patch.object(codex,"_SESSION_INDEX",index):
+                    rejected(lambda:codex.to_canonical(rollout,strict_json=True))
+            with patch.object(cursor_flush,"STATE_DIR",home/"state"):
+                cursor_flush.STATE_DIR.mkdir(exist_ok=True)
+                saved=cursor_flush._state_path(SID)
+                saved.write_text('{"record_ts":{},"extra":'+constant+'}')
+                cursor_flush._read_state(SID)
+                rejected(lambda:cursor_flush._read_state(SID,strict=True))
+            store=fixtures._make_cursor_store(home/"chats")
+            raw=('{"role":"assistant","content":"synthetic output","extra":'+constant+'}').encode()
+            key=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as sql:
+                meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0]);meta["latestRootBlobId"]=key
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
+                sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
+            cursor.to_canonical(store)
+            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            # Validate both native metadata locations, independent of leaf content.
+            clean=b'{"role":"assistant","content":"synthetic output"}'
+            key=hashlib.sha256(clean).hexdigest()
+            with sqlite3.connect(store) as sql:
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,clean))
+                sql.execute("UPDATE meta SET value=?",('{"latestRootBlobId":"'+key+'","extra":'+constant+'}',))
+            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            with sqlite3.connect(store) as sql:
+                sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
+            meta=store.parent/"meta.json";original=meta.read_text()
+            meta.write_text(original.rstrip()[:-1]+',"extra":'+constant+'}')
+            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+
+
+def test_strict_cursor_content_blocks_match_the_canonicalizer():
+    invalid=[{"type":"future","text":"lost output"},{"type":"text","text":17},
+             {"type":"reasoning","text":[]},{"type":"tool-call","toolCallId":17,"toolName":"Read","args":{}},
+             {"type":"tool_use","id":"call","name":[],"input":{}}]
+    supported=[{"type":"text","text":"synthetic output"},{"type":"reasoning","text":"synthetic reasoning"},
+               {"type":"tool-call","toolCallId":"one","toolName":"Read","args":{}},
+               {"type":"tool_use","id":"two","name":"Read","input":{}}]
+    for block in invalid+supported:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/"chats")
+            message={"role":"assistant","content":[block],"usage":{"input_tokens":3}}
+            raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as sql:
+                meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0]);meta["latestRootBlobId"]=key
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
+                sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
+            transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"assistant","message":{k:v for k,v in message.items() if k!="role"}}])
+            for source in [store,transcript]:
+                before=source.read_bytes()
+                if block in invalid: rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                else:
+                    actual=cursor.to_canonical(source,strict_json=True)
+                    assert actual==cursor.to_canonical(source)
+                    assert any(row.get("message",{}).get("usage",{}).get("input_tokens")==3 for row in actual[0])
+                assert source.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

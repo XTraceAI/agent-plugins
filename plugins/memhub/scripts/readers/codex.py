@@ -47,6 +47,7 @@ import sys
 import uuid as _uuid
 from collections import deque
 from pathlib import Path
+from .strict_json import loads as load_json
 from typing import Any
 
 # The readers are imported both as a package and, by some callers, with
@@ -163,7 +164,7 @@ def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) 
         if not line:
             continue
         try:
-            record = json.loads(line)
+            record = load_json(line, strict=strict_json)
         except json.JSONDecodeError:
             if strict_json and raw.endswith(("\n", "\r")):
                 raise
@@ -393,8 +394,8 @@ def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_js
             if not line:
                 continue
             try:
-                row = json.loads(line)
-            except Exception:  # noqa: BLE001 — a torn final line is normal
+                row = load_json(line, strict=strict_json)
+            except json.JSONDecodeError:  # a torn final line is normal
                 if strict_json and raw.endswith(("\n", "\r")):
                     raise
                 continue

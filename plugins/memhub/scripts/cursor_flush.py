@@ -63,6 +63,7 @@ import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
+from readers.strict_json import loads as load_json  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
@@ -219,7 +220,7 @@ def _state_path(uuid: str) -> Path:
 
 def _read_state(uuid: str, *, strict: bool = False) -> dict:
     try:
-        state = json.loads(_state_path(uuid).read_text(encoding="utf-8"))
+        state = load_json(_state_path(uuid).read_text(encoding="utf-8"), strict=strict)
         if strict and (not isinstance(state, dict) or any(
                 key in state and not isinstance(state[key], dict)
                 for key in ("record_ts", "usage_events"))):
