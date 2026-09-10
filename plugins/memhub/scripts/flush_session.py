@@ -535,17 +535,7 @@ async def _send(session, arguments, room, title, namespace,
         # asymmetry the transport paths were fixed for one round earlier.
         _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
         return False, room
-    out = getattr(res, "structuredContent", None)
-    if isinstance(out, dict) and "conversation_id" not in out \
-            and isinstance(out.get("result"), dict):
-        out = out["result"]  # FastMCP wraps some returns in {"result": …}
-    if not isinstance(out, dict):
-        for text in texts:
-            try:
-                out = json.loads(text)
-                break
-            except json.JSONDecodeError:
-                continue
+    out = mcp_http.ack_of(res, arguments.get("conversation_id"))
     if isinstance(out, dict) and "conversation_id" in out:
         if not capture_context.acknowledges(out, arguments.get("conversation_id"),
                                             arguments["messages"],
