@@ -256,6 +256,25 @@ def test_equivalent_origin_reuses_installed_credentials_without_cross_origin_fal
                 assert sinks.resolve_capture_auth(sinks.Sink("other",other),refresh=False) == (other,None)
 
 
+def test_sanitized_cache_names_cannot_select_another_origins_credentials():
+    with isolated():
+        legitimate="https://api.example.test:443/mcp"
+        collision="https://api.example.test_443/mcp"
+        pak.CACHE_DIR.mkdir()
+        pak.key_path(legitimate).write_text(json.dumps({"secret":"origin-specific"}))
+        auth.token_cache_path(legitimate).write_text(json.dumps({"access_token":"origin-specific"}))
+        assert pak.key_path(legitimate)==pak.key_path(collision),"exercise the legacy collision"
+        with patch.object(auth,"resolve_bearer",side_effect=AssertionError("unsafe host must fail before credential access")):
+            for url in [collision,"https://host_name.example/mcp","https://api%2eexample.test/mcp", "https://λ.example/mcp"]:
+                rejected(lambda:sinks.Sink("other",url))
+        assert sinks.resolve_capture_auth(sinks.Sink("valid",legitimate),refresh=False)==(legitimate,"origin-specific")
+        local="http://localhost:47421/mcp"
+        pak.key_path(local).write_text(json.dumps({"secret":"different-protocol"}))
+        assert sinks.resolve_capture_auth(sinks.Sink("local",local),refresh=False)==(local,None)
+        assert sinks.resolve_capture_auth(sinks.Sink("local",local,"explicit"),refresh=False)==(local,"explicit")
+        assert sinks.Sink("ipv6","https://[2001:db8::1]:443/mcp").url.startswith("https:")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

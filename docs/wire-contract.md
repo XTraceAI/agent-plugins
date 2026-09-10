@@ -115,6 +115,11 @@ hyphens, and must be unique. The optional `mcp_path` defaults to
 userinfo, a query or fragment. Remote destinations require HTTPS; HTTP is
 accepted only for literal `localhost`, `127.0.0.1` or `::1`. Tokens are optional
 nonempty ASCII bearer values without whitespace/control characters.
+Endpoints require standard ASCII DNS names (IDNs use their ASCII form) or IP
+literals. Underscore/escaped host spellings are refused before credential
+lookup, preventing collisions in the existing host/port cache naming format.
+An independent loopback service requires an explicit token; it cannot borrow
+a legacy token cached for another protocol on the same host/port.
 
 Selection follows this order:
 
