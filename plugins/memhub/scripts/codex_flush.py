@@ -385,7 +385,10 @@ def _verdict(res, expected_conversation_id: str | None = None, *, records=None) 
     if getattr(res, "isError", False):
         _log(f"server rejected the import: {mcp_http.texts_of(res)[:1]}")
         return "unconfirmed"
-    confirms = (lambda candidate: capture_context.acknowledges(candidate, expected_conversation_id, records)) if records is not None else None
+    # Batch-aware calls may accept explicit complete stored-or-dropped
+    # accounting. A bare 200/null ack still cannot advance native progress.
+    confirms = (lambda candidate: capture_context.acknowledges(
+        candidate, expected_conversation_id, records)) if records is not None else None
     ack = mcp_http.ack_of(res, expected_conversation_id, prefer=confirms)
     if ack is not None and confirms is not None and confirms(ack):
         return "ok"
