@@ -625,7 +625,8 @@ def main() -> int:
     host = _env_host()
     try:
         sink = sinks.resolve_capture_sink()
-        separate = sink is None or capture_context.state_directory(STATE_DIR, sink) != STATE_DIR
+        separate = (sink is None or sink.token is not None
+                    or capture_context.state_directory(STATE_DIR, sink) != STATE_DIR)
         if separate:
             message, signature = _separate_capture_health(host, sink)
         else:
