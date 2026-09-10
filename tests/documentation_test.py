@@ -8,7 +8,9 @@ checks make the supported install and recovery paths part of the test suite.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,36 @@ def check(label: str, condition: bool) -> None:
     print(f"  {'ok ' if condition else 'FAIL'} {label}")
     if not condition:
         failures.append(label)
+
+
+def test_license_files_present() -> None:
+    license_bytes = (ROOT / "LICENSE").read_bytes()
+    notice_bytes = (ROOT / "NOTICE").read_bytes()
+    check("root ships Apache License 2.0", license_bytes.lstrip().startswith(b"Apache License")
+          and b"Version 2.0, January 2004" in license_bytes)
+    check("NOTICE names XTrace Inc.", b"XTrace Inc." in notice_bytes)
+    with tempfile.TemporaryDirectory() as temp:
+        # A git-subdirectory install cannot rely on files at the repository root.
+        installed = Path(temp) / "installed"
+        shutil.copytree(ROOT / "plugins" / "memhub", installed,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        for name, expected in (("LICENSE", license_bytes), ("NOTICE", notice_bytes)):
+            source = ROOT / "plugins" / "memhub" / name
+            check(f"installed {name} is a real identical copy",
+                  not source.is_symlink() and (installed / name).read_bytes() == expected)
+            staging = ROOT / "plugins" / "memhub-staging" / name
+            check(f"staging {name} resolves to the shipped copy",
+                  staging.is_symlink() and staging.resolve() == source.resolve()
+                  and staging.read_bytes() == expected)
+
+
+def test_manifests_declare_apache_license() -> None:
+    plugin = ROOT / "plugins" / "memhub"
+    for path in (plugin / "plugin.json", plugin / ".claude-plugin" / "plugin.json",
+                 plugin / ".codex-plugin" / "plugin.json", plugin / ".cursor-plugin" / "plugin.json",
+                 ROOT / "plugins" / "memhub-staging" / ".claude-plugin" / "plugin.json"):
+        check(f"{path.relative_to(ROOT)} declares Apache-2.0",
+              json.loads(path.read_text(encoding="utf-8")).get("license") == "Apache-2.0")
 
 
 def test_root_readme_is_multi_host() -> None:
