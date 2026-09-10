@@ -247,9 +247,11 @@ def main(argv=None) -> int:
                 def latest_mtime(row):
                     path = Path(row["path"])
                     if args.host == "cursor" and path.name == "store.db":
-                        metadata = reader._read_meta_json(path.parent) or {}
-                        value = metadata.get("updatedAtMs")
-                        return value / 1000 if type(value) in (int, float) and math.isfinite(value) else 0
+                        metadata = reader._read_meta_json(path.parent, strict_json=True, strict_utf8=True)
+                        value = metadata.get("updatedAtMs") if isinstance(metadata, dict) else None
+                        if type(value) not in (int, float) or not math.isfinite(value):
+                            raise ValueError("Cursor latest ordering requires a finite native timestamp")
+                        return value / 1000
                     return row["mtime"]
                 latest = Path(max(discovered, key=latest_mtime)["path"]).resolve(strict=True)
                 if args.host == "cursor":
@@ -270,7 +272,7 @@ def main(argv=None) -> int:
                     sessions = ([{"path": str(latest)}] if len(matches) == 1 else matches)
                 if not any(Path(row["path"]).resolve() == latest for row in sessions):
                     sessions.append({"path": str(latest)})
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
         diagnostic("discovery_incomplete")
         return 2
 
