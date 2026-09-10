@@ -263,11 +263,11 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
     with open(transcript, "rb") as fh:
         fh.seek(offset)
         while True:
-            raw = fh.readline(16 * 1024 * 1024 + 1)
+            # Decode one whole record so the existing tool-result/prose
+            # elision can retain its identity and emit a bounded payload.
+            raw = fh.readline()
             if not raw:
                 break
-            if len(raw) > 16 * 1024 * 1024:
-                raise ValueError("native record exceeds the per-turn read limit")
             if consumed > offset and (len(records) >= 2000 or consumed - offset + len(raw) > 3_500_000):
                 break
             if not raw.endswith(b"\n"):

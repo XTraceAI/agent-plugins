@@ -248,8 +248,10 @@ skips only when every active destination is caught up, dormant or already held.
 Health identifies the destination whose delivery failed.
 
 Catch-up uses at most 2,000 native records or approximately 3.5 MB of source per
-batch; a single source line is limited to 16 MiB and existing tool-result elision
-runs before transmission. A final partial line waits for its newline. Each
+batch. A larger individual record is read whole and the existing tool-result
+and oversized-prose elision bounds its wire payload while retaining its identity.
+Read memory therefore scales with the largest single native record. A final
+partial line waits for its newline. Each
 successful batch commits its own cursor; later failures retain earlier progress.
 The acknowledgement must match the conversation and final sent record UUID,
 or explicitly account for records the server received and deliberately dropped.
