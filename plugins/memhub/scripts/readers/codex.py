@@ -416,7 +416,7 @@ def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_js
         return None
 
 
-def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=False, strict_json=False) -> str | None:
+def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=False, strict_json=False, title_index=None) -> str | None:
     """What Codex calls this session, else the best name we can derive.
 
     Precedence, and why: MemHub should show the title Codex's own UI shows.
@@ -431,7 +431,8 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=Fa
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or _sidecar_thread_name(session_id, strict_utf8=strict_utf8, strict_json=strict_json))
+                   or (title_index.get(session_id) if title_index is not None else
+                       _sidecar_thread_name(session_id, strict_utf8=strict_utf8, strict_json=strict_json)))
     if thread_name:
         return thread_name
 
@@ -456,7 +457,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=Fa
     return normalize_title(first_user or last_complete)
 
 
-def rollout_to_claude_records(rollout: list[dict], *, strict_utf8=False, strict_json=False) -> tuple[list[dict], dict]:
+def rollout_to_claude_records(rollout: list[dict], *, strict_utf8=False, strict_json=False, title_index=None) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -480,7 +481,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict_utf8=False, strict_
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout, sm.get("id"), strict_utf8=strict_utf8, strict_json=strict_json),
+        "title": _title(rollout, sm.get("id"), strict_utf8=strict_utf8, strict_json=strict_json, title_index=title_index),
         "host": HOST,
     }
 
@@ -763,7 +764,7 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path, *, strict_utf8: bool = False, strict_json: bool = False) -> tuple[list[dict], dict]:
-    """Load a rollout and transform it to Claude-shaped records."""
+def to_canonical(path, *, strict_utf8: bool = False, strict_json: bool = False, title_index=None) -> tuple[list[dict], dict]:
+    """Normalize a rollout; an optional complete title index supports historical exports."""
     return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8, strict_json=strict_json),
-                                    strict_utf8=strict_utf8, strict_json=strict_json)
+                                    strict_utf8=strict_utf8, strict_json=strict_json, title_index=title_index)
