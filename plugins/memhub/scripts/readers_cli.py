@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import closing, contextmanager
 import datetime
 import json
@@ -36,6 +37,9 @@ def native_text(value, *, required=False):
 
 def source_revision(path: Path, host: str) -> tuple:
     paths = [path]
+    if host == "codex":
+        from readers.codex import _SESSION_INDEX
+        paths.append(_SESSION_INDEX)  # Desktop title changes need a new revision.
     if path.name == "store.db":
         # SQLite can keep current changes in WAL; --since must not skip them.
         paths += [path.with_name("store.db-wal"), path.with_name("store.db-journal"),
@@ -138,6 +142,7 @@ def main(argv=None) -> int:
         diagnostic("discovery_incomplete")
         return 2
 
+    prepared = []
     for session in sessions:
         path = Path(session["path"])
         try:
@@ -146,13 +151,25 @@ def main(argv=None) -> int:
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
                 raise ValueError("invalid mtime")
-            if args.since is not None and mtime < args.since:
-                continue
             header = header_for(reader, path, mtime)
+            prepared.append((path, revision, header))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError,
+                OverflowError, RecursionError):
+            diagnostic("session_unreadable", path)
+    # Reject every candidate sharing an actual native identity before emitting
+    # any of them. File names alone do not establish Codex session identity.
+    counts = Counter(header["conversation_id"] for _, _, header in prepared)
+    for path, revision, header in prepared:
+        if counts[header["conversation_id"]] > 1:
+            diagnostic("discovery_incomplete", path)
+            continue
+        if args.since is not None and header["mtime"] < args.since:
+            continue
+        try:
             records = []
             if not args.metadata_only:
                 with source_snapshot(path, args.host) as snapshot:
-                    records, native = reader.to_canonical(snapshot, strict_utf8=True)
+                    records, native = reader.to_canonical(snapshot, strict_utf8=True, strict_json=True)
                 if native.get("session_id") != header["native_session_id"]:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":

@@ -331,7 +331,7 @@ def _parse_node(data: bytes) -> tuple[list[str], int | None]:
     return out, ts
 
 
-def _load_messages(db_path: Path, *, strict_utf8: bool = False) -> list[tuple[dict, int | None]]:
+def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, int | None]]:
     """Walk the hash tree from latestRootBlobId; return ordered JSON leaves
     paired with their nearest ancestor node's wall clock (ms epoch, or None).
     Checkpoint nodes are timestamped; their leaves inherit that clock, which
@@ -344,6 +344,8 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False) -> list[tuple[di
             try:
                 m = json.loads(value)
             except (TypeError, json.JSONDecodeError):
+                if strict_json:
+                    raise
                 continue
             if isinstance(m, dict) and m.get("latestRootBlobId"):
                 root = m["latestRootBlobId"]
@@ -365,6 +367,8 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False) -> list[tuple[di
             try:
                 msg = json.loads(data.decode("utf-8", errors="strict" if strict_utf8 else "replace"))
             except json.JSONDecodeError:
+                if strict_json:
+                    raise
                 return
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
@@ -383,6 +387,8 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False) -> list[tuple[di
                 try:
                     msg = json.loads(bytes(data).decode("utf-8", errors="strict" if strict_utf8 else "replace"))
                 except json.JSONDecodeError:
+                    if strict_json:
+                        raise
                     continue
                 if isinstance(msg, dict) and msg.get("role"):
                     messages.append((msg, None))
@@ -605,7 +611,7 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False) -> list[tuple[dic
 
 def to_canonical(path, *, session_id: str | None = None,
                  cwd: str | None = None, model: str | None = None,
-                 strict_utf8: bool = False
+                 strict_utf8: bool = False, strict_json: bool = False
                  ) -> tuple[list[dict], dict]:
     """Load either a legacy ``store.db`` or current hook transcript."""
     source = Path(path)
@@ -634,7 +640,7 @@ def to_canonical(path, *, session_id: str | None = None,
     # ``updatedAtMs`` is NOT a substitute: it moves with every write, so using
     # it dates the whole undated remainder at flush-adjacent time.
     messages = [(message, _iso_ms(node_ts))
-                for message, node_ts in _load_messages(source, strict_utf8=strict_utf8)]
+                for message, node_ts in _load_messages(source, strict_utf8=strict_utf8, strict_json=strict_json)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
         model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))
