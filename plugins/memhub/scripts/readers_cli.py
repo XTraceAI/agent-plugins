@@ -142,6 +142,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     reader = reader_for(args.host)
     explicit_path = False
+    latest = None
     incomplete = False
 
     def diagnostic(code: str, path=None):
@@ -162,6 +163,26 @@ def main(argv=None) -> int:
             sessions = [{"path": str(path)}]
         else:
             sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"))
+            if args.session == "latest":
+                latest, error = reader.locate("latest")
+                if error or latest is None:
+                    diagnostic("session_unavailable")
+                    return 2
+                latest = latest.resolve(strict=True)
+                if args.host == "cursor":
+                    latest = cursor_source(latest, select_saved=True)
+                    # Discovery prefers stores, whereas native latest may
+                    # select a newer transcript of the same session. Replace
+                    # that one representation without hiding duplicate stores.
+                    def cursor_id(path):
+                        path = Path(path)
+                        return path.parent.name if path.name == "store.db" else path.stem
+                    matches = [row for row in sessions
+                               if cursor_id(row["path"]) == cursor_id(latest)]
+                    if len(matches) == 1:
+                        sessions[sessions.index(matches[0])] = {"path": str(latest)}
+                if not any(Path(row["path"]).resolve() == latest for row in sessions):
+                    sessions.append({"path": str(latest)})
     except (OSError, ValueError, TypeError, AttributeError):
         diagnostic("discovery_incomplete")
         return 2
@@ -191,13 +212,6 @@ def main(argv=None) -> int:
         # Preserve the native latest-selection rule, but only after all actual
         # identities have participated in ambiguity detection.
         try:
-            latest, error = reader.locate("latest")
-            if error or latest is None:
-                diagnostic("session_unavailable")
-                return 2
-            latest = latest.resolve(strict=True)
-            if args.host == "cursor":
-                latest = cursor_source(latest, select_saved=True)
             prepared = [item for item in prepared if item[0] == latest]
             if not prepared:
                 diagnostic("session_unavailable")
@@ -215,9 +229,11 @@ def main(argv=None) -> int:
         if counts[header["conversation_id"]] > 1:
             diagnostic("discovery_incomplete", path)
             continue
-        if args.since is not None and header["mtime"] < args.since:
-            continue
         try:
+            if args.since is not None and header["mtime"] < args.since:
+                if source_revision(path, args.host) != revision:
+                    diagnostic("source_changed", path)
+                continue
             records = []
             if not args.metadata_only:
                 with source_snapshot(path, args.host) as snapshot:

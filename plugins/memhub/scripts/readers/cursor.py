@@ -287,14 +287,14 @@ _MS_EPOCH_MIN = 1_500_000_000_000
 _MS_EPOCH_MAX = 4_000_000_000_000
 
 
-def _parse_node(data: bytes) -> tuple[list[str], int | None]:
+def _parse_node(data: bytes, *, strict: bool = False) -> tuple[list[str], int | None]:
     """(ordered child blob ids, node timestamp ms) of a protobuf tree node.
 
     Minimal TLV walk (stdlib only — no protobuf dependency): field 1
     length-delimited (tag 0x0A) with len 32 is a child hash; a varint in the
     ms-epoch window is the checkpoint's wall clock (observed as field 26 on
     cursor-agent 2026.08); everything else is skipped by wire type. Malformed
-    input just yields what parsed."""
+    input just yields what parsed unless strict validation is requested."""
     out: list[str] = []
     ts: int | None = None
     i, n = 0, len(data)
@@ -303,18 +303,26 @@ def _parse_node(data: bytes) -> tuple[list[str], int | None]:
         v, shift = 0, 0
         while j < n:
             b = data[j]
+            if strict and (shift > 63 or (shift == 63 and b > 1)):
+                raise ValueError("invalid protobuf varint")
             v |= (b & 0x7F) << shift
             j += 1
             if not b & 0x80:
-                break
+                return v, j
             shift += 7
+        if strict:
+            raise ValueError("truncated protobuf varint")
         return v, j
 
     while i < n:
         tag, i = varint(i)
+        if strict and not 1 <= tag >> 3 <= (1 << 29) - 1:
+            raise ValueError("invalid protobuf field")
         wire = tag & 7
         if wire == 2:                      # length-delimited
             ln, i = varint(i)
+            if strict and (i + ln > n or (tag >> 3 == 1 and ln != 32)):
+                raise ValueError("invalid protobuf child or field length")
             if tag >> 3 == 1 and ln == 32 and i + 32 <= n:
                 out.append(data[i:i + 32].hex())
             i += ln
@@ -327,7 +335,11 @@ def _parse_node(data: bytes) -> tuple[list[str], int | None]:
         elif wire == 1:
             i += 8
         else:                              # unknown wire type — stop safely
+            if strict:
+                raise ValueError("unsupported protobuf wire type")
             break
+        if strict and i > n:
+            raise ValueError("truncated protobuf fixed field")
     return out, ts
 
 
@@ -380,7 +392,7 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
-        children, node_ts = _parse_node(data)
+        children, node_ts = _parse_node(data, strict=strict_json)
         active.add(blob_id)
         try:
             for child in children:
