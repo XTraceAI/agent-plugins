@@ -119,7 +119,7 @@ def load_config(path: Path | None = None) -> dict | None:
         if name in registry:
             raise SinkConfigError("capture sink names must be unique")
         base = _endpoint(item.get("url"))
-        if urlsplit(base).query:
+        if "?" in base:
             raise SinkConfigError("capture base URL cannot contain a query")
         path = item.get("mcp_path", DEFAULT_MCP_PATH)
         if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
@@ -177,7 +177,14 @@ def resolve_capture_auth(sink: Sink, *, refresh: bool = True) -> tuple[str, str 
     # explicit sink can use its own stored PAK/current token, but must not send
     # its refresh token to the installed backend's different authorization server.
     try:
-        same_backend = _origin(_memhub_auth._plugin_mcp_config()["url"]) == _origin(sink.url)
+        installed = _memhub_auth._plugin_mcp_config()["url"]
+        same_backend = _origin(installed) == _origin(sink.url)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
         same_backend = False
-    return _memhub_auth.resolve_bearer(sink.url, refresh=refresh and same_backend)
+    _, bearer = _memhub_auth.resolve_bearer(sink.url, refresh=refresh and same_backend)
+    if bearer is None and same_backend and installed != sink.url:
+        # Old caches use the URL's literal netloc. Keep explicitly cached
+        # credentials first, then reuse the installed spelling of this SAME
+        # origin. The request still targets the selected complete MCP URL.
+        _, bearer = _memhub_auth.resolve_bearer(installed, refresh=refresh)
+    return sink.url, bearer

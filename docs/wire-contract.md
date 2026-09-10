@@ -57,7 +57,13 @@ remains supported. A session is checked for source changes and JSON encoding
 errors before its header is emitted; stdout delivery errors still require
 the consumer to discard its incomplete stream.
 
-Full reads reject invalid UTF-8 instead of replacing text. The existing capture
+Full reads reject invalid UTF-8 and malformed complete JSON rows instead of
+silently replacing or skipping content. An unfinished final JSON row can wait
+for a later read. Enumeration excludes all candidates with duplicate native
+identities before emitting any of them; an explicit path can select one.
+Codex's title index participates in source revisions and `--since`, so a title
+assignment or rename is observable even when its rollout has not changed.
+The existing capture
 readers retain their tolerant defaults. Cursor SQLite files and journals are
 copied into a private, temporary snapshot before opening SQLite; the native
 directory is never used for shared-memory files or journal recovery. A hot
@@ -140,7 +146,10 @@ explicit `MEMHUB_TOKEN`, selected sink token, then existing credentials looked
 up for the selected endpoint. Existing caches remain keyed by backend host and
 port; this does not add path-specific credential storage. The resolver never
 borrows the default cloud host's credential for a different host. OAuth refresh
-uses installed-plugin metadata only for that same backend origin; another
+uses installed-plugin metadata only for that same backend origin. When the
+selected URL has no stored credential, an equivalent origin with different
+hostname casing or an explicit default port can reuse the installed URL's
+credential; requests still use the selected endpoint. A different
 origin can use its own stored PAK or still-valid cached token without sending
 its refresh token to the installed backend's authorization server.
 
