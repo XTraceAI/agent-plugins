@@ -55,6 +55,9 @@ def receiver(label, order):
             if controls.get("partial_ack"):
                 result.update(ack_through=args["messages"][0]["uuid"],
                               messages_received=len(args["messages"]), records_dropped=1)
+            if controls.get("all_dropped") or controls.get("all_dropped_at") == len(requests):
+                result.update(ack_through=None, records_new=0,
+                              messages_received=len(args["messages"]), records_dropped=len(args["messages"]))
             if controls["wrong_ack"]:
                 result["ack_through"] = "a-different-batch"
             error = controls["error"]
@@ -358,7 +361,7 @@ def test_nested_and_text_acknowledgements_confirm_only_the_submitted_batch():
     order=[]
     with tempfile.TemporaryDirectory() as td,receiver("local",order) as local,receiver("cloud",order) as cloud:
         home=Path(td);data=payload(home);configure(home,local[0],active=["local"])
-        local[2]["nested_ack"]=True
+        local[2].update(nested_ack=True,all_dropped=True)
         invoke(home,cloud[0],data)
         assert state(home,"local",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
         local[2]["text_ack"]=True;append(Path(data["transcript_path"]),1)

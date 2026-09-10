@@ -593,7 +593,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _mark_failure(session_id, "server_rejected", detail)
         return
 
-    out = mcp_http.ack_of(res, session_id)
+    out = mcp_http.ack_of(res, session_id, prefer=lambda candidate:
+                         capture_context.acknowledges(candidate, session_id, sendable))
     if not isinstance(out, dict) or "conversation_id" not in out:
         # Unrecognized body: do NOT advance. Re-sending is free.
         detail = (texts[0] if texts else "")[:120]
