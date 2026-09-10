@@ -336,6 +336,43 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
                 assert source.read_bytes()==before
 
 
+def test_cursor_store_metadata_utf8_and_json_modes_are_independent():
+    with tempfile.TemporaryDirectory() as td:
+        store=fixtures._make_cursor_store(Path(td)/"chats")
+        path=store.parent/"meta.json";meta=json.loads(path.read_text());meta["cwd"]="invalidXtext"
+        path.write_bytes(json.dumps(meta).encode().replace(b"invalidXtext",b"invalid\xfftext"))
+        before=path.read_bytes()
+        actual=cursor.to_canonical(store,strict_json=True,strict_utf8=False)
+        assert "invalid\ufffdtext" in json.dumps(actual,ensure_ascii=False)
+        rejected(lambda:cursor.to_canonical(store,strict_json=True,strict_utf8=True))
+        rejected(lambda:cursor.to_canonical(store,strict_utf8=True))
+        assert cursor._read_meta_json(store.parent) is None, "legacy metadata handling stays tolerant"
+        assert path.read_bytes()==before
+        path.write_text("{bad}")
+        assert cursor._read_meta_json(store.parent,strict_utf8=True) is None
+        rejected(lambda:cursor._read_meta_json(store.parent,strict_json=True))
+
+
+def test_strict_cursor_user_blocks_preserve_text_or_reject_unsupported_content():
+    invalid=[{"type":"text","text":17},{"type":"image","data":"synthetic"},
+             {"type":"text","text":None},{"type":"text"}]
+    supported=[{"type":"text","text":"synthetic prompt"},{"type":"text","text":""}]
+    for block in invalid+supported:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/"chats")
+            message={"role":"user","content":[block]};raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as sql:
+                meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0]);meta["latestRootBlobId"]=key
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
+                sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
+            transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"user","message":{"content":[block]}}])
+            for source in [store,transcript]:
+                before=source.read_bytes();legacy=cursor.to_canonical(source)
+                if block in invalid:rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                else:assert cursor.to_canonical(source,strict_json=True)==legacy
+                assert source.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
