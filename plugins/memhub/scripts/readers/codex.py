@@ -149,7 +149,7 @@ def clean_user_text(text: str) -> str | None:
     return t
 
 
-def load_rollout(path, *, strict_utf8: bool = False) -> list[dict]:
+def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[dict]:
     """Parse a Codex rollout .jsonl tolerantly (skip malformed lines, e.g. a
     truncated final line from an interrupted write).
 
@@ -158,13 +158,15 @@ def load_rollout(path, *, strict_utf8: bool = False) -> list[dict]:
     em-dash then kills the whole import on a cp950/cp1252 box."""
     records: list[dict] = []
     errors = "strict" if strict_utf8 else "replace"
-    for line in Path(path).read_text(encoding="utf-8", errors=errors).splitlines():
-        line = line.strip()
+    for raw in Path(path).read_text(encoding="utf-8", errors=errors).splitlines(keepends=True):
+        line = raw.strip()
         if not line:
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            if strict_json and raw.endswith(("\n", "\r")):
+                raise
             continue
         # The return type says list[dict] and every consumer walks these with
         # ``r.get(...)``. A line holding a bare JSON scalar (``null``, a number,
@@ -174,6 +176,8 @@ def load_rollout(path, *, strict_utf8: bool = False) -> list[dict]:
         # Dropped here, once, rather than guarded at every walk.
         if isinstance(record, dict):
             records.append(record)
+        elif strict_json:
+            raise ValueError("Codex rollout row is not an object")
     return records
 
 
@@ -747,6 +751,6 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path, *, strict_utf8: bool = False) -> tuple[list[dict], dict]:
+def to_canonical(path, *, strict_utf8: bool = False, strict_json: bool = False) -> tuple[list[dict], dict]:
     """Load a rollout and transform it to Claude-shaped records."""
-    return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8))
+    return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8, strict_json=strict_json))
