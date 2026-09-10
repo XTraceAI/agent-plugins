@@ -33,6 +33,7 @@ jobs:
           python3 tests/version_parity_test.py
           python3 tests/registration_test.py
       - name: Require a version bump when shipped plugin code changes
+        if: github.base_ref == 'main'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}

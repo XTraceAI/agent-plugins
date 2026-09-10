@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime
 import json
 import math
+import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 from readers import reader_for, validate_canonical
@@ -35,7 +38,8 @@ def source_revision(path: Path, host: str) -> tuple:
     paths = [path]
     if path.name == "store.db":
         # SQLite can keep current changes in WAL; --since must not skip them.
-        paths += [path.with_name("store.db-wal"), path.parent / "meta.json"]
+        paths += [path.with_name("store.db-wal"), path.with_name("store.db-journal"),
+                  path.parent / "meta.json"]
     if host == "cursor":
         from cursor_flush import _state_path, _UUID_RE
         sid = path.parent.name if path.name == "store.db" else path.stem
@@ -75,6 +79,30 @@ def encode(value: dict) -> str:
     return json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
 
 
+@contextmanager
+def source_snapshot(path: Path, host: str):
+    if host != "cursor" or path.name != "store.db":
+        yield path
+        return
+    # SQLite mode=ro may still create an SHM file. Copy stable source bytes to
+    # a private snapshot so journal handling never writes in the native store.
+    # The caller compares source revisions before and after the entire read.
+    with tempfile.TemporaryDirectory(prefix="native-reader-") as temporary:
+        directory = Path(temporary) / path.parent.name
+        directory.mkdir(mode=0o700)
+        for name in ("store.db", "store.db-wal", "store.db-journal", "meta.json"):
+            source, target = path.parent / name, directory / name
+            try:
+                with source.open("rb") as handle:
+                    target.touch(mode=0o600, exist_ok=False)
+                    with target.open("wb") as output:
+                        shutil.copyfileobj(handle, output)
+            except FileNotFoundError:
+                if name in {"store.db", "meta.json"}:
+                    raise
+        yield directory / path.name
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", choices=("codex", "cursor"), required=True)
@@ -108,6 +136,7 @@ def main(argv=None) -> int:
     for session in sessions:
         path = Path(session["path"])
         try:
+            path = path.resolve(strict=True)
             revision = source_revision(path, args.host)
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
@@ -117,7 +146,8 @@ def main(argv=None) -> int:
             header = header_for(reader, path, mtime)
             records = []
             if not args.metadata_only:
-                records, native = reader.to_canonical(path)
+                with source_snapshot(path, args.host) as snapshot:
+                    records, native = reader.to_canonical(snapshot, strict_utf8=True)
                 if native.get("session_id") != header["native_session_id"]:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
@@ -134,7 +164,8 @@ def main(argv=None) -> int:
             lines = [encode(header)] + [encode(record) for record in records]
             for line in lines:
                 print(line)
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error,
+                OverflowError, RecursionError):
             diagnostic("session_unreadable", path)
     return 2 if incomplete else 0
 

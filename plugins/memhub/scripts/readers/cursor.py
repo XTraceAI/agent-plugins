@@ -331,7 +331,7 @@ def _parse_node(data: bytes) -> tuple[list[str], int | None]:
     return out, ts
 
 
-def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
+def _load_messages(db_path: Path, *, strict_utf8: bool = False) -> list[tuple[dict, int | None]]:
     """Walk the hash tree from latestRootBlobId; return ordered JSON leaves
     paired with their nearest ancestor node's wall clock (ms epoch, or None).
     Checkpoint nodes are timestamped; their leaves inherit that clock, which
@@ -363,7 +363,7 @@ def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
             data = data.encode("utf-8")
         if data[:1] == b"{":
             try:
-                msg = json.loads(data.decode("utf-8", errors="replace"))
+                msg = json.loads(data.decode("utf-8", errors="strict" if strict_utf8 else "replace"))
             except json.JSONDecodeError:
                 return
             if isinstance(msg, dict) and msg.get("role"):
@@ -381,7 +381,7 @@ def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
         for data in blobs.values():
             if isinstance(data, (bytes, bytearray)) and data[:1] == b"{":
                 try:
-                    msg = json.loads(bytes(data).decode("utf-8", errors="replace"))
+                    msg = json.loads(bytes(data).decode("utf-8", errors="strict" if strict_utf8 else "replace"))
                 except json.JSONDecodeError:
                     continue
                 if isinstance(msg, dict) and msg.get("role"):
@@ -603,7 +603,8 @@ def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
 
 
 def to_canonical(path, *, session_id: str | None = None,
-                 cwd: str | None = None, model: str | None = None
+                 cwd: str | None = None, model: str | None = None,
+                 strict_utf8: bool = False
                  ) -> tuple[list[dict], dict]:
     """Load either a legacy ``store.db`` or current hook transcript."""
     source = Path(path)
@@ -632,7 +633,7 @@ def to_canonical(path, *, session_id: str | None = None,
     # ``updatedAtMs`` is NOT a substitute: it moves with every write, so using
     # it dates the whole undated remainder at flush-adjacent time.
     messages = [(message, _iso_ms(node_ts))
-                for message, node_ts in _load_messages(source)]
+                for message, node_ts in _load_messages(source, strict_utf8=strict_utf8)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
         model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))

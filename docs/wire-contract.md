@@ -25,7 +25,7 @@ the next header or end of stream:
 | `cwd`, `git_branch` | Native structural metadata or `null`. |
 | `title` | Existing reader title in full mode; always `null` in metadata-only mode. |
 | `path` | Native source path on this machine. |
-| `mtime` | Unix seconds of the most recent source observation: the native file, or an existing Cursor WAL, metadata sidecar or saved hook-pin file. |
+| `mtime` | Unix seconds of the most recent source observation: the native file, or an existing Cursor journal, metadata sidecar or saved hook-pin file. |
 
 Canonical records retain their existing UUIDs, message blocks and usage rules.
 Cursor records also restore saved hook usage and timestamp pins through the
@@ -56,6 +56,14 @@ reported as incomplete to avoid traversal cycles. A configured root symlink
 remains supported. A session is checked for source changes and JSON encoding
 errors before its header is emitted; stdout delivery errors still require
 the consumer to discard its incomplete stream.
+
+Full reads reject invalid UTF-8 instead of replacing text. The existing capture
+readers retain their tolerant defaults. Cursor SQLite files and journals are
+copied into a private, temporary snapshot before opening SQLite; the native
+directory is never used for shared-memory files or journal recovery. Source
+revisions are compared across the read, and changed sources are reported as
+incomplete. Numeric overflow in native metadata rejects that session while
+preserving healthy peers.
 
 ## Verification
 
