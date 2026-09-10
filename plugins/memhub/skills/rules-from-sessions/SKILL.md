@@ -360,7 +360,8 @@ to a server.
 
 | script | what it answers |
 |---|---|
-| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_extract.py` | the pipeline itself: router → judge → author → drafts |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_extract.py` | the pipeline itself: router → redacted window → one server call (judge + author, MemHub `POST /v1/team/rulebook/harness/draft`) → stamp → drafts |
+| `${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py` | the LIVE sensor (S1): the Stop hook, the three-moment review, the sync — every path a no-op unless `MEMHUB_HARNESS_EXTRACT` is on |
 | `scripts/replay_hooks.py` | one command: replay a session through the installed hook AND the extractor |
 | `scripts/staging_sessions.py` | read-only adapter: a teammate's staging-captured session → the replay window |
 | `scripts/score_s0.py` | the scorecard: judge recall on gold, router hits, whole-pipeline over a corpus |
@@ -422,10 +423,20 @@ activate ratio, not at the judge.
 
 ## What runs a model, and how it is kept out of your session
 
-The judge and author are headless `claude -p` calls. Each child runs under
-`--safe-mode` (no plugins, no hooks, no CLAUDE.md) **and** carries
+Since S1 the judge and the author run **on the server** (MemHub #1249): the
+client sends one redacted window per turn to `POST /v1/team/rulebook/harness/draft`
+on the plugin's own credential, and gets back a row shaped for `create_rule`
+or a one-word refusal. No API key, no model and no prompt live on the laptop.
+Point the replay at the backend you mean — `MEMHUB_MCP_BASE_URL=https://api.staging.memhub.xtrace.ai`
+selects the staging plugin's credential — because the call is metered against
+that org's compute credits. The endpoint creates nothing; drafts still go to a
+local file only.
+
+The one model call left on the client is the post-session review
+(`harness_stop.py review`), a headless `claude -p` over a session's drafts. It
+runs under `--safe-mode` (no plugins, no hooks, no CLAUDE.md) **and** carries
 `MEMHUB_HARNESS_CHILD=1`, which `claude_hook_guard.py` honours by disarming
 every hook. Both, because the first is a Claude-Code-only flag and the second
-works on every host. Without them a replay's own child sessions get captured
-into the repo brain and show up on the fleet board — that happened while S0
-was being measured.
+works on every host. Without them the review's own session gets captured into
+the repo brain and shows up on the fleet board — that happened while S0 was
+being measured.
