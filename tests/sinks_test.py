@@ -275,6 +275,17 @@ def test_sanitized_cache_names_cannot_select_another_origins_credentials():
         assert sinks.Sink("ipv6","https://[2001:db8::1]:443/mcp").url.startswith("https:")
 
 
+def test_environment_base_query_is_rejected_before_path_composition():
+    with isolated():
+        for base in ["https://example.test?", "https://example.test?token=opaque", "http://localhost:47421?"]:
+            os.environ["MEMHUB_MCP_BASE_URL"]=base
+            with patch.object(auth,"default_url",side_effect=AssertionError("reject the base before composition")):
+                rejected(sinks.resolve_capture_sink)
+        os.environ["MEMHUB_MCP_BASE_URL"]="http://localhost:47421"
+        os.environ["MEMHUB_MCP_SERVER_PATH"]="/custom/mcp?mode=local"
+        assert sinks.resolve_capture_sink().url=="http://localhost:47421/custom/mcp?mode=local"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

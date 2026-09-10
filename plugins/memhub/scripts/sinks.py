@@ -146,6 +146,8 @@ def load_config(path: Path | None = None) -> dict | None:
 def _selection() -> tuple[tuple[str, ...], dict[str, Sink]]:
     # An explicit URL bypasses even an invalid config or named selection.
     if os.environ.get("MEMHUB_MCP_BASE_URL"):
+        if "?" in os.environ["MEMHUB_MCP_BASE_URL"]:
+            raise SinkConfigError("capture base URL cannot contain a query")
         sink = Sink("env", _memhub_auth.default_url())
         return (sink.name,), {sink.name: sink}
     config = load_config()
