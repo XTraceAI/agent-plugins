@@ -66,6 +66,7 @@ import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
+from readers.strict_json import loads as load_json  # noqa: E402
 from redact import redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import git_env, git_readonly  # noqa: E402
@@ -229,7 +230,7 @@ _SHARED_STATE_FIELDS = frozenset({
 
 def _state_at(path: Path, *, strict: bool = False) -> dict:
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = load_json(path.read_text(encoding="utf-8"), strict=strict)
         if strict and (not isinstance(state, dict) or any(
                 key in state and not isinstance(state[key], dict)
                 for key in ("record_ts", "usage_events"))):

@@ -55,8 +55,8 @@ Runtime diagnostics use stderr JSON Lines with `type: "diagnostic"`, `host`,
 `code`, and a nullable local `path`. Codes are `discovery_incomplete`,
 `session_unavailable`, `session_unreadable`, and `source_changed`; diagnostics
 do not include transcript excerpts or raw parser exceptions. Argument errors
-use argparse's ordinary stderr help. Symlinked subdirectories are skipped and
-reported as incomplete to avoid traversal cycles. A configured root symlink
+use argparse's ordinary stderr help. Symlinked subdirectories and discovered file aliases are skipped and
+reported as incomplete to avoid cycles and duplicate native identities. A configured root symlink
 remains supported. A session is checked for source changes and JSON encoding
 errors before its header is emitted; stdout delivery errors still require
 the consumer to discard its incomplete stream.
@@ -65,6 +65,9 @@ Full reads reject invalid UTF-8 and malformed complete JSON rows instead of
 silently replacing or skipping content. An unfinished final JSON row can wait
 for a later read. Enumeration excludes all candidates with duplicate native
 identities before emitting any of them; an explicit path can select one.
+For Cursor, one store and one transcript may represent the same session, but
+multiple stores or multiple transcripts remain ambiguous even when a preferred
+representation or a saved source pin would hide the other copies.
 Codex reads the complete title index lazily only when a rollout needs its fallback.
 Only that session's matching title observation participates in revision checks.
 Its native `updated_at` contributes to full-read `mtime` and `--since`; older
