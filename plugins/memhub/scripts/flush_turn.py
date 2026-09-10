@@ -860,7 +860,10 @@ def main() -> int:
 
 def _default_capture_url():
     import _memhub_auth
-    return _memhub_auth.default_url()
+    try:
+        return _memhub_auth.default_url()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
+        return None  # An independent configured destination needs no cloud setup.
 
 
 if __name__ == "__main__":
