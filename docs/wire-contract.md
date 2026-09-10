@@ -252,9 +252,16 @@ Health identifies the destination whose delivery failed.
 Catch-up uses at most 2,000 native records or approximately 3.5 MB of source per
 batch. A larger individual record is read whole and the existing tool-result
 and oversized-prose elision bounds its wire payload while retaining its identity.
-Read memory therefore scales with the largest single native record. A final
+Read memory therefore scales with the largest single native record. An attachment
+prefix that crosses a batch boundary carries a replay of the next complete native
+message as context, with the same UUID. Its cursor commits only the prefix byte
+span; the physical message is consumed later and safely deduplicates. With no
+complete message yet, the prefix remains pending. A final
 partial line waits for its newline. Each
 successful batch commits its own cursor; later failures retain earlier progress.
+Multiple-destination capture keeps retrying an endpoint without durable per-turn
+acknowledgements, since this standalone change cannot assume a multi-destination
+backstop. Single-destination capture retains legacy backstop dormancy.
 The acknowledgement must match the conversation and final sent record UUID,
 or explicitly account for records the server received and deliberately dropped.
 

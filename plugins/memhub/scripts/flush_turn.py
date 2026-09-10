@@ -262,6 +262,9 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
     """
     records: list[dict] = []
     consumed = offset
+    seeking_message = False
+    has_message = False
+    has_attachment = False
     with open(transcript, "rb") as fh:
         fh.seek(offset)
         while True:
@@ -270,18 +273,36 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
             raw = fh.readline()
             if not raw:
                 break
-            if consumed > offset and (len(records) >= 2000 or consumed - offset + len(raw) > 3_500_000):
-                break
             if not raw.endswith(b"\n"):
                 break  # partial trailing write — resume here next turn
-            consumed += len(raw)
-            line = raw.strip()
-            if not line:
-                continue
+            if not seeking_message and consumed > offset and (
+                    len(records) >= (2000 if has_message else 1999)
+                    or consumed - offset + len(raw) > 3_500_000):
+                if has_message or not has_attachment:
+                    break
+                # Attachments need a real message to establish the envelope.
+                # Replay a later native message as context, retaining its UUID,
+                # but commit only this prefix's byte span. Its physical record
+                # will be read again later and deduplicated by the receiver.
+                seeking_message = True
             try:
-                records.append(json.loads(line))
+                record = json.loads(raw.strip())
             except (json.JSONDecodeError, UnicodeDecodeError):
-                continue  # unparseable but complete: skip, keep the offset
+                if not seeking_message:
+                    consumed = fh.tell()
+                continue
+            message = isinstance(record, dict) and isinstance(record.get("message"), dict)
+            if seeking_message:
+                if message:
+                    records.append(record)
+                    return records, consumed
+                continue
+            records.append(record)
+            has_message = has_message or message
+            has_attachment = has_attachment or (isinstance(record, dict) and record.get("type") == "attachment")
+            consumed = fh.tell()
+    if seeking_message or (has_attachment and not has_message):
+        return [], offset  # Keep real content until a complete message arrives.
     return records, consumed
 
 
@@ -617,10 +638,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # which is the cost this hook exists to avoid. Go dormant for
         # the session rather than pay for the wrong behaviour: the
         # commit/PR and SessionEnd hooks still capture it.
-        _log("server has no per-turn support (no ack_through) — "
-             "disabling per-turn flush for this session; commit/PR "
-             "and session-end capture still apply. Upgrade the MemHub "
-             "server to enable it.")
+        if not _DORMANCY_ALLOWED.get():
+            _log("server has no durable per-turn acknowledgement — cursor retained; "
+                 "multiple-destination capture will retry on the next turn")
+            _save_state(session_id, unsupported=False)
+            _mark_failure(session_id, "unrecognized_response", "no durable per-turn acknowledgement")
+            return
+        _log("server has no per-turn support — using commit/PR and session-end capture")
         # ``unsupported`` and NOT a failure breadcrumb. This is a
         # deliberate degrade, not a break: per-turn goes dormant while
         # the commit/PR and SessionEnd paths keep capturing, so there
@@ -732,7 +756,7 @@ def _run_sink(hook_input: dict) -> int:
         lock_fd = _acquire(session_id)
         if lock_fd is None:
             return 0  # a flush is already in flight; its successor carries ours
-        if _read_state(session_id).get("unsupported"):
+        if _read_state(session_id).get("unsupported") and _DORMANCY_ALLOWED.get():
             return 0
         # Bounded, because the lock is held for the whole round-trip and the
         # prefilter skips every later turn while it is held. Without a cap, one
@@ -780,6 +804,8 @@ def _run_sink(hook_input: dict) -> int:
 
 # Bounded cache shared across destinations during this one invocation. Each
 # projection gets its own copy, so endpoint-specific arguments cannot mutate it.
+_DORMANCY_ALLOWED: ContextVar[bool] = ContextVar("turn_dormancy_allowed", default=True)
+
 _REDACTION_CACHE: ContextVar[dict | None] = ContextVar("turn_redaction_cache", default=None)
 
 
@@ -831,6 +857,7 @@ def main() -> int:
                     for sink in sorted(selected, key=lambda sink: not sink.is_local)]
         deadline = time.monotonic() + min(60.0, _flush_timeout_s())
         cache_token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
+        dormancy_token = _DORMANCY_ALLOWED.set(len(selected) == 1)
         try:
             for index, (sink, legacy) in enumerate(selected):
                 remaining = deadline - time.monotonic()
@@ -841,6 +868,7 @@ def main() -> int:
                     _run_sink(payload)
         finally:
             _REDACTION_CACHE.reset(cache_token)
+            _DORMANCY_ALLOWED.reset(dormancy_token)
     except BaseException:
         _log("capture selection unavailable; upload progress retained")
     return 0
