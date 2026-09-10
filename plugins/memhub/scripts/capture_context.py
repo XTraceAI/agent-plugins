@@ -26,7 +26,13 @@ _room_env: ContextVar[str | None] = ContextVar("capture_room_env", default=None)
 _payload: ContextVar[dict | None] = ContextVar("capture_hook_payload", default=None)
 
 
-def entrypoint(function):
+def entrypoint(function=None, *, observe_when_unselected=False):
+    if function is None:
+        return lambda target: entrypoint(target, observe_when_unselected=observe_when_unselected)
+
+    def unselected(*args, **kwargs):
+        return function(*args, **kwargs, observations_only=True) if observe_when_unselected else 0
+
     @wraps(function)
     def selected(*args, **kwargs):
         try:
@@ -34,12 +40,12 @@ def entrypoint(function):
             legacy = sink is not None and sink.name == "cloud" and sink.url == _memhub_auth.default_url()
         except SinkConfigError as error:
             print(f"[memhub-capture] {error}; capture deferred")
-            return 0
+            return unselected(*args, **kwargs)
         except Exception:
             print("[memhub-capture] destination unavailable; capture deferred")
-            return 0
+            return unselected(*args, **kwargs)
         if sink is None:
-            return 0
+            return unselected(*args, **kwargs)
         with bind(sink, legacy=legacy):
             return function(*args, **kwargs)
     return selected
@@ -200,6 +206,11 @@ def acknowledges(out, conversation_id, records, *, require_durable=True):
         return True
     dropped = out.get("records_dropped")
     received = out.get("messages_received")
-    if type(dropped) is not int or not 0 < dropped <= len(records) or received != len(records):
+    if (type(dropped) is not int or not 0 < dropped <= len(records)
+            or type(received) is not int or received != len(records)):
         return False
-    return (ack is None and dropped == len(records)) or (ack is not None and ack in ids)
+    if ack is None:
+        return dropped == len(records)
+    prefix = next((index + 1 for index, record in enumerate(records)
+                   if isinstance(record, dict) and record.get("uuid") == ack), None)
+    return prefix is not None and prefix + dropped == len(records)
