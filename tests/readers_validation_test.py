@@ -207,6 +207,36 @@ def test_strict_cursor_tree_validates_complete_protobuf_nodes():
             assert store.read_bytes()==before
 
 
+def test_cursor_json_only_mode_does_not_enable_utf8_strictness():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[1][1];original=path.read_bytes();expected=cursor.to_canonical(path)
+        row=b'{"role":"assistant","message":{"content":"invalid\xfftext"}}'
+        for ending in (b"\n",b""):
+            path.write_bytes(original+row+ending)
+            result=cursor.to_canonical(path,strict_json=True,strict_utf8=False)
+            assert "invalid\ufffdtext" in json.dumps(result,ensure_ascii=False)
+            rejected(lambda:cursor.to_canonical(path,strict_json=True,strict_utf8=True))
+        # Original capture still defers an unterminated undecodable byte tail.
+        assert cursor.to_canonical(path)==expected
+
+
+def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
+    invalid=[{"not_role":1}, {"role":None}, {"role":[]}, {"role":"future"},
+             {"role":"assistant"}, {"role":"user","content":17},
+             {"role":"assistant","content":[17]}]
+    for message in invalid:
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            with sqlite3.connect(store) as connection:
+                identity=next(key for key,value in connection.execute("SELECT id,data FROM blobs")
+                              if isinstance(value,bytes) and b'"role": "assistant"' in value)
+                connection.execute("UPDATE blobs SET data=? WHERE id=?",(json.dumps(message).encode(),identity))
+            before=store.read_bytes()
+            cursor.to_canonical(store)
+            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            assert store.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
