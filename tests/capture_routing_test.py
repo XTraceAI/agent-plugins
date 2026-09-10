@@ -400,6 +400,34 @@ def test_same_named_endpoint_changes_do_not_suppress_new_health_warnings():
         assert "127.0.0.1" not in marker and "synthetic" not in marker
 
 
+def test_disabled_or_invalid_delivery_keeps_shared_cursor_observations_for_later_capture():
+    generation="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    for active in [[],["missing"]]:
+        with tempfile.TemporaryDirectory() as td,receiver() as (url,requests,_):
+            home=Path(td);config(home,url,active=active)
+            script,args,payload,path,*_=sources(home)[3]
+            shared=home/f".config/memhub-plugin/cursorflush/{SID}.json";shared.parent.mkdir(parents=True)
+            held={"transcript_revision":"existing-cloud-progress","sent_usage_generations":["previous"],"unsupported":True}
+            shared.write_text(json.dumps(held))
+            payload.update(generation_id=generation,input_tokens=20120,output_tokens=48,
+                           cache_read_tokens=1024,cache_write_tokens=9)
+            invoke(home,script,payload,*args)
+            saved=json.loads(shared.read_text())
+            assert not requests and saved["record_ts"] and saved["usage_events"][generation]
+            assert all(saved[key]==value for key,value in held.items())
+            assert not (shared.parent/"local").exists()
+            config(home,url)
+            followup={key:value for key,value in payload.items() if key not in {
+                "generation_id","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens"}}
+            invoke(home,script,followup,*args)
+            assert len(requests)==1
+            records=imports(requests)[0]["messages"]
+            measured=[row["message"]["usage"] for row in records if row.get("message",{}).get("usage")]
+            assert any(usage.get("output_tokens")==48 and usage.get("input_tokens")==20120 for usage in measured)
+            after=json.loads(shared.read_text())
+            assert after["record_ts"]==saved["record_ts"] and after["usage_events"]==saved["usage_events"]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
