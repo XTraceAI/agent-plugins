@@ -346,7 +346,7 @@ def _rollout_thread_name(rollout: list[dict]) -> str | None:
     return found
 
 
-def _sidecar_thread_name(session_id: str | None, *, strict: bool = False) -> str | None:
+def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_json=False) -> str | None:
     """The name Codex gave this thread, from the ``session_index.jsonl``
     sidecar — for the sessions whose rollout does not carry one.
 
@@ -387,7 +387,7 @@ def _sidecar_thread_name(session_id: str | None, *, strict: bool = False) -> str
             # Drop the incomplete byte prefix before strict UTF-8 decoding;
             # the seek may have landed inside a multi-byte character.
             blob = blob.partition(b"\n")[2]
-        lines = blob.decode("utf-8", errors="strict" if strict else "replace").splitlines(keepends=True)
+        lines = blob.decode("utf-8", errors="strict" if strict_utf8 else "replace").splitlines(keepends=True)
         for raw in deque(lines, maxlen=_INDEX_MAX_LINES):
             line = raw.strip()
             if not line:
@@ -395,11 +395,11 @@ def _sidecar_thread_name(session_id: str | None, *, strict: bool = False) -> str
             try:
                 row = json.loads(line)
             except Exception:  # noqa: BLE001 — a torn final line is normal
-                if strict and raw.endswith(("\n", "\r")):
+                if strict_json and raw.endswith(("\n", "\r")):
                     raise
                 continue
             if not isinstance(row, dict):
-                if strict:
+                if strict_json:
                     raise ValueError("Codex title index row is not an object")
                 continue
             if row.get("id") != session_id:
@@ -411,12 +411,12 @@ def _sidecar_thread_name(session_id: str | None, *, strict: bool = False) -> str
     except FileNotFoundError:
         return None
     except Exception:  # noqa: BLE001 — legacy capture remains best-effort
-        if strict:
+        if strict_utf8 or strict_json:
             raise
         return None
 
 
-def _title(rollout: list[dict], session_id: str | None = None, *, strict_sidecar=False) -> str | None:
+def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=False, strict_json=False) -> str | None:
     """What Codex calls this session, else the best name we can derive.
 
     Precedence, and why: MemHub should show the title Codex's own UI shows.
@@ -431,7 +431,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_sidecar
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or _sidecar_thread_name(session_id, strict=strict_sidecar))
+                   or _sidecar_thread_name(session_id, strict_utf8=strict_utf8, strict_json=strict_json))
     if thread_name:
         return thread_name
 
@@ -456,7 +456,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_sidecar
     return normalize_title(first_user or last_complete)
 
 
-def rollout_to_claude_records(rollout: list[dict], *, strict_sidecar=False) -> tuple[list[dict], dict]:
+def rollout_to_claude_records(rollout: list[dict], *, strict_utf8=False, strict_json=False) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -480,7 +480,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict_sidecar=False) -> t
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout, sm.get("id"), strict_sidecar=strict_sidecar),
+        "title": _title(rollout, sm.get("id"), strict_utf8=strict_utf8, strict_json=strict_json),
         "host": HOST,
     }
 
@@ -766,4 +766,4 @@ def locate(ref: str) -> tuple[Path | None, str]:
 def to_canonical(path, *, strict_utf8: bool = False, strict_json: bool = False) -> tuple[list[dict], dict]:
     """Load a rollout and transform it to Claude-shaped records."""
     return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8, strict_json=strict_json),
-                                    strict_sidecar=strict_utf8 or strict_json)
+                                    strict_utf8=strict_utf8, strict_json=strict_json)
