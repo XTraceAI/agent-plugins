@@ -700,6 +700,41 @@ def test_cursor_uuid_selection_does_not_parse_unrelated_saved_state():
         assert result.returncode==2 and "session_unreadable" in result.stderr
 
 
+
+def test_hidden_cursor_transcript_duplicates_are_ambiguous_even_with_one_store():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);store=fixtures._make_cursor_store(home/".cursor/chats",uuid=SID)
+        first=transcript(home)
+        second=write_jsonl(home/f".cursor/projects/other/agent-transcripts/{SID}/{SID}.jsonl",fixtures.CURSOR_TRANSCRIPT)
+        os.utime(first,(MTIME+200,MTIME+200));os.utime(second,(MTIME+100,MTIME+100))
+        for selection in [[],["--session",SID],["--session","latest"]]:
+            for mode in [[],["--metadata-only"]]:
+                result,rows=run(home,"cursor",*selection,*mode)
+                assert result.returncode==2 and rows==[] and "discovery_incomplete" in result.stderr,(rows,result.stderr)
+        for path in [first,second,store]:
+            result,rows=run(home,"cursor","--session",str(path),"--metadata-only")
+            assert result.returncode==0 and len(rows)==1,result.stderr
+        second.unlink()
+        for selection in [[],["--session",SID],["--session","latest"]]:
+            result,rows=run(home,"cursor",*selection,"--metadata-only")
+            assert result.returncode==0 and len(rows)==1,result.stderr
+
+
+def test_cursor_file_aliases_never_emit_duplicate_resolved_identities():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);original=transcript(home);other="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        alias=home/f".cursor/projects/alias/agent-transcripts/{other}/{other}.jsonl"
+        alias.parent.mkdir(parents=True);alias.symlink_to(original)
+        for mode in [[],["--metadata-only"]]:
+            result,rows=run(home,"cursor",*mode)
+            headers=[row for row in rows if row.get("type")=="session"]
+            assert result.returncode==2 and len(headers)==1,(rows,result.stderr)
+            assert headers[0]["native_session_id"]==SID
+            assert "discovery_incomplete" in result.stderr
+        result,rows=run(home,"cursor","--session",str(alias),"--metadata-only")
+        assert result.returncode==0 and len(rows)==1 and rows[0]["native_session_id"]==SID,result.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
