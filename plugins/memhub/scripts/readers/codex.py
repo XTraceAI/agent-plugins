@@ -398,7 +398,11 @@ def _sidecar_thread_name(session_id: str | None, *, strict: bool = False) -> str
                 if strict and raw.endswith(("\n", "\r")):
                     raise
                 continue
-            if not isinstance(row, dict) or row.get("id") != session_id:
+            if not isinstance(row, dict):
+                if strict:
+                    raise ValueError("Codex title index row is not an object")
+                continue
+            if row.get("id") != session_id:
                 continue
             name = row.get("thread_name")
             if isinstance(name, str) and name.strip():
