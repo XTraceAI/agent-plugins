@@ -168,6 +168,11 @@ def acknowledges(out, conversation_id, records, *, require_durable=True):
         return True
     dropped = out.get("records_dropped")
     received = out.get("messages_received")
-    if type(dropped) is not int or not 0 < dropped <= len(records) or received != len(records):
+    if (type(dropped) is not int or not 0 < dropped <= len(records)
+            or type(received) is not int or received != len(records)):
         return False
-    return (ack is None and dropped == len(records)) or (ack is not None and ack in ids)
+    if ack is None:
+        return dropped == len(records)
+    prefix = next((index + 1 for index, record in enumerate(records)
+                   if isinstance(record, dict) and record.get("uuid") == ack), None)
+    return prefix is not None and prefix + dropped == len(records)
