@@ -10,6 +10,10 @@ Three modes, three of the scorecard's rows:
           positive costs one author call, a false negative is a lesson that
           never exists. Precision is measured at the END of the pipeline, by
           the activate-ratio row, not here.
+          Since S1 the judge runs on the server behind `POST …/harness/draft`
+          (MemHub #1249) and is not separately callable: a moment is "signal"
+          when the reply is anything but `no_signal`, and a positive also runs
+          the author, so this mode spends author calls too.
 
   router  the router alone over a corpus, no model calls, no cost. Reports how
           often each regex fires and — once you have judged the corpus — what
@@ -84,10 +88,14 @@ def cmd_gold(args) -> None:
         lines.append(f"USER'S NEW MESSAGE: {it['user'][:900]}")
         if it.get("last_error"):
             lines.append(f"  ! error just before: {str(it['last_error'])[:250]}")
-        try:
-            verdict, dt = hx.judge("\n".join(lines), args.timeout)
-        except hx.ModelError as exc:
-            return item_id, None, 0.0, str(exc)
+        reply, dt = hx.server_draft("\n".join(lines), timeout=args.timeout)
+        reason = str(reply.get("reason") or "")
+        if reason in hx.CLIENT_REASONS or reason in ("judge_failed", "disabled"):
+            return item_id, None, 0.0, reason
+        # The judge said yes whenever the author ran — every reason but
+        # `no_signal` is an author outcome, refusal or draft.
+        verdict = {"signal": reason != "no_signal", "kind": reply.get("kind") or "none",
+                   "reason": reason}
         return item_id, verdict, dt, ""
 
     out, errors, lat = {}, [], []
@@ -214,10 +222,8 @@ def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
            "--stats", str(out_dir / f"{name}.stats.json"),
            "--trace", str(out_dir / f"{name}.trace.log"),
            "--budget", str(args.budget), "--env", args.env, "--quiet"]
-    if args.judge_timeout:
-        cmd += ["--judge-timeout", str(args.judge_timeout)]
-    if args.author_timeout:
-        cmd += ["--author-timeout", str(args.author_timeout)]
+    if args.draft_timeout:
+        cmd += ["--draft-timeout", str(args.draft_timeout)]
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
     try:
@@ -227,8 +233,8 @@ def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
     stats["file"] = path.name
     stats["wall_s"] = round(time.time() - t0, 1)
     print(f"  done {name}: {stats.get('rows', 0)} rows, "
-          f"{stats.get('judge_calls', 0)} judge, "
-          f"{stats.get('author_calls', 0)} author, {stats['wall_s']}s",
+          f"{stats.get('server_calls', 0)} calls, "
+          f"{stats.get('transport_errors', 0)} transport errors, {stats['wall_s']}s",
           flush=True)
     return stats
 
@@ -280,54 +286,77 @@ def cmd_corpus(args) -> None:
     # Duplicates ACROSS the whole run, not just within one session: two
     # engineers hitting the same trap is exactly the twin the server-side
     # check exists for, and the scorecard should say whether it happens.
+    # Two passes, both reported: the lexical one the in-run twin check uses
+    # (statement Jaccard), and a looser one over what the rows would DO — the
+    # same trigger regex or a shared anchor, or a near-identical title — which
+    # is what S0's hand judgement found and the lexical pass missed (Finding 5).
     hx = _load_extract()
-    dupes = []
+    dupes, near = [], []
     for i, a in enumerate(rows_all):
         for b in rows_all[i + 1:]:
+            pair = (a["source_ref"], b["source_ref"], a["title"][:60], b["title"][:60])
             if hx.similarity(a["statement"], b["statement"]) > hx.TWIN_THRESHOLD:
-                dupes.append((a["source_ref"], b["source_ref"],
-                              a["title"][:60], b["title"][:60]))
+                dupes.append(pair)
+            elif _same_trigger(a, b) or hx.similarity(a["title"], b["title"]) >= 0.6:
+                near.append(pair)
+    latencies = [x for r in results for x in (r.get("latencies") or [])]
+    latencies.sort()
 
     engineers = sorted({r["_engineer"] for r in rows_all}) or ["?"]
+    router_authored = dict(collections.Counter(
+        k for r in results for k, n in (r.get("router_authored") or {}).items()
+        for _ in range(n)).most_common())
+    router_refused = dict(collections.Counter(
+        k for r in results for k, n in (r.get("router_refused") or {}).items()
+        for _ in range(n)).most_common())
+    hinted = sum(r.get("hinted_calls", 0) for r in results)
     summary = {
         "sessions": len(results),
         "engineers": sorted(set(engineer_of.values())) or ["?"],
         "engineers_with_rows": engineers,
         "turns": sum(r.get("turns", 0) for r in results),
+        "turns_sent": sum(r.get("turns_sent", 0) for r in results),
+        "turns_spared_by_router": sum(r.get("turns_spared", 0) for r in results),
         "rows": len(rows_all),
         "rows_per_session_max": max(per_session.values() or [0]),
         "rows_per_session_mean": round(
             sum(per_session.values()) / max(len(per_session), 1), 2),
         "sessions_over_budget": over_budget,
-        "duplicate_pairs": len(dupes),
-        "judge_calls": sum(r.get("judge_calls", 0) for r in results),
-        "author_calls": sum(r.get("author_calls", 0) for r in results),
-        "judge_timeouts": sum(r.get("judge_timeouts", 0) for r in results),
-        "author_timeouts": sum(r.get("author_timeouts", 0) for r in results),
-        "model_errors": sum(r.get("model_errors", 0) for r in results),
+        "duplicate_pairs_lexical": len(dupes),
+        "duplicate_pairs_trigger_or_title": len(near),
+        "server_calls": sum(r.get("server_calls", 0) for r in results),
+        "transport_errors": sum(r.get("transport_errors", 0) for r in results),
+        "latency_p50_s": round(latencies[len(latencies) // 2], 1) if latencies else None,
+        "latency_p90_s": round(latencies[int(len(latencies) * .9)], 1) if latencies else None,
+        "judge_kinds": dict(collections.Counter(
+            k for r in results for k, n in (r.get("kinds") or {}).items()
+            for _ in range(n)).most_common()),
         "twins_dropped_in_run": sum(r.get("twins", 0) for r in results),
         "refusals": dict(refusals.most_common()),
-        "router_authored": dict(collections.Counter(
-            k for r in results for k, n in (r.get("router_authored") or {}).items()
-            for _ in range(n)).most_common()),
-        "router_refused": dict(collections.Counter(
-            k for r in results for k, n in (r.get("router_refused") or {}).items()
-            for _ in range(n)).most_common()),
+        "router_hinted_calls": hinted,
+        "router_authored": router_authored,
+        "router_refused": router_refused,
+        # rows from router-hinted turns ÷ router-hinted calls: the scorecard's
+        # "router regex precision" row, measured the same way as S0's
+        "router_precision": round(sum(router_authored.values()) / hinted, 3) if hinted else None,
         "wall_s": round(time.time() - t0, 1),
     }
     (out_dir / "summary.json").write_text(
         json.dumps(summary, indent=1), encoding="utf-8")
     (out_dir / "rows.json").write_text(
         json.dumps(rows_all, indent=1), encoding="utf-8")
-    write_judge_sheet(out_dir / "judge_sheet.md", rows_all, summary, dupes)
+    write_judge_sheet(out_dir / "judge_sheet.md", rows_all, summary, dupes, near)
 
     print("\n" + "=" * 62)
-    for key in ("sessions", "engineers", "turns", "rows",
+    for key in ("sessions", "engineers", "turns", "turns_sent",
+                "turns_spared_by_router", "rows",
                 "rows_per_session_max", "rows_per_session_mean",
-                "sessions_over_budget", "duplicate_pairs", "judge_calls",
-                "author_calls", "judge_timeouts", "author_timeouts",
+                "sessions_over_budget", "duplicate_pairs_lexical",
+                "duplicate_pairs_trigger_or_title", "server_calls",
+                "transport_errors", "latency_p50_s", "latency_p90_s",
+                "router_hinted_calls", "router_precision",
                 "twins_dropped_in_run", "wall_s"):
-        print(f"{key:26} {summary[key]}")
+        print(f"{key:32} {summary[key]}")
     print(f"{'refusals':26} {summary['refusals']}")
     print(f"\n-> {out_dir}/judge_sheet.md   (hand-judge this; the gate turns on it)")
 
@@ -359,12 +388,26 @@ Mark R and give the reason from: `no_action`, `unmatchable`, `derivable`,
 """
 
 
-def write_judge_sheet(path: Path, rows: list, summary: dict, dupes: list) -> None:
+def _same_trigger(a: dict, b: dict) -> bool:
+    ma, mb = a.get("matcher") or {}, b.get("matcher") or {}
+    if ma and mb and ma.get("event") == mb.get("event"):
+        for key in ("command_rx", "path_rx", "content_rx"):
+            if ma.get(key) and ma.get(key) == mb.get(key):
+                return True
+    oa, ob = a.get("ordering") or {}, b.get("ordering") or {}
+    if oa and ob and oa.get("gated_command_rx") == ob.get("gated_command_rx"):
+        return True
+    return bool(set(a.get("anchors") or []) & set(b.get("anchors") or []))
+
+
+def write_judge_sheet(path: Path, rows: list, summary: dict, dupes: list,
+                      near: list | None = None) -> None:
     out = [JUDGE_SHEET_HEADER, "",
            f"- rows drafted: **{len(rows)}**",
            f"- sessions: {summary['sessions']} "
            f"({len(summary['engineers'])} engineers)",
-           f"- duplicate pairs found across the run: {len(dupes)}",
+           f"- duplicate pairs found across the run: {len(dupes)} lexical, "
+           f"{len(near or [])} by trigger/title",
            "", "| # | verdict | reason | engineer | source_ref | title |",
            "|---|---|---|---|---|---|"]
     for n, r in enumerate(rows, 1):
@@ -381,7 +424,8 @@ def write_judge_sheet(path: Path, rows: list, summary: dict, dupes: list) -> Non
             f" · **delivery** `{r['delivery']}` · **engine** `{engine}`",
             f"- **repo** `{r['state'].get('repo') or '(unresolved)'}`"
             f" · **branch** `{r['state'].get('branch') or '—'}`"
-            f" · **flagged by** `{r.get('_reason', '')[:80]}`",
+            f" · **flagged by** `{r.get('_reason', '')[:80]}`"
+            f" · **judge kind** `{r.get('_kind') or '—'}`",
             "",
             f"> {r['statement']}",
             "",
@@ -396,6 +440,11 @@ def write_judge_sheet(path: Path, rows: list, summary: dict, dupes: list) -> Non
                 f"{_load_extract().TWIN_THRESHOLD})", ""]
         for a, b, ta, tb in dupes:
             out.append(f"- `{a}` vs `{b}` — {ta} / {tb}")
+    if near:
+        out += ["", "## Near-duplicate pairs (same trigger or anchor, or title "
+                "similarity ≥ 0.6) — judge by hand", ""]
+        for a, b, ta, tb in near:
+            out.append(f"- `{a}` vs `{b}` — {ta} / {tb}")
     path.write_text("\n".join(out), encoding="utf-8")
 
 
@@ -406,8 +455,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("gold", help="judge recall/precision on the labelled set")
     g.add_argument("--jobs", type=int, default=6)
     g.add_argument("--limit", type=int, default=0)
-    g.add_argument("--timeout", type=int, default=0,
-                   help="seconds per judge call (default: the spec's 30)")
+    g.add_argument("--timeout", type=float, default=0,
+                   help="seconds per server call (default: the client's bound)")
     g.add_argument("--out", default="")
 
     r = sub.add_parser("router", help="router hits over a corpus, no model")
@@ -421,8 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--limit", type=int, default=0)
     c.add_argument("--budget", type=int, default=8)
     c.add_argument("--env", default="staging")
-    c.add_argument("--judge-timeout", type=int, default=0)
-    c.add_argument("--author-timeout", type=int, default=0)
+    c.add_argument("--draft-timeout", type=float, default=0,
+                   help="seconds for the one server call per turn")
     return p
 
 
