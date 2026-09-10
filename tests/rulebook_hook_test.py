@@ -2073,6 +2073,30 @@ def armed_lane_checks() -> None:
               str(rb_mod.receipt_segments("npm test -- --grep 'a|b'")))
         check("receipt: a REAL pipeline is still refused",
               rb_mod.receipt_segments("pytest | tail") == [])
+        # A trailing `;` or newline ends the last command; it does not start
+        # an empty one. `pytest;` was a passing receipt refused.
+        check("receipt: a trailing terminator does not empty the last segment",
+              rb_mod.last_segment("pytest;") == "pytest"
+              and rb_mod.last_segment("git fetch\n") == "git fetch"
+              and rb_mod.receipt_segments("pytest -q; ") == ["pytest -q"]
+              and rb_mod.receipt_segments("make lint && pytest;", whole_chain=True)
+              == ["make lint", "pytest"],
+              str((rb_mod.last_segment("pytest;"), rb_mod.receipt_segments("pytest -q; "))))
+        check("receipt: a trailing `&` is a background, not a terminator",
+              rb_mod.receipt_segments("pytest &") == []
+              and rb_mod.receipt_segments("pytest &", whole_chain=True) == [])
+        # `${#files}` is the length expansion, not a comment. Reading its `#`
+        # as one blanked the rest of the line and the gate never saw the push.
+        check("comment: `${#var}` is not a comment — the push after it still fires",
+              rb_mod.command_fires(r"git\s+push\b", "n=${#files}; git push", flags=0)
+              and rb_mod.command_fires(r"git\s+push\b", "echo ${#x} && git push origin main",
+                                       flags=0),
+              rb_mod.strip_comments("n=${#files}; git push"))
+        check("comment: a real comment after the command is still a comment",
+              rb_mod.strip_comments("git push # done").rstrip() == "git push"
+              and not rb_mod.command_fires(r"git\s+push\b", "true # git push", flags=0)
+              and not rb_mod.command_fires(r"git\s+push\b", "{ # git push", flags=0),
+              rb_mod.strip_comments("git push # done"))
         # Any wrapper — on `CMD_WRAPPERS` or not — is seen through, because
         # `executes` reads syntax and carries no list of runners.
         for wrapped in ("doas git fetch --all", "builtin git fetch --all",

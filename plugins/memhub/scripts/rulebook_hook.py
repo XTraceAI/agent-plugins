@@ -264,7 +264,7 @@ def last_segment(shell):
     background `&`, newline). Separators are located in the blanked copy, so
     one written inside a quoted argument is the data it is, and the segment
     itself is sliced out of the original."""
-    text = shell or ""
+    text = trim_terminators(shell)
     end = 0
     for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(text)):
         end = m.end()
@@ -289,7 +289,8 @@ def and_only_segments(shell):
     complied. A rule that fires when you have already done the thing is the
     one people learn to ignore — the same point `rulebook_verify` presses on
     every author."""
-    blank = blank_quoted(shell or "")
+    shell = trim_terminators(shell)
+    blank = blank_quoted(shell)
     # Any separator that is NOT `&&` disqualifies the chain — asked of
     # `_SEPARATOR_RX`, the one place that knows what a separator is. The raw
     # character scan this replaces called `git fetch 2>&1 && git log
@@ -329,7 +330,20 @@ QUOTED_SINGLE_RX = re.compile(_QUOTED_SINGLE)
 _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
 _ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
-_COMMENT_RX = re.compile(r"(?<![^\s;&|(){}])#[^\n]*")
+# A `#` starts a comment at the start of a word: after whitespace, an
+# operator, or a grouping paren/brace. NOT after `{` — `${#files}` is the
+# length expansion, and reading its `#` as a comment blanked the rest of the
+# line, so `n=${#files}; git push` reached the gate with no push in it.
+_COMMENT_RX = re.compile(r"(?<![^\s;&|()}])#[^\n]*")
+# A trailing `;` or newline ends the last command; it does not start an empty
+# one. `pytest;` is a run of pytest, and splitting on that `;` made the last
+# segment "" — a passing receipt refused, and the gate fired on a caller
+# who had complied. A trailing `&` is NOT a terminator: it backgrounds.
+_TRAILING_TERMINATOR_RX = re.compile(r"[\s;\n]+$")
+
+
+def trim_terminators(shell):
+    return _TRAILING_TERMINATOR_RX.sub("", shell or "")
 
 
 def blank_quoted(text):
@@ -441,6 +455,7 @@ def receipt_segments(shell, whole_chain=False):
     `and_only_segments`) and is what the session- and prompt-armed rules
     need: the shape they are about puts the required command FIRST
     (`git fetch -q && git log origin/main`) and never last."""
+    shell = trim_terminators(shell)
     if whole_chain:
         segs = and_only_segments(shell)
         if segs:
@@ -453,7 +468,7 @@ def receipt_segments(shell, whole_chain=False):
     #
     # Joiners are read with `last_segment`'s own splitter (single `|` is not
     # one of them, which is what the pipe test below still relies on).
-    joiners = [m.group(0) for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(shell or ""))]
+    joiners = [m.group(0) for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(shell))]
     if joiners and joiners[-1] == "||":
         return []
     # A call that ENDS in a background `&` now yields an empty last segment —
