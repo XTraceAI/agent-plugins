@@ -174,9 +174,9 @@ shared Cursor pins and separate capture/cloud-service health.
 ### Conversation hook delivery
 
 Each delivery freezes its selected destination for authentication, state,
-room routing and async work. Empty selection skips delivery. Claude per-turn
-capture supports multiple active destinations. Claude SessionEnd/commit/PR
-backstop, Codex and Cursor still reject multiple names until their corresponding
+room routing and async work. Empty selection skips delivery. Claude per-turn and SessionEnd/commit/PR
+backstop capture support multiple active destinations. Codex and Cursor still
+reject multiple names until their corresponding
 delivery paths support independent progress.
 The installed endpoint keeps its existing room-cache namespace. Other remote
 endpoints use a digest of their complete URL, so one server cannot read or
@@ -200,7 +200,7 @@ Literal loopback capture skips cloud room resolution and adds native session ID
 plus an observed raw surface when available. Claude reads explicit `source_surface`
 or `entrypoint`; Codex reads native `originator`; Cursor reads explicit metadata
 or its recognized native source location. Missing surfaces remain omitted. Older
-cloud envelopes stay unchanged for the single-destination backstop, Codex and
+cloud envelopes stay unchanged for the single-destination Codex and
 Cursor paths. Canonical host-prefixed conversation IDs and record UUIDs retain
 the existing reader convention.
 
@@ -251,3 +251,32 @@ connections. Cases cover explicit membership, identity, local-first order,
 401/429/500 recovery, slow-drip deadlines, overlapping hooks, legacy cursors,
 per-destination locks/dormancy, old-cloud compatibility, batching, acknowledgement
 validation and redaction isolation. No hosted CI job is added.
+
+
+### Claude session-end, commit and PR backstops
+
+The whole-session backstop uses the same frozen active-destination selection,
+local-first ordering and independent state as turn capture. Each destination
+has its own backstop lock and health breadcrumb, separate from its turn cursor.
+A cloud error or held cloud lock does not prevent a local import. Backstops
+continue to resend the transcript-so-far; stable UUIDs and server deduplication
+make replay safe without adopting another destination's progress.
+
+A shared deadline defaults to 240 seconds, with a reserved share for each
+remaining destination. `MEMHUB_FLUSH_DEADLINE_S` may lower it; non-finite or
+nonpositive values fall back to the default. Auth and transport use bounded
+cancellable waits. Each request contains at most 2,000 records and retains the
+existing byte-sized slices. A timeout or unfinished set of slices records a
+failure for retry, including when earlier slices succeeded.
+
+Every destination receives the same redacted records and discovered PR
+provenance. Native identity and an observed raw surface are included; an absent
+surface remains absent. Only an explicit old-cloud rejection of those optional
+fields permits one retry without them. Local acknowledgements must identify
+the same conversation and account for the slice. A legacy cloud backstop may
+still accept its matching conversation response without a durable watermark;
+this never advances the separate per-turn cursor.
+
+Run `python3 tests/backstop_sinks_test.py` for dual delivery, independent cloud
+failure/recovery, replay, provenance, old-cloud compatibility, missing surface,
+slow response deadlines, bounded record batches and concurrent backstop locks.
