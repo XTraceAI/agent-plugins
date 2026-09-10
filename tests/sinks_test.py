@@ -131,6 +131,7 @@ def test_destination_schema_is_unambiguous_and_path_safe():
             configured(config, entries=[{"name": name, "url": "https://cloud.example.test"}])
             rejected(sinks.resolve_capture_sink)
         for items in [[None], [{"name": "local", "url": "https://cloud.example.test"}] * 2,
+                      [{"name": "local", "url": "https://cloud.example.test?"}],
                       [{"name": "local", "url": "https://cloud.example.test?private=value"}],
                       [{"name": "local", "url": "https://cloud.example.test", "mcp_path": "//other"}],
                       [{"name": "local", "url": "https://cloud.example.test", "token": "bad\nheader"}]]:
@@ -230,6 +231,29 @@ assert sinks.resolve_capture_auth(selected) == (selected.url,"local")
         result = subprocess.run([sys.executable, "-c", script, str(SCRIPTS)], env=env,
                                 text=True, capture_output=True, timeout=20)
         assert result.returncode == 0, result.stderr
+
+
+def test_equivalent_origin_reuses_installed_credentials_without_cross_origin_fallback():
+    with isolated():
+        pak.CACHE_DIR.mkdir()
+        pak.key_path(CLOUD).write_text(json.dumps({"secret":"installed-key"}))
+        selected="https://CLOUD.example.test:443/custom/mcp"
+        sink=sinks.Sink("selected",selected)
+        assert sinks.resolve_capture_auth(sink,refresh=False) == (selected,"installed-key")
+        pak.key_path(selected).write_text(json.dumps({"secret":"selected-key"}))
+        assert sinks.resolve_capture_auth(sink,refresh=False) == (selected,"selected-key")
+        pak.key_path(selected).unlink();pak.key_path(CLOUD).unlink()
+        auth.token_cache_path(CLOUD).write_text(json.dumps({"access_token":"installed-access"}))
+        assert sinks.resolve_capture_auth(sink,refresh=False) == (selected,"installed-access")
+        refreshed=[]
+        with patch.object(auth,"_refresh_cached_token_if_stale",side_effect=refreshed.append):
+            assert sinks.resolve_capture_auth(sink) == (selected,"installed-access")
+        assert refreshed == [selected,CLOUD]
+        for other in [OTHER,"https://cloud.example.test:8443/mcp","http://cloud.example.test/mcp"]:
+            if other.startswith("http:"):
+                rejected(lambda:sinks.Sink("other",other))
+            else:
+                assert sinks.resolve_capture_auth(sinks.Sink("other",other),refresh=False) == (other,None)
 
 
 if __name__ == "__main__":

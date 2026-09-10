@@ -139,7 +139,10 @@ explicit `MEMHUB_TOKEN`, selected sink token, then existing credentials looked
 up for the selected endpoint. Existing caches remain keyed by backend host and
 port; this does not add path-specific credential storage. The resolver never
 borrows the default cloud host's credential for a different host. OAuth refresh
-uses installed-plugin metadata only for that same backend origin; another
+uses installed-plugin metadata only for that same backend origin. When the
+selected URL has no stored credential, an equivalent origin with different
+hostname casing or an explicit default port can reuse the installed URL's
+credential; requests still use the selected endpoint. A different
 origin can use its own stored PAK or still-valid cached token without sending
 its refresh token to the installed backend's authorization server.
 
