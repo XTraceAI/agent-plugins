@@ -138,9 +138,10 @@ def main(argv=None) -> int:
     parser.add_argument("--host", choices=("codex", "cursor"), required=True)
     parser.add_argument("--since", type=since_instant)
     parser.add_argument("--metadata-only", action="store_true")
-    parser.add_argument("--session", help="One native session ID or path instead of enumeration")
+    parser.add_argument("--session", help="Select one native session ID, latest, or an explicit path")
     args = parser.parse_args(argv)
     reader = reader_for(args.host)
+    explicit_path = False
     incomplete = False
 
     def diagnostic(code: str, path=None):
@@ -151,7 +152,9 @@ def main(argv=None) -> int:
                           "code": code, "path": str(path) if path else None}), file=sys.stderr)
 
     try:
-        if args.session and args.session != "latest":
+        explicit_path = (args.session is not None and args.session != "latest"
+                         and ("/" in args.session or Path(args.session).expanduser().exists()))
+        if explicit_path:
             path, error = reader.locate(args.session)
             if error or path is None:
                 diagnostic("session_unavailable")
@@ -200,6 +203,12 @@ def main(argv=None) -> int:
                 diagnostic("session_unavailable")
                 return 2
         except (OSError, ValueError, TypeError, AttributeError):
+            diagnostic("session_unavailable")
+            return 2
+    elif args.session and not explicit_path:
+        native_id = args.session.removesuffix(".jsonl") if args.host == "codex" else args.session
+        prepared = [item for item in prepared if item[2]["native_session_id"] == native_id]
+        if not prepared:
             diagnostic("session_unavailable")
             return 2
     for path, revision, header in prepared:
