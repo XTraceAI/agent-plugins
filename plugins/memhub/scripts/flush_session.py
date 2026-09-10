@@ -182,7 +182,7 @@ def _deadline_s() -> float:
     return value if value > 0 and math.isfinite(value) else _DEFAULT_DEADLINE_S
 
 
-async def _flush(session_id: str, transcript_path: str) -> None:
+def _prepare_transcript(transcript_path: str):
 
     # Tolerant parse, NOT json.loads-or-die: this hook reads the transcript
     # while Claude Code is still appending to it, so a truncated final line
@@ -270,6 +270,28 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    # Chunked, because this path sends the WHOLE transcript in one
+    # call and real sessions can outgrow a single payload. Unchunked,
+    # this works on ordinary sessions and fails on precisely the long
+    # ones — and as the backstop for when per-turn capture is dormant,
+    # failing on the biggest sessions is failing where it matters most.
+    # Slices are disjoint and sent in order against one conversation,
+    # so the server's watermark sees a normal incremental import.
+    payloads = [part[start:start + 2000] for part in make_slices(records)
+                for start in range(0, len(part), 2000)]
+    return payloads, provenance, title, cwd, namespace
+
+
+async def _flush(session_id: str, transcript_path: str) -> None:
+    # Pure preparation may read a large file or wait on git. Keep it off the
+    # event loop so one destination cannot spend another's reserved budget.
+    # The worker never sends requests or commits delivery progress; a late
+    # result after cancellation cannot acknowledge or advance this session.
+    prepared = await capture_async.blocking(_prepare_transcript, transcript_path)
+    if prepared is None:
+        return
+    payloads, provenance, title, cwd, namespace = prepared
+
     # In a thread: resolving may renew the token with blocking urllib calls
     # (~25s of socket timeout), and a synchronous call cannot be cancelled by
     # the deadline this flush runs under.
@@ -317,16 +339,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Cached hit is a dict lookup; a miss asks the server once and
     # caches the answer, so this is not a per-flush round-trip.
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
-
-    # Chunked, because this path sends the WHOLE transcript in one
-    # call and real sessions can outgrow a single payload. Unchunked,
-    # this works on ordinary sessions and fails on precisely the long
-    # ones — and as the backstop for when per-turn capture is dormant,
-    # failing on the biggest sessions is failing where it matters most.
-    # Slices are disjoint and sent in order against one conversation,
-    # so the server's watermark sees a normal incremental import.
-    payloads = [part[start:start + 2000] for part in make_slices(records)
-                for start in range(0, len(part), 2000)]
 
     # Bounded by wall clock, not just by slice count. The hook's own
     # budget is 300s; a many-slice session can exceed it, and being
