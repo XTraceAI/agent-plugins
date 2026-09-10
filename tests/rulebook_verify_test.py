@@ -147,6 +147,81 @@ def main() -> int:
     ordering = {"title": "t", "statement": "s", "delivery": "agent_hook",
                 "ordering": {"required_command_rx": r"\bpytest\b", "gated_command_rx": r"^git\s+push\b",
                              "armed_by_events": ["edit"], "min_edits": 1, "display_name": "pytest"}}
+    # The two arming events the create-rule skill documents recipes for must
+    # be verifiable, or that skill's mandatory verification step rejects every
+    # rule written to them.
+    sess = {"title": "t", "statement": "s", "delivery": "agent_hook",
+            "ordering": {"required_command_rx": r"git\s+(fetch|pull)\b",
+                         "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
+                         "armed_by_events": ["session"], "display_name": "git fetch"}}
+    # A rule this hook cannot honour in full is forced to `advise` at load, so
+    # a GATE carrying one cannot block on the runtime being tested — and
+    # create-rule would file it as verified. The lint checks `_degraded`
+    # itself rather than any one of its causes, so a malformed floor, a floor
+    # ABOVE this hook, and an unknown key all land in the same place.
+    floored = dict(bash(command_rx=r"rm\s+-rf"), mode="gate")
+    for floor, why in (("1.2", "malformed"), ("99.0.0", "above this hook")):
+        rc, out = run(dict(floored, min_hook_version=floor), "--fires", "rm -rf ./x")
+        check(f"degraded gate: a floor {why} fails the load gate",
+              rc == 1 and "would block nothing" in out, out)
+    rc, out = run(dict(floored, mode="advise", min_hook_version="99.0.0"),
+                  "--fires", "rm -rf ./x", "--no-self-mention")
+    check("degraded advise: the same floor passes, with a note saying it will "
+          "gate once the plugin is new enough",
+          rc == 0 and "NOTE" in out and "still advises" in out, out)
+    rc, out = run(dict(floored, min_hook_version="0.54.0"), "--fires", "rm -rf ./x",
+                  "--no-self-mention")
+    check("degraded gate: a floor this hook MEETS loads normally", rc == 0, out)
+    rc, out = run(dict(bash(command_rx="x", given={"repo": {"future_key": True}}),
+                       mode="gate"), "--fires", "x")
+    check("degraded gate: an unknown `given` key fails the same way",
+          rc == 1, out)
+    # An unknown MATCHER key on an ADVISORY rule: the hook degrades it (to
+    # advice, which it already is) and ignores the predicate, so without this
+    # check the rule verified clean and was filed firing outside its scope.
+    rc, out = run(bash(command_rx=r"^git push$", cwd_rx="^/prod$"), "--fires", "git push",
+                  "--no-self-mention")
+    check("unknown matcher key: an advisory rule fails the load gate and names the key",
+          rc == 1 and "LOAD   FAIL" in out and "matcher.cwd_rx" in out, out)
+    rc, out = run(bash(command_rx=r"^git push$", min_chars=10, predicts_rx="x"), "--fires",
+                  "git push", "--no-self-mention")
+    check("unknown matcher key: every key on the server allowlist loads",
+          rc == 0 and "LOAD   ok" in out, out)
+
+    rc, out = run(sess, "--fires", "session >> gate:git log origin/main",
+                  "--silent", "session >> ok:git fetch -q >> gate:git log origin/main",
+                  "--no-self-mention")
+    check("ordering: a session-armed rule can be verified",
+          rc == 0 and "FIRES  ok" in out and "SILENT ok" in out, out)
+    rc, out = run(sess, "--fires", "session >> gate:git log origin/main",
+                  "--silent", "session >> ok:git fetch -q >> session >> "
+                              "gate:git log origin/main", "--no-self-mention")
+    check("ordering: a second `session` step does not re-arm — SessionStart "
+          "fires again on resume and `/clear`, and the live lane refuses it",
+          rc == 0 and "SILENT ok" in out, out)
+    rc, out = run(sess, "--fires", "prompt:anything >> gate:git log origin/main",
+                  "--no-self-mention")
+    check("ordering: an arming step the rule does not name is refused",
+          rc == 1 and "cannot arm this rule" in out, out)
+
+    prompt_rule = {"title": "t", "statement": "s", "delivery": "agent_hook",
+                   "ordering": {"required_command_rx": r"curl\b[^\n]*staging",
+                                "gated_command_rx": r"gh\s+pr\s+comment\b",
+                                "armed_by_events": ["prompt"], "armed_by_rx": r"\bstaging\b",
+                                "display_name": "a staging probe"}}
+    rc, out = run(prompt_rule,
+                  "--fires", "prompt:is the staging brain 404ing? >> gate:gh pr comment 7",
+                  "--silent", "prompt:how is production? >> gate:gh pr comment 7",
+                  "--no-self-mention")
+    check("ordering: a prompt-armed rule verifies, and a prompt that does not "
+          "match armed_by_rx is a SILENT case rather than an error",
+          rc == 0 and "FIRES  ok" in out and "SILENT ok" in out, out)
+    rc, out = run(dict(prompt_rule, ordering={k: v for k, v in prompt_rule["ordering"].items()
+                                              if k != "armed_by_rx"}),
+                  "--fires", "prompt:staging >> gate:gh pr comment 7", "--no-self-mention")
+    check("ordering: a prompt-armed rule with no armed_by_rx is refused — it "
+          "would arm on nothing", rc == 1 and "armed_by_rx" in out, out)
+
     rc, out = run(ordering,
                   "--fires", "edit:src/a.py >> gate:git push",
                   "--fires", "edit:src/a.py >> red:pytest tests >> gate:git push",

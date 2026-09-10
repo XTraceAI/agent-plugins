@@ -54,6 +54,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pr_link  # noqa: E402
 import readers  # noqa: E402
+from redact import redact_text  # noqa: E402
 from readers import claude as claude_reader  # noqa: E402
 
 _IMPORT_SESSION = Path(__file__).resolve().parent / "import_session.py"
@@ -331,7 +332,12 @@ def cmd_import(args) -> int:
     # so incremental dedup holds across re-imports.
     conv_id = args.conversation_id or f"{r.HOST}-{sid}"
     if not args.title and meta.get("title"):
-        passthrough += ["--title", meta["title"]]
+        # Redacted before it becomes ARGV. import_session redacts it again on
+        # the far side, but a child's command line is world-readable while it
+        # runs (`ps aux`, /proc/<pid>/cmdline), so a first prompt carrying a
+        # key would be visible to any local user in the gap. redact_text is
+        # idempotent, so the second pass is free.
+        passthrough += ["--title", redact_text(meta["title"])]
 
     n_tool = sum(1 for rec in records
                  if isinstance(rec["message"].get("content"), list)

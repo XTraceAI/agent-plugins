@@ -252,10 +252,246 @@ def shell_only(cmd):
     return "\n".join(out)
 
 
+# Everything `_SEPARATOR_RX` knows EXCEPT the single pipe, which is left in
+# so a piped command stays one segment for the receipt test below to refuse.
+# A bare `&` belongs here: `git fetch & true` is two commands, and reading it
+# as one let `true`'s exit 0 vouch for a fetch that was still running.
+_LAST_SEG_SPLIT_RX = re.compile(r"&&|\|\||;|\n|(?<![>&])&(?![>&])")
+
+
 def last_segment(shell):
-    """The final command segment of a shell string (split on ;, &&, ||, newline)."""
-    parts = [x.strip() for x in re.split(r"&&|\|\||;|\n", shell) if x.strip()]
-    return parts[-1] if parts else ""
+    """The final command segment of a shell string (split on ;, &&, ||, a
+    background `&`, newline). Separators are located in the blanked copy, so
+    one written inside a quoted argument is the data it is, and the segment
+    itself is sliced out of the original."""
+    text = trim_terminators(shell)
+    end = 0
+    for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(text)):
+        end = m.end()
+    return text[end:].strip()
+
+
+def and_only_segments(shell):
+    """The segments of a chain joined ONLY by `&&`, or [] when it is anything
+    else (a pipe, a `;`, a `||`, a background `&`, a second line).
+
+    Such a chain that exits 0 ran every one of its segments and every one of
+    them succeeded — so for that shape, and only that shape, the call's single
+    exit status is each segment's own. Everywhere else the last unpiped
+    segment is still the only one the status belongs to.
+
+    Separators are classified on the BLANKED copy, so an operator character
+    inside a quoted argument is the data it is. This was deliberately left
+    quote-unaware once, on the reasoning that mis-reading a quoted `|` only
+    disqualifies a chain and so costs an extra gate. That reasoning was
+    wrong: `npm test -- --grep 'a|b' && git push` is a chain whose test DID
+    run and pass, and refusing to see it fires the gate at someone who has
+    complied. A rule that fires when you have already done the thing is the
+    one people learn to ignore — the same point `rulebook_verify` presses on
+    every author."""
+    shell = trim_terminators(shell)
+    blank = blank_quoted(shell)
+    # Any separator that is NOT `&&` disqualifies the chain — asked of
+    # `_SEPARATOR_RX`, the one place that knows what a separator is. The raw
+    # character scan this replaces called `git fetch 2>&1 && git log
+    # origin/main` a broken chain, because a redirection `&` looks like a
+    # background `&` to a scan that only reads characters. That gated a call
+    # whose fetch had run and passed — the same false gate on a complying
+    # caller that the quoted-operator fix removed two rounds ago, from the
+    # other direction.
+    if any(m.group(0) != "&&" for m in _SEPARATOR_RX.finditer(blank)):
+        return []
+    out, pos = [], 0
+    for m in _AND_RX.finditer(blank):
+        out.append(shell[pos:m.start()])
+        pos = m.end()
+    out.append(shell[pos:])
+    return [x.strip() for x in out if x.strip()]
+
+
+# Quoted spans, blanked to spaces IN PLACE. `shlex` would tokenise properly
+# but throws on the half-quoted strings real commands contain, and this only
+# needs the contents neutralised, not the tokens. Length-preserving on
+# purpose: the separator scans below find operators in the blanked copy and
+# slice the ORIGINAL at those offsets, so quoted text survives intact.
+# A double-quoted span honours backslash escapes, so `"a \\"b\\" c"` is ONE
+# span — ending it at the first `\\"` put the rest of the argument back into
+# the shell grammar, where a `|` inside it became an operator. A
+# single-quoted span has no escapes at all in POSIX shell (a backslash is
+# literal and a `'` cannot appear), so it stays the simpler pattern.
+_QUOTED_SINGLE = r"'[^']*'"
+_QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
+_QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
+QUOTED_SINGLE_RX = re.compile(_QUOTED_SINGLE)
+# `&&` and `||` first, so the lone-operator alternatives only see what is
+# left. A standalone `&` backgrounds the command to its left and the next one
+# runs anyway — `gh pr view -R other & git push` is TWO commands. The
+# lookarounds keep redirection out: `2>&1`, `cmd >&2`, `cmd &> log`.
+_SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
+_AND_RX = re.compile(r"&&")
+_ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
+# A `#` starts a comment at the start of a word: after whitespace, an
+# operator, or a grouping paren/brace. NOT after `{` — `${#files}` is the
+# length expansion, and reading its `#` as a comment blanked the rest of the
+# line, so `n=${#files}; git push` reached the gate with no push in it.
+_COMMENT_RX = re.compile(r"(?<![^\s;&|()}])#[^\n]*")
+# A trailing `;` or newline ends the last command; it does not start an empty
+# one. `pytest;` is a run of pytest, and splitting on that `;` made the last
+# segment "" — a passing receipt refused, and the gate fired on a caller
+# who had complied. A trailing `&` is NOT a terminator: it backgrounds.
+_TRAILING_TERMINATOR_RX = re.compile(r"[\s;\n]+$")
+
+
+def trim_terminators(shell):
+    return _TRAILING_TERMINATOR_RX.sub("", shell or "")
+
+
+def blank_quoted(text):
+    """`text` with the contents of quoted spans — and every backslash escape
+    outside them — replaced by spaces, character for character, so every
+    offset still points at the same place.
+
+    A `\\|` is not a pipe. `gh pr view --jq .title\\|ascii_downcase -R
+    acme/other` is one command, and reading its escaped pipe as an operator
+    left the `-R` in a fragment that no longer began with `gh`. Quoting was
+    only ever half of "this character is data"."""
+    return _COMMENT_RX.sub(lambda m: " " * len(m.group(0)), blank_syntax(text))
+
+
+def blank_syntax(text):
+    """Quotes and escapes blanked, comments LEFT IN PLACE, length preserved.
+
+    The stage before comment blanking, exposed because `strip_comments` needs
+    to find comments and `blank_quoted`'s output no longer has any. Escapes
+    become a NON-space placeholder: blanking `\\ ` to a real space made
+    `--jq .title\\ #literal` look like `#literal` starts a word, and `\\ `
+    joins two words in bash, so the placeholder has to join them here too."""
+    blanked = _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
+                             + m.group(0)[-1], text or "")
+    return _ESCAPE_RX.sub("\x01\x01", blanked)
+
+
+def unquoted(text):
+    """`text` with the CONTENTS of quoted spans removed.
+
+    A regex over a whole segment cannot tell a command from an argument that
+    merely spells one, and everywhere else in this hook that only over-fires.
+    On the two paths that let a call OUT of a gate — the self-discharge
+    exemption and the receipt — it lets it out instead, which is the one
+    direction that must not happen: `echo 'git fetch' && git log origin/main`
+    and `grep 'git fetch' setup.sh && git log origin/main` would both read the
+    stale ref with the obligation cleared. Blanking quoted text costs a
+    receipt whose command is genuinely quoted (`pytest "tests/x"`), and that
+    costs an extra gate rather than a missed one."""
+    return blank_quoted(text)
+
+
+CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
+                           "nohup", "time", "nice", "stdbuf", "setsid",
+                           "sh", "bash", "zsh", "dash", "ksh"})
+# `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
+# — `sudo cd x` cannot move this shell and `env cd x` fails outright.
+CD_WRAPPERS = frozenset({"command", "builtin"})
+EXPANSION_RX = re.compile(r"[$`]")   # `$VAR`, `${…}`, `$(…)`, backticks
+CMD_PREFIXES = frozenset({"!", "if", "elif", "then", "else", "while", "until", "do"})
+BLOCK_END = frozenset({"fi", "done", "esac", "}", ";;"})
+COMPOUND = frozenset({"case", "select", "coproc"})
+
+
+
+def executes(segment, rx):
+    """Does this segment run the command `rx` describes?
+
+    SYNTAX ONLY. The hook understands shell syntax — quotes, comments,
+    `&&`/`||`/`;`/pipes/background — and nothing about what any command
+    DOES. So this blanks quoted spans and comments, drops leading `FOO=1`
+    assignments and grouping braces, and searches the rest. There is no list
+    of runners: `timeout 300 pytest`, `.venv/bin/pytest`, `caffeinate -i
+    pytest` and the next wrapper nobody thought of all discharge, because the
+    alternative — a list of commands known to run their argument — was wrong
+    for every wrapper not on it, and a missed receipt blocks someone who
+    complied.
+
+    KNOWN AND ACCEPTED RESIDUAL: an UNQUOTED mention discharges. `echo
+    pytest` clears a test obligation; `grep -n pytest README.md` clears it.
+    A quoted one does not (`echo 'git fetch'`, `git commit -m 'ran pytest'`),
+    and a comment does not. This is accepted because the obligation is
+    advisory — whether the run was SUFFICIENT (right tests, right args) was
+    never knowable here either, and a caller who wants past a gate has the
+    recorded `RULEBOOK_OVERRIDE=` door already. What the hook closes is the
+    accidental bypass a quoted string or a comment produces; an unquoted
+    `echo pytest` is not a shape anyone types by accident."""
+    # Grouping is not part of a command's name — `(git fetch -q)` runs the
+    # fetch and propagates its status, so it is as good a receipt as the bare
+    # form.
+    text = strip_leading_assignments(
+        unquoted(segment or "").strip("(){} \t")).strip()
+    # `!` inverts a pipeline's status: `! git fetch && git log origin/main`
+    # reaches the log only when the fetch FAILED, and the exit code of `!
+    # pytest` is green exactly when the tests were not. Still syntax, not
+    # command knowledge — a negated segment vouches for nothing.
+    if text.startswith("!"):
+        return False
+    return bool(text) and bool(re.search(rx, text))
+
+
+def self_discharging(shell, spec):
+    """Does this one call run the required command BEFORE the gated one, in a
+    chain whose single exit status vouches for the required part?
+
+    `&&`-only, and the required segment must come first: those are the two
+    conditions under which the gated segment cannot run unless the required
+    one already ran and passed. Anything else — a `||`, a `;`, a pipe, or the
+    required command written after the gated one — is a command the gate is
+    there for."""
+    segs = and_only_segments(shell)
+    required = next((i for i, part in enumerate(segs)
+                     if executes(part, spec["required_command_rx"])), None)
+    if required is None:
+        return False
+    return any(command_fires(spec["gated_command_rx"], unquoted(part), flags=0)
+               for part in segs[required + 1:])
+
+
+def receipt_segments(shell, whole_chain=False):
+    """The segments of `shell` whose success the call's exit status vouches
+    for. Today's answer — the last segment, unpiped, not backgrounded — is
+    what an arbitrary command line can support. `whole_chain` widens it to
+    every segment of an `&&`-only chain, which is sound (see
+    `and_only_segments`) and is what the session- and prompt-armed rules
+    need: the shape they are about puts the required command FIRST
+    (`git fetch -q && git log origin/main`) and never last."""
+    shell = trim_terminators(shell)
+    if whole_chain:
+        segs = and_only_segments(shell)
+        if segs:
+            return segs
+    # The last segment is a receipt only if it NECESSARILY ran. Reached
+    # through `||` it ran only when the one before it FAILED, so `true || git
+    # fetch` exits 0 from `true` and never fetches — and taking that as a
+    # receipt discharged the obligation with the required command unrun. `&&`
+    # and `;` both guarantee it ran, and then the call's status is its own.
+    #
+    # Joiners are read with `last_segment`'s own splitter (single `|` is not
+    # one of them, which is what the pipe test below still relies on).
+    joiners = [m.group(0) for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(shell))]
+    if joiners and joiners[-1] == "||":
+        return []
+    # A call that ENDS in a background `&` now yields an empty last segment —
+    # the separator is the final token — and an empty one is no receipt. That
+    # is right: `git fetch &` exits 0 from launching the job, not from the
+    # fetch, which may still be running or about to fail.
+    last = last_segment(shell)
+    # On the blanked copy, like everything else that asks whether a character
+    # is an operator. `npm test -- --grep 'a|b'` is not a pipeline, and
+    # reading it as one refused a receipt for a test that had passed —
+    # leaving the obligation armed and blocking the push. This is the FOURTH
+    # finding from raw-vs-blanked (rounds 7, 13, 15, 16); `last_segment`
+    # itself was fixed last round and this line beside it was left reading
+    # raw.
+    if last and "|" not in blank_quoted(last):
+        return [last]
+    return []
 
 
 # ── a leading assignment is not part of the command ─────────────────────────
@@ -313,9 +549,37 @@ def strip_leading_assignments(shell):
     return "\n".join(out)
 
 
+def strip_comments(text):
+    """`text` with `#` comments blanked and quotes left INTACT, length
+    preserved.
+
+    `blank_quoted` answers "which characters are syntax", and blanks quoted
+    content along the way — right for finding operators, wrong for matching a
+    rule, which is deliberately allowed to see inside quotes. This asks only
+    the comment question, off `blank_syntax` (which has not blanked comments
+    yet), then blanks that span in the original.
+
+    A `#` that STARTS a word comments out the rest of the line. `git fetch #
+    git log origin/main` runs only the fetch, and the gate was matching the
+    commented `git log` and blocking a compliant call. Mid-word — `%h#%s`, a
+    URL fragment — is not a comment at all."""
+    out = list(text or "")
+    for m in _COMMENT_RX.finditer(blank_syntax(text)):
+        for i in range(m.start(), m.end()):
+            out[i] = " "
+    return "".join(out)
+
+
 def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
     """Does `rx` match this command, given that a leading env assignment is not
-    part of it?
+    part of it, and that a `#` comment is not part of it either?
+
+    Comments are blanked HERE rather than at each caller: this is the one
+    function that answers "does this command match", for the matcher lane and
+    the ordering gate alike, and blanking in `blank_quoted` only reached the
+    callers that happened to use it. `git fetch # git log origin/main` runs
+    only the fetch, and the gate was reading the commented `git log` and
+    blocking a compliant call.
 
     The command is read as BOTH forms — as written, and with the assignments
     that begin a segment removed. `rx` fires when EITHER matches, so an anchored
@@ -327,6 +591,7 @@ def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
     instead would let a prefix delete the very token the exemption keys on, so
     `FOO=1 cmd` would defeat an exemption that `cmd` honours — stripping would
     become a way to BREAK an exemption, which is the opposite of the point."""
+    text = strip_comments(text)
     forms = [text]
     bare = strip_leading_assignments(text)
     if bare != text:
@@ -793,11 +1058,19 @@ class OrderingEngine:
             portable_lock.unlock(lock.fileno())
             lock.close()
 
-    def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None):
+    def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None, armed=None):
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
-        under lock; None on lock timeout (fail open)."""
+        under lock; None on lock timeout (fail open).
+
+        `armed` is the event that armed this obligation OUTSIDE the worktree
+        state — "session" or "prompt" — read by the caller from the SESSION's
+        own state file. A session- or prompt-armed obligation belongs to one
+        session (each session must fetch before it reads `origin/*`; the
+        sibling session down the hall fetching does not answer for this one),
+        so it cannot live in the worktree state every session shares."""
         spec = rule["ordering"]
         armed_by = tuple(spec.get("armed_by_events", ("edit", "write")))
+        by_call = any(k in armed_by for k in ("session", "prompt"))
         is_edit = tool in EDIT_TOOLS and hook_phase == "post"
         if is_edit and not any(k in armed_by for k in ("edit", "write")):
             return None
@@ -807,13 +1080,31 @@ class OrderingEngine:
         # A Bash call reports ONE exit status. It is the receipt's own status
         # only when the receipt is the final segment and not piped (`pytest |
         # tail` returns tail's status). Earlier segments / pipelines never
-        # discharge — under-counting is the safe direction.
-        last = last_segment(seg) if seg else ""
+        # discharge — under-counting is the safe direction. A session- or
+        # prompt-armed rule reads an `&&`-only chain whole instead
+        # (`receipt_segments`): its required command sits FIRST in that chain,
+        # never last, and a chain that exits 0 vouches for every segment.
         is_receipt = hook_phase == "post" and tool == "Bash" and seg and \
-            re.search(spec["required_command_rx"], last) and \
-            "|" not in last and not last.rstrip().endswith("&")   # piped / backgrounded: status isn't the suite's
+            any(executes(part, spec["required_command_rx"])
+                for part in receipt_segments(seg, whole_chain=by_call))
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             command_fires(spec["gated_command_rx"], seg, flags=0)
+        # One call that runs the required command BEFORE the gated one
+        # discharges its own obligation (`git fetch -q && git log
+        # origin/main`), and blocking it would be a gate firing on the very
+        # call that satisfies it.
+        #
+        # ORDER and JOINER both have to hold. Accepting the required pattern
+        # anywhere in the string — which the miner's offline replay does, and
+        # which this did to agree with it — exempts two commands that are
+        # exactly what the rule exists to catch: `git log origin/main && git
+        # fetch` reads the stale ref and fetches afterwards, and `git fetch ||
+        # git log origin/main` runs the stale read PRECISELY when the fetch
+        # failed. Agreeing with a replay's approximation is not worth a hole
+        # in the gate; the replay counts a few more sessions than the engine
+        # gates, and that is the right direction for the two to differ in.
+        if is_gate and by_call and self_discharging(seg, spec):
+            return None
         if not (is_edit or is_receipt or is_gate):
             return None
 
@@ -832,18 +1123,34 @@ class OrderingEngine:
             if is_receipt:                                # handler 2: green receipt
                 if ok is True:                            # a red run never discharges
                     s["count"] = 0
-                    # conversion is (worktree, branch)-scoped: a subagent's or
-                    # sibling session's receipt converts whichever fire is open
-                    rule["_converted_fire"] = s.pop("open_fire", None)
+                    # For an EDIT-armed rule, conversion is (worktree,
+                    # branch)-scoped: a subagent's or sibling session's
+                    # receipt converts whichever fire is open, because the
+                    # obligation belongs to the checkout.
+                    #
+                    # A session- or prompt-armed one belongs to the SESSION,
+                    # so its open fire is not here to convert — the caller
+                    # holds it in session state. Popping the shared slot let
+                    # one session's compliance mark ANOTHER session's fire
+                    # converted, and two concurrent fires overwrote the single
+                    # slot so attribution followed execution order rather than
+                    # who complied.
+                    if not by_call:
+                        rule["_converted_fire"] = s.pop("open_fire", None)
                     self._write(st)
                     return "discharged"
                 return None
             # handler 3: the gate — read-only
+            name = spec.get("display_name", rule["id"])
             if s["count"] >= int(spec.get("min_edits", 1)):
                 rule["_gate_msg"] = (
                     f"{s['count']} edit(s) since the last passing "
-                    f"'{spec.get('display_name', rule['id'])}' "
-                    f"(last: {s['last_edit']}). Run it first.")
+                    f"'{name}' (last: {s['last_edit']}). Run it first.")
+                return "fired"
+            if armed:
+                since = ("this session started" if armed == "session"
+                         else "your prompt armed this rule")
+                rule["_gate_msg"] = f"no passing '{name}' since {since}. Run it first."
                 return "fired"
             return "allowed"
         finally:
@@ -955,6 +1262,144 @@ _GIVEN = {
 }
 
 
+_VERSION_RX = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_HOOK_VERSION = []          # memo: the manifest is read at most once per process
+
+
+def version_tuple(v):
+    """`major.minor.patch` as a comparable tuple, or None.
+
+    Strict on purpose: three ASCII-digit components and nothing else. There is
+    no prerelease in this plugin's history to support, and a grammar that
+    admits one buys a pile of ordering questions ("is 1.0.0-rc older than
+    1.0.0?") to answer a version string nobody publishes."""
+    m = _VERSION_RX.match(v.strip()) if isinstance(v, str) else None
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def hook_version():
+    """This hook's own version, from the plugin manifest beside it.
+
+    None when the manifest is missing, unreadable, or does not carry a
+    `major.minor.patch` — and an unknown version satisfies no
+    `min_hook_version`, so a hook that cannot say what it is degrades a rule
+    rather than gating on a condition it may not understand."""
+    if not _HOOK_VERSION:
+        override = os.environ.get("MEMHUB_RULEBOOK_HOOK_VERSION")
+        if override is not None:
+            _HOOK_VERSION.append(version_tuple(override))
+        else:
+            try:
+                manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", ".claude-plugin", "plugin.json")
+                with open(manifest, encoding="utf-8") as f:
+                    _HOOK_VERSION.append(version_tuple(json.load(f).get("version")))
+            except Exception:
+                _HOOK_VERSION.append(None)
+    return _HOOK_VERSION[0]
+
+
+# Every key of an `ordering` block this hook knows how to honour. A rule may
+# be written for a NEWER one: the engine reads a block with `spec.get(...)`,
+# so an unknown key is silently ignored and the rule runs as if the author
+# had not written it. That is the 0.40.1 shape — see `degradation`.
+_ORDERING_KEYS = frozenset({"required_command_rx", "gated_command_rx", "armed_by_events",
+                            "armed_by_rx", "min_edits", "display_name", "path_rx"})
+_ARMED_BY_EVENTS = frozenset({"edit", "write", "session", "prompt"})
+
+
+def given_unsupported(g):
+    """The first `block.key` of a `given` this hook does not know, or "".
+
+    A different question from `given_norm`'s: that one refuses a value of the
+    wrong KIND, which is a malformed rule however new the hook. This one finds
+    a predicate written for a hook we are not, which is version skew — and the
+    same `_GIVEN` table answers both, so there is no second list to drift."""
+    if not isinstance(g, dict):
+        return ""
+    for block, spec in g.items():
+        kinds = _GIVEN.get(block)
+        if kinds is None:
+            return str(block)[:40]
+        if isinstance(spec, dict):
+            for k in spec:
+                if k not in kinds:
+                    return f"{block}.{str(k)[:40]}"
+    return ""
+
+
+def given_supported(g):
+    """`g` with the blocks and keys this hook does not know removed. What is
+    left is checked; the rule is advise-only and says why (`degradation`), so
+    nothing is dropped quietly."""
+    out = {}
+    for block, spec in g.items():
+        kinds = _GIVEN.get(block)
+        if kinds is None or not isinstance(spec, dict):
+            continue
+        kept = {k: v for k, v in spec.items() if k in kinds}
+        if kept:
+            out[block] = kept
+    return out
+
+
+def ordering_unsupported(o):
+    """The first `ordering` key — or arming event — this hook does not know."""
+    if not isinstance(o, dict):
+        return ""
+    for k in o:
+        if k not in _ORDERING_KEYS:
+            return f"ordering.{str(k)[:40]}"
+    events = o.get("armed_by_events")
+    if isinstance(events, (list, tuple)):
+        for ev in events:
+            if ev not in _ARMED_BY_EVENTS:
+                return f"ordering.armed_by_events:{str(ev)[:40]}"
+    return ""
+
+
+def degradation(row, given=None, ordering=None):
+    """Why this hook cannot honour `row` in full, or "" when it can.
+
+    `given` and `ordering` are the rule's RAW blocks. Only the caller knows
+    where they sit: a server row keeps `given` inside its `matcher`, a pilot
+    row at the top level.
+
+    A rule may be newer than the hook reading it, and until now that was
+    silent in the worst direction: the engine reads an `ordering` block with
+    `spec.get(...)`, so a key it does not know is ignored and the rule runs as
+    if the condition were satisfied. Version 0.40.1 did exactly that with a
+    `given` — five spurious overrides in one session, and nothing anywhere
+    said the hook had not read the rule it was enforcing.
+
+    A rule that says so itself (`min_hook_version`) and one that merely
+    carries a key we do not know are the same fact, so they degrade the same
+    way: the rule advises, never gates, and says once per session that this is
+    what happened.
+
+    SCOPE, stated plainly: this protects FORWARD skew — this hook reading a
+    rule written for a later one. It cannot protect a hook OLDER than the
+    field itself, because the check is code that only the newer hook has: 0.53
+    loads a rule floored at 0.54 and its ordering engine ignores the condition
+    it cannot read. Closing that needs the server to serve an advice-only
+    representation to a hook below the floor, which is why `fetch_book` sends
+    `hook_version`; the server half is not in this repo."""
+    want_raw = row.get("min_hook_version")
+    if want_raw is not None:
+        have = hook_version()
+        want = version_tuple(want_raw)
+        if want is None:
+            return f"min_hook_version {str(want_raw)[:20]!r} is not major.minor.patch"
+        if have is None:
+            return (f"this rule needs hook {'.'.join(map(str, want))} and this hook "
+                    "cannot read its own version")
+        if have < want:
+            return (f"this rule needs hook {'.'.join(map(str, want))}; this is "
+                    f"{'.'.join(map(str, have))}")
+    unknown = given_unsupported(given) or ordering_unsupported(ordering)
+    return f"this hook does not understand `{unknown}`" if unknown else ""
+
+
 def given_norm(g):
     """Lint a rule's `given` block off the wire. Returns the block, or None on
     an unknown sub-block, an unknown key, or a value of the wrong kind — and
@@ -1034,6 +1479,43 @@ _BASE_ARG = re.compile(r"--base[=\s]+" + _ARG)
 # A plain branch name, and nothing that reaches elsewhere in history: no rev
 # syntax (`~ ^ : @{…}`), no path traversal, no leading dash.
 _BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
+# `help cd`: `cd [-L|[-P [-e]] [-@]] [dir]`. The options were being captured
+# AS the directory, so `cd -P ../Other` matched nothing and the call read as
+# local.
+CD_SEGMENT = re.compile(r"^\s*cd(?:\s+-[LPe@]+)*\s+" + _ARG + r"\s*$")
+CD_BARE = re.compile(r"^\s*cd(?:\s+-[LPe@]+)*\s*$")
+# `-R` / `--repo` is read only off a `gh` segment: to grep, cp and rsync the
+# same flag means --recursive, and `grep -R foo/bar .` would otherwise name a
+# repo nobody mentioned.
+# `gh pr view --help`: `-R, --repo [HOST/]OWNER/REPO`. The short flag also
+# takes its value attached (`-Racme/repo`), which is the form a shell alias
+# usually ends up with.
+REPO_ARG = re.compile(r"(?:^|\s)(?:-R\s*=?\s*|--repo\s*=?\s*)" + _ARG)
+GH_SEGMENT = re.compile(r"^gh\b")
+# `git -h`: `git [-C <path>] [--git-dir=<path>] [--work-tree=<path>] …`, and
+# GIT_DIR / GIT_WORK_TREE do the same from the environment. Each points git at
+# a tree this cannot name as a repo, so each refuses.
+GIT_C_RX = re.compile(r"(?:^|\s)(?:-C(?:[=\s]|$)|--git-dir\b|--work-tree\b)")
+GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+# `[HOST/]OWNER/REPO`, host KEPT. Dropping it was wrong in the one case the
+# host exists to distinguish: with a single local checkout of
+# `github.com/acme/repo`, `-R ghe.corp/acme/repo` matched it unambiguously and
+# its branch and diff answered for a repository on another server. Not
+# missing the repo, which is what the earlier spelling fix was about —
+# confidently naming the wrong one.
+SLUG = re.compile(r"^(?:[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+ORIGIN_SECTION = re.compile(r'^\[\s*remote\s+"origin"\s*\]', re.I)
+CONFIG_URL = re.compile(r"^url\s*=\s*(.+)$", re.I)
+SIBLINGS_MAX = 128     # CHECKOUTS examined, not entries listed: a fleet parent
+                        # holds sixty-odd worktrees beside a pile of scratch
+                        # directories, and capping the listing cut the tail of
+                        # it alphabetically
+SIBLINGS_BUDGET_S = 0.5   # measured: 5.6 ms warm over 68 worktrees, ~1 s the
+                           # first time the directory is walked at all. Past
+                           # this the scan gives up and answers "no checkout",
+                           # which is silence — never a slow tool call.
+
+
 _CD_PREFIX = re.compile(r"^\s*cd\s+" + _ARG + r"\s*(?:&&|;)")
 
 
@@ -1091,6 +1573,10 @@ class Probes:
         return self._memo[key]
 
     def _git(self, *args):
+        # `git -C ""` would resolve against the HOOK process's cwd, which is
+        # nobody's checkout in particular. A probe with no root answers None.
+        if not self.root:
+            return None
         import subprocess
         p = subprocess.run(["git", "-C", self.root, *args], capture_output=True,
                            text=True, timeout=PROBE_TIMEOUT_S)
@@ -1323,11 +1809,33 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
 }
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
+# Every matcher key this hook has code for — the server's §3.1 allowlist as
+# of 0.54, plus the legacy `result_rx` alias. `predicts_rx` is on it although
+# nothing here reads it: the server defines it as inert (it never fires
+# anything), so not reading it changes no outcome. A key absent from this set
+# is a predicate the rule's author meant and this hook cannot evaluate; the
+# rule degrades to advice rather than fire as if the condition held.
+_MATCHER_KNOWN = frozenset({
+    "event", "command_rx", "command_not_rx", "content_rx", "content_not_rx",
+    "path_rx", "path_not_rx", "match_heredoc_body", "body_rx", "warn_once_per",
+    "converted_rx", "predicts_rx", "min_chars", "result_rx",
+    "given",            # rides inside the matcher block; linted by `given_norm` below
+})
+
+
+def matcher_unsupported(m):
+    """The first matcher key this hook has no code for, or "". The hook
+    degrades such a rule to advice; the verifier refuses it outright, since
+    to an author it is a typo. One list, asked from both places."""
+    if not isinstance(m, dict):
+        return ""
+    return next((k for k in m if k not in _MATCHER_KNOWN), "")
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
                                  "on", "repo_scope", "_scope_repos", "_scope_paths",
                                  "_scope_exclude_paths", "anchors", "ordering",
-                                 "_rulebook_id", "_book_name", "_book_scope", "_book_members"})
+                                 "_rulebook_id", "_book_name", "_book_scope", "_book_members",
+                                 "min_hook_version", "_degraded"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
@@ -1447,6 +1955,73 @@ def book_rank(rule):
             -members if isinstance(members, int) and not isinstance(members, bool) else 0)
 
 
+def _norm_given(r):
+    """Normalise `r["given"]` in place; False when the RULE must be dropped.
+
+    A value of the wrong kind is a malformed rule and drops it, exactly as
+    `rx_ok` does — the hook's age changes nothing about it. A block or key
+    this hook does not know is version skew instead: what it can check stays
+    and is checked, what it cannot is removed, and `_degrade` makes the rule
+    advise-only and says which key it could not read. A `given` with nothing
+    left is removed entirely rather than left as an empty block that would
+    read as "no condition, all good"."""
+    raw = r["given"]
+    if not isinstance(raw, dict):
+        return False
+    # A known BLOCK whose value is not a dict of predicates is malformed, and
+    # `given_supported` skipped it exactly as it skips an unknown block — so
+    # `{"repo": 42}` left nothing supported, no skew reported, and the rule
+    # loaded with its condition silently removed. Checked before the strip,
+    # because after it the two are indistinguishable.
+    for block, spec in raw.items():
+        if block in _GIVEN and not (isinstance(spec, dict) and spec):
+            return False
+    supported = given_supported(raw)
+    kept = given_norm(supported) if supported else None
+    # The two failures are judged separately, because a rule can carry both.
+    # A KNOWN key with a value of the wrong kind is malformed and drops the
+    # rule however new the hook — and an unsupported key sitting beside it
+    # used to suppress that, so `{"future_key": true, "branch_rx": 42}` had
+    # its whole `given` removed and fired unconditionally. Skew must not
+    # launder a malformed predicate.
+    if supported and kept is None:
+        return False
+    if kept:
+        r["given"] = kept
+    else:
+        r.pop("given", None)
+    return True
+
+
+def _degrade(row, r, given=None, unknown_matcher=""):
+    """Mark `r` advise-only when this hook cannot honour `row` in full."""
+    if r is None:
+        return None
+    r.pop("min_hook_version", None)      # answered here; never a matcher field
+    why = degradation(row, given, r.get("ordering"))
+    if not why and unknown_matcher:
+        why = f"this hook does not understand `matcher.{unknown_matcher}`"
+    if not why:
+        return r
+    r["_degraded"] = why
+    r["mode"] = "advise"        # §5.3: a gate the hook cannot fully read is not a gate
+    return r
+
+
+def ordering_rx_ok(o):
+    """Every pattern in an `ordering` block passes the wire lint.
+
+    `armed_by_rx` is optional but is a pattern off the same wire as the other
+    two, and it runs in the PROMPT lane — synchronous, before the person's
+    words reach the model, on a five-second hook timeout. An uncompilable one
+    raises and a catastrophic one runs out the clock; either way the outer
+    handler swallows it and NOTHING arms for that prompt, this rule and every
+    valid rule after it. `rx_ok` already refuses both shapes."""
+    if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
+        return False
+    return rx_ok(o["armed_by_rx"]) if "armed_by_rx" in o else True
+
+
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. The book facts
@@ -1478,14 +2053,12 @@ def to_hook_rule(row):
                     r[k] = _clean_text(r[k])
             if not r.get("id") or not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
                 return None           # same regex lint as the server shape
-            if isinstance(r.get("ordering"), dict) and not all(
-                    rx_ok(r["ordering"].get(k)) for k in ("required_command_rx", "gated_command_rx")):
+            if isinstance(r.get("ordering"), dict) and not ordering_rx_ok(r["ordering"]):
                 return None
-            if "given" in r:
-                r["given"] = given_norm(r["given"])
-                if r["given"] is None:
-                    return None
-            return r
+            raw_given = r.get("given")
+            if "given" in r and not _norm_given(r):
+                return None
+            return _degrade(row, r, raw_given)
         r = {"id": row.get("rule_id") or row.get("id"),
              "text": _clean_text(row.get("statement") or row.get("title")),
              "why": _clean_text(row.get("why")), "status": row.get("status", "active"),
@@ -1505,7 +2078,7 @@ def to_hook_rule(row):
         # v2.4: anchor rules carry their own identifiers; session rules carry nothing
         if row.get("delivery") == "session_context":
             r["on"] = "session"
-            return r
+            return _degrade(row, r)
         if isinstance(row.get("anchors"), list) and row["anchors"]:
             anchors = [_clean_text(a) for a in row["anchors"] if isinstance(a, str) and a.strip()]
             if not anchors:
@@ -1513,14 +2086,14 @@ def to_hook_rule(row):
             r["on"] = "anchor"
             r["anchors"] = anchors[:64]
             r["fire_scope"] = "session"
-            return r
+            return _degrade(row, r)
         if isinstance(row.get("ordering"), dict):
             o = row["ordering"]
-            if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
+            if not ordering_rx_ok(o):
                 return None
             r["on"] = "ordering"
             r["ordering"] = o
-            return r
+            return _degrade(row, r)
         m = row.get("matcher")
         if not isinstance(m, dict):
             return None
@@ -1531,8 +2104,16 @@ def to_hook_rule(row):
         ev = m.get("event") or "bash"
         r["on"] = {"output": "result", "write": "edit"}.get(ev, ev)
         keys = _RESULT_KEYS if r["on"] == "result" else _MATCHER_KEYS
+        # A predicate this hook has no code for. Copying it through and
+        # letting `evaluate` ignore it would run the rule as if the condition
+        # held — the forward-skew failure `degradation` exists to name. Same
+        # treatment as an unknown `given` key; `matcher_unsupported` is the
+        # one statement of "known", and the verifier asks it too.
+        unknown = matcher_unsupported(m)
         for k, v in m.items():
             if k == "event":
+                continue
+            if k not in _MATCHER_KNOWN:
                 continue
             if k == "result_rx" and "content_rx" in m:
                 continue              # content_rx is the schema key; result_rx is a legacy alias
@@ -1543,11 +2124,10 @@ def to_hook_rule(row):
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
-        if "given" in r:
-            r["given"] = given_norm(r["given"])
-            if r["given"] is None:      # unknown key or wrong kind: drop the RULE, as rx_ok does
-                return None
-        return r
+        raw_given = r.get("given")
+        if "given" in r and not _norm_given(r):
+            return None
+        return _degrade(row, r, raw_given, unknown_matcher=unknown)
     except Exception:
         return None
 
@@ -1667,7 +2247,20 @@ def fetch_book(repo, timeout=None):
     Not sending the parameter is the one form no grammar change can break.
     200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
     current, which is what §5.3 gate freshness measures); anything else →
-    the cache is left exactly as it was."""
+    the cache is left exactly as it was.
+
+    `hook_version` rides along so the SERVER can enforce a rule's
+    `min_hook_version`. That floor cannot be enforced only here, and saying so
+    plainly: the check lives in code that exists only in the hook it is
+    protecting against. A 0.53 hook does not know the field, loads the rule
+    anyway, and its ordering engine ignores the condition it cannot read — the
+    exact 0.40.1 shape. What the local check buys is FORWARD skew (this hook
+    reading a rule written for a later one); the backstop for hooks already
+    installed has to be the server serving them an advice-only representation,
+    and it cannot do that without being told who is asking. An older hook
+    sends no version, which is itself the signal that it predates the field.
+    Unknown query parameters are ignored by every backend this has run
+    against, so sending it costs nothing while the server side is unbuilt."""
     api = _api()
     if not api:
         return
@@ -1675,6 +2268,9 @@ def fetch_book(repo, timeout=None):
     old = load_book(repo) or {}
     hdrs = {"If-None-Match": old["etag"]} if old.get("etag") else {}
     q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    have = hook_version()
+    if have:
+        q += "&hook_version=" + ".".join(str(n) for n in have)
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
                           timeout=timeout or FETCH_TIMEOUT_S)
@@ -2240,21 +2836,232 @@ def state_path(session_id):
 
 
 def load_state(p):
-    st = {"fired": [], "counts": {}, "raw": {}, "open": {}}
+    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {},
+          "armed_once": [], "armed_fire": {}, "armed_version": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
     except Exception:
         pass
+    if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
+        st["armed"] = {}
+    if not isinstance(st.get("armed_once"), list):
+        st["armed_once"] = []
+    if not isinstance(st.get("armed_fire"), dict):
+        st["armed_fire"] = {}
+    if not isinstance(st.get("armed_version"), dict):
+        st["armed_version"] = {}
     return st
 
 
-def save_state(p, st):
+def stale_arming(st, rule):
+    """Was this rule's session arming written against a DIFFERENT version of
+    the rule than the one now loaded? An arming records the version it was
+    made for; a rule that has since been refreshed under the same id carries
+    an obligation no event of this session armed. Only an arming that
+    recorded a version can be stale — one an older hook wrote is kept."""
+    rid = rule["id"]
+    if rid not in st["armed"] or rid not in st["armed_version"]:
+        return False
+    return st["armed_version"][rid] != rule.get("_version")
+
+
+def drop_arming(st, rid):
+    """Forget a session arming and the open fire it carries; returns that
+    fire's id, if any, so the caller can close it in the ledger."""
+    st["armed"].pop(rid, None)
+    st["armed_version"].pop(rid, None)
+    return st.setdefault("armed_fire", {}).pop(rid, None)
+
+
+# The session's obligation keys. A hook process reads the whole state file,
+# works, and writes the whole file back; two hooks of ONE session can overlap
+# (parallel tool calls, a sub-agent's calls), and the second writer's
+# snapshot used to put back an arming the first had just discharged — so a
+# gated command stayed blocked after its required command had run. These
+# keys are therefore merged by DELTA under a lock: what this process armed
+# is added, what it discharged is removed, and everything else is whatever
+# is on disk now.
+_ARMING_KEYS = ("armed", "armed_fire", "armed_version")
+_APPEND_KEYS = ("armed_once",)      # only ever appended to
+
+
+def snapshot_arming(st):
+    """What the arming keys looked like when this process loaded the state —
+    the baseline `save_state` diffs against."""
+    return {k: dict(st.get(k) or {}) for k in _ARMING_KEYS}
+
+
+def _state_lock(p):
+    """Exclusive lock on the session state's sidecar, or None past
+    LOCK_WAIT_S (the hook fails open — a plain write, today's behaviour)."""
+    if portable_lock is None:
+        return None
     try:
+        lock = open(p + ".lock", "a+", encoding="utf-8")
+    except Exception:
+        return None
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            portable_lock.lock_exclusive(lock.fileno(), blocking=False)
+            return lock
+        except OSError:
+            if time.monotonic() >= deadline:
+                lock.close()
+                return None
+            time.sleep(0.005)
+
+
+def save_state(p, st, before=None):
+    """Write the session state. With `before` (a `snapshot_arming` taken at
+    load), the arming keys are merged by delta against the file as it is NOW,
+    under the session lock, so a concurrent hook's write cannot resurrect an
+    obligation this one discharged, nor drop one this one armed."""
+    lock = _state_lock(p) if before is not None else None
+    try:
+        if lock is not None:
+            cur = load_state(p)
+            for k in _ARMING_KEYS:
+                merged = dict(cur.get(k) or {})
+                for rid in before[k]:
+                    if rid not in st[k]:
+                        merged.pop(rid, None)          # discharged by this process
+                for rid, v in st[k].items():
+                    if rid not in before[k] or before[k][rid] != v:
+                        merged[rid] = v                # armed or re-versioned here
+                st[k] = merged
+            for k in _APPEND_KEYS:
+                seen = list(cur.get(k) or [])
+                st[k] = seen + [x for x in st[k] if x not in seen]
         with open(p, "w", encoding="utf-8") as f:
             json.dump(st, f)
     except Exception:
         pass
+    finally:
+        if lock is not None:
+            try:
+                portable_lock.unlock(lock.fileno())
+            except Exception:
+                pass
+            lock.close()
+
+
+# The wrappers Claude Code puts around a prompt IT generated rather than one a
+# person typed: a slash command's expansion, a skill body, a resumed session's
+# continuation, a loop wake-up, a background task's notification. Anchored at
+# the START and never searched — a prompt that merely QUOTES one of these is a
+# person talking about them, which is exactly what a conversation about this
+# hook looks like. `transcript_filter._OPENS_WITH_WRAPPER` makes the same
+# statement about the same tags for the capture path; this is the hook's own
+# copy, because a hook on the prompt path must not grow an import to read one
+# regex.
+_HARNESS_PROMPT_RX = re.compile(
+    r"\s*(?:<(?:command-name|command-message|command-args|local-command-stdout"
+    r"|local-command-stderr|local-command-caveat|system-reminder|task-notification)>"
+    r"|This session is being continued"
+    r"|Caveat: The messages below"
+    r"|Base directory for this skill:)")
+
+
+def harness_prompt(text):
+    """True when this UserPromptSubmit carries something the HARNESS wrote.
+
+    Only what a PERSON typed may arm an obligation: a rule armed by the word
+    "staging" in a prompt exists because someone said they were asking about
+    staging, and a skill body or a loop wake-up that happens to contain the
+    word said nothing of the kind. It would arm the rule for the rest of the
+    session with nobody having asked for it.
+
+    Every marker here is STRUCTURED — a wrapper tag, or a sentence the client
+    emits verbatim. An ordinary English prefix is not a marker however
+    harness-like it reads: `Approach this as` was one, and it silenced
+    "Approach this as a staging incident", a real person asking exactly the
+    question a staging rule exists for. Suppressing a genuine prompt is the
+    worse error of the two, because the rule then never arms and nothing
+    anywhere says why."""
+    return bool(_HARNESS_PROMPT_RX.match(text or ""))
+
+
+def session_scoped(rule):
+    """Is this ordering rule's obligation the SESSION's rather than the
+    checkout's? True when it is armed by the session or by a prompt — the two
+    events that happen to one session and not to a worktree."""
+    spec = (rule.get("ordering") or {}) if rule.get("on") == "ordering" else {}
+    return any(k in tuple(spec.get("armed_by_events", ("edit", "write")))
+               for k in ("session", "prompt"))
+
+
+def arms_on(rule, event, prompt=""):
+    """Does `event` arm this ordering rule?
+
+    The one statement of it: `arm_obligations` asks it for the live lanes and
+    `rulebook_verify` asks it for a `--fires` case, so a rule the verifier
+    says fires is a rule the hook arms. Two copies of this predicate would
+    let the authoring tool bless a rule the engine never arms."""
+    if rule.get("on") != "ordering":
+        return False
+    spec = rule.get("ordering") or {}
+    if event not in tuple(spec.get("armed_by_events", ("edit", "write"))):
+        return False
+    if event == "prompt":
+        # A prompt lane with no pattern would arm on every prompt, which is a
+        # session-armed rule wearing the wrong label. Say which prompts, or
+        # arm on none.
+        rx = spec.get("armed_by_rx")
+        return bool(rx) and bool(re.search(rx, prompt, re.I))
+    return True
+
+
+def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
+    """Record the ordering rules THIS event arms, in the session's own state
+    file — the one the pre lane already loads and reads.
+
+    `armed_by_events` used to mean the edit family alone, so the only
+    obligations the engine could carry were "you changed something, now run
+    the suite". The two shapes it could not carry are the ones a team asks for
+    most: armed for the whole session ("fetch before you read `origin/*`") and
+    armed by what the person just said ("you are asking about staging — probe
+    it before you answer"). Both arm at a moment that is not a tool call, so
+    both write here rather than into the worktree state the edit lane keeps."""
+    arming = [r for r in rules
+              if r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
+              and arms_on(r, event, prompt)]
+    if not arming:
+        return []
+    sp = state_path(session)
+    st = load_state(sp)
+    before = snapshot_arming(st)
+    armed = []
+    for r in arming:
+        rid = r["id"]
+        # SessionStart is not once per session. Claude Code fires it again on
+        # resume, on `/clear` and after a compaction, under the SAME session
+        # id — `capture_health._already_warned` exists for the same reason. A
+        # plain re-arm would resurrect an obligation the session had already
+        # discharged, so a rule the agent satisfied at the start blocks again
+        # an hour later with nothing having changed. Whether this session has
+        # EVER been armed by this event is recorded apart from whether it is
+        # armed right now.
+        #
+        # Only `session` is once-only. A second prompt that raises the subject
+        # again is a second question and deserves its own probe, so the prompt
+        # lane re-arms by design.
+        if event == "session":
+            once = f"session:{rid}"
+            if once in st.setdefault("armed_once", []):
+                continue
+            st["armed_once"].append(once)   # only the once-only event is recorded here
+        st["armed"].setdefault(rid, event)   # first arming wins; re-arming is a no-op
+        # The arming belongs to the rule AS IT READ when the prompt matched.
+        # A rule refreshed under the same id — `armed_by_rx` changed from
+        # `staging` to `production`, say — is a different obligation, and the
+        # pre lane drops an arming whose version no longer matches rather
+        # than block a call no prompt ever armed for the new text.
+        st.setdefault("armed_version", {})[rid] = r.get("_version")
+        armed.append(rid)
+    save_state(sp, st, before=before)
+    return armed
 
 
 def result_text(resp):
@@ -2745,6 +3552,19 @@ def session_digest(rules, repo, gitdir, ctx):
         else:
             cut.append(r)
     active = [r for r in in_scope if r.get("on") != "session"]
+    # A rule this hook cannot read in full advises instead of gating and says
+    # so on its first fire — but a rule whose only `armed_by_events` value is
+    # an event this hook has no lane for never fires at all, so that notice
+    # has nowhere to land and the rule is exactly as silent as it was before
+    # `min_hook_version` existed.
+    #
+    # It is surfaced HERE rather than at the gated command. Firing it there
+    # would mean firing a rule whose arming condition this hook cannot
+    # evaluate — the precise failure the degradation machinery exists to
+    # prevent — and it would repeat on every matching call. Session start is
+    # where "once per session" already lives, and the fact the reader needs is
+    # not the rule, it is that their plugin is too old to run it.
+    stale = [r for r in in_scope if r.get("_degraded")]
     lines = [f"## {DISCLOSE_ADVISORY} Rulebook (team rules — advisory)", SESSION_PREAMBLE]
     for r in posture:
         lines.append(f"- {r['text']}{_why(r)}")
@@ -2754,6 +3574,14 @@ def session_digest(rules, repo, gitdir, ctx):
             f"this repo — they fire inline as you work (proactive on tool "
             f"calls, reactive on errors). Treat a fire as a teammate's note, "
             f"not boilerplate.")
+    if stale:
+        names = ", ".join(sorted(str(r.get("_label") or r["id"]) for r in stale)[:5])
+        lines.append(
+            f"- {len(stale)} rule{'s' if len(stale) != 1 else ''} in your book "
+            f"need{'' if len(stale) != 1 else 's'} a newer {BRAND} plugin than "
+            f"this one ({names}) — {'they run' if len(stale) != 1 else 'it runs'} "
+            f"as advice and cannot gate. Update the plugin to get "
+            f"{'them' if len(stale) != 1 else 'it'} back.")
     roster = books_line(posture + active)
     if roster:
         lines.append(roster)
@@ -2764,6 +3592,33 @@ def session_digest(rules, repo, gitdir, ctx):
         log_fires(ctx, cut, hook_phase="session", mode="suppressed", excerpt="",
                   dedup_keys={r["id"]: f"{r['id']}@session" for r in cut},
                   raw_counts={r["id"]: 0 for r in cut})
+
+
+def refresh_if_stale(repo, rules, fetched_at, sources):
+    """(rules, fetched_at, sources), with the book re-fetched first when it is
+    old enough to be wrong.
+
+    Only when stale: a book younger than the pre lane's refresh window is
+    already current, so the common case keeps the detached spawn and pays
+    nothing. A stale one is worth waiting for, bounded by
+    SESSION_FETCH_TIMEOUT_S — `fetch_book` leaves the cache untouched on every
+    failure path, so a timeout proceeds with exactly what we already had.
+
+    Shared by the two lanes that get ONE look at their trigger. The session
+    digest is a session's only view of the book; a prompt is the only chance a
+    prompt-armed rule gets. Both were written this way; only one of them had
+    the code."""
+    if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0":
+        return rules, fetched_at, sources
+    try:
+        if _age_s(fetched_at) >= REFRESH_AFTER_S:
+            fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
+            rules, _, fetched_at, sources = load_rules(repo)
+        else:
+            spawn_fetch(repo)
+    except Exception:
+        pass
+    return rules, fetched_at, sources
 
 
 def main():
@@ -2810,6 +3665,23 @@ def main():
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data)}
+    if mode == "prompt":
+        # UserPromptSubmit. It arms and says nothing: anything printed here is
+        # injected above the person's own words, and an arming is not news —
+        # the fire at the gated command is.
+        #
+        # The book is refreshed FIRST, on the same terms the session lane
+        # uses. A prompt is the only chance a prompt-armed rule gets: evaluate
+        # it against a stale book and the matching prompt is GONE, so a rule
+        # activated while the session sat idle stays unarmed and silently
+        # permits its gated commands until somebody happens to raise the
+        # subject again. The pre lane's detached refresh cannot help — it
+        # lands after the prompt it needed to see.
+        text = str(data.get("prompt") or "")
+        if text and not harness_prompt(text):
+            rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
+            arm_obligations(rules, repo, gitdir, session, "prompt", prompt=text)
+        return 0
     # Repo facts answer about the tree the COMMAND runs in; which rules bind
     # you is still the session's repo, and stays keyed on it.
     #
@@ -2839,20 +3711,13 @@ def main():
         # ago. Only a stale book is worth waiting for, and never longer than
         # SESSION_FETCH_TIMEOUT_S: `fetch_book` leaves the cache untouched on
         # every failure path, so a timeout renders exactly what we already had.
-        if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") != "0":
-            try:
-                if _age_s(fetched_at) >= REFRESH_AFTER_S:
-                    fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
-                    rules, _, fetched_at, sources = load_rules(repo)
-                else:
-                    spawn_fetch(repo)
-            except Exception:
-                pass
+        rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
         try:        # which source each rule came from — the pilot's merge audit
             _atomic_json(book_path(repo) + ".sources", {"at": _now(), "sources": sources})
         except Exception:
             pass
         session_digest(rules, repo, gitdir, ctx)
+        arm_obligations(rules, repo, gitdir, session, "session")
         return 0
     if mode == "pre":
         maybe_refresh(repo, fetched_at)
@@ -2860,6 +3725,7 @@ def main():
     inp = data.get("tool_input") or {}
     sp = state_path(session)
     st = load_state(sp)
+    before = snapshot_arming(st)      # `save_state` merges the arming keys by delta
     fired_now = []
 
     cmd = str(inp.get("command", "")) if tool == "Bash" else ""
@@ -2945,7 +3811,7 @@ def main():
             continue
         crx = r.get("converted_rx")
         if mode == "post" and tool == "Bash" and crx and cmd \
-                and re.search(crx, shell_only(cmd), re.I | re.M):
+                and re.search(crx, strip_comments(shell_only(cmd)), re.I | re.M):
             log_conversion(fid, "converted_rx")
             del st["open"][rid]
             st.get("open_file", {}).pop(rid, None)
@@ -3002,14 +3868,28 @@ def main():
                 continue
 
             if r.get("on") == "ordering":
+                if stale_arming(st, r):
+                    # Armed for an earlier version of this rule. The rule that
+                    # arms on `staging` and the one that now arms on
+                    # `production` share an id and nothing else; no prompt of
+                    # this session matched the new one, so it is not armed.
+                    drop_arming(st, rid)
                 try:
                     ordering = ordering or OrderingEngine(root, branch)
                     ok = bash_ok(ev["resp"], strict=r.get("mode") == "gate") \
                         if ev["resp"] is not None else None
                     outcome = ordering.feed(r, hook_phase=ev["order_phase"], tool=etool, cmd=ecmd,
-                                            file_path=efp, ok=ok)
+                                            file_path=efp, ok=ok, armed=st["armed"].get(rid))
                 except Exception:
                     outcome = None
+                if outcome == "discharged":
+                    # The session's own arming is discharged here, not in the
+                    # worktree state: it was never written there. Its open
+                    # fire lives beside it for the same reason — a sibling
+                    # session sharing the checkout must not convert it.
+                    fid = drop_arming(st, rid)
+                    if fid:
+                        log_conversion(fid, "discharged")
                 if outcome == "discharged" and r.get("_converted_fire"):
                     log_conversion(r["_converted_fire"], "discharged")
                 elif outcome == "fired":
@@ -3060,7 +3940,7 @@ def main():
             fired_on[rid] = ev
 
     if not fired_now:
-        save_state(sp, st)
+        save_state(sp, st, before=before)
         return 0
 
     # §5.3: which of this call's fires are GATES. Only a call the hook sees
@@ -3151,6 +4031,15 @@ def main():
     for r in shown:
         label = r.get("_label") or r["id"]
         detail = f" — {r['_gate_msg']}" if r.get("_gate_msg") else ""
+        # A rule this hook could not read in full ran as advice. Say so with
+        # the fire, once per session per rule — through `st["fired"]`, the
+        # same dedup every `fire_scope: session` rule already uses, so this
+        # cannot disagree with it about what "once per session" means.
+        stale_key = f"_degraded:{r['id']}"
+        if r.get("_degraded") and stale_key not in st["fired"]:
+            st["fired"].append(stale_key)
+            lines.append(f"  _(advice only — {r['_degraded']}. Update the "
+                         f"{BRAND} plugin to let this rule gate.)_")
         blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
@@ -3237,14 +4126,16 @@ def main():
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
-        if r.get("on") == "ordering" and ordering and ids.get(r["id"]):
+        if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
+            st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
+        elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):
             ordering.mark_fired(r["id"], ids[r["id"]])
         elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
             st["open"][r["id"]] = ids.get(r["id"])
             if r.get("on") == "edit":
                 ev = fired_on.get(r["id"])
                 st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
-    save_state(sp, st)
+    save_state(sp, st, before=before)
     return 0
 
 if __name__ == "__main__":

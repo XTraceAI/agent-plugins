@@ -151,6 +151,17 @@ Capture runs on independent paths that all feed one server-side watermark
    and read by every writer, capture included; until then, everything lands
    in personal memory instead of the repo's room.
 
+5. **Naming.** A captured session is called what its host calls it, so the
+   sessions list in MemHub reads the same as the one in the editor: Claude
+   Code's generated title (a rename by the user outranks it), and on Codex the
+   `thread_name` Codex itself generated — read from the rollout, or from
+   `~/.codex/session_index.jsonl` for the hosts that only record it there —
+   passed through verbatim. Only a session its host never named falls back to
+   a title derived from the first prompt, trimmed to one readable line. Codex
+   re-derives this on every flush, so a thread renamed mid-session updates on
+   its next turn; Cursor exposes no host-generated name, so its title stays the
+   one derived from the opening ask.
+
 All of the above authenticate with the plugin's own credential — separate
 from `/mcp`, provisioned by `/memhub:login` (see Install) — because they run
 as cold background processes that can never open a browser.
@@ -410,6 +421,19 @@ session from linking itself later. Every path degrades to silence — a
 disconnected org, an unreachable server, no credential, a listing command whose
 output names several PRs, or a command that merely *mentions* a PR without
 addressing GitHub.
+
+The **one** thing it remembers is a negative: an org that has the feature on but
+no GitHub connected cannot change that without an admin acting, so that answer
+is cached for **30 minutes** rather than re-asked on every `gh pr` command. The
+entry is scoped to the deployment, the repo *and* the credential that earned it,
+because which org answers depends on which token is resolved. Two replies are
+deliberately never cached — a connected one (`linked_sessions` and `pr.known`
+change constantly) and one that just says the feature is off, since the server
+answers that from a flag check without looking at the integration at all, so its
+`github_connected` field is a default rather than a finding. Caching that field
+once silenced linking for a day on machines whose GitHub was connected the whole
+time. Set `MEMHUB_PRLINK_NEGATIVE_TTL_S` to change the window; `/memhub:link-pr`
+always asks live.
 
 **A PR opened by some other means — a script, a Makefile target, a CI helper,
 `hub pull-request` — is not detected, deliberately**: recognising arbitrary

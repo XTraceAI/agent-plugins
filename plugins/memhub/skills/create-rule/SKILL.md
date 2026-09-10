@@ -125,6 +125,8 @@ them decide — step 5 flags these as `cross_book`.
 | a failing or noteworthy tool output | `agent_hook` | `matcher: {event: "output", content_rx, command_rx?, content_not_rx?}` |
 | a file about to be read into the agent's context — the Read tool, OR a `cat`/`head`/`tail`/`less`/`more`/`sed` on a path in a Bash command (not piped, not redirected; `cd`-relative paths resolve) | `agent_hook` | `matcher: {event: "read", path_rx?, path_not_rx?, command_not_rx?, given: {file: {lines_gt}, agent: {main}}}` — needs `path_rx` or `given.file`, or it fires on every file |
 | "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, min_edits, display_name}` |
+| "run X once a session, before Y" — X is not owed to an edit, it is owed to the session (`git fetch` before reading `origin/*`) | `agent_hook` | the same `ordering` block with `armed_by_events: ["session"]`: armed at session start, discharged by one green X, and re-armed for the next session |
+| "when the person asks about Z, do X before answering" (probe staging before answering a staging question) | `agent_hook` | the same `ordering` block with `armed_by_events: ["prompt"]` **and** `armed_by_rx` — the pattern the prompt must match. Without `armed_by_rx` the rule arms on nothing; only what a person TYPED arms it, never a slash command's body or a loop wake-up |
 | applies when a file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server decides relevance per call |
 | worldview with no trigger at all | `session_context` | none — at most 15 such rules per repo scope are shown at session start; prefer a checkable shape when one exists, because advice shown in-flight is acted on far more often than advice shown at session start |
 
@@ -137,6 +139,14 @@ is the branch name, and the hook matches `scope_repos` by exact string, so
 the rule would bind nobody), `scope_paths` / `scope_exclude_paths` (globs — they constrain
 edit rules by file path; a Bash call carries no path, so an include-scoped
 rule never fires on one).
+
+**A rule that needs a newer hook.** If the rule uses a key an older installed
+hook would not understand, pass `min_hook_version: "<major.minor.patch>"`.
+Where the installed hook is older it runs the rule as ADVICE, never as a gate,
+and says so once per session naming the version it wanted — instead of
+ignoring the condition and firing as if it held. A key the hook does not know
+degrades the same way even without the field, so `min_hook_version` is how you
+make the message say what is actually missing.
 
 **Advise, or stop the command?** A rule advises by default: its sentence is
 shown and the call goes through. Pass `mode: "gate"` and the rule DENIES a
@@ -270,15 +280,34 @@ JSON
 ```
 
 An `ordering` rule is verified as a sequence of steps joined by ` >> `
-(`edit:<path>`, `ok:<cmd>` a green receipt, `red:<cmd>` a red one, and last
-`gate:<cmd>`); the case fires when that final call is gated:
+(`edit:<path>`, `ok:<cmd>` a green receipt, `red:<cmd>` a red one, `session`
+the SessionStart arming, `prompt:<what the person typed>` the
+UserPromptSubmit arming, and last `gate:<cmd>`); the case fires when that
+final call is gated. Use the arming step your rule's `armed_by_events` names
+— a case that never arms the rule can never fire:
 
 ```bash
+# armed_by_events: ["edit", "write"]
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
   --fires  'edit:src/a.py >> gate:git push' \
   --fires  'edit:src/a.py >> red:pytest tests >> gate:git push' \
   --silent 'edit:src/a.py >> ok:pytest tests >> gate:git push'
+
+# armed_by_events: ["session"]
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires  'session >> gate:git log origin/main' \
+  --silent 'session >> ok:git fetch -q >> gate:git log origin/main'
+
+# armed_by_events: ["prompt"] + armed_by_rx
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires  'prompt:is the staging brain 404ing? >> gate:gh pr comment 7 --body ok' \
+  --silent 'prompt:how is production? >> gate:gh pr comment 7 --body ok' \
+  --silent 'prompt:check staging >> ok:curl -s https://staging/health >> gate:gh pr comment 7 --body ok'
 ```
+
+A `prompt:` whose text does not match `armed_by_rx` arms nothing, so it is
+the natural `--silent` case: it proves the rule stays quiet when nobody
+raised the subject.
 
 It exits non-zero until every case behaves. **Do not file a rule while it
 exits non-zero, and show the table to the user.** What each line means:

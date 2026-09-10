@@ -63,7 +63,7 @@ import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
-from redact import redact_records  # noqa: E402
+from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
 
@@ -1030,7 +1030,15 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # Bound a semi-trusted session title (store content, like cwd): a
         # non-str from a corrupt meta is dropped rather than sent as-is, and a
         # runaway length is capped so it can't bloat every re-send.
-        arguments["title"] = title.strip()[:200]
+        #
+        # Redacted HERE because the title is derived from RAW records -- the
+        # `redact_records` above covers only `sendable`, so a session whose
+        # first prompt is `export MEMHUB_TOKEN=mhk_...` would otherwise ship
+        # its key as the conversation's NAME, the most visible field there is.
+        # Redact BEFORE the cap. Capping first can chop a straddling key
+        # below `_SECRET`'s {16,} floor, and the surviving fragment then
+        # matches nothing and ships in the clear. Verified both ways.
+        arguments["title"] = redact_text(title.strip())[:200]
 
     try:
         res = await session.call_tool("import_conversation",
