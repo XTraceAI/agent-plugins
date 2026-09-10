@@ -180,6 +180,33 @@ def test_strict_cursor_tree_rejects_missing_references_and_cycles_but_allows_sha
             assert store.read_bytes()==before
 
 
+def test_legacy_cwd_probe_tolerates_later_decode_damage():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1]
+        expected=codex.session_cwd(path)
+        assert expected
+        path.write_bytes(path.read_bytes()+b'{"bad":"\xff"}\n')
+        assert codex.session_cwd(path)==expected
+        rejected(lambda:codex.session_metadata(path))
+        rejected(lambda:codex.to_canonical(path,strict_utf8=True))
+
+
+def test_strict_cursor_tree_validates_complete_protobuf_nodes():
+    tails=[b"\x0a\x20short", b"\x80", b"\x0a\x80", b"\x15x", b"\x19x",
+           b"\x00", b"\x0e", b"\x0a\x01x", b"\x10"+b"\x80"*10+b"\x00"]
+    for tail in tails:
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            with sqlite3.connect(store) as connection:
+                root=json.loads(connection.execute("SELECT value FROM meta").fetchone()[0])["latestRootBlobId"]
+                data=connection.execute("SELECT data FROM blobs WHERE id=?",(root,)).fetchone()[0]
+                connection.execute("UPDATE blobs SET data=? WHERE id=?",(data+tail,root))
+            before=store.read_bytes()
+            cursor.to_canonical(store,strict_utf8=True)
+            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            assert store.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
