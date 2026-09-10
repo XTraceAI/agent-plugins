@@ -413,6 +413,11 @@ def test_attachment_prefixes_replay_native_context_without_skipping_offsets():
                                              "attachment":{"content":"x"*size}})+"\n")
             invoke(home,cloud[0],data)
             assert not local[1] and state(home,"local",local[0]).get("offset",0)==0
+            with path.open("a") as output:
+                output.write(json.dumps({"type":"user","uuid":"command-wrapper",
+                    "message":{"role":"user","content":"<command-name>/model</command-name>"}})+"\n")
+            invoke(home,cloud[0],data)
+            assert not local[1] and state(home,"local",local[0]).get("offset",0)==0
             append(path,1,content="y"*message_size);append(path,2)
             local[2]["fail_at"]=2;invoke(home,cloud[0],data)
             committed=state(home,"local",local[0])["offset"]

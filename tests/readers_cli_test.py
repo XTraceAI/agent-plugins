@@ -422,7 +422,17 @@ def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted(
             for mode in ([],["--metadata-only"]):
                 result,rows=run(home,host,"--session","latest",*mode)
                 assert result.returncode==2 and rows==[] and "discovery_incomplete" in result.stderr,result.stderr
-            if host=="cursor":shutil.rmtree(duplicate)
+            if host=="cursor":
+                # A malformed copy still owns the same path-derived identity.
+                (duplicate/"meta.json").write_text("{broken}")
+                for selection in ([],["--session",native_id],["--session","latest"]):
+                    for mode in ([],["--metadata-only"]):
+                        result,rows=run(home,host,*selection,*mode)
+                        assert result.returncode==2,result.stderr
+                        assert all(row.get("native_session_id")!=native_id for row in rows if row.get("type")=="session")
+                result,rows=run(home,host,"--session",str(original))
+                assert result.returncode==0 and rows[0]["native_session_id"]==native_id,result.stderr
+                shutil.rmtree(duplicate)
             else:duplicate.unlink()
             result,rows=run(home,host,"--session","latest")
             assert result.returncode==0 and rows[0]["path"]==str(original.resolve()),result.stderr
