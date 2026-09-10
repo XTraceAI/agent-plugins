@@ -2316,6 +2316,15 @@ def armed_lane_checks() -> None:
         c = pre("p6", "gh pr comment 7 --body ok")
         check("prompt-armed: a prompt matching the new rx arms the new version",
               "[probe-staging]" in c, c)
+        # `armed_once` exists for the once-only SESSION event. Every matching
+        # prompt used to append a `prompt:<id>` marker nothing ever read, so a
+        # long session that kept raising the subject grew its state file on
+        # every prompt and reread it on every tool call.
+        for _ in range(3):
+            prompt("p6", "is production up?")
+        st = json.load(open(os.path.join(td, "state", "p6.json")))
+        check("prompt-armed: repeated prompts leave no markers in the once-only list",
+              not any(m.startswith("prompt:") for m in st["armed_once"]), st["armed_once"])
         json.dump({**book, "fetched_at": stale}, open(bp, "w"))   # restore for what follows
         check("refresh_if_stale: honours MEMHUB_RULEBOOK_FETCH=0",
               rb_mod.refresh_if_stale("x", ["r"], stale, {"a": 1}) == (["r"], stale, {"a": 1}))
@@ -2389,6 +2398,12 @@ def min_hook_version_checks() -> None:
             gate("wrong-kind", "foxtrot", given={"repo": {"diff_lines_gt": "lots"}}),
             gate("half-known", "golf",
                  given={"repo": {"branch_rx": "^main$", "commits_since_base_gt": 3}}),
+            # A matcher predicate this hook has no code for. `to_hook_rule`
+            # used to copy it through and `evaluate` ignored it, so the rule
+            # stayed a GATE and blocked outside the scope its author wrote.
+            _row("unknown-matcher", {"event": "bash", "command_rx": r"\bjuliet\b",
+                                     "warn_once_per": "turn", "cwd_rx": "^/nowhere"},
+                 mode="gate"),
             {"id": "unknown-ordering", "on": "ordering", "repo_scope": "any", "mode": "gate",
              "ordering": {"required_command_rx": "pytest", "gated_command_rx": r"\bhotel\b",
                           "armed_by_events": ["session"], "phase_of_moon": "waxing"},
@@ -2447,6 +2462,17 @@ def min_hook_version_checks() -> None:
         c, _ = pre("v1", "echo")
         check("unknown key: an unrecognised `given` BLOCK degrades it too",
               "`weather`" in c, c)
+
+        c, deny = pre("v1", "juliet")
+        check("unknown key: an unrecognised MATCHER key degrades the rule to advice "
+              "and names it", "matcher.cwd_rx" in c and deny != "deny", c)
+        inert = H.to_hook_rule(_row("inert", {"event": "bash", "command_rx": "x",
+                                              "predicts_rx": "y", "min_chars": 10},
+                                    mode="gate"))
+        check("unknown key: every key on the server's matcher allowlist is known — "
+              "`predicts_rx` (inert by definition) and `min_chars` do not degrade",
+              inert is not None and inert.get("mode") == "gate"
+              and not inert.get("_degraded"), str(inert))
 
         # An ordering rule needs its arming event first; this one says
         # `session`, so the session lane has to have run.
