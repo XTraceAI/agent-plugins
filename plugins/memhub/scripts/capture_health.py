@@ -665,7 +665,8 @@ def main() -> int:
             signature = (f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
                          f"|{rulebook[0] if rulebook else ''}")
     except sinks.SinkConfigError as error:
-        message, signature = f"Capture configuration: {error}. No capture destination was selected.", "capture:configuration"
+        message = f"Capture configuration: {error}. No capture destination was selected."
+        signature = "capture:configuration:" + hashlib.sha256(str(error).encode()).hexdigest()[:24]
     if not message:
         return 0
 

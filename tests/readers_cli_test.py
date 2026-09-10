@@ -586,6 +586,38 @@ def test_native_id_selection_cannot_substitute_a_misleading_rollout_filename():
         assert result.returncode==2 and rows==[] and "Traceback" not in result.stderr
 
 
+def test_latest_cursor_uses_newer_transcript_without_losing_saved_source():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);store=fixtures._make_cursor_store(home/".cursor/chats",uuid=SID)
+        path=transcript(home)
+        meta_path=store.parent/"meta.json";meta=json.loads(meta_path.read_text())
+        meta["updatedAtMs"]=int((MTIME-100)*1000);meta_path.write_text(json.dumps(meta))
+        result,rows=run(home,"cursor","--session","latest")
+        assert result.returncode==0 and rows[0]["path"]==str(path.resolve()),result.stderr
+        state_dir=home/".config/memhub-plugin/cursorflush";state_dir.mkdir(parents=True)
+        (state_dir/f"{SID}.json").write_text(json.dumps({"source_kind":"store"}))
+        result,rows=run(home,"cursor","--session","latest")
+        assert result.returncode==0 and rows[0]["path"]==str(store.resolve()),result.stderr
+
+
+def test_since_filter_checks_the_final_source_revision():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home);original=readers_cli.header_for
+        def changing(*args,**kwargs):
+            header=original(*args,**kwargs)
+            os.utime(path,(MTIME+200,MTIME+200))
+            return header
+        stdout,stderr=io.StringIO(),io.StringIO()
+        with patch.object(codex,"_SESSION_INDEX",home/"index.jsonl"), \
+             patch.object(readers_cli,"header_for",changing), \
+             contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+            code=readers_cli.main(["--host","codex","--session",str(path),"--since","2026-09-08T00:01:40Z"])
+        assert code==2 and not stdout.getvalue() and "source_changed" in stderr.getvalue(),stderr.getvalue()
+        os.utime(path,(MTIME,MTIME))
+        result,rows=run(home,"codex","--session",str(path),"--since","2026-09-08T00:01:40Z")
+        assert result.returncode==0 and not rows and not result.stderr,result.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
