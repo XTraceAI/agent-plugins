@@ -735,6 +735,28 @@ def test_cursor_file_aliases_never_emit_duplicate_resolved_identities():
         assert result.returncode==0 and len(rows)==1 and rows[0]["native_session_id"]==SID,result.stderr
 
 
+def test_latest_cursor_does_not_prepare_unrelated_saved_state_or_metadata():
+    for damaged in ["state", "metadata"]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);path=transcript(home);other="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            if damaged=="state":
+                older=write_jsonl(home/f".cursor/projects/older/agent-transcripts/{other}/{other}.jsonl",[None])
+                os.utime(older,(MTIME-100,MTIME-100))
+                bad=home/f".config/memhub-plugin/cursorflush/{other}.json"
+                bad.parent.mkdir(parents=True);bad.write_text("{broken")
+            else:
+                older=fixtures._make_cursor_store(home/".cursor/chats",uuid=other)
+                bad=older.parent/"meta.json";bad.write_text('{"updatedAtMs":0,"cwd":17}')
+            before=bad.read_bytes()
+            for mode in [[],["--metadata-only"]]:
+                result,rows=run(home,"cursor","--session","latest",*mode)
+                assert result.returncode==0 and rows[0]["native_session_id"]==SID,(damaged,result.stderr)
+                assert {row.get("native_session_id") for row in rows if row.get("type")=="session"}=={SID}
+            result,_=run(home,"cursor","--metadata-only")
+            assert result.returncode==2 and "session_unreadable" in result.stderr
+            assert path.read_bytes() and bad.read_bytes()==before
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
