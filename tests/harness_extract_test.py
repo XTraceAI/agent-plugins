@@ -323,6 +323,26 @@ def test_a_staging_replay_never_stamps_the_replaying_machines_repo():
     print("PASS test_a_staging_replay_never_stamps_the_replaying_machines_repo")
 
 
+def test_the_engine_target_is_the_action_the_engine_would_fire_on():
+    """Codex on #191: an edit rule stamped against the first file action of
+    ANY kind picked a Read in another checkout, and the row filed into the
+    wrong repo. The target must be the event's own tool AND match the regex."""
+    turn = _turn(tools=[_tool("Read", "/other/repo/notes.md"),
+                        _tool("Bash", "git status"),
+                        _tool("Edit", "/here/app/config.py"),
+                        _tool("Edit", "/here/tests/test_x.py")])
+    edit = {"engine": "matcher", "matcher": {"event": "edit", "path_rx": r"tests/.*\.py$"}}
+    assert hx.engine_target(edit, turn) == ("Edit", "/here/tests/test_x.py")
+    read = {"engine": "matcher", "matcher": {"event": "read", "path_rx": r"\.md$"}}
+    assert hx.engine_target(read, turn) == ("Read", "/other/repo/notes.md")
+    bash = {"engine": "matcher", "matcher": {"event": "bash", "command_rx": r"git st"}}
+    assert hx.engine_target(bash, turn) == ("Bash", "git status")
+    # no action of the event's kind matches: the tool is known, the target is not
+    miss = {"engine": "matcher", "matcher": {"event": "edit", "path_rx": r"nope"}}
+    assert hx.engine_target(miss, turn) == ("Edit", "")
+    print("PASS test_the_engine_target_is_the_action_the_engine_would_fire_on")
+
+
 # ------------------------------------------------------------------- twins
 def test_twins_are_dropped_within_a_run():
     a = {"statement": "When running git worktree add -b, check the branch "

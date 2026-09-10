@@ -42,6 +42,10 @@ import uuid
 from pathlib import Path
 
 EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
+# The installed hook runs on Read too (the read lane, v0.49), and the author
+# can write `matcher.event = "read"`; a replay that skipped Read calls
+# reported those rules as never firing (Codex, #191).
+REPLAYED_TOOLS = EDIT_TOOLS | {"Bash", "Read"}
 SYS = re.compile(r"<system-reminder>.*?</system-reminder>"
                  r"|<task-notification>.*?</task-notification>", re.S)
 # Correction shape, for the "did a fire precede this?" column only. Not the
@@ -128,7 +132,10 @@ def fired(out) -> tuple[list[str], bool]:
     spec = out.get("hookSpecificOutput", {}) or {}
     ctx = spec.get("additionalContext", "") or ""
     msg = out.get("systemMessage", "") or ""
-    titles = re.findall(r"\[([^\]]{3,80})\]", ctx + " " + msg)
+    # The hook names a fired rule on BOTH channels (additionalContext and
+    # systemMessage), so one fire appears at least twice in the concatenation;
+    # count each label once per response (Codex, #191).
+    titles = list(dict.fromkeys(re.findall(r"\[([^\]]{3,80})\]", ctx + " " + msg)))
     blocked = (spec.get("permissionDecision") == "deny") or ("Blocked" in msg)
     return titles, blocked
 
@@ -222,7 +229,7 @@ def replay_hooks(transcript: Path, scripts: str, keep: bool) -> dict:
                         continue
                     name = b.get("name")
                     inp = b.get("input") or {}
-                    if name != "Bash" and name not in EDIT_TOOLS:
+                    if name not in REPLAYED_TOOLS:
                         continue
                     pending[b.get("id")] = (turn, name, inp)
                     dt, out, err = run_hook(

@@ -216,6 +216,14 @@ def cmd_router(args) -> None:
 # ----------------------------------------------------------------- corpus
 def run_one(scripts: Path, path: Path, out_dir: Path, args) -> dict:
     name = path.stem
+    # A rerun into the same --out must measure THIS run: the extractor opens
+    # its drafts file in append mode, and the aggregate below reads every
+    # line, so last run's rows would be counted again (Codex, #191/#192).
+    for suffix in (".drafts.jsonl", ".stats.json", ".trace.log"):
+        try:
+            (out_dir / f"{name}{suffix}").unlink()
+        except FileNotFoundError:
+            pass
     cmd = [sys.executable, str(scripts / "harness_extract.py"),
            "--turns", str(path),
            "--out", str(out_dir / f"{name}.drafts.jsonl"),

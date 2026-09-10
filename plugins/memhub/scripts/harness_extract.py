@@ -856,21 +856,33 @@ class Trace:
             self.fh.close()
 
 
+_EVENT_TOOLS = {"bash": ("Bash",), "output": ("Bash",),
+                "edit": ("Edit", "Write", "MultiEdit", "NotebookEdit"),
+                "read": ("Read",)}
+
+
 def engine_target(raw: dict, turn: dict) -> tuple[str, str]:
-    """The action the lesson is about, for the per-action state stamp."""
+    """The action the lesson is about, for the per-action state stamp.
+
+    The action must be one the ENGINE would fire on: the event's own tools,
+    and the regex the author wrote matching it. Picking the first file action
+    of any kind stamped an edit rule with a Read in another checkout, and the
+    row then filed into and scoped to the wrong repo (Codex, #191).
+    """
     engine = raw.get("engine")
     if engine == "matcher":
         m = raw.get("matcher") or {}
-        if m.get("event") == "bash":
-            for action in turn.get("tools", []):
-                if action.get("tool") == "Bash" and _rx_ok(m.get("command_rx")):
-                    if re.search(m["command_rx"], action.get("target", ""), re.I):
-                        return "Bash", action.get("target", "")
-            return "Bash", ""
+        event = m.get("event")
+        tools = _EVENT_TOOLS.get(event, ())
+        rx_key = "command_rx" if event in ("bash", "output") else "path_rx"
+        rx = m.get(rx_key) if _rx_ok(m.get(rx_key)) else None
         for action in turn.get("tools", []):
-            if action.get("tool") in ("Edit", "Write", "MultiEdit", "Read"):
-                return action["tool"], action.get("target", "")
-        return "Edit", ""
+            if action.get("tool") not in tools:
+                continue
+            target = action.get("target", "")
+            if rx is None or re.search(rx, target, re.I):
+                return action["tool"], target
+        return (tools[0] if tools else ""), ""
     if engine == "anchors":
         anchors = [a for a in (raw.get("anchors") or []) if isinstance(a, str)]
         for action in turn.get("tools", []):

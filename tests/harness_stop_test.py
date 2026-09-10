@@ -470,6 +470,44 @@ def test_sync_files_rows_proposed_with_the_stamp_and_never_activates():
     print("PASS test_sync_files_rows_proposed_with_the_stamp_and_never_activates")
 
 
+# ---------------------------------------------------------------- idle
+def test_the_idle_waiter_reviews_after_silence_and_exits():
+    """§4.3: a session silent for IDLE_S is reviewed once; a transcript that
+    keeps moving keeps the waiter waiting; a deleted one ends the wait."""
+    with _Env() as env:
+        tp = env.base / "s.jsonl"
+        tp.write_text("", encoding="utf-8")
+        old = (hs.IDLE_S, hs.IDLE_POLL_S, hs.review_and_sync)
+        moments = []
+        hs.IDLE_S, hs.IDLE_POLL_S = 0.3, 0.05
+        hs.review_and_sync = lambda session, moment, pr_number=None: moments.append(moment)
+        try:
+            t0 = time.time()
+            os.utime(tp, (t0 - 10, t0 - 10))          # already silent
+            assert hs.cmd_idle("sess", str(tp), "") == 0
+            assert moments == ["idle"] and time.time() - t0 < 5
+            assert hs.load_meta("sess")["idle_pid"] == os.getpid()
+            # a transcript still being written is not idle yet
+            moments.clear()
+            tp.unlink()
+            assert hs.cmd_idle("sess", str(tp), "") == 0
+            assert moments == ["idle"], "a vanished transcript ends the wait with one review"
+        finally:
+            hs.IDLE_S, hs.IDLE_POLL_S, hs.review_and_sync = old
+    print("PASS test_the_idle_waiter_reviews_after_silence_and_exits")
+
+
+def test_the_sensor_never_spells_activate():
+    """Activation is a human act (§2, §5.1). The word must not be in the
+    sensor at all, so no future edit can pass it by accident."""
+    src = (SCRIPTS / "harness_stop.py").read_text(encoding="utf-8")
+    import re  # noqa: PLC0415
+    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert not re.search(r"[\"']activate[\"']\s*:", code), "activate must never be a sent key"
+    assert "activate=" not in code
+    print("PASS test_the_sensor_never_spells_activate")
+
+
 # ------------------------------------------------------------ session start
 def test_session_start_reviews_syncs_and_announces_once():
     with _Env() as env:
