@@ -158,7 +158,8 @@ def _usage_of(message: dict) -> dict[str, int] | None:
 def _read_meta_json(session_dir: Path) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        value = json.loads(p.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -181,22 +182,55 @@ def session_cwd(path) -> str | None:
     return cwd if isinstance(cwd, str) and cwd else None
 
 
-def list_sessions(limit: int = 20) -> list[dict]:
+def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
     """Most recent Cursor sessions, preferring the richer store per UUID."""
     rows: list[dict] = []
     store_ids: set[str] = set()
-    for d in _session_dirs():
+    if on_error is None:
+        stores, transcripts = _session_dirs(), _transcript_paths()
+    else:
+        from .discovery import paths
+        # Either layout may legitimately be absent; both absent is incomplete.
+        roots = []
+        for root in (_CHATS, _PROJECTS):
+            try:
+                root.stat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                on_error(error)
+            else:
+                roots.append(root)
+        if not roots:
+            on_error(FileNotFoundError("Cursor session stores are unavailable"))
+        stores = [path.parent for path in paths(_CHATS, ("*", "*", "store.db"), on_error)] if _CHATS in roots else []
+        transcripts = paths(_PROJECTS, ("*", "agent-transcripts", "*", "*.jsonl"), on_error) if _PROJECTS in roots else []
+    for d in stores:
+        if on_error is not None:
+            # Discovery uses filesystem observations. Bad session metadata is
+            # diagnosed per session by the CLI, without hiding healthy peers.
+            try:
+                mtime = (d / "store.db").stat().st_mtime
+            except OSError as error:
+                on_error(error)
+                continue
+            store_ids.add(d.name)
+            rows.append({"id": d.name, "path": str(d / "store.db"),
+                         "mtime": mtime, "host": HOST, "cwd": None})
+            continue
         m = _read_meta_json(d) or {}
         store_ids.add(d.name)
         rows.append({"id": d.name, "path": str(d / "store.db"),
                      "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
                      "host": HOST, "cwd": m.get("cwd")})
-    for p in _transcript_paths():
+    for p in transcripts:
         if p.stem in store_ids:
             continue
         try:
             mtime = p.stat().st_mtime
-        except OSError:
+        except OSError as error:
+            if on_error is not None:
+                on_error(error)
             continue
         rows.append({"id": p.stem, "path": str(p), "mtime": mtime,
                      "host": HOST, "cwd": None})
@@ -302,7 +336,7 @@ def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
     paired with their nearest ancestor node's wall clock (ms epoch, or None).
     Checkpoint nodes are timestamped; their leaves inherit that clock, which
     is what turns "the whole session is one instant" into a real timeline."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         blobs = {row[0]: row[1] for row in con.execute("SELECT id, data FROM blobs")}
         root = None
@@ -602,3 +636,27 @@ def to_canonical(path, *, session_id: str | None = None,
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
         model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))
+
+
+def session_metadata(path) -> dict:
+    """Native identity and start; a first user message is not a session start."""
+    source = Path(path)
+    if source.name == "store.db":
+        with (source.parent / "meta.json").open(encoding="utf-8") as handle:
+            meta = json.load(handle)
+        if not isinstance(meta, dict) or meta.get("schemaVersion") != _SCHEMA_VERSION:
+            raise ValueError("unsupported Cursor store metadata")
+        created = meta.get("createdAtMs")
+        return {"session_id": source.parent.name, "cwd": meta.get("cwd"),
+                "git_branch": meta.get("gitBranch"),
+                "started_at": _iso_ms(created) if type(created) in (int, float) else None,
+                "source_surface": meta.get("source_surface")}
+    # This observed location identifies IDE transcripts. An arbitrary file does
+    # not establish a CLI or IDE surface, and absent native start stays unknown.
+    try:
+        relative = source.resolve().relative_to(_PROJECTS.resolve())
+        known_ide = len(relative.parts) == 4 and relative.parts[1] == "agent-transcripts"
+    except ValueError:
+        known_ide = False
+    return {"session_id": source.stem, "cwd": None, "git_branch": None,
+            "started_at": None, "source_surface": "cursor-ide" if known_ide else None}

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Read-only native session headers and canonical JSONL for local consumers."""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import math
+import sqlite3
+import sys
+from pathlib import Path
+
+from readers import reader_for, validate_canonical
+
+
+def since_instant(value: str) -> float:
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone required")
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError) as error:
+        raise argparse.ArgumentTypeError("since must be a timestamp with a timezone") from error
+
+
+def native_text(value, *, required=False):
+    if not required and (value is None or value == ""):
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("native identity must be text")
+    return value
+
+
+def source_revision(path: Path, host: str) -> tuple:
+    paths = [path]
+    if path.name == "store.db":
+        # SQLite can keep current changes in WAL; --since must not skip them.
+        paths += [path.with_name("store.db-wal"), path.parent / "meta.json"]
+    if host == "cursor":
+        from cursor_flush import _state_path, _UUID_RE
+        sid = path.parent.name if path.name == "store.db" else path.stem
+        if _UUID_RE.fullmatch(sid):
+            # A hook can add usage/timestamp pins after the native file stops
+            # changing. Those observations must participate in --since too.
+            paths.append(_state_path(sid))
+    revision = []
+    for item in paths:
+        try:
+            stat = item.stat()
+            with item.open("rb"):
+                pass
+        except FileNotFoundError:
+            if item == path:
+                raise
+            continue
+        revision.append((str(item), stat.st_size, stat.st_mtime_ns, stat.st_ino))
+    return tuple(revision)
+
+
+def header_for(reader, path: Path, mtime: float) -> dict:
+    native = reader.session_metadata(path)
+    sid = native_text(native.get("session_id"), required=True)
+    start = native_text(native.get("started_at"))
+    if start is not None:
+        since_instant(start)  # Validate but preserve the original fractional precision.
+    return {"type": "session", "host": reader.HOST, "native_session_id": sid,
+            "conversation_id": f"{reader.HOST}-{sid}",
+            "source_surface": native_text(native.get("source_surface")),
+            "started_at": start, "cwd": native_text(native.get("cwd")),
+            "git_branch": native_text(native.get("git_branch")), "title": None,
+            "path": str(path), "mtime": mtime}
+
+
+def encode(value: dict) -> str:
+    return json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", choices=("codex", "cursor"), required=True)
+    parser.add_argument("--since", type=since_instant)
+    parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument("--session", help="One native session ID or path instead of enumeration")
+    args = parser.parse_args(argv)
+    reader = reader_for(args.host)
+    incomplete = False
+
+    def diagnostic(code: str, path=None):
+        nonlocal incomplete
+        incomplete = True
+        # Static codes keep parser errors and transcript excerpts out of diagnostics.
+        print(json.dumps({"type": "diagnostic", "host": args.host,
+                          "code": code, "path": str(path) if path else None}), file=sys.stderr)
+
+    try:
+        if args.session:
+            path, error = reader.locate(args.session)
+            if error or path is None:
+                diagnostic("session_unavailable")
+                return 2
+            sessions = [{"path": str(path)}]
+        else:
+            sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        diagnostic("discovery_incomplete")
+        return 2
+
+    for session in sessions:
+        path = Path(session["path"])
+        try:
+            revision = source_revision(path, args.host)
+            mtime = max(item[2] for item in revision) / 1_000_000_000
+            if not math.isfinite(mtime):
+                raise ValueError("invalid mtime")
+            if args.since is not None and mtime < args.since:
+                continue
+            header = header_for(reader, path, mtime)
+            records = []
+            if not args.metadata_only:
+                records, native = reader.to_canonical(path)
+                if native.get("session_id") != header["native_session_id"]:
+                    raise ValueError("native identity changed during read")
+                if args.host == "cursor":
+                    from cursor_flush import apply_session_state
+                    apply_session_state(records, header["native_session_id"])
+                if records and validate_canonical(records):
+                    raise ValueError("reader emitted invalid canonical records")
+                header["title"] = native_text(native.get("title"))
+            if source_revision(path, args.host) != revision:
+                diagnostic("source_changed", path)
+                continue
+            # Validate the entire session before emitting its header. A bad
+            # number or unsupported value cannot leave a partial session behind.
+            lines = [encode(header)] + [encode(record) for record in records]
+            for line in lines:
+                print(line)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+            diagnostic("session_unreadable", path)
+    return 2 if incomplete else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

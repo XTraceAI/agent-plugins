@@ -657,7 +657,10 @@ def rollout_uuid(path) -> str | None:
     return m.group(1) if m else None
 
 
-def _rollout_files() -> list[Path]:
+def _rollout_files(on_error=None) -> list[Path]:
+    if on_error is not None:
+        from .discovery import paths
+        return paths(_SESSIONS, ("**", "rollout-*.jsonl"), on_error)
     return [Path(f) for f in glob.glob(str(_SESSIONS / "**" / "rollout-*.jsonl"),
                                        recursive=True)]
 
@@ -668,38 +671,53 @@ def _rollout_files() -> list[Path]:
 _META_MAX_RECORDS = 200
 
 
+def session_metadata(path) -> dict:
+    """Read native session identity without reading prompt-derived titles."""
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for _ in range(_META_MAX_RECORDS):
+            line = handle.readline(1024 * 1024 + 1)
+            if not line:
+                break
+            if len(line) > 1024 * 1024:
+                raise ValueError("session metadata probe exceeded its line bound")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = _session_meta([record])
+            if payload:
+                git = payload.get("git")
+                return {
+                    "session_id": payload.get("id"),
+                    "cwd": payload.get("cwd"),
+                    "source_surface": payload.get("originator"),
+                    "started_at": payload.get("timestamp") or record.get("timestamp"),
+                    "git_branch": git.get("branch") if isinstance(git, dict) else None,
+                }
+    return {}
+
+
 def session_cwd(path) -> str | None:
-    """The directory this session was started in, from ``session_meta.cwd``.
-
-    Same read ``to_canonical`` already does through ``_session_meta``, without
-    parsing the rollout to get there.
-    """
+    """The native working directory, using the bounded session metadata read."""
     try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-            for _, line in zip(range(_META_MAX_RECORDS), handle):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, dict) or record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                cwd = payload.get("cwd") if isinstance(payload, dict) else None
-                return cwd if isinstance(cwd, str) and cwd else None
-    except OSError:
+        cwd = session_metadata(path).get("cwd")
+        return cwd if isinstance(cwd, str) and cwd else None
+    except (OSError, ValueError):
         return None
-    return None
 
 
-def list_sessions(limit: int = 20) -> list[dict]:
-    """Most recent rollouts, newest first."""
-    files = sorted(_rollout_files(), key=lambda f: f.stat().st_mtime, reverse=True)
-    return [{"id": rollout_uuid(f) or f.stem, "path": str(f),
-             "mtime": f.stat().st_mtime, "host": HOST, "cwd": None}
-            for f in files[:limit]]
+def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
+    """Most recent rollouts; discovery callers can receive access failures."""
+    rows = []
+    for path in _rollout_files(on_error):
+        try:
+            rows.append({"id": rollout_uuid(path) or path.stem, "path": str(path),
+                         "mtime": path.stat().st_mtime, "host": HOST, "cwd": None})
+        except OSError as error:
+            if on_error is None:
+                raise
+            on_error(error)
+    return sorted(rows, key=lambda row: row["mtime"], reverse=True)[:limit]
 
 
 def locate(ref: str) -> tuple[Path | None, str]:
