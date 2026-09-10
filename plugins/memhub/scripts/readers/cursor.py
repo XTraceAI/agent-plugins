@@ -186,7 +186,7 @@ def session_cwd(path) -> str | None:
     return cwd if isinstance(cwd, str) and cwd else None
 
 
-def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
+def list_sessions(limit: int | None = 20, *, on_error=None, include_representations=False) -> list[dict]:
     """Most recent Cursor sessions, preferring the richer store per UUID."""
     rows: list[dict] = []
     store_ids: set[str] = set()
@@ -228,7 +228,7 @@ def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
                      "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
                      "host": HOST, "cwd": m.get("cwd")})
     for p in transcripts:
-        if p.stem in store_ids:
+        if p.stem in store_ids and not include_representations:
             continue
         try:
             mtime = p.stat().st_mtime
