@@ -475,9 +475,11 @@ by a majority of three readers, 42 activatable rows, and duplicates as its
 own weakness. Whether people say yes to what the agent proposes only a week
 of dogfood with the flag on shows. Before that:
 
-1. **A `judge_only` mode on the draft endpoint** (MemHub-Backend, Felix's
-   call). Today the server author still runs and bills on every flagged
-   moment; the client reads only the classification.
+1. **Review and deploy MemHub-Backend #1264**, which removes the server
+   author: `POST /v1/team/rulebook/harness/classify` makes one model call and
+   returns the verdict, and the identity check that ran on author rows moves
+   into `create_rule` for session drafts. Re-run the gold set after it
+   deploys — two sentences of the judge prompt changed.
 2. **Two human judges** on the rows the dogfood produces, judged
    independently, then adjudicated — the readers section says why one
    reader of any kind is not enough.
