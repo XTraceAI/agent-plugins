@@ -253,6 +253,10 @@ def main(argv=None) -> int:
         sessions = [row for row in sessions if (Path(row["path"]).parent.name
                     if Path(row["path"]).name == "store.db" else Path(row["path"]).stem) == args.session]
 
+    # Cursor identity survives unreadable metadata: a damaged copy still
+    # makes the other path ambiguous. Count before preparing either copy.
+    cursor_counts = Counter(f"cursor-{Path(row['path']).parent.name if Path(row['path']).name == 'store.db' else Path(row['path']).stem}"
+                            for row in sessions) if args.host == "cursor" else None
     prepared = []
     for session in sessions:
         path = Path(session["path"])
@@ -273,7 +277,7 @@ def main(argv=None) -> int:
             diagnostic("session_unreadable", path)
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
-    counts = Counter(header["conversation_id"] for _, _, header in prepared)
+    counts = cursor_counts if cursor_counts is not None else Counter(header["conversation_id"] for _, _, header in prepared)
     if args.session == "latest":
         # Preserve the native latest-selection rule, but only after all actual
         # identities have participated in ambiguity detection.
