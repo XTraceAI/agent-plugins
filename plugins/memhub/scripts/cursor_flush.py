@@ -1177,8 +1177,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
-@capture_context.entrypoint
-def main() -> int:
+@capture_context.entrypoint(observe_when_unselected=True)
+def main(*, observations_only: bool = False) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -1240,7 +1240,7 @@ def main() -> int:
                 prior_pending, event_pr_urls)
             if url not in accepted_pr_set
         ]
-        if pending_pr_urls != prior_pending:
+        if not observations_only and pending_pr_urls != prior_pending:
             # Cursor's transcript omits shell results. Persist the hook-only
             # evidence before source reads and network work so any later event
             # can retry it after a crash, missing source, or failed send.
@@ -1342,7 +1342,7 @@ def main() -> int:
         # fields, leaving the pin map untouched on disk. A duplicate
         # afterShellExecution can also reach this point: pending URL telemetry
         # retries through the same bounded send path until acknowledged.
-        if not should_flush(
+        if not observations_only and not should_flush(
                 event, payload, state, blob_ids, time.time(),
                 source_kind=source_kind, source_revision=source_revision,
                 usage_pending=usage_pending,
@@ -1355,6 +1355,8 @@ def main() -> int:
             first_observation="record_ts" not in state,
             boundary_uuids=boundary_uuids)
         _save_state(uuid, **fields)
+        if observations_only:
+            return 0  # Retain native observations without authenticating or uploading.
         try:
             mode = _FLUSH_MODE.get(event, "now")
             asyncio.run(asyncio.wait_for(
