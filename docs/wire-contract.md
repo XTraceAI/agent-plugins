@@ -103,3 +103,5 @@ tests under isolated bare Python and MCP SDK environments. Existing reader,
 Cursor usage and timestamp suites continue to cover cumulative usage,
 deduplication and unobserved usage. No network or MCP import is needed by the
 reader CLI; subprocess tests reject both.
+
+Cursor `--session latest` prepares only the resolved native UUID after counting same-ID copies. Invalid metadata or state from an unrelated UUID cannot fail a healthy selected export; whole-host exports still report those damaged sessions.
