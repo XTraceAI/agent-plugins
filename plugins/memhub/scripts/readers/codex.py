@@ -149,7 +149,7 @@ def clean_user_text(text: str) -> str | None:
     return t
 
 
-def load_rollout(path) -> list[dict]:
+def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[dict]:
     """Parse a Codex rollout .jsonl tolerantly (skip malformed lines, e.g. a
     truncated final line from an interrupted write).
 
@@ -157,13 +157,16 @@ def load_rollout(path) -> list[dict]:
     are UTF-8, a bare read_text() decodes with the OS locale codec, and one
     em-dash then kills the whole import on a cp950/cp1252 box."""
     records: list[dict] = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
+    errors = "strict" if strict_utf8 else "replace"
+    for raw in Path(path).read_text(encoding="utf-8", errors=errors).splitlines(keepends=True):
+        line = raw.strip()
         if not line:
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            if strict_json and raw.endswith(("\n", "\r")):
+                raise
             continue
         # The return type says list[dict] and every consumer walks these with
         # ``r.get(...)``. A line holding a bare JSON scalar (``null``, a number,
@@ -173,6 +176,8 @@ def load_rollout(path) -> list[dict]:
         # Dropped here, once, rather than guarded at every walk.
         if isinstance(record, dict):
             records.append(record)
+        elif strict_json:
+            raise ValueError("Codex rollout row is not an object")
     return records
 
 
@@ -341,7 +346,7 @@ def _rollout_thread_name(rollout: list[dict]) -> str | None:
     return found
 
 
-def _sidecar_thread_name(session_id: str | None) -> str | None:
+def _sidecar_thread_name(session_id: str | None, *, strict: bool = False) -> str | None:
     """The name Codex gave this thread, from the ``session_index.jsonl``
     sidecar — for the sessions whose rollout does not carry one.
 
@@ -378,28 +383,40 @@ def _sidecar_thread_name(session_id: str | None) -> str | None:
             start = max(0, size - _INDEX_TAIL_BYTES)
             fh.seek(start)
             blob = fh.read()
-        lines = blob.decode("utf-8", errors="replace").splitlines()
-        if start and lines:
-            lines = lines[1:]   # the seek landed mid-row; that is not a record
-        for line in deque(lines, maxlen=_INDEX_MAX_LINES):
-            line = line.strip()
+        if start:
+            # Drop the incomplete byte prefix before strict UTF-8 decoding;
+            # the seek may have landed inside a multi-byte character.
+            blob = blob.partition(b"\n")[2]
+        lines = blob.decode("utf-8", errors="strict" if strict else "replace").splitlines(keepends=True)
+        for raw in deque(lines, maxlen=_INDEX_MAX_LINES):
+            line = raw.strip()
             if not line:
                 continue
             try:
                 row = json.loads(line)
             except Exception:  # noqa: BLE001 — a torn final line is normal
+                if strict and raw.endswith(("\n", "\r")):
+                    raise
                 continue
-            if not isinstance(row, dict) or row.get("id") != session_id:
+            if not isinstance(row, dict):
+                if strict:
+                    raise ValueError("Codex title index row is not an object")
+                continue
+            if row.get("id") != session_id:
                 continue
             name = row.get("thread_name")
             if isinstance(name, str) and name.strip():
                 found = _one_line(name)
         return found
-    except Exception:  # noqa: BLE001 — no index, unreadable, anything
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — legacy capture remains best-effort
+        if strict:
+            raise
         return None
 
 
-def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
+def _title(rollout: list[dict], session_id: str | None = None, *, strict_sidecar=False) -> str | None:
     """What Codex calls this session, else the best name we can derive.
 
     Precedence, and why: MemHub should show the title Codex's own UI shows.
@@ -414,7 +431,7 @@ def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or _sidecar_thread_name(session_id))
+                   or _sidecar_thread_name(session_id, strict=strict_sidecar))
     if thread_name:
         return thread_name
 
@@ -439,7 +456,7 @@ def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
     return normalize_title(first_user or last_complete)
 
 
-def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
+def rollout_to_claude_records(rollout: list[dict], *, strict_sidecar=False) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -463,7 +480,7 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout, sm.get("id")),
+        "title": _title(rollout, sm.get("id"), strict_sidecar=strict_sidecar),
         "host": HOST,
     }
 
@@ -657,7 +674,10 @@ def rollout_uuid(path) -> str | None:
     return m.group(1) if m else None
 
 
-def _rollout_files() -> list[Path]:
+def _rollout_files(on_error=None) -> list[Path]:
+    if on_error is not None:
+        from .discovery import paths
+        return paths(_SESSIONS, ("**", "rollout-*.jsonl"), on_error)
     return [Path(f) for f in glob.glob(str(_SESSIONS / "**" / "rollout-*.jsonl"),
                                        recursive=True)]
 
@@ -668,38 +688,53 @@ def _rollout_files() -> list[Path]:
 _META_MAX_RECORDS = 200
 
 
+def session_metadata(path) -> dict:
+    """Read native session identity without reading prompt-derived titles."""
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for _ in range(_META_MAX_RECORDS):
+            line = handle.readline(1024 * 1024 + 1)
+            if not line:
+                break
+            if len(line) > 1024 * 1024:
+                raise ValueError("session metadata probe exceeded its line bound")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = _session_meta([record])
+            if payload:
+                git = payload.get("git")
+                return {
+                    "session_id": payload.get("id"),
+                    "cwd": payload.get("cwd"),
+                    "source_surface": payload.get("originator"),
+                    "started_at": payload.get("timestamp") or record.get("timestamp"),
+                    "git_branch": git.get("branch") if isinstance(git, dict) else None,
+                }
+    return {}
+
+
 def session_cwd(path) -> str | None:
-    """The directory this session was started in, from ``session_meta.cwd``.
-
-    Same read ``to_canonical`` already does through ``_session_meta``, without
-    parsing the rollout to get there.
-    """
+    """The native working directory, using the bounded session metadata read."""
     try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-            for _, line in zip(range(_META_MAX_RECORDS), handle):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, dict) or record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                cwd = payload.get("cwd") if isinstance(payload, dict) else None
-                return cwd if isinstance(cwd, str) and cwd else None
-    except OSError:
+        cwd = session_metadata(path).get("cwd")
+        return cwd if isinstance(cwd, str) and cwd else None
+    except (OSError, ValueError):
         return None
-    return None
 
 
-def list_sessions(limit: int = 20) -> list[dict]:
-    """Most recent rollouts, newest first."""
-    files = sorted(_rollout_files(), key=lambda f: f.stat().st_mtime, reverse=True)
-    return [{"id": rollout_uuid(f) or f.stem, "path": str(f),
-             "mtime": f.stat().st_mtime, "host": HOST, "cwd": None}
-            for f in files[:limit]]
+def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
+    """Most recent rollouts; discovery callers can receive access failures."""
+    rows = []
+    for path in _rollout_files(on_error):
+        try:
+            rows.append({"id": rollout_uuid(path) or path.stem, "path": str(path),
+                         "mtime": path.stat().st_mtime, "host": HOST, "cwd": None})
+        except OSError as error:
+            if on_error is None:
+                raise
+            on_error(error)
+    return sorted(rows, key=lambda row: row["mtime"], reverse=True)[:limit]
 
 
 def locate(ref: str) -> tuple[Path | None, str]:
@@ -728,6 +763,7 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path) -> tuple[list[dict], dict]:
+def to_canonical(path, *, strict_utf8: bool = False, strict_json: bool = False) -> tuple[list[dict], dict]:
     """Load a rollout and transform it to Claude-shaped records."""
-    return rollout_to_claude_records(load_rollout(path))
+    return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8, strict_json=strict_json),
+                                    strict_sidecar=strict_utf8 or strict_json)
