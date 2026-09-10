@@ -53,6 +53,9 @@ def receiver(label, order):
                       "records_new": len(args.get("messages", [])), "pending": 0}
             if controls["ack"]:
                 result["ack_through"] = (args.get("messages") or [{}])[-1].get("uuid")
+            if controls.get("partial_ack"):
+                result.update(ack_through=args["messages"][0]["uuid"],
+                              messages_received=len(args["messages"]), records_dropped=1)
             if controls["wrong_ack"]:
                 result["ack_through"] = "a-different-batch"
             error = controls["error"]
@@ -325,10 +328,25 @@ def test_acknowledgements_account_for_explicit_drops_without_accepting_a_wrong_b
     assert not capture_context.acknowledges({**response,"records_dropped":0},SID,records)
     assert not capture_context.acknowledges({**response,"messages_received":1},SID,records)
     assert not capture_context.acknowledges({**response,"ack_through":"other"},SID,records)
+    partial={**response,"messages_received":3}
+    three=records+[{"uuid":"remaining"}]
+    assert not capture_context.acknowledges(partial,SID,three)
+    assert capture_context.acknowledges({**partial,"records_dropped":2},SID,three)
+    assert not capture_context.acknowledges({**response,"messages_received":True},SID,records)
     all_dropped={**response,"records_dropped":2,"ack_through":None}
     assert capture_context.acknowledges(all_dropped,SID,[{},{}])
     assert not capture_context.acknowledges({**all_dropped,"conversation_id":"other"},SID,[{},{}])
     assert not capture_context.acknowledges({**all_dropped,"records_dropped":True},SID,[{},{}])
+
+
+def test_partial_ack_and_insufficient_drop_count_leave_the_destination_cursor_pinned():
+    with tempfile.TemporaryDirectory() as td,receiver("local",[]) as local,receiver("cloud",[]) as cloud:
+        home=Path(td);data=payload(home,3);configure(home,local[0]);cloud[2]["partial_ack"]=True
+        invoke(home,cloud[0],data)
+        assert state(home,"local",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
+        assert state(home,"cloud",local[0]).get("offset",0)==0
+        cloud[2]["partial_ack"]=False;invoke(home,cloud[0],data)
+        assert state(home,"cloud",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
 
 
 if __name__ == "__main__":

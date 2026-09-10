@@ -185,10 +185,12 @@ shared Cursor pins and separate capture/cloud-service health.
 ### Conversation hook delivery
 
 Each delivery freezes its selected destination for authentication, state,
-room routing and async work. Empty selection skips delivery. Claude per-turn and SessionEnd/commit/PR
-backstop capture support multiple active destinations. Codex and Cursor still
-reject multiple names until their corresponding
-delivery paths support independent progress.
+room routing and async work. Empty or invalid selection skips delivery. Cursor
+still preserves local per-generation usage and timestamp observations for a
+later read or configured delivery; this does not authenticate or upload.
+Claude per-turn and SessionEnd/commit/PR backstops support multiple active
+destinations. Codex and Cursor still require one destination until their
+corresponding delivery paths support independent progress.
 The installed endpoint keeps its existing room-cache namespace. Other remote
 endpoints use a digest of their complete URL, so one server cannot read or
 overwrite another server's cached room ID. Loopback never resolves cloud rooms.
