@@ -117,3 +117,16 @@ without breaking anyone.
 
 Version bumps matter beyond bookkeeping: the plugin cache is keyed by version,
 so a fix does not reach an existing install until the version changes.
+
+## Validation
+
+Run `bash scripts/check-plugin.sh` before proposing a change. It requires
+`python3` and `uv`, then runs every discovered suite and the flush shell test
+under both bare Python and the MCP SDK. It uses temporary account configuration;
+it does not install the plugin or read saved account credentials.
+
+The existing Ubuntu `guard` job runs the same command on pull requests. Suite
+failures fail that job; the version/packaging guard remains in place. There is
+one hosted job, with obsolete runs cancelled. Run the same command locally on
+macOS before merging plugin changes and record the tested source and OS in the
+PR. Hosted macOS runs are reserved for separately approved release validation.
