@@ -142,7 +142,8 @@ def test_cursor_restores_saved_pins_without_writing_capture_state():
         assert before_result.returncode == 0
         target = next(row for row in reversed(before[1:]) if row["type"] == "assistant")
         assert "usage" not in target["message"]
-        state = {"offset": 73, "record_ts": {target["uuid"]: STAMP},
+        state = {"source_kind": "transcript", "transcript_path": str(path),
+                 "offset": 73, "record_ts": {target["uuid"]: STAMP},
                  "usage_events": cursor_flush._usage_events_with({}, "synthetic-generation", target["uuid"],
                      {"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 0,
                       "cache_creation_input_tokens": 0})}
@@ -508,6 +509,45 @@ def test_complete_cursor_non_object_rows_are_incomplete_not_silently_skipped():
         path.write_bytes(original+b'{"unfinished":')
         result,rows=run(home,"cursor")
         assert result.returncode==0 and rows[1:]==cursor.to_canonical(path)[0]
+
+
+def test_cursor_pins_follow_the_saved_representation_and_reject_mismatched_paths():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=transcript(home)
+        _,before=run(home,"cursor")
+        target=next(row for row in reversed(before[1:]) if row["type"]=="assistant")
+        state_path=home/f".config/memhub-plugin/cursorflush/{SID}.json";state_path.parent.mkdir(parents=True)
+        state={"source_kind":"transcript","transcript_path":str(path),
+               "record_ts":{target["uuid"]:STAMP},"usage_events":cursor_flush._usage_events_with(
+                   {},"synthetic-generation",target["uuid"],{"input_tokens":7,"output_tokens":3})}
+        state_path.write_text(json.dumps(state));saved=state_path.read_bytes()
+        store=fixtures._make_cursor_store(home/".cursor/chats",uuid=SID)
+        original={p:p.read_bytes() for p in [path,store,store.parent/"meta.json"]}
+        result,rows=run(home,"cursor")
+        assert result.returncode==0 and rows[0]["path"]==str(path.resolve()),result.stderr
+        assistant=next(row for row in rows[1:] if row["uuid"]==target["uuid"])
+        assert assistant["timestamp"]==STAMP and assistant["message"]["usage"]["output_tokens"]==3
+        by_id,selected=run(home,"cursor","--session",SID)
+        assert by_id.returncode==0 and selected[1:]==rows[1:],by_id.stderr
+        result,explicit=run(home,"cursor","--session",str(path))
+        assert result.returncode==0 and explicit[1:]==rows[1:],result.stderr
+        result,wrong=run(home,"cursor","--session",str(store))
+        assert result.returncode==2 and wrong==[] and "session_unreadable" in result.stderr
+        assert state_path.read_bytes()==saved and all(p.read_bytes()==content for p,content in original.items())
+        for source_kind,recorded_path in [("transcript",str(home/"missing.jsonl")),("unknown",str(path)),(None,None)]:
+            state.update(source_kind=source_kind,transcript_path=recorded_path);state_path.write_text(json.dumps(state))
+            result,rows=run(home,"cursor")
+            assert result.returncode==2 and rows==[],(source_kind,result.stderr)
+        state.update(source_kind="store");state_path.write_text(json.dumps(state))
+        result,rows=run(home,"cursor","--session",str(path))
+        assert result.returncode==2 and rows==[]
+        result,rows=run(home,"cursor","--session",str(store))
+        assert result.returncode==0 and rows,result.stderr
+        duplicate=fixtures._make_cursor_store(home/"duplicate",uuid=SID)
+        alternate=home/f".cursor/chats/other-workspace/{SID}";alternate.parent.mkdir()
+        duplicate.parent.rename(alternate)
+        result,rows=run(home,"cursor","--session",str(store))
+        assert result.returncode==2 and rows==[],result.stderr
 
 
 if __name__ == "__main__":
