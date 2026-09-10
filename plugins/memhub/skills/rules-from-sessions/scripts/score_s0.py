@@ -366,6 +366,100 @@ def cmd_review(args) -> None:
     print(f"\n-> {out}/summary.json")
 
 
+# ------------------------------------------------------------------ judge
+JUDGE_RUBRIC = """\
+You are the second judge of a set of drafted team rules. Judge each row AS A \
+SET MEMBER, by five criteria; a row is ACTIVATABLE (verdict "A") only if all \
+five hold, otherwise REJECT ("R") with one reason word.
+
+1. It would change an action: a reader can name the next command, edit or \
+read it would alter. Not a summary, not an observation. (reject: no_action)
+2. The trigger can actually match: the regex or anchors would fire on the \
+shape of a real future action and would NOT fire on every member of that \
+family. Anchors must be identifiers or paths — a bare English word, a repo \
+name, or an identifier present in every call recalls everywhere. A trigger \
+that matches nothing and one that matches everything are the same reject. \
+(reject: unmatchable)
+3. It is not derivable: a new engineer would not learn it from the repo, its \
+tests, its docs or CLAUDE.md, and it is not already a team rule. (reject: \
+derivable)
+4. It is not project state: not "PR #N does X", not "we decided Y for this \
+ticket", not a restatement of an error message. (reject: project_state)
+5. It outlives the session: still true next month; not tied to one line, one \
+branch, one PR that will merge, one bug. (reject: one_off)
+Also reject a row that duplicates another row in the set (reject: duplicate, \
+keep the better-triggered one) or that states something false (reject: wrong).
+
+Be strict: an activated rule fires in every teammate's sessions. Answer for \
+every row by calling the StructuredOutput tool; never ask a question."""
+
+JUDGE_SCHEMA = {"type": "object", "properties": {"verdicts": {"type": "array", "items": {
+    "type": "object", "properties": {
+        "index": {"type": "integer"}, "verdict": {"type": "string", "enum": ["A", "R"]},
+        "reason": {"type": "string", "enum": ["", "no_action", "unmatchable", "derivable",
+                                              "project_state", "one_off", "duplicate", "wrong"]},
+        "why": {"type": "string"}},
+    "required": ["index", "verdict", "reason", "why"]}}},
+    "required": ["verdicts"]}
+
+
+def cmd_judge(args) -> None:
+    """A second judge over a run's rows: a fresh headless model with the
+    rubric and nothing else — no session, no first judge's verdicts — so the
+    pass is independent of whoever built the pipeline. Reports the score
+    under each judge and their agreement. Not a human; the scorecard says so."""
+    hs = _load_stop()
+    rows = json.loads(Path(args.rows).read_text(encoding="utf-8"))
+    L = [f"{len(rows)} ROWS:"]
+    for i, r in enumerate(rows, 1):
+        engine = {k: r[k] for k in ("matcher", "ordering", "anchors") if k in r}
+        L += [f"[{i}] {r.get('title', '')}", f"    statement: {r.get('statement', '')}",
+              f"    trigger: {json.dumps(engine, ensure_ascii=False)}", ""]
+    cmd = ["claude", "-p", "--model", args.model, "--safe-mode", "--output-format", "json",
+           "--json-schema", json.dumps(JUDGE_SCHEMA), "--no-session-persistence",
+           "--disallowedTools", "Bash", "Read", "Edit", "Write", "MultiEdit", "Agent",
+           "Grep", "Glob", "WebSearch", "WebFetch", "--append-system-prompt", JUDGE_RUBRIC]
+    hx = _load_extract()
+    t0 = time.time()
+    proc = subprocess.run(cmd, input="\n".join(L), capture_output=True, text=True,
+                          timeout=args.timeout, env=hx.child_env())
+    if proc.returncode != 0:
+        sys.exit(f"judge failed: exit {proc.returncode}: {proc.stderr[-300:]}")
+    env = json.loads(proc.stdout)
+    verdicts = (env.get("structured_output") or {}).get("verdicts") or []
+    got = {v["index"]: v for v in verdicts if isinstance(v, dict) and isinstance(v.get("index"), int)}
+    missing = [i for i in range(1, len(rows) + 1) if i not in got]
+    A2 = {i for i, v in got.items() if v.get("verdict") == "A"}
+    out = {"model": args.model, "rows": len(rows), "judged": len(got), "missing": missing,
+           "A": sorted(A2), "R": {}, "why": {str(i): v.get("why", "")[:200] for i, v in got.items()},
+           "score": round(len(A2) / max(len(rows), 1), 3), "seconds": round(time.time() - t0, 1)}
+    for i, v in got.items():
+        if v.get("verdict") != "A":
+            out["R"].setdefault(v.get("reason") or "unspecified", []).append(i)
+    print(f"judge 2 ({args.model}): {len(A2)}/{len(rows)} activatable = {out['score']}"
+          f" | rejects {({k: len(v) for k, v in out['R'].items()})} | {out['seconds']}s")
+    if args.against:
+        v1 = json.loads(Path(args.against).read_text(encoding="utf-8"))
+        A1 = set(v1["A"])
+        both = A1 & A2
+        agree = len(both) + len(set(range(1, len(rows) + 1)) - A1 - A2)
+        p_o = agree / len(rows)
+        p1, p2 = len(A1) / len(rows), len(A2) / len(rows)
+        p_e = p1 * p2 + (1 - p1) * (1 - p2)
+        kappa = (p_o - p_e) / (1 - p_e) if p_e < 1 else 1.0
+        out.update({"judge1_A": sorted(A1), "agreement": round(p_o, 3), "kappa": round(kappa, 3),
+                    "both_A": sorted(both), "only_judge1": sorted(A1 - A2), "only_judge2": sorted(A2 - A1),
+                    "score_judge1": round(len(A1) / len(rows), 3),
+                    "score_both_agree": round(len(both) / len(rows), 3),
+                    "score_either": round(len(A1 | A2) / len(rows), 3)})
+        print(f"judge 1: {len(A1)}/{len(rows)} = {out['score_judge1']} | agreement {out['agreement']}"
+              f" kappa {out['kappa']} | both agree {len(both)} ({out['score_both_agree']})"
+              f" | only judge 1 {sorted(A1 - A2)} | only judge 2 {sorted(A2 - A1)}")
+    if args.out:
+        Path(args.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
+        print(f"-> {args.out}")
+
+
 # ----------------------------------------------------------------- router
 def cmd_router(args) -> None:
     """Router hits per kind over a corpus. No model calls, no cost.
@@ -671,6 +765,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--corpus", required=True)
     r.add_argument("--out", default="")
 
+    j = sub.add_parser("judge", help="a second judge (fresh headless model) over a run's rows")
+    j.add_argument("--rows", required=True, help="rows.json of a run")
+    j.add_argument("--against", default="", help="the first judge's verdicts JSON, for agreement")
+    j.add_argument("--model", default="opus")
+    j.add_argument("--timeout", type=int, default=600)
+    j.add_argument("--out", default="")
+
     rv = sub.add_parser("review", help="the post-session review over a corpus run's drafts")
     rv.add_argument("--run", required=True, help="a `corpus` run directory (rows.json, *.drafts.jsonl)")
     rv.add_argument("--corpus", required=True)
@@ -696,7 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     {"gold": cmd_gold, "router": cmd_router, "corpus": cmd_corpus,
-     "review": cmd_review}[args.mode](args)
+     "review": cmd_review, "judge": cmd_judge}[args.mode](args)
     return 0
 
 

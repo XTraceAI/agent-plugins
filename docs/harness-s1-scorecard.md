@@ -24,8 +24,8 @@ sessions. The server author drafts 117 rows of which 37 are activatable
 (0.32, under the 0.5 gate). A keep/drop review agent over those rows does
 not repair them (0.35). The local agent authoring from the classifier's
 flagged moments, with the whole session in front of it, drafts 20 rows of
-which 14 are activatable (**0.70**, above S0's 0.68 and the gate), at
-under one row per session. The judge is fine either way: recall 0.93 on
+which 14 are activatable by the first judge (**0.70**) and 10 by a majority
+of three readers (**0.50**, on the gate), at under one row per session. The judge is fine either way: recall 0.93 on
 the gold set. What S0 had for free and the server author lost was the
 refusal rate; the local agent, given the session, has it back.
 
@@ -50,13 +50,14 @@ first two are what it replaces.
 | metric | S0 | S1 · server author, before review | S1 · server author + keep/drop review agent | **S1 · classifier → local agent mines** | target |
 |---|---|---|---|---|---|
 | judge recall on `clf_gold.json` | 0.85 completed · 0.77 end-to-end | **0.93** (40 / 43), 138 of 140 completed | same classifier | same classifier | ≥ 0.85 **PASS** |
-| rows a human would activate ÷ rows drafted | 0.68 (21 / 31) | 0.32 (37 / 117) | 0.35 (29 / 84) | **0.70 (14 / 20)** | ≥ 0.5 **PASS** |
+| rows a human would activate ÷ rows drafted | 0.68 (21 / 31) | 0.32 (37 / 117) — 0.36 by majority of three readers | 0.35 (29 / 84) | **0.70 (14 / 20)** judge 1 — **0.50 by majority of three readers**, 0.20–0.70 across them | ≥ 0.5 **ON THE GATE** |
 | drafts per session | max 5 · mean 1.29 | max 8 · mean 4.88, 12 sessions at the cap | max 8 · mean 4.67 | **max 2 · mean 0.83** | ≤ 8 **PASS** |
 | duplicate rows within a run | 0 lexical · 2 semantic | 0 lexical · 5 semantic (by hand) | 0 · 4 | **0 · 0** | report **PASS** |
 | router regex precision | 0.015 | 0.25 as a hint; 5 / 12 activatable | — | hint carried on 48 of 426 moments | report |
 
-**All five rows are met by the third pipeline; two of five miss on the
-first two.** One judge, not two.
+**Four of five rows are met by the third pipeline and the fifth sits on
+the gate; two of five miss on the first two.** See the readers section: the
+activate number moves 0.20–0.70 with the reader.
 
 ### Supporting numbers
 
@@ -228,6 +229,41 @@ anchor rows survived.
 The first is exactly the cross-teammate twin the server-side check (§5.1)
 exists for. None of the five is lexical, and the client's Jaccard saw none
 of them — S0 Finding 5, unchanged.
+
+## Three readers, no agreement — the gate is not measurable by one reader
+
+The rubric asks for two people judging independently. Two more readers were
+run over the same rows: fresh headless models (`score_s0.py judge`, opus
+and sonnet, `--safe-mode`, no session, no first judge's verdicts, the rubric
+verbatim and nothing else). They are not humans; they are what could be
+obtained overnight, and they disagree with the first judge and with each
+other about as much as chance would.
+
+| rows | judge 1 (the pipeline's author) | opus | sonnet | majority of three | all three |
+|---|---|---|---|---|---|
+| 117, server author | 37/117 = 0.32 | 18/117 = 0.15 | 104/117 = 0.89 | **42/117 = 0.36** | 11/117 = 0.09 |
+| 20, local agent mines | 14/20 = 0.70 | 4/20 = 0.20 | 14/20 = 0.70 | **10/20 = 0.50** | 3/20 = 0.15 |
+
+Pairwise Cohen's κ — judge 1/opus 0.24 and 0.03, judge 1/sonnet
+0.06 and -0.19, opus/sonnet 0.04 and 0.19 (server rows, mined
+rows). Sonnet accepts nearly everything; opus rejects nearly everything and
+its reasons are often right (one mined row tells the agent to expect a
+block on reading `~/.claude/projects`, which this repo's own mining tooling
+reads by design; another says re-point pip at public PyPI on a 401 when the
+401 means the token expired). Judge 1 sits between them.
+
+What survives every reader: the *ordering* under the two discriminating
+readers (mining ≥ server author: 0.70 vs 0.32 for judge 1, 0.20 vs 0.15 for
+opus; sonnet, which accepts 89% of anything, inverts it), the yield per
+session (0.83 vs 4.88), duplicates (0 vs 5), and the three rows every reader
+accepted — mergeability lags a push, `share_agent_brain` demotes a grant,
+SQLite tests drop `postgresql_where` indexes.
+
+So the scorecard's activate row should be read as **"0.50 by majority of
+three readers, between 0.20 and 0.70 depending on the reader"**, not as
+0.70. It sits on the gate, not over it. And the gate itself needs what the
+spec asked for and S0 and S1 both lacked: two humans, judged independently,
+then adjudicated — a model reader is a third opinion, not a substitute.
 
 ## Findings
 
