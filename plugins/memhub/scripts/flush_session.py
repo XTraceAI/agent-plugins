@@ -115,7 +115,7 @@ def _breadcrumb(session_id, reason: str, detail: str = "",
                           last_error_detail=(detail or "")[:200] or None,
                           last_error_at=time.time())
         atomic_write.publish(
-            capture_context.state_directory(_SESSION_STATE_DIR) / f"{session_id}.sessionflush.json",
+            capture_context.state_directory(_SESSION_STATE_DIR) / f"{capture_context.session_file_key(session_id)}.sessionflush.json",
             json.dumps(record))
     except Exception:  # noqa: BLE001
         pass
@@ -624,7 +624,7 @@ def _run_sink(hook_input: dict) -> int:
             return 0
         directory = capture_context.state_directory(_SESSION_STATE_DIR)
         directory.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(directory / f"{session_id}.sessionflush.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = os.open(directory / f"{capture_context.session_file_key(session_id)}.sessionflush.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             portable_lock.lock_exclusive(lock_fd, blocking=False)
         except OSError:

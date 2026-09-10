@@ -327,6 +327,8 @@ Run `python3 tests/backstop_sinks_test.py` for dual delivery, independent cloud
 failure/recovery, replay, provenance, old-cloud compatibility, missing surface,
 slow response deadlines, bounded record batches and concurrent backstop locks.
 
+Claude delivery keeps native session IDs unchanged on the wire. IDs longer than 200 ASCII characters use a reserved-prefix SHA-256 key for local lock/state filenames, leaving room for atomic-write temporary suffixes. Short IDs retain their existing filenames. Existing long-ID cursors can replay once into the new filename; the unchanged native IDs preserve server deduplication.
+
 
 ### Codex delivery to multiple destinations
 

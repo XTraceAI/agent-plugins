@@ -163,6 +163,25 @@ def test_slow_local_preparation_preserves_cloud_budget_and_cannot_commit_late():
         assert not state(home,"local",local[0]).get("last_ok_at")
 
 
+def test_long_native_ids_capture_through_both_claude_hooks_with_bounded_state_names():
+    for length in (200,201,237,238,256):
+        with tempfile.TemporaryDirectory() as td,cases.receiver("local",[]) as local,cases.receiver("cloud",[]) as cloud:
+            home=Path(td);data=cases.payload(home);cases.configure(home,local[0])
+            sid="s"*length;data["session_id"]=sid
+            cases.invoke(home,cloud[0],data);backstop(home,cloud[0],data)
+            for receiver in (local,cloud):
+                batches=cases.routing.imports(receiver[1])
+                assert len(batches)==2,(length,len(batches))
+                assert all(batch["conversation_id"]==sid for batch in batches)
+            for name in ("local","cloud"):
+                folder=cases.directory(home,name,local[0]);files=list(folder.iterdir())
+                assert all(len(path.name.encode())<=255 for path in files)
+                turn=next(path for path in files if path.suffix==".json" and ".sessionflush." not in path.name)
+                stop=next(path for path in files if path.name.endswith(".sessionflush.json"))
+                assert json.loads(turn.read_text())["offset"]>0
+                assert json.loads(stop.read_text())["last_ok_at"]>0
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
