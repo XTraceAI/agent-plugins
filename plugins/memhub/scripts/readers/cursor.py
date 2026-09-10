@@ -389,6 +389,13 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
                 if strict_json:
                     raise
                 return
+            if strict_json:
+                if not isinstance(msg, dict) or msg.get("role") not in ("system", "user", "assistant", "tool"):
+                    raise ValueError("Cursor store leaf has no supported message role")
+                content = msg.get("content")
+                if not isinstance(content, (str, list)) or (isinstance(content, list)
+                        and any(not isinstance(block, dict) for block in content)):
+                    raise ValueError("Cursor store message has invalid content")
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
@@ -609,7 +616,10 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
                     f"cursor transcript {path} line {line_no} exceeds 8 MiB")
             terminated = raw.endswith((b"\n", b"\r"))
             try:
-                entry = json.loads(raw.decode("utf-8"))
+                # JSON-only validation permits replacement decoding. Leaving
+                # both flags off retains legacy unfinished-byte-tail handling.
+                errors = "replace" if strict_json and not strict_utf8 else "strict"
+                entry = json.loads(raw.decode("utf-8", errors=errors))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 if not terminated and not (strict_utf8 and isinstance(exc, UnicodeDecodeError)):
                     # Cursor appends records. A hook can race the writer, so a
