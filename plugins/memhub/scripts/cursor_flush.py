@@ -56,16 +56,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import capture_context  # noqa: E402
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
+from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly  # noqa: E402
+from room_map import git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 _CURSOR_PROJECTS = Path.home() / ".cursor" / "projects"
@@ -217,11 +217,31 @@ def _state_path(uuid: str) -> Path:
     return STATE_DIR / f"{_safe_uuid(uuid)}.json"
 
 
-def _read_state(uuid: str) -> dict:
+# Native observations belong to the session, not to an upload destination.
+# Keep these in the original file so readers_cli sees exactly the hook's pins.
+_SHARED_STATE_FIELDS = frozenset({
+    "usage_events", "record_ts", "cursor_meta", "source_kind", "transcript_path",
+})
+
+
+def _state_at(path: Path) -> dict:
     try:
-        return json.loads(_state_path(uuid).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
         return {}
+
+
+def _delivery_path(uuid: str) -> Path:
+    return capture_context.state_directory(STATE_DIR) / f"{_safe_uuid(uuid)}.json"
+
+
+def _read_state(uuid: str) -> dict:
+    shared = _state_at(_state_path(uuid))
+    if _delivery_path(uuid) == _state_path(uuid):
+        return shared
+    return {**{key: value for key, value in shared.items() if key in _SHARED_STATE_FIELDS},
+            **_state_at(_delivery_path(uuid))}
 
 
 def _save_state(uuid: str, **fields) -> None:
@@ -244,9 +264,24 @@ def _save_state(uuid: str, **fields) -> None:
     try:
         if fh is not None:
             portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
-        state = _read_state(uuid)
-        state.update(fields)
-        atomic_write.publish(_state_path(uuid), json.dumps(state))
+        if _delivery_path(uuid) == _state_path(uuid):
+            state = _read_state(uuid)
+            state.update(fields)
+            atomic_write.publish(_state_path(uuid), json.dumps(state))
+        else:
+            # The original lock serializes pins and both destination files.
+            # A partial failure can only cause a retry, never acknowledge an
+            # upload that did not commit. Pin updates precede delivery state.
+            shared = {key: value for key, value in fields.items() if key in _SHARED_STATE_FIELDS}
+            delivery = {key: value for key, value in fields.items() if key not in _SHARED_STATE_FIELDS}
+            if shared:
+                state = _state_at(_state_path(uuid))
+                state.update(shared)
+                atomic_write.publish(_state_path(uuid), json.dumps(state))
+            if delivery:
+                state = _state_at(_delivery_path(uuid))
+                state.update(delivery)
+                atomic_write.publish(_delivery_path(uuid), json.dumps(state))
     finally:
         if fh is not None:
             try:
@@ -1012,6 +1047,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
         "source_platform": cursor_reader.HOST,
+        **capture_context.identity(uuid, lambda: cursor_reader.session_metadata(source_path)),
         "flush": flush_mode,
     }
     if room:
@@ -1123,10 +1159,12 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
+@capture_context.entrypoint
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
         payload = json.loads(sys.stdin.read() or "{}")
+        capture_context.observe(payload)
     except json.JSONDecodeError:
         payload = {}
 

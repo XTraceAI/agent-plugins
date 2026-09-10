@@ -49,12 +49,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import capture_context  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 import pr_provenance  # noqa: E402
-from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
-from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
-from room_map import env_for_url, forget_room  # noqa: E402
+from _memhub_auth import NonInteractiveAuthRequired  # noqa: E402
+from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
+from brain_resolve import is_missing_brain  # noqa: E402
+from room_map import forget_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -110,7 +112,7 @@ def _breadcrumb(session_id, reason: str, detail: str = "",
                           last_error_detail=(detail or "")[:200] or None,
                           last_error_at=time.time())
         atomic_write.publish(
-            _SESSION_STATE_DIR / f"{session_id}.sessionflush.json",
+            capture_context.state_directory(_SESSION_STATE_DIR) / f"{session_id}.sessionflush.json",
             json.dumps(record))
     except Exception:  # noqa: BLE001
         pass
@@ -342,6 +344,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "messages": payload,
             "conversation_id": session_id,
             "source_platform": "claude",
+            **capture_context.identity(session_id),
         }
         if provenance:
             arguments["provenance"] = provenance
@@ -585,6 +588,7 @@ def _auth_required(e: BaseException) -> bool:
     return False
 
 
+@capture_context.entrypoint
 def main() -> int:
     # Bound BEFORE the try, because the handler reads them. Assigned inside it,
     # any failure earlier in the block — a malformed stdin payload is enough —
@@ -595,9 +599,10 @@ def main() -> int:
     started = time.monotonic()
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
+        capture_context.observe(hook_input)
         session_id = hook_input.get("session_id")
         transcript_path = hook_input.get("transcript_path")
-        if not session_id or not transcript_path or not Path(transcript_path).exists():
+        if not capture_context.valid_session_id(session_id) or not transcript_path or not Path(transcript_path).exists():
             _log("missing session_id/transcript_path; skipping")
             return 0
         # SessionEnd carries no tool_input; it reports its reason instead.
