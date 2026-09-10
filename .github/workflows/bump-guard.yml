@@ -14,13 +14,16 @@
 name: bump-guard
 on:
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+concurrency:
+  group: plugin-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
   guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,6 +33,7 @@ jobs:
           python3 tests/version_parity_test.py
           python3 tests/registration_test.py
       - name: Require a version bump when shipped plugin code changes
+        if: github.base_ref == 'main'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -61,3 +65,10 @@ jobs:
           echo "Either bump every manifest (the release train, see RELEASING.md)" >&2
           echo "or add the 'bump-exempt' label to assert this change is inert." >&2
           exit 1
+      - name: Install the tested uv version
+        run: |
+          python3 -m venv "$RUNNER_TEMP/plugin-tools"
+          "$RUNNER_TEMP/plugin-tools/bin/python" -m pip install --disable-pip-version-check 'uv==0.11.2'
+          echo "$RUNNER_TEMP/plugin-tools/bin" >> "$GITHUB_PATH"
+      - name: Run full plugin suites under bare Python and the MCP SDK
+        run: bash scripts/check-plugin.sh
