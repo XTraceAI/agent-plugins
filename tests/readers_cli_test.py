@@ -406,6 +406,9 @@ def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted(
                 assert result.returncode==2 and "discovery_incomplete" in result.stderr
                 headers=[row for row in rows if row.get("type")=="session"]
                 assert len(headers)==1 and headers[0]["path"]==str(healthy.resolve())
+            native_id=(codex.session_metadata(original)["session_id"] if host=="codex" else original.parent.name)
+            result,rows=run(home,host,"--session",native_id,"--metadata-only")
+            assert result.returncode==2 and rows==[] and "discovery_incomplete" in result.stderr,result.stderr
             # Latest retains native ordering, but cannot hide another copy of
             # its actual identity. Both metadata and full reads fail closed.
             os.utime(original,(MTIME+100,MTIME+100))
@@ -423,6 +426,8 @@ def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted(
             else:duplicate.unlink()
             result,rows=run(home,host,"--session","latest")
             assert result.returncode==0 and rows[0]["path"]==str(original.resolve()),result.stderr
+            result,rows=run(home,host,"--session",native_id,"--metadata-only")
+            assert result.returncode==0 and rows[0]["native_session_id"]==native_id,result.stderr
             # An explicit native path remains an unambiguous request.
             result,rows=run(home,host,"--session",str(original),"--metadata-only")
             assert result.returncode==0 and len(rows)==1,result.stderr
@@ -565,6 +570,20 @@ def test_cursor_pins_follow_the_saved_representation_and_reject_mismatched_paths
         duplicate.parent.rename(alternate)
         result,rows=run(home,"cursor","--session",str(store))
         assert result.returncode==2 and rows==[],result.stderr
+
+
+def test_native_id_selection_cannot_substitute_a_misleading_rollout_filename():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home);actual=codex.session_metadata(path)["session_id"]
+        misleading="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert misleading!=actual
+        path.rename(path.with_name(f"rollout-2026-01-01T00-00-00-{misleading}.jsonl"))
+        result,rows=run(home,"codex","--session",misleading)
+        assert result.returncode==2 and rows==[] and "session_unavailable" in result.stderr
+        result,rows=run(home,"codex","--session",actual)
+        assert result.returncode==0 and rows[0]["native_session_id"]==actual,result.stderr
+        result,rows=run(home,"codex","--session","x"*5000)
+        assert result.returncode==2 and rows==[] and "Traceback" not in result.stderr
 
 
 if __name__ == "__main__":
