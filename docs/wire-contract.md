@@ -353,7 +353,11 @@ loopback first. Each endpoint owns its upload revision/blob set, acknowledged
 usage generations, provenance, backoff, dormancy and long-running upload lock.
 A held or slow cloud upload cannot block local capture or shared observations.
 The overall 240-second budget includes lock waits and reserves time for every
-remaining destination. Authentication and transport use cancellable waits.
+remaining destination. Initial observation gets a reserved share too. Source
+lookup, store/blob reads, canonicalization, redaction, metadata lookup,
+authentication and transport use cancellable daemon-worker waits. Workers only
+prepare values; the waiting owner publishes observations and delivery progress,
+so completion after a timeout cannot write late state or initiate an upload.
 
 The existing canonical reader supplies records; redaction is cached within the
 invocation. Requests retain byte-sized slices and contain at most 2,000 records.
@@ -366,7 +370,8 @@ preserved; old-cloud optional-field fallback does not alter record content.
 
 Run `python3 tests/cursor_sinks_test.py` for failure/recovery, both late-usage
 arrival orders, canonical parity, raw/unknown surfaces, legacy cloud dormancy,
-partial batches, bounded slow responses, busy destination locks and concurrent
+partial batches, slow preparation without late writes, bounded slow responses,
+busy destination locks and concurrent
 observation updates during an in-flight upload. Existing Cursor capture, usage
 and timestamp suites remain part of the full plugin check.
 

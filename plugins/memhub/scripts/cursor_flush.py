@@ -948,7 +948,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     shipped: set[str] | None = None
     try:
         if source_kind == "store":
-            shipped = blob_ids & current_blob_ids(source_path)
+            shipped = blob_ids & await capture_async.blocking(current_blob_ids, source_path)
     except Exception as e:  # noqa: BLE001 — see below
         # Unreadable mid-flush: we cannot say which blobs survived the read,
         # so the watermark is left ALONE rather than advanced to the gate set
@@ -984,7 +984,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
             pending_pr_urls=pending_pr_urls,
             accepted_pr_urls=accepted_pr_urls,
         )
-    sendable = redact_once(elide_oversized_tool_results(records))
+    sendable = await capture_async.blocking(_prepare_sendable, records)
     if not sendable:
         if records:
             _log(f"all {len(records)} record(s) redacted away — nothing to "
@@ -1068,6 +1068,8 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
             _log(f"ignoring unusable cwd from Cursor source: {str(cwd)[:60]!r}")
         room, namespace = None, None
 
+    source_identity = await capture_async.blocking(lambda: capture_context.identity(
+        uuid, lambda: cursor_reader.session_metadata(source_path), include_cloud=True))
     arguments = {
         "messages": sendable,
         # Host-namespaced so server-side watermarks never collide across
@@ -1076,7 +1078,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
         "source_platform": cursor_reader.HOST,
-        **capture_context.identity(uuid, lambda: cursor_reader.session_metadata(source_path), include_cloud=True),
+        **source_identity,
         "flush": flush_mode,
     }
     if room:
@@ -1168,7 +1170,38 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
-def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
+def _prepare_source(uuid, payload, state):
+    """Read and canonicalize only; a timed-out worker cannot publish observations."""
+    source_kind, source_path, error = _source_for(uuid, payload, state)
+    if source_kind is None or source_path is None:
+        raise ValueError(error or "no readable Cursor source")
+    cursor_meta = _payload_meta(payload, state)
+    blob_ids = set()
+    if source_kind == "store":
+        blob_ids = current_blob_ids(source_path)
+        if not blob_ids:
+            raise ValueError("store reports zero blobs (rebuilding?)")
+        records, meta = cursor_reader.to_canonical(source_path)
+    else:
+        records, meta = cursor_reader.to_canonical(
+            source_path, session_id=uuid,
+            cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
+    # Content identity precedes timestamp and usage enrichment on the owner.
+    revision = _records_revision(records) if source_kind == "transcript" else None
+    return source_kind, source_path, cursor_meta, blob_ids, records, meta, revision
+
+
+async def _bounded_source(uuid, payload, state, timeout):
+    return await asyncio.wait_for(
+        capture_async.blocking(_prepare_source, uuid, payload, state), timeout)
+
+
+def _prepare_sendable(records):
+    return redact_once(elide_oversized_tool_results(records))
+
+
+def _capture_sink(payload: dict, *, observations_only: bool = False,
+                  timeout: float | None = None) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     started = time.monotonic()
     capture_context.observe(payload)
@@ -1216,7 +1249,7 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
-        budget = capture_context.time_budget() or FLUSH_TIMEOUT_S
+        budget = timeout if timeout is not None else capture_context.time_budget() or FLUSH_TIMEOUT_S
         remaining = max(0.0, budget - (time.monotonic() - started))
         if remaining <= 0:
             return 0
@@ -1249,30 +1282,15 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
                     "pending_pr_urls": pending_pr_urls,
                     "accepted_pr_urls": accepted_pr_urls,
                 }
-            source_kind, source_path, err = _source_for(uuid, payload, state)
-            if source_kind is None or source_path is None:
-                _log(f"{event}: {err or 'no readable Cursor source'}")
+            remaining = max(0.0, budget - (time.monotonic() - started))
+            if remaining <= 0:
                 return 0
-
-            cursor_meta = _payload_meta(payload, state)
-            blob_ids: set[str] = set()
-            source_revision: str | None = None
             try:
-                if source_kind == "store":
-                    blob_ids = current_blob_ids(source_path)
-                    if not blob_ids:
-                        # A readable empty store is mid-rebuild. Leave every
-                        # watermark untouched so the next hook retries it.
-                        _log(f"{event}: store reports zero blobs (rebuilding?) — "
-                             "skipping")
-                        return 0
-                    records, meta = cursor_reader.to_canonical(source_path)
-                else:
-                    records, meta = cursor_reader.to_canonical(
-                        source_path, session_id=uuid,
-                        cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
-            except Exception as e:  # locked/partial/corrupt source — next hook retries
-                _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
+                (source_kind, source_path, cursor_meta, blob_ids,
+                 records, meta, source_revision) = asyncio.run(
+                    _bounded_source(uuid, payload, state, remaining))
+            except Exception as error:  # unreadable/slow source: no observation or delivery advance
+                _log(f"{event}: source preparation deferred ({type(error).__name__})")
                 return 0
 
             # Native observations are shared before destination selection or
@@ -1304,16 +1322,6 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
                   any(key in payload for key in _HOOK_USAGE_KEYS)):
                 _log(f"{event}: malformed token counters or generation_id — "
                      "leaving this turn unmeasured")
-
-            if source_kind == "transcript":
-                # Content identity only — computed BEFORE _stamp_records and
-                # _apply_usage mutate the records. The send gate answers "is
-                # there new CONTENT?"; it must never re-fire because a timestamp
-                # pin was minted or upgraded (stamps ride along on whatever send
-                # happens, and pending usage forces its own send via
-                # usage_pending). Hashing post-stamp would couple the gate's
-                # stability to the pin map rather than the source content.
-                source_revision = _records_revision(records)
 
             applied_usage = _apply_usage(records, usage_events)
             sent_usage = set(state.get("sent_usage_generations") or [])
@@ -1367,9 +1375,10 @@ def _capture_sink(payload: dict, *, observations_only: bool = False) -> int:
     return 0
 
 
-def _run_sink(payload: dict, *, observations_only: bool = False) -> int:
+def _run_sink(payload: dict, *, observations_only: bool = False,
+              timeout: float | None = None) -> int:
     try:
-        return _capture_sink(payload, observations_only=observations_only)
+        return _capture_sink(payload, observations_only=observations_only, timeout=timeout)
     except Exception as error:
         _log(f"destination capture deferred ({type(error).__name__})")
     return 0
@@ -1381,12 +1390,16 @@ def main() -> int:
         if not isinstance(payload, dict):
             return 0
         started = time.monotonic()
-        _run_sink(payload, observations_only=True)
+        selected = capture_context.resolve_capture_sinks()
+        # Reserve source observation a share too, so a slow first read cannot
+        # consume every destination's chance. Selection stays fixed for this hook.
+        _run_sink(payload, observations_only=True,
+                  timeout=FLUSH_TIMEOUT_S / (len(selected) + 1))
         token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
         try:
             remaining = max(0.0, FLUSH_TIMEOUT_S - (time.monotonic() - started))
             if remaining:
-                capture_context.deliver(payload, _run_sink, remaining)
+                capture_context.deliver(payload, _run_sink, remaining, selected=selected)
         finally:
             _REDACTION_CACHE.reset(token)
     except Exception as error:
