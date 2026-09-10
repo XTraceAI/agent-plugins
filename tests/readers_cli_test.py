@@ -497,6 +497,19 @@ def test_codex_title_sidecar_is_strict_only_for_full_discovery_reads():
         assert result.returncode==0 and rows[0]["title"]=="complete title",result.stderr
 
 
+def test_complete_cursor_non_object_rows_are_incomplete_not_silently_skipped():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=transcript(home);original=path.read_bytes()
+        for row in [b'null\n',b'17\n',b'[]\n',b'null',b'{"role":"user","message":null}\n']:
+            path.write_bytes(original+row);before=path.read_bytes()
+            result,rows=run(home,"cursor")
+            assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
+            assert path.read_bytes()==before and "Traceback" not in result.stderr
+        path.write_bytes(original+b'{"unfinished":')
+        result,rows=run(home,"cursor")
+        assert result.returncode==0 and rows[1:]==cursor.to_canonical(path)[0]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

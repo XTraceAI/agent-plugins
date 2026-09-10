@@ -560,7 +560,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 _MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
 
 
-def _load_transcript(path: Path, *, strict_utf8: bool = False) -> list[tuple[dict, str | None]]:
+def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, str | None]]:
     """Read Cursor hook JSONL, ignoring only an unfinished final line.
 
     A message's clock is its OWN embedded ``<timestamp>`` tag (user turns
@@ -595,11 +595,17 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False) -> list[tuple[dic
                     break
                 raise ValueError(
                     f"cursor transcript {path} line {line_no} is invalid JSON") from exc
-            if not isinstance(entry, dict) or entry.get("role") not in (
+            if not isinstance(entry, dict):
+                if strict_json:
+                    raise ValueError("Cursor transcript row is not an object")
+                continue
+            if entry.get("role") not in (
                     "system", "user", "assistant", "tool"):
                 continue
             body = entry.get("message")
             if not isinstance(body, dict):
+                if strict_json:
+                    raise ValueError("Cursor transcript message is not an object")
                 continue
             message = dict(body)
             message["role"] = entry["role"]
@@ -617,7 +623,7 @@ def to_canonical(path, *, session_id: str | None = None,
     source = Path(path)
     if source.name != "store.db":
         sid = session_id or source.stem
-        messages = _load_transcript(source, strict_utf8=strict_utf8)
+        messages = _load_transcript(source, strict_utf8=strict_utf8, strict_json=strict_json)
         # The banner's clock: the first embedded user-turn tag — the earliest
         # source-carried instant the transcript offers (None when it offers
         # none; the flush's first-seen stamp covers live sessions).
