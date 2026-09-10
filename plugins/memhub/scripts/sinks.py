@@ -30,6 +30,8 @@ def _name(value) -> str:
             or not value.isascii()
             or any(not (char.isalnum() or char in "_-") for char in value)):
         raise SinkConfigError("capture sink names must use letters, digits, '_' or '-'")
+    if re.fullmatch(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])", value, re.IGNORECASE):
+        raise SinkConfigError("capture sink name is reserved by the operating system")
     return value
 
 

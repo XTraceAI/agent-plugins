@@ -340,6 +340,16 @@ def test_noncanonical_numeric_ipv4_endpoints_reject_before_credentials():
                 assert sinks.resolve_capture_auth(sinks.Sink("selected", selected), refresh=False) == (selected, None)
 
 
+def test_reserved_windows_device_names_cannot_be_sink_directories():
+    with isolated() as (_, config):
+        for name in ["CON", "con", "PrN", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9"]:
+            configured(config, entries=[{"name":name,"url":"https://cloud.example.test"}], active=[name])
+            rejected(sinks.resolve_capture_sink)
+        for name in ["console", "auxiliary", "com0", "lpt10", "con_local", "local"]:
+            configured(config, entries=[{"name":name,"url":"https://cloud.example.test"}], active=[name])
+            assert sinks.resolve_capture_sink().name==name
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
