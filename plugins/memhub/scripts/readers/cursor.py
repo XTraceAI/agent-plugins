@@ -369,7 +369,7 @@ def _validate_message(message):
         allowed = ("reasoning", "text", "tool-call", "tool_use") if role == "assistant" else ("tool-result",)
         if kind not in allowed:
             raise ValueError("Cursor message has unsupported content block")
-        if kind in ("text", "reasoning") and block.get("text") is not None and not isinstance(block["text"], str):
+        if kind in ("text", "reasoning") and not isinstance(block.get("text"), str):
             raise ValueError("Cursor message text must be a string")
         if kind in ("tool-call", "tool_use", "tool-result"):
             for key in ("toolCallId", "id", "toolName", "name"):
