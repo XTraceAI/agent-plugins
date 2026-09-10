@@ -33,4 +33,3 @@ def redact_once(records):
             cache["bytes"] += len(key)
         result.append(copy.deepcopy(items[key]))
     return result
-
