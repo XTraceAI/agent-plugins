@@ -176,6 +176,317 @@ def cmd_gold(args) -> None:
         print(f"\n-> {args.out}")
 
 
+# ------------------------------------------------------------------ nudge
+_TRACE_TURN = re.compile(r"^== turn (\d+) \|")
+_TRACE_SERVER = re.compile(r"^   server \(([\d.]+)s\): (\S+)(?: — .*?)?(?: \| judge=(\S+))?$")
+
+
+def moments_from_trace(hx, doc: dict, trace_path: Path, rows: list[dict]) -> list[dict]:
+    """The classifier-flagged moments of a finished `corpus` run, rebuilt
+    from its trace (a run made with `--moments` records them directly)."""
+    kind_of = {r["source_ref"]: r.get("_kind") for r in rows}
+    sent: dict[int, tuple[bool, str]] = {}
+    turn_n = None
+    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = _TRACE_TURN.match(line)
+        if m:
+            turn_n = int(m.group(1))
+            continue
+        if turn_n is None or turn_n in sent:
+            continue
+        m = _TRACE_SERVER.match(line)
+        if m:
+            sent[turn_n] = (hx.judge_said_signal(m.group(2)), m.group(3) or "")
+        elif line.startswith(("   DRAFT (", "   server drafted, client refused", "   twin of")):
+            sent[turn_n] = (True, kind_of.get(f"{doc.get('session')}#{turn_n}") or "")
+    turns = doc.get("turns") or []
+    session = doc.get("session") or ""
+    out = []
+    for i, turn in enumerate(turns):
+        flagged = sent.get(turn.get("n"))
+        if not flagged or not flagged[0]:
+            continue
+        prev = turns[i - 1] if i else None
+        # A replayed session with no declared repo (NULL agentic_namespace on
+        # the conversation row) would lose every row to `state_missing_repo`
+        # — 131 server rows and 17 mined rows did in S1's runs. The rubric
+        # judges the row, not the stamp; a live session always has a cwd. So
+        # the measurement stamps `unresolved` and says so on the row.
+        state = hx.stamp_state(session=session, turn=turn, row_engine_target=("", ""),
+                               cwd="", hook_version=hx.plugin_version(), env_name="staging",
+                               default_repo=doc.get("repo") or "unresolved")
+        out.append({"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
+                    "hint": hx.router_hint(hx.route(turn, prev)), "kind": flagged[1],
+                    "state": state})
+    return out
+
+
+NUDGE_SCHEMA = {"type": "object", "properties": {
+    "propose": {"type": "boolean"}, "why": {"type": "string"},
+    "title": {"type": ["string", "null"]}, "statement": {"type": ["string", "null"]},
+    "engine": {"type": ["string", "null"], "enum": ["matcher", "ordering", "anchors", None]},
+    "matcher": {"type": ["object", "null"], "properties": {
+        "event": {"type": ["string", "null"]}, "command_rx": {"type": ["string", "null"]},
+        "command_not_rx": {"type": ["string", "null"]}, "path_rx": {"type": ["string", "null"]},
+        "path_not_rx": {"type": ["string", "null"]}, "content_rx": {"type": ["string", "null"]}}},
+    "ordering": {"type": ["object", "null"], "properties": {
+        "required_command_rx": {"type": ["string", "null"]}, "gated_command_rx": {"type": ["string", "null"]},
+        "armed_by_events": {"type": ["array", "null"], "items": {"type": "string"}},
+        "display_name": {"type": ["string", "null"]}}},
+    "anchors": {"type": ["array", "null"], "items": {"type": "string"}}},
+    "required": ["propose", "why", "title", "statement", "engine", "matcher", "ordering", "anchors"]}
+
+NUDGE_SYSTEM = """\
+You are the coding agent inside the session shown. The transcript so far is \
+yours: you did those actions and wrote those words. A harness line has just \
+been injected at the user's next prompt (it is the last thing you see). Decide \
+what you would do about it, and only that — do not do the user's new task. If \
+you would propose a rule, fill the row exactly as the line asks: propose=true \
+and the fields (the engine blocks you do not use are null). If you would say \
+nothing, propose=false with a one-sentence why. Answer by calling the \
+StructuredOutput tool; never ask a question here — if you would have asked the \
+user first, still fill the row you would have proposed and say so in why."""
+
+NUDGE_DIGEST_CHARS = 24000
+
+
+def cmd_nudge(args) -> None:
+    """Path A, minus the person: for every classifier-flagged moment of a
+    finished corpus run, a headless agent gets the session UP TO that turn
+    (its own context, as a digest) and the exact line the prompt lane would
+    inject, and decides whether to propose. Its rows go through the same
+    `build_row`, identity and twin checks the live path applies at
+    `create_rule`, and land in `<run>/nudge/` with a judge sheet. Nothing is
+    filed."""
+    hx = _load_extract()
+    sys.path.insert(0, str(plugin_scripts()))
+    import harness_stop as hs                               # noqa: PLC0415
+    run, corpus = Path(args.run), Path(args.corpus)
+    out = run / "nudge"
+    out.mkdir(parents=True, exist_ok=True)
+    engineer_of = {}
+    idx = corpus / "index.json"
+    if idx.is_file():
+        engineer_of = {s["file"]: s["engineer"] for s in json.loads(idx.read_text()).get("sessions", [])}
+
+    jobs = []
+    for doc_path in sorted(corpus.glob("*.json")):
+        if doc_path.name == "index.json":
+            continue
+        name = doc_path.stem
+        doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        trace = run / f"{name}.trace.log"
+        if not trace.is_file():
+            continue
+        drafts = run / f"{name}.drafts.jsonl"
+        rows = hx.read_drafts(drafts) if drafts.is_file() else []
+        moments = moments_from_trace(hx, doc, trace, rows)
+        if args.per_session:
+            moments = moments[:args.per_session]
+        for m in moments:
+            jobs.append((name, doc, m))
+    if args.limit:
+        jobs = jobs[:args.limit]
+    print(f"{len(jobs)} moments across {len({j[0] for j in jobs})} sessions, {args.jobs} agents at a time")
+
+    def digest_upto(doc, turn_n):
+        lines = []
+        for t in doc.get("turns") or []:
+            if t.get("n") > turn_n:
+                break
+            acts = [a.get("brief", "") for a in t.get("tools", [])]
+            shown = (acts[:3] + ["  …"] + acts[-3:]) if len(acts) > 6 else acts
+            lines.append(f"[turn {t.get('n')}] USER: {(t.get('user') or '')[:600]}")
+            lines += ["    " + a[:160] for a in shown]
+            errs = [r for r in t.get("results", []) if r.get("error")][:2]
+            lines += [f"    ! {(e.get('text') or '')[:200]}" for e in errs]
+            lines.append(f"    AGENT: {(t.get('asst') or '')[-500:]}")
+        text = "\n".join(lines)
+        if len(text) > NUDGE_DIGEST_CHARS:
+            text = "…\n" + text[-NUDGE_DIGEST_CHARS:]
+        return hx.redact_window(text)
+
+    def one(job):
+        name, doc, m = job
+        session = doc.get("session") or name
+        repo = (m.get("state") or {}).get("repo") or ""
+        user = (f"TRANSCRIPT SO FAR:\n{digest_upto(doc, m['turn'])}\n\n"
+                f"[the user's next prompt arrives; injected with it:]\n{hs.nudge_line(session, m, repo)}")
+        cmd = ["claude", "-p", "--model", args.model, "--safe-mode", "--output-format", "json",
+               "--json-schema", json.dumps(NUDGE_SCHEMA), "--no-session-persistence",
+               "--disallowedTools", "Bash", "Read", "Edit", "Write", "MultiEdit", "Agent",
+               "Grep", "Glob", "WebSearch", "WebFetch", "--append-system-prompt", NUDGE_SYSTEM]
+        t0 = time.time()
+        err = ""
+        try:
+            proc = subprocess.run(cmd, input=user, capture_output=True, text=True,
+                                  timeout=args.timeout, env=hx.child_env())
+            env = json.loads(proc.stdout) if proc.returncode == 0 else {}
+            got = env.get("structured_output") or {}
+            if not got:
+                err = f"exit {proc.returncode}: {(proc.stderr or proc.stdout)[-160:]}"
+        except Exception as exc:                            # noqa: BLE001
+            got, err = {}, repr(exc)[:200]
+        rec = {"name": name, "session": session, "turn": m["turn"], "kind": m.get("kind"),
+               "hint": m.get("hint"), "seconds": round(time.time() - t0, 1),
+               "propose": bool(got.get("propose")), "why": (got.get("why") or "")[:300],
+               "error": err, "engineer": engineer_of.get(f"{name}.json", name.split("__")[0])}
+        if got.get("propose"):
+            raw = {"title": got.get("title"), "statement": got.get("statement"), "engine": got.get("engine"),
+                   "matcher": got.get("matcher"), "ordering": got.get("ordering"), "anchors": got.get("anchors"),
+                   "derivable": False, "rationale": got.get("why")}
+            if hx.pii_in_row(raw):
+                rec["refused"] = "pii_in_row"
+            else:
+                row, why = hx.build_row(raw, state=dict(m.get("state") or {}), session=session,
+                                        turn_n=m["turn"], reason=f"nudge:{m.get('kind') or 'judge'}",
+                                        scope_repos=[repo] if repo else [])
+                if row is None:
+                    rec["refused"] = why
+                else:
+                    row["_kind"] = m.get("kind"); row["_engineer"] = rec["engineer"]
+                    rec["row"] = row
+        print(f"  {name} t{m['turn']} {m.get('kind') or '-'}: "
+              f"{'PROPOSE' if rec['propose'] else ('ERROR' if err else 'silent')}"
+              f"{' → ' + rec['refused'] if rec.get('refused') else ''} {rec['seconds']}s", flush=True)
+        return rec
+
+    t0 = time.time()
+    recs = []
+    with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for rec in pool.map(one, jobs):
+            recs.append(rec)
+    rows, per_session = [], collections.defaultdict(list)
+    twins = 0
+    for rec in recs:
+        row = rec.get("row")
+        if not row:
+            continue
+        if hx.is_twin(row, per_session[rec["session"]]):
+            twins += 1; rec["refused"] = "twin_in_session"; rec.pop("row"); continue
+        per_session[rec["session"]].append(row); rows.append(row)
+    (out / "decisions.json").write_text(json.dumps(recs, indent=1, default=str), encoding="utf-8")
+    (out / "rows.json").write_text(json.dumps(rows, indent=1, default=str), encoding="utf-8")
+    sessions = {j[0] for j in jobs}
+    summary = {
+        "moments": len(recs), "sessions": len(sessions),
+        "proposed": sum(1 for r in recs if r["propose"]),
+        "silent": sum(1 for r in recs if not r["propose"] and not r["error"]),
+        "errors": sum(1 for r in recs if r["error"]),
+        "refused": dict(collections.Counter(r["refused"] for r in recs if r.get("refused")).most_common()),
+        "rows": len(rows), "twins_in_session": twins,
+        "rows_per_session_mean": round(len(rows) / max(len(sessions), 1), 2),
+        "rows_per_session_max": max((len(v) for v in per_session.values()), default=0),
+        "by_kind": {k: f"{sum(1 for r in recs if (r.get('kind') or '-') == k and r.get('row'))}/"
+                       f"{sum(1 for r in recs if (r.get('kind') or '-') == k)}"
+                    for k in sorted({r.get("kind") or "-" for r in recs})},
+        "by_engine": dict(collections.Counter(
+            next(k for k in ("matcher", "ordering", "anchors") if k in r) for r in rows)),
+        "latency_p50_s": sorted(r["seconds"] for r in recs)[len(recs) // 2] if recs else None,
+        "wall_s": round(time.time() - t0, 1),
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
+    write_judge_sheet(out / "judge_sheet.md", rows,
+                      {"sessions": len(sessions), "engineers": sorted({r["_engineer"] for r in rows})}, [], [])
+    print("\n" + "=" * 62)
+    for k, v in summary.items():
+        print(f"{k:24} {v}")
+    print(f"\n-> {out}/judge_sheet.md")
+
+
+# ------------------------------------------------------------------ judge
+JUDGE_RUBRIC = """\
+You are the second judge of a set of drafted team rules. Judge each row AS A \
+SET MEMBER, by five criteria; a row is ACTIVATABLE (verdict "A") only if all \
+five hold, otherwise REJECT ("R") with one reason word.
+
+1. It would change an action: a reader can name the next command, edit or \
+read it would alter. Not a summary, not an observation. (reject: no_action)
+2. The trigger can actually match: the regex or anchors would fire on the \
+shape of a real future action and would NOT fire on every member of that \
+family. Anchors must be identifiers or paths — a bare English word, a repo \
+name, or an identifier present in every call recalls everywhere. A trigger \
+that matches nothing and one that matches everything are the same reject. \
+(reject: unmatchable)
+3. It is not derivable: a new engineer would not learn it from the repo, its \
+tests, its docs or CLAUDE.md, and it is not already a team rule. (reject: \
+derivable)
+4. It is not project state: not "PR #N does X", not "we decided Y for this \
+ticket", not a restatement of an error message. (reject: project_state)
+5. It outlives the session: still true next month; not tied to one line, one \
+branch, one PR that will merge, one bug. (reject: one_off)
+Also reject a row that duplicates another row in the set (reject: duplicate, \
+keep the better-triggered one) or that states something false (reject: wrong).
+
+Be strict: an activated rule fires in every teammate's sessions. Answer for \
+every row by calling the StructuredOutput tool; never ask a question."""
+
+JUDGE_SCHEMA = {"type": "object", "properties": {"verdicts": {"type": "array", "items": {
+    "type": "object", "properties": {
+        "index": {"type": "integer"}, "verdict": {"type": "string", "enum": ["A", "R"]},
+        "reason": {"type": "string", "enum": ["", "no_action", "unmatchable", "derivable",
+                                              "project_state", "one_off", "duplicate", "wrong"]},
+        "why": {"type": "string"}},
+    "required": ["index", "verdict", "reason", "why"]}}},
+    "required": ["verdicts"]}
+
+
+def cmd_judge(args) -> None:
+    """A second judge over a run's rows: a fresh headless model with the
+    rubric and nothing else — no session, no first judge's verdicts — so the
+    pass is independent of whoever built the pipeline. Reports the score
+    under each judge and their agreement. Not a human; the scorecard says so."""
+    rows = json.loads(Path(args.rows).read_text(encoding="utf-8"))
+    L = [f"{len(rows)} ROWS:"]
+    for i, r in enumerate(rows, 1):
+        engine = {k: r[k] for k in ("matcher", "ordering", "anchors") if k in r}
+        L += [f"[{i}] {r.get('title', '')}", f"    statement: {r.get('statement', '')}",
+              f"    trigger: {json.dumps(engine, ensure_ascii=False)}", ""]
+    cmd = ["claude", "-p", "--model", args.model, "--safe-mode", "--output-format", "json",
+           "--json-schema", json.dumps(JUDGE_SCHEMA), "--no-session-persistence",
+           "--disallowedTools", "Bash", "Read", "Edit", "Write", "MultiEdit", "Agent",
+           "Grep", "Glob", "WebSearch", "WebFetch", "--append-system-prompt", JUDGE_RUBRIC]
+    hx = _load_extract()
+    t0 = time.time()
+    proc = subprocess.run(cmd, input="\n".join(L), capture_output=True, text=True,
+                          timeout=args.timeout, env=hx.child_env())
+    if proc.returncode != 0:
+        sys.exit(f"judge failed: exit {proc.returncode}: {proc.stderr[-300:]}")
+    env = json.loads(proc.stdout)
+    verdicts = (env.get("structured_output") or {}).get("verdicts") or []
+    got = {v["index"]: v for v in verdicts if isinstance(v, dict) and isinstance(v.get("index"), int)}
+    missing = [i for i in range(1, len(rows) + 1) if i not in got]
+    A2 = {i for i, v in got.items() if v.get("verdict") == "A"}
+    out = {"model": args.model, "rows": len(rows), "judged": len(got), "missing": missing,
+           "A": sorted(A2), "R": {}, "why": {str(i): v.get("why", "")[:200] for i, v in got.items()},
+           "score": round(len(A2) / max(len(rows), 1), 3), "seconds": round(time.time() - t0, 1)}
+    for i, v in got.items():
+        if v.get("verdict") != "A":
+            out["R"].setdefault(v.get("reason") or "unspecified", []).append(i)
+    print(f"judge 2 ({args.model}): {len(A2)}/{len(rows)} activatable = {out['score']}"
+          f" | rejects {({k: len(v) for k, v in out['R'].items()})} | {out['seconds']}s")
+    if args.against:
+        v1 = json.loads(Path(args.against).read_text(encoding="utf-8"))
+        A1 = set(v1["A"])
+        both = A1 & A2
+        agree = len(both) + len(set(range(1, len(rows) + 1)) - A1 - A2)
+        p_o = agree / len(rows)
+        p1, p2 = len(A1) / len(rows), len(A2) / len(rows)
+        p_e = p1 * p2 + (1 - p1) * (1 - p2)
+        kappa = (p_o - p_e) / (1 - p_e) if p_e < 1 else 1.0
+        out.update({"judge1_A": sorted(A1), "agreement": round(p_o, 3), "kappa": round(kappa, 3),
+                    "both_A": sorted(both), "only_judge1": sorted(A1 - A2), "only_judge2": sorted(A2 - A1),
+                    "score_judge1": round(len(A1) / len(rows), 3),
+                    "score_both_agree": round(len(both) / len(rows), 3),
+                    "score_either": round(len(A1 | A2) / len(rows), 3)})
+        print(f"judge 1: {len(A1)}/{len(rows)} = {out['score_judge1']} | agreement {out['agreement']}"
+              f" kappa {out['kappa']} | both agree {len(both)} ({out['score_both_agree']})"
+              f" | only judge 1 {sorted(A1 - A2)} | only judge 2 {sorted(A2 - A1)}")
+    if args.out:
+        Path(args.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
+        print(f"-> {args.out}")
+
+
 # ----------------------------------------------------------------- router
 def cmd_router(args) -> None:
     """Router hits per kind over a corpus. No model calls, no cost.
@@ -481,6 +792,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--corpus", required=True)
     r.add_argument("--out", default="")
 
+    nd = sub.add_parser("nudge", help="path A minus the person: the agent's decision on every flagged moment")
+    nd.add_argument("--run", required=True, help="a `corpus` run directory")
+    nd.add_argument("--corpus", required=True)
+    nd.add_argument("--model", default="sonnet")
+    nd.add_argument("--jobs", type=int, default=4)
+    nd.add_argument("--timeout", type=int, default=240)
+    nd.add_argument("--limit", type=int, default=0)
+    nd.add_argument("--per-session", type=int, default=0)
+
     j = sub.add_parser("judge", help="a second judge (fresh headless model) over a run's rows")
     j.add_argument("--rows", required=True, help="rows.json of a run")
     j.add_argument("--against", default="", help="the first judge's verdicts JSON, for agreement")
@@ -506,7 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     {"gold": cmd_gold, "router": cmd_router, "corpus": cmd_corpus,
-     "judge": cmd_judge}[args.mode](args)
+     "judge": cmd_judge, "nudge": cmd_nudge}[args.mode](args)
     return 0
 
 
