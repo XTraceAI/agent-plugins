@@ -10,7 +10,7 @@ import tempfile
 from unittest.mock import patch
 
 import readers_test as fixtures
-from readers import codex, cursor, discovery
+from readers import claude, codex, cursor, discovery
 import cursor_flush
 
 SID="11111111-2222-3333-4444-555555555555"
@@ -371,6 +371,45 @@ def test_strict_cursor_user_blocks_preserve_text_or_reject_unsupported_content()
                 if block in invalid:rejected(lambda:cursor.to_canonical(source,strict_json=True))
                 else:assert cursor.to_canonical(source,strict_json=True)==legacy
                 assert source.read_bytes()==before
+
+
+def test_jsonl_unicode_separators_remain_inside_codex_and_claude_records():
+    for separator in ["\u0085", "\u2028", "\u2029"]:
+        for ending in ["\n", "\r\n", "\r", ""]:
+            with tempfile.TemporaryDirectory() as td:
+                home=Path(td);text="before"+separator+"after"
+                record={"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}
+                path=sources(home)[0][1];original=path.read_bytes();path.write_bytes(original+json.dumps(record,ensure_ascii=False).encode()+ending.encode())
+                for strict in [False,True]:
+                    assert codex.load_rollout(path,strict_json=strict,strict_utf8=strict)[-1]==record
+                    assert text in json.dumps(codex.to_canonical(path,strict_json=strict,strict_utf8=strict),ensure_ascii=False)
+                index=home/'session_index.jsonl';index.write_bytes(json.dumps({'id':SID,'thread_name':text},ensure_ascii=False).encode()+ending.encode())
+                with patch.object(codex,'_SESSION_INDEX',index):
+                    for strict in [False,True]:assert codex._sidecar_thread_name(SID,strict_json=strict,strict_utf8=strict)=='before'
+                native={'type':'user','cwd':'/synthetic/'+text,'message':{'role':'user','content':text}}
+                path=home/'claude.jsonl';path.write_bytes(json.dumps(native,ensure_ascii=False).encode()+ending.encode())
+                assert claude.load(path)==[native]
+                assert claude.session_cwd(path)==native['cwd']
+                # Unicode/control separators outside strings are not JSON whitespace.
+                malformed=home/'invalid.jsonl'
+                for suffix in ['\v','\f',separator]:
+                    malformed.write_bytes(json.dumps(record).encode()+suffix.encode()+b'\n')
+                    rejected(lambda:codex.load_rollout(malformed,strict_json=True))
+
+
+def test_strict_cursor_assistant_text_and_reasoning_require_string_values():
+    for kind in ['text','reasoning']:
+        for value in [None,17,'MISSING']:
+            block={'type':kind}
+            if value!='MISSING':block['text']=value
+            with tempfile.TemporaryDirectory() as td:
+                home=Path(td);store=fixtures._make_cursor_store(home/'chats');message={'role':'assistant','content':[block]}
+                raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+                with sqlite3.connect(store) as sql:
+                    meta=json.loads(sql.execute('SELECT value FROM meta').fetchone()[0]);meta['latestRootBlobId']=key
+                    sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw));sql.execute('UPDATE meta SET value=?',(json.dumps(meta),))
+                transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[{'role':'assistant','message':{'content':[block]}}])
+                for source in [store,transcript]:rejected(lambda:cursor.to_canonical(source,strict_json=True))
 
 
 if __name__=='__main__':

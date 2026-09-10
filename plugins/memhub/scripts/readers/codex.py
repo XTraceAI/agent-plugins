@@ -159,8 +159,10 @@ def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) 
     em-dash then kills the whole import on a cp950/cp1252 box."""
     records: list[dict] = []
     errors = "strict" if strict_utf8 else "replace"
-    for raw in Path(path).read_text(encoding="utf-8", errors=errors).splitlines(keepends=True):
-        line = raw.strip()
+    # Split bytes first: Unicode separators inside JSON strings are content.
+    for encoded in Path(path).read_bytes().splitlines(keepends=True):
+        raw = encoded.decode("utf-8", errors=errors)
+        line = raw.strip(" \t\r\n") if strict_json else raw.strip()
         if not line:
             continue
         try:
@@ -388,9 +390,10 @@ def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_js
             # Drop the incomplete byte prefix before strict UTF-8 decoding;
             # the seek may have landed inside a multi-byte character.
             blob = blob.partition(b"\n")[2]
-        lines = blob.decode("utf-8", errors="strict" if strict_utf8 else "replace").splitlines(keepends=True)
+        lines = [raw.decode("utf-8", errors="strict" if strict_utf8 else "replace")
+                 for raw in blob.splitlines(keepends=True)]
         for raw in deque(lines, maxlen=_INDEX_MAX_LINES):
-            line = raw.strip()
+            line = raw.strip(" \t\r\n") if strict_json else raw.strip()
             if not line:
                 continue
             try:
