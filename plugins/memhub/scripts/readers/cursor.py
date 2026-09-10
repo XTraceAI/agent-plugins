@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import hashlib
 import re
 import sqlite3
 import sys
@@ -382,6 +383,8 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
         data = blobs[blob_id]
         if isinstance(data, str):
             data = data.encode("utf-8")
+        if strict_json and hashlib.sha256(data).hexdigest() != blob_id:
+            raise ValueError("Cursor blob content does not match its hash")
         if data[:1] == b"{":
             try:
                 msg = json.loads(data.decode("utf-8", errors="strict" if strict_utf8 else "replace"))
