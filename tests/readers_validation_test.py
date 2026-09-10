@@ -223,7 +223,9 @@ def test_cursor_json_only_mode_does_not_enable_utf8_strictness():
 def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
     invalid=[{"not_role":1}, {"role":None}, {"role":[]}, {"role":"future"},
              {"role":"assistant"}, {"role":"user","content":17},
-             {"role":"assistant","content":[17]}]
+             {"role":"assistant","content":[17]},
+             {"role":"tool","content":"lost output"},
+             {"role":"tool","content":[{"type":"text","text":"lost output"}]}]
     for message in invalid:
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
