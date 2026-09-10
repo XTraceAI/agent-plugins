@@ -210,6 +210,6 @@ def acknowledges(out, conversation_id, records, *, require_durable=True):
         return False
     if ack is None:
         return dropped == len(records)
-    prefix = next((index + 1 for index, record in enumerate(records)
-                   if isinstance(record, dict) and record.get("uuid") == ack), None)
+    prefix = next((index + 1 for index, identity in enumerate(ids)
+                   if identity == ack), None)
     return prefix is not None and prefix + dropped == len(records)
