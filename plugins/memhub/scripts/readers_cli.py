@@ -151,7 +151,7 @@ def main(argv=None) -> int:
                           "code": code, "path": str(path) if path else None}), file=sys.stderr)
 
     try:
-        if args.session:
+        if args.session and args.session != "latest":
             path, error = reader.locate(args.session)
             if error or path is None:
                 diagnostic("session_unavailable")
@@ -184,6 +184,24 @@ def main(argv=None) -> int:
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
     counts = Counter(header["conversation_id"] for _, _, header in prepared)
+    if args.session == "latest":
+        # Preserve the native latest-selection rule, but only after all actual
+        # identities have participated in ambiguity detection.
+        try:
+            latest, error = reader.locate("latest")
+            if error or latest is None:
+                diagnostic("session_unavailable")
+                return 2
+            latest = latest.resolve(strict=True)
+            if args.host == "cursor":
+                latest = cursor_source(latest, select_saved=True)
+            prepared = [item for item in prepared if item[0] == latest]
+            if not prepared:
+                diagnostic("session_unavailable")
+                return 2
+        except (OSError, ValueError, TypeError, AttributeError):
+            diagnostic("session_unavailable")
+            return 2
     for path, revision, header in prepared:
         if counts[header["conversation_id"]] > 1:
             diagnostic("discovery_incomplete", path)

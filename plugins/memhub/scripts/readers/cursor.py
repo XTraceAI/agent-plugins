@@ -355,9 +355,16 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
 
     messages: list[tuple[dict, int | None]] = []
     seen: set[str] = set()
+    active: set[str] = set()
 
     def walk(blob_id: str, inherited_ts: int | None) -> None:
-        if blob_id in seen or blob_id not in blobs:
+        if not isinstance(blob_id, str) or blob_id not in blobs:
+            if strict_json:
+                raise ValueError("Cursor tree references a missing blob")
+            return
+        if blob_id in active and strict_json:
+            raise ValueError("Cursor tree contains a cycle")
+        if blob_id in seen:
             return
         seen.add(blob_id)
         data = blobs[blob_id]
@@ -374,12 +381,18 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
                 messages.append((msg, inherited_ts))
             return
         children, node_ts = _parse_node(data)
-        for child in children:
-            walk(child, node_ts or inherited_ts)
+        active.add(blob_id)
+        try:
+            for child in children:
+                walk(child, node_ts or inherited_ts)
+        finally:
+            active.remove(blob_id)
 
     if root:
         walk(root, None)
-    if not messages:
+    elif strict_json and blobs:
+        raise ValueError("Cursor tree has no root")
+    if not messages and not strict_json:
         # Fallback: no walkable root (interrupted write). Take JSON blobs in
         # insertion order — degraded but better than losing the session.
         for data in blobs.values():

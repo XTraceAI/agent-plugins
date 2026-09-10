@@ -307,6 +307,22 @@ def test_ipv6_origin_forms_share_only_the_same_backends_credentials():
                 assert sinks.resolve_capture_auth(sinks.Sink("other",other),refresh=False)==(other,None)
 
 
+def test_trailing_dns_dot_remains_a_distinct_credential_origin():
+    with isolated():
+        selected="https://cloud.example.test./mcp"
+        sink=sinks.Sink("dotted",selected)
+        pak.CACHE_DIR.mkdir()
+        pak.key_path(CLOUD).write_text(json.dumps({"secret":"installed-key"}))
+        auth.token_cache_path(CLOUD).write_text(json.dumps({"access_token":"installed-access"}))
+        assert sinks.resolve_capture_auth(sink,refresh=False)==(selected,None)
+        refreshed=[]
+        with patch.object(auth,"_refresh_cached_token_if_stale",side_effect=refreshed.append):
+            assert sinks.resolve_capture_auth(sink)==(selected,None)
+        assert refreshed==[],"installed OAuth metadata must not cross URL origins"
+        pak.key_path(selected).write_text(json.dumps({"secret":"dotted-key"}))
+        assert sinks.resolve_capture_auth(sink,refresh=False)==(selected,"dotted-key")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
