@@ -343,6 +343,24 @@ def test_the_engine_target_is_the_action_the_engine_would_fire_on():
     print("PASS test_the_engine_target_is_the_action_the_engine_would_fire_on")
 
 
+def test_an_identity_in_a_locally_authored_row_is_refused():
+    """The server's `_pii_in_trigger` never sees a row the local agent
+    authors, so the same coarse test runs client-side."""
+    ok = {"title": "T", "statement": "When X then Y.", "matcher": {"event": "bash",
+          "command_rx": r"/Users/[^/]+/dev"}, "anchors": None}
+    assert hx.pii_in_row(ok) == ""
+    for bad in ({"statement": "see /Users/felixmeng/xtrace"},
+                {"matcher": {"command_rx": r"/Users/(?!felixmeng)[A-Za-z0-9_]+/dev"}},
+                {"anchors": ["dana@example.com"]},
+                {"title": "mail dana@example\\.com"},
+                {"ordering": {"gated_command_rx": "/home/dana/x"}}):
+        assert hx.pii_in_row(bad), bad
+    assert hx.judge_said_signal("project_state") and hx.judge_said_signal("drafted")
+    for r in ("no_signal", "judge_failed", "disabled", "transport_error", ""):
+        assert not hx.judge_said_signal(r), r
+    print("PASS test_an_identity_in_a_locally_authored_row_is_refused")
+
+
 # ------------------------------------------------------------------- twins
 def test_twins_are_dropped_within_a_run():
     a = {"statement": "When running git worktree add -b, check the branch "

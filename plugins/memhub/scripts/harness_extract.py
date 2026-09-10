@@ -67,6 +67,13 @@ WINDOW_MAX_CHARS = 24576      # the server refuses a longer body (schema max)
 # These three are the client failing to ask, and are counted apart so an
 # outage is never read as "the author refused".
 CLIENT_REASONS = ("no_credential", "transport_error", "bad_reply")
+# Reasons that mean the judge never said yes: every other reason is an
+# author outcome (a refusal or a draft) and the moment was a signal.
+NOT_A_SIGNAL = ("no_signal", "judge_failed", "disabled") + CLIENT_REASONS
+
+
+def judge_said_signal(reason: str) -> bool:
+    return bool(reason) and reason not in NOT_A_SIGNAL
 
 FLAG = "MEMHUB_HARNESS_EXTRACT"
 _ON = ("1", "on", "true", "yes")
@@ -502,6 +509,41 @@ def server_draft(window: str, hint: str = "", repo: str = "",
 
 
 # ------------------------------------------------------------- row contract
+# The server refuses a drafted row whose trigger or statement carries an
+# identity (`_pii_in_trigger`, S0 Finding 1). A row the LOCAL agent authors
+# never passes through that service — `create_rule` validates shape, not
+# identity — so the same coarse test runs here: a `/Users/` or `/home/` path
+# whose next segment has two consecutive letters, or an e-mail address,
+# probed as written and with regex quoting collapsed.
+_PII_PATTERNS = (
+    re.compile(r"/(?:Users|home)/[^/\s]*[A-Za-z]{2}[^/\s]*"),
+    re.compile(r"[\w.\-+]+@[\w\-]+\.[A-Za-z]{2,}"),
+)
+
+
+def _unescape(text: str) -> str:
+    return re.sub(r"\[(.)\]", r"\1", re.sub(r"\\(.)", r"\1", text))
+
+
+def pii_in_row(row: dict) -> str:
+    """The first identity-shaped fragment in what a row matches or shows,
+    or ''."""
+    hay: list[str] = []
+    for block in ("matcher", "ordering"):
+        node = row.get(block)
+        if isinstance(node, dict):
+            hay += [v for v in node.values() if isinstance(v, str)]
+    hay += [a for a in (row.get("anchors") or []) if isinstance(a, str)]
+    hay += [row[k] for k in ("statement", "title") if isinstance(row.get(k), str)]
+    for text in hay:
+        for probe in (text, _unescape(text)):
+            for pat in _PII_PATTERNS:
+                hit = pat.search(probe)
+                if hit:
+                    return hit.group(0)
+    return ""
+
+
 def _rx_ok(pattern) -> bool:
     if not isinstance(pattern, str) or not pattern.strip():
         return False
@@ -970,8 +1012,17 @@ def extract_turn(turn: dict, prev: dict | None, *, doc: dict, args,
     kind = reply.get("kind")
     if kind:
         stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
+    reason = str(reply.get("reason") or "refused")
+    if getattr(args, "moments", "") and judge_said_signal(reason):
+        # The classifier flagged this moment. Whatever the server's author
+        # did with it, the local mining pass (harness_stop.py review) gets
+        # the same redacted window, with the stamp it would carry.
+        stats["moments"] = stats.get("moments", 0) + 1
+        append_draft(Path(args.moments), {
+            "turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
+            "hint": hint, "kind": kind, "reason": reason,
+            "window": window, "state": state_probe})
     if not reply.get("drafted"):
-        reason = str(reply.get("reason") or "refused")
         note_refusal(reason, hint)
         if reason in CLIENT_REASONS:
             stats["transport_errors"] += 1
@@ -1118,6 +1169,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="hook version for the state stamp (default: plugin.json)")
     p.add_argument("--draft-timeout", type=float, default=0,
                    help=f"seconds for the one server call (default {DRAFT_TIMEOUT_S:g})")
+    p.add_argument("--moments", default="",
+                   help="also append every classifier-flagged moment (window + stamp) "
+                        "to this JSONL, for the local mining pass")
     p.add_argument("--pace", type=float, default=0,
                    help="seconds to wait after each server call (replay only; "
                         "a personal key is capped at 60 calls/min)")

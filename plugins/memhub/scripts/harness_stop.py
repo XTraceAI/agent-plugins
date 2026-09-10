@@ -104,6 +104,12 @@ def reviewed_path(session: str) -> Path:
     return _base() / f"{_safe(session)}.reviewed.jsonl"
 
 
+def moments_path(session: str) -> Path:
+    """Classifier-flagged moments (window + stamp), appended by the extract
+    child, mined by the review."""
+    return _base() / f"{_safe(session)}.moments.jsonl"
+
+
 def load_meta(session: str) -> dict:
     try:
         got = json.loads(meta_path(session).read_text(encoding="utf-8"))
@@ -184,7 +190,7 @@ def _args(**over) -> argparse.Namespace:
     """The replay's argument shape, for `extract_turn`."""
     base = {"hook_version": "", "env": env_name(), "budget": hx.DEFAULT_BUDGET,
             "no_model": False, "draft_timeout": 0, "out": "", "quiet": True,
-            "trace": "", "stats": "", "turn": None}
+            "trace": "", "stats": "", "turn": None, "moments": "", "pace": 0}
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -236,9 +242,9 @@ def cmd_extract(session: str, transcript: str, cwd: str) -> int:
     stats = hx.new_stats(doc)
     trace = hx.Trace(str(hx.log_path("extract.log")), quiet=True)
     try:
-        hx.extract_turn(last, prev, doc=doc, args=_args(), kept=kept, stats=stats,
-                        trace=trace, out_path=out_path, arcs=arcs,
-                        pr_number=meta.get("pr_number"))
+        hx.extract_turn(last, prev, doc=doc, args=_args(moments=str(moments_path(session))),
+                        kept=kept, stats=stats, trace=trace, out_path=out_path,
+                        arcs=arcs, pr_number=meta.get("pr_number"))
     finally:
         trace.close()
     save_meta(session, repo=repo, cwd=doc["cwd"], transcript_path=transcript,
@@ -269,6 +275,7 @@ def cmd_idle(session: str, transcript: str, cwd: str) -> int:
 
 
 # ------------------------------------------------------------- the review
+_NULLABLE_STR = {"type": ["string", "null"]}
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -280,8 +287,30 @@ REVIEW_SCHEMA = {
         "drop": {"type": "array", "items": {"type": "object", "properties": {
             "index": {"type": "integer"}, "why": {"type": "string"}},
             "required": ["index", "why"]}},
+        # Rows the local agent authors from the classifier-flagged moments —
+        # the same fields the server author produces, so one `build_row`
+        # and one PII check serve both.
+        "author": {"type": "array", "items": {"type": "object", "properties": {
+            "moment": {"type": "integer"},
+            "title": {"type": "string"},
+            "statement": {"type": "string"},
+            "engine": {"type": "string", "enum": ["matcher", "ordering", "anchors"]},
+            "matcher": {"type": ["object", "null"], "properties": {
+                "event": {"type": ["string", "null"]},
+                "command_rx": _NULLABLE_STR, "command_not_rx": _NULLABLE_STR,
+                "path_rx": _NULLABLE_STR, "path_not_rx": _NULLABLE_STR,
+                "content_rx": _NULLABLE_STR}},
+            "ordering": {"type": ["object", "null"], "properties": {
+                "required_command_rx": _NULLABLE_STR, "gated_command_rx": _NULLABLE_STR,
+                "armed_by_events": {"type": ["array", "null"], "items": {"type": "string"}},
+                "display_name": _NULLABLE_STR}},
+            "anchors": {"type": ["array", "null"], "items": {"type": "string"}},
+            "supersedes_rule_id": {"type": ["string", "null"]},
+            "rationale": {"type": "string"}},
+            "required": ["moment", "title", "statement", "engine", "matcher",
+                         "ordering", "anchors", "supersedes_rule_id", "rationale"]}},
     },
-    "required": ["keep", "drop"],
+    "required": ["keep", "drop", "author"],
 }
 
 REVIEW_PROMPT = """\
@@ -302,17 +331,51 @@ KEEP a draft that updates or corrects an existing rule, and set \
 `supersedes_rule_id` to that rule's id (only an id from the rulebook you were \
 shown; otherwise null).
 
-Keep at most the budget stated. You never rewrite a draft and you never \
-activate anything: a human reads every row you keep. Answer with JSON only, \
-by calling the StructuredOutput tool; never ask a question."""
+You also receive MOMENTS: turns a classifier flagged as carrying a lesson, \
+each with the window around it. You are the author for these. For a moment \
+that carries a lesson no kept draft and no rulebook rule already states, \
+AUTHOR one row in `author`; otherwise leave it. Most moments are not lessons \
+— refuse silently when: no engine below can be filled with something a \
+program can match next time; the point is derivable from the repo, its tests, \
+docs or CLAUDE.md; the fix is already in the error output the agent saw; it \
+is project state or narrative (what this PR does, what was decided for this \
+ticket) rather than a behaviour that repeats; it is task narration; it is \
+true only of one file, one line, one PR that will merge. Ask yourself, for \
+every row: which next command, edit or read does this change, and is it still \
+true next month? If you cannot name both, do not author it.
+
+A row fills exactly ONE engine, the shape of the ACTION it must fire on:
+- engine="matcher": {{"event":"bash","command_rx":…}} / {{"event":"edit","path_rx":…}} / \
+{{"event":"output","content_rx":…}} / {{"event":"read","path_rx":…}}. Python `re`; the SHAPE \
+of the command, never the literal; narrow enough not to fire on every member \
+of that family (a rule that nags on every `git status` is worse than none).
+- engine="ordering": {{"required_command_rx":…,"gated_command_rx":…,"armed_by_events":["edit"],"display_name":…}} \
+— run X after edits, before Y.
+- engine="anchors": 1-8 CONCRETE identifiers — file paths, symbol names, env \
+var names, table names. Never a bare English word, never a repo name, never a \
+phrase; an anchor that appears in every call recalls everywhere.
+`statement` is one when-X-then-Y sentence a teammate could be held to, \
+carrying the WHY in a clause. `title` is a short noun phrase naming the trap. \
+NEVER put a person's name, username, home directory or e-mail in a row.
+
+Kept drafts plus authored rows together stay within the budget stated. You \
+never rewrite a draft and you never activate anything: a human reads every \
+row. Answer with JSON only, by calling the StructuredOutput tool; never ask a \
+question."""
 
 
 def session_digest(session: str, meta: dict) -> str:
     """The session as prose the reviewer can read in one pass: each human
     turn and the agent's final words, most recent last, bounded."""
     tp = meta.get("transcript_path") or ""
+    turns_path = meta.get("turns_path") or ""      # a replayed session: canonical turns JSON
     turns: list[dict] = []
-    if tp and os.path.isfile(tp):
+    if turns_path and os.path.isfile(turns_path):
+        try:
+            turns = json.loads(Path(turns_path).read_text(encoding="utf-8")).get("turns") or []
+        except (OSError, ValueError):
+            turns = []
+    elif tp and os.path.isfile(tp):
         try:
             turns = hx.turns_from_transcript(tp)
         except (OSError, ValueError):
@@ -345,17 +408,30 @@ def cached_book(repo: str) -> list[dict]:
     return out
 
 
+MOMENT_WINDOW_CHARS = 3500    # per moment, inside the review's own input
+
+
 def review_input(drafts: list[dict], digest: str, book: list[dict],
-                 budget: int) -> str:
-    L = [f"BUDGET: keep at most {budget} of the {len(drafts)} drafts.", "",
-         "DRAFTS:"]
+                 budget: int, moments: list[dict] | None = None) -> str:
+    L = [f"BUDGET: keep at most {budget} rows in total — kept drafts plus "
+         f"authored rows — from the {len(drafts)} drafts and "
+         f"{len(moments or [])} moments.", "", "DRAFTS:"]
+    if not drafts:
+        L.append("  (none)")
     for i, r in enumerate(drafts, 1):
         engine = {k: r[k] for k in ("matcher", "ordering", "anchors") if k in r}
         L += [f"[{i}] {r.get('title', '')}",
               f"    statement: {r.get('statement', '')}",
               f"    trigger: {json.dumps(engine, ensure_ascii=False)}",
               f"    from: {r.get('source_ref', '')} ({r.get('_reason', '')})"]
-    L += ["", "RULEBOOK (existing rules, for supersedes_rule_id):"]
+    L += ["", "MOMENTS (classifier-flagged; author from these):"]
+    if not moments:
+        L.append("  (none)")
+    for i, m in enumerate(moments or [], 1):
+        L += [f"[M{i}] turn {m.get('turn')} · classifier: {m.get('kind') or '-'}"
+              f"{' · router: ' + m['hint'] if m.get('hint') else ''}",
+              (m.get("window") or "")[:MOMENT_WINDOW_CHARS], ""]
+    L += ["RULEBOOK (existing rules, for supersedes_rule_id):"]
     L += [f"- {b['id']} [{b['status']}] {b['title']}: {b['statement']}" for b in book] \
         or ["  (none cached)"]
     L += ["", "SESSION DIGEST:", digest]
@@ -444,6 +520,61 @@ def apply_review(drafts: list[dict], verdict: dict, book: list[dict],
     return kept, dropped
 
 
+def apply_mining(moments: list[dict], verdict: dict, book: list[dict], *,
+                 session: str, repo: str, kept: list[dict], budget: int,
+                 pr_number=None) -> tuple[list[dict], dict]:
+    """Rows the local agent authored from the flagged moments, as complete
+    stamped rows or nothing — the same `build_row` contract the server path
+    uses, plus the identity check the server would have run. Returns
+    (rows, refusal counts)."""
+    known = {b["id"] for b in book}
+    out: list[dict] = []
+    refused: dict[str, int] = {}
+
+    def refuse(why: str) -> None:
+        refused[why] = refused.get(why, 0) + 1
+
+    used = set()
+    for item in verdict.get("author") or []:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("moment")
+        if not isinstance(idx, int) or not 1 <= idx <= len(moments) or idx in used:
+            refuse("bad_moment")
+            continue
+        used.add(idx)
+        if len(kept) + len(out) >= budget:
+            refuse("budget")
+            break
+        raw = {"title": item.get("title"), "statement": item.get("statement"),
+               "engine": item.get("engine"), "matcher": item.get("matcher"),
+               "ordering": item.get("ordering"), "anchors": item.get("anchors"),
+               "derivable": False, "rationale": item.get("rationale")}
+        if hx.pii_in_row(raw):
+            refuse("pii_in_row")          # never logged with the fragment
+            continue
+        moment = moments[idx - 1]
+        state = dict(moment.get("state") or {})
+        if pr_number is not None:
+            state["pr_number"] = pr_number
+        row, why = hx.build_row(raw, state=state, session=session,
+                                turn_n=moment.get("turn"),
+                                reason=f"local:{moment.get('kind') or 'judge'}",
+                                scope_repos=[repo] if repo else [])
+        if row is None:
+            refuse(why)
+            continue
+        if hx.is_twin(row, kept + out):
+            refuse("twin_in_run")
+            continue
+        sup = item.get("supersedes_rule_id")
+        row["supersedes_rule_id"] = sup if isinstance(sup, str) and sup in known else None
+        row["_kind"] = moment.get("kind")
+        row["_review"] = {"authored": True, "moment": idx, "at": time.time()}
+        out.append(row)
+    return out, refused
+
+
 def review(session: str, *, moment: str, pr_number=None) -> int:
     """§4.3. Returns the number of rows kept, or -1 when nothing was reviewed."""
     meta = load_meta(session)
@@ -452,14 +583,18 @@ def review(session: str, *, moment: str, pr_number=None) -> int:
     drafts = hx.read_drafts(hx.drafts_path(session))
     seen = int(meta.get("reviewed_through") or 0)
     new = drafts[seen:]
-    if not new:
+    moments = hx.read_drafts(moments_path(session))
+    mined = int(meta.get("mined_through") or 0)
+    new_moments = moments[mined:]
+    if not new and not new_moments:
         return -1
     already = len(hx.read_drafts(reviewed_path(session)))
     budget = max(0, hx.DEFAULT_BUDGET - already)
-    book = cached_book(meta.get("repo") or "")
+    repo = meta.get("repo") or ""
+    book = cached_book(repo)
     digest = session_digest(session, meta)
     try:
-        verdict = call_review(review_input(new, digest, book, budget),
+        verdict = call_review(review_input(new, digest, book, budget, new_moments),
                               cwd=meta.get("cwd") or "")
     except ReviewError as exc:
         failures = int(meta.get("review_failures") or 0) + 1
@@ -467,22 +602,28 @@ def review(session: str, *, moment: str, pr_number=None) -> int:
         if failures >= REVIEW_GIVE_UP_AFTER:
             # Three bounded attempts is the retry budget. The drafts stay in
             # their file for a human; the review stops spending on them.
-            save_meta(session, reviewed_through=len(drafts), review_failures=0,
-                      reviewed_at=time.time(), review_gave_up=True)
+            save_meta(session, reviewed_through=len(drafts), mined_through=len(moments),
+                      review_failures=0, reviewed_at=time.time(), review_gave_up=True)
         else:
             save_meta(session, review_failures=failures)
         return -1
     kept, dropped = apply_review(new, verdict, book, budget, pr_number=meta.get("pr_number"))
-    if kept:
+    authored, refused = apply_mining(new_moments, verdict, book, session=session,
+                                     repo=repo, kept=kept, budget=budget,
+                                     pr_number=meta.get("pr_number"))
+    rows = kept + authored
+    if rows:
         with reviewed_path(session).open("a", encoding="utf-8") as fh:
-            for row in kept:
+            for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-    save_meta(session, reviewed_through=len(drafts), reviewed_at=time.time(),
-              review_failures=0, review_moment=moment,
-              dropped=int(meta.get("dropped") or 0) + len(dropped))
+    save_meta(session, reviewed_through=len(drafts), mined_through=len(moments),
+              reviewed_at=time.time(), review_failures=0, review_moment=moment,
+              dropped=int(meta.get("dropped") or 0) + len(dropped),
+              mining_refused=refused)
     _log(f"review {session[:8]} ({moment}): {len(new)} new drafts, kept {len(kept)}, "
-         f"dropped {len(dropped)}")
-    return len(kept)
+         f"dropped {len(dropped)}; {len(new_moments)} moments, authored {len(authored)}, "
+         f"refused {refused}")
+    return len(rows)
 
 
 # ------------------------------------------------------------------- sync
@@ -628,7 +769,9 @@ def cmd_session(payload: dict) -> int:
         if sid == payload.get("session_id"):
             continue
         drafts = int(meta.get("drafts") or 0)
-        if drafts > int(meta.get("reviewed_through") or 0):
+        moments = len(hx.read_drafts(moments_path(sid)))
+        if drafts > int(meta.get("reviewed_through") or 0) \
+                or moments > int(meta.get("mined_through") or 0):
             _spawn("review", "--session", sid, "--moment", "session-start")
             continue
         rows = hx.read_drafts(reviewed_path(sid))

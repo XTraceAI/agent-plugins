@@ -396,6 +396,108 @@ def test_a_failed_review_leaves_the_drafts_and_gives_up_after_three():
     print("PASS test_a_failed_review_leaves_the_drafts_and_gives_up_after_three")
 
 
+def test_the_review_mines_rows_from_flagged_moments():
+    """Direction from the owner: the classifier is the server's, the lesson
+    mining is the LOCAL agent's. The review receives the flagged moments and
+    authors rows itself; each row is stamped from its moment, PII-checked
+    and twin-checked exactly like a server row, and the budget is shared
+    with kept drafts."""
+    with _Env() as env:
+        hs.save_meta("sess", repo="repo", cwd=str(env.base))
+        state = {"repo": "repo", "session_id": "sess", "turn": 5, "hook_version": "0.53.0",
+                 "at": "2026-09-10T00:00:00Z", "branch": "b", "head_sha": "abc",
+                 "pr_number": None, "env": "staging"}
+        for n in (5, 6, 7):
+            hx.append_draft(hs.moments_path("sess"), {
+                "turn": n, "source_ref": f"sess#{n}", "hint": "", "kind": "correction",
+                "reason": "no_engine", "window": f"USER'S NEW MESSAGE: moment {n}",
+                "state": dict(state, turn=n)})
+        seen = {}
+        real = hs.subprocess.run
+
+        def fake(cmd, **kw):
+            seen.update(kw=kw)
+            return _Proc(stdout=json.dumps({"structured_output": {
+                "keep": [], "drop": [],
+                "author": [
+                    {"moment": 1, "title": "Fetch before origin reads",
+                     "statement": "When reading origin/* refs, run git fetch first because a stale ref answers wrong.",
+                     "engine": "matcher",
+                     "matcher": {"event": "bash", "command_rx": "git\\s+log\\s+\\S*origin/",
+                                 "command_not_rx": None, "path_rx": None, "path_not_rx": None, "content_rx": None},
+                     "ordering": None, "anchors": None, "supersedes_rule_id": None, "rationale": "r"},
+                    {"moment": 2, "title": "Colleague path",
+                     "statement": "When editing /Users/colleague/dev/x, stop because it is not yours to edit.",
+                     "engine": "anchors", "matcher": None, "ordering": None,
+                     "anchors": ["/Users/colleague/dev/x"], "supersedes_rule_id": None, "rationale": "r"},
+                    {"moment": 3, "title": "No engine",
+                     "statement": "When doing the thing, do the other thing first because reasons abound.",
+                     "engine": "anchors", "matcher": None, "ordering": None,
+                     "anchors": ["the staging database"], "supersedes_rule_id": None, "rationale": "r"},
+                    {"moment": 9, "title": "Bogus", "statement": "x" * 30, "engine": "anchors",
+                     "matcher": None, "ordering": None, "anchors": ["a.py"],
+                     "supersedes_rule_id": None, "rationale": "r"},
+                ]}}))
+
+        hs.subprocess.run = fake
+        try:
+            got = hs.review("sess", moment="test")
+        finally:
+            hs.subprocess.run = real
+        assert got == 1, got
+        assert "[M1] turn 5" in seen["kw"]["input"] and "moment 7" in seen["kw"]["input"]
+        rows = hx.read_drafts(hs.reviewed_path("sess"))
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["source_ref"] == "sess#5" and row["state"]["turn"] == 5
+        assert row["_reason"] == "local:correction" and row["_review"]["authored"]
+        assert row["matcher"] == {"event": "bash", "command_rx": "git\\s+log\\s+\\S*origin/"}
+        assert all(row["state"].get(k) for k in hs.STATE_KEYS)
+        meta = hs.load_meta("sess")
+        assert meta["mined_through"] == 3
+        assert meta["mining_refused"] == {"pii_in_row": 1, "anchors_not_identifiers": 1,
+                                           "bad_moment": 1}, meta["mining_refused"]
+        # nothing new: no second call
+        hs.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no"))
+        try:
+            assert hs.review("sess", moment="again") == -1
+        finally:
+            hs.subprocess.run = real
+    print("PASS test_the_review_mines_rows_from_flagged_moments")
+
+
+def test_extract_records_the_flagged_moment_for_the_local_miner():
+    with _Env() as env:
+        repo = _git_repo(env.base)
+        tp = env.base / "s.jsonl"
+        _transcript(tp, [("do it", "done", []), ("no, i mean on staging", "ok", [])])
+        real = hx.server_draft
+        # the server's author refused — the moment is still the local agent's to mine
+        hx.server_draft = lambda w, hint="", repo="", timeout=0: (
+            {"drafted": False, "reason": "project_state", "kind": "correction"}, 0.1)
+        try:
+            hs.cmd_extract("sess", str(tp), str(repo))
+        finally:
+            hx.server_draft = real
+        moments = hx.read_drafts(hs.moments_path("sess"))
+        assert len(moments) == 1 and moments[0]["turn"] == 2
+        assert moments[0]["kind"] == "correction" and moments[0]["hint"] == "wrong_target"
+        assert "USER'S NEW MESSAGE: no, i mean on staging" in moments[0]["window"]
+        assert moments[0]["state"]["repo"] == "repo"
+        assert not hx.drafts_path("sess").exists()
+        # a no_signal turn records nothing
+        _transcript(tp, [("do it", "done", []), ("no, i mean on staging", "ok", []),
+                         ("thanks", "np", [])])
+        hx.server_draft = lambda w, hint="", repo="", timeout=0: (
+            {"drafted": False, "reason": "no_signal", "kind": None}, 0.1)
+        try:
+            hs.cmd_extract("sess", str(tp), str(repo))
+        finally:
+            hx.server_draft = real
+        assert len(hx.read_drafts(hs.moments_path("sess"))) == 1
+    print("PASS test_extract_records_the_flagged_moment_for_the_local_miner")
+
+
 # ---------------------------------------------------------------- the sync
 class _Block:
     def __init__(self, text):

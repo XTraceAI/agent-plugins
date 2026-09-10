@@ -34,6 +34,7 @@ import collections
 import concurrent.futures as cf
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -166,6 +167,203 @@ def cmd_gold(args) -> None:
             "false_negatives": fns, "false_positives": fps,
         }, indent=1), encoding="utf-8")
         print(f"\n-> {args.out}")
+
+
+# ----------------------------------------------------------------- review
+def _load_stop():
+    scripts = plugin_scripts()
+    sys.path.insert(0, str(scripts))
+    import harness_stop                                     # noqa: PLC0415
+    return harness_stop
+
+
+_TRACE_TURN = re.compile(r"^== turn (\d+) \|")
+_TRACE_SERVER = re.compile(r"^   server \(([\d.]+)s\): (\S+)(?: — .*?)?(?: \| judge=(\S+))?$")
+
+
+def moments_from_trace(hx, doc: dict, trace_path: Path, rows: list[dict]) -> list[dict]:
+    """The classifier-flagged moments of a finished `corpus` run, rebuilt
+    from its trace: a turn was a signal when the server ran the author on it
+    (any reason but no_signal / an outage), whether or not a row came back.
+    Runs made after this mode existed record moments directly
+    (`--moments`); this reads the ones that did not."""
+    kind_of = {r["source_ref"]: r.get("_kind") for r in rows}
+    sent: dict[int, tuple[bool, str]] = {}
+    turn_n = None
+    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = _TRACE_TURN.match(line)
+        if m:
+            turn_n = int(m.group(1))
+            continue
+        if turn_n is None or turn_n in sent:
+            continue
+        m = _TRACE_SERVER.match(line)
+        if m:
+            sent[turn_n] = (hx.judge_said_signal(m.group(2)), m.group(3) or "")
+        elif line.startswith(("   DRAFT (", "   server drafted, client refused", "   twin of")):
+            sent[turn_n] = (True, kind_of.get(f"{doc.get('session')}#{turn_n}") or "")
+    turns = doc.get("turns") or []
+    session = doc.get("session") or ""
+    out = []
+    for i, turn in enumerate(turns):
+        flagged = sent.get(turn.get("n"))
+        if not flagged or not flagged[0]:
+            continue
+        prev = turns[i - 1] if i else None
+        state = hx.stamp_state(session=session, turn=turn, row_engine_target=("", ""),
+                               cwd="", hook_version=hx.plugin_version(), env_name="staging",
+                               default_repo=doc.get("repo") or "")
+        hits = hx.route(turn, prev)
+        out.append({"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
+                    "hint": hx.router_hint(hits), "kind": flagged[1], "reason": "replay",
+                    "window": hx.redact_window(hx.build_window(turn, prev, state)),
+                    "state": state})
+    return out
+
+
+def cmd_review(args) -> None:
+    """The post-session review (§4.3) over a corpus run — the stage AFTER
+    the classifier, where an agent with the whole session decides what a
+    human sees. The activate ratio a reviewer meets is the ratio after this
+    stage, not before it. Two variants, one headless `claude -p` per session
+    each, disarmed (`--safe-mode`, MEMHUB_HARNESS_CHILD=1):
+
+      --variant review   keep/drop over the rows the SERVER author drafted
+      --variant mine     the local agent AUTHORS from the classifier-flagged
+                         moments, with no server drafts in front of it
+
+    Nothing is synced or filed: rows land in `<run>/<variant>/`. With
+    `--verdicts` (the hand judgement over `rows.json` indices) the
+    after-review ratio of the `review` variant is computed here; `mine`
+    writes a fresh judge sheet, since its rows are new.
+    """
+    hx = _load_extract()
+    hs = _load_stop()
+    run = Path(args.run)
+    corpus = Path(args.corpus)
+    out = run / args.variant
+    drafts_dir = out / "state"
+    if drafts_dir.exists():
+        import shutil                                       # noqa: PLC0415
+        shutil.rmtree(drafts_dir)
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MEMHUB_HARNESS_DRAFTS"] = str(drafts_dir)
+    rows_all = json.loads((run / "rows.json").read_text(encoding="utf-8"))
+    index_of: dict = collections.defaultdict(list)
+    for i, r in enumerate(rows_all, 1):
+        index_of[(r["source_ref"], r["title"])].append(i)
+
+    jobs = []
+    for doc_path in sorted(corpus.glob("*.json")):
+        if doc_path.name == "index.json":
+            continue
+        name = doc_path.stem
+        doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        drafts = run / f"{name}.drafts.jsonl"
+        rows = hx.read_drafts(drafts) if drafts.is_file() else []
+        # Two corpus files can carry one session id (the same session
+        # captured twice); the replay keys its state by corpus file so they
+        # never share a drafts or reviewed file. `source_ref` keeps the id.
+        key = name
+        n_moments = 0
+        if args.variant == "review":
+            if not rows:
+                continue
+            hx.drafts_path(key).write_text(drafts.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            trace = run / f"{name}.trace.log"
+            moments = moments_from_trace(hx, doc, trace, rows) if trace.is_file() else []
+            if not moments:
+                continue
+            for m in moments:
+                hx.append_draft(hs.moments_path(key), m)
+            n_moments = len(moments)
+        repo = doc.get("repo") or ((rows[0].get("state") or {}).get("repo") if rows else "") or ""
+        hs.save_meta(key, repo=repo, turns_path=str(doc_path), cwd="",
+                     drafts=len(rows) if args.variant == "review" else 0,
+                     reviewed_through=0, mined_through=0)
+        jobs.append((name, key, len(rows) if args.variant == "review" else 0, n_moments))
+    print(f"{len(jobs)} sessions, variant={args.variant}, {args.jobs} reviews at a time")
+
+    def one(job):
+        name, key, n, n_moments = job
+        t0 = time.time()
+        got = hs.review(key, moment="replay")
+        reviewed = hx.read_drafts(hs.reviewed_path(key))
+        (out / f"{name}.reviewed.jsonl").write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in reviewed), encoding="utf-8")
+        meta = hs.load_meta(key)
+        print(f"  {name}: {n} drafts, {n_moments} moments -> {len(reviewed)} rows"
+              f"{' (review failed)' if got < 0 else ''} {round(time.time() - t0)}s"
+              f"{' refused ' + json.dumps(meta.get('mining_refused')) if meta.get('mining_refused') else ''}",
+              flush=True)
+        return {"name": name, "drafts": n, "moments": n_moments,
+                "kept": len(reviewed), "failed": got < 0,
+                "gave_up": bool(meta.get("review_gave_up")),
+                "refused": meta.get("mining_refused") or {}, "kept_rows": reviewed}
+
+    t0 = time.time()
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for res in pool.map(one, jobs):
+            results.append(res)
+
+    kept_rows = [r for res in results for r in res["kept_rows"]]
+    kept_idx = sorted({i for r in kept_rows for i in index_of.get((r["source_ref"], r["title"]), [])})
+    refused = collections.Counter()
+    for res in results:
+        for why, n in res["refused"].items():
+            refused[why] += n
+    summary = {
+        "variant": args.variant,
+        "sessions_reviewed": len(results),
+        "reviews_failed": sum(1 for r in results if r["failed"]),
+        "drafts_in": sum(r["drafts"] for r in results),
+        "moments_in": sum(r["moments"] for r in results),
+        "rows_out": len(kept_rows),
+        "rows_per_session_max": max((r["kept"] for r in results), default=0),
+        "rows_per_session_mean": round(sum(r["kept"] for r in results) / max(len(results), 1), 2),
+        "kept_indices": kept_idx,
+        "mining_refused": dict(refused.most_common()),
+        "supersedes_set": sum(1 for r in kept_rows if r.get("supersedes_rule_id")),
+        "by_engine": dict(collections.Counter(
+            next(k for k in ("matcher", "ordering", "anchors") if k in r) for r in kept_rows)),
+        "wall_s": round(time.time() - t0, 1),
+    }
+    if args.variant == "mine":
+        engineer_of = {}
+        idx = corpus / "index.json"
+        if idx.is_file():
+            engineer_of = {s["file"]: s["engineer"]
+                           for s in json.loads(idx.read_text()).get("sessions", [])}
+        for res in results:
+            for r in res["kept_rows"]:
+                r["_engineer"] = engineer_of.get(f"{res['name']}.json", res["name"].split("__")[0])
+        (out / "rows.json").write_text(json.dumps(kept_rows, indent=1), encoding="utf-8")
+        write_judge_sheet(out / "judge_sheet.md", kept_rows,
+                          {"sessions": len(results), "engineers": sorted({r["_engineer"] for r in kept_rows})},
+                          [], [])
+    if args.verdicts and args.variant == "review":
+        v = json.loads(Path(args.verdicts).read_text(encoding="utf-8"))
+        A = set(v["A"])
+        R = {i: why for why, ids in v["R"].items() for i in ids}
+        kept_set = set(kept_idx)
+        summary.update({
+            "activatable_before": len(A), "drafted_before": len(rows_all),
+            "ratio_before": round(len(A) / max(len(rows_all), 1), 3),
+            "activatable_after": len(A & kept_set), "kept_after": len(kept_set),
+            "ratio_after": round(len(A & kept_set) / max(len(kept_set), 1), 3),
+            "activatable_dropped_by_review": sorted(A - kept_set),
+            "rejects_kept_by_review": {str(i): R[i] for i in sorted(kept_set - A)},
+            "rejects_dropped_by_reason": dict(collections.Counter(
+                R[i] for i in R if i not in kept_set).most_common()),
+        })
+    (out / "summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
+    print("\n" + "=" * 62)
+    for k, v in summary.items():
+        if k not in ("kept_indices",):
+            print(f"{k:32} {v}")
+    print(f"\n-> {out}/summary.json")
 
 
 # ----------------------------------------------------------------- router
@@ -473,6 +671,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--corpus", required=True)
     r.add_argument("--out", default="")
 
+    rv = sub.add_parser("review", help="the post-session review over a corpus run's drafts")
+    rv.add_argument("--run", required=True, help="a `corpus` run directory (rows.json, *.drafts.jsonl)")
+    rv.add_argument("--corpus", required=True)
+    rv.add_argument("--verdicts", default="", help="hand judgement JSON over rows.json indices")
+    rv.add_argument("--jobs", type=int, default=3)
+    rv.add_argument("--variant", choices=("review", "mine"), default="review")
+
     c = sub.add_parser("corpus", help="the whole pipeline over a corpus")
     c.add_argument("--corpus", required=True)
     c.add_argument("--out", required=True)
@@ -490,7 +695,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    {"gold": cmd_gold, "router": cmd_router, "corpus": cmd_corpus}[args.mode](args)
+    {"gold": cmd_gold, "router": cmd_router, "corpus": cmd_corpus,
+     "review": cmd_review}[args.mode](args)
     return 0
 
 
