@@ -220,6 +220,43 @@ def test_short_count_quarantine_and_throttle_are_destination_local():
         assert len(local[1])==2 and len(cloud[1])==4
 
 
+def test_growing_ledger_quarantines_only_the_frozen_retry_prefix():
+    with tempfile.TemporaryDirectory() as td,receiver() as local,receiver() as cloud:
+        home=Path(td);cases.configure(home,local[0]);path=append(home,[event("poison")])
+        first_end=path.stat().st_size;cloud[2]["reply"]={"accepted":0,"rejected":0}
+        invoke(home,cloud[0])
+        append(home,[event("later-1")]);invoke(home,cloud[0])
+        append(home,[event("later-2")]);invoke(home,cloud[0])
+        saved=state(home,"cloud",local[0])
+        assert saved["fires_offset"]==first_end,saved
+        assert saved["stall"]["n"]==1,saved
+        rejected=[json.loads(line)["rejected"]["fire_id"] for line in
+                  (directory(home,"cloud",local[0])/"rejected.jsonl").read_text().splitlines()]
+        assert rejected==["poison"],rejected
+        rows=[[row["fire_id"] for row in request[2]["fires"]] for request in cloud[1]]
+        assert rows==[["poison"]]*3+[["later-1","later-2"]],rows
+        cloud[2]["reply"]=None;invoke(home,cloud[0])
+        assert state(home,"cloud",local[0])["fires_offset"]==path.stat().st_size
+        assert "stall" not in state(home,"cloud",local[0])
+        assert len(local[1])==3
+
+
+def test_frozen_retry_keeps_new_conversions_out_of_its_original_projection():
+    with tempfile.TemporaryDirectory() as td,receiver() as local,receiver() as cloud:
+        home=Path(td);cases.configure(home,local[0]);append(home,[event("first")])
+        cloud[2]["reply"]={"accepted":0,"rejected":0};invoke(home,cloud[0])
+        with (ledger(home)/"conversions.jsonl").open("w") as output:
+            output.write(json.dumps({"fire_id":"first","converted":True,"converted_at":"2026-01-02T00:00:00Z"})+"\n")
+        invoke(home,cloud[0])
+        assert state(home,"cloud",local[0])["stall"]["n"]==2
+        assert cloud[1][0][2]["fires"]==cloud[1][1][2]["fires"]
+        cloud[2]["reply"]=None;invoke(home,cloud[0])
+        assert cloud[1][2][2]["fires"]==cloud[1][0][2]["fires"]
+        assert cloud[1][3][2]["fires"][0]["converted"] is True
+        assert state(home,"cloud",local[0])["conversions_offset"]==(ledger(home)/"conversions.jsonl").stat().st_size
+        assert "stall" not in state(home,"cloud",local[0])
+
+
 def test_installed_cloud_alone_adopts_legacy_progress_and_cloud_lock_never_blocks_local():
     with tempfile.TemporaryDirectory() as td,receiver() as local,receiver() as cloud:
         home=Path(td);cases.configure(home,local[0]);path=append(home,[event()])

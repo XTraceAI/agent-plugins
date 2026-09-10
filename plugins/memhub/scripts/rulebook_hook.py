@@ -2377,7 +2377,7 @@ def _capture_api():
     return (pak.api_base(url), bearer, mcp_http) if bearer else None
 
 
-def _read_rows(path, start=0, offsets=None):
+def _read_rows(path, start=0, offsets=None, stop=None):
     """Complete JSON lines from byte `start`; returns (rows, end_offset) where
     end_offset stops before any partial trailing line. `offsets`, if given,
     receives each row's end offset so a caller can watermark per row."""
@@ -2388,6 +2388,8 @@ def _read_rows(path, start=0, offsets=None):
         with open(path, "rb") as f:
             f.seek(end)
             for line in f:
+                if stop is not None and end + len(line) > stop:
+                    break
                 if not line.endswith(b"\n"):
                     break
                 end += len(line)
@@ -2467,6 +2469,30 @@ def _older_than(iso, seconds):
 
 
 def pending_batches(sent):
+    """Replay a stalled prefix independently of later ledger appends."""
+    stall = sent.get("stall") or {}
+    boundary = stall.get("after") if isinstance(stall, dict) else None
+    if isinstance(boundary, dict):
+        valid = True
+        for kind in ("fires", "conversions"):
+            end = boundary.get(kind + "_offset")
+            try:
+                size = os.path.getsize(os.path.join(_ledger_dir(), kind + ".jsonl"))
+            except FileNotFoundError:
+                size = 0
+            if type(end) is not int or not sent.get(kind + "_offset", 0) <= end <= size:
+                valid = False
+        if valid:
+            frozen, after = _pending_batches(sent, boundary)
+            if frozen:
+                remainder = dict(after)
+                remainder.pop("stall", None)
+                later, new_sent = _pending_batches(remainder)
+                return frozen + later, new_sent
+    return _pending_batches(sent)
+
+
+def _pending_batches(sent, boundary=None):
     """Rows to POST = fires past the watermark ∪ fires named by conversions past
     THEIR watermark (each re-sent with converted/converted_at merged — the
     ingest is an upsert on fire_id, so a re-send is an update, never a dup).
@@ -2479,9 +2505,11 @@ def pending_batches(sent):
     ldir = _ledger_dir()
     fpath, cpath = os.path.join(ldir, "fires.jsonl"), os.path.join(ldir, "conversions.jsonl")
     f_offsets = []
-    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets)
+    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets,
+                                boundary.get("fires_offset") if boundary else None)
     c_offsets = []
-    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets)
+    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets,
+                                boundary.get("conversions_offset") if boundary else None)
     if not new_fires and not new_convs:
         return [], dict(sent, fires_offset=f_end, conversions_offset=c_end)
     # New fires carry their own rows. A NEW conversion may name a fire behind
@@ -2656,7 +2684,9 @@ async def _flush_fires(final=False):
                 stall = cur.get("stall") or {}  # progress written by earlier batches
                 n = (stall.get("n", 0) + 1) if stall.get("key") == batch_key else 1
                 if n < STALL_QUARANTINE_AFTER:
-                    cur["stall"] = {"key": batch_key, "n": n}
+                    cur["stall"] = {"key": batch_key, "n": n,
+                                    "after": {field: after[field] for field in
+                                              ("fires_offset", "conversions_offset")}}
                     _atomic_json(_sent_path(), cur)
                     _breadcrumb("flush", "receiver did not account for every input row")
                     return
