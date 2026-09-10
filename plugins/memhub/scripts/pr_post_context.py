@@ -33,8 +33,24 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pr_babysit_trigger  # noqa: E402
-import pr_link_trigger  # noqa: E402
+# Imported defensively, because these are MODULE-SCOPE imports and therefore
+# outside _lane's guard. `pr_link_trigger` pulls in pr_link -> pr_provenance and
+# touches Path.home() while importing, so a half-written file during a plugin
+# upgrade, or an unset HOME, used to make this hook exit 1 with a traceback and
+# lose BOTH instructions — where the old two-registration layout would still
+# have emitted the babysit one from its own process. A hook never fails the call
+# it follows, so a lane that cannot even be imported is simply a lane that has
+# nothing to say.
+try:
+    import pr_link_trigger  # noqa: E402
+except BaseException as _exc:  # noqa: BLE001
+    pr_link_trigger = None
+    print(f"[memhub-pr-context] link lane unavailable: {_exc!r}", file=sys.stderr)
+try:
+    import pr_babysit_trigger  # noqa: E402
+except BaseException as _exc:  # noqa: BLE001
+    pr_babysit_trigger = None
+    print(f"[memhub-pr-context] babysit lane unavailable: {_exc!r}", file=sys.stderr)
 
 # The matcher the babysit hook carried before the merge, replicated exactly.
 # Claude Code matchers are UNANCHORED regexes, so `"Bash"` also selected
@@ -60,10 +76,29 @@ def contexts_for(payload: object, *, host: str = "claude") -> list[str]:
     tool_name = payload.get("tool_name")
     tool_name = tool_name if isinstance(tool_name, str) else ""
 
-    parts = [_lane(lambda: pr_link_trigger.context_for(payload, host=host))]
-    if _BASH.search(tool_name):
-        parts.append(_lane(lambda: pr_babysit_trigger.context_for(payload)))
-    return [part for part in parts if part]
+    link = babysit = None
+    if pr_link_trigger is not None:
+        link = _lane(lambda: pr_link_trigger.context_for(payload, host=host))
+    if pr_babysit_trigger is not None and _BASH.search(tool_name):
+        babysit = _lane(lambda: pr_babysit_trigger.context_for(payload))
+
+    # The lanes find the pull request by DIFFERENT rules: the link lane reads
+    # gh's report structurally (a URL alone on its line, or a `key:\tvalue`
+    # field) precisely so a pull-request BODY citing some other PR cannot
+    # choose the target, while the babysit lane takes the first URL anywhere in
+    # stdout. Separately that was two hooks disagreeing; merged it would be ONE
+    # instruction saying "link PR A" and "babysit PR B" — aiming a loop that
+    # fixes findings and pushes at a pull request the session never opened. If
+    # they disagree, the hardened extractor wins and the babysit half is
+    # dropped, because arming the wrong loop is worse than arming none.
+    if link and babysit:
+        found = pr_babysit_trigger.PR_URL.search(babysit)
+        if not found or found.group(0) not in link:
+            print("[memhub-pr-context] lanes named different pull requests; "
+                  "babysit suppressed", file=sys.stderr)
+            babysit = None
+
+    return [part for part in (link, babysit) if part]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,7 +108,10 @@ def main(argv: list[str] | None = None) -> int:
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return 0
 
-    parts = contexts_for(payload, host=pr_link_trigger.host_from_argv(argv))
+    host = "claude"
+    if pr_link_trigger is not None:
+        host = _lane(lambda: pr_link_trigger.host_from_argv(argv)) or "claude"
+    parts = contexts_for(payload, host=host)
     if not parts:
         return 0
     print(json.dumps({

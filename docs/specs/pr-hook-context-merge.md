@@ -66,13 +66,33 @@ the same means: **one registration, one context.**
 `PostToolUse[6]` collapse into a single registration behind one entry point
 that emits at most one `additionalContext`.
 
-**Explicitly out of scope.** The same defect exists on the Edit family —
-`reactive_prefilter → directive_recall` (`[0]`), `artifact_sync_reminder`
-(`[2]`) and `rulebook_hook post` (`[5]`) can all fire on one edit and only the
-first survives. A general Claude-side dispatcher mirroring
-`codex_hook_bridge.py` is the eventual fix; it is deliberately **not** this
-change. This spec must not make that harder: each lane stays a pure function
-callable from a future dispatcher.
+**Explicitly out of scope — and it leaves a residual hole, named here rather
+than glossed.** The merge stops the two PR instructions displacing *each
+other*. It does not make a `PostToolUse` call deliver more than one context,
+and the PR group is not the only synchronous handler matching `Bash` that can
+return one:
+
+| idx | handler | matches `Bash` | emits context |
+|---|---|---|---|
+| `[0]` | `pr_post_context.py` (this change) | yes | yes |
+| `[1]` | `reactive_prefilter → directive_recall` | yes | yes, when the tool output matches `_ERROR_RE` |
+| `[2]` | `flush_session` | yes | no — and `async`, whose context is not delivered anyway |
+| `[3]` | `artifact_sync_reminder` | no (Edit family) | yes |
+| `[4]` | `md_capture` | yes | no |
+| `[5]` | `rulebook_hook post` | yes | yes |
+
+So the PR group is registered **first**. Without that, a
+`git push && gh pr create` or any create whose output carries `error:`,
+`fatal:` or `npm ERR!` loses BOTH PR instructions to reactive recall — strictly
+worse than the pre-fix state, where babysit at least arrived. Registering first
+is a real trade, accepted deliberately: on exactly those calls the directive
+recall loses instead. It costs nothing on ordinary Bash calls, because this
+group is silent unless a pull request was really created.
+
+The eventual fix is one Claude-side dispatcher folding every `Bash` handler
+together, mirroring `codex_hook_bridge.py`. It is deliberately **not** this
+change, and this spec must not make it harder: each lane stays a pure function
+a dispatcher can call.
 
 **Also out of scope.** Arming babysit on a PR created through a GitHub MCP
 tool. The merged matcher covers MCP tools, which the babysit hook has never
@@ -152,11 +172,11 @@ matches `*gh*pr*`).
 }
 ```
 
-**Position is deliberate.** The merged group keeps index 3 rather than moving
-to 6. While the harness keeps the earliest context, sitting at 3 means a
-rulebook fire at `[5]` cannot displace the PR context; sitting at 6 would mean
-it can. The index is a mitigation, not the fix — the fix is that our own two
-lanes can no longer displace each other.
+**Position is deliberate: index 0.** While the harness keeps the earliest
+context, every later Bash emitter — reactive directive recall and the rulebook
+post handler — can displace the PR context from any other index. The index is a
+mitigation, not the fix; the fix is that our own two lanes can no longer
+displace each other.
 
 **Timeout is 15s**, the tighter of the two budgets replaced. The only I/O is
 `pr_link.check` (4s); the babysit lane is regex over the payload. The merge
@@ -227,6 +247,13 @@ stub `checker` so nothing reaches a live backend). It must cover:
 3. A GitHub MCP create → link text only, babysit absent.
 4. A raising link lane → babysit context still emitted, exit 0.
 5. A raising babysit lane → link context still emitted, exit 0.
+5b. A lane that cannot be IMPORTED (module-scope failure, outside `_lane`) →
+   the other lane still emitted, exit 0, no traceback.
+5c. The two lanes naming DIFFERENT pull requests → the babysit half dropped,
+   the link instruction emitted alone (the hardened extractor wins; arming a
+   loop on a pull request the session never opened is worse than arming none).
+5d. The merged group is registered ahead of every other synchronous handler
+   that matches `Bash` and can emit context.
 6. Both lanes silent → **no stdout at all**, exit 0.
 7. Malformed / non-dict stdin → no traceback, no stdout, exit 0.
 8. The output parses as one JSON object with exactly one
@@ -267,7 +294,7 @@ is cleaned up with `scripts/purge_today.py`.
 - `plugin.json` / `marketplace.json` descriptions — updated where they
   describe the two hooks as separate, since those descriptions are
   documentation.
-- Version **0.53.2** (a fix), bumped in **all five** manifests together:
+- Version **0.53.3** (a fix; 0.53.2 was taken by #187 mid-flight), bumped in **all five** manifests together:
   `plugins/memhub/plugin.json`, `plugins/memhub/.claude-plugin/plugin.json`,
   `plugins/memhub/.codex-plugin/plugin.json`,
   `plugins/memhub/.cursor-plugin/plugin.json`, and

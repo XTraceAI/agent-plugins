@@ -60,22 +60,24 @@ _POST_TOOLS = ("^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|"
                "local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$")
 
 
-# Claude-only capture scripts: they read Claude's transcript store and must
-# never mount on Codex, whose capture routes through codex_flush. ONE list,
-# used by the generator's drop-filter AND asserted by
-# tests/codex_hooks_parity_test.py — two copies drifted apart once already
-# (the test forbade four names while the filter dropped two, so a renamed
-# Claude flush hook would have leaked into the Codex output and only been
-# caught by the test it was supposed to agree with).
+# Claude-only scripts: they read Claude's transcript store, or arm a Claude-only
+# loop, and must never mount on Codex, whose capture routes through codex_flush.
+#
+# This is an ASSERTED list, not a filter: `generate` below builds the Codex
+# document from a fixed template and never copies Claude's commands, so nothing
+# here is dropped from anything — `tests/codex_hooks_parity_test.py` is the only
+# consumer, and it asserts none of these names appears in the generated file.
+# The comment used to claim a "generator drop-filter" that does not exist,
+# which is the kind of reassurance that makes the next person stop looking.
 CLAUDE_ONLY_CAPTURE = (
     "flush_turn.py",
     "flush_session.py",
     "turn_flush_prefilter.py",
     "pr_babysit_trigger.py",
-    # The merged PR-lane entry point CALLS pr_babysit_trigger, so mounting it
-    # on Codex would arm a Claude-only babysit loop by the back door. Codex
-    # reaches the link lane through codex_hook_bridge, which already folds
-    # its jobs into one context and calls pr_link_trigger directly.
+    # The merged PR-lane entry point CALLS pr_babysit_trigger, so it must never
+    # become the Codex path either. Codex reaches the link lane through
+    # codex_hook_bridge, which already folds its jobs into one context and
+    # calls pr_link_trigger directly.
     "pr_post_context.py",
 )
 

@@ -115,7 +115,7 @@ all call it. Three copies of a string prefix is how a host silently stops linkin
 |---|---|
 | `plugins/memhub/scripts/pr_link.py` | **New.** Shared, importable, side-effect-free: the `touches_github` / `creates_pr` detectors (shell, REST API, MCP), URL extraction, `conversation_id_for`, the `check` call, and the context texts. |
 | `plugins/memhub/scripts/pr_link_trigger.py` | **New.** The link lane: `context_for(payload, host=…)`, plus a `main()` that keeps the stdin → `additionalContext` contract for the Codex bridge and the tests. |
-| `plugins/memhub/scripts/pr_post_context.py` | **New** (v0.53.2). The lane's single `PostToolUse` registration: runs the link lane then the babysit lane and emits ONE `additionalContext`. |
+| `plugins/memhub/scripts/pr_post_context.py` | **New** (v0.53.3). The lane's single `PostToolUse` registration: runs the link lane then the babysit lane and emits ONE `additionalContext`. |
 | `plugins/memhub/scripts/capture.py` | **Changed.** New `current` subcommand (§7). |
 | `plugins/memhub/scripts/readers/{claude,codex,cursor}.py` | **Changed.** Each gains `session_cwd(path) -> str | None` (§7). |
 | `plugins/memhub/scripts/codex_hook_bridge.py` | **Changed.** `_dispatch_post` also runs `pr_link_trigger.py` for shell tools (§5.2). |
@@ -359,20 +359,81 @@ return reply.data if reply.status == 200 and isinstance(reply.data, dict) else N
 - `None` (no credential, transport error, non-200, unexpected shape) ⇒ the hook emits nothing.
   Silence is always the safe answer: the user can still run `/memhub:link-pr`.
 - Record failures as a breadcrumb under `~/.config/memhub-plugin/` the way `rulebook_hook`
-  does, so an operator can see why a machine went quiet.
+  does, so an operator can see why a machine went quiet. **Redacted through `redact.py`**: this is
+  the only file that persists exception text, it is append-only and never rotated, and an exception
+  can carry the credential in its own arguments — a `UnicodeEncodeError` names the entire string it
+  failed on, which is exactly what a bearer holding one non-UTF-8 byte would produce. For the same
+  reason the identity digest encodes with `surrogatepass`, so that hash can never be the thing that
+  raises.
 
 ### 4.4 Caching
 
-Cache **only the negative org-level answer**: when a reply has `enabled:false` or
-`github_connected:false`, write `{"answer": …, "at": <epoch>}` to
-`~/.config/memhub-plugin/prlink/<sha256(api_base)[:16]>.json` (via `atomic_write.py`) and skip the
-network for 24h. Everything else — `linked_sessions`, `pr.known` — changes constantly and is
-never cached.
+Cache **only a `github_connected:false` answer, and only when the feature is enabled**: when a
+reply has `enabled` not false AND `github_connected:false`, write `{"answer": …, "at": <epoch>}`
+to `~/.config/memhub-plugin/prlink/<sha256(api_base \n scope \n identity)[:16]>.json` (via
+`atomic_write.py`) and skip the network for **30 minutes**. Everything else — `linked_sessions`,
+`pr.known` — changes constantly and is never cached.
 
 Rationale: an org with GitHub disconnected would otherwise pay an HTTP round trip on every `gh pr`
-command forever, for an answer that cannot change without an admin action. A freshly connected
-integration is picked up within a day, or immediately if the user runs `/memhub:link-pr` (which
-always calls live).
+command forever, for an answer that only an admin action changes. But the negative side of this
+cache is a **one-way latch** — nothing invalidates it when the condition flips positive — so its
+TTL is the whole blast radius of a wrong entry, and the three rules below bound it.
+
+**A `enabled:false` reply is never cached.** This is the rule that matters most, and it is not a
+matter of taste: on the server, `probe()` returns `ProbeResult(enabled=False)` from a feature-flag
+gate *before it runs a single query*, and `ProbeResult.github_connected` **defaults to `False`**
+on the dataclass. The docstring is explicit that this is deliberate — "a dark-launched feature
+must not add queries to every `gh pr` in the fleet, which is why nothing below the flag check
+runs." So in a disabled reply `github_connected:false` is **a default nobody computed**, not a
+finding about the org's integration. Caching it files a field the server never looked at as a
+durable admin-owned fact.
+
+This is not hypothetical. On 2026-09-08 15:18 a real machine cached
+`{"enabled": false, "github_connected": false}` for `github.com/xtraceai/memory-hub` while that
+org's GitHub App was connected the whole time — the `SESSION_PR_LINKING` flag was simply still
+off. The flag was turned on later that day; the entry was 23.6 h old against the old 24 h TTL when
+the user opened PR #760, so `check()` returned the cached negative, never contacted the server,
+and `context_for`'s `enabled is False` branch returned `None`. No advisory, and no breadcrumb
+(those are written only on exceptions), so the hook went silent with no trace. Under this section's
+rules that entry is never written at all.
+
+**The key carries the identity, not just the deployment and repo.** `enabled` and
+`github_connected` are properties of *the org that answers*, and which org answers is determined by
+the **bearer** — `resolve_bearer` prefers `$MEMHUB_TOKEN`, then a stored personal access key, then
+a cached OAuth token, so the identity behind a check can change without the user doing anything
+deliberate. Keyed on `api_base + repo` alone, a negative earned under one identity silences every
+later identity on the same machine and repo. The key therefore includes a truncated digest of the
+resolved bearer; a re-login or a token swap starts clean. The bearer is hashed, never stored.
+
+**30 minutes, overridable.** `NEGATIVE_TTL_S` defaults to `30 * 60` and is read at call time
+through `MEMHUB_PRLINK_NEGATIVE_TTL_S` (seconds; a non-numeric or negative value falls back to the
+default, `0` disables serving from the cache). Turning the feature on, or connecting GitHub, now
+takes effect within half an hour on a machine that happened to ask while it was off, instead of up
+to a day — and `/memhub:link-pr` still asks live, always.
+
+**A stored answer is re-tested against these rules on read, not only on write**, through one
+shared predicate. Be precise about what this does and does not do. It is *not* what retires the
+24 h-era entries already on disk — those were keyed without an identity, so they now hash to an
+address nothing looks up: they are orphaned rather than read-and-rejected. Either way nobody has
+to clear `~/.config/memhub-plugin/prlink/` by hand. The read-side gate is defence in depth for an
+entry that reaches the file some other way, and it is what keeps *what we cache* and *what we would
+say* from drifting apart — `_cacheable` tests `enabled is not False` precisely because
+`context_for` goes silent on `enabled is False`, and a reply the one accepts must be a reply the
+other would advise on.
+
+**The directory is pruned, because the key now multiplies.** An entry per deployment × repo ×
+credential, with an OAuth access token rotating about daily, is one permanently dead file per
+rotation forever — nothing else in the plugin prunes this directory. Each write drops entries older
+than twice the larger of the active and the default window (so a widened TTL can never delete a
+servable entry), bounded to a fixed number of files per pass because this is hook-path code. A TTL
+of `0` suppresses the **write** as well as the read, so "disabled" does not mean "accumulate
+entries nothing will ever serve".
+
+**Server-contract note (no backend change required).** That a disabled reply carries
+`github_connected:false` rather than omitting the field is a real ambiguity in §2.1's wire
+contract, and it is the server's to resolve if it ever wants to. This client does not wait on it:
+by refusing to read any sibling field out of an `enabled:false` reply, the plugin is correct under
+either spelling. Do not "fix" this by inferring connection state from a disabled reply.
 
 ### 4.5 The contexts
 
@@ -466,9 +527,10 @@ ONE entry in `PostToolUse`, shared with the babysit lane.
 }
 ```
 
-The merged group keeps the **babysit** group's index (3, not 6). While the harness delivers the
-earliest context, sitting at 3 means a rulebook fire at `[5]` cannot displace the PR context;
-sitting at 6 would mean it can. The index is a mitigation; the fix is that the lane's own two
+The merged group is registered **first** (index 0). While the harness delivers the earliest
+context, every later handler matching `Bash` that can return one — reactive directive recall,
+the rulebook post handler — would otherwise displace the PR context; reactive recall fires
+exactly when the output looks like a failure, which `git push && gh pr create` makes routine. The index is a mitigation; the fix is that the lane's own two
 instructions can no longer displace each other. The babysit lane is gated inside
 `pr_post_context.py` on the tool name matching `re.compile("Bash")` — unanchored, replicating the
 harness matcher it replaced — so widening the registration to the GitHub MCP tools did not widen
@@ -814,9 +876,11 @@ every `def test_*` to actually be invoked — use `globals()` discovery or list 
   namespaced id is not double-prefixed.
 - `check()` with a stubbed `mcp_http.rest`: 200 → dict; 500, timeout, exception, missing bearer →
   `None` and no raise.
-- cache: a `github_connected:false` reply writes the file and a second call inside 24h makes no
-  HTTP call; a `github_connected:true` reply writes nothing; a corrupt cache file is ignored, not
-  fatal.
+- cache: a `github_connected:false` reply (with the feature enabled) writes the file and a second
+  call inside 30 min makes no HTTP call; a `github_connected:true` reply writes nothing; an
+  `enabled:false` reply writes nothing and is not served even from an entry already on disk; an
+  entry written under a different bearer is not read; `MEMHUB_PRLINK_NEGATIVE_TTL_S` overrides the
+  window and a junk value falls back to the default; a corrupt cache file is ignored, not fatal.
 
 **`tests/pr_link_trigger_test.py`** (subprocess, like the other hook tests)
 - a Claude PostToolUse payload for `gh pr create` with one URL and a stubbed connected `check` →

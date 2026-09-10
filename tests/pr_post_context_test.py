@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -161,16 +164,37 @@ def test_a_github_mcp_create_never_arms_a_babysit_loop():
     that is a behaviour change, and this change is a bug fix.
     """
     FAKE.reply = dict(CONNECTED)
-    rc, out, _ = run(payload(
+    body = payload(
         tool="mcp__github__create_pull_request",
         tool_input={"title": "x", "head": "f", "base": "main"},
         response={"content": [{"type": "text",
-                               "text": json.dumps({"html_url": PR})}]}),
-        home=_home())
+                               "text": json.dumps({"html_url": PR})}]})
+    rc, out, _ = run(body, home=_home())
     ctx = one_document(out)
     check("the link lane still self-links an MCP create",
           rc == 0 and LINK_OPENER in ctx, ctx[:160])
     check("…and no babysit loop is armed", BABYSIT_OPENER not in ctx, ctx[:160])
+
+    # The end-to-end case above cannot see the gate: an MCP payload carries no
+    # `command`, so the babysit lane declines for a second, unrelated reason and
+    # the assertion passes even with the gate removed (mutation-verified: the
+    # suite stayed green with `if _BASH.search(...)` replaced by `if True:`).
+    # Force the lane to speak, so only the gate can silence it.
+    mod = _module()
+    real = mod.pr_babysit_trigger.context_for
+    try:
+        mod.pr_babysit_trigger.context_for = lambda _p: f"BABYSIT {PR}"
+        forced = mod.contexts_for(body, host="claude")
+        check("the tool-name gate alone keeps an MCP create from arming a loop",
+              not any(c.startswith("BABYSIT") for c in forced),
+              str(forced)[:120])
+        # …and the same forced lane DOES speak for a Bash create, so the test
+        # above is about the gate and not about a lane that never runs.
+        bash = mod.contexts_for(payload("gh pr create --fill"), host="claude")
+        check("…while a Bash create still reaches the babysit lane",
+              any(c.startswith("BABYSIT") for c in bash), str(bash)[:120])
+    finally:
+        mod.pr_babysit_trigger.context_for = real
 
 
 def test_a_failing_lane_loses_only_its_own_voice():
@@ -197,6 +221,64 @@ def test_a_failing_lane_loses_only_its_own_voice():
         mod.pr_babysit_trigger.context_for = boom
         check("both raising is silence, not a traceback",
               mod.contexts_for(body) == [])
+    finally:
+        mod.pr_link_trigger.context_for = link
+        mod.pr_babysit_trigger.context_for = babysit
+
+
+def test_a_lane_that_cannot_even_be_imported_loses_only_its_own_voice():
+    """The module-scope imports sit OUTSIDE _lane's guard.
+
+    A half-written `pr_link.py` during a plugin upgrade, or an unset HOME (which
+    `Path.home()` raises on while pr_link imports), made this hook exit 1 with a
+    traceback and lose BOTH instructions — where the old layout still emitted
+    babysit from its own process.
+    """
+    scripts = tempfile.mkdtemp(prefix="memhub-prctx-broken-")
+    for src in SCRIPTS.glob("*.py"):
+        shutil.copy(src, scripts)
+    pathlib.Path(scripts, "pr_link.py").write_text(
+        'raise ImportError("simulated half-written upgrade")\n', encoding="utf-8")
+    home = _home()
+    env = {**os.environ, "HOME": home, "USERPROFILE": home, "PYTHONUTF8": "1",
+           "MEMHUB_TOKEN": "mhk_test",
+           "MEMHUB_MCP_BASE_URL": f"http://127.0.0.1:{FAKE.port}"}
+    proc = subprocess.run([sys.executable, str(pathlib.Path(scripts,
+                                                           "pr_post_context.py"))],
+                          input=json.dumps(payload("gh pr create --fill")),
+                          capture_output=True, text=True, encoding="utf-8",
+                          env=env, timeout=30)
+    check("exit 0 even though the link lane will not import",
+          proc.returncode == 0, str(proc.returncode))
+    check("no traceback", "Traceback" not in proc.stderr, proc.stderr[-200:])
+    check("…and the babysit instruction still arrives",
+          BABYSIT_OPENER in (one_document(proc.stdout) or ""),
+          proc.stdout[:160])
+
+
+def test_the_lanes_may_not_name_two_different_pull_requests():
+    """Merged, a disagreement would aim a fix-and-push loop at the wrong PR.
+
+    The link lane reads gh's report structurally (hardened so a pull-request
+    BODY citing another PR cannot choose the target); the babysit lane takes the
+    first URL anywhere in stdout. When they disagree the hardened one wins.
+    """
+    mod = _module()
+    link, babysit = mod.pr_link_trigger.context_for, mod.pr_babysit_trigger.context_for
+    body = payload("gh pr create --fill")
+    try:
+        mod.pr_link_trigger.context_for = lambda _p, **_k: f"LINK {PR}"
+        mod.pr_babysit_trigger.context_for = (
+            lambda _p: "A pull request was just created: "
+                       "https://github.com/evil/repo/pull/777 .")
+        got = mod.contexts_for(body)
+        check("a disagreement drops the babysit half", got == [f"LINK {PR}"],
+              str(got)[:160])
+
+        mod.pr_babysit_trigger.context_for = (
+            lambda _p: f"A pull request was just created: {PR} .")
+        got = mod.contexts_for(body)
+        check("…and agreement keeps both", len(got) == 2, str(got)[:160])
     finally:
         mod.pr_link_trigger.context_for = link
         mod.pr_babysit_trigger.context_for = babysit
@@ -252,11 +334,22 @@ def test_the_manifest_reaches_the_lanes_through_this_entry_point_only():
     check("it is synchronous — additionalContext from an async hook is not delivered",
           not hook.get("async"))
     check("the guard still runs first", "claude_hook_guard.py" in hook["command"])
-    # Index 3, not 6: while the harness delivers the earliest context, a
-    # rulebook fire at [5] must not be able to displace the PR context.
-    check("…and it sits ahead of the rulebook post handler",
-          post.index(group) < next(i for i, g in enumerate(post)
-                                   if "rulebook_hook.py" in g["hooks"][0]["command"]))
+    # Registered FIRST. Any later handler that matches Bash and returns
+    # additionalContext can displace the PR context — reactive directive recall
+    # (which fires exactly when the output looks like a failure, so
+    # `git push && gh pr create` makes it routine) and the rulebook post
+    # handler both do. An index > 0 silently reintroduces the bug.
+    check("the PR lane is registered FIRST, ahead of every other Bash emitter",
+          post.index(group) == 0, str(post.index(group)))
+    emitters = [i for i, g in enumerate(post)
+                for h in g["hooks"]
+                if not h.get("async")
+                and re.search(g["matcher"], "Bash")
+                and any(s in h["command"] for s in
+                        ("directive_recall.py", "rulebook_hook.py",
+                         "pr_post_context.py"))]
+    check("…and every competing Bash emitter is behind it",
+          emitters and min(emitters) == post.index(group), str(emitters))
 
 
 if __name__ == "__main__":

@@ -34,10 +34,15 @@ import pr_provenance  # noqa: E402
 
 CHECK_TIMEOUT_S = 4.0
 # An org with GitHub disconnected cannot change that answer without an admin
-# acting, so it is the one reply worth caching. A day is short enough that a
-# freshly connected integration is picked up on its own, and /memhub:link-pr
-# always asks live.
-NEGATIVE_TTL_S = 24 * 3600
+# acting, so it is the one reply worth caching. But nothing invalidates a
+# negative when the condition flips POSITIVE, so this TTL is the entire blast
+# radius of a wrong entry: for 24h it silenced linking on every machine that
+# happened to ask while the feature was off, with no request, no error and no
+# log line. Half an hour keeps the round trips away without latching the day.
+# Overridable per machine with MEMHUB_PRLINK_NEGATIVE_TTL_S; /memhub:link-pr
+# always asks live regardless.
+NEGATIVE_TTL_S = 30 * 60
+NEGATIVE_TTL_ENV = "MEMHUB_PRLINK_NEGATIVE_TTL_S"
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "prlink"
 
 HOSTS = ("claude", "codex", "cursor")
@@ -1494,57 +1499,161 @@ def _repo_of(pr_url: str) -> str:
     return f"{m.group(1)}/{m.group(2)}/{m.group(3)}".casefold() if m else ""
 
 
-def _cache_path(api_base: str, scope: str = "") -> Path:
-    """Where a negative answer for THIS deployment and THIS repo is stored.
+def _negative_ttl_s() -> float:
+    """The negative cache's window, in seconds.
+
+    Read at CALL time, not at import: the override exists so one machine can be
+    pinned without waiting for a release, and a hook process is too short-lived
+    for an import-time read to mean anything different. Anything unparseable —
+    junk, a negative, NaN, an infinity — is the default rather than an error,
+    because this runs inside a hook where a mistyped env var must not become the
+    reason linking goes quiet. ``0`` disables serving from the cache entirely.
+
+    The module constant is the fallback, so a test that monkeypatches
+    ``NEGATIVE_TTL_S`` still steers this.
+    """
+    raw = os.environ.get(NEGATIVE_TTL_ENV, "").strip()
+    if not raw:
+        return float(NEGATIVE_TTL_S)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(NEGATIVE_TTL_S)
+    # NaN fails the lower bound and an infinity the upper, so both land on the
+    # default without a separate isfinite() check.
+    return value if 0 <= value < 10 ** 9 else float(NEGATIVE_TTL_S)
+
+
+def _cacheable(answer: object) -> bool:
+    """Is this reply a FINDING about the org's GitHub integration, or a default?
+
+    Only `github_connected:false` is worth storing, and only when the feature is
+    enabled. Server-side, `probe()` returns `ProbeResult(enabled=False)` from a
+    feature-flag gate *before it runs a single query*, and `github_connected`
+    defaults to False on that result object — deliberately, so a dark-launched
+    feature adds no queries to every `gh pr` in the fleet. So in an
+    `enabled:false` reply `github_connected:false` is **a default nobody
+    computed**, and caching it filed "this org disconnected GitHub" about orgs
+    whose GitHub App was connected the whole time, then latched it for a day.
+    That is the real 2026-09-08 incident behind this rule (spec §4.4).
+
+    Applied on READ as well as on write. Note what actually retires the entries
+    the 24h-era code already wrote: they were keyed without an identity, so the
+    key they live at is one nothing looks up any more — they are orphaned, not
+    consulted-and-rejected, and either way nobody has to clear the state dir by
+    hand. The read-side gate is defence in depth for anything that reaches the
+    file some other way, and it is what keeps "what we cache" and "what we would
+    say" from ever drifting apart.
+    """
+    return (isinstance(answer, dict)
+            and answer.get("enabled") is not False
+            and answer.get("github_connected") is False)
+
+
+def _cache_path(api_base: str, scope: str = "", identity: str = "") -> Path:
+    """Where a negative answer for THIS deployment, repo and identity is stored.
 
     ``enabled`` and ``github_connected`` are properties of the MemHub ORG that
     owns the repo, not of the deployment — one person can be in several orgs on
     one backend. Keying on the api_base alone meant a single disconnected org
-    silenced linking for every other org's pull requests for 24 hours, without
-    a request, which is exactly the silent failure the feature is meant to
-    avoid. The repo is the coarsest thing in the request that determines which
-    org answers, so it is what scopes the entry; the cost is one round trip per
-    repo per day instead of one per `gh pr` call.
+    silenced linking for every other org's pull requests, without a request,
+    which is exactly the silent failure the feature is meant to avoid. The repo
+    is the coarsest thing in the request that determines which org answers, so
+    it scopes the entry.
+
+    ``identity`` is the third: which org answers is ultimately decided by the
+    BEARER, and `resolve_bearer` prefers $MEMHUB_TOKEN, then a stored personal
+    access key, then a cached OAuth token — so the identity behind a check can
+    change without the user doing anything deliberate. Without it, a negative
+    earned under one identity silenced every later identity on the same machine
+    and repo. It is a truncated hash; the credential itself is never stored.
     """
-    digest = hashlib.sha256(f"{api_base}\n{scope}".encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(
+        f"{api_base}\n{scope}\n{identity}".encode("utf-8")).hexdigest()[:16]
     return STATE_DIR / f"{digest}.json"
 
 
-def _cached_negative(api_base: str, now: float, scope: str = "") -> dict | None:
-    """A stored `enabled:false` / `github_connected:false` answer, if fresh."""
+def _cached_negative(api_base: str, now: float, scope: str = "",
+                     identity: str = "") -> dict | None:
+    """A stored `github_connected:false` answer, if fresh and still cacheable."""
     try:
-        raw = json.loads(_cache_path(api_base, scope).read_text(encoding="utf-8"))
+        raw = json.loads(
+            _cache_path(api_base, scope, identity).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(raw, dict):
         return None
     at = raw.get("at")
     answer = raw.get("answer")
-    if not isinstance(at, (int, float)) or not isinstance(answer, dict):
+    if not isinstance(at, (int, float)) or not _cacheable(answer):
         return None
     # A clock that moved backwards must not pin a stale answer forever.
-    if not (0 <= now - at < NEGATIVE_TTL_S):
+    if not (0 <= now - at < _negative_ttl_s()):
         return None
     return answer
 
 
-def _store_negative(api_base: str, answer: dict, now: float, scope: str = "") -> None:
+def _prune(now: float, budget: int = 500) -> None:
+    """Drop entries no TTL could still serve. Bounded, best effort, never fatal.
+
+    The key includes the credential, and on the OAuth path the access token
+    rotates about daily — so without this the directory gains one permanently
+    dead file per rotation, per repo, per deployment, forever. Nothing else in
+    the plugin prunes it.
+
+    The horizon is twice the LARGER of the active and the default window, so a
+    widened `MEMHUB_PRLINK_NEGATIVE_TTL_S` can never delete an entry that is
+    still servable, and a `0` (serving disabled) still prunes on the default
+    hour rather than deleting everything on sight. `budget` caps the work
+    because this runs on the hook path.
+    """
+    horizon = 2 * max(_negative_ttl_s(), float(NEGATIVE_TTL_S))
+    for seen, path in enumerate(STATE_DIR.glob("*.json")):
+        if seen >= budget:
+            return
+        try:
+            if now - path.stat().st_mtime > horizon:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _store_negative(api_base: str, answer: dict, now: float, scope: str = "",
+                    identity: str = "") -> None:
+    """Write one negative. The decision to write is `_cacheable`'s, at the call
+    site — this stays dumb so a test can plant an entry the current rules would
+    refuse and prove the READ path refuses it too."""
     try:
         import atomic_write
 
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        atomic_write.publish(_cache_path(api_base, scope),
+        atomic_write.publish(_cache_path(api_base, scope, identity),
                              json.dumps({"at": now, "answer": answer}))
+        _prune(now)
     except Exception:
         pass
 
 
 def breadcrumb(what: str, exc: object) -> None:
-    """Why this machine went quiet — local only, best effort, never fatal."""
+    """Why this machine went quiet — local only, best effort, never fatal.
+
+    REDACTED, because this is the only file that persists exception text and an
+    exception can carry a credential in its own arguments — `UnicodeEncodeError`
+    names the entire string it failed on, and a transport error can quote a
+    header. It is append-only and never rotated, so anything landing here is
+    permanent. If `redact` is somehow unavailable, the exception's type goes in
+    alone rather than a repr nobody screened.
+    """
+    try:
+        import redact
+
+        detail = redact.redact_text(f"{exc!r}")
+    except Exception:  # noqa: BLE001 — a breadcrumb is never worth an exception
+        detail = type(exc).__name__
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with (STATE_DIR / "breadcrumb").open("a", encoding="utf-8") as handle:
-            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {what}: {exc!r}\n")
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {what}: {detail}\n")
     except OSError:
         pass
 
@@ -1567,12 +1676,22 @@ def check(pr_url: str, *, timeout: float = CHECK_TIMEOUT_S, now: float | None = 
         if not bearer:
             return None
         api_base = pak.api_base(url)
+        # Hashed, never stored: the file name is all that survives.
+        #
+        # `surrogatepass`, NOT a bare encode. os.environ decodes with
+        # surrogateescape, so a $MEMHUB_TOKEN carrying one non-UTF-8 byte is a
+        # str holding a lone surrogate — and a bare .encode() would raise
+        # UnicodeEncodeError, whose args carry THE WHOLE TOKEN, straight into
+        # the breadcrumb below. surrogatepass round-trips any lone surrogate
+        # and cannot raise, so the digest is always taken and nothing throws.
+        identity = hashlib.sha256(
+            bearer.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     except Exception as exc:  # noqa: BLE001 — degrade, never raise into a hook
         breadcrumb("resolve", exc)
         return None
 
     scope = _repo_of(pr_url)
-    cached = _cached_negative(api_base, now, scope)
+    cached = _cached_negative(api_base, now, scope, identity)
     if cached is not None:
         return cached
 
@@ -1588,8 +1707,10 @@ def check(pr_url: str, *, timeout: float = CHECK_TIMEOUT_S, now: float | None = 
         if reply.status != 200 or not isinstance(reply.data, dict):
             return None
         data = reply.data
-        if data.get("enabled") is False or data.get("github_connected") is False:
-            _store_negative(api_base, data, now, scope)
+        # `> 0` so that pinning the TTL to zero disables the cache outright
+        # rather than leaving a machine writing entries it will never read.
+        if _cacheable(data) and _negative_ttl_s() > 0:
+            _store_negative(api_base, data, now, scope, identity)
         return data
     except Exception as exc:  # noqa: BLE001
         breadcrumb("check", exc)
@@ -1758,7 +1879,8 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
 
 __all__ = [
     "CHECK_TIMEOUT_S", "CONNECT_ADVISORY", "CREATED", "HOSTS", "IN_PLAY",
-    "NEGATIVE_TTL_S", "REPO_ADVISORY", "STATE_DIR", "breadcrumb", "check",
+    "NEGATIVE_TTL_ENV", "NEGATIVE_TTL_S", "REPO_ADVISORY", "STATE_DIR",
+    "breadcrumb", "check",
     "context_for", "context_for_call", "conversation_id_for", "creates_pr",
     "github_api_call", "github_api_host", "is_gh_pr_command", "is_gh_pr_create",
     "is_github_mcp_create", "is_github_mcp_tool", "pr_url_from_response",

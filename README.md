@@ -400,14 +400,24 @@ injects one instruction. There are three answers:
 Both lanes ship as a **single** `PostToolUse` registration
 (`pr_post_context.py`), which runs the link lane, then the babysit lane, and
 emits one `additionalContext` with the link instruction first. They were two
-registrations until v0.53.2, and on `gh pr create` — the one command where both
+registrations until v0.53.3, and on `gh pr create` — the one command where both
 fire — only one of the two instructions ever reached the model. A `PostToolUse`
 call yields one context: when two hook groups each return one, the
 earlier-registered group's survives and the later one is dropped, silently, so
 the self-link on the one call that links unconditionally was the instruction
-that lost. Merging them also removes any dependence on registration order. The
-Codex path already worked this way — `codex_hook_bridge.py` folds its jobs into
-one document — so the two hosts now compose context the same way.
+that lost. The Codex path already worked this way — `codex_hook_bridge.py` folds
+its jobs into one document — so the two hosts now compose context the same way.
+
+The merge fixes the two PR instructions displacing **each other**; it does not
+make a `PostToolUse` call deliver more than one context. Two other synchronous
+handlers match `Bash` and can return one: reactive directive recall, which
+speaks when the tool output looks like a failure, and the rulebook post
+handler. The PR group is therefore registered **first**, so a
+`git push && gh pr create` whose output happens to contain `error:` keeps its
+PR instructions — and since the PR group stays silent unless a pull request was
+really created, ordinary Bash calls are unaffected. Folding every `Bash`
+handler into one dispatcher, the way the Codex bridge already does, is the real
+fix and is still outstanding.
 
 Widening the registration to the GitHub MCP tools (which the link lane already
 matched) did not widen what arms a babysit loop: that lane is still gated on a
@@ -439,6 +449,19 @@ session from linking itself later. Every path degrades to silence — a
 disconnected org, an unreachable server, no credential, a listing command whose
 output names several PRs, or a command that merely *mentions* a PR without
 addressing GitHub.
+
+The **one** thing it remembers is a negative: an org that has the feature on but
+no GitHub connected cannot change that without an admin acting, so that answer
+is cached for **30 minutes** rather than re-asked on every `gh pr` command. The
+entry is scoped to the deployment, the repo *and* the credential that earned it,
+because which org answers depends on which token is resolved. Two replies are
+deliberately never cached — a connected one (`linked_sessions` and `pr.known`
+change constantly) and one that just says the feature is off, since the server
+answers that from a flag check without looking at the integration at all, so its
+`github_connected` field is a default rather than a finding. Caching that field
+once silenced linking for a day on machines whose GitHub was connected the whole
+time. Set `MEMHUB_PRLINK_NEGATIVE_TTL_S` to change the window; `/memhub:link-pr`
+always asks live.
 
 **A PR opened by some other means — a script, a Makefile target, a CI helper,
 `hub pull-request` — is not detected, deliberately**: recognising arbitrary

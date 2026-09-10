@@ -37,6 +37,17 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 15,
+            "statusMessage": "MemHub: checking PR context",
+            "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_post_context.py\"; fi ;; esac"
+          }
+        ]
+      },
+      {
         "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|Bash)$",
         "hooks": [
           {
@@ -67,17 +78,6 @@
             "timeout": 10,
             "statusMessage": "MemHub: checking artifact links",
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/artifact_sync_reminder.py\"; fi"
-          }
-        ]
-      },
-      {
-        "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 15,
-            "statusMessage": "MemHub: checking PR context",
-            "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_post_context.py\"; fi ;; esac"
           }
         ]
       },
