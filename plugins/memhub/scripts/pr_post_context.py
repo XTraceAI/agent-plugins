@@ -59,6 +59,19 @@ except BaseException as _exc:  # noqa: BLE001
 # GitHub MCP tools this merged registration now also matches.
 _BASH = re.compile("Bash")
 
+# host, owner, repo, number — the identity of a pull request, compared instead
+# of the URL text. The backend answers with the owner LOWERCASED
+# (`XTraceAI` -> `xtraceai`), so a case-sensitive comparison read gh's own URL
+# as a different pull request and suppressed the babysit lane on every repo
+# whose owner has a capital in it. GitHub owners and repo names are
+# case-insensitive; the number is the identity.
+_PR_IDENTITY = re.compile(r"(?i)https?://([^/\s]+)/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+
+
+def _pr_identities(text: str) -> set[tuple[str, str, str, str]]:
+    return {(host.lower(), owner.lower(), repo.lower(), number)
+            for host, owner, repo, number in _PR_IDENTITY.findall(text)}
+
 
 def _lane(job: Callable[[], str | None]) -> str | None:
     """Run one lane. A lane that raises loses its own voice, not the other's."""
@@ -92,8 +105,8 @@ def contexts_for(payload: object, *, host: str = "claude") -> list[str]:
     # they disagree, the hardened extractor wins and the babysit half is
     # dropped, because arming the wrong loop is worse than arming none.
     if link and babysit:
-        found = pr_babysit_trigger.PR_URL.search(babysit)
-        if not found or found.group(0) not in link:
+        armed = _pr_identities(babysit)
+        if armed and not (armed & _pr_identities(link)):
             print("[memhub-pr-context] lanes named different pull requests; "
                   "babysit suppressed", file=sys.stderr)
             babysit = None

@@ -279,6 +279,30 @@ def test_the_lanes_may_not_name_two_different_pull_requests():
             lambda _p: f"A pull request was just created: {PR} .")
         got = mod.contexts_for(body)
         check("…and agreement keeps both", len(got) == 2, str(got)[:160])
+
+        # The backend answers with the owner LOWERCASED, so the real staging
+        # smoke produced `github.com/xtraceai/...` from the link lane against
+        # gh's own `github.com/XTraceAI/...`. A case-sensitive comparison read
+        # that as two different pull requests and suppressed babysit on every
+        # repo whose owner has a capital in it — the flagship case, in this
+        # repo. Compare the identity, not the bytes.
+        mod.pr_link_trigger.context_for = (
+            lambda _p, **_k: "MemHub: you just opened "
+                             "https://github.com/xtraceai/agent-plugins/pull/999.")
+        mod.pr_babysit_trigger.context_for = (
+            lambda _p: "A pull request was just created: "
+                       "https://github.com/XTraceAI/agent-plugins/pull/999 .")
+        got = mod.contexts_for(body)
+        check("…and owner CASE alone is not a disagreement", len(got) == 2,
+              str(got)[:200])
+
+        # A different NUMBER in the same repo still is one.
+        mod.pr_babysit_trigger.context_for = (
+            lambda _p: "A pull request was just created: "
+                       "https://github.com/XTraceAI/agent-plugins/pull/1000 .")
+        got = mod.contexts_for(body)
+        check("…while a different PR number still drops babysit", len(got) == 1,
+              str(got)[:200])
     finally:
         mod.pr_link_trigger.context_for = link
         mod.pr_babysit_trigger.context_for = babysit

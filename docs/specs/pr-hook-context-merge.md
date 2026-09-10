@@ -252,6 +252,11 @@ stub `checker` so nothing reaches a live backend). It must cover:
 5c. The two lanes naming DIFFERENT pull requests → the babysit half dropped,
    the link instruction emitted alone (the hardened extractor wins; arming a
    loop on a pull request the session never opened is worse than arming none).
+   Compared on IDENTITY — host, owner, repo, number, case-insensitively — not
+   on the URL text: the backend answers with the owner lowercased
+   (`XTraceAI` → `xtraceai`), and a byte comparison read gh's own URL as a
+   different pull request, suppressing babysit on every repo whose owner has a
+   capital in it. A differing NUMBER is still a disagreement.
 5d. The merged group is registered ahead of every other synchronous handler
    that matches `Bash` and can emit context.
 6. Both lanes silent → **no stdout at all**, exit 0.
