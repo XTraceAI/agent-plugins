@@ -65,7 +65,7 @@ from session_title import (  # noqa: E402
     generated_title,
     prompt_title,
 )
-from transcript_chunks import slices as make_slices  # noqa: E402
+from transcript_chunks import DEFAULT_CHUNK_BYTES, slices as make_slices  # noqa: E402
 from capture_redaction import CACHE as _REDACTION_CACHE, redact_once as redact_records  # noqa: E402
 from transcript_filter import (  # noqa: E402
     drop_command_wrappers,
@@ -275,10 +275,24 @@ def _prepare_transcript(transcript_path: str):
     # this works on ordinary sessions and fails on precisely the long
     # ones — and as the backstop for when per-turn capture is dormant,
     # failing on the biggest sessions is failing where it matters most.
-    # Slices are disjoint and sent in order against one conversation,
-    # so the server's watermark sees a normal incremental import.
-    payloads = [part[start:start + 2000] for part in make_slices(records)
-                for start in range(0, len(part), 2000)]
+    # Every request needs a real message. Reserve space for replaying the
+    # smallest native message when a byte/count boundary isolates sidecars.
+    # Its original UUID makes that context idempotent; never invent a record
+    # or acknowledge an attachment-only transcript before its message exists.
+    messages = [row for row in records if isinstance(row.get("message"), dict) and row.get("uuid")]
+    if not messages:
+        return
+    encoded_size = lambda row: len(json.dumps(row, separators=(",", ":")))
+    context = min(messages, key=encoded_size)
+    payloads = []
+    for part in make_slices(records, max(1, DEFAULT_CHUNK_BYTES - encoded_size(context))):
+        for start in range(0, len(part), 2000):
+            capped = part[start:start + 2000]
+            if any(isinstance(row.get("message"), dict) for row in capped):
+                payloads.append(capped)
+            else:
+                for offset in range(0, len(capped), 1999):
+                    payloads.append(capped[offset:offset + 1999] + [context])
     return payloads, provenance, title, cwd, namespace
 
 

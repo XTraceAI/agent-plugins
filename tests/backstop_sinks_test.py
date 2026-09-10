@@ -163,6 +163,31 @@ def test_slow_local_preparation_preserves_cloud_budget_and_cannot_commit_late():
         assert not state(home,"local",local[0]).get("last_ok_at")
 
 
+def test_backstop_sidecar_batches_keep_real_message_context_on_retry():
+    for record_type, count, size in [("mode", 2000, 10), ("attachment", 2005, 10),
+                                     ("attachment", 2, 2_000_000)]:
+        with tempfile.TemporaryDirectory() as td,cases.receiver("local",[]) as local,cases.receiver("cloud",[]) as cloud:
+            home=Path(td);data=cases.payload(home,0);cases.configure(home,local[0],active=["local"])
+            path=Path(data["transcript_path"])
+            with path.open("a") as output:
+                for index in range(count):
+                    output.write(json.dumps({"type":record_type,"uuid":f"sidecar-{index}",
+                                             "payload":"x"*size})+"\n")
+            local[2]["require_message"]=True
+            backstop(home,cloud[0],data)
+            assert not local[1] and not state(home,"local",local[0]).get("last_ok_at")
+            cases.append(path,1);local[2]["fail_at"]=2
+            original=path.read_bytes();backstop(home,cloud[0],data)
+            assert not state(home,"local",local[0]).get("last_ok_at")
+            local[2].pop("fail_at");backstop(home,cloud[0],data)
+            batches=cases.routing.imports(local[1])
+            assert all(len(batch["messages"])<=2000 and any(isinstance(row.get("message"),dict)
+                       for row in batch["messages"]) for batch in batches)
+            assert {row["uuid"] for batch in batches for row in batch["messages"]} == {
+                *(f"sidecar-{index}" for index in range(count)),"record-1"}
+            assert state(home,"local",local[0])["last_ok_at"] and path.read_bytes()==original
+
+
 def test_long_native_ids_capture_through_both_claude_hooks_with_bounded_state_names():
     for length in (200,201,237,238,256):
         with tempfile.TemporaryDirectory() as td,cases.receiver("local",[]) as local,cases.receiver("cloud",[]) as cloud:
@@ -180,6 +205,18 @@ def test_long_native_ids_capture_through_both_claude_hooks_with_bounded_state_na
                 stop=next(path for path in files if path.name.endswith(".sessionflush.json"))
                 assert json.loads(turn.read_text())["offset"]>0
                 assert json.loads(stop.read_text())["last_ok_at"]>0
+            cases.invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=1)
+            cases.append(Path(data["transcript_path"]),1)
+            cases.invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=0)
+            descriptors=[]
+            try:
+                for name in ("local","cloud"):
+                    lock=cases.directory(home,name,local[0])/(capture_context.session_file_key(sid)+".lock")
+                    fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o600)
+                    cases.portable_lock.lock_exclusive(fd,blocking=False);descriptors.append(fd)
+                cases.invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=1)
+            finally:
+                for fd in descriptors: os.close(fd)
 
 
 if __name__=="__main__":
