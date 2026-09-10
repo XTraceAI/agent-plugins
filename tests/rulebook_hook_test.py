@@ -15,6 +15,12 @@ Covers the properties that make this safe to ship in everyone's harness:
 * ordering rules arm on edits, discharge on a GREEN receipt only, gate the
   push, and keep state per (worktree, branch) — shared by sibling sessions and
   subagents, never leaking across branches;
+* an obligation can also be armed by the SESSION or by what the person typed
+  (`armed_by_events: ["session"] / ["prompt"]`), and that arming is the
+  session's own — a sibling session's receipt does not discharge it;
+* a rule this hook cannot read in full — `min_hook_version` newer than us, or
+  a `given`/`ordering` key we do not know — advises, never gates, and says so
+  once per session instead of firing as if the condition held;
 * the post lane fires on failing result text, gated by cmd_rx;
 * repo_scope filters rules to the repo the session is in;
 * MEMHUB_RULEBOOK_BASE relocates the book cache, state and ledger together, so
@@ -460,7 +466,13 @@ def given_and_scope_checks() -> None:
 
         # --- a bad given drops the RULE at load, never the hook --------------
         c = pre("Bash", {"command": "bad-given-cmd"})
-        check("given: an unknown key drops the rule", "[bad-given]" not in c, c)
+        # An unknown key used to drop the rule silently — a rule vanishing
+        # because the hook is older than it is, with nothing anywhere saying
+        # so. It now degrades instead: the rule advises, it cannot gate, and
+        # it names the key this hook could not read (min_hook_version_checks
+        # covers the rest of that behaviour).
+        check("given: an unknown key degrades the rule to advice and says so",
+              "[bad-given]" in c and "repo.nope" in c and "BLOCKED" not in c, c)
         check("given: a wrong value kind drops the rule", "[bad-given-kind]" not in c, c)
 
         # --- given.repo diff probes against a real repository ----------------
@@ -1814,6 +1826,8 @@ def main() -> int:
     bash_edit_checks()
     read_lane_checks()
     diff_base_checks()
+    armed_lane_checks()
+    min_hook_version_checks()
 
     print()
     if FAILURES:
@@ -1823,5 +1837,811 @@ def main() -> int:
     return 1 if FAILURES else 0
 
 
+
+def armed_lane_checks() -> None:
+    """An obligation can be armed by something that is not an edit.
+
+    `ordering.armed_by_events` accepted the edit family alone, so the two
+    shapes a team asks for most could not fire at a command at all. Armed for
+    the whole SESSION — "fetch before you read `origin/*`", which the local
+    corpus says would have caught 38 of 799 sessions and which could only be
+    delivered as a session-start note. And armed by what the person just typed
+    ("you are asking about staging — probe it before you answer"), which had
+    no lane at all: there was no UserPromptSubmit entry for this hook.
+
+    A session- or prompt-armed obligation is the SESSION's, not the
+    worktree's: each session must fetch for itself, and a sibling session in
+    the same checkout fetching does not answer for this one. So the arming
+    lives in the session's own state file, and these checks pin that.
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as rb_mod
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "armedrepo")
+        os.makedirs(repo)
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        with open(os.path.join(repo, "f.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        _git(repo, "add", "-A")
+        assert _git(repo, "commit", "-q", "-m", "base").returncode == 0
+
+        fetch_rule = {
+            "id": "fetch-before-origin-read", "on": "ordering", "repo_scope": "any",
+            "mode": "gate", "_label": "fetch-first",
+            "ordering": {"required_command_rx": r"git\s+(fetch|pull)\b",
+                         "gated_command_rx": r"git\s+(log|diff|show)\b[^\n]*\borigin/",
+                         "armed_by_events": ["session"], "display_name": "git fetch"},
+            "text": "Fetch before you read origin/*", "why": "the ref is as old as your clone"}
+        probe_rule = {
+            "id": "probe-before-answering", "on": "ordering", "repo_scope": "any",
+            "mode": "gate", "_label": "probe-staging",
+            "ordering": {"required_command_rx": r"curl\b[^\n]*staging",
+                         "gated_command_rx": r"gh\s+pr\s+comment\b",
+                         "armed_by_events": ["prompt"], "armed_by_rx": r"\bstaging\b",
+                         "display_name": "a live staging probe"},
+            "text": "Probe staging live before you answer about it", "why": "w"}
+        seed_book(td, "armedrepo", [fetch_rule, probe_rule])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+        n = [0]
+
+        def start(session):
+            return run("session", {"session_id": session, "cwd": repo,
+                                   "hook_event_name": "SessionStart"}, env)[1]
+
+        def prompt(session, text):
+            return run("prompt", {"session_id": session, "cwd": repo,
+                                  "hook_event_name": "UserPromptSubmit",
+                                  "prompt": text}, env)[1]
+
+        def pre(session, command):
+            n[0] += 1
+            return ctx(run("pre", {"session_id": session, "cwd": repo, "tool_name": "Bash",
+                                   "tool_use_id": f"a{n[0]}",
+                                   "tool_input": {"command": command}}, env)[1])
+
+        def post(session, command, exit_code=0):
+            n[0] += 1
+            return ctx(run("post", {"session_id": session, "cwd": repo, "tool_name": "Bash",
+                                    "tool_use_id": f"a{n[0]}",
+                                    "tool_input": {"command": command},
+                                    "tool_response": {"stdout": "", "exit_code": exit_code}},
+                           env)[1])
+
+        # --- session arming ------------------------------------------------
+        c = pre("s0", "git log origin/main -5")
+        check("session-armed: nothing is armed before SessionStart runs", c == "", c)
+
+        start("s1")
+        c = pre("s1", "git log origin/main -5")
+        check("session-armed: the gated command fires after SessionStart armed it",
+              "[fetch-first]" in c, c)
+        check("session-armed: it BLOCKS — a gate the engine could not run before",
+              "BLOCKED" in c, c)
+        check("session-armed: the reason names the session, not an edit count",
+              "since this session started" in c, c)
+
+        post("s1", "git fetch --all")
+        c = pre("s1", "git log origin/main -5")
+        check("session-armed: a green fetch discharges it for the rest of the session",
+              c == "", c)
+
+        # The arming is the SESSION's. s1 fetched; s2 has not, and s2 shares
+        # the worktree state file with it.
+        start("s2")
+        c = pre("s2", "git log origin/main -5")
+        check("session-armed: a sibling session's fetch does not discharge this one",
+              "[fetch-first]" in c, c)
+
+        chain = "git fetch -q && git log origin/main -5"
+        c = pre("s2", chain)
+        check("session-armed: one call that fetches AND reads discharges itself, "
+              "never gates", c == "", c)
+        post("s2", chain)
+        c = pre("s2", "git log origin/main -5")
+        check("session-armed: and that call's fetch really did discharge it — an "
+              "`&&` chain that exits 0 vouches for every segment, so the receipt "
+              "need not be last", c == "", c)
+
+        # The exemption above is not "the required pattern appears somewhere".
+        # These two are exactly what the rule exists to catch: the first reads
+        # the stale ref and fetches afterwards, the second runs the stale read
+        # PRECISELY when the fetch failed.
+        for bad, why in ((f"git log origin/main -5 && git fetch -q", "required command comes AFTER the gated one"),
+                         (f"git fetch -q || git log origin/main -5", "`||` runs the read when the fetch FAILED"),
+                         (f"git fetch -q ; git log origin/main -5", "`;` vouches for nothing")):
+            start("bad" + str(abs(hash(bad)) % 9999))
+            sess = "bad" + str(abs(hash(bad)) % 9999)
+            c = pre(sess, bad)
+            check(f"session-armed: no self-discharge when the {why}",
+                  "[fetch-first]" in c, f"{bad!r} -> {c}")
+
+        # A required command that is a QUOTED argument, or sits in a comment,
+        # is not a command. The hook understands shell SYNTAX only — quotes,
+        # comments, separators — so these are the two mention shapes it can
+        # tell from a run, and on the two paths that let a call OUT of a gate
+        # (self-discharge and the receipt) they must not.
+        for mention in ("echo 'git fetch' && git log origin/main -5",
+                        'grep "git fetch" setup.sh && git log origin/main -5',
+                        "printf 'git fetch\\n' && git log origin/main -5"):
+            sess = "q" + str(abs(hash(mention)) % 99999)
+            start(sess)
+            c = pre(sess, mention)
+            check("session-armed: a quoted mention does not "
+                  "excuse the gate", "[fetch-first]" in c, f"{mention!r} -> {c}")
+
+        for mention in ("echo 'git fetch --all'", "git commit -m 'git fetch --all'",
+                        "true # git fetch --all"):
+            sess = "r" + str(abs(hash(mention)) % 99999)
+            start(sess)
+            post(sess, mention)
+            c = pre(sess, "git log origin/main -5")
+            check("session-armed: a quoted or commented mention is not a "
+                  "receipt either", "[fetch-first]" in c, f"{mention!r} -> {c}")
+
+        # ACCEPTED RESIDUAL, pinned so a change to it is deliberate: an
+        # UNQUOTED mention discharges. Telling `echo git fetch` from `sudo git
+        # fetch` needs to know what `echo` does, and the hook knows no
+        # commands — the list it used to carry refused every wrapper not on
+        # it (`timeout`, `caffeinate`, `.venv/bin/…`), and a missed receipt
+        # blocks someone who complied.
+        start("resid")
+        post("resid", "echo git fetch --all")
+        c = pre("resid", "git log origin/main -5")
+        check("session-armed: (accepted residual) an unquoted mention "
+              "discharges — the hook knows syntax, not commands", c == "", c)
+
+        # Any wrapper discharges: `uv run … pytest`, `sudo git fetch`,
+        # `timeout 300 pytest` put the real command in an argument, and the
+        # hook does not need to know the wrapper to see it. This is the shape
+        # the SHIPPED tests-before-push rule is written against.
+        # An operator character inside a quoted argument is data, so a chain
+        # carrying one is still an `&&`-only chain. Reading it as a separator
+        # refused to see a required command that DID run and pass, and fired
+        # the gate at someone who had complied — the habituation failure the
+        # whole design worries about.
+        start("s12")
+        post("s12", "git fetch --all -- --grep 'a|b'")
+        c = pre("s12", "git log origin/main -5")
+        check("session-armed: a quoted `|` does not stop a chain from being a "
+              "receipt", c == "", c)
+        check("and_only_segments: a quoted operator is data",
+              rb_mod.and_only_segments("npm test -- --grep 'a|b' && git push")
+              == ["npm test -- --grep 'a|b'", "git push"],
+              str(rb_mod.and_only_segments("npm test -- --grep 'a|b' && git push")))
+        check("and_only_segments: a REAL pipe still disqualifies the chain",
+              rb_mod.and_only_segments("a | b && c") == [])
+        # A redirection `&` is not a background `&`. A raw character scan
+        # could not tell them apart and called this a broken chain, gating a
+        # call whose fetch had run and passed — the same false gate on a
+        # complying caller as the quoted-operator case, from the other side.
+        # Asked of `_SEPARATOR_RX` now: one definition of "separator".
+        for chain in ("git fetch 2>&1 && git log origin/main",
+                      "git fetch >&2 && git log origin/main",
+                      "git fetch &> /tmp/l && git log origin/main"):
+            check(f"and_only_segments: {chain.split(' &&')[0]!r} is a chain",
+                  len(rb_mod.and_only_segments(chain)) == 2,
+                  str(rb_mod.and_only_segments(chain)))
+        for broken in ("a & b", "a | b", "a ; b"):
+            check(f"and_only_segments: {broken!r} is not a chain",
+                  rb_mod.and_only_segments(broken) == [])
+        start("s13")
+        post("s13", "git fetch --all 2>&1")
+        c = pre("s13", "git log origin/main -5")
+        check("session-armed: a redirected fetch is still a receipt", c == "", c)
+
+        # A segment reached through `||` ran only if the one before it FAILED.
+        # `true || git fetch` exits 0 from `true` and never fetches, so taking
+        # its textual last segment as a receipt discharged the obligation with
+        # the required command unrun. This one predates the branch: the same
+        # hole discharges the shipped tests-before-push rule via `make test ||
+        # pytest`.
+        start("s14")
+        post("s14", "true || git fetch --all")
+        c = pre("s14", "git log origin/main -5")
+        check("session-armed: a receipt reached through `||` is refused — it "
+              "may never have run", "[fetch-first]" in c, c)
+        # `;` and `&&` both guarantee the last segment ran.
+        start("s15")
+        post("s15", "echo hi ; git fetch --all")
+        c = pre("s15", "git log origin/main -5")
+        check("session-armed: after `;` the last segment did run", c == "", c)
+
+        # A BACKGROUNDED required command is not a receipt: the call's exit 0
+        # came from launching it, or from whatever ran in the foreground
+        # afterwards, and the fetch may still be running or about to fail.
+        # `last_segment` did not split on a bare `&`, so `git fetch & true`
+        # read as one segment starting with `git fetch`.
+        for bg in ("git fetch --all & true", "git fetch --all &"):
+            sess = "bg" + str(abs(hash(bg)) % 9999)
+            start(sess)
+            post(sess, bg)
+            c = pre(sess, "git log origin/main -5")
+            check("session-armed: a backgrounded fetch is not a receipt",
+                  "[fetch-first]" in c, f"{bg!r} -> {c}")
+        check("last_segment: a bare `&` separates, a redirection `&` does not",
+              rb_mod.last_segment("git fetch & true") == "true"
+              and rb_mod.last_segment("git fetch 2>&1") == "git fetch 2>&1",
+              rb_mod.last_segment("git fetch & true"))
+        # The pipe test beside `last_segment` was still reading RAW text, so
+        # a quoted `|` in the last segment refused a receipt for a test that
+        # had passed — leaving the obligation armed and blocking the push.
+        check("receipt: a quoted `|` in the last segment is not a pipeline",
+              rb_mod.receipt_segments("npm test -- --grep 'a|b'")
+              == ["npm test -- --grep 'a|b'"],
+              str(rb_mod.receipt_segments("npm test -- --grep 'a|b'")))
+        check("receipt: a REAL pipeline is still refused",
+              rb_mod.receipt_segments("pytest | tail") == [])
+        # A trailing `;` or newline ends the last command; it does not start
+        # an empty one. `pytest;` was a passing receipt refused.
+        check("receipt: a trailing terminator does not empty the last segment",
+              rb_mod.last_segment("pytest;") == "pytest"
+              and rb_mod.last_segment("git fetch\n") == "git fetch"
+              and rb_mod.receipt_segments("pytest -q; ") == ["pytest -q"]
+              and rb_mod.receipt_segments("make lint && pytest;", whole_chain=True)
+              == ["make lint", "pytest"],
+              str((rb_mod.last_segment("pytest;"), rb_mod.receipt_segments("pytest -q; "))))
+        # `!` inverts the status: `! git fetch && git log origin/main` reaches
+        # the log only when the fetch FAILED, and `! pytest` exits 0 when the
+        # tests did not. A negated segment is no receipt and does not
+        # self-discharge.
+        _fetch_rx = r"git\s+(fetch|pull)\b"
+        check("receipt: a `!`-negated command is not a receipt",
+              not rb_mod.executes("! git fetch", _fetch_rx)
+              and not rb_mod.executes("( ! git fetch -q )", _fetch_rx)
+              and not rb_mod.executes("FOO=1 ! pytest -q", r"\bpytest\b")
+              and rb_mod.executes("git fetch -q", _fetch_rx))
+        check("receipt: ...and does not self-discharge the gated command after it",
+              not rb_mod.self_discharging(
+                  "! git fetch && git log origin/main",
+                  {"required_command_rx": _fetch_rx,
+                   "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
+                   "armed_by_events": ["session"]})
+              and rb_mod.self_discharging(
+                  "git fetch -q && git log origin/main",
+                  {"required_command_rx": _fetch_rx,
+                   "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
+                   "armed_by_events": ["session"]}))
+        check("receipt: a trailing `&` is a background, not a terminator",
+              rb_mod.receipt_segments("pytest &") == []
+              and rb_mod.receipt_segments("pytest &", whole_chain=True) == [])
+        # `${#files}` is the length expansion, not a comment. Reading its `#`
+        # as one blanked the rest of the line and the gate never saw the push.
+        check("comment: `${#var}` is not a comment — the push after it still fires",
+              rb_mod.command_fires(r"git\s+push\b", "n=${#files}; git push", flags=0)
+              and rb_mod.command_fires(r"git\s+push\b", "echo ${#x} && git push origin main",
+                                       flags=0),
+              rb_mod.strip_comments("n=${#files}; git push"))
+        check("comment: a real comment after the command is still a comment",
+              rb_mod.strip_comments("git push # done").rstrip() == "git push"
+              and not rb_mod.command_fires(r"git\s+push\b", "true # git push", flags=0)
+              and not rb_mod.command_fires(r"git\s+push\b", "{ # git push", flags=0),
+              rb_mod.strip_comments("git push # done"))
+
+        # Two hooks of ONE session overlap (parallel tool calls, a
+        # sub-agent). Each loads the whole state and writes the whole state
+        # back; the later writer's stale snapshot used to put back an arming
+        # the earlier one had just discharged, so the gated command stayed
+        # blocked after its required command had run. The arming keys merge
+        # by delta against the file as it is at save time.
+        with tempfile.TemporaryDirectory() as td2:
+            p = os.path.join(td2, "s.json")
+            st0 = rb_mod.load_state(p)
+            st0["armed"]["r"] = "session"
+            st0["armed_version"]["r"] = 1
+            st0["armed_fire"]["r"] = "f1"
+            rb_mod.save_state(p, st0)
+            a = rb_mod.load_state(p); ba = rb_mod.snapshot_arming(a)    # hook A loads
+            b = rb_mod.load_state(p); bb = rb_mod.snapshot_arming(b)    # hook B loads
+            rb_mod.drop_arming(b, "r"); rb_mod.save_state(p, b, before=bb)   # B discharges
+            a["fired"].append("x"); rb_mod.save_state(p, a, before=ba)       # A writes after
+            final = rb_mod.load_state(p)
+            check("armed state: a concurrent hook's stale snapshot does not resurrect "
+                  "a discharged obligation",
+                  "r" not in final["armed"] and "r" not in final["armed_fire"]
+                  and "r" not in final["armed_version"] and "x" in final["fired"],
+                  str(final))
+            c = rb_mod.load_state(p); bc = rb_mod.snapshot_arming(c)
+            d = rb_mod.load_state(p); bd = rb_mod.snapshot_arming(d)
+            d["armed"]["q"] = "prompt"; rb_mod.save_state(p, d, before=bd)  # D arms
+            rb_mod.save_state(p, c, before=bc)                               # C writes after
+            check("armed state: ...nor drop an obligation the other hook armed",
+                  rb_mod.load_state(p)["armed"].get("q") == "prompt",
+                  str(rb_mod.load_state(p)["armed"]))
+        # Any wrapper — on `CMD_WRAPPERS` or not — is seen through, because
+        # `executes` reads syntax and carries no list of runners.
+        for wrapped in ("doas git fetch --all", "builtin git fetch --all",
+                        "stdbuf -o0 git fetch --all", "timeout 300 git fetch --all",
+                        "caffeinate -i git fetch --all", "gtimeout 300 uv run git fetch"):
+            check(f"receipt: {wrapped.split()[0]!r} still runs the fetch",
+                  rb_mod.executes(wrapped, r"git\s+(fetch|pull)\b"), wrapped)
+        # `command true # git fetch` runs only `true`. Reading the comment as
+        # code found a fetch in it and took the call as a green receipt.
+        check("receipt: a `#` comment is not a command",
+              not rb_mod.executes("command true # git fetch", r"git\s+(fetch|pull)\b"))
+        check("receipt: and the command BEFORE the comment still counts",
+              rb_mod.executes("git fetch --all # done", r"git\s+(fetch|pull)\b"))
+        start("s16")
+        post("s16", "command true # git fetch")
+        c = pre("s16", "git log origin/main -5")
+        check("session-armed: a fetch inside a comment is no receipt",
+              "[fetch-first]" in c, c)
+        # The GATE matcher read raw text too, so a commented-out gated
+        # command blocked a compliant call. Fixed in `command_fires`, the one
+        # function both the matcher lane and the ordering gate go through —
+        # blanking it in `blank_quoted` had only reached callers that used it.
+        start("s17")
+        c = pre("s17", "git fetch --all # git log origin/main")
+        check("session-armed: a commented-out gated command does not gate the "
+              "fetch that complies", c == "", c)
+        c = pre("s17", "git log origin/main -5")
+        check("session-armed: ...and that fetch was still armed until it ran",
+              c == "" or "[fetch-first]" in c, c)
+        check("command_fires: quotes stay visible to a matcher — only comments go",
+              rb_mod.command_fires(r"rm\s+-rf", 'echo "rm -rf /"', flags=0)
+              and not rb_mod.command_fires(r"rm\s+-rf", "echo hi # rm -rf /", flags=0))
+        # `executes` is syntax-only: every unquoted, uncommented spelling of
+        # the required command discharges, whatever runs it. The wrappers
+        # here include ones no list would have carried.
+        _rx = r"\bpytest\b|run_all\.py"
+        for really_runs in ("command pytest", "python3 -m pytest", "sudo -u bob pytest",
+                            "nice -n 5 pytest", ".venv/bin/pytest -x",
+                            "timeout 300 pytest", "gtimeout 300 uv run pytest",
+                            "caffeinate -i pytest", "./tests/run_all.py",
+                            "uv run --with 'mcp<2' python tests/run_all.py"):
+            check(f"receipt: {really_runs[:28]!r} discharges",
+                  rb_mod.executes(really_runs, _rx), really_runs)
+        # What still refuses is decided by `receipt_segments`, not by
+        # `executes`: a `||` tail, a pipeline, a backgrounded command, and a
+        # quoted mention. These are the shapes the exit status cannot vouch
+        # for, and they are refused on syntax alone.
+        for refused in ("make test || pytest", "ls | grep pytest", "pytest &",
+                        "git commit -m 'fix pytest flake'", "git log # ran pytest"):
+            segs = rb_mod.receipt_segments(refused)
+            check(f"receipt: {refused!r} is refused on syntax alone",
+                  not any(rb_mod.executes(p, _rx) for p in segs),
+                  f"{refused!r} -> segments {segs!r}")
+        # Found by auditing `executes` against `_segment_target`: grouping is
+        # not part of a command's name, and `(git fetch -q)` runs the fetch
+        # and propagates its status, so it is as good a receipt as the bare
+        # form. `_segment_target` has stripped this since round 13.
+        for grouped in ("(git fetch -q)", "{ git fetch -q; }"):
+            check(f"receipt: {grouped!r} is a receipt",
+                  rb_mod.executes(grouped, r"git\s+(fetch|pull)\b"), grouped)
+        check("receipt: and a group running something else is not",
+              not rb_mod.executes("(echo hi)", r"git\s+(fetch|pull)\b"))
+        check("last_segment: a separator inside quotes is data",
+              rb_mod.last_segment("echo 'a; b'") == "echo 'a; b'",
+              rb_mod.last_segment("echo 'a; b'"))
+
+        start("s9")
+        post("s9", "sudo git fetch --all")
+        c = pre("s9", "git log origin/main -5")
+        check("session-armed: a runner still discharges — the real command is "
+              "its argument", c == "", c)
+
+        # The same through the live post/pre lanes: a `||` tail, a pipe and a
+        # background `&` are refused by `receipt_segments`; a quoted mention
+        # by `unquoted`. No command knowledge is involved in any of them.
+        for refused in ("make test || git fetch --all", "ls | grep 'git fetch'",
+                        "git fetch --all & true"):
+            sess = "s11" + str(abs(hash(refused)) % 9999)
+            start(sess)
+            post(sess, refused)
+            c = pre(sess, "git log origin/main -5")
+            check("session-armed: refused on syntax alone",
+                  "[fetch-first]" in c, f"{refused!r} -> {c}")
+
+        # SessionStart is NOT once per session: it fires again on resume, on
+        # `/clear` and after a compaction, under the same session id. A plain
+        # re-arm resurrects an obligation the session already discharged.
+        start("s10")
+        post("s10", "git fetch --all")
+        c = pre("s10", "git log origin/main -5")
+        check("session-armed: discharged", c == "", c)
+        start("s10")                       # the resume / clear / compact replay
+        c = pre("s10", "git log origin/main -5")
+        check("session-armed: a second SessionStart does not resurrect a "
+              "discharged obligation", c == "", c)
+
+        start("s3")
+        post("s3", "git fetch --all", exit_code=1)
+        c = pre("s3", "git log origin/main -5")
+        check("session-armed: a RED fetch discharges nothing", "[fetch-first]" in c, c)
+
+        start("s4")
+        post("s4", "git fetch --all | tee /tmp/f", exit_code=0)
+        c = pre("s4", "git log origin/main -5")
+        check("session-armed: a piped fetch discharges nothing — the exit status "
+              "is tee's", "[fetch-first]" in c, c)
+
+        # An edit is not one of this rule's arming events, and an edit-armed
+        # rule's own semantics are untouched by any of this.
+        start("s5")
+        post("s5", "git fetch --all")
+        n[0] += 1
+        run("post", {"session_id": "s5", "cwd": repo, "tool_name": "Write",
+                     "tool_use_id": f"a{n[0]}",
+                     "tool_input": {"file_path": os.path.join(repo, "f.py"),
+                                    "content": "x = 2\n"}}, env)
+        c = pre("s5", "git log origin/main -5")
+        check("session-armed: an edit does not re-arm a rule armed by the session",
+              c == "", c)
+
+        # A session-armed obligation is the SESSION's, and so is its open
+        # fire. The worktree state is shared with every sibling session in the
+        # checkout, so keeping the fire there let one session's compliance
+        # mark another session's fire converted — and two concurrent fires
+        # overwrote the single slot, so attribution followed execution order
+        # rather than who complied.
+        start("x1")
+        start("x2")
+        c1 = pre("x1", "git log origin/main -5")
+        c2 = pre("x2", "git log origin/main -5")
+        check("session-armed: two sessions in one checkout each get their own "
+              "fire", "[fetch-first]" in c1 and "[fetch-first]" in c2, f"{c1}|{c2}")
+        post("x1", "git fetch --all")          # only x1 complied
+        c = pre("x2", "git log origin/main -5")
+        check("session-armed: a sibling session's receipt does not discharge "
+              "this one's obligation", "[fetch-first]" in c, c)
+        c = pre("x1", "git log origin/main -5")
+        check("session-armed: and the session that DID comply is discharged",
+              c == "", c)
+
+        # --- prompt arming --------------------------------------------------
+        start("p1")
+        c = pre("p1", "gh pr comment 7 --body ok")
+        check("prompt-armed: unarmed until a prompt matches", c == "", c)
+
+        prompt("p1", "is the staging brain still returning 404s?")
+        c = pre("p1", "gh pr comment 7 --body ok")
+        check("prompt-armed: a matching prompt arms it", "[probe-staging]" in c, c)
+        check("prompt-armed: the reason names the prompt",
+              "since your prompt armed this rule" in c, c)
+
+        post("p1", "curl -s https://staging.example/health")
+        c = pre("p1", "gh pr comment 7 --body ok")
+        check("prompt-armed: the probe discharges it", c == "", c)
+
+        start("p2")
+        prompt("p2", "is production still returning 404s?")
+        c = pre("p2", "gh pr comment 7 --body ok")
+        check("prompt-armed: a prompt that does not match arms nothing", c == "", c)
+
+        # Only what a PERSON typed arms an obligation. A skill body or a loop
+        # wake-up that happens to contain the word said nothing of the kind,
+        # and would arm the rule for the rest of the session with nobody
+        # having asked.
+        start("p3")
+        prompt("p3", "<command-name>/deploy</command-name>\ncheck staging first")
+        c = pre("p3", "gh pr comment 7 --body ok")
+        check("prompt-armed: a harness-generated prompt arms nothing", c == "", c)
+
+        # ...but only a STRUCTURED wrapper is harness-generated. An ordinary
+        # English prefix is not one however harness-like it reads, and
+        # silencing a genuine prompt is the worse error: the rule then never
+        # arms and nothing anywhere says why.
+        start("p5")
+        prompt("p5", "Approach this as a staging incident and tell me what broke")
+        c = pre("p5", "gh pr comment 7 --body ok")
+        check("prompt-armed: an English prefix that merely reads like a "
+              "wrapper still arms", "[probe-staging]" in c, c)
+        for text, want in (("Approach this as a staging incident", False),
+                           ("Approach this assignment about staging", False),
+                           ("<system-reminder>staging</system-reminder>", True),
+                           ("Base directory for this skill: /x staging", True),
+                           ("This session is being continued about staging", True)):
+            check(f"harness_prompt({text[:34]!r}...) is {want}",
+                  rb_mod.harness_prompt(text) is want, str(rb_mod.harness_prompt(text)))
+
+        # The prompt lane says nothing itself: anything it printed would be
+        # injected above the person's own words, and an arming is not news.
+        out = prompt("p4", "what about staging?")
+        check("prompt lane: emits nothing", out.strip() == "", out)
+
+        # A prompt is the ONLY chance a prompt-armed rule gets. Evaluated
+        # against a stale book, the matching prompt is gone — so a rule
+        # activated while the session sat idle stays unarmed and silently
+        # permits its gated commands. The lane refreshes first, on the same
+        # terms the session digest uses; here the fetch is disabled, so the
+        # test asserts the shape instead: a rule absent from the book at
+        # prompt time cannot arm, and one present can.
+        import datetime as _dt2
+        stale = (_dt2.datetime.now(_dt2.timezone.utc)
+                 - _dt2.timedelta(seconds=rb_mod.REFRESH_AFTER_S + 60)).isoformat()
+        d = os.path.join(td, "book")
+        # The book directory also holds the `.sources` sidecar the session
+        # lane writes, and listdir order is not guaranteed — pick the book.
+        bp = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")][0]
+        book = json.load(open(bp))
+        without = [r for r in book["rules"] if r.get("id") != "probe-before-answering"]
+        json.dump({**book, "fetched_at": stale, "rules": without}, open(bp, "w"))
+        start("p6")
+        prompt("p6", "is staging up?")
+        json.dump({**book, "fetched_at": stale}, open(bp, "w"))   # the rule is activated
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: a rule absent at prompt time did not arm "
+              "(the prompt is gone — hence the refresh before arming)",
+              c == "", c)
+        prompt("p6", "is staging up?")            # the next matching prompt does arm it
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: ...and the next matching prompt arms it",
+              "[probe-staging]" in c, c)
+
+        # The arming belongs to the rule as it read when the prompt matched.
+        # Refresh the rule under the same id — a new version, and an
+        # `armed_by_rx` this session's prompts never matched — and the old
+        # arming must not carry over to block a call the new rule never
+        # armed for. A prompt matching the NEW rule arms it afresh.
+        renamed = [dict(r, version=2, ordering={**r["ordering"], "armed_by_rx": r"\bproduction\b"})
+                   if r.get("id") == "probe-before-answering" else r
+                   for r in book["rules"]]
+        json.dump({**book, "fetched_at": stale, "rules": renamed}, open(bp, "w"))
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: an arming made for an earlier rule version is dropped, "
+              "not applied to the refreshed rule", "[probe-staging]" not in c, c)
+        st = json.load(open(os.path.join(td, "state", "p6.json")))
+        check("prompt-armed: ...and the stale arming is gone from state",
+              "probe-before-answering" not in st["armed"], st["armed"])
+        prompt("p6", "is staging up?")            # matches the OLD rx only
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: a prompt matching only the old rx does not arm the new rule",
+              "[probe-staging]" not in c, c)
+        prompt("p6", "is production up?")
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: a prompt matching the new rx arms the new version",
+              "[probe-staging]" in c, c)
+        # `armed_once` exists for the once-only SESSION event. Every matching
+        # prompt used to append a `prompt:<id>` marker nothing ever read, so a
+        # long session that kept raising the subject grew its state file on
+        # every prompt and reread it on every tool call.
+        for _ in range(3):
+            prompt("p6", "is production up?")
+        st = json.load(open(os.path.join(td, "state", "p6.json")))
+        check("prompt-armed: repeated prompts leave no markers in the once-only list",
+              not any(m.startswith("prompt:") for m in st["armed_once"]), st["armed_once"])
+        json.dump({**book, "fetched_at": stale}, open(bp, "w"))   # restore for what follows
+        # In-process call: `env` above reaches only the subprocess lanes, so
+        # the opt-out has to be set here or a plain `python3 tests/…` run
+        # takes the fetch path and reloads the book.
+        _prev = os.environ.get("MEMHUB_RULEBOOK_FETCH")
+        os.environ["MEMHUB_RULEBOOK_FETCH"] = "0"
+        try:
+            check("refresh_if_stale: honours MEMHUB_RULEBOOK_FETCH=0",
+                  rb_mod.refresh_if_stale("x", ["r"], stale, {"a": 1}) == (["r"], stale, {"a": 1}))
+        finally:
+            if _prev is None:
+                os.environ.pop("MEMHUB_RULEBOOK_FETCH", None)
+            else:
+                os.environ["MEMHUB_RULEBOOK_FETCH"] = _prev
+
+        # `armed_by_rx` runs in the prompt lane — synchronous, on a 5s hook
+        # timeout, before the person's words reach the model. An
+        # uncompilable or catastrophically backtracking one would raise or
+        # run out the clock, the outer handler would swallow it, and NOTHING
+        # would arm for that prompt — this rule and every valid rule after
+        # it. So it takes the same `rx_ok` lint the other two patterns do,
+        # and a rule carrying a bad one never reaches the lane.
+        for bad in ("(", "(a+)+$"):
+            check(f"prompt-armed: a rule whose armed_by_rx is {bad!r} is dropped at load",
+                  rb_mod.to_hook_rule(dict(probe_rule, id="bad-rx",
+                                           ordering=dict(probe_rule["ordering"],
+                                                         armed_by_rx=bad))) is None)
+        check("prompt-armed: a good armed_by_rx still loads",
+              rb_mod.to_hook_rule(dict(probe_rule)) is not None)
+
+
+def min_hook_version_checks() -> None:
+    """A rule can be newer than the hook reading it, and that used to be
+    silent in the worst direction.
+
+    The engine reads an `ordering` block with `spec.get(...)` and `given_ok`
+    walks the keys it knows, so a condition the installed hook does not
+    understand was ignored and the rule fired as if it were satisfied. That is
+    the 0.40.1 incident: a stale hook ignored a `given` and produced five
+    spurious overrides in one session, and nothing said so.
+
+    Now such a rule advises, never gates, and says which key it could not read
+    — once per session, through the same `st["fired"]` dedup every
+    `fire_scope: session` rule uses.
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    check("version: three ASCII-digit components parse",
+          H.version_tuple("0.53.0") == (0, 53, 0))
+    check("version: ordering is numeric, not lexical",
+          H.version_tuple("0.9.0") < H.version_tuple("0.53.0"))
+    for bad in ("1.2", "1.2.3.4", "1.2.3-rc1", "v1.2.3", "1.2.x", " ", 3, None, "01.2.3.4"):
+        check(f"version: {bad!r} is refused (no prerelease grammar to get wrong)",
+              H.version_tuple(bad) is None, repr(H.version_tuple(bad)))
+    check("version: the hook reads its own from the plugin manifest beside it",
+          H.hook_version() is not None and len(H.hook_version()) == 3, str(H.hook_version()))
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "verrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+
+        # One rule per COMMAND. MAX_ADVISE keeps two advisories per call, so
+        # six rules firing on one command would hide four of them and the
+        # assertions would be reading the cap, not the degradation.
+        def gate(rid, word, given=None, **extra):
+            matcher = {"event": "bash", "command_rx": rf"\b{word}\b",
+                       "warn_once_per": "turn"}
+            if given is not None:       # a `given` rides inside the matcher block
+                matcher["given"] = given
+            return _row(rid, matcher, mode="gate", **extra)
+
+        seed_book(td, "verrepo", [
+            gate("needs-newer", "alpha", min_hook_version="99.0.0"),
+            gate("needs-this", "bravo", min_hook_version="0.53.0"),
+            gate("bad-version", "charlie", min_hook_version="1.2"),
+            gate("unknown-given", "delta", given={"repo": {"commits_since_base_gt": 3}}),
+            gate("unknown-given-block", "echo", given={"weather": {"raining": True}}),
+            gate("wrong-kind", "foxtrot", given={"repo": {"diff_lines_gt": "lots"}}),
+            gate("half-known", "golf",
+                 given={"repo": {"branch_rx": "^main$", "commits_since_base_gt": 3}}),
+            # A matcher predicate this hook has no code for. `to_hook_rule`
+            # used to copy it through and `evaluate` ignored it, so the rule
+            # stayed a GATE and blocked outside the scope its author wrote.
+            _row("unknown-matcher", {"event": "bash", "command_rx": r"\bjuliet\b",
+                                     "warn_once_per": "turn", "cwd_rx": "^/nowhere"},
+                 mode="gate"),
+            {"id": "unknown-ordering", "on": "ordering", "repo_scope": "any", "mode": "gate",
+             "ordering": {"required_command_rx": "pytest", "gated_command_rx": r"\bhotel\b",
+                          "armed_by_events": ["session"], "phase_of_moon": "waxing"},
+             "text": "unknown-ordering text", "why": "w"},
+            # Its ONLY arming event is one this hook has no lane for, so no
+            # lane can ever record it and it can never fire at a command.
+            {"id": "unarmable", "on": "ordering", "repo_scope": "any", "mode": "gate",
+             "_label": "moonrise-rule",
+             "ordering": {"required_command_rx": "pytest", "gated_command_rx": r"\bindia\b",
+                          "armed_by_events": ["moonrise"]},
+             "text": "unarmable text", "why": "w"},
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0",
+               "MEMHUB_RULEBOOK_HOOK_VERSION": "0.53.0"}
+        n = [0]
+
+        def pre(session, word):
+            n[0] += 1
+            rc, out = run("pre", {"session_id": session, "cwd": repo, "tool_name": "Bash",
+                                  "tool_use_id": f"v{n[0]}",
+                                  "tool_input": {"command": f"run {word} --now"}}, env)
+            deny = ""
+            if out.strip():
+                deny = json.loads(out)["hookSpecificOutput"].get("permissionDecision", "")
+            return ctx(out), deny
+
+        c, deny = pre("v1", "alpha")
+        check("min_hook_version: a rule needing a newer hook still FIRES",
+              "[needs-newer]" in c, c)
+        check("min_hook_version: it advises — the call is not blocked",
+              deny != "deny" and "BLOCKED" not in c, c + " " + deny)
+        check("min_hook_version: and says which version it wanted",
+              "advice only" in c and "needs hook 99.0.0" in c and "this is 0.53.0" in c, c)
+
+        c2, _ = pre("v1", "alpha")
+        check("min_hook_version: the notice is once per session, not per fire",
+              "[needs-newer]" in c2 and "advice only" not in c2, c2)
+
+        c3, _ = pre("v2", "alpha")
+        check("min_hook_version: a NEW session hears it again", "advice only" in c3, c3)
+
+        c, deny = pre("v1", "bravo")
+        check("min_hook_version: a rule needing exactly this hook is unaffected "
+              "and still gates", "**BLOCKED [needs-this]**" in c and deny == "deny", c)
+
+        c, deny = pre("v1", "charlie")
+        check("min_hook_version: a malformed version degrades — it is not "
+              "silently ignored",
+              "[charlie]" not in c and "is not major.minor.patch" in c
+              and deny != "deny", c)
+
+        c, deny = pre("v1", "delta")
+        check("unknown key: an unrecognised `given` key degrades the rule to advice",
+              "repo.commits_since_base_gt" in c and deny != "deny", c)
+
+        c, _ = pre("v1", "echo")
+        check("unknown key: an unrecognised `given` BLOCK degrades it too",
+              "`weather`" in c, c)
+
+        c, deny = pre("v1", "juliet")
+        check("unknown key: an unrecognised MATCHER key degrades the rule to advice "
+              "and names it", "matcher.cwd_rx" in c and deny != "deny", c)
+        inert = H.to_hook_rule(_row("inert", {"event": "bash", "command_rx": "x",
+                                              "predicts_rx": "y", "min_chars": 10},
+                                    mode="gate"))
+        check("unknown key: every key on the server's matcher allowlist is known — "
+              "`predicts_rx` (inert by definition) and `min_chars` do not degrade",
+              inert is not None and inert.get("mode") == "gate"
+              and not inert.get("_degraded"), str(inert))
+
+        # An ordering rule needs its arming event first; this one says
+        # `session`, so the session lane has to have run.
+        run("session", {"session_id": "v1", "cwd": repo,
+                        "hook_event_name": "SessionStart"}, env)
+        c, deny = pre("v1", "hotel")
+        check("unknown key: an unrecognised `ordering` key degrades it too",
+              "ordering.phase_of_moon" in c and deny != "deny", c)
+
+        c, _ = pre("v1", "foxtrot")
+        check("wrong kind: a KNOWN key with a value of the wrong kind is a "
+              "malformed rule and still drops it, as rx_ok does", c == "", c)
+
+        # A rule can carry BOTH failures, and they are judged separately. An
+        # unsupported key sitting beside a malformed known one used to
+        # suppress the malformed check, so the whole `given` was removed and
+        # the rule fired unconditionally. Skew must not launder a malformed
+        # predicate.
+        def _row_given(g):
+            return _row("mixed", {"event": "bash", "command_rx": "x", "given": g})
+        check("mixed: a malformed known key drops the rule even beside an "
+              "unsupported one",
+              H.to_hook_rule(_row_given({"repo": {"future_key": True,
+                                                  "branch_rx": 42}})) is None)
+        r = H.to_hook_rule(_row_given({"repo": {"branch_rx": "^main$",
+                                                "future_key": 1}}))
+        # A KNOWN block whose VALUE is the wrong kind is malformed too, and
+        # `given_supported` skipped it exactly as it skips an unknown block —
+        # so nothing was supported, no skew was reported, and the rule loaded
+        # with its condition silently removed.
+        check("mixed: a known block with a non-dict value drops the rule",
+              H.to_hook_rule(_row_given({"repo": 42})) is None)
+        check("mixed: an EMPTY known block drops it too",
+              H.to_hook_rule(_row_given({"repo": {}})) is None)
+        check("mixed: a WELL-FORMED known key beside an unsupported one is "
+              "kept and still checked",
+              r is not None and r.get("given") == {"repo": {"branch_rx": "^main$"}},
+              str(r and r.get("given")))
+
+        # What the hook CAN check is still checked. `branch_rx: ^main$` holds
+        # here, so the rule fires; the point is that the unknown key next to
+        # it neither dropped the rule nor let it gate.
+        c, deny = pre("v1", "golf")
+        check("unknown key: the predicates the hook does understand still bind",
+              "[half-known]" in c and deny != "deny", c)
+        seed_book(td, "verrepo2", [gate("half-known", "golf",
+                                        given={"repo": {"branch_rx": "^nope$",
+                                                        "commits_since_base_gt": 3}})])
+        repo2 = os.path.join(td, "verrepo2")
+        os.makedirs(os.path.join(repo2, ".git"))
+        with open(os.path.join(repo2, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        n[0] += 1
+        _, out = run("pre", {"session_id": "v9", "cwd": repo2, "tool_name": "Bash",
+                             "tool_use_id": f"v{n[0]}",
+                             "tool_input": {"command": "run golf --now"}}, env)
+        check("unknown key: and a known predicate that FAILS still keeps the "
+              "rule silent — degrading is not a licence to fire", ctx(out) == "", ctx(out))
+
+        # An unknown arming event is version skew, not a rule that quietly
+        # never arms.
+        # A rule whose only arming event is unknown fires NOWHERE — no lane
+        # records it, so `feed` never sees it armed and the advice-only fire
+        # that was supposed to carry the notice has nothing to ride on. It is
+        # surfaced at SESSION START instead: firing it at the gated command
+        # would mean firing a rule whose arming condition this hook cannot
+        # evaluate, which is the exact failure the degradation exists to
+        # prevent, and it would repeat on every matching call.
+        c, deny = pre("v3", "india")
+        check("unarmable: it cannot fire at the command, and does not",
+              c == "" and deny != "deny", c)
+        _, out = run("session", {"session_id": "v4", "cwd": repo,
+                                 "hook_event_name": "SessionStart"}, env)
+        digest = ctx(out)
+        check("unarmable: session start says the plugin is too old to run it",
+              "need a newer" in digest and "moonrise-rule" in digest, digest)
+        check("unarmable: and says it runs as advice and cannot gate",
+              "cannot gate" in digest, digest)
+
+        moonrise = H.degradation({}, None, {"armed_by_events": ["moonrise"]})
+        check("unknown key: an unrecognised arming event degrades",
+              moonrise == "this hook does not understand "
+                          "`ordering.armed_by_events:moonrise`", moonrise)
 if __name__ == "__main__":
     sys.exit(main())
