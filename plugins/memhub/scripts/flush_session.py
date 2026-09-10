@@ -535,7 +535,10 @@ async def _send(session, arguments, room, title, namespace,
         # asymmetry the transport paths were fixed for one round earlier.
         _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
         return False, room
-    out = mcp_http.ack_of(res, arguments.get("conversation_id"))
+    out = mcp_http.ack_of(res, arguments.get("conversation_id"), prefer=lambda candidate:
+                         capture_context.acknowledges(candidate, arguments.get("conversation_id"),
+                                                      arguments["messages"],
+                                                      require_durable=env == "local" or not capture_context.is_legacy()))
     if isinstance(out, dict) and "conversation_id" in out:
         if not capture_context.acknowledges(out, arguments.get("conversation_id"),
                                             arguments["messages"],

@@ -445,6 +445,22 @@ def test_configured_installed_cloud_token_is_healthy_without_account_login():
         assert "Capture destination" not in result.stdout and "session is not being saved" not in result.stdout,result.stdout
 
 
+def test_changed_configuration_failure_warns_once_for_each_new_cause():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=home/".config/memhub-plugin/config.json"
+        path.parent.mkdir(parents=True)
+        base={"version":1,"sinks":[],"active":["missing"]}
+        path.write_text(json.dumps(base))
+        override={"MEMHUB_BACKEND_URL":"http://127.0.0.1:9"}
+        first=invoke(home,"capture_health.py",{"session_id":SID},override=override)
+        again=invoke(home,"capture_health.py",{"session_id":SID},override=override)
+        assert "Capture configuration" in first.stdout and not again.stdout
+        path.write_text(json.dumps({**base,"version":77}))
+        changed=invoke(home,"capture_health.py",{"session_id":SID},override=override)
+        repeat=invoke(home,"capture_health.py",{"session_id":SID},override=override)
+        assert "Capture configuration" in changed.stdout and not repeat.stdout
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
