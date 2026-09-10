@@ -257,6 +257,20 @@ def test_frozen_retry_keeps_new_conversions_out_of_its_original_projection():
         assert "stall" not in state(home,"cloud",local[0])
 
 
+def test_frozen_full_batch_preserves_conversion_lookahead_before_its_watermark():
+    with tempfile.TemporaryDirectory() as td,receiver() as local,receiver() as cloud:
+        home=Path(td);cases.configure(home,local[0]);append(home,[event(f"fire-{i}") for i in range(201)])
+        with (ledger(home)/"conversions.jsonl").open("w") as output:
+            for identity in ["fire-0","fire-200"]:
+                output.write(json.dumps({"fire_id":identity,"converted":True,"converted_at":"2026-01-02T00:00:00Z"})+"\n")
+        cloud[2]["reply"]={"accepted":0,"rejected":0};invoke(home,cloud[0])
+        assert state(home,"cloud",local[0])["conversions_offset"]==0
+        append(home,[event("later")]);invoke(home,cloud[0])
+        assert cloud[1][0][2]["fires"]==cloud[1][1][2]["fires"]
+        assert state(home,"cloud",local[0])["stall"]["n"]==2
+        assert cloud[1][1][2]["fires"][0]["converted"] is True
+
+
 def test_installed_cloud_alone_adopts_legacy_progress_and_cloud_lock_never_blocks_local():
     with tempfile.TemporaryDirectory() as td,receiver() as local,receiver() as cloud:
         home=Path(td);cases.configure(home,local[0]);path=append(home,[event()])

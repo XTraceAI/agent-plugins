@@ -2468,10 +2468,10 @@ def _older_than(iso, seconds):
     return (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() > seconds
 
 
-def pending_batches(sent):
+def pending_batches(sent, observation=None):
     """Replay a stalled prefix independently of later ledger appends."""
     stall = sent.get("stall") or {}
-    boundary = stall.get("after") if isinstance(stall, dict) else None
+    boundary = stall.get("read") if isinstance(stall, dict) else None
     if isinstance(boundary, dict):
         valid = True
         for kind in ("fires", "conversions"):
@@ -2483,16 +2483,16 @@ def pending_batches(sent):
             if type(end) is not int or not sent.get(kind + "_offset", 0) <= end <= size:
                 valid = False
         if valid:
-            frozen, after = _pending_batches(sent, boundary)
+            frozen, _ = _pending_batches(sent, boundary)
             if frozen:
-                remainder = dict(after)
+                remainder = dict(frozen[0][1])
                 remainder.pop("stall", None)
-                later, new_sent = _pending_batches(remainder)
-                return frozen + later, new_sent
-    return _pending_batches(sent)
+                later, new_sent = _pending_batches(remainder, observation=observation)
+                return frozen[:1] + later, new_sent
+    return _pending_batches(sent, observation=observation)
 
 
-def _pending_batches(sent, boundary=None):
+def _pending_batches(sent, boundary=None, observation=None):
     """Rows to POST = fires past the watermark ∪ fires named by conversions past
     THEIR watermark (each re-sent with converted/converted_at merged — the
     ingest is an upsert on fire_id, so a re-send is an update, never a dup).
@@ -2510,6 +2510,8 @@ def _pending_batches(sent, boundary=None):
     c_offsets = []
     new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets,
                                 boundary.get("conversions_offset") if boundary else None)
+    if observation is not None:
+        observation.update(fires_offset=f_end, conversions_offset=c_end)
     if not new_fires and not new_convs:
         return [], dict(sent, fires_offset=f_end, conversions_offset=c_end)
     # New fires carry their own rows. A NEW conversion may name a fire behind
@@ -2636,7 +2638,8 @@ async def _flush_fires(final=False):
         return
     try:
         sent = load_sent()
-        batches, new_sent = pending_batches(sent)
+        observation = {}
+        batches, new_sent = pending_batches(sent, observation)
         n = sum(len(b) for b, _ in batches)
         if not n:
             return
@@ -2684,9 +2687,11 @@ async def _flush_fires(final=False):
                 stall = cur.get("stall") or {}  # progress written by earlier batches
                 n = (stall.get("n", 0) + 1) if stall.get("key") == batch_key else 1
                 if n < STALL_QUARANTINE_AFTER:
+                    # Read bounds include conversion lookahead whose progress
+                    # cannot commit until a later batch has also succeeded.
+                    read = stall.get("read") if stall.get("key") == batch_key else None
                     cur["stall"] = {"key": batch_key, "n": n,
-                                    "after": {field: after[field] for field in
-                                              ("fires_offset", "conversions_offset")}}
+                                    "read": read or observation}
                     _atomic_json(_sent_path(), cur)
                     _breadcrumb("flush", "receiver did not account for every input row")
                     return
