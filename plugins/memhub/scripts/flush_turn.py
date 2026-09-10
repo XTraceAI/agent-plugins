@@ -707,7 +707,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "backend did not acknowledge the captured PR URL",
         )
         return
-    _mark_success(session_id, offset=consumed,
+    _mark_success(session_id, offset=consumed, unsupported=False,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,
                   pending_pr_urls=pending_pr_urls,
