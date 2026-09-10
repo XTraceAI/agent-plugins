@@ -251,9 +251,9 @@ def test_empty_transcript_revision_is_marked_examined():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         old_state = cursor_flush.STATE_DIR
-        old_redact = cursor_flush.redact_records
+        old_redact = cursor_flush.redact_once
         cursor_flush.STATE_DIR = root / "state"
-        cursor_flush.redact_records = lambda records: records
+        cursor_flush.redact_once = lambda records: records
         try:
             asyncio.run(cursor_flush._flush(
                 SESSION, root / f"{SESSION}.jsonl", set(),
@@ -264,7 +264,7 @@ def test_empty_transcript_revision_is_marked_examined():
 
             # A defensive future redactor that drops non-empty content must not
             # mark that content examined; a later corrected rule can resend it.
-            cursor_flush.redact_records = lambda _records: []
+            cursor_flush.redact_once = lambda _records: []
             asyncio.run(cursor_flush._flush(
                 SESSION, root / f"{SESSION}.jsonl", set(),
                 source_kind="transcript", source_revision="held-revision",
@@ -273,7 +273,7 @@ def test_empty_transcript_revision_is_marked_examined():
                 "empty-revision")
         finally:
             cursor_flush.STATE_DIR = old_state
-            cursor_flush.redact_records = old_redact
+            cursor_flush.redact_once = old_redact
     print("PASS test_empty_transcript_revision_is_marked_examined")
 
 
