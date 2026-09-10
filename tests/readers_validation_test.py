@@ -412,6 +412,37 @@ def test_strict_cursor_assistant_text_and_reasoning_require_string_values():
                 for source in [store,transcript]:rejected(lambda:cursor.to_canonical(source,strict_json=True))
 
 
+def test_bounded_codex_index_keeps_cr_and_crlf_records_after_partial_prefix():
+    for newline in (b"\r", b"\r\n", b"\n"):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"index.jsonl"
+            wanted=json.dumps({"id":SID,"thread_name":"synthetic title"}).encode()+newline
+            path.write_bytes(b"x"*200+newline+wanted)
+            with patch.object(codex,"_SESSION_INDEX",path),patch.object(codex,"_INDEX_TAIL_BYTES",len(wanted)+20):
+                for strict in (False,True):
+                    assert codex._sidecar_thread_name(SID,strict_json=strict,strict_utf8=strict)=="synthetic title"
+
+
+def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
+    invalid=[[{"type":"image","data":"synthetic"}],[{"type":"text","text":17}],
+             [{"type":"text"}],{},17]
+    supported=["synthetic",[{"type":"text","text":"synthetic"}],[],None]
+    for fallback in invalid+supported:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/"chats")
+            block={"type":"tool-result","toolCallId":"call","experimental_content":fallback}
+            message={"role":"tool","content":[block]};raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as sql:
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
+                sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
+            transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"tool","message":{"content":[block]}}])
+            for source in [store,transcript]:
+                before=source.read_bytes()
+                if fallback in invalid:rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                else:assert cursor.to_canonical(source,strict_json=True)==cursor.to_canonical(source)
+                assert source.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

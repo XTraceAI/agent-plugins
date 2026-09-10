@@ -371,6 +371,13 @@ def _validate_message(message):
             raise ValueError("Cursor message has unsupported content block")
         if kind in ("text", "reasoning") and not isinstance(block.get("text"), str):
             raise ValueError("Cursor message text must be a string")
+        if kind == "tool-result" and not isinstance(block.get("result"), str):
+            fallback = block.get("experimental_content")
+            if fallback is not None and not isinstance(fallback, str):
+                if not isinstance(fallback, list) or any(
+                        not isinstance(item, dict) or item.get("type") != "text"
+                        or not isinstance(item.get("text"), str) for item in fallback):
+                    raise ValueError("Cursor tool result has unsupported fallback content")
         if kind in ("tool-call", "tool_use", "tool-result"):
             for key in ("toolCallId", "id", "toolName", "name"):
                 if block.get(key) is not None and not isinstance(block[key], str):

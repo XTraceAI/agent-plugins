@@ -389,7 +389,7 @@ def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_js
         if start:
             # Drop the incomplete byte prefix before strict UTF-8 decoding;
             # the seek may have landed inside a multi-byte character.
-            blob = blob.partition(b"\n")[2]
+            blob = b"".join(blob.splitlines(keepends=True)[1:])
         lines = [raw.decode("utf-8", errors="strict" if strict_utf8 else "replace")
                  for raw in blob.splitlines(keepends=True)]
         for raw in deque(lines, maxlen=_INDEX_MAX_LINES):
