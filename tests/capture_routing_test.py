@@ -238,7 +238,7 @@ def test_capture_and_cloud_service_health_are_distinct():
             message, signature = capture_health._separate_capture_health("cloud.example.test", sink)
             assert "Capture destination 'local'" in message and "Cloud services" in message
             assert "does not establish cloud authentication" in message
-            assert "capture:local:timeout" in signature and "cloud:cloud.example.test:expired" in signature
+            assert "capture:local:" in signature and ":timeout" in signature and "cloud:cloud.example.test:expired" in signature
             assert auth.default_url() == "https://cloud.example.test/mcp-server/mcp"
 
 
@@ -380,6 +380,24 @@ def test_renewable_capture_health_is_silent_without_network_or_cross_origin_trus
         (directory/f"{SID}.json").write_text(json.dumps({"last_error":"timeout","last_error_at":time.time()}))
         message,_=capture_health._separate_capture_health(None,selected)
         assert "'alias'" in message and "no usable credential" not in message
+
+
+def test_same_named_endpoint_changes_do_not_suppress_new_health_warnings():
+    import io
+    first=sinks.Sink("local","http://127.0.0.1:47421/mcp","synthetic")
+    second=sinks.Sink("local","http://127.0.0.1:47422/mcp","synthetic")
+    with tempfile.TemporaryDirectory() as td, patch.object(capture_health,"STATE_DIR",Path(td)), \
+            patch.object(capture_health,"_env_host",return_value=None), \
+            patch.object(capture_health,"_recent_failure",return_value=("timeout",time.time())):
+        for sink,expected in [(first,True),(first,False),(second,True),(second,False)]:
+            output=io.StringIO()
+            with patch.object(sinks,"resolve_capture_sink",return_value=sink), \
+                    patch.object(sys,"stdin",io.StringIO(json.dumps({"session_id":SID}))), \
+                    contextlib.redirect_stdout(output):
+                assert capture_health.main()==0
+            assert bool(output.getvalue()) is expected
+        marker=(Path(td)/f"{SID}.health").read_text()
+        assert "127.0.0.1" not in marker and "synthetic" not in marker
 
 
 if __name__ == "__main__":

@@ -174,7 +174,7 @@ def main(argv=None) -> int:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
                     from cursor_flush import apply_session_state
-                    apply_session_state(records, header["native_session_id"])
+                    apply_session_state(records, header["native_session_id"], strict=True)
                 if records and validate_canonical(records):
                     raise ValueError("reader emitted invalid canonical records")
                 header["title"] = native_text(native.get("title"))

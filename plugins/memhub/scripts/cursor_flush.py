@@ -224,11 +224,29 @@ _SHARED_STATE_FIELDS = frozenset({
 })
 
 
-def _state_at(path: Path) -> dict:
+def _state_at(path: Path, *, strict: bool = False) -> dict:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if strict and (not isinstance(state, dict) or any(
+                key in state and not isinstance(state[key], dict)
+                for key in ("record_ts", "usage_events"))):
+            raise ValueError("invalid saved Cursor observations")
+        if strict:
+            import datetime
+            for stamp in state.get("record_ts", {}).values():
+                if stamp is not None and (not isinstance(stamp, str) or
+                        datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).tzinfo is None):
+                    raise ValueError("invalid saved Cursor timestamp")
+            for event in state.get("usage_events", {}).values():
+                if (not isinstance(event, dict) or not isinstance(event.get("target_uuid"), str)
+                        or not event["target_uuid"] or cursor_reader.normalize_usage(event.get("usage")) is None):
+                    raise ValueError("invalid saved Cursor usage")
+        return state if isinstance(state, dict) else {}
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
+        if strict:
+            raise
         return {}
 
 
@@ -236,12 +254,12 @@ def _delivery_path(uuid: str) -> Path:
     return capture_context.state_directory(STATE_DIR) / f"{_safe_uuid(uuid)}.json"
 
 
-def _read_state(uuid: str) -> dict:
-    shared = _state_at(_state_path(uuid))
+def _read_state(uuid: str, *, strict: bool = False) -> dict:
+    shared = _state_at(_state_path(uuid), strict=strict)
     if _delivery_path(uuid) == _state_path(uuid):
         return shared
     return {**{key: value for key, value in shared.items() if key in _SHARED_STATE_FIELDS},
-            **_state_at(_delivery_path(uuid))}
+            **_state_at(_delivery_path(uuid), strict=strict)}
 
 
 def _save_state(uuid: str, **fields) -> None:
@@ -686,7 +704,7 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     return stamps
 
 
-def apply_session_state(records: list[dict], uuid: str) -> None:
+def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False) -> None:
     """Restore live-observed fidelity onto an out-of-band re-read.
 
     capture.py (the manual import / sweep backstop for sessions whose
@@ -702,7 +720,7 @@ def apply_session_state(records: list[dict], uuid: str) -> None:
         # must not select a state file (even a sanitized one) — skipping the
         # restore just leaves the records with their artifact-carried clocks.
         return
-    state = _read_state(uuid)
+    state = _read_state(uuid, strict=True) if strict else _read_state(uuid)
     _stamp_records(records, state.get("record_ts"), None,
                    first_observation=True)
     _apply_usage(records, state.get("usage_events"))

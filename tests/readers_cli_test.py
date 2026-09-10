@@ -461,6 +461,42 @@ def test_codex_title_sidecar_changes_participate_in_since_and_revision_checks():
         assert code==2 and stdout.getvalue()=="" and "source_changed" in stderr.getvalue()
 
 
+def test_existing_malformed_cursor_pins_are_incomplete_but_missing_is_optional():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=transcript(home)
+        state=home/f".config/memhub-plugin/cursorflush/{SID}.json";state.parent.mkdir(parents=True)
+        for invalid in ['{truncated','[]','null','{"record_ts":[]}','{"usage_events":17}',
+                        '{"record_ts":{"record":"not a date"}}',
+                        '{"usage_events":{"generation":{}}}']:
+            state.write_text(invalid);before=state.read_bytes()
+            result,rows=run(home,"cursor")
+            assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
+            assert "truncated" not in result.stderr and state.read_bytes()==before
+        state.write_text('{"record_ts":{"record":null},"usage_events":{}}')
+        result,rows=run(home,"cursor")
+        assert result.returncode==0 and rows,result.stderr
+        state.unlink()
+        result,rows=run(home,"cursor")
+        assert result.returncode==0 and rows[1:]==cursor.to_canonical(path)[0],result.stderr
+
+
+def test_codex_title_sidecar_is_strict_only_for_full_discovery_reads():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home)
+        sid=json.loads(path.read_text().splitlines()[0])["payload"]["id"]
+        index=home/".codex/session_index.jsonl"
+        for content in [json.dumps({"id":sid,"thread_name":"bad"}).encode().replace(b'bad',b'bad\xff'),b'{bad}\n']:
+            index.write_bytes(content)
+            with patch.object(codex,"_SESSION_INDEX",index):
+                codex.to_canonical(path)  # Ordinary capture remains tolerant.
+            result,rows=run(home,"codex")
+            assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
+            assert "bad" not in result.stderr
+        index.write_text(json.dumps({"id":sid,"thread_name":"complete title"})+'\n{"id":')
+        result,rows=run(home,"codex")
+        assert result.returncode==0 and rows[0]["title"]=="complete title",result.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

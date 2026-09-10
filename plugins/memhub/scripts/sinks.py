@@ -6,9 +6,11 @@ not change _memhub_auth defaults or install/update any account configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 from urllib.parse import urlsplit
 
 import _memhub_auth
@@ -41,9 +43,21 @@ def _endpoint(value) -> str:
                 or parts.username is not None or parts.password is not None
                 or parts.fragment or parts.port == 0):
             raise ValueError()
+        host = parts.hostname
+        if ":" in host or parts.netloc.startswith("["):
+            if "%" in host:
+                raise ValueError()
+            ipaddress.IPv6Address(host)
+        elif (not host.isascii() or len(host) > 253 or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in host.removesuffix(".").split("."))):
+            # The legacy host/port cache substitutes ':' with '_'. Standard
+            # DNS names cannot contain '_', so refusing non-hostname URL forms
+            # also prevents one origin from naming another origin's cache file.
+            raise ValueError()
         mcp_http.require_secure(value)
     except (ValueError, mcp_http.McpError):
-        raise SinkConfigError("capture endpoint requires HTTPS or literal loopback HTTP") from None
+        raise SinkConfigError("capture endpoint requires a standard ASCII hostname or IP and HTTPS or literal loopback HTTP") from None
     return value
 
 
@@ -187,6 +201,11 @@ def resolve_capture_auth(sink: Sink, *, refresh: bool = True) -> tuple[str, str 
         same_backend = _origin(installed) == _origin(sink.url)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
         same_backend = False
+    if sink.is_local and not same_backend:
+        # Legacy cache names do not include the scheme. A separate loopback
+        # service must supply its own explicit token rather than inherit one
+        # cached under the same host/port for a different protocol.
+        return sink.url, None
     _, bearer = _memhub_auth.resolve_bearer(sink.url, refresh=refresh and same_backend)
     if bearer is None and same_backend and installed != sink.url:
         # Old caches use the URL's literal netloc. Keep explicitly cached
