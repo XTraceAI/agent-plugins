@@ -225,6 +225,7 @@ def main(argv=None) -> int:
         else:
             options = {"include_representations": True} if args.host == "cursor" else {}
             sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"), **options)
+            discovered = list(sessions)
             if args.host == "cursor":
                 # One store and one transcript are alternative representations.
                 # Multiple copies of either kind remain ambiguous even when a
@@ -240,13 +241,22 @@ def main(argv=None) -> int:
                     cursor_counts[f"cursor-{sid}"] = max(map(len, kinds.values()))
                     sessions.extend(kinds["store"] or kinds["transcript"])
             if args.session == "latest":
-                latest, error = reader.locate("latest")
-                if error or latest is None:
+                if not discovered:
                     diagnostic("session_unavailable")
                     return 2
-                latest = latest.resolve(strict=True)
+                def latest_mtime(row):
+                    path = Path(row["path"])
+                    if args.host == "cursor" and path.name == "store.db":
+                        metadata = reader._read_meta_json(path.parent) or {}
+                        value = metadata.get("updatedAtMs")
+                        return value / 1000 if type(value) in (int, float) and math.isfinite(value) else 0
+                    return row["mtime"]
+                latest = Path(max(discovered, key=latest_mtime)["path"]).resolve(strict=True)
                 if args.host == "cursor":
                     latest = cursor_source(latest, select_saved=True)
+                    if not any(Path(row["path"]).resolve(strict=True) == latest for row in discovered):
+                        diagnostic("session_unavailable")
+                        return 2
                     # Discovery prefers stores, whereas native latest may
                     # select a newer transcript of the same session. Replace
                     # that one representation without hiding duplicate stores.
@@ -293,7 +303,7 @@ def main(argv=None) -> int:
             header = header_for(reader, path, mtime)
             prepared.append((path, revision, header))
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
-                OverflowError, RecursionError):
+                OverflowError, RecursionError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
@@ -362,7 +372,7 @@ def main(argv=None) -> int:
             for line in lines:
                 print(line)
         except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error,
-                OverflowError, RecursionError):
+                OverflowError, RecursionError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
     return 2 if incomplete else 0
 

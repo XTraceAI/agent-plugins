@@ -399,7 +399,7 @@ def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted(
                 duplicate=original.with_name("rollout-another.jsonl")
                 shutil.copyfile(original,duplicate)
                 rows=[json.loads(line) for line in original.read_text().splitlines()]
-                rows[0]["payload"]["id"]="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                rows[0]["payload"].update(id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",timestamp=STAMP)
                 healthy=write_jsonl(original.with_name("rollout-healthy.jsonl"),rows)
             for mode in ([],["--metadata-only"]):
                 result,rows=run(home,host,*mode)
@@ -755,6 +755,28 @@ def test_latest_cursor_does_not_prepare_unrelated_saved_state_or_metadata():
             result,_=run(home,"cursor","--metadata-only")
             assert result.returncode==2 and "session_unreadable" in result.stderr
             assert path.read_bytes() and bad.read_bytes()==before
+
+
+def test_latest_never_reintroduces_symlinked_discovery_directories():
+    for host in ["codex","cursor"]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);safe=rollout(home) if host=="codex" else transcript(home)
+            external=home/"outside"; external.mkdir()
+            if host=="codex":
+                rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+                rows[0]["payload"].update(id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",timestamp=STAMP)
+                bad=write_jsonl(external/"rollout-outside.jsonl",rows)
+                link=home/".codex/sessions/2027";link.symlink_to(external,target_is_directory=True)
+            else:
+                sid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                bad=write_jsonl(external/f"agent-transcripts/{sid}/{sid}.jsonl",fixtures.CURSOR_TRANSCRIPT)
+                link=home/".cursor/projects/outside";link.symlink_to(external,target_is_directory=True)
+            os.utime(bad,(MTIME+100,MTIME+100))
+            for mode in [[],["--metadata-only"]]:
+                result,rows=run(home,host,"--session","latest",*mode)
+                assert result.returncode==2 and "discovery_incomplete" in result.stderr,result.stderr
+                headers=[row for row in rows if row.get("type")=="session"]
+                assert len(headers)==1 and headers[0]["path"]==str(safe.resolve()),headers
 
 
 if __name__ == "__main__":

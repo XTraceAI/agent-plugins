@@ -542,7 +542,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         "messages": sendable,
         "conversation_id": f"codex-{sid}",
         "source_platform": codex_reader.HOST,
-        **capture_context.identity(sid, lambda: codex_reader.session_metadata(rollout), include_cloud=True),
+        **capture_context.identity(sid, {"source_surface": meta.get("originator")}, include_cloud=True),
         "flush": "now",
     }
     if room:

@@ -37,7 +37,7 @@ def _name(value) -> str:
 
 def _endpoint(value) -> str:
     try:
-        if (not isinstance(value, str) or not value or "\\" in value
+        if (not isinstance(value, str) or not value or not value.isascii() or "\\" in value
                 or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
             raise ValueError()
         parts = urlsplit(value)
@@ -64,7 +64,7 @@ def _endpoint(value) -> str:
             ipaddress.IPv4Address(host)
         mcp_http.require_secure(value)
     except (ValueError, mcp_http.McpError):
-        raise SinkConfigError("capture endpoint requires a standard ASCII hostname or IP and HTTPS or literal loopback HTTP") from None
+        raise SinkConfigError("capture endpoint requires an ASCII URL with a standard hostname or IP and HTTPS or literal loopback HTTP") from None
     return value
 
 
