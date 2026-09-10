@@ -599,10 +599,13 @@ def main() -> int:
 
     host = _env_host()
     try:
-        sink = sinks.resolve_capture_sink()
-        separate = sink is None or capture_context.state_directory(STATE_DIR, sink) != STATE_DIR
+        selected = sinks.resolve_capture_sinks()
+        separate = len(selected) != 1 or capture_context.state_directory(STATE_DIR, selected[0]) != STATE_DIR
         if separate:
-            message, signature = _separate_capture_health(host, sink)
+            reports = [_separate_capture_health(host if index == 0 else None, sink)
+                       for index, sink in enumerate(selected or (None,))]
+            message = " ".join(text for text, _ in reports if text)
+            signature = "|".join(cause for _, cause in reports if cause)
         else:
             if not host:
                 return 0

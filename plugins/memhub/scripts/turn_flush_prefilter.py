@@ -93,30 +93,19 @@ def main() -> int:
     if size <= 0:
         return 1
 
-    sink = sinks.resolve_capture_sink()
-    if sink is None:
-        return 1
-    state_dir = capture_context.state_directory(STATE_DIR, sink)
-    if _lock_is_held(state_dir / f"{session_id}.lock"):
-        return 1
-
-    try:
-        state = json.loads(
-            (state_dir / f"{session_id}.json").read_text(encoding="utf-8"))
-        offset = int(state.get("offset", 0))
-    except (OSError, ValueError, TypeError):
-        return 0  # no cursor yet — first turn of the session, always flush
-
-    # The flush found a server without per-turn support and went dormant for
-    # this session. Skip silently: the warning was emitted once, and the
-    # commit/PR and session-end hooks still capture the session.
-    if state.get("unsupported"):
-        return 1
-
-    # Grew → new turns to ship. Shrank → the transcript was rewritten and the
-    # offset is meaningless, so the flush must re-send from the top; either way
-    # this is not the "nothing changed" case.
-    return 0 if size != offset else 1
+    selected = sinks.resolve_capture_sinks()
+    for sink in selected:
+        state_dir = capture_context.state_directory(STATE_DIR, sink)
+        if _lock_is_held(state_dir / f"{session_id}.lock"):
+            continue
+        try:
+            state = json.loads((state_dir / f"{session_id}.json").read_text(encoding="utf-8"))
+            offset = int(state.get("offset", 0))
+        except (OSError, ValueError, TypeError):
+            return 0
+        if not state.get("unsupported") and size != offset:
+            return 0
+    return 1  # Every active destination is caught up, dormant or already flushing.
 
 
 if __name__ == "__main__":

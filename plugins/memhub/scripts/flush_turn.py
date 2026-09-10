@@ -37,6 +37,9 @@ pop a browser, so it can only consume a token ``/memhub:login`` already minted.
 from __future__ import annotations
 
 import asyncio
+import copy
+from contextvars import ContextVar
+import math
 import json
 import os
 import subprocess
@@ -67,6 +70,8 @@ from transcript_filter import (  # noqa: E402
 # logic, where the silent failures live, be tested without the dependency.
 # Nothing here needs the SDK any more, so the indirection went with it.
 import capture_context  # noqa: E402
+import capture_async  # noqa: E402
+import sinks  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
@@ -95,6 +100,9 @@ def _flush_timeout_s() -> float:
     capture would be silently dead. ``MEMHUB_TURN_FLUSH=0`` is how you turn
     this off; a timeout of nothing is a misconfiguration, not an intent.
     """
+    budget = capture_context.time_budget()
+    if budget is not None:
+        return budget
     raw = (os.environ.get("MEMHUB_TURN_FLUSH_TIMEOUT_S") or "").strip()
     if not raw:
         return _DEFAULT_FLUSH_TIMEOUT_S
@@ -102,7 +110,7 @@ def _flush_timeout_s() -> float:
         value = float(raw)
     except ValueError:
         return _DEFAULT_FLUSH_TIMEOUT_S
-    return value if value > 0 else _DEFAULT_FLUSH_TIMEOUT_S
+    return value if value > 0 and math.isfinite(value) else _DEFAULT_FLUSH_TIMEOUT_S
 
 # UI bookkeeping the client writes for its own display: mode switches, the
 # generated title, queue state. They carry no content and no ``message``, and
@@ -256,7 +264,14 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
     consumed = offset
     with open(transcript, "rb") as fh:
         fh.seek(offset)
-        for raw in fh:
+        while True:
+            raw = fh.readline(16 * 1024 * 1024 + 1)
+            if not raw:
+                break
+            if len(raw) > 16 * 1024 * 1024:
+                raise ValueError("native record exceeds the per-turn read limit")
+            if consumed > offset and (len(records) >= 2000 or consumed - offset + len(raw) > 3_500_000):
+                break
             if not raw.endswith(b"\n"):
                 break  # partial trailing write — resume here next turn
             consumed += len(raw)
@@ -338,6 +353,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     offset = _read_cursor(state, size)
     records, consumed = _read_tail(transcript_path, offset)
     if not records:
+        if consumed > offset:
+            _save_state(session_id, offset=consumed)
         return
 
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
@@ -376,7 +393,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # runs over what will actually be sent, and before slicing would matter:
     # a single record the server can never accept would otherwise pin the
     # cursor and stall this session's capture for good.
-    sendable = redact_records(
+    sendable = _redact_once(
         elide_oversized_tool_results(drop_command_wrappers(records))
     )
 
@@ -424,7 +441,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # synchronous call, so run inline it would pin the event loop AND hold the
     # flock past the flush deadline, blocking every later turn's capture for
     # the session. Offloading is what makes the timeout mean anything here.
-    url, bearer = await asyncio.to_thread(resolve_bearer)
+    url, bearer = await capture_async.blocking(resolve_bearer)
     if not bearer:
         # Not an error — the state a background hook must degrade quietly on.
         # Raised rather than returned so the one handler in main() records the
@@ -445,7 +462,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # granting each the full timeout lets a stalled lookup consume the budget
     # and the import, the only call that actually captures anything, never
     # happens. Half guarantees the second call still gets a turn.
-    session = mcp_http.Session(url, bearer, timeout=_flush_timeout_s() / 2)
+    session = capture_context.session(url, bearer, timeout=_flush_timeout_s() / 2)
     # No `initialize` handshake: verified against the live server, a fresh
     # process can call a tool directly and get a result. Dropping it removes two
     # of the three round trips this hook used to make per turn.
@@ -456,7 +473,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         "messages": sendable,
         "conversation_id": session_id,
         "source_platform": "claude",
-        **capture_context.identity(session_id),
+        **capture_context.identity(session_id, include_cloud=True),
         # The whole point: durable on arrival, extracted in batches.
         "flush": "auto",
     }
@@ -502,7 +519,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         guarantees that; a second inline ladder is exactly how the two drift.
         """
         try:
-            return await session.call_tool("import_conversation", arguments=args)
+            return await capture_context.import_conversation(session, args)
         except mcp_http.McpRateLimited as e:
             wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
             _log(f"rate limited{wait} — the next turn retries (cursor unmoved)")
@@ -648,6 +665,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                     last_error_detail=None, last_error_at=None)
         return
 
+    expected_ack = next((record.get("uuid") for record in reversed(sendable)
+                         if isinstance(record, dict) and record.get("uuid")), None)
+    if (out.get("conversation_id") != session_id or expected_ack is None
+            or out.get("ack_through") != expected_ack):
+        _mark_failure(session_id, "unrecognized_response",
+                      "durable acknowledgement does not cover this batch")
+        return
+
     # Committed server-side — only now is it safe to move the cursor.
     # ``custom_title`` is stored SEPARATELY from the title that was
     # sent, and only when there is one: it is the one source a later
@@ -702,8 +727,7 @@ class _NoCredential(RuntimeError):
 # raised on our own stack, so `isinstance` is the whole check.
 
 
-@capture_context.entrypoint
-def main() -> int:
+def _run_sink(hook_input: dict) -> int:
     lock_fd: int | None = None
     # Bound BEFORE the try so the handler can always write a breadcrumb. Reading
     # stdin or parsing it is itself a failure path, and a NameError raised from
@@ -711,7 +735,6 @@ def main() -> int:
     # the traceback it was written to prevent.
     session_id = ""
     try:
-        hook_input = json.loads(sys.stdin.read() or "{}")
         capture_context.observe(hook_input)
         session_id = (hook_input.get("session_id") or "").strip()
         transcript_path = (hook_input.get("transcript_path") or "").strip()
@@ -721,6 +744,8 @@ def main() -> int:
         lock_fd = _acquire(session_id)
         if lock_fd is None:
             return 0  # a flush is already in flight; its successor carries ours
+        if _read_state(session_id).get("unsupported"):
+            return 0
         # Bounded, because the lock is held for the whole round-trip and the
         # prefilter skips every later turn while it is held. Without a cap, one
         # hung request would stall capture for this session until the hook's own
@@ -730,7 +755,7 @@ def main() -> int:
         # the next turn re-sends.
         timeout_s = _flush_timeout_s()
         asyncio.run(asyncio.wait_for(
-            _flush(session_id, transcript_path), timeout=timeout_s))
+            _drain(session_id, transcript_path), timeout=timeout_s))
     # BaseException, not Exception: anyio mixes CancelledError into task
     # groups, producing a BaseExceptionGroup that an Exception handler would
     # miss — killing the hook with a traceback in the user's session.
@@ -763,6 +788,79 @@ def main() -> int:
             except OSError:
                 pass
     return 0
+
+
+# Bounded cache shared across destinations during this one invocation. Each
+# projection gets its own copy, so endpoint-specific arguments cannot mutate it.
+_REDACTION_CACHE: ContextVar[dict | None] = ContextVar("turn_redaction_cache", default=None)
+
+
+def _redact_once(records):
+    cache = _REDACTION_CACHE.get()
+    if cache is None:
+        return redact_records(records)
+    result = []
+    items = cache["items"]
+    for record in records:
+        key = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        if key not in items:
+            redacted = redact_records([record])[0]
+            # Keep memory bounded for long catch-up sessions. Eviction only
+            # repeats redaction; it can never skip or change a record.
+            if len(key) > 8 * 1024 * 1024:
+                result.append(redacted)
+                continue
+            if cache["bytes"] + len(key) > 8 * 1024 * 1024:
+                items.clear()
+                cache["bytes"] = 0
+            items[key] = redacted
+            cache["bytes"] += len(key)
+        result.append(copy.deepcopy(items[key]))
+    return result
+
+
+async def _drain(session_id, transcript_path):
+    while True:
+        before = _read_cursor(_read_state(session_id), os.path.getsize(transcript_path))
+        await _flush(session_id, transcript_path)
+        after = _read_cursor(_read_state(session_id), os.path.getsize(transcript_path))
+        if after <= before or after >= os.path.getsize(transcript_path):
+            return
+
+
+def main() -> int:
+    if os.environ.get("MEMHUB_TURN_FLUSH", "").strip().lower() in {"0", "off", "false"}:
+        return 0
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        selected = sinks.resolve_capture_sinks()
+        if not isinstance(payload, dict) or not selected:
+            return 0
+        # Local first, stable within each class. Inactive registry entries are
+        # absent. Reserve a share for every remaining destination.
+        installed_url = _default_capture_url()
+        selected = [(sink, sink.name == "cloud" and sink.url == installed_url)
+                    for sink in sorted(selected, key=lambda sink: not sink.is_local)]
+        deadline = time.monotonic() + min(60.0, _flush_timeout_s())
+        cache_token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
+        try:
+            for index, (sink, legacy) in enumerate(selected):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                budget = remaining / (len(selected) - index)
+                with capture_context.bind(sink, legacy=legacy, budget=budget):
+                    _run_sink(payload)
+        finally:
+            _REDACTION_CACHE.reset(cache_token)
+    except BaseException:
+        _log("capture selection unavailable; upload progress retained")
+    return 0
+
+
+def _default_capture_url():
+    import _memhub_auth
+    return _memhub_auth.default_url()
 
 
 if __name__ == "__main__":

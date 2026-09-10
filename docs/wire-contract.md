@@ -131,6 +131,8 @@ and malformed outer structure are treated as corrupt-file fallback.
 `resolve_capture_sink()` returns an immutable `Sink` or `None` when explicitly
 disabled. It rejects multiple active destinations until a caller implements
 independent delivery. `active_sink_names()` exposes the validated ordered names.
+`resolve_capture_sinks()` returns every explicitly active destination as an
+immutable tuple for callers that provide independent delivery.
 A `Sink.url` is the complete MCP endpoint, `mcp_path` retains its path/query,
 and `is_local` describes a literal loopback destination. Its representation
 omits URLs and credentials.
@@ -162,9 +164,11 @@ shared Cursor pins and separate capture/cloud-service health.
 
 ### Conversation hook delivery
 
-Each invocation freezes one selected destination for its authentication, state,
-room routing and async work. Empty selection skips delivery. Multiple active
-names remain unsupported and are reported without selecting another endpoint.
+Each delivery freezes its selected destination for authentication, state,
+room routing and async work. Empty selection skips delivery. Claude per-turn
+capture supports multiple active destinations. Claude SessionEnd/commit/PR
+backstop, Codex and Cursor still reject multiple names until their corresponding
+delivery paths support independent progress.
 The existing installed cloud retains its legacy state. Other named or explicit
 environment destinations store progress under the hook state directory, then
 sink name and a digest of the full endpoint. Changing an endpoint under the same
@@ -183,8 +187,8 @@ Literal loopback capture skips cloud room resolution and adds native session ID
 plus an observed raw surface when available. Claude reads explicit `source_surface`
 or `entrypoint`; Codex reads native `originator`; Cursor reads explicit metadata
 or its recognized native source location. Missing surfaces remain omitted. Older
-cloud envelopes stay unchanged; multi-destination extension negotiation is
-separate work. Canonical host-prefixed conversation IDs and record UUIDs retain
+cloud envelopes stay unchanged for the single-destination backstop, Codex and
+Cursor paths. Canonical host-prefixed conversation IDs and record UUIDs retain
 the existing reader convention.
 
 Capture health reads failures only from the selected destination. A success at
@@ -192,3 +196,41 @@ another destination cannot clear that failure, and a constant local token cannot
 certify cloud login. Cloud-service authentication and rulebook issues are reported
 separately. The health hook does not contact either destination or report a
 connection as proven merely because credentials exist.
+
+### Claude per-turn delivery to multiple destinations
+
+The turn hook takes an immutable active selection and visits loopback endpoints
+first. Registry-only destinations never receive a request. It reserves a share
+of the remaining time for each destination, within a total network deadline of
+60 seconds (or a smaller positive `MEMHUB_TURN_FLUSH_TIMEOUT_S`). Auth and HTTP
+work use daemon workers around the existing transport, so a slow-dripping body
+cannot keep the hook alive after cancellation. A late result never advances
+upload progress; an uncertain response is retried with the same record UUIDs.
+
+Each destination has its own session lock, cursor, failure and unsupported-server
+state. Only the unchanged installed cloud uses the legacy flat cursor. A held
+cloud lock or unsupported server does not disable local capture. The prefilter
+skips only when every active destination is caught up, dormant or already held.
+Health identifies the destination whose delivery failed.
+
+Catch-up uses at most 2,000 native records or approximately 3.5 MB of source per
+batch; a single source line is limited to 16 MiB and existing tool-result elision
+runs before transmission. A final partial line waits for its newline. Each
+successful batch commits its own cursor; later failures retain earlier progress.
+The acknowledgement must match the conversation and final sent record UUID.
+
+Redaction reuses a bounded invocation-local cache across destinations. Payloads
+get separate copies, and endpoint-specific fields cannot mutate shared content.
+Eviction after 8 MiB of cache keys can repeat redaction during large catch-up;
+it cannot change or skip records. Both destinations receive native session ID
+and an observed raw surface when present. If an older non-loopback endpoint
+explicitly rejects those optional argument names, one retry omits only those
+fields. Local payloads retain them; unrelated errors are not retried this way.
+
+`python3 tests/multi_sink_test.py` exercises real subprocess hooks and two
+loopback receivers. The fake cloud's logical HTTPS URL is mapped to its test
+receiver at the existing HTTP boundary, while a socket guard forbids outside
+connections. Cases cover explicit membership, identity, local-first order,
+401/429/500 recovery, slow-drip deadlines, overlapping hooks, legacy cursors,
+per-destination locks/dormancy, old-cloud compatibility, batching, acknowledgement
+validation and redaction isolation. No hosted CI job is added.

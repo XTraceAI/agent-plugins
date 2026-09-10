@@ -7,6 +7,7 @@ calls retain their legacy defaults; executable hook entrypoints opt in.
 from __future__ import annotations
 
 from contextvars import ContextVar
+from contextlib import contextmanager
 from functools import wraps
 import hashlib
 from pathlib import Path
@@ -18,6 +19,7 @@ from sinks import Sink, SinkConfigError, resolve_capture_auth, resolve_capture_s
 
 _current: ContextVar[Sink | None] = ContextVar("capture_destination", default=None)
 _legacy: ContextVar[bool] = ContextVar("capture_legacy_state", default=True)
+_budget: ContextVar[float | None] = ContextVar("capture_time_budget", default=None)
 _payload: ContextVar[dict | None] = ContextVar("capture_hook_payload", default=None)
 
 
@@ -35,16 +37,37 @@ def entrypoint(function):
             return 0
         if sink is None:
             return 0
-        token = _current.set(sink)
-        legacy_token = _legacy.set(legacy)
-        payload_token = _payload.set(None)
-        try:
+        with bind(sink, legacy=legacy):
             return function(*args, **kwargs)
-        finally:
-            _payload.reset(payload_token)
-            _legacy.reset(legacy_token)
-            _current.reset(token)
     return selected
+
+
+@contextmanager
+def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None):
+    if legacy is None:
+        legacy = sink.name == "cloud" and sink.url == _memhub_auth.default_url()
+    token = _current.set(sink)
+    legacy_token = _legacy.set(legacy)
+    budget_token = _budget.set(budget)
+    payload_token = _payload.set(None)
+    try:
+        yield
+    finally:
+        _payload.reset(payload_token)
+        _budget.reset(budget_token)
+        _legacy.reset(legacy_token)
+        _current.reset(token)
+
+
+def time_budget():
+    return _budget.get()
+
+
+def session(url, bearer, timeout):
+    import capture_async
+    import mcp_http
+    factory = capture_async.Session if _current.get() is not None else mcp_http.Session
+    return factory(url, bearer, timeout=timeout)
 
 
 def observe(payload: dict) -> None:
@@ -82,10 +105,10 @@ async def resolve_repo_brain(session, cwd, env):
     return await brain_resolve.resolve_repo_brain(session, cwd, env)
 
 
-def identity(native_id: str, metadata=None) -> dict:
+def identity(native_id: str, metadata=None, *, include_cloud=False) -> dict:
     """Add local identity without changing older cloud import envelopes."""
     sink = _current.get()
-    if sink is None or not sink.is_local:
+    if sink is None or (not sink.is_local and not include_cloud):
         return {}
     result = {"native_session_id": native_id}
     payload = _payload.get() or {}
@@ -98,4 +121,21 @@ def identity(native_id: str, metadata=None) -> dict:
         if isinstance(source, str) and source.strip():
             result["source_surface"] = source
             break
+    return result
+
+
+async def import_conversation(session, arguments):
+    """Retry explicit old-cloud argument rejection once with its legacy envelope."""
+    import mcp_http
+    result = await session.call_tool("import_conversation", arguments=arguments)
+    sink = _current.get()
+    if sink is None or sink.is_local or not getattr(result, "isError", False):
+        return result
+    text = " ".join(mcp_http.texts_of(result)).lower()
+    fields = {"native_session_id", "source_surface"}.intersection(arguments)
+    if fields and any(field in text for field in fields) and any(marker in text for marker in (
+            "unexpected keyword argument", "extra inputs are not permitted",
+            "extra inputs not permitted", "unknown argument", "additional properties")):
+        legacy = {key: value for key, value in arguments.items() if key not in fields}
+        return await session.call_tool("import_conversation", arguments=legacy)
     return result

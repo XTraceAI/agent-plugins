@@ -153,6 +153,12 @@ def active_sink_names() -> tuple[str, ...]:
     return _selection()[0]
 
 
+def resolve_capture_sinks() -> tuple[Sink, ...]:
+    """Freeze active destinations for a caller supporting independent delivery."""
+    names, registry = _selection()
+    return tuple(registry[name] for name in names)
+
+
 def resolve_capture_sink() -> Sink | None:
     """Select one destination, or None for an explicitly empty active list.
 
