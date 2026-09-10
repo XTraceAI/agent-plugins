@@ -37,6 +37,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_context  # noqa: E402
+import capture_async  # noqa: E402
+from capture_redaction import CACHE as _REDACTION_CACHE, redact_once  # noqa: E402
+from transcript_chunks import slices as make_slices  # noqa: E402
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
@@ -203,7 +206,8 @@ def _acquire(sid: str, blocking: bool = False) -> int | None:
     # subprocess) would otherwise hang one detached process per boundary
     # event. Poll up to LOCK_WAIT_S, then give up (the sweep backstops);
     # a dead peer releases via the kernel and this returns instantly.
-    deadline = time.monotonic() + LOCK_WAIT_S
+    budget = capture_context.time_budget()
+    deadline = time.monotonic() + min(LOCK_WAIT_S, budget if budget is not None else LOCK_WAIT_S)
     while True:
         try:
             portable_lock.lock_exclusive(fd, blocking=False)
@@ -455,7 +459,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             pending_pr_urls=pending_pr_urls,
             accepted_pr_urls=accepted_pr_urls,
         )
-    sendable = redact_records(elide_oversized_tool_results(records))
+    sendable = redact_once(elide_oversized_tool_results(records))
     if not sendable:
         # Nothing to send. Empty is normal for a rollout with no user turns
         # yet — but records>0 with sendable==0 means EVERYTHING redacted
@@ -472,7 +476,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _save_state(sid, rollout_size=size, fail_streak=0)
         return
 
-    url, bearer = await asyncio.to_thread(resolve_bearer)
+    url, bearer = await capture_async.blocking(resolve_bearer)
     if not bearer:
         _log("no usable credential — skipping (run /memhub:login)")
         # Local auth gap, not a server failure — clear any failure run rather
@@ -481,7 +485,8 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
                     last_error_at=time.time(), fail_streak=0)
         return
     env = env_for_url(url)
-    session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
+    session = capture_context.session(url, bearer, timeout=min(FLUSH_TIMEOUT_S / 2,
+                                      capture_context.time_budget() or FLUSH_TIMEOUT_S))
 
     cwd = meta.get("cwd")
     # Both derive from cwd alone and neither feeds the other, so they run
@@ -492,7 +497,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         try:
             room, namespace = await asyncio.gather(
                 resolve_repo_brain(session, cwd, env),
-                asyncio.to_thread(_git_remote_basename, cwd),
+                capture_async.blocking(_git_remote_basename, cwd),
             )
         except Exception as e:  # noqa: BLE001
             # resolve_repo_brain is documented never to raise — belt-and-
@@ -525,7 +530,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         "messages": sendable,
         "conversation_id": f"codex-{sid}",
         "source_platform": codex_reader.HOST,
-        **capture_context.identity(sid, lambda: codex_reader.session_metadata(rollout)),
+        **capture_context.identity(sid, lambda: codex_reader.session_metadata(rollout), include_cloud=True),
         "flush": "now",
     }
     if room:
@@ -552,41 +557,32 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         # matches nothing and ships in the clear. Verified both ways.
         arguments["title"] = redact_text(title.strip())[:200]
 
-    try:
-        res = await session.call_tool("import_conversation",
-                                      arguments=arguments)
-    except mcp_http.McpRateLimited as e:
-        _log(f"rate limited: {e}")
-        _note_failure(sid, "rate_limited")
-        return
-    except mcp_http.McpError as e:
-        _log(f"import failed: {e}")
-        _note_failure(sid, f"mcp_error: {str(e)[:80]}")
-        return
+    payloads = [part[start:start + 2000] for part in make_slices(sendable)
+                for start in range(0, len(part), 2000)]
+    for batch in payloads:
+        batch_args = {**arguments, "messages": batch}
+        try:
+            res = await capture_context.import_conversation(session, batch_args)
+        except mcp_http.McpRateLimited as e:
+            _log(f"rate limited: {e}")
+            _note_failure(sid, "rate_limited")
+            return
+        except mcp_http.McpError as e:
+            _log(f"import failed: {e}")
+            _note_failure(sid, f"mcp_error: {str(e)[:80]}")
+            return
+        verdict = _verdict(res, f"codex-{sid}")
+        if verdict == "unsupported":
+            _log("server does not report ack_through — capture deferred for this destination")
+            _save_state(sid, unsupported=True, unsupported_at=time.time(), fail_streak=0)
+            return
+        ack = mcp_http.ack_of(res, f"codex-{sid}")
+        if verdict != "ok" or not capture_context.acknowledges(ack or {}, f"codex-{sid}", batch):
+            _note_failure(sid, "unconfirmed_import")
+            return
+        pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge_confirmed_import(
+            pending_pr_urls, accepted_pr_urls, ack)
 
-    # A returned call is NOT a persisted call — see _persisted. Advancing the
-    # byte watermark on a 200-with-nothing-stored reply skips that span
-    # forever, and on a session's last flush there is no later event to
-    # re-send it.
-    verdict = _verdict(res, f"codex-{sid}")
-    if verdict == "unsupported":
-        _log("server does not report ack_through — per-event flush is "
-             "dormant for this session; run /memhub:import-session to "
-             "capture it, or upgrade the server")
-        _save_state(sid, unsupported=True, unsupported_at=time.time(),
-                    fail_streak=0)
-        return
-    if verdict != "ok":
-        _note_failure(sid, "unconfirmed_import")
-        return
-
-    ack = mcp_http.ack_of(res, f"codex-{sid}")
-    reconciled = pr_provenance.acknowledge_confirmed_import(
-        pending_pr_urls,
-        accepted_pr_urls,
-        ack,
-    )
-    pending_pr_urls, accepted_pr_urls = reconciled
     if pending_pr_urls:
         # The transcript committed, but its optional URL write did not. Hold
         # the byte watermark so the next Stop can retry the same deduplicated
@@ -606,14 +602,10 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
-@capture_context.entrypoint
-def main() -> int:
+def _capture_sink(payload: dict) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-        capture_context.observe(payload)
-    except json.JSONDecodeError:
-        payload = {}
+    started = time.monotonic()
+    capture_context.observe(payload)
 
     rollout, sid = locate_rollout(payload)
     if rollout is None or not sid:
@@ -636,14 +628,18 @@ def main() -> int:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
-        return _flush_locked(event, payload, sid, rollout, size)
+        budget = capture_context.time_budget()
+        remaining = None if budget is None else max(0.0, budget - (time.monotonic() - started))
+        return _flush_locked(event, payload, sid, rollout, size, timeout=remaining)
     finally:
         os.close(lock_fd)  # releases the flock
 
 
 def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
-                  size: int) -> int:
+                  size: int, *, timeout: float | None = None) -> int:
     """The gated flush, run while this session's flock is held."""
+    if timeout is not None and timeout <= 0:
+        return 0
     state = _read_state(sid)
     if not should_flush(event, payload, state, size):
         return 0
@@ -666,12 +662,33 @@ def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
 
     try:
         asyncio.run(asyncio.wait_for(_flush(sid, rollout, size),
-                                     timeout=FLUSH_TIMEOUT_S))
+                                     timeout=FLUSH_TIMEOUT_S if timeout is None else timeout))
     except Exception as e:
         # Timeouts included: record the stamp so the cooldown applies to a
         # slow upload too, not just to server-reported errors.
         _log(f"{event}: flush error: {e}")
         _note_failure(sid, f"flush_error: {type(e).__name__}")
+    return 0
+
+
+def _run_sink(payload: dict) -> int:
+    try:
+        return _capture_sink(payload)
+    except Exception as error:
+        _log(f"destination capture deferred ({type(error).__name__})")
+    return 0
+
+
+def main() -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        token = _REDACTION_CACHE.set({"items": {}, "bytes": 0})
+        try:
+            capture_context.deliver(payload, _run_sink, FLUSH_TIMEOUT_S)
+        finally:
+            _REDACTION_CACHE.reset(token)
+    except Exception as error:
+        _log(f"capture deferred ({type(error).__name__})")
     return 0
 
 

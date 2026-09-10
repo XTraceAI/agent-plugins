@@ -184,9 +184,8 @@ shared Cursor pins and separate capture/cloud-service health.
 
 Each delivery freezes its selected destination for authentication, state,
 room routing and async work. Empty selection skips delivery. Claude per-turn and SessionEnd/commit/PR
-backstop capture support multiple active destinations. Codex and Cursor still
-reject multiple names until their corresponding
-delivery paths support independent progress.
+backstop capture and Codex support multiple active destinations. Cursor still
+requires one destination until its delivery path supports independent progress.
 The installed endpoint keeps its existing room-cache namespace. Other remote
 endpoints use a digest of their complete URL, so one server cannot read or
 overwrite another server's cached room ID. Loopback never resolves cloud rooms.
@@ -208,9 +207,7 @@ this change supports one selected destination, not concurrent fan-out.
 Literal loopback capture skips cloud room resolution and adds native session ID
 plus an observed raw surface when available. Claude reads explicit `source_surface`
 or `entrypoint`; Codex reads native `originator`; Cursor reads explicit metadata
-or its recognized native source location. Missing surfaces remain omitted. Older
-cloud envelopes stay unchanged for the single-destination Codex and
-Cursor paths. Canonical host-prefixed conversation IDs and record UUIDs retain
+or its recognized native source location. Missing surfaces remain omitted. The single-destination Cursor path retains its existing cloud envelope. Canonical host-prefixed conversation IDs and record UUIDs retain
 the existing reader convention.
 
 Capture health reads failures only from the selected destination. A success at
@@ -289,3 +286,30 @@ this never advances the separate per-turn cursor.
 Run `python3 tests/backstop_sinks_test.py` for dual delivery, independent cloud
 failure/recovery, replay, provenance, old-cloud compatibility, missing surface,
 slow response deadlines, bounded record batches and concurrent backstop locks.
+
+
+### Codex delivery to multiple destinations
+
+Codex Stop and milestone hooks use the shared frozen destination list. Each
+endpoint has its own rollout-size watermark, lock, cooldown, unsupported-server
+state and pending PR provenance. Only the unchanged installed cloud adopts the
+legacy flat state file. A held lock or local state-write failure cannot abort
+another destination's capture.
+
+The whole invocation shares a 240-second budget, reserving time per destination
+with loopback first. Lock waits consume that destination's allocation; transport,
+authentication and repository lookup cannot hold the process open past its wait.
+Whole-rollout imports keep the existing canonical reader and redaction. Batches
+contain at most 2,000 records and retain byte-sized slices. Every batch must
+confirm the same conversation and its final record before the rollout watermark
+advances; a failed later batch leaves the previous watermark for safe replay.
+
+`conversation_id` remains `codex-<native_id>`, `native_session_id` remains native,
+and an observed originator is forwarded unchanged as `source_surface`. Missing
+originator metadata remains unknown. One explicit old-cloud optional-field
+rejection permits a compatibility retry without changing the local envelope.
+Canonical usage deltas and record UUIDs match the existing Codex reader.
+
+Run `python3 tests/codex_sinks_test.py` for independent failure and recovery,
+per-destination dormancy, native identity and usage parity, old-cloud fallback,
+legacy state ownership, partial-batch retry, lock deadlines and write failures.

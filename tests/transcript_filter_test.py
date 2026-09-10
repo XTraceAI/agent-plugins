@@ -417,7 +417,7 @@ for script in ("flush_turn.py", "flush_session.py", "import_session.py",
     # nested — redact_records( opens before the elide call with no paren
     # closing between them, so elide is its argument; or sequential — a
     # redact_records( call follows the elide line.
-    redactors = ("redact_records(", "_redact_once(")
+    redactors = ("redact_records(", "_redact_once(", "redact_once(")
     ordered = False
     for redactor in redactors:
         wrap = body.rfind(redactor, 0, e)

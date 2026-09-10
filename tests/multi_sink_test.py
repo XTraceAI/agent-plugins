@@ -53,7 +53,7 @@ def receiver(label, order):
                       "records_new": len(args.get("messages", [])), "pending": 0}
             if controls["ack"]:
                 result["ack_through"] = (args.get("messages") or [{}])[-1].get("uuid")
-            if controls["wrong_ack"]:
+            if controls["wrong_ack"] or controls.get("wrong_ack_at") == len(requests):
                 result["ack_through"] = "a-different-batch"
             error = controls["error"]
             if controls["reject_extensions"] and "native_session_id" in args:
