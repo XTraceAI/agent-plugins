@@ -106,6 +106,8 @@ Cursor usage and timestamp suites continue to cover cumulative usage,
 deduplication and unobserved usage. No network or MCP import is needed by the
 reader CLI; subprocess tests reject both.
 
+Cursor `--session latest` prepares only the resolved native UUID after counting same-ID copies. Invalid metadata or state from an unrelated UUID cannot fail a healthy selected export; whole-host exports still report those damaged sessions.
+
 ## Capture destination API
 
 `plugins/memhub/scripts/sinks.py` provides a read-only destination resolver for
@@ -179,6 +181,13 @@ its refresh token to the installed backend's authorization server.
 A trailing DNS dot remains part of the URL host, so `https://example.test`
 and `https://example.test.` require their own credentials even if DNS resolves
 them to the same address ([URL Standard](https://url.spec.whatwg.org/#host-equivalence)).
+
+Sink names cannot be Windows device basenames such as `CON` or `COM1`,
+regardless of platform, because they also identify capture-state directories.
+
+Numeric IPv4 capture endpoints use canonical dotted-decimal addresses. Shortened,
+octal, hexadecimal and trailing-dot numeric aliases are rejected before credential
+lookup; DNS names and valid IPv6 literals keep their existing behavior.
 
 File-based capture selection does not change `default_url()`, unqualified
 `resolve_bearer()` or `resolve_url_and_auth()`. Login, recall, brain overview and
