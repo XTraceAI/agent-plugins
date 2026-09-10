@@ -207,7 +207,7 @@ def acknowledges(out, conversation_id, records, *, require_durable=True):
     ids = [record.get("uuid") for record in records
            if isinstance(record, dict) and record.get("uuid")]
     ack = out["ack_through"]
-    if ids and ack == ids[-1]:
+    if ids and len(ids) == len(records) and ack == ids[-1]:
         return True
     dropped = out.get("records_dropped")
     received = out.get("messages_received")

@@ -354,6 +354,17 @@ def test_acknowledgements_account_for_explicit_drops_without_accepting_a_wrong_b
     assert not capture_context.acknowledges({**all_dropped,"records_dropped":True},SID,[{},{}])
 
 
+def test_uuid_less_records_require_complete_drop_accounting():
+    records=[{"uuid":"accepted"},{"type":"user","message":{"content":"synthetic"}}]
+    ack={"conversation_id":SID,"ack_through":"accepted"}
+    for response in [ack,{**ack,"records_dropped":1},{**ack,"messages_received":2,"records_dropped":0},
+                     {**ack,"messages_received":1,"records_dropped":1}]:
+        assert not capture_context.acknowledges(response,SID,records),response
+    assert capture_context.acknowledges({**ack,"messages_received":2,"records_dropped":1},SID,records)
+    # A UUID-less earlier record also requires accounting despite a final UUID.
+    assert not capture_context.acknowledges(ack,SID,list(reversed(records)))
+
+
 def test_partial_ack_and_insufficient_drop_count_leave_the_destination_cursor_pinned():
     with tempfile.TemporaryDirectory() as td,receiver("local",[]) as local,receiver("cloud",[]) as cloud:
         home=Path(td);data=payload(home,3);configure(home,local[0]);cloud[2]["partial_ack"]=True
