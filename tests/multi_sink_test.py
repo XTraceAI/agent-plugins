@@ -62,6 +62,9 @@ def receiver(label, order):
             if controls["wrong_ack"]:
                 result["ack_through"] = "a-different-batch"
             error = controls["error"]
+            if controls.get("require_message") and (len(args.get("messages", [])) > 2000 or
+                    not any(isinstance(row.get("message"), dict) for row in args.get("messages", []))):
+                error = "invalid message batch"
             if controls["reject_extensions"] and "native_session_id" in args:
                 error = "unexpected keyword argument 'native_session_id'"
             tool_result = ({"isError": True, "content": [{"type": "text", "text": error}]}
@@ -75,7 +78,7 @@ def receiver(label, order):
             body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": tool_result}).encode()
             if controls["release"] is not None:
                 controls["release"].wait(3)
-            self.send_response(controls["status"])
+            self.send_response(500 if controls.get("fail_at") == len(requests) else controls["status"])
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -232,11 +235,14 @@ def test_legacy_cloud_cursor_and_per_sink_lock_dormancy():
             invoke(home,cloud[0],data,script="turn_flush_prefilter.py")
             invoke(home,cloud[0],data)
             assert len(local[1]) == 2 and not cloud[1]
+        (target/f"{SID}.json").write_text(json.dumps({"unsupported":True,"offset":0}))
+        invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=0)
         cloud[2]["ack"]=False;invoke(home,cloud[0],data)
-        assert state(home,"cloud",local[0])["unsupported"]
+        assert not state(home,"cloud",local[0])["unsupported"]
+        assert state(home,"cloud",local[0])["last_error"]=="unrecognized_response"
         append(Path(data["transcript_path"]),2);invoke(home,cloud[0],data)
-        assert len(local[1]) == 3 and len(cloud[1]) == 1
-        invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=1)
+        assert len(local[1]) == 3 and len(cloud[1]) == 2
+        invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=0)
 
 
 def test_old_cloud_extension_fallback_does_not_change_local_projection():
@@ -394,6 +400,40 @@ def test_large_native_records_are_elided_without_stranding_later_turns():
             assert len(json.dumps(large))<3_500_000 and "elided" in json.dumps(large)
             assert any(r["uuid"]=="record-99" for r in received)
             assert state(home,"local",local[0])["offset"]==path.stat().st_size
+
+
+def test_attachment_prefixes_replay_native_context_without_skipping_offsets():
+    for count,size,message_size in [(1,2_000_000,2_000_000),(2005,10,10)]:
+        with tempfile.TemporaryDirectory() as td,receiver("local",[]) as local,receiver("cloud",[]) as cloud:
+            home=Path(td);data=payload(home,count=0);path=Path(data["transcript_path"])
+            configure(home,local[0],active=["local"]);local[2]["require_message"]=True
+            with path.open("a") as output:
+                for index in range(count):
+                    output.write(json.dumps({"type":"attachment","uuid":f"attachment-{index}",
+                                             "attachment":{"content":"x"*size}})+"\n")
+            invoke(home,cloud[0],data)
+            assert not local[1] and state(home,"local",local[0]).get("offset",0)==0
+            append(path,1,content="y"*message_size);append(path,2)
+            local[2]["fail_at"]=2;invoke(home,cloud[0],data)
+            committed=state(home,"local",local[0])["offset"]
+            assert 0<committed<path.stat().st_size
+            local[2].pop("fail_at");invoke(home,cloud[0],data)
+            batches=routing.imports(local[1])
+            assert all(len(batch["messages"])<=2000 and any("message" in row for row in batch["messages"]) for batch in batches)
+            seen={row["uuid"] for batch in batches for row in batch["messages"]}
+            assert seen=={f"attachment-{i}" for i in range(count)}|{"record-1","record-2"}
+            assert sum(row["uuid"]=="record-1" for batch in batches for row in batch["messages"])>1
+            assert state(home,"local",local[0])["offset"]==path.stat().st_size
+
+
+def test_single_destination_keeps_legacy_backstop_dormancy():
+    with tempfile.TemporaryDirectory() as td,receiver("local",[]) as local,receiver("cloud",[]) as cloud:
+        home=Path(td);data=payload(home);configure(home,local[0],active=["cloud"])
+        cloud[2]["ack"]=False;invoke(home,cloud[0],data)
+        assert state(home,"cloud",local[0])["unsupported"]
+        append(Path(data["transcript_path"]),1);invoke(home,cloud[0],data)
+        assert len(cloud[1])==1
+        invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=1)
 
 
 if __name__ == "__main__":

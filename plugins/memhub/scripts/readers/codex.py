@@ -431,7 +431,8 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=Fa
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or (title_index.get(session_id) if title_index is not None else
+                   or (title_index(session_id) if callable(title_index) else
+                       title_index.get(session_id) if title_index is not None else
                        _sidecar_thread_name(session_id, strict_utf8=strict_utf8, strict_json=strict_json)))
     if thread_name:
         return thread_name
