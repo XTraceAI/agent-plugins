@@ -157,13 +157,14 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return normalize_usage(raw)
 
 
-def _read_meta_json(session_dir: Path, *, strict_json=False) -> dict | None:
+def _read_meta_json(session_dir: Path, *, strict_json=False, strict_utf8=False) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        value = load_json(p.read_text(encoding="utf-8"), strict=strict_json)
+        errors = "replace" if strict_json and not strict_utf8 else "strict"
+        value = load_json(p.read_text(encoding="utf-8", errors=errors), strict=strict_json)
         return value if isinstance(value, dict) else None
-    except (OSError, ValueError):
-        if strict_json:
+    except (OSError, ValueError) as error:
+        if strict_json or (strict_utf8 and isinstance(error, UnicodeError)):
             raise
         return None
 
@@ -357,6 +358,10 @@ def _validate_message(message):
     role = message["role"]
     if role == "tool" and not isinstance(content, list):
         raise ValueError("Cursor tool message has invalid result blocks")
+    if role == "user" and isinstance(content, list):
+        if any(block.get("type") != "text" or not isinstance(block.get("text"), str)
+               for block in content):
+            raise ValueError("Cursor user message requires text blocks")
     if role not in ("assistant", "tool") or isinstance(content, str):
         return
     for block in content:
@@ -696,7 +701,7 @@ def to_canonical(path, *, session_id: str | None = None,
             created_ts=created_ts)
 
     session_dir = source.parent
-    mj = _read_meta_json(session_dir, strict_json=strict_json) or {}
+    mj = _read_meta_json(session_dir, strict_json=strict_json, strict_utf8=strict_utf8) or {}
     version = mj.get("schemaVersion")
     if version != _SCHEMA_VERSION:
         raise ValueError(
