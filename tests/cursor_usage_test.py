@@ -187,7 +187,7 @@ def test_hook_usage_is_exact_and_aborts_remain_unmeasured():
     print("PASS test_hook_usage_is_exact_and_aborts_remain_unmeasured")
 
 
-def test_usage_state_refresh_survives_bounded_eviction_and_bad_records():
+def test_usage_state_refresh_preserves_all_observed_records_and_rejects_bad_records():
     usage = {
         "input_tokens": 1, "output_tokens": 2,
         "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4,
@@ -200,7 +200,8 @@ def test_usage_state_refresh_survives_bounded_eviction_and_bad_records():
     }
     refreshed = cursor_flush._usage_events_with(
         {"usage_events": oversized}, GENERATION, "wrong-late-target", usage)
-    assert len(refreshed) == 512
+    assert len(refreshed) == 513
+    assert all(refreshed[key] == value for key, value in oversized.items() if key != GENERATION)
     assert list(refreshed)[-1] == GENERATION
     assert refreshed[GENERATION]["target_uuid"] == "active"
 
@@ -208,7 +209,7 @@ def test_usage_state_refresh_survives_bounded_eviction_and_bad_records():
     assert cursor_flush._apply_usage(malformed, {
         GENERATION: {"target_uuid": "missing-message", "usage": usage},
     }) == set()
-    print("PASS test_usage_state_refresh_survives_bounded_eviction_and_bad_records")
+    print("PASS test_usage_state_refresh_preserves_all_observed_records_and_rejects_bad_records")
 
 
 def test_transcript_gate_deduplicates_revision_and_usage_generation():

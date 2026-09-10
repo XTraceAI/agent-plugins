@@ -205,6 +205,33 @@ def test_cursor_network_wait_does_not_hold_shared_observations_or_another_destin
         assert state(home,'cloud',local[0])['sent_usage_generations']==[GEN,GEN2]
 
 
+def test_delayed_destination_recovers_usage_older_than_five_hundred_twelve_generations():
+    import uuid
+    with tempfile.TemporaryDirectory() as td,cases.receiver('local',[]) as local,cases.receiver('cloud',[]) as cloud:
+        home=Path(td);payload,path=source(home);cases.configure(home,local[0]);cloud[2]['status']=500
+        invoke(home,cloud[0],measured(payload));saved=json.loads(shared_path(home).read_text())
+        original=saved['usage_events'][GEN];usage=original['usage']
+        for index in range(512):append(path,index)
+        records,_=cursor.to_canonical(path,session_id=SID)
+        targets=[row['uuid'] for row in records if row['type']=='assistant'][-512:]
+        # Persist the same observation transitions without starting 512
+        # identical child processes; both real delivery paths read this state.
+        for index,target in enumerate(targets):
+            generation=str(uuid.uuid5(uuid.NAMESPACE_URL,f'synthetic-generation-{index}'))
+            saved['usage_events']=cursor_flush._usage_events_with(saved,generation,target,usage)
+        assert len(saved['usage_events'])==513 and saved['usage_events'][GEN]==original
+        shared_path(home).write_text(json.dumps(saved));invoke(home,cloud[0],payload)
+        assert len(state(home,'local',local[0])['sent_usage_generations'])==513
+        assert not state(home,'cloud',local[0]).get('sent_usage_generations')
+        cloud[2]['status']=200;invoke(home,cloud[0],payload)
+        received=cases.routing.imports(cloud[1])[-1]['messages']
+        measured_rows=[row for row in received if row.get('message',{}).get('usage')]
+        assert len(measured_rows)==513 and sum(row['message']['usage']['output_tokens'] for row in measured_rows)==513*48
+        assert next(row for row in received if row['uuid']==original['target_uuid'])['message']['usage']==usage
+        assert state(home,'local',local[0])['sent_usage_generations']==state(home,'cloud',local[0])['sent_usage_generations']
+        assert json.loads(shared_path(home).read_text())['usage_events'][GEN]==original
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
