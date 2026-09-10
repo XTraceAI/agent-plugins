@@ -369,7 +369,7 @@ def should_flush(event: str, payload: dict, state: dict, size: int) -> bool:
 # network access, hooksPath redirects hooks). The rollout's cwd is
 # semi-trusted, so those are disarmed explicitly rather than relying on
 # `remote get-url` not happening to reach them today.
-def _verdict(res, expected_conversation_id: str | None = None) -> str:
+def _verdict(res, expected_conversation_id: str | None = None, *, records=None) -> str:
     """``"ok"`` | ``"unconfirmed"`` | ``"unsupported"`` for an import reply.
 
     Identical to cursor_flush's, deliberately: a returned call is not a
@@ -385,7 +385,10 @@ def _verdict(res, expected_conversation_id: str | None = None) -> str:
     if getattr(res, "isError", False):
         _log(f"server rejected the import: {mcp_http.texts_of(res)[:1]}")
         return "unconfirmed"
-    ack = mcp_http.ack_of(res, expected_conversation_id)
+    confirms = (lambda candidate: capture_context.acknowledges(candidate, expected_conversation_id, records)) if records is not None else None
+    ack = mcp_http.ack_of(res, expected_conversation_id, prefer=confirms)
+    if ack is not None and confirms is not None and confirms(ack):
+        return "ok"
     if ack is None:
         _log("import response unrecognized — holding the watermark")
         return "unconfirmed"
@@ -571,12 +574,13 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             _log(f"import failed: {e}")
             _note_failure(sid, f"mcp_error: {str(e)[:80]}")
             return
-        verdict = _verdict(res, f"codex-{sid}")
+        verdict = _verdict(res, f"codex-{sid}", records=batch)
         if verdict == "unsupported":
             _log("server does not report ack_through — capture deferred for this destination")
             _save_state(sid, unsupported=True, unsupported_at=time.time(), fail_streak=0)
             return
-        ack = mcp_http.ack_of(res, f"codex-{sid}")
+        ack = mcp_http.ack_of(res, f"codex-{sid}", prefer=lambda candidate:
+                             capture_context.acknowledges(candidate, f"codex-{sid}", batch))
         if verdict != "ok" or not capture_context.acknowledges(ack or {}, f"codex-{sid}", batch):
             _note_failure(sid, "unconfirmed_import")
             return

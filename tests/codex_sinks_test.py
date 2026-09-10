@@ -117,7 +117,9 @@ def test_codex_batching_and_wrong_ack_hold_the_whole_rollout_watermark():
         for index in range(2000):append(path,str(index))
         local[2]["wrong_ack_at"]=2;invoke(home,cloud[0],payload)
         assert not state(home,"local",local[0]).get("rollout_size")
-        local[2].pop("wrong_ack_at");local[1].clear();invoke(home,cloud[0],payload)
+        local[2].pop("wrong_ack_at");local[1].clear()
+        local[2].update(all_dropped_at=1,nested_ack=True)
+        invoke(home,cloud[0],payload)
         lengths=[len(batch["messages"]) for batch in cases.routing.imports(local[1])]
         assert lengths==[2000,5],lengths
         assert state(home,"local",local[0])["rollout_size"]==path.stat().st_size
