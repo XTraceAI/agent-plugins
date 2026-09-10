@@ -56,6 +56,11 @@ def _token(value) -> str | None:
     return value
 
 
+def _origin(url: str) -> tuple[str, str, int]:
+    parts = urlsplit(_endpoint(url))
+    return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+
+
 @dataclass(frozen=True)
 class Sink:
     name: str
@@ -172,9 +177,7 @@ def resolve_capture_auth(sink: Sink, *, refresh: bool = True) -> tuple[str, str 
     # explicit sink can use its own stored PAK/current token, but must not send
     # its refresh token to the installed backend's different authorization server.
     try:
-        installed = urlsplit(_memhub_auth._plugin_mcp_config()["url"])
-        selected = urlsplit(sink.url)
-        same_backend = (installed.scheme, installed.netloc) == (selected.scheme, selected.netloc)
+        same_backend = _origin(_memhub_auth._plugin_mcp_config()["url"]) == _origin(sink.url)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
         same_backend = False
     return _memhub_auth.resolve_bearer(sink.url, refresh=refresh and same_backend)

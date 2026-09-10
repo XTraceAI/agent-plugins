@@ -339,6 +339,34 @@ os._exit(0)
                 file.chmod(0o600)
 
 
+def test_hot_rollback_journal_recovers_only_the_private_snapshot():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        path = fixtures._make_cursor_store(home / ".cursor/chats")
+        expected, _ = cursor.to_canonical(path)
+        script = '''import os,sqlite3,sys
+con=sqlite3.connect(sys.argv[1])
+con.execute("PRAGMA journal_mode=DELETE")
+con.execute("PRAGMA cache_size=2")
+con.execute("BEGIN IMMEDIATE")
+con.execute("DELETE FROM blobs")
+for number in range(200):
+    con.execute("INSERT INTO blobs(id,data) VALUES (?,?)",(str(number),b"uncommitted"*1000))
+os._exit(0)
+'''
+        result = subprocess.run([sys.executable, "-c", script, str(path)],
+                                env={"HOME": td, "USERPROFILE": td}, capture_output=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+        journal = path.with_name("store.db-journal")
+        assert journal.exists() and journal.read_bytes()[:8] != b"\0" * 8
+        before = {file.name: file.read_bytes() for file in path.parent.iterdir()}
+        result, rows = run(home, "cursor")
+        assert result.returncode == 0 and rows[1:] == expected, result.stderr
+        again, replay = run(home, "cursor")
+        assert again.returncode == 0 and replay == rows
+        assert {file.name: file.read_bytes() for file in path.parent.iterdir()} == before
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
