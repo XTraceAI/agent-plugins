@@ -1957,34 +1957,45 @@ def armed_lane_checks() -> None:
             check(f"session-armed: no self-discharge when the {why}",
                   "[fetch-first]" in c, f"{bad!r} -> {c}")
 
-        # A required command that is an ARGUMENT, not a command. Everywhere
-        # else a regex over a whole segment only over-fires; on the two paths
-        # that let a call OUT of a gate it under-gates, which is the direction
-        # that must not happen. Quoting is irrelevant — an argument does not
-        # have to be quoted to be an argument — so the pattern has to match at
-        # the segment's COMMAND position.
+        # A required command that is a QUOTED argument, or sits in a comment,
+        # is not a command. The hook understands shell SYNTAX only — quotes,
+        # comments, separators — so these are the two mention shapes it can
+        # tell from a run, and on the two paths that let a call OUT of a gate
+        # (self-discharge and the receipt) they must not.
         for mention in ("echo 'git fetch' && git log origin/main -5",
                         'grep "git fetch" setup.sh && git log origin/main -5',
-                        "echo git fetch && git log origin/main -5",
                         "printf 'git fetch\\n' && git log origin/main -5"):
             sess = "q" + str(abs(hash(mention)) % 99999)
             start(sess)
             c = pre(sess, mention)
-            check("session-armed: a mention is not a command and does not "
+            check("session-armed: a quoted mention does not "
                   "excuse the gate", "[fetch-first]" in c, f"{mention!r} -> {c}")
 
-        for mention in ("echo 'git fetch --all'", "echo git fetch --all"):
+        for mention in ("echo 'git fetch --all'", "git commit -m 'git fetch --all'",
+                        "true # git fetch --all"):
             sess = "r" + str(abs(hash(mention)) % 99999)
             start(sess)
             post(sess, mention)
             c = pre(sess, "git log origin/main -5")
-            check("session-armed: a mention is not a receipt either",
-                  "[fetch-first]" in c, f"{mention!r} -> {c}")
+            check("session-armed: a quoted or commented mention is not a "
+                  "receipt either", "[fetch-first]" in c, f"{mention!r} -> {c}")
 
-        # A runner is the exception: `uv run … pytest` and `sudo git fetch`
-        # put the real command in an argument by construction. This is the
-        # shape the SHIPPED tests-before-push rule is written against, so
-        # anchoring without it would have broken a live rule.
+        # ACCEPTED RESIDUAL, pinned so a change to it is deliberate: an
+        # UNQUOTED mention discharges. Telling `echo git fetch` from `sudo git
+        # fetch` needs to know what `echo` does, and the hook knows no
+        # commands — the list it used to carry refused every wrapper not on
+        # it (`timeout`, `caffeinate`, `.venv/bin/…`), and a missed receipt
+        # blocks someone who complied.
+        start("resid")
+        post("resid", "echo git fetch --all")
+        c = pre("resid", "git log origin/main -5")
+        check("session-armed: (accepted residual) an unquoted mention "
+              "discharges — the hook knows syntax, not commands", c == "", c)
+
+        # Any wrapper discharges: `uv run … pytest`, `sudo git fetch`,
+        # `timeout 300 pytest` put the real command in an argument, and the
+        # hook does not need to know the wrapper to see it. This is the shape
+        # the SHIPPED tests-before-push rule is written against.
         # An operator character inside a quoted argument is data, so a chain
         # carrying one is still an `&&`-only chain. Reading it as a separator
         # refused to see a required command that DID run and pass, and fired
@@ -2062,10 +2073,11 @@ def armed_lane_checks() -> None:
               str(rb_mod.receipt_segments("npm test -- --grep 'a|b'")))
         check("receipt: a REAL pipeline is still refused",
               rb_mod.receipt_segments("pytest | tail") == [])
-        # Found by auditing the wrapper lists against each other: a wrapper
-        # `_segment_target` knows must not be one `executes` refuses to see.
+        # Any wrapper — on `CMD_WRAPPERS` or not — is seen through, because
+        # `executes` reads syntax and carries no list of runners.
         for wrapped in ("doas git fetch --all", "builtin git fetch --all",
-                        "stdbuf -o0 git fetch --all"):
+                        "stdbuf -o0 git fetch --all", "timeout 300 git fetch --all",
+                        "caffeinate -i git fetch --all", "gtimeout 300 uv run git fetch"):
             check(f"receipt: {wrapped.split()[0]!r} still runs the fetch",
                   rb_mod.executes(wrapped, r"git\s+(fetch|pull)\b"), wrapped)
         # `command true # git fetch` runs only `true`. Reading the comment as
@@ -2093,20 +2105,27 @@ def armed_lane_checks() -> None:
         check("command_fires: quotes stay visible to a matcher — only comments go",
               rb_mod.command_fires(r"rm\s+-rf", 'echo "rm -rf /"', flags=0)
               and not rb_mod.command_fires(r"rm\s+-rf", "echo hi # rm -rf /", flags=0))
-        # `command`, `builtin` and `exec` have MODES: `command -v pytest`
-        # prints where pytest is and runs nothing, so `command -v pytest &&
-        # git push` was self-discharging a test obligation without testing.
-        # The rest of the runner list exists only to run what it is given, so
-        # a flag disqualifies only those three.
-        _rx = r"pytest|run_all\.py"
-        for introspect in ("command -v pytest", "command -V pytest", "exec -a x pytest"):
-            check(f"receipt: {introspect!r} runs nothing",
-                  not rb_mod.executes(introspect, _rx))
+        # `executes` is syntax-only: every unquoted, uncommented spelling of
+        # the required command discharges, whatever runs it. The wrappers
+        # here include ones no list would have carried.
+        _rx = r"\bpytest\b|run_all\.py"
         for really_runs in ("command pytest", "python3 -m pytest", "sudo -u bob pytest",
-                            "nice -n 5 pytest",
+                            "nice -n 5 pytest", ".venv/bin/pytest -x",
+                            "timeout 300 pytest", "gtimeout 300 uv run pytest",
+                            "caffeinate -i pytest", "./tests/run_all.py",
                             "uv run --with 'mcp<2' python tests/run_all.py"):
-            check(f"receipt: {really_runs[:28]!r} really runs it",
+            check(f"receipt: {really_runs[:28]!r} discharges",
                   rb_mod.executes(really_runs, _rx), really_runs)
+        # What still refuses is decided by `receipt_segments`, not by
+        # `executes`: a `||` tail, a pipeline, a backgrounded command, and a
+        # quoted mention. These are the shapes the exit status cannot vouch
+        # for, and they are refused on syntax alone.
+        for refused in ("make test || pytest", "ls | grep pytest", "pytest &",
+                        "git commit -m 'fix pytest flake'", "git log # ran pytest"):
+            segs = rb_mod.receipt_segments(refused)
+            check(f"receipt: {refused!r} is refused on syntax alone",
+                  not any(rb_mod.executes(p, _rx) for p in segs),
+                  f"{refused!r} -> segments {segs!r}")
         # Found by auditing `executes` against `_segment_target`: grouping is
         # not part of a command's name, and `(git fetch -q)` runs the fetch
         # and propagates its status, so it is as good a receipt as the bare
@@ -2126,15 +2145,17 @@ def armed_lane_checks() -> None:
         check("session-armed: a runner still discharges — the real command is "
               "its argument", c == "", c)
 
-        # ...but a runner handed INLINE CODE runs that, and the tokens after
-        # it are the program's own argv.
-        start("s11")
-        c = pre("s11", "python -c 'pass' git fetch && git log origin/main -5")
-        check("session-armed: `python -c … git fetch` runs no fetch and does "
-              "not excuse the gate", "[fetch-first]" in c, c)
-        post("s11", "python -c 'pass' git fetch")
-        c = pre("s11", "git log origin/main -5")
-        check("session-armed: nor is it a receipt", "[fetch-first]" in c, c)
+        # The same through the live post/pre lanes: a `||` tail, a pipe and a
+        # background `&` are refused by `receipt_segments`; a quoted mention
+        # by `unquoted`. No command knowledge is involved in any of them.
+        for refused in ("make test || git fetch --all", "ls | grep 'git fetch'",
+                        "git fetch --all & true"):
+            sess = "s11" + str(abs(hash(refused)) % 9999)
+            start(sess)
+            post(sess, refused)
+            c = pre(sess, "git log origin/main -5")
+            check("session-armed: refused on syntax alone",
+                  "[fetch-first]" in c, f"{refused!r} -> {c}")
 
         # SessionStart is NOT once per session: it fires again on resume, on
         # `/clear` and after a compaction, under the same session id. A plain

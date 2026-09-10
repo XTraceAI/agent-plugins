@@ -378,85 +378,41 @@ CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
 # `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
 # — `sudo cd x` cannot move this shell and `env cd x` fails outright.
 CD_WRAPPERS = frozenset({"command", "builtin"})
-_MODAL_RUNNERS = frozenset({"command", "builtin", "exec"})
 EXPANSION_RX = re.compile(r"[$`]")   # `$VAR`, `${…}`, `$(…)`, backticks
 CMD_PREFIXES = frozenset({"!", "if", "elif", "then", "else", "while", "until", "do"})
 BLOCK_END = frozenset({"fi", "done", "esac", "}", ";;"})
 COMPOUND = frozenset({"case", "select", "coproc"})
 
 
-_RUNNERS = frozenset({
-    "uv", "uvx", "python", "python3", "py", "node", "npm", "npx", "yarn", "pnpm",
-    "poetry", "pipenv", "pdm", "rye", "hatch", "tox", "make", "just", "task",
-    "bash", "sh", "zsh", "env", "sudo", "time", "nohup", "nice", "command",
-    "exec", "xargs", "cargo", "go", "docker", "podman", "poe",
-    "doas", "builtin", "setsid", "stdbuf", "sh", "bash", "zsh", "dash", "ksh",
-})
-
-
-# A runner given code inline runs THAT, and everything after is the program's
-# own argv. One general shape, not a per-tool grammar.
-_INLINE_CODE_FLAGS = frozenset({"-c", "--command", "-e", "--eval", "--exec"})
-
 
 def executes(segment, rx):
-    """Does this segment RUN the command `rx` describes, or merely mention it?
+    """Does this segment run the command `rx` describes?
 
-    `re.search` over a whole segment cannot tell the two apart, and on the
-    paths that let a call OUT of a gate that is the difference between a
-    receipt and a bypass: `echo git fetch && git log origin/main` and `grep
-    'git fetch' setup.sh && git log origin/main` both read the stale ref with
-    the obligation cleared. Blanking quotes closed the second and not the
-    first — the argument does not have to be quoted to be an argument.
+    SYNTAX ONLY. The hook understands shell syntax — quotes, comments,
+    `&&`/`||`/`;`/pipes/background — and nothing about what any command
+    DOES. So this blanks quoted spans and comments, drops leading `FOO=1`
+    assignments and grouping braces, and searches the rest. There is no list
+    of runners: `timeout 300 pytest`, `.venv/bin/pytest`, `caffeinate -i
+    pytest` and the next wrapper nobody thought of all discharge, because the
+    alternative — a list of commands known to run their argument — was wrong
+    for every wrapper not on it, and a missed receipt blocks someone who
+    complied.
 
-    So the pattern must match at the segment's COMMAND position: the start,
-    once leading `FOO=1` assignments are gone. The exception is a runner —
-    `uv run … pytest`, `sudo git fetch`, `make test` — where the real command
-    is an argument by construction, and there the pattern may match anywhere.
-    A wrapper not on that list simply does not discharge, which is an extra
-    gate rather than a missed one.
-
-    Except when the runner was handed INLINE CODE (`python -c …`, `bash -c …`,
-    `node -e …`): the tokens after that are the program's own `argv`, not a
-    command line, so `python -c 'pass' git fetch` runs no fetch at all.
-
-    KNOWN AND ACCEPTED RESIDUAL: this is not a shell parser, and a caller who
-    WANTS past a gate does not need one — `RULEBOOK_OVERRIDE=` is the
-    sanctioned way, and it is sanctioned precisely because it is RECORDED
-    (the same statement `Probes._named_base` makes about `--base`). What this
-    closes is the ACCIDENTAL bypass: `echo git fetch`, a grep for it, a commit
-    message quoting it. Teaching this function each runner's own argument
-    grammar — which token is `python -m`'s module, which is `npm run`'s
-    script — would be a per-tool parser that is wrong for the next tool, and
-    it would buy nothing against a deliberate bypass that has an approved
-    door already."""
+    KNOWN AND ACCEPTED RESIDUAL: an UNQUOTED mention discharges. `echo
+    pytest` clears a test obligation; `grep -n pytest README.md` clears it.
+    A quoted one does not (`echo 'git fetch'`, `git commit -m 'ran pytest'`),
+    and a comment does not. This is accepted because the obligation is
+    advisory — whether the run was SUFFICIENT (right tests, right args) was
+    never knowable here either, and a caller who wants past a gate has the
+    recorded `RULEBOOK_OVERRIDE=` door already. What the hook closes is the
+    accidental bypass a quoted string or a comment produces; an unquoted
+    `echo pytest` is not a shape anyone types by accident."""
     # Grouping is not part of a command's name — `(git fetch -q)` runs the
     # fetch and propagates its status, so it is as good a receipt as the bare
     # form.
     text = strip_leading_assignments(
         unquoted(segment or "").strip("(){} \t")).strip()
-    if not text:
-        return False
-    if re.match(rx, text):
-        return True
-    tokens = text.split()
-    head = os.path.basename(tokens[0]) if tokens else ""
-    if head not in _RUNNERS or any(t in _INLINE_CODE_FLAGS for t in tokens[1:]):
-        return False
-    # `command`, `builtin` and `exec` have MODES: `command -v pytest` prints
-    # where pytest is and runs nothing, so a successful `command -v pytest &&
-    # git push` was self-discharging a test obligation without testing. The
-    # rest of the list exists only to run what it is given — `sudo -u bob
-    # pytest`, `nice -n 5 pytest`, `python3 -m pytest` all really run it — so
-    # a flag disqualifies only the three that can mean something else.
-    #
-    # And only the token IMMEDIATELY after them, which is where their own
-    # options go. Scanning every token read `builtin git fetch --all` as
-    # flagged, when `--all` belongs to `git fetch`; the existing receipt test
-    # caught that.
-    if head in _MODAL_RUNNERS and tokens[1:2] and tokens[1].startswith("-"):
-        return False
-    return bool(re.search(rx, text))
+    return bool(text) and bool(re.search(rx, text))
 
 
 def self_discharging(shell, spec):
