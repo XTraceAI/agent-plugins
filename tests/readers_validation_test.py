@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -170,7 +171,11 @@ def test_strict_cursor_tree_rejects_missing_references_and_cycles_but_allows_sha
                     connection.execute("UPDATE meta SET value=?",(json.dumps(meta),))
                 else:
                     reference=root if damage=="cycle" else children[0]
-                    connection.execute("UPDATE blobs SET data=? WHERE id=?",(data+b"\x0a\x20"+bytes.fromhex(reference),root))
+                    updated=data+b"\x0a\x20"+bytes.fromhex(reference)
+                    identity=hashlib.sha256(updated).hexdigest() if damage=="shared" else root
+                    connection.execute("UPDATE blobs SET id=?,data=? WHERE id=?",(identity,updated,root))
+                    meta["latestRootBlobId"]=identity
+                    connection.execute("UPDATE meta SET value=?",(json.dumps(meta),))
             before=store.read_bytes()
             expected=cursor.to_canonical(store)
             if damage=="shared":
@@ -233,6 +238,22 @@ def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
                 identity=next(key for key,value in connection.execute("SELECT id,data FROM blobs")
                               if isinstance(value,bytes) and b'"role": "assistant"' in value)
                 connection.execute("UPDATE blobs SET data=? WHERE id=?",(json.dumps(message).encode(),identity))
+            before=store.read_bytes()
+            cursor.to_canonical(store)
+            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            assert store.read_bytes()==before
+
+
+def test_strict_cursor_hashes_reject_structurally_valid_modified_blobs():
+    for leaf in (True,False):
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            with sqlite3.connect(store) as connection:
+                identity,data=next((key,value) for key,value in connection.execute("SELECT id,data FROM blobs")
+                                   if value.startswith(b"{")==leaf)
+                changed=(json.dumps({"role":"assistant","content":"changed message"}).encode()
+                         if leaf else data+b"\x10\x01")
+                connection.execute("UPDATE blobs SET data=? WHERE id=?",(changed,identity))
             before=store.read_bytes()
             cursor.to_canonical(store)
             rejected(lambda:cursor.to_canonical(store,strict_json=True))
