@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import base64
 import json
+import hashlib
 import re
 import os
 import sys
@@ -577,6 +578,7 @@ def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
     """No network and no success inference from a constant local credential."""
     messages, causes = [], []
     if sink is not None:
+        endpoint = hashlib.sha256(sink.url.encode("utf-8")).hexdigest()[:24]
         _, bearer = sinks.resolve_capture_auth(sink, refresh=False)
         failures = [failure for family in (STATE_DIR, STATE_DIR.parent / "codexflush",
                                             STATE_DIR.parent / "cursorflush")
@@ -585,12 +587,12 @@ def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
         if not bearer and not _renewable_capture_credential(sink):
             messages.append(f"Capture destination '{sink.name}' has no usable credential. "
                             "Check its configuration or saved login.")
-            causes.append(f"capture:{sink.name}:auth")
+            causes.append(f"capture:{sink.name}:{endpoint}:auth")
         elif failure:
             reason = _REASONS.get(failure[0], _REASONS["error"])
             messages.append(f"Capture destination '{sink.name}': {reason}. "
                             "Its upload progress is retained for retry.")
-            causes.append(f"capture:{sink.name}:{failure[0]}")
+            causes.append(f"capture:{sink.name}:{endpoint}:{failure[0]}")
     if host:
         problem = _token_problem(host)
         if problem:
