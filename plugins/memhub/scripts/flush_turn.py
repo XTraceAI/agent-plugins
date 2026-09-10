@@ -138,7 +138,7 @@ def _log(msg: str) -> None:
 
 def _read_state(session_id: str) -> dict:
     try:
-        state = json.loads((capture_context.state_directory(STATE_DIR) / f"{session_id}.json").read_text(encoding="utf-8"))
+        state = json.loads((capture_context.state_directory(STATE_DIR) / f"{capture_context.session_file_key(session_id)}.json").read_text(encoding="utf-8"))
         return state if isinstance(state, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
@@ -180,7 +180,7 @@ def _save_state(session_id: str, **fields) -> None:
     #
     # 0600 by default: not a secret exactly, but it holds the session title, the
     # repo path and server error text, none of which needs to be world-readable.
-    atomic_write.publish(capture_context.state_directory(STATE_DIR) / f"{session_id}.json", json.dumps(state))
+    atomic_write.publish(capture_context.state_directory(STATE_DIR) / f"{capture_context.session_file_key(session_id)}.json", json.dumps(state))
 
 
 # Everything below exists because this hook is `async: true`, and Claude Code
@@ -236,7 +236,7 @@ def _acquire(session_id: str) -> int | None:
     exists to prevent. There is no such thing as a stale flock.
     """
     capture_context.state_directory(STATE_DIR).mkdir(parents=True, exist_ok=True)
-    fd = os.open(capture_context.state_directory(STATE_DIR) / f"{session_id}.lock",
+    fd = os.open(capture_context.state_directory(STATE_DIR) / f"{capture_context.session_file_key(session_id)}.lock",
                  os.O_CREAT | os.O_RDWR, 0o600)
     try:
         portable_lock.lock_exclusive(fd, blocking=False)
