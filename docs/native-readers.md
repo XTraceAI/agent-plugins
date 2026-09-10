@@ -7,11 +7,16 @@ that must distinguish a damaged source from complete coverage:
 records, metadata = reader.to_canonical(path, strict_utf8=True, strict_json=True)
 ```
 
-Strict reads reject invalid UTF-8 and malformed complete JSON rows. Cursor JSONL
+Strict reads reject invalid UTF-8, malformed complete JSON rows, non-standard
+JSON constants and numbers that overflow to a non-finite value. This includes
+opted-in title indexes, native store metadata and saved observations. Cursor JSONL
 rows must be objects, and recognized message roles need an object message body.
 An unfinished final JSON record remains deferred because native writers append
 their transcripts. Existing capture callers retain the default tolerant behavior.
 Canonical record IDs, usage normalization and timestamp rules are unchanged.
+Cursor assistant blocks must match supported text, reasoning and tool-call
+shapes; both native tool-call aliases retain their content and usage. Unknown
+blocks fail strict reads instead of silently dropping their content.
 
 `session_metadata(path)` returns native identity, raw observed surface, native
 start and repository metadata without deriving a title from a prompt. Missing
