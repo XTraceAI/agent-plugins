@@ -426,6 +426,12 @@ def executes(segment, rx):
     # form.
     text = strip_leading_assignments(
         unquoted(segment or "").strip("(){} \t")).strip()
+    # `!` inverts a pipeline's status: `! git fetch && git log origin/main`
+    # reaches the log only when the fetch FAILED, and the exit code of `!
+    # pytest` is green exactly when the tests were not. Still syntax, not
+    # command knowledge — a negated segment vouches for nothing.
+    if text.startswith("!"):
+        return False
     return bool(text) and bool(re.search(rx, text))
 
 

@@ -2082,6 +2082,27 @@ def armed_lane_checks() -> None:
               and rb_mod.receipt_segments("make lint && pytest;", whole_chain=True)
               == ["make lint", "pytest"],
               str((rb_mod.last_segment("pytest;"), rb_mod.receipt_segments("pytest -q; "))))
+        # `!` inverts the status: `! git fetch && git log origin/main` reaches
+        # the log only when the fetch FAILED, and `! pytest` exits 0 when the
+        # tests did not. A negated segment is no receipt and does not
+        # self-discharge.
+        _fetch_rx = r"git\s+(fetch|pull)\b"
+        check("receipt: a `!`-negated command is not a receipt",
+              not rb_mod.executes("! git fetch", _fetch_rx)
+              and not rb_mod.executes("( ! git fetch -q )", _fetch_rx)
+              and not rb_mod.executes("FOO=1 ! pytest -q", r"\bpytest\b")
+              and rb_mod.executes("git fetch -q", _fetch_rx))
+        check("receipt: ...and does not self-discharge the gated command after it",
+              not rb_mod.self_discharging(
+                  "! git fetch && git log origin/main",
+                  {"required_command_rx": _fetch_rx,
+                   "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
+                   "armed_by_events": ["session"]})
+              and rb_mod.self_discharging(
+                  "git fetch -q && git log origin/main",
+                  {"required_command_rx": _fetch_rx,
+                   "gated_command_rx": r"git\s+log\b[^\n]*\borigin/",
+                   "armed_by_events": ["session"]}))
         check("receipt: a trailing `&` is a background, not a terminator",
               rb_mod.receipt_segments("pytest &") == []
               and rb_mod.receipt_segments("pytest &", whole_chain=True) == [])
