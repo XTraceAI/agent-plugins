@@ -291,7 +291,8 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
                 if not seeking_message:
                     consumed = fh.tell()
                 continue
-            message = isinstance(record, dict) and isinstance(record.get("message"), dict)
+            message = (isinstance(record, dict) and isinstance(record.get("message"), dict)
+                       and bool(drop_command_wrappers([record])))
             if seeking_message:
                 if message:
                     records.append(record)
