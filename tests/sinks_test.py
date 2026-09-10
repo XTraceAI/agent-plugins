@@ -350,6 +350,17 @@ def test_reserved_windows_device_names_cannot_be_sink_directories():
             assert sinks.resolve_capture_sink().name==name
 
 
+def test_non_ascii_endpoint_paths_and_queries_reject_before_auth():
+    with isolated() as (_, config):
+        for url in ["https://cloud.example.test/mémoire", "https://cloud.example.test/mcp?name=é"]:
+            with patch.object(auth, "resolve_bearer", side_effect=AssertionError("no credential lookup")):
+                rejected(lambda:sinks.Sink("selected",url))
+        configured(config, entries=[{"name":"local","url":"https://cloud.example.test","mcp_path":"/mémoire"}])
+        rejected(sinks.resolve_capture_sink)
+        url="https://cloud.example.test/m%C3%A9moire?name=%C3%A9"
+        assert sinks.Sink("selected",url).url==url
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

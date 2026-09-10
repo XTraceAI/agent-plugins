@@ -38,3 +38,5 @@ rows, incomplete tails, byte decoding, saved observations, discovery errors and
 native metadata. Existing reader, usage and timestamp suites remain required.
 
 Strict Cursor validation also checks user text blocks in both store leaves and hook transcripts. Unsupported block kinds or non-string text reject the read. Store metadata honors JSON and UTF-8 strictness independently; JSON-only mode permits replacement-decoded text while UTF-8 strict mode rejects invalid bytes. Default capture behavior remains unchanged.
+
+Codex rollout/title-index and Claude transcript/working-directory probes split JSONL at byte-level LF/CR boundaries. Literal Unicode line separators inside JSON strings remain content. Cursor strict assistant text/reasoning blocks require a string text value; empty strings remain valid.
