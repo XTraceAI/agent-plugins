@@ -104,6 +104,34 @@ def encode(value: dict) -> str:
     return json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
 
 
+def historical_titles(reader, session_ids):
+    """Read the complete title index once, keeping only selected identities."""
+    found = {}
+    try:
+        handle = reader._SESSION_INDEX.open("rb")
+    except FileNotFoundError:
+        return found
+    with handle:
+        while raw := handle.readline(reader._INDEX_TAIL_BYTES + 1):
+            if len(raw) > reader._INDEX_TAIL_BYTES:
+                raise ValueError("Codex title index line exceeds its read bound")
+            text = raw.decode("utf-8")
+            if not text.strip():
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError:
+                if raw.endswith((b"\n", b"\r")):
+                    raise
+                break
+            if not isinstance(row, dict):
+                raise ValueError("Codex title index row is not an object")
+            sid, name = row.get("id"), row.get("thread_name")
+            if isinstance(sid, str) and sid in session_ids and isinstance(name, str) and name.strip():
+                found[sid] = reader._one_line(name)
+    return found
+
+
 @contextmanager
 def source_snapshot(path: Path, host: str):
     if host != "cursor" or path.name != "store.db":
@@ -225,6 +253,13 @@ def main(argv=None) -> int:
         if not prepared:
             diagnostic("session_unavailable")
             return 2
+    titles = None
+    if args.host == "codex" and not args.metadata_only and prepared:
+        try:
+            titles = historical_titles(reader, {item[2]["native_session_id"] for item in prepared})
+        except (OSError, ValueError, TypeError, RecursionError):
+            diagnostic("session_unreadable", reader._SESSION_INDEX)
+            return 2
     for path, revision, header in prepared:
         if counts[header["conversation_id"]] > 1:
             diagnostic("discovery_incomplete", path)
@@ -237,7 +272,8 @@ def main(argv=None) -> int:
             records = []
             if not args.metadata_only:
                 with source_snapshot(path, args.host) as snapshot:
-                    records, native = reader.to_canonical(snapshot, strict_utf8=True, strict_json=True)
+                    options = {"title_index": titles} if args.host == "codex" else {}
+                    records, native = reader.to_canonical(snapshot, strict_utf8=True, strict_json=True, **options)
                 if native.get("session_id") != header["native_session_id"]:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
