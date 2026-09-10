@@ -688,9 +688,9 @@ def _rollout_files(on_error=None) -> list[Path]:
 _META_MAX_RECORDS = 200
 
 
-def session_metadata(path) -> dict:
+def session_metadata(path, *, strict_utf8: bool = True) -> dict:
     """Read native session identity without reading prompt-derived titles."""
-    with Path(path).open("r", encoding="utf-8") as handle:
+    with Path(path).open("r", encoding="utf-8", errors="strict" if strict_utf8 else "replace") as handle:
         for _ in range(_META_MAX_RECORDS):
             line = handle.readline(1024 * 1024 + 1)
             if not line:
@@ -717,7 +717,7 @@ def session_metadata(path) -> dict:
 def session_cwd(path) -> str | None:
     """The native working directory, using the bounded session metadata read."""
     try:
-        cwd = session_metadata(path).get("cwd")
+        cwd = session_metadata(path, strict_utf8=False).get("cwd")
         return cwd if isinstance(cwd, str) and cwd else None
     except (OSError, ValueError):
         return None
