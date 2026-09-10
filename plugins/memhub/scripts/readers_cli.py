@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 from readers import reader_for, validate_canonical
+from readers.strict_json import loads as load_json
 
 
 def since_instant(value: str) -> float:
@@ -116,7 +117,7 @@ def historical_titles(reader, session_ids):
             if not text.strip():
                 continue
             try:
-                row = json.loads(text)
+                row = load_json(text, strict=True)
             except json.JSONDecodeError:
                 if raw.endswith((b"\n", b"\r")):
                     raise
@@ -203,6 +204,7 @@ def main(argv=None) -> int:
     explicit_path = False
     latest = None
     incomplete = False
+    cursor_counts = Counter()
 
     def diagnostic(code: str, path=None):
         nonlocal incomplete
@@ -221,7 +223,22 @@ def main(argv=None) -> int:
                 return 2
             sessions = [{"path": str(path)}]
         else:
-            sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"))
+            options = {"include_representations": True} if args.host == "cursor" else {}
+            sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"), **options)
+            if args.host == "cursor":
+                # One store and one transcript are alternative representations.
+                # Multiple copies of either kind remain ambiguous even when a
+                # preferred store or saved pin would otherwise hide them.
+                groups = {}
+                for row in sessions:
+                    path = Path(row["path"])
+                    kind = "store" if path.name == "store.db" else "transcript"
+                    sid = path.parent.name if kind == "store" else path.stem
+                    groups.setdefault(sid, {"store": [], "transcript": []})[kind].append(row)
+                sessions = []
+                for sid, kinds in groups.items():
+                    cursor_counts[f"cursor-{sid}"] = max(map(len, kinds.values()))
+                    sessions.extend(kinds["store"] or kinds["transcript"])
             if args.session == "latest":
                 latest, error = reader.locate("latest")
                 if error or latest is None:
@@ -255,8 +272,10 @@ def main(argv=None) -> int:
 
     # Cursor identity survives unreadable metadata: a damaged copy still
     # makes the other path ambiguous. Count before preparing either copy.
-    cursor_counts = Counter(f"cursor-{Path(row['path']).parent.name if Path(row['path']).name == 'store.db' else Path(row['path']).stem}"
-                            for row in sessions) if args.host == "cursor" else None
+    if args.host == "cursor" and explicit_path:
+        cursor_counts = Counter()
+    elif args.host != "cursor":
+        cursor_counts = None
     prepared = []
     for session in sessions:
         path = Path(session["path"])
@@ -277,7 +296,9 @@ def main(argv=None) -> int:
             diagnostic("session_unreadable", path)
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
-    counts = cursor_counts if cursor_counts is not None else Counter(header["conversation_id"] for _, _, header in prepared)
+    counts = Counter(header["conversation_id"] for _, _, header in prepared)
+    if cursor_counts is not None:
+        counts |= cursor_counts
     if args.session == "latest":
         # Preserve the native latest-selection rule, but only after all actual
         # identities have participated in ambiguity detection.
