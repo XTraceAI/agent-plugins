@@ -439,6 +439,15 @@ def test_single_destination_keeps_legacy_backstop_dormancy():
         append(Path(data["transcript_path"]),1);invoke(home,cloud[0],data)
         assert len(cloud[1])==1
         invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=1)
+        configure(home,local[0]);cloud[2]["ack"]=True
+        invoke(home,cloud[0],data)
+        assert not state(home,"cloud",local[0]).get("unsupported")
+        configure(home,local[0],active=["cloud"])
+        append(Path(data["transcript_path"]),2)
+        invoke(home,cloud[0],data,script="turn_flush_prefilter.py",expected=0)
+        invoke(home,cloud[0],data)
+        assert state(home,"cloud",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
+        assert len(cloud[1])==3
 
 
 if __name__ == "__main__":
