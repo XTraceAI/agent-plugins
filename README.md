@@ -559,3 +559,8 @@ soft (not a git repo / hook error → silent no-op).
 
 To point at a different MemHub instance, edit `plugins/memhub/.mcp.json`
 (`url` and `oauth.clientId`).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 XTrace Inc.
+The installable MemHub plugin includes its own copies of `LICENSE` and `NOTICE`.
