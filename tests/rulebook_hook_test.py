@@ -2275,7 +2275,9 @@ def armed_lane_checks() -> None:
         stale = (_dt2.datetime.now(_dt2.timezone.utc)
                  - _dt2.timedelta(seconds=rb_mod.REFRESH_AFTER_S + 60)).isoformat()
         d = os.path.join(td, "book")
-        bp = [os.path.join(d, f) for f in os.listdir(d)][0]
+        # The book directory also holds the `.sources` sidecar the session
+        # lane writes, and listdir order is not guaranteed — pick the book.
+        bp = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json")][0]
         book = json.load(open(bp))
         without = [r for r in book["rules"] if r.get("id") != "probe-before-answering"]
         json.dump({**book, "fetched_at": stale, "rules": without}, open(bp, "w"))
@@ -2290,6 +2292,31 @@ def armed_lane_checks() -> None:
         c = pre("p6", "gh pr comment 7 --body ok")
         check("prompt-armed: ...and the next matching prompt arms it",
               "[probe-staging]" in c, c)
+
+        # The arming belongs to the rule as it read when the prompt matched.
+        # Refresh the rule under the same id — a new version, and an
+        # `armed_by_rx` this session's prompts never matched — and the old
+        # arming must not carry over to block a call the new rule never
+        # armed for. A prompt matching the NEW rule arms it afresh.
+        renamed = [dict(r, version=2, ordering={**r["ordering"], "armed_by_rx": r"\bproduction\b"})
+                   if r.get("id") == "probe-before-answering" else r
+                   for r in book["rules"]]
+        json.dump({**book, "fetched_at": stale, "rules": renamed}, open(bp, "w"))
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: an arming made for an earlier rule version is dropped, "
+              "not applied to the refreshed rule", "[probe-staging]" not in c, c)
+        st = json.load(open(os.path.join(td, "state", "p6.json")))
+        check("prompt-armed: ...and the stale arming is gone from state",
+              "probe-before-answering" not in st["armed"], st["armed"])
+        prompt("p6", "is staging up?")            # matches the OLD rx only
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: a prompt matching only the old rx does not arm the new rule",
+              "[probe-staging]" not in c, c)
+        prompt("p6", "is production up?")
+        c = pre("p6", "gh pr comment 7 --body ok")
+        check("prompt-armed: a prompt matching the new rx arms the new version",
+              "[probe-staging]" in c, c)
+        json.dump({**book, "fetched_at": stale}, open(bp, "w"))   # restore for what follows
         check("refresh_if_stale: honours MEMHUB_RULEBOOK_FETCH=0",
               rb_mod.refresh_if_stale("x", ["r"], stale, {"a": 1}) == (["r"], stale, {"a": 1}))
 

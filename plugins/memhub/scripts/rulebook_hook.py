@@ -2725,7 +2725,7 @@ def state_path(session_id):
 
 def load_state(p):
     st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {},
-          "armed_once": [], "armed_fire": {}}
+          "armed_once": [], "armed_fire": {}, "armed_version": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2737,7 +2737,29 @@ def load_state(p):
         st["armed_once"] = []
     if not isinstance(st.get("armed_fire"), dict):
         st["armed_fire"] = {}
+    if not isinstance(st.get("armed_version"), dict):
+        st["armed_version"] = {}
     return st
+
+
+def stale_arming(st, rule):
+    """Was this rule's session arming written against a DIFFERENT version of
+    the rule than the one now loaded? An arming records the version it was
+    made for; a rule that has since been refreshed under the same id carries
+    an obligation no event of this session armed. Only an arming that
+    recorded a version can be stale — one an older hook wrote is kept."""
+    rid = rule["id"]
+    if rid not in st["armed"] or rid not in st["armed_version"]:
+        return False
+    return st["armed_version"][rid] != rule.get("_version")
+
+
+def drop_arming(st, rid):
+    """Forget a session arming and the open fire it carries; returns that
+    fire's id, if any, so the caller can close it in the ledger."""
+    st["armed"].pop(rid, None)
+    st["armed_version"].pop(rid, None)
+    return st.setdefault("armed_fire", {}).pop(rid, None)
 
 
 def save_state(p, st):
@@ -2825,15 +2847,16 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
     armed by what the person just said ("you are asking about staging — probe
     it before you answer"). Both arm at a moment that is not a tool call, so
     both write here rather than into the worktree state the edit lane keeps."""
-    ids = [r["id"] for r in rules
-           if r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
-           and arms_on(r, event, prompt)]
-    if not ids:
+    arming = [r for r in rules
+              if r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
+              and arms_on(r, event, prompt)]
+    if not arming:
         return []
     sp = state_path(session)
     st = load_state(sp)
     armed = []
-    for rid in ids:
+    for r in arming:
+        rid = r["id"]
         # SessionStart is not once per session. Claude Code fires it again on
         # resume, on `/clear` and after a compaction, under the SAME session
         # id — `capture_health._already_warned` exists for the same reason. A
@@ -2851,6 +2874,12 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
             continue
         st["armed_once"].append(once)
         st["armed"].setdefault(rid, event)   # first arming wins; re-arming is a no-op
+        # The arming belongs to the rule AS IT READ when the prompt matched.
+        # A rule refreshed under the same id — `armed_by_rx` changed from
+        # `staging` to `production`, say — is a different obligation, and the
+        # pre lane drops an arming whose version no longer matches rather
+        # than block a call no prompt ever armed for the new text.
+        st.setdefault("armed_version", {})[rid] = r.get("_version")
         armed.append(rid)
     save_state(sp, st)
     return armed
@@ -3654,6 +3683,12 @@ def main():
                 continue
 
             if r.get("on") == "ordering":
+                if stale_arming(st, r):
+                    # Armed for an earlier version of this rule. The rule that
+                    # arms on `staging` and the one that now arms on
+                    # `production` share an id and nothing else; no prompt of
+                    # this session matched the new one, so it is not armed.
+                    drop_arming(st, rid)
                 try:
                     ordering = ordering or OrderingEngine(root, branch)
                     ok = bash_ok(ev["resp"], strict=r.get("mode") == "gate") \
@@ -3667,8 +3702,7 @@ def main():
                     # worktree state: it was never written there. Its open
                     # fire lives beside it for the same reason — a sibling
                     # session sharing the checkout must not convert it.
-                    st["armed"].pop(rid, None)
-                    fid = st.setdefault("armed_fire", {}).pop(rid, None)
+                    fid = drop_arming(st, rid)
                     if fid:
                         log_conversion(fid, "discharged")
                 if outcome == "discharged" and r.get("_converted_fire"):
