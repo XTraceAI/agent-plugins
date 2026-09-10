@@ -24,6 +24,7 @@ _legacy: ContextVar[bool] = ContextVar("capture_legacy_state", default=True)
 _budget: ContextVar[float | None] = ContextVar("capture_time_budget", default=None)
 _room_env: ContextVar[str | None] = ContextVar("capture_room_env", default=None)
 _payload: ContextVar[dict | None] = ContextVar("capture_hook_payload", default=None)
+_import_state: ContextVar[dict | None] = ContextVar("capture_import_attempt", default=None)
 
 
 def entrypoint(function=None, *, observe_when_unselected=False):
@@ -61,9 +62,13 @@ def bind(sink: Sink, *, legacy: bool | None = None, budget: float | None = None,
     room_token = _room_env.set(room_env or _capture_room_env(sink))
     budget_token = _budget.set(budget)
     payload_token = _payload.set(None)
+    # Share this invocation's attempt marker with copied async contexts so
+    # the outer timeout handler can distinguish preparation from an upload.
+    import_token = _import_state.set({"contacted": False})
     try:
         yield
     finally:
+        _import_state.reset(import_token)
         _payload.reset(payload_token)
         _budget.reset(budget_token)
         _room_env.reset(room_token)
@@ -182,11 +187,19 @@ def identity(native_id: str, metadata=None, *, include_cloud=False) -> dict:
     return result
 
 
+def import_was_attempted():
+    state = _import_state.get()
+    return state is None or state["contacted"]
+
+
 async def import_conversation(session, arguments, *, timeout=None):
     """Retry explicit old-cloud argument rejection once with its legacy envelope."""
     import mcp_http
     deadline = None if timeout is None else time.monotonic() + timeout
     kwargs = {} if timeout is None else {"timeout": timeout}
+    state = _import_state.get()
+    if state is not None:
+        state["contacted"] = True
     result = await session.call_tool("import_conversation", arguments=arguments, **kwargs)
     sink = _current.get()
     if sink is None or sink.is_local or not getattr(result, "isError", False):

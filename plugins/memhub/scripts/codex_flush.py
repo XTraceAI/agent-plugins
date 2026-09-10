@@ -162,7 +162,7 @@ def _save_state(sid: str, **fields) -> None:
     atomic_write.publish(capture_context.state_directory(STATE_DIR) / f"{sid}.json", json.dumps(state))
 
 
-def _acquire(sid: str, blocking: bool = False) -> int | None:
+def _acquire(sid: str, blocking: bool = False, *, timeout: float | None = None) -> int | None:
     """Per-session flock. Non-blocking returns None when held; blocking WAITS.
 
     A milestone `git commit` is very often the last action before a turn ends,
@@ -206,7 +206,7 @@ def _acquire(sid: str, blocking: bool = False) -> int | None:
     # subprocess) would otherwise hang one detached process per boundary
     # event. Poll up to LOCK_WAIT_S, then give up (the sweep backstops);
     # a dead peer releases via the kernel and this returns instantly.
-    budget = capture_context.time_budget()
+    budget = capture_context.time_budget() if timeout is None else timeout
     deadline = time.monotonic() + min(LOCK_WAIT_S, budget if budget is not None else LOCK_WAIT_S)
     while True:
         try:
@@ -615,20 +615,31 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
+def _prepare_source(payload):
+    rollout, sid = locate_rollout(payload)
+    return rollout, sid, rollout.stat().st_size if rollout is not None else 0
+
+
 def _capture_sink(payload: dict) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     started = time.monotonic()
     capture_context.observe(payload)
 
-    rollout, sid = locate_rollout(payload)
+    budget = capture_context.time_budget()
+    if budget is None:
+        budget = FLUSH_TIMEOUT_S
+    try:
+        rollout, sid, size = asyncio.run(asyncio.wait_for(
+            capture_async.blocking(_prepare_source, payload), timeout=budget))
+    except (TimeoutError, OSError) as error:
+        _log(f"{event}: source discovery deferred ({type(error).__name__})")
+        return 0
     if rollout is None or not sid:
         _log(f"{event}: no session identity in payload — skipping")
         return 0
 
-    try:
-        size = rollout.stat().st_size
-    except OSError as e:
-        _log(f"{event}: rollout unreadable ({e}) — skipping")
+    remaining = budget - (time.monotonic() - started)
+    if remaining <= 0:
         return 0
 
     # One flush per session at a time — the whole check-then-act, so a
@@ -636,13 +647,12 @@ def _capture_sink(payload: dict) -> int:
     # rollout, and race the write back.
     # Stop is the last-chance event (no SessionEnd), so it WAITS for a
     # concurrent flush rather than skip and never run again.
-    lock_fd = _acquire(sid, blocking=(event == "Stop"))
+    lock_fd = _acquire(sid, blocking=(event == "Stop"), timeout=remaining)
     if lock_fd is None:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
-        budget = capture_context.time_budget()
-        remaining = None if budget is None else max(0.0, budget - (time.monotonic() - started))
+        remaining = max(0.0, budget - (time.monotonic() - started))
         return _flush_locked(event, payload, sid, rollout, size, timeout=remaining)
     finally:
         os.close(lock_fd)  # releases the flock
@@ -677,10 +687,14 @@ def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
         asyncio.run(asyncio.wait_for(_flush(sid, rollout, size),
                                      timeout=FLUSH_TIMEOUT_S if timeout is None else timeout))
     except Exception as e:
-        # Timeouts included: record the stamp so the cooldown applies to a
-        # slow upload too, not just to server-reported errors.
+        # Local preparation gets a retry breadcrumb, but only an attempted
+        # upload contributes to contacted-server failure/dormancy counts.
         _log(f"{event}: flush error: {e}")
-        _note_failure(sid, f"flush_error: {type(e).__name__}")
+        reason = f"flush_error: {type(e).__name__}"
+        if capture_context.import_was_attempted():
+            _note_failure(sid, reason)
+        else:
+            _save_state(sid, last_error=reason, last_error_at=time.time(), fail_streak=0)
     return 0
 
 
