@@ -456,7 +456,8 @@ def test_the_review_mines_rows_from_flagged_moments():
         meta = hs.load_meta("sess")
         assert meta["mined_through"] == 3
         assert meta["mining_refused"] == {"pii_in_row": 1, "anchors_not_identifiers": 1,
-                                           "bad_moment": 1}, meta["mining_refused"]
+                                           "moment_out_of_range": 1}, meta["mining_refused"]
+        assert (Path(os.environ["MEMHUB_HARNESS_DRAFTS"]) / "sess.verdict.json").exists()
         # nothing new: no second call
         hs.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no"))
         try:

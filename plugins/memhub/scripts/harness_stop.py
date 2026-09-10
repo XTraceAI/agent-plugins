@@ -539,8 +539,11 @@ def apply_mining(moments: list[dict], verdict: dict, book: list[dict], *,
         if not isinstance(item, dict):
             continue
         idx = item.get("moment")
-        if not isinstance(idx, int) or not 1 <= idx <= len(moments) or idx in used:
-            refuse("bad_moment")
+        if not isinstance(idx, int) or not 1 <= idx <= len(moments):
+            refuse("moment_out_of_range")
+            continue
+        if idx in used:
+            refuse("moment_reused")        # one row per moment; the second is dropped
             continue
         used.add(idx)
         if len(kept) + len(out) >= budget:
@@ -607,6 +610,11 @@ def review(session: str, *, moment: str, pr_number=None) -> int:
         else:
             save_meta(session, review_failures=failures)
         return -1
+    try:        # the raw verdict, for a reader of a refusal count — scratch, never synced
+        _publish(_base() / f"{_safe(session)}.verdict.json",
+                 json.dumps(verdict, ensure_ascii=False, default=str))
+    except Exception:
+        pass
     kept, dropped = apply_review(new, verdict, book, budget, pr_number=meta.get("pr_number"))
     authored, refused = apply_mining(new_moments, verdict, book, session=session,
                                      repo=repo, kept=kept, budget=budget,

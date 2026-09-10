@@ -17,15 +17,17 @@
 
 ## The one-paragraph answer
 
-**The pipeline got worse on the gate that matters, and it must not be
-turned on as it stands.** It drafts almost four times as many rows as S0
-(117 vs 31) and more of them are activatable in absolute terms (37 vs 21),
-but the ratio a reviewer sees fell from **0.68 to 0.32**, under the 0.5
-gate. The cause is not the judge — its recall on the gold set is 0.93, as
-the server team measured — it is that the **author stopped refusing**:
-S0's author refused 86% of the moments it saw and S1's refuses 33%, so the
-refusal machinery that carried S0 is not carrying S1. Half the sessions hit
-the 8-draft budget, which is why drafts-per-session still "passes".
+**Measured at the stage a reviewer meets — after the agent that runs after
+the classifier — the pipeline that works is: server classifier → local
+agent mines the lessons.** Three pipelines were replayed on the same 24
+sessions. The server author drafts 117 rows of which 37 are activatable
+(0.32, under the 0.5 gate). A keep/drop review agent over those rows does
+not repair them (0.35). The local agent authoring from the classifier's
+flagged moments, with the whole session in front of it, drafts 20 rows of
+which 14 are activatable (**0.70**, above S0's 0.68 and the gate), at
+under one row per session. The judge is fine either way: recall 0.93 on
+the gold set. What S0 had for free and the server author lost was the
+refusal rate; the local agent, given the session, has it back.
 
 ## What changed between S0 and S1, and what did not
 
@@ -42,16 +44,19 @@ the 8-draft budget, which is why drafts-per-session still "passes".
 
 ## The scorecard
 
-| metric | S0 | S1 | target | verdict |
-|---|---|---|---|---|
-| judge recall on `clf_gold.json` | 0.85 completed · 0.77 end-to-end | **0.93** (40 / 43) among 138 of 140 completed · ≥ 0.89 end-to-end | ≥ 0.85 | **PASS** |
-| rows a human would activate ÷ rows drafted | 0.68 (21 / 31) | **0.32** (37 / 117) | ≥ 0.5 | **MISS** |
-| drafts per session | max 5 · mean 1.29 | max **8** · mean **4.88** — 12 of 24 sessions at the cap | ≤ 8 | PASS on the number; **the cap is doing the work** |
-| duplicate rows within a run | 0 lexical · 2 semantic (by hand) | **0** lexical · **5** semantic (by hand) · 24 flagged by trigger/title, mostly false | report both | **MISS** — worse than S0 |
-| router regex precision | 0.015 (1 row / 68 author calls) | **0.25** (12 rows / 48 hinted calls); activatable 5 / 12 | report | reported — a different quantity now, see Finding 6 |
+Three pipelines on the same corpus. The gate is judged on the third; the
+first two are what it replaces.
 
-**Two of five gates miss, the same two S0 missed, and the one that
-matters most moved the wrong way.**
+| metric | S0 | S1 · server author, before review | S1 · server author + keep/drop review agent | **S1 · classifier → local agent mines** | target |
+|---|---|---|---|---|---|
+| judge recall on `clf_gold.json` | 0.85 completed · 0.77 end-to-end | **0.93** (40 / 43), 138 of 140 completed | same classifier | same classifier | ≥ 0.85 **PASS** |
+| rows a human would activate ÷ rows drafted | 0.68 (21 / 31) | 0.32 (37 / 117) | 0.35 (29 / 84) | **0.70 (14 / 20)** | ≥ 0.5 **PASS** |
+| drafts per session | max 5 · mean 1.29 | max 8 · mean 4.88, 12 sessions at the cap | max 8 · mean 4.67 | **max 2 · mean 0.83** | ≤ 8 **PASS** |
+| duplicate rows within a run | 0 lexical · 2 semantic | 0 lexical · 5 semantic (by hand) | 0 · 4 | **0 · 0** | report **PASS** |
+| router regex precision | 0.015 | 0.25 as a hint; 5 / 12 activatable | — | hint carried on 48 of 426 moments | report |
+
+**All five rows are met by the third pipeline; two of five miss on the
+first two.** One judge, not two.
 
 ### Supporting numbers
 
@@ -102,7 +107,64 @@ its verdict, so a second pass is a read; the run directory is scratch
 | `no_action` | 1 | "quote or hedge" |
 | `wrong` | 1 | "heredoc markdown bypasses auto-capture" — fixed in 0.49.1, the rule would misinform |
 
-### The 37 rows judged activatable
+### After the classifier: two agents, measured
+
+Both variants ran the same headless local agent (`claude -p --safe-mode`,
+sonnet, `MEMHUB_HARNESS_CHILD=1`) once per session with the session digest
+and the cached rulebook — `score_s0.py review --variant review|mine`.
+
+| | keep/drop over the server's 117 rows | local agent authors from the 426 flagged moments |
+|---|---|---|
+| rows out | 84 | 20 |
+| activatable | 29 (0.35) | **14 (0.70)** |
+| what it did to the hand verdicts | kept 55 rejects, dropped 8 activatable rows | — new rows, judged fresh |
+| rejects it did drop | one_off 10 · project_state 7 · unmatchable 4 · derivable 3 · duplicate 1 | — |
+| by engine | anchors 55 · matcher 26 · ordering 3 | matcher 13 · anchors 7 (activatable 8/13 · 6/7) |
+| by classifier kind (activatable) | — | standing_rule 4/5 · correction 4/6 · claim_challenge 3/4 · tribal 2/3 · error_arc 1/2 |
+| engineers with rows | 4 of 5 | 4 of 5 |
+| refusals the client applied | — | 22 moment out of range/reused · 17 `state_missing_repo` · 2 unusable engines |
+| identities in a row | 0 | 0 |
+| wall clock, 3 agents at a time | 4.5 min | 11.7 min |
+
+The keep/drop agent is not a filter: shown a row and asked whether to keep
+it, it keeps it. The mining agent, shown a moment and asked whether there
+is a lesson at all, mostly says no — 426 moments, 61 rows attempted, 20
+survived the client's checks — and what it writes is command-shaped (13 of
+20 matchers, against 31 of 117 for the server author).
+
+Rejects among the 20: an output rule that fires on every directive
+injection (`unmatchable`), a "retry the auto-mode classifier block" row that
+is bad advice, the heredoc-capture row that 0.49.1 made false, a claim about
+`search_all_brains` the corpus cannot substantiate (`wrong` ×3), a taste
+about usage-based feature calls (`one_off`), and `| tail` masking exit
+status, which CLAUDE.md already says (`derivable`).
+
+### The 14 mined rows judged activatable
+
+| # | title | engine | classifier kind |
+|---|---|---|---|
+| 1 | gh mergeable status lags after a push | `matcher` | claim_challenge |
+| 2 | CodeArtifact index down for pip/uv | `matcher` | standing_rule |
+| 3 | Stale stat quoted into memory note | `matcher` | standing_rule |
+| 4 | Rejected tool use is not a detour signal | `matcher` | standing_rule |
+| 5 | Local scratchpad sim ≠ staging test | `anchors` | standing_rule |
+| 9 | Per-turn resume double-fires SessionStart rules | `matcher` | tribal |
+| 11 | share_agent_brain demotes existing grants | `anchors` | correction |
+| 12 | gate the enqueue, not just the handler | `anchors` | correction |
+| 13 | large diffs don't converge under iterative review | `matcher` | error_arc |
+| 14 | conflict-resolution-drops-trailing-paren | `matcher` | claim_challenge |
+| 15 | Teamspace-scoped UI must not cross scopes | `anchors` | correction |
+| 16 | blocked-read-of-local-session-transcripts | `matcher` | correction |
+| 17 | SQLite tests silently drop postgresql partial indexes | `anchors` | claim_challenge |
+| 20 | slack-scope-bind-no-membership-check | `anchors` | tribal |
+
+Five of these are the same lessons the server author found (mergeability
+lags a push, `share_agent_brain` demotes, `CONFLICT (content)` needs a
+parse check, the Slack scope-bind gap, gate the enqueue) and nine are new;
+the server author's 37 include 23 the miner did not write. Absolute yield
+is lower; the ratio a reviewer meets is what the gate measures.
+
+### The 37 rows the server author drafted that were judged activatable
 
 | # | title | engine | judge kind |
 |---|---|---|---|
@@ -259,24 +321,29 @@ transport lost 15–21% of judgements) is closed.
 
 ## What S1 says about turning it on
 
-**Not yet.** The sensor is built, flagged off, and tested; the pipeline it
-would feed drafts too much. Before `MEMHUB_HARNESS_EXTRACT` goes on
-anywhere but a dogfood machine, in this order:
+**The sensor should ship with the local agent as the author.** That is
+now the default shape of `harness_stop.py`: the extract child records every
+classifier-flagged moment beside the drafts, and the review — the local
+agent with the whole session — authors from those moments, in the same row
+contract, through the same `build_row`, twin check and identity test. On
+this corpus that pipeline clears every gate S0 set: 0.70 activatable,
+under one row per session, no duplicates, no identities.
 
-1. **Give the author back its refusals** (server, MemHub #1249's prompt):
-   the first and fifth rubric criteria as explicit refusal tests — "name
-   the next command this changes" and "true next month" — and a
-   concreteness test on anchors (Finding 2). Re-measure on the same corpus.
-2. **Run the review over this run's drafts** and report the ratio *after*
-   review, which is the ratio a human actually sees (Finding 3).
-3. **Decide the budget's meaning** (Finding 4): a per-session cap of 8
-   with a session sending its first 8 signals is not the same as a review
-   choosing the best 8.
-4. **Second judge.** One pass by the pipeline's author, again.
+Before `MEMHUB_HARNESS_EXTRACT` goes on anywhere but a dogfood machine:
 
-None of these is "the model is not good enough". Recall is 0.93 and the
-activatable rows are real lessons; the machinery that is missing is the
-refusal machinery S0 had for free.
+1. **A `judge_only` mode on the draft endpoint** (MemHub-Backend, Felix's
+   call). Today the server author still runs and bills on every flagged
+   moment and its rows are then ignored; the classifier alone is ~2 s and
+   a fraction of the spend.
+2. **Drop the keep/drop review over server rows** from the design (§4.3
+   steps 1–2 as written): measured, it does not filter. The review moment
+   stays; its job is mining.
+3. **`state_missing_repo` for repo-less sessions** — 17 mined rows and 131
+   server rows were lost to it in the replay. A live session has a `cwd`;
+   the replay adapter should carry the corpus file's engineer/repo label
+   as the fallback stamp so the number is measured on every drafted row.
+4. **Second judge.** One pass by the pipeline's author, again — now over
+   137 rows.
 
 ## Reproducing this
 
@@ -287,6 +354,8 @@ export MEMHUB_MCP_BASE_URL=https://api.staging.memhub.xtrace.ai   # the staging 
 python3 $S/score_s0.py router --corpus $SP/corpus                  # free, no server
 python3 $S/score_s0.py corpus --corpus $SP/corpus --out $SP/s1-run --jobs 2 --pace 1.0
 python3 $S/score_s0.py gold   --jobs 2 --out $SP/s1-gold.json
+python3 $S/score_s0.py review --run $SP/s1-run --corpus $SP/corpus --variant review --verdicts verdicts.json
+python3 $S/score_s0.py review --run $SP/s1-run --corpus $SP/corpus --variant mine    # fresh judge sheet
 ```
 
 `--pace 1.0` with at most two workers is not optional: a personal access
