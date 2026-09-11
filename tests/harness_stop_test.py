@@ -271,6 +271,52 @@ def test_the_child_holding_the_turns_error_arcs_is_never_the_one_dropped():
     print("PASS test_the_child_holding_the_turns_error_arcs_is_never_the_one_dropped")
 
 
+def test_a_taken_over_child_never_publishes_the_thinner_moment():
+    with _Env() as env:
+        repo_dir = _git_repo(env.base)
+        tp = env.base / "s.jsonl"
+        _transcript(tp, [("do the thing", "done", []),
+                         ("ok ship it", "shipped", [("Bash", {"command": "ls"}, "a", False)])])
+        size = tp.stat().st_size
+        arc = json.dumps([{"signature": "boom", "target": "make", "fix": "make", "cost": 6}])
+
+        def arcs_file(session, ns):
+            path = hx.session_file(session, f".arcs-{ns}.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(arc)
+            return path
+
+        hints = []
+        real = hx.server_classify
+
+        def classify(window, hint="", repo="", timeout=0):
+            hints.append(hint)
+            if len(hints) == 1:
+                # the no-arcs child is mid-classification when the child holding
+                # the turn's arcs arrives and takes the turn over
+                hs.cmd_extract("race", str(tp), str(repo_dir), str(arcs_file("race", 1)), size)
+            return {"signal": True, "reason": "classified", "kind": "error_arc"}, 0.1
+
+        hx.server_classify = classify
+        try:
+            hs.cmd_extract("race", str(tp), str(repo_dir), "", size)
+        finally:
+            hx.server_classify = real
+        assert hints == ["", "error_arc"], hints
+        assert [m["hint"] for m in hx.read_jsonl(hs.moments_path("race"))] == ["error_arc"]
+
+        # a winner that already published keeps its turn: nobody takes it over
+        calls = []
+        hx.server_classify = _classify(calls, {"signal": True, "reason": "classified", "kind": "x"})
+        try:
+            hs.cmd_extract("pub", str(tp), str(repo_dir), "", size)
+            hs.cmd_extract("pub", str(tp), str(repo_dir), str(arcs_file("pub", 1)), size)
+        finally:
+            hx.server_classify = real
+        assert len(calls) == 1 and len(hx.read_jsonl(hs.moments_path("pub"))) == 1
+    print("PASS test_a_taken_over_child_never_publishes_the_thinner_moment")
+
+
 def test_extract_takes_the_turn_that_stopped_not_the_prompt_queued_after_it():
     with _Env() as env:
         repo = _git_repo(env.base)
@@ -400,6 +446,11 @@ def test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in():
         assert state["repo"] == "beta" and "touched_repos" not in state, state
         line = hs.nudge_line("s", {"turn": 1, "state": state}, "alpha")
         assert 'scope_repos=["beta"]' in line and "repositories" not in line
+        # `git -C <path>` points a command at another repository as a leading `cd` does
+        for target in (f"git -C {beta} status", f"cd {alpha} && git -C ../beta log -1",
+                       f"GIT_PAGER=cat git -c core.pager=cat -C {beta} diff"):
+            got = hx.stamp_state(turn={"n": 4, "tools": [{"tool": "Bash", "target": target}]}, **kw)
+            assert got["repo"] == "beta", (target, got)
         # a turn that worked in both names both and asks for the narrowing
         both = {"n": 2, "tools": [{"tool": "Bash", "target": f"cd {beta} && make test"},
                                   {"tool": "Edit", "target": str(alpha / "x.py")}]}

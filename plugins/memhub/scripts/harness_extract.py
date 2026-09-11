@@ -35,6 +35,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -515,6 +516,36 @@ def _hook():
 
 
 _REPO_CACHE: dict = {}
+_SEGMENTS = re.compile(r"&&|\|\||;|\|")
+
+
+def git_c_root(base: str, command: str) -> str:
+    """The directory `git -C <path>` points a command at, resolved against
+    `base`, or "". `git -h`: `git [-C <path>] [-c <name>=<value>] …`, and
+    several `-C` are cumulative. The rulebook hook's `command_root` reads only
+    a leading `cd`, so without this `git -C B status` run from repo A is A's."""
+    for segment in _SEGMENTS.split(command or ""):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            return ""
+        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            words = words[1:]            # an environment prefix
+        if not words or os.path.basename(words[0]) != "git":
+            continue
+        path, seen, i = base, False, 1
+        while i < len(words) and words[i].startswith("-"):
+            if words[i] in ("-C", "-c") and i + 1 < len(words):
+                if words[i] == "-C":
+                    step = os.path.expanduser(words[i + 1])
+                    path = step if os.path.isabs(step) else os.path.join(path or "", step)
+                    seen = True
+                i += 2
+                continue
+            i += 1
+        if seen:
+            return path if path and os.path.isdir(path) else ""
+    return ""
 
 
 def resolve_repo(tool: str, target: str, cwd: str) -> tuple[str, str]:
@@ -534,6 +565,7 @@ def _resolve_repo_uncached(tool: str, target: str, cwd: str) -> tuple[str, str]:
         root = ""
         if tool == "Bash" and target:
             root = rh.command_root(cwd, target) or ""
+            root = git_c_root(root or cwd, target) or root
         elif target and os.path.isabs(target):
             root = os.path.dirname(target)
         # Never fall through to the current directory: with no cwd the answer
@@ -607,9 +639,10 @@ def new_stats() -> dict:
 def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
                  repo: str, env_name: str, stats: dict, trace, out_path: Path,
                  arcs: list[dict] | None = None, hook_version: str = "",
-                 timeout: float = 0) -> dict | None:
+                 timeout: float = 0, may_publish=None) -> dict | None:
     """One turn through router → window → classifier → moment. Returns the
-    moment appended to `out_path`, or None."""
+    moment appended to `out_path`, or None. `may_publish`, when given, is
+    asked once a signal comes back, and a False drops the moment."""
     hits = route(turn, prev, arcs)
     stats["router_hits"] += len(hits)
     trace(f"turn {turn.get('n')} | router: {[k for k, _ in hits] or '-'}")
@@ -638,6 +671,9 @@ def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
     moment = {"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
               "hint": hint, "kind": kind, "derivable": reply.get("derivable"),
               "state": state}
+    if may_publish is not None and not may_publish():
+        trace("   signal dropped: another child now holds this turn")
+        return None
     append_jsonl(out_path, moment)
     stats["moments"] += 1
     trace(f"   classifier ({dt}s): signal [{kind}], moment recorded")

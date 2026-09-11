@@ -2260,8 +2260,10 @@ _REDACTIONS = (
     (re.compile(r"(?i)\b([a-z0-9_-]*(?:secret|passwd|password|token|api[_-]?key|"
                 r"access[_-]?key|credential))(\s*[=:]\s*|\s+)('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
      r"\1\2<redacted>"),
-    # `curl -u user:password`, `-U user:password`, and quoted, `-u 'user:pass word'`.
-    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):([^\s\"']+)"), r"\1\2:<redacted>"),
+    # `curl -u user:password`, `-U user:password`, a quoted password
+    # (`-u user:'pass word'`), and a quoted pair (`-u 'user:pass word'`).
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
+     r"\1\2:<redacted>"),
     (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)(['\"])([^:'\"]+):([^'\"]*)\2"),
      r"\1\2\3:<redacted>\2"),
     # Authorization / Proxy-Authorization headers, with or without a scheme.

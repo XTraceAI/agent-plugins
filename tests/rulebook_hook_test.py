@@ -1397,6 +1397,8 @@ def main() -> int:
         ('KEY="double quoted"', 'PGPASSWORD="hunter3 two" psql -h db', "hunter3"),
         ('--flag "spaced"', 'mysql --password "pa ss" -h db', "pa ss"),
         ("curl -u 'user:pass'", "curl -u 'admin:pa55w0rd' https://x.com", "pa55w0rd"),
+        ("curl -u user:'pass'", "curl -u admin:'pa55 w0rd' https://x.com", "pa55 w0rd"),
+        ('curl --user user:"pass"', 'curl --user admin:"s3cr3t pw" https://x.com', "s3cr3t pw"),
     ]:
         out = rb.redact_secrets(cmd)
         check("recall redacts a quoted value: %s" % label,
