@@ -376,6 +376,21 @@ with tempfile.TemporaryDirectory() as td:
         f.read_room = lambda *a, **k: {"brain_id": "B-CACHED", "name": "Repo: x/y"}
         asyncio.run(f.flush(sid7))
         check(resolved == [] and seen_args[-1].get("agent_brain_id") == "B-CACHED", "cache hit → no server resolution, cached brain used")
+        # the server disowns the cached room → evicted, so the next Stop resolves
+        # again instead of re-sending the dead id until MAX_ATTEMPTS gives up.
+        # Session capture used to evict it as a side effect; it no longer routes.
+        forgot: list = []
+        f.forget_room = lambda cwd=None, env=None: forgot.append((cwd, env)) or True
+        async def missing_save(session, call_args):
+            raise f.SaveRejected("tool error: Error executing tool save_artifact: Agent brain not found")
+        f._save = missing_save
+        r7.write_text("# R7\n" + "m" * 7000, encoding="utf-8")
+        mc.save_state(sid7, {"dirty": [str(r7)], "saved": {}, "attempts": {}})
+        asyncio.run(f.flush(sid7))
+        check(len(forgot) == 1 and Path(forgot[0][0]) == r7.parent,
+              f"missing brain → the cached room is forgotten for the file's dir: {forgot}")
+        check(str(r7) in mc.load_state(sid7)["dirty"], "the capture stays dirty and retries next Stop")
+        f._save = capture_save
 
         # (audit #3b) a file linked by `path` in .claude/artifact-map.json is
         # owned by a hand-saved lineage (/memhub:spec) — the auto-capture must

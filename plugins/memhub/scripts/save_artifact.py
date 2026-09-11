@@ -35,8 +35,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
-from room_map import env_for_url, read_room, repo_root  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
+from room_map import env_for_url, forget_room, read_room, repo_root  # noqa: E402
 
 
 def unwrap(result) -> dict:
@@ -126,9 +126,10 @@ async def main() -> int:
     # override.
     #
     # The cache is read first; on a miss the room is resolved from the server
-    # over the session opened below (the same `resolve_repo_brain` the capture
-    # hooks use), so a hand-saved artifact lands in the repo room whenever one
-    # exists — not only after something else happened to cache it.
+    # over the session opened below (`brain_resolve.resolve_repo_brain`, the
+    # same exact-name lookup the `.md` auto-capture uses), so a hand-saved
+    # artifact lands in the repo room whenever one exists — not only after
+    # something else happened to cache it.
     room = None
     room_cwd: Path | None = None
     want_room = not args.agent_brain_id and not args.no_room
@@ -171,6 +172,19 @@ async def main() -> int:
             print("-" * 56)
             res = await session.call_tool("save_artifact", arguments=call_args)
             out = unwrap(res)
+            if room and getattr(res, "isError", False) and is_missing_brain(
+                    [getattr(b, "text", "") for b in getattr(res, "content", []) or []]):
+                # The cached room is not a brain this backend has — deleted, or
+                # an id cached from the other backend. `resolve_repo_brain`
+                # hands a cached id back on every failed re-resolution, so
+                # without this eviction every later save re-sends the same dead
+                # id. Session capture used to evict it as a side effect; it no
+                # longer routes sessions, so the artifact writers own it now.
+                # Only a room that came from the cache/resolver: an explicit
+                # --agent-brain-id is the caller's, never ours to forget.
+                forget_room(room_cwd, env)
+                print("room     : the cached room does not exist on this backend — "
+                      "dropped from the cache; re-run to resolve the room again")
     print(json.dumps(out, indent=2))
     return 0
 

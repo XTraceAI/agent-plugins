@@ -5,6 +5,8 @@
   already-open session (`brain_resolve.resolve_repo_brain`), so a hand-saved
   artifact lands in the repo room whenever one exists.
 - `--no-room` / `--agent-brain-id` still bypass resolution entirely.
+- A cached room the server disowns ("Agent brain not found") is evicted, so the
+  next save resolves again; an explicit `--agent-brain-id` never is.
 
 Run: python3 tests/save_artifact_test.py  (stdlib only; the SDK is faked).
 """
@@ -44,6 +46,17 @@ class _Result:
     content: list = []
 
 
+class _Missing:
+    """The server's answer for an id that is not a brain it has."""
+    structuredContent = None
+    isError = True
+    content = [types.SimpleNamespace(
+        type="text", text="Error executing tool save_artifact: Agent brain not found")]
+
+
+RESULT: list = [_Result()]
+
+
 class _Session:
     def __init__(self, *a, **k): pass
     async def __aenter__(self): return self
@@ -51,7 +64,7 @@ class _Session:
     async def initialize(self): pass
     async def call_tool(self, name, arguments=None):
         calls.append({"tool": name, **(arguments or {})})
-        return _Result()
+        return RESULT[0]
 
 
 class _Transport:
@@ -121,6 +134,19 @@ with tempfile.TemporaryDirectory() as td:
     sa.resolve_repo_brain = none_resolve
     rc = run("--file", str(doc), "--name", "Spec: X")
     check(rc == 0 and len(resolved) == 1 and "agent_brain_id" not in calls[-1], "no room anywhere → saved without a brain")
+
+    print("server disowns the cached room → evicted, so the next save resolves again")
+    forgot: list = []
+    sa.forget_room = lambda cwd=None, env=None: forgot.append((cwd, env)) or True
+    sa.read_room = lambda cwd, env: {"brain_id": "B-DEAD", "name": "Repo: x/y"}
+    RESULT[0] = _Missing()
+    rc = run("--file", str(doc), "--name", "Spec: X")
+    check(rc == 0 and forgot == [(doc.resolve().parent, "staging")],
+          f"dead cached room forgotten for the file's repo: {forgot}")
+    forgot.clear()
+    run("--file", str(doc), "--name", "Spec: X", "--agent-brain-id", "B-EXPLICIT")
+    check(forgot == [], "an explicit --agent-brain-id is never evicted from the cache")
+    RESULT[0] = _Result()
 
 print()
 print("FAILED" if FAILS else "ALL PASSED", f"({FAILS} failures)")
