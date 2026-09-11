@@ -470,6 +470,22 @@ def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
                 assert source.read_bytes()==before
 
 
+def test_sqlite_metadata_bytes_honor_the_requested_utf8_policy():
+    with tempfile.TemporaryDirectory() as td:
+        store=fixtures._make_cursor_store(Path(td)/"chats")
+        with sqlite3.connect(store) as sql:
+            meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0])
+            meta["extra"]="invalidXtext"
+            raw=json.dumps(meta).encode().replace(b"invalidXtext",b"invalid\xfftext")
+            sql.execute("UPDATE meta SET value=?",(raw,))
+        before=store.read_bytes()
+        records,_=cursor.to_canonical(store,strict_json=True,strict_utf8=False)
+        assert records
+        for json_mode in [False,True]:
+            rejected(lambda:cursor.to_canonical(store,strict_json=json_mode,strict_utf8=True))
+        assert store.read_bytes()==before
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

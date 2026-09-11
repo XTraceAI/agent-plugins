@@ -404,6 +404,9 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
         root = None
         for (value,) in con.execute("SELECT value FROM meta"):
             try:
+                if isinstance(value, (bytes, bytearray)):
+                    errors = "replace" if strict_json and not strict_utf8 else "strict"
+                    value = value.decode("utf-8", errors=errors)
                 m = load_json(value, strict=strict_json)
             except (TypeError, json.JSONDecodeError):
                 if strict_json:

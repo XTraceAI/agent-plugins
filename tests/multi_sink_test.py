@@ -461,15 +461,16 @@ def test_large_native_records_are_elided_without_stranding_later_turns():
             assert state(home,"local",local[0])["offset"]==path.stat().st_size
 
 
-def test_attachment_prefixes_replay_native_context_without_skipping_offsets():
-    for count,size,message_size in [(1,2_000_000,2_000_000),(2005,10,10)]:
+def test_nonmessage_prefixes_replay_native_context_without_skipping_offsets():
+    for kind,count,size,message_size in [(kind,*case) for kind in ["attachment","system"]
+            for case in [(1,2_000_000,2_000_000),(2005,10,10)]]:
         with tempfile.TemporaryDirectory() as td,receiver("local",[]) as local,receiver("cloud",[]) as cloud:
             home=Path(td);data=payload(home,count=0);path=Path(data["transcript_path"])
             configure(home,local[0],active=["local"]);local[2]["require_message"]=True
             with path.open("a") as output:
                 for index in range(count):
-                    output.write(json.dumps({"type":"attachment","uuid":f"attachment-{index}",
-                                             "attachment":{"content":"x"*size}})+"\n")
+                    output.write(json.dumps({"type":kind,"uuid":f"attachment-{index}",
+                                             kind:{"content":"x"*size}})+"\n")
             invoke(home,cloud[0],data)
             assert not local[1] and state(home,"local",local[0]).get("offset",0)==0
             with path.open("a") as output:
@@ -517,6 +518,31 @@ def test_drop_receipts_count_uuid_records_before_the_acknowledgement():
                   "records_dropped":dropped,"ack_through":"accepted"}
         assert capture_context.acknowledges(response,SID,records),records
         assert not capture_context.acknowledges({**response,"records_dropped":dropped-1},SID,records)
+
+
+def test_slow_batch_preparation_leaves_time_for_the_next_destination():
+    for operation in ["_read_tail","_redact_once","_namespace"]:
+        order=[]
+        with tempfile.TemporaryDirectory() as td,receiver("local",order) as local,receiver("cloud",order) as cloud:
+            home=Path(td);data=payload(home);configure(home,local[0]);env=environment(home,cloud[0])
+            guard=home/"guard/sitecustomize.py"
+            with guard.open("a") as output:
+                output.write("\nimport flush_turn,capture_context,time\n"
+                    f"original=flush_turn.{operation}\n"
+                    "def slow(*args,**kwargs):\n"
+                    "    if capture_context._current.get().is_local: time.sleep(1.2)\n"
+                    "    return original(*args,**kwargs)\n"
+                    f"flush_turn.{operation}=slow\n")
+            env["MEMHUB_TURN_FLUSH_TIMEOUT_S"]="0.8"
+            result=subprocess.run([sys.executable,"-c",
+                "import flush_turn,time;started=time.monotonic();flush_turn.main();assert time.monotonic()-started<1.1;"
+                "saved={p:p.read_bytes() for p in flush_turn.STATE_DIR.rglob('*.json')};time.sleep(1.3);"
+                "assert saved=={p:p.read_bytes() for p in flush_turn.STATE_DIR.rglob('*.json')},'late state write'"],
+                env=env,input=json.dumps(data),text=True,capture_output=True,timeout=5)
+            assert result.returncode==0 and "Traceback" not in result.stderr,(operation,result.stderr)
+            assert order==["cloud"],(operation,order)
+            assert state(home,"cloud",local[0])["offset"]==Path(data["transcript_path"]).stat().st_size
+            assert not state(home,"local",local[0]).get("offset")
 
 
 if __name__ == "__main__":

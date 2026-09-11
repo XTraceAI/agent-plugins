@@ -264,7 +264,7 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
     consumed = offset
     seeking_message = False
     has_message = False
-    has_attachment = False
+    needs_message = False
     with open(transcript, "rb") as fh:
         fh.seek(offset)
         while True:
@@ -278,9 +278,9 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
             if not seeking_message and consumed > offset and (
                     len(records) >= (2000 if has_message else 1999)
                     or consumed - offset + len(raw) > 3_500_000):
-                if has_message or not has_attachment:
+                if has_message or not needs_message:
                     break
-                # Attachments need a real message to establish the envelope.
+                # Non-inert prefixes need a real message to establish the envelope.
                 # Replay a later native message as context, retaining its UUID,
                 # but commit only this prefix's byte span. Its physical record
                 # will be read again later and deduplicated by the receiver.
@@ -300,9 +300,11 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
                 continue
             records.append(record)
             has_message = has_message or message
-            has_attachment = has_attachment or (isinstance(record, dict) and record.get("type") == "attachment")
+            needs_message = needs_message or (isinstance(record, dict)
+                and record.get("type") not in _INERT_RECORD_TYPES
+                and bool(drop_command_wrappers([record])))
             consumed = fh.tell()
-    if seeking_message or (has_attachment and not has_message):
+    if seeking_message or (needs_message and not has_message):
         return [], offset  # Keep real content until a complete message arrives.
     return records, consumed
 
@@ -368,12 +370,22 @@ def _namespace(records: list[dict]) -> tuple[str | None, str | None]:
     return cwd, None
 
 
-async def _flush(session_id: str, transcript_path: str) -> None:
-
+def _prepare_tail(session_id, transcript_path):
     size = os.path.getsize(transcript_path)
     state = _read_state(session_id)
     offset = _read_cursor(state, size)
     records, consumed = _read_tail(transcript_path, offset)
+    return state, offset, records, consumed
+
+
+def _prepare_sendable(records):
+    return _redact_once(elide_oversized_tool_results(drop_command_wrappers(records)))
+
+
+async def _flush(session_id: str, transcript_path: str) -> None:
+    # Pure preparation can be abandoned; writes stay with the awaiting owner.
+    state, offset, records, consumed = await capture_async.blocking(
+        _prepare_tail, session_id, transcript_path)
     if not records:
         if consumed > offset:
             _save_state(session_id, offset=consumed)
@@ -415,9 +427,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # runs over what will actually be sent, and before slicing would matter:
     # a single record the server can never accept would otherwise pin the
     # cursor and stall this session's capture for good.
-    sendable = _redact_once(
-        elide_oversized_tool_results(drop_command_wrappers(records))
-    )
+    sendable = await capture_async.blocking(_prepare_sendable, records)
 
     if not sendable or all(
         isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
@@ -425,7 +435,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     ):
         # The title usually arrives in exactly this kind of batch, so read it
         # before dropping the records on the floor.
-        inert_title, inert_custom = _titles(records, state)
+        inert_title, inert_custom = await capture_async.blocking(_titles, records, state)
         fields = {"offset": consumed}
         if inert_title:
             fields["title"] = inert_title
@@ -449,7 +459,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # skipped, and the namespace is silently None for that flush — so its
     # directives extract unscoped and are recalled in every repo, even though an
     # earlier flush had already resolved the name.
-    cwd, namespace = _namespace(records)
+    cwd, namespace = await capture_async.blocking(_namespace, records)
     if not cwd:
         cwd = state.get("cwd") or None
     if not namespace:
@@ -457,7 +467,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         namespace = state.get("namespace") or None
 
     # This delta's title if it carries one, else whatever we last saw.
-    title, custom = _titles(records, state)
+    title, custom = await capture_async.blocking(_titles, records, state)
     # In a THREAD, because resolving can renew the token — two blocking urllib
     # calls, up to ~25s of socket timeout. `asyncio.wait_for` cannot cancel a
     # synchronous call, so run inline it would pin the event loop AND hold the

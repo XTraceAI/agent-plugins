@@ -84,6 +84,16 @@ def cursor_source(path: Path, *, select_saved=False) -> Path:
     raise ValueError("saved observations belong to another source")
 
 
+def discovered_source(path: Path, discovered) -> bool:
+    for row in discovered:
+        try:
+            if Path(row["path"]).resolve(strict=True) == path:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def header_for(reader, path: Path, mtime: float) -> dict:
     native = reader.session_metadata(path)
     sid = native_text(native.get("session_id"), required=True)
@@ -256,7 +266,7 @@ def main(argv=None) -> int:
                 latest = Path(max(discovered, key=latest_mtime)["path"]).resolve(strict=True)
                 if args.host == "cursor":
                     latest = cursor_source(latest, select_saved=True)
-                    if not any(Path(row["path"]).resolve(strict=True) == latest for row in discovered):
+                    if not discovered_source(latest, discovered):
                         diagnostic("session_unavailable")
                         return 2
                     # Discovery prefers stores, whereas native latest may
@@ -298,6 +308,8 @@ def main(argv=None) -> int:
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
                 path = cursor_source(path, select_saved=select_saved)
+                if not explicit_path and not discovered_source(path, discovered):
+                    raise ValueError("saved Cursor source was excluded by discovery")
             revision = source_revision(path, args.host)
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
