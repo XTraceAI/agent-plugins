@@ -184,7 +184,7 @@ def load_rollout(path, *, strict: bool = False) -> list[dict]:
     return records
 
 
-def _text_of(content: Any) -> str:
+def _text_of(content: Any, *, strict: bool = False) -> str:
     """Join the text pieces of a Responses-API content value (a list of
     ``{type: input_text|output_text|text|summary_text, text}`` blocks, or a
     bare string)."""
@@ -195,9 +195,17 @@ def _text_of(content: Any) -> str:
         for b in content:
             if isinstance(b, dict) and isinstance(b.get("text"), str):
                 parts.append(b["text"])
+            elif isinstance(b, dict):
+                if strict and ("text" in b or b.get("type") in
+                               ("input_text", "output_text", "text", "summary_text")):
+                    raise ValueError("Codex text block requires string text")
             elif isinstance(b, str):
                 parts.append(b)
+            elif strict:
+                raise ValueError("Codex content has an unsupported text block")
         return "\n".join(parts)
+    if strict:
+        raise ValueError("Codex text content must be a string or block list")
     return ""
 
 
@@ -624,7 +632,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
             role = pl.get("role")
             if role == "developer":
                 continue  # sandbox/permissions system injection — noise
-            text = _text_of(pl.get("content")).strip()
+            text = _text_of(pl.get("content"), strict=strict).strip()
             if not text:
                 continue
             if role == "user":
@@ -649,7 +657,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
                 append_assistant({"type": "text", "text": text})
 
         elif pt == "reasoning":
-            summary = _text_of(pl.get("summary")).strip()
+            value = pl.get("summary")
+            summary = _text_of(value, strict=strict and value is not None).strip()
             if summary:
                 append_assistant({"type": "thinking", "thinking": summary})
 
