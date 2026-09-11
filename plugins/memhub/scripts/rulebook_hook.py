@@ -2244,7 +2244,8 @@ def fetch_book(repo, timeout=None):
 # would rather not send command text at all. It is a floor, not a guarantee.
 _REDACTIONS = (
     # `--token=x`, `--password x`, `API_KEY=x` — the value, not the flag, so the
-    # judge still sees that a credential was passed.
+    # judge still sees that a credential was passed. A quoted value
+    # (`--token='x'`, `PGPASSWORD="two words"`) goes whole, quotes and all.
     #
     # `auth` is deliberately NOT in this list even though it names plenty of
     # real secrets: it also names `gh auth login`, `--auth-mode`, `auth0_sub`,
@@ -2257,10 +2258,14 @@ _REDACTIONS = (
     # commands. `aws_secret_access_key`, `--with-token` and `API_KEY` all still
     # match, because each ends with one.
     (re.compile(r"(?i)\b([a-z0-9_-]*(?:secret|passwd|password|token|api[_-]?key|"
-                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)([^\s\"']+)"),
+                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
      r"\1\2<redacted>"),
-    # `curl -u user:password`, `-U user:password`.
-    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):([^\s\"']+)"), r"\1\2:<redacted>"),
+    # `curl -u user:password`, `-U user:password`, a quoted password
+    # (`-u user:'pass word'`), and a quoted pair (`-u 'user:pass word'`).
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
+     r"\1\2:<redacted>"),
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)(['\"])([^:'\"]+):([^'\"]*)\2"),
+     r"\1\2\3:<redacted>\2"),
     # Authorization / Proxy-Authorization headers, with or without a scheme.
     (re.compile(r"(?i)(authorization\s*:\s*)(?:bearer|basic|token)?\s*[^\s\"']+"),
      r"\1<redacted>"),
@@ -3004,6 +3009,111 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
     return armed
 
 
+# ── error-arc pairing, for the harness-tied memory sensor ──────────────────
+#
+# A tool error on a command and a later success on the same command are ONE
+# moment, what broke and what fixed it, not two. The post lane already sees
+# every Bash result, so it pairs them here into a per-session file that the
+# Stop sensor (`harness_stop.py`) takes at the end of the turn. The arcs live
+# in their own file on purpose: the session state is merged by delta under a
+# lock for the arming keys only, so a second whole-file writer there could
+# drop another call's arc. Behind the harness flag: with it off nothing here
+# is read or written.
+HARNESS_FLAG = "MEMHUB_HARNESS_EXTRACT"
+ARCS_OPEN_MAX = 20            # distinct failing commands tracked per session
+ARCS_CLOSED_MAX = 20          # closed arcs waiting for the Stop sensor
+
+
+def harness_extract_on(environ=None):
+    env = os.environ if environ is None else environ
+    return str(env.get(HARNESS_FLAG, "")).strip().lower() in ("1", "on", "true", "yes")
+
+
+def arcs_path(session_id):
+    return state_path(session_id)[:-len(".json")] + ".arcs.json"
+
+
+def _update_arcs(session_id, change):
+    """Read, change and write the arcs file under its own lock; returns what
+    `change` returns. Fails open, like every other path in this hook."""
+    p = arcs_path(session_id)
+    lock = _state_lock(p)
+    try:
+        try:
+            with open(p, encoding="utf-8") as f:
+                arcs = json.load(f)
+        except Exception:
+            arcs = {}
+        if not isinstance(arcs, dict):
+            arcs = {}
+        out = change(arcs)
+        # Private (0600): a failed command's text can carry a credential, and
+        # the rename keeps the temp file's mode.
+        tmp = f"{p}.{os.getpid()}.tmp"
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(arcs, f)
+        os.replace(tmp, p)
+        return out
+    except Exception:
+        return None
+    finally:
+        if lock is not None:
+            try:
+                portable_lock.unlock(lock.fileno())
+            except Exception:
+                pass
+            lock.close()
+
+
+def pair_error_arc(session_id, cmd, resp):
+    """Record a Bash failure on `cmd`, or close the arc a later success on the
+    same command completes. `cost` is the number of Bash results between the
+    two; a costly arc is worth a look whatever its error said."""
+    key = shell_only(cmd or "").strip()[:200]
+    if not key:
+        return
+    ok = bash_ok(resp)
+    signature = result_text(resp)[:200]
+
+    def change(arcs):
+        n = arcs["calls"] = int(arcs.get("calls") or 0) + 1
+        opened = arcs.setdefault("open", {})
+        closed = arcs.setdefault("closed", [])
+        if ok:
+            first = opened.pop(key, None)
+            if isinstance(first, dict):
+                closed.append({"signature": first.get("signature", ""), "target": key,
+                               "fix": key, "cost": n - int(first.get("call") or n),
+                               "at": _now()})
+                del closed[:-ARCS_CLOSED_MAX]
+        elif key not in opened:
+            opened[key] = {"signature": signature, "call": n}
+            for stale in list(opened)[:-ARCS_OPEN_MAX]:
+                opened.pop(stale, None)
+
+    _update_arcs(session_id, change)
+
+
+def take_error_arcs(session_id):
+    """The closed arcs since the last take, with the open failures cleared so
+    nothing pairs across turns. Never raises; no file is no arcs."""
+    if not os.path.exists(arcs_path(session_id)):
+        return []
+
+    def change(arcs):
+        closed = [a for a in (arcs.get("closed") or []) if isinstance(a, dict)]
+        arcs.clear()
+        return closed
+
+    got = _update_arcs(session_id, change)
+    return got if isinstance(got, list) else []
+
+
 def result_text(resp):
     if resp is None:
         return ""
@@ -3685,6 +3795,13 @@ def main():
                     if mode == "pre" and tool in EDIT_TOOLS else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
+    # A subagent's arcs are its own: its Stop is ignored by harness_stop.py, so
+    # recording them under the session would hand them to the main agent's turn.
+    if resp is not None and cmd and not ctx["agent_id"] and harness_extract_on():
+        try:
+            pair_error_arc(session, cmd, resp)     # taken by harness_stop.py at Stop
+        except Exception:
+            pass
     ordering = None
     dedup_keys = {}
     by_id = {r["id"]: r for r in rules}
