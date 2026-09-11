@@ -108,13 +108,18 @@ def test_saved_observations_are_strict_only_when_requested_and_never_written():
         path=Path(td)/f'{SID}.json'
         assert cursor_flush._read_state(SID,strict=True)=={}
         for body in ['{bad}','[]','null','{"record_ts":[]}','{"usage_events":17}',
-                     '{"record_ts":{"record":"not a date"}}','{"usage_events":{"generation":{}}}']:
+                     '{"record_ts":{"record":"not a date"}}','{"record_ts":{" ":null}}',
+                     '{"usage_events":{"generation":{}}}',
+                     '{"usage_events":{"11111111-2222-3333-4444-555555555555":{"target_uuid":" ","usage":{"input_tokens":1}}}}',
+                     '{"usage_events":{" ":{"target_uuid":"11111111-2222-3333-4444-555555555555","usage":{"input_tokens":1}}}}']:
             path.write_text(body);before=path.read_bytes()
             cursor_flush._read_state(SID)
             rejected(lambda:cursor_flush._read_state(SID,strict=True))
             assert path.read_bytes()==before
-        path.write_text('{"record_ts":{"record":null},"usage_events":{}}')
-        assert cursor_flush._read_state(SID,strict=True)['record_ts']['record'] is None
+        path.write_text('{"record_ts":{"11111111-2222-3333-4444-555555555555":null},"usage_events":{"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee":{"target_uuid":"11111111-2222-3333-4444-555555555555","usage":{"input_tokens":1}}}}')
+        state=cursor_flush._read_state(SID,strict=True)
+        assert state['record_ts'][SID] is None
+        assert state['usage_events']['aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee']['target_uuid']==SID
 
 
 def test_discovery_reports_missing_and_symlinked_sources_and_keeps_healthy_paths():
