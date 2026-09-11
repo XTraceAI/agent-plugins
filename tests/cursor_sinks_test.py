@@ -308,6 +308,63 @@ def test_cursor_slow_preparation_preserves_deadline_and_has_no_late_state_writes
                 assert not state(home,"local",local[0]).get("blob_ids")
 
 
+def test_cursor_hook_only_pr_evidence_survives_busy_locks_and_missing_source():
+    for unavailable in ("busy", "missing", "disabled", "legacy"):
+        with tempfile.TemporaryDirectory() as td,cases.receiver('local',[]) as local,cases.receiver('cloud',[]) as cloud:
+            home=Path(td);payload,path=source(home);original=path.read_bytes()
+            cases.configure(home,local[0],active=[] if unavailable in ("disabled", "legacy") else None)
+            if unavailable!="legacy":local[2]["provenance"]=cloud[2]["provenance"]=True
+            url="https://github.com/example/project/pull/321"
+            event={**payload,"command":"gh pr create --fill","output":url}
+            fds=[]
+            try:
+                if unavailable=="busy":
+                    for lock in [state_path(home,name,local[0]).with_suffix('.flush.lock') for name in ['local','cloud']]+[shared_path(home).with_suffix('.observations.lock')]:
+                        lock.parent.mkdir(parents=True,exist_ok=True)
+                        fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o600)
+                        portable_lock.lock_exclusive(fd,blocking=False);fds.append(fd)
+                if unavailable=="missing":path.unlink()
+                result=subprocess.run([sys.executable,"-c",
+                    "import cursor_flush,sys;cursor_flush.FLUSH_TIMEOUT_S=0.6;sys.argv=['cursor_flush.py','afterShellExecution'];cursor_flush.main()"],
+                    env=cases.environment(home,cloud[0]),input=json.dumps(event),text=True,capture_output=True,timeout=3)
+                assert result.returncode==0 and 'Traceback' not in result.stderr,result.stderr
+                assert json.loads(shared_path(home).read_text()).get('observed_pr_urls')==[url],unavailable
+                assert not local[1] and not cloud[1]
+            finally:
+                for fd in fds:os.close(fd)
+            path.write_bytes(original);cases.configure(home,local[0]);cloud[2]['status']=500
+            invoke(home,cloud[0],payload)
+            for receiver in [local,cloud]:
+                assert cases.routing.imports(receiver[1])[-1]['provenance']=={'github_pr_urls':[url]}
+            assert state(home,'local',local[0])['accepted_pr_urls']==([] if unavailable=='legacy' else [url])
+            assert not state(home,'cloud',local[0]).get('accepted_pr_urls')
+            cloud[2]['status']=200;invoke(home,cloud[0],payload)
+            assert len(local[1])==1 and len(cloud[1])==2
+            assert state(home,'cloud',local[0])['accepted_pr_urls']==([] if unavailable=='legacy' else [url])
+            invoke(home,cloud[0],payload)
+            assert len(local[1])==1 and len(cloud[1])==2
+            assert path.read_bytes()==original
+
+
+def test_concurrent_cursor_pr_observations_merge_under_state_ownership():
+    from concurrent.futures import ThreadPoolExecutor
+    with tempfile.TemporaryDirectory() as td,cases.receiver('local',[]) as local,cases.receiver('cloud',[]) as cloud:
+        home=Path(td);payload,path=source(home);cases.configure(home,local[0],active=[])
+        env=cases.environment(home,cloud[0]);urls=[f"https://github.com/example/project/pull/{n}" for n in range(321,325)]
+        lock=shared_path(home).with_suffix('.observations.lock');lock.parent.mkdir(parents=True,exist_ok=True)
+        fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o600);portable_lock.lock_exclusive(fd,blocking=False)
+        def fire(url):
+            result=subprocess.run([sys.executable,"-c",
+                "import cursor_flush,sys;cursor_flush.FLUSH_TIMEOUT_S=0.2;sys.argv=['cursor_flush.py','afterShellExecution'];cursor_flush.main()"],
+                env=env,input=json.dumps({**payload,"command":"gh pr create --fill","output":url}),text=True,capture_output=True,timeout=3)
+            assert result.returncode==0 and 'Traceback' not in result.stderr,result.stderr
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(fire,urls))
+        finally:os.close(fd)
+        assert set(json.loads(shared_path(home).read_text())['observed_pr_urls'])==set(urls)
+        assert not local[1] and not cloud[1]
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

@@ -225,6 +225,7 @@ def _state_path(uuid: str) -> Path:
 # Keep these in the original file so readers_cli sees exactly the hook's pins.
 _SHARED_STATE_FIELDS = frozenset({
     "usage_events", "record_ts", "cursor_meta", "source_kind", "transcript_path",
+    "observed_pr_urls",
 })
 
 
@@ -260,11 +261,29 @@ def _delivery_path(uuid: str) -> Path:
 
 def _read_state(uuid: str, *, strict: bool = False) -> dict:
     shared = _state_at(_state_path(uuid), strict=strict)
-    if _delivery_path(uuid) == _state_path(uuid):
-        return shared
-    return {**{key: value for key, value in shared.items() if key in _SHARED_STATE_FIELDS},
-            **{key: value for key, value in _state_at(_delivery_path(uuid), strict=strict).items()
-               if key not in _SHARED_STATE_FIELDS}}
+    state = shared if _delivery_path(uuid) == _state_path(uuid) else {
+        **{key: value for key, value in shared.items() if key in _SHARED_STATE_FIELDS},
+        **{key: value for key, value in _state_at(_delivery_path(uuid), strict=strict).items()
+           if key not in _SHARED_STATE_FIELDS}}
+    # Hook-only evidence is native observation; acknowledgements belong to
+    # each destination. Reconstruct pending links on every later event.
+    observed = shared.get("observed_pr_urls")
+    if observed:
+        accepted = (set(pr_provenance.merge_urls(state.get("accepted_pr_urls") or []))
+                    | set(pr_provenance.merge_urls(state.get("settled_pr_urls") or [])))
+        state["pending_pr_urls"] = [url for url in pr_provenance.merge_urls(
+            state.get("pending_pr_urls") or [], observed) if url not in accepted]
+    return state
+
+
+def _merge_observations(state, fields):
+    merged = {**state, **fields}
+    if "observed_pr_urls" in fields:
+        # Merge under the existing short state lock, independently of the
+        # source-observation and destination-upload locks.
+        merged["observed_pr_urls"] = pr_provenance.merge_urls(
+            fields["observed_pr_urls"], state.get("observed_pr_urls") or [])
+    return merged
 
 
 def _save_state(uuid: str, **fields) -> None:
@@ -289,7 +308,7 @@ def _save_state(uuid: str, **fields) -> None:
             portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
         if _delivery_path(uuid) == _state_path(uuid):
             state = _read_state(uuid)
-            state.update(fields)
+            state = _merge_observations(state, fields)
             atomic_write.publish(_state_path(uuid), json.dumps(state))
         else:
             # The original lock serializes pins and both destination files.
@@ -299,7 +318,7 @@ def _save_state(uuid: str, **fields) -> None:
             delivery = {key: value for key, value in fields.items() if key not in _SHARED_STATE_FIELDS}
             if shared:
                 state = _state_at(_state_path(uuid))
-                state.update(shared)
+                state = _merge_observations(state, shared)
                 atomic_write.publish(_state_path(uuid), json.dumps(state))
             if delivery:
                 state = _state_at(_delivery_path(uuid))
@@ -1107,6 +1126,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # matches nothing and ships in the clear. Verified both ways.
         arguments["title"] = redact_text(title.strip())[:200]
 
+    submitted_pr_urls = list(pending_pr_urls)
     payloads = [part[start:start + 2000] for part in make_slices(sendable)
                 for start in range(0, len(part), 2000)]
     for batch in payloads:
@@ -1150,6 +1170,11 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
               "unsupported": False, "unsupported_at": 0,
               "pending_pr_urls": pending_pr_urls,
               "accepted_pr_urls": accepted_pr_urls,
+              # A confirmed transcript from an older backend may omit the
+              # optional provenance ack. Keep its compatibility no-retry
+              # outcome separate from genuinely acknowledged PR evidence.
+              "settled_pr_urls": pr_provenance.merge_urls(
+                  submitted_pr_urls, state.get("settled_pr_urls") or []),
               "fail_streak": 0}
     if source_kind == "store":
         # On a CONFIRMED import, advance the watermark even when the post-read
@@ -1223,6 +1248,10 @@ def _capture_sink(payload: dict, *, observations_only: bool = False,
         return 0
     event_pr_urls, missing_pr_urls = pr_provenance.scan_shell_event(
         event, payload)
+    if event_pr_urls:
+        # Transcript files omit shell output. Record it before any upload or
+        # source-observation wait, even with disabled delivery or no source.
+        _save_state(uuid, observed_pr_urls=event_pr_urls)
     if missing_pr_urls:
         _log(f"{event}: direct gh pr create result had no canonical "
              "GitHub PR URL")

@@ -51,6 +51,9 @@ def receiver(label, order):
             assert request["params"]["name"] == "import_conversation"
             result = {"conversation_id": args.get("conversation_id"),
                       "records_new": len(args.get("messages", [])), "pending": 0}
+            if "provenance" in controls:
+                result["provenance_received"] = {"github_pr_urls":
+                    args.get("provenance", {}).get("github_pr_urls", []) if controls["provenance"] else []}
             if controls["ack"]:
                 result["ack_through"] = (args.get("messages") or [{}])[-1].get("uuid")
             if controls.get("partial_ack"):
