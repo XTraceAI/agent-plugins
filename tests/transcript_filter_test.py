@@ -417,10 +417,14 @@ for script in ("flush_turn.py", "flush_session.py", "import_session.py",
     # nested — redact_records( opens before the elide call with no paren
     # closing between them, so elide is its argument; or sequential — a
     # redact_records( call follows the elide line.
-    wrap = body.rfind("redact_records(", 0, e)
-    nested = wrap != -1 and ")" not in body[wrap + len("redact_records("):e]
-    sequential = body.find("redact_records(", e) != -1
-    check(f"{script} redacts AFTER eliding", nested or sequential)
+    redactors = ("redact_records(", "_redact_once(")
+    ordered = False
+    for redactor in redactors:
+        wrap = body.rfind(redactor, 0, e)
+        nested = wrap != -1 and ")" not in body[wrap + len(redactor):e]
+        sequential = body.find(redactor, e) != -1
+        ordered |= nested or sequential
+    check(f"{script} redacts AFTER eliding", ordered)
 
 # And the kept head of a hard-trimmed block is real input to that scan: a
 # credential inside the head survives elision, then redaction scrubs it.
