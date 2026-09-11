@@ -235,13 +235,16 @@ def test_e01_confirmed_ack_advances_the_watermark():
 def test_e02_null_ack_holds_the_watermark():
     for host in hosts("e02"):
         mark = confirmed(host)
+        before = time.time()
         with serving(reply({"conversation_id": host.conv, "ack_through": None})):
             host.flush()
         assert_held_failure(host, mark, "unconfirmed_import",
                             "import NOT confirmed (ack_through null)")
         if isinstance(host, Cursor):
-            # Cursor's backoff between failures is the debounce stamp
-            assert host.state()["last_flush_at"] > 0
+            # Cursor's backoff between failures is the debounce stamp — and
+            # the success path set it too, so only a FRESH stamp proves the
+            # failure path wrote it.
+            assert host.state()["last_flush_at"] >= before, host.state()
     print("PASS test_e02_null_ack_holds_the_watermark")
 
 
@@ -304,6 +307,7 @@ def test_e06_ack_for_another_conversation_holds():
 def test_e07_missing_ack_field_goes_dormant_at_once():
     for host in hosts("e07"):
         mark = confirmed(host)
+        host.set_state(fail_streak=3)   # so "streak 0" proves a reset
         before = time.time()
         with serving(reply({"conversation_id": host.conv})):
             host.flush()
@@ -382,7 +386,10 @@ def test_e12_failed_reprobe_stays_dormant_without_a_fresh_budget():
     for host in hosts("e12"):
         mark = confirmed(host)
         _go_dormant(host)
-        host.set_state(unsupported_at=time.time() - codex_flush.DORMANT_RETRY_S - 5)
+        # fail_streak 2 so "streak 0" afterwards proves the dormant branch
+        # resets it rather than counting the failed re-probe
+        host.set_state(unsupported_at=time.time() - codex_flush.DORMANT_RETRY_S - 5,
+                       fail_streak=2)
         assert host.gate_open(), host.state()
         before = time.time()
         with serving(_null(host)) as server:

@@ -21,7 +21,7 @@ Every row's *Where to look* names one of these and nothing vaguer. All paths are
 | **OP-CX-STATE** | `~/.config/memhub-plugin/codexflush/<sid>.json` | `codex_flush._save_state` |
 | **OP-CU-LOG** | `~/.config/memhub-plugin/cursorflush/log` (`[cursor-flush]`) | `cursor_flush._log`, the Cursor launcher |
 | **OP-CU-STATE** | `~/.config/memhub-plugin/cursorflush/<uuid>.json` | `cursor_flush._save_state` |
-| **OP-CL-STATE** | `~/.config/memhub-plugin/turnflush/<sid>.json` and `<sid>.sessionflush.json`. These are **the only files `capture_health` reads**. | `flush_turn`, `flush_session._breadcrumb` |
+| **OP-CL-STATE** | `~/.config/memhub-plugin/turnflush/<sid>.json` and `<sid>.sessionflush.json`. These are **the only capture-state files `capture_health` reads** (it also reads the token cache and the rulebook cache, but no Codex or Cursor state). | `flush_turn`, `flush_session._breadcrumb` |
 | **OP-ROW** | The conversation row in MemHub: count, name, room, message count | server |
 | **OP-CX-HOOKS** | `~/.codex/hooks.json`, `~/.codex/memhub_hook_bridge.py` | `setup_codex_hooks.py` |
 | **OP-EXIT** | A non-zero exit code with a documented meaning (`link-pr`: `4` ambiguous, `3` not found) | the script |
@@ -56,7 +56,9 @@ Every row's *Where to look* names one of these and nothing vaguer. All paths are
 
 *Held* means the watermark stays at the last confirmed value while newer content waits for the next attempt.
 
-Rows that list "Codex, Cursor" were checked on both. Tests live in `tests/capture_server_replies_test.py`, drive the real state file and log, and stub only the credential, the MCP session and the rollout parse. Pure reply classification (`_verdict`) is also pinned in `codex_capture_test.py` / `cursor_capture_test.py::test_import_verdicts_and_dormancy`.
+Rows that list "Codex, Cursor" were checked on both. Tests live in `tests/capture_server_replies_test.py`, drive the real state file and log, and stub only the credential, the MCP session and the rollout parse.
+
+Codex rows run through `_flush_locked`, which includes the event gate, the cooldown, the deadline and the broad handler. Cursor rows run `_flush` directly, so on Cursor "refused inside the window" is checked through `should_flush` as a pure function, not through `main()`. Pure reply classification (`_verdict`) is also pinned in `codex_capture_test.py` / `cursor_capture_test.py::test_import_verdicts_and_dormancy`.
 
 | # | Variation (ordering) | Host(s) | Expected observable | Where to look | Automated? |
 |---|---|---|---|---|---|
@@ -75,7 +77,7 @@ Rows that list "Codex, Cursor" were checked on both. Tests live in `tests/captur
 | E12 | Dormant, window elapses, re-probe answers `null` | Codex, Cursor | One server call; **stays dormant**; `unsupported_at` reset to now; streak 0 (no fresh 5-attempt budget); refused again | same | `test_e12_failed_reprobe_stays_dormant_without_a_fresh_budget` |
 | E13 | Dormant, window elapses, re-probe confirmed | Codex, Cursor | **Advance and re-arm.** `unsupported: false`, `unsupported_at: 0`, streak 0; gate open | same | `test_e13_confirmed_reprobe_rearms_the_session` |
 | E14 | Codex: a failed flush, then within 60 s a `git commit` PostToolUse, then a `Stop` | Codex | PostToolUse makes **no server call**; log `PostToolUse: unconfirmed_import 0s ago — cooling down (60s)`. The Stop **does** call the server. | OP-CX-LOG | `test_e14_codex_cooldown_skips_milestones_but_not_stop`, `test_e14b_cooldown_is_logged_with_its_window` |
-| E15 | Server call outlives the flush deadline (`FLUSH_TIMEOUT_S`, 240 s) | Codex | **Hold**; streak 1; `last_error: flush_error: TimeoutError`; log `Stop: flush error: …` | OP-CX-STATE/LOG | `test_e15_codex_timeout_counts_toward_dormancy` |
+| E15 | Server call outlives the flush deadline (`FLUSH_TIMEOUT_S`, 240 s) | Codex | **Hold**; streak 1; `last_error: flush_error: TimeoutError`; log `Stop: flush error:` (a timeout carries no message, so nothing follows) | OP-CX-STATE/LOG | `test_e15_codex_timeout_counts_toward_dormancy` |
 | E15 | same | Cursor | Expected: identical, via `cursor_flush.main`'s own `wait_for` and broad handler | OP-CU-STATE/LOG | **No.** `main()` owns the timeout (FE-5) |
 | E16 | Server reachable, then the connection drops mid-call | Codex | **Hold**; streak 1; `last_error: flush_error: ConnectionResetError`; log `Stop: flush error: <message>` | OP-CX-STATE/LOG | `test_e16_connection_drop_mid_call` |
 | E16 | same | Cursor | `_flush` lets the error out with the watermark held (automated); `main()` converts it to `flush_error: <Type>` plus a streak step (not automated, FE-5) | OP-CU-STATE/LOG | Partial: `test_e16_connection_drop_mid_call` |
@@ -95,6 +97,7 @@ Recorded here, not fixed: ENG-1034 is an observer of capture code.
 - **FE-3 — Auth failures are not named on Codex/Cursor.** Both flushers fold 401, 403, 5xx and transport errors into `mcp_error: <message>`. `flush_session` distinguishes `auth` and `forbidden`, which is what lets a health message name the fix.
 - **FE-4 — A real Claude SessionEnd rejection, cause unknown.** Session `33f509ce-…` (2026-09-09 14:59) breadcrumbed `server_rejected` with *"messages failed validation: Input should be 'user', 'ai' or 'assistant'"*. That is the source of the owner's *"capture last failed 23h ago"*. The transcript now holds only `custom-title` and `agent-name` records. Claude path; triage separately from this matrix.
 - **FE-5 — Cursor `main()`'s timeout and transport-raise handling is not automated.** E15/E16 on Cursor need a driver that goes through `main()`: a transcript on disk, the session lock and the event gate.
+- **FE-6 — Stale docstrings in the code under test.** `codex_flush._note_failure` and `cursor_flush._note_failure` say a re-probe after `DORMANT_RETRY_S` gets "a FRESH budget". Their dormant branch does the opposite: a failed re-probe stays dormant and restarts the timer. E12 pins what the code does.
 
 ## 4. Families A–D, F, G
 
@@ -110,7 +113,7 @@ The manual checklist also belongs to 1034b.
 
 ## 5. Test sandbox: Deliverable 3, as built
 
-**Found.** Every suite on `2c50f8c` was run under a throwaway `$HOME` and checked for files left behind. Exactly **2 of 50** wrote into it:
+**Found.** Every suite on `2c50f8c` was run under a throwaway `$HOME` and checked for files left behind. Exactly **2 of 49** wrote into it:
 - `codex_capture_test.py` → `.config/memhub-plugin/codexflush/log`
 - `cursor_capture_test.py` → `.config/memhub-plugin/cursorflush/log`
 
@@ -118,6 +121,14 @@ Both flushers fix `STATE_DIR` from `Path.home()` at import, and neither suite re
 
 **Fixed, in two layers:**
 1. **Each suite that imports capture code redirects `HOME` and `USERPROFILE` before the import** (the `flush_session_test.py` pattern). The two leaking suites now do, as does `capture_server_replies_test.py`. This makes a direct `python3 tests/<suite>.py` safe.
-2. **`tests/run_all.py` runs every suite under its own throwaway `HOME`** (plus `USERPROFILE`, `XDG_CONFIG_HOME`), and **fails a suite that leaves any file in it**, naming the files. This keeps the runner hermetic and turns the next leaking suite into a red build instead of a polluted log. The check is pinned by `tests/run_all_sandbox_test.py`.
+2. **`tests/run_all.py` runs every suite under its own throwaway `HOME`** (plus `USERPROFILE`, `XDG_CONFIG_HOME`, and `PYTHONDONTWRITEBYTECODE=1`), and **fails a suite that leaves any file in it**, naming the files. This keeps the runner hermetic and turns the next suite that writes through `Path.home()` into a red build instead of a polluted log. The check is pinned by `tests/run_all_sandbox_test.py`.
+   - `PYTHONDONTWRITEBYTECODE` matters on macOS: the Command Line Tools `/usr/bin/python3` sets `sys.pycache_prefix` under `$HOME/Library/Caches`, so every child would otherwise write bytecode into the throwaway HOME and fail.
+   - **What the check does not catch:**
+     - writes routed through other variables that can point at the real home (`CODEX_HOME`, `MEMHUB_ROOMS_FILE`, `MEMHUB_RULEBOOK_BASE`, `XDG_CACHE_HOME`, …);
+     - empty directories;
+     - files a suite creates and then deletes;
+     - writes by detached children after the suite exits.
 
-**The rule for new suites.** If the code under test resolves anything from `Path.home()`, redirect `HOME`/`USERPROFILE` to a temp dir before importing it. The runner will fail the suite otherwise.
+     None of the current suites does any of these.
+
+**The rule for new suites.** If the code under test resolves anything from `Path.home()`, redirect `HOME`/`USERPROFILE` to a temp dir before importing it.

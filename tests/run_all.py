@@ -58,10 +58,14 @@ def run_suite(suite: Path) -> tuple[bool, str, list[str]]:
         # amount of decode tolerance on OUR side can fix the child crashing.
         # HOME and USERPROFILE both: POSIX expanduser reads HOME, Windows
         # reads USERPROFILE and never consults HOME.
+        # PYTHONDONTWRITEBYTECODE: macOS's Command Line Tools python3 sets
+        # sys.pycache_prefix under $HOME/Library/Caches, so without it every
+        # child writes stdlib bytecode into the throwaway HOME and fails.
         result = subprocess.run([sys.executable, str(suite)],
                                 capture_output=True, text=True,
                                 encoding="utf-8", errors="replace",
                                 env={**os.environ, "PYTHONUTF8": "1",
+                                     "PYTHONDONTWRITEBYTECODE": "1",
                                      "HOME": home, "USERPROFILE": home,
                                      "XDG_CONFIG_HOME": os.path.join(home, ".config")})
         written = sorted(p.relative_to(home).as_posix()

@@ -81,6 +81,21 @@ def test_failing_suite_that_writes_nothing_still_fails():
     print("PASS test_failing_suite_that_writes_nothing_still_fails")
 
 
+def test_child_writes_no_bytecode():
+    # macOS's Command Line Tools python3 points sys.pycache_prefix under
+    # $HOME/Library/Caches: without this, importing anything would write .pyc
+    # files into the throwaway HOME and fail every suite on that interpreter.
+    root = _suites(("probe_test.py",
+                    "import os, sys\n"
+                    "print('dont_write', os.environ.get('PYTHONDONTWRITEBYTECODE'),"
+                    " sys.dont_write_bytecode)\n"))
+    ok, output, written = run_all.run_suite(root / "probe_test.py")
+    assert ok, output
+    assert "dont_write 1 True" in output, output
+    assert written == [], written
+    print("PASS test_child_writes_no_bytecode")
+
+
 def test_main_reports_the_leaking_suite():
     root = _suites(("clean_test.py", CLEAN), ("leaky_test.py", LEAKY))
     out = io.StringIO()
