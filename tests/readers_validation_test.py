@@ -643,6 +643,11 @@ def test_checked_codex_tool_arguments_preserve_supported_values_or_fail():
                 payload={'type':kind,'call_id':'native-call','name':'native-tool',field:raw}
                 path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
                 assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+            for raw in ['{"value":NaN}','[Infinity]','1e999']:
+                payload={'type':kind,'call_id':'native-call','name':'native-tool',field:raw}
+                path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+                codex.to_canonical(path)
+                rejected(lambda:codex.to_canonical(path,strict=True))
 
 
 def test_idless_tool_use_exception_is_limited_to_transcripts():

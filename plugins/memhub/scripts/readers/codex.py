@@ -224,7 +224,7 @@ def _tool_input(payload: dict, *, strict: bool = False) -> dict:
         return raw
     if isinstance(raw, str):
         try:
-            v = json.loads(raw)
+            v = load_json(raw, strict=strict)
             return v if isinstance(v, dict) else {"input": v}
         except json.JSONDecodeError:
             return {"input": raw}
