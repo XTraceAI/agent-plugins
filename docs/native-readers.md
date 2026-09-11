@@ -12,7 +12,8 @@ Checked mode adds validation to the existing normalization. It rejects invalid U
 text, malformed complete JSON rows, non-finite numbers, and Cursor content
 shapes the normalizer cannot preserve. Existing Cursor blob hashes, references
 and framing are checked before returning the tree. Original files are not
-edited, and healthy inputs keep their IDs, usage and timestamps.
+edited, and healthy inputs keep their IDs, usage and timestamps. Checked Codex
+reads require a nonempty native session ID before generating record identities.
 
 For JSONL, CR/LF terminates a committed row. An unparseable final fragment
 without that delimiter is deferred until a later read, even if its current
