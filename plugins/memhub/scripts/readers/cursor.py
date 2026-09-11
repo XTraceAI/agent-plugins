@@ -355,11 +355,8 @@ def _parse_node(data: bytes, *, strict: bool = False) -> tuple[list[str], int | 
     return out, ts
 
 
-def _validate_message(message, *, source_kind):
-    if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
-        raise ValueError("Cursor source has no supported message role")
-    content = message.get("content")
-    provider_options = message.get("providerOptions")
+def _validate_model_options(value) -> None:
+    provider_options = value.get("providerOptions") if isinstance(value, dict) else None
     if provider_options is not None:
         if not isinstance(provider_options, dict):
             raise ValueError("Cursor provider options must be an object")
@@ -370,6 +367,13 @@ def _validate_message(message, *, source_kind):
             model = cursor_options.get("modelName")
             if model is not None and (not isinstance(model, str) or not model.strip()):
                 raise ValueError("Cursor model must be nonblank text or null")
+
+
+def _validate_message(message, *, source_kind):
+    if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
+        raise ValueError("Cursor source has no supported message role")
+    content = message.get("content")
+    _validate_model_options(message)
     if not isinstance(content, (str, list)) or (isinstance(content, list)
             and any(not isinstance(block, dict) for block in content)):
         raise ValueError("Cursor message has invalid content")
@@ -383,6 +387,7 @@ def _validate_message(message, *, source_kind):
     if role not in ("assistant", "tool") or isinstance(content, str):
         return
     for block in content:
+        _validate_model_options(block)
         kind = block.get("type")
         allowed = ("reasoning", "text", "tool-call", "tool_use") if role == "assistant" else ("tool-result",)
         if kind not in allowed:
