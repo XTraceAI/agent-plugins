@@ -23,6 +23,11 @@ cannot silently invent a tool identity or disconnect its result. A malformed
 working-directory value or creation-time type fails the checked store read
 because copying it could assign the wrong project or a fabricated date.
 
+Checked Cursor reads preserve valid usage from empty assistant messages as
+usage-only records. Those records have separate stable IDs, preserving existing
+record and tool identities. Native lifecycle events remain ignorable; an
+unsupported message role reports incomplete input instead of hiding a message.
+
 `session_metadata(path)` reads native identity, surface, start and repository
 metadata without deriving a title from a prompt. Missing facts remain unknown.
 `list_sessions(..., on_error=callback)` reports inaccessible or skipped sources;

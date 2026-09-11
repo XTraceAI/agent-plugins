@@ -493,6 +493,68 @@ def test_checked_metadata_decoding_rejects_invalid_utf8_at_both_store_locations(
             assert all(path.read_bytes()==raw for path,raw in originals.items())
 
 
+def test_checked_codex_tools_require_consumed_native_identity():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];original=path.read_bytes()
+        for kind in ('function_call','custom_tool_call','function_call_output','custom_tool_call_output'):
+            valid={'type':kind,'call_id':'native-call','name':'native-tool','output':'done'}
+            fields=['call_id','name'] if kind.endswith('_call') else ['call_id']
+            for field in fields:
+                for value in (None,'',' ',17,False):
+                    payload=dict(valid);payload[field]=value
+                    path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+                    before=path.read_bytes();codex.to_canonical(path)
+                    rejected(lambda:codex.to_canonical(path,strict=True))
+                    assert path.read_bytes()==before
+            # Both native ID spellings used by normalization remain supported.
+            for key in ('call_id','id'):
+                payload=dict(valid);payload.pop('call_id');payload[key]='native-call'
+                path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+                assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+
+
+def test_checked_cursor_transcripts_reject_unknown_roles():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[1][1];original=path.read_bytes();expected=cursor.to_canonical(path)
+        for role in ('future','',None,17,[]):
+            path.write_bytes(json.dumps({'role':role,'message':{'content':'unsupported'}}).encode()+b'\n'+original)
+            before=path.read_bytes()
+            assert cursor.to_canonical(path)==expected
+            rejected(lambda:cursor.to_canonical(path,strict=True))
+            assert path.read_bytes()==before
+
+
+def test_checked_cursor_empty_assistants_preserve_usage_and_legacy_identities():
+    for content in ('',' \t',[],[{'type':'text','text':''}],[{'type':'reasoning','text':' '} ]):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td)
+            message={'role':'assistant','content':content,'usage':{'inputTokens':3},
+                     'providerOptions':{'cursor':{'modelName':'native-model'}}}
+            transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[
+                {'role':'assistant','message':{k:v for k,v in message.items() if k!='role'}},
+                {'role':'assistant','message':{'content':[{'type':'tool_use','name':'native-tool'}]}}])
+            store=fixtures._make_cursor_store(home/'chats')
+            raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as sql:
+                sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(identity,raw))
+                sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':identity}),))
+            for source in (transcript,store):
+                before=source.read_bytes();legacy,_=cursor.to_canonical(source)
+                checked,_=cursor.to_canonical(source,strict=True)
+                measured=[r for r in checked if r.get('message',{}).get('usage')]
+                assert len(measured)==1 and measured[0]['message']['usage']['input_tokens']==3
+                assert measured[0]['message']['content']==[{'type':'text','text':''}]
+                assert measured[0]['message']['model']=='native-model'
+                assert [r for r in checked if r not in measured]==legacy
+                assert len({r['uuid'] for r in checked})==len(checked)
+                assert cursor.to_canonical(source,strict=True)[0]==checked
+                assert source.read_bytes()==before
+            first=cursor.to_canonical(transcript,strict=True)[0]
+            with transcript.open('a') as handle:
+                handle.write(json.dumps({'role':'assistant','message':{'content':'later'}})+'\n')
+            assert cursor.to_canonical(transcript,strict=True)[0][:-1]==first
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

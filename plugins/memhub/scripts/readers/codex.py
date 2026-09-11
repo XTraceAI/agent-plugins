@@ -608,6 +608,16 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
             continue
         pt = pl.get("type")
 
+        if strict and pt in ("function_call", "custom_tool_call",
+                             "function_call_output", "custom_tool_call_output"):
+            identity = pl.get("call_id") or pl.get("id")
+            if not isinstance(identity, str) or not identity.strip():
+                raise ValueError("Codex tool record requires its native call identifier")
+            if pt in ("function_call", "custom_tool_call"):
+                name = pl.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("Codex tool call requires its native tool name")
+
         if pt == "message":
             role = pl.get("role")
             if role == "developer":
