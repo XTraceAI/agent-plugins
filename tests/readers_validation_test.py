@@ -694,7 +694,9 @@ def test_codex_metadata_checks_committed_prefix_and_finite_json():
         path=sources(Path(td))[0][1];original=path.read_bytes()
         expected=codex.session_metadata(path)
         for ending in (b'\n',b'\r',b'\r\n'):
-            for prefix in (b'{bad}',b'null',b'[]',b'{"ignored":NaN}',b'{"ignored":1e999}'):
+            for prefix in (b'{bad}',b'null',b'[]',b'{"ignored":NaN}',b'{"ignored":1e999}',
+                           b'{"type":"session_meta","payload":null}',
+                           b'{"type":"session_meta","payload":17}'):
                 path.write_bytes(prefix+ending+original)
                 before=path.read_bytes()
                 rejected(lambda:codex.session_metadata(path))
@@ -709,6 +711,9 @@ def test_codex_metadata_checks_committed_prefix_and_finite_json():
         for tail in (b'{unfinished',b'{bad}'):
             path.write_bytes(tail)
             assert codex.session_metadata(path)=={}
+        path.write_bytes(b'{"type":"session_meta","payload":{}}\n'+original)
+        assert codex.session_metadata(path)['session_id'] is None
+        assert codex.session_metadata(path,strict=False)==expected
 
 
 def test_cursor_schema_version_requires_an_integer():
