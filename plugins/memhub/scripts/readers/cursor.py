@@ -359,6 +359,17 @@ def _validate_message(message, *, source_kind):
     if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
         raise ValueError("Cursor source has no supported message role")
     content = message.get("content")
+    provider_options = message.get("providerOptions")
+    if provider_options is not None:
+        if not isinstance(provider_options, dict):
+            raise ValueError("Cursor provider options must be an object")
+        cursor_options = provider_options.get("cursor")
+        if cursor_options is not None:
+            if not isinstance(cursor_options, dict):
+                raise ValueError("Cursor provider options must contain an object")
+            model = cursor_options.get("modelName")
+            if model is not None and (not isinstance(model, str) or not model.strip()):
+                raise ValueError("Cursor model must be nonblank text or null")
     if not isinstance(content, (str, list)) or (isinstance(content, list)
             and any(not isinstance(block, dict) for block in content)):
         raise ValueError("Cursor message has invalid content")

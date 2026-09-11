@@ -493,15 +493,21 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
     sm = _session_meta(rollout)
     if strict and (not isinstance(sm.get("id"), str) or not sm["id"].strip()):
         raise ValueError("Codex checked reads require a native session identifier")
+    if strict and sm.get("cli_version") is not None and not isinstance(sm["cli_version"], str):
+        raise ValueError("Codex CLI version must be text or null")
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
     for r in rollout:
         if not isinstance(r, dict):  # see _rollout_thread_name
             continue
         pl = r.get("payload")
-        if isinstance(pl, dict) and r.get("type") == "turn_context" and pl.get("model"):
-            model = pl["model"]
-            break
+        if isinstance(pl, dict) and r.get("type") == "turn_context":
+            value = pl.get("model")
+            if strict and value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("Codex model must be nonblank text or null")
+            if value:
+                model = value
+                break
     meta = {
         "session_id": sm.get("id"),
         "cwd": cwd,
