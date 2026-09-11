@@ -525,7 +525,7 @@ def _model_of(obj) -> str | None:
 
 def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                   session_id: str, cwd: str | None, model_hint: str | None,
-                  created_ts: str | None) -> tuple[list[dict], dict]:
+                  created_ts: str | None, strict: bool = False) -> tuple[list[dict], dict]:
     """Transform either native source after it has yielded ordered messages.
 
     Each message's ``ts`` is a clock the artifact carries FOR IT (or None —
@@ -533,6 +533,11 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
     """
     ts_holder: dict = {"ts": None}
     out: list[dict] = []
+    usage_only_count = 0
+
+    def legacy_index() -> int:
+        # Recovered measurements must not shift existing record or tool IDs.
+        return len(out) - usage_only_count
 
     def rec(record: dict) -> dict:
         if cwd:
@@ -541,7 +546,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
         # one are SKIPPED by the agentic parser (imported as nothing).
         # Deterministic over (session, output index) so re-flushes fold.
         record["uuid"] = str(_uuid.uuid5(
-            _uuid.NAMESPACE_URL, f"memhub:cursor:{session_id}:{len(out)}"))
+            _uuid.NAMESPACE_URL, f"memhub:cursor:{session_id}:{legacy_index()}"))
         if ts_holder["ts"]:
             record["timestamp"] = ts_holder["ts"]
         return record
@@ -574,7 +579,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
     out.append(user(banner))
 
     title = None
-    for msg, message_ts in dated_messages:
+    for message_index, (msg, message_ts) in enumerate(dated_messages):
         ts_holder["ts"] = message_ts
         role = msg.get("role")
         content = msg.get("content")
@@ -622,13 +627,21 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                     record = assistant({
                         "type": "tool_use",
                         "id": (b.get("toolCallId") or b.get("id") or
-                               f"cursor-call-{len(out)}"),
+                               f"cursor-call-{legacy_index()}"),
                         "name": b.get("toolName") or b.get("name") or "tool",
                         "input": args if isinstance(args, dict) else {"input": args},
                     }, block_model)
                     out.append(record)
                     emitted.append(record)
             usage = _usage_of(msg)
+            if strict and usage and not emitted:
+                record = assistant({"type": "text", "text": ""}, _model_of(msg))
+                record["uuid"] = str(_uuid.uuid5(
+                    _uuid.NAMESPACE_URL,
+                    f"memhub:cursor:{session_id}:usage-only:{message_index}"))
+                out.append(record)
+                emitted.append(record)
+                usage_only_count += 1
             if emitted and usage:
                 emitted[-1]["message"]["usage"] = usage
             continue
@@ -644,7 +657,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                         json.dumps(result) if result is not None else "")
                 out.append(user([{
                     "type": "tool_result",
-                    "tool_use_id": b.get("toolCallId") or f"cursor-out-{len(out)}",
+                    "tool_use_id": b.get("toolCallId") or f"cursor-out-{legacy_index()}",
                     "content": result,
                 }]))
 
@@ -697,6 +710,9 @@ def _load_transcript(path: Path, *, strict: bool = False) -> list[tuple[dict, st
                 continue
             if entry.get("role") not in (
                     "system", "user", "assistant", "tool"):
+                if strict and ("role" in entry or "message" in entry):
+                    raise ValueError("Cursor transcript has no supported message role")
+                # Native lifecycle events such as turn_ended are not messages.
                 continue
             body = entry.get("message")
             if not isinstance(body, dict):
@@ -728,7 +744,7 @@ def to_canonical(path, *, session_id: str | None = None,
         created_ts = next((ts for _, ts in messages if ts), None)
         return _canonicalize(
             messages, session_id=sid, cwd=cwd, model_hint=model,
-            created_ts=created_ts)
+            created_ts=created_ts, strict=strict)
 
     session_dir = source.parent
     mj = _read_meta_json(session_dir, strict=strict) or {}
@@ -747,7 +763,7 @@ def to_canonical(path, *, session_id: str | None = None,
                 for message, node_ts in _load_messages(source, strict=strict)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_created_at(mj, strict=strict))
+        model_hint=None, created_ts=_created_at(mj, strict=strict), strict=strict)
 
 
 def session_metadata(path) -> dict:
