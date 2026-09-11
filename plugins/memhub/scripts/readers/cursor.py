@@ -414,6 +414,15 @@ def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, i
             try:
                 if isinstance(value, (bytes, bytearray)):
                     value = value.decode("utf-8")
+                # Native Cursor stores can serialize the JSON metadata as hex
+                # text. Decode that representation before checking the JSON.
+                if isinstance(value, str) and re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value):
+                    try:
+                        value = bytes.fromhex(value).decode("utf-8")
+                    except UnicodeError:
+                        if strict:
+                            raise
+                        continue
                 m = load_json(value, strict=strict)
             except (TypeError, json.JSONDecodeError):
                 if strict:
