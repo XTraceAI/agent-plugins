@@ -2244,7 +2244,8 @@ def fetch_book(repo, timeout=None):
 # would rather not send command text at all. It is a floor, not a guarantee.
 _REDACTIONS = (
     # `--token=x`, `--password x`, `API_KEY=x` — the value, not the flag, so the
-    # judge still sees that a credential was passed.
+    # judge still sees that a credential was passed. A quoted value
+    # (`--token='x'`, `PGPASSWORD="two words"`) goes whole, quotes and all.
     #
     # `auth` is deliberately NOT in this list even though it names plenty of
     # real secrets: it also names `gh auth login`, `--auth-mode`, `auth0_sub`,
@@ -2257,10 +2258,12 @@ _REDACTIONS = (
     # commands. `aws_secret_access_key`, `--with-token` and `API_KEY` all still
     # match, because each ends with one.
     (re.compile(r"(?i)\b([a-z0-9_-]*(?:secret|passwd|password|token|api[_-]?key|"
-                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)([^\s\"']+)"),
+                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
      r"\1\2<redacted>"),
-    # `curl -u user:password`, `-U user:password`.
+    # `curl -u user:password`, `-U user:password`, and quoted, `-u 'user:pass word'`.
     (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):([^\s\"']+)"), r"\1\2:<redacted>"),
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)(['\"])([^:'\"]+):([^'\"]*)\2"),
+     r"\1\2\3:<redacted>\2"),
     # Authorization / Proxy-Authorization headers, with or without a scheme.
     (re.compile(r"(?i)(authorization\s*:\s*)(?:bearer|basic|token)?\s*[^\s\"']+"),
      r"\1<redacted>"),

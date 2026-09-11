@@ -28,6 +28,7 @@ live outside the plugin so they are not shipped to installs)
 """
 from __future__ import annotations
 
+import os
 import re
 
 # ``mhk_`` secrets observed at 47 chars total; ``{16,}`` after the prefix is
@@ -75,11 +76,22 @@ def redact(value):
 # redacting it costs little; passing an identity on cannot be undone.
 #
 # Two shapes, coarse on purpose: a home directory (`/Users/<name>`,
-# `/home/<name>`, `C:\\Users\\<name>`) becomes `~`, which is how the path
+# `/home/<name>`, `C:\\Users\\<name>`, `/root`, and this machine's own home
+# wherever it lives) becomes `~`, which is how the path
 # reads to every teammate anyway, and an e-mail address becomes `<email>`.
-_HOME_DIR = re.compile(r"(?<![\w.~-])(?:/(?:Users|home)/|[A-Za-z]:\\Users\\)"
-                       r"[^/\\\s'\"`:;,)]+")
+_PATH_END = r"(?=$|[/\\\s'\"`:;,)])"
+_HOME_DIR = re.compile(r"(?<![\w.~-])(?:(?:/(?:Users|home)/|[A-Za-z]:\\Users\\)"
+                       r"[^/\\\s'\"`:;,)]+|/root" + _PATH_END + r")")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _own_home():
+    """This machine's home directory as a pattern: a CI agent's or a
+    container's home often fits none of the fixed shapes."""
+    home = os.path.expanduser("~").rstrip("/\\")
+    if len(home) < 2 or home.startswith("~"):
+        return None
+    return re.compile(r"(?<![\w.~-])" + re.escape(home) + _PATH_END)
 
 
 def redact_identities(text: str) -> str:
@@ -87,6 +99,9 @@ def redact_identities(text: str) -> str:
     about to reach a model, never for records being captured."""
     if not text:
         return text
+    own = _own_home()
+    if own is not None:
+        text = own.sub("~", text)
     return _EMAIL.sub("<email>", _HOME_DIR.sub("~", text))
 
 

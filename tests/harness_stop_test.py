@@ -375,6 +375,51 @@ def test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in():
     print("PASS test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in")
 
 
+def test_each_stop_reads_from_the_cursor_not_from_byte_zero():
+    with _Env() as env:
+        repo = _git_repo(env.base)
+        tp = env.base / "s.jsonl"
+        steps = [(f"step {i}", f"did {i}", [("Bash", {"command": f"echo {i}"}, "ok", False)])
+                 for i in range(1, 5)]
+        calls, starts = [], []
+        real_classify, real_read = hx.server_classify, hx.turns_from_transcript
+
+        def spy(path, start=0, before=0):
+            starts.append(start)
+            return real_read(path, start=start, before=before)
+
+        hx.server_classify = _classify(calls, {"signal": False, "reason": "classified"})
+        hx.turns_from_transcript = spy
+        try:
+            _transcript(tp, steps[:3])
+            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
+            assert starts == [0], starts
+            assert hs.load_meta("sess")["scan"]["uuid"] == "u2"
+            _transcript(tp, steps[:4])
+            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
+            assert len(starts) == 2 and starts[1] > 0, "the second Stop resumes from the cursor"
+            assert "PREVIOUS USER MESSAGE: step 3" in calls[-1]["window"]
+            assert "USER'S NEW MESSAGE: step 4" in calls[-1]["window"]
+            assert hs.load_meta("sess")["last_turn"] == 4, "numbered as a full read would"
+            # a transcript replaced under the cursor falls back to a full read
+            _transcript(tp, [("other", "x", [])] + steps[:4])
+            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
+            assert starts[-1] == 0 and hs.load_meta("sess")["last_turn"] == 5, starts
+        finally:
+            hx.server_classify, hx.turns_from_transcript = real_classify, real_read
+    print("PASS test_each_stop_reads_from_the_cursor_not_from_byte_zero")
+
+
+def test_the_newest_turn_is_handed_whatever_order_the_children_finished_in():
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=5)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(5))      # turn 5's classifier answered first
+        hx.append_jsonl(hs.moments_path("sess"), _moment(4))
+        ctx = json.loads(_prompt({"session_id": "sess", "prompt": "go"})[1])["hookSpecificOutput"]["additionalContext"]
+        assert "turn 5" in ctx and "turn 4" not in ctx, ctx[:80]
+    print("PASS test_the_newest_turn_is_handed_whatever_order_the_children_finished_in")
+
+
 def test_an_older_turns_child_never_moves_the_meta_back():
     with _Env():
         hs.save_meta("sess", advance_turn=5, repo="new")
@@ -408,6 +453,9 @@ def test_the_nudge_line():
     # the server refuses to guess a rulebook for someone bound to several
     assert line.index("list_rulebooks") < line.index("Then pass title") and "rulebook_id" in line
     assert "ask the user which" in line
+    # the server does no title matching: a twin is found before filing, retired ones too
+    assert line.index("list_rulebooks") < line.index("include_retired=true") < line.index("Then pass title")
+    assert "supersedes_rule_id" in line and "has_more" in line
     assert len(line) < 1600
     assert "may already be written down" in hs.nudge_line("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line

@@ -29,7 +29,7 @@ all created private:
 
   <session>.moments.jsonl    flagged moments, then a `handed` row per nudge
                              (append-only: two lanes write it at once)
-  <session>.meta.json        last extracted turn, repo, cwd
+  <session>.meta.json        last extracted turn, repo, cwd, transcript cursor
   <session>.meta.json.lock   serializes the meta file's read-merge-write
   <session>.turn-*.claim     the turn an extract child already took
   stop.log / extract.log     one line per step, never prompt text
@@ -241,6 +241,30 @@ def _claim_turn(session: str, marker: str) -> bool:
     return True
 
 
+def read_turns(transcript: str, cursor, upto: int = -1) -> list[dict]:
+    """The transcript's turns up to byte `upto`. A long session must not be
+    rescanned from byte zero at every Stop, so each child leaves a cursor at the
+    start of the turn before the one it extracted, and the next reads from
+    there: the two turns a window needs, and the new one. A cursor that no
+    longer lands on the human message it recorded (a rewritten or replaced
+    transcript), or that leaves fewer than two turns, falls back to a full
+    read."""
+    def bounded(turns: list[dict]) -> list[dict]:
+        return [t for t in turns if upto < 0 or int(t.get("offset") or 0) < upto]
+
+    try:
+        start = int(cursor.get("offset") or 0)
+        before = int(cursor.get("before") or 0)
+        uuid = str(cursor.get("uuid") or "")
+    except (AttributeError, TypeError, ValueError):
+        start, before, uuid = 0, 0, ""
+    if start > 0 and uuid and (upto < 0 or start < upto):
+        part = bounded(hx.turns_from_transcript(transcript, start=start, before=before))
+        if len(part) >= 2 and part[0].get("offset") == start and part[0].get("uuid") == uuid:
+            return part
+    return bounded(hx.turns_from_transcript(transcript))
+
+
 def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
                 upto: int = -1) -> int:
     """The child: the turn in progress at byte `upto` (the transcript's size
@@ -259,12 +283,10 @@ def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
         except OSError:
             pass
     try:
-        turns = hx.turns_from_transcript(transcript)
+        turns = read_turns(transcript, load_meta(session).get("scan"), upto)
     except (OSError, ValueError) as exc:
         _log(f"extract {session[:8]}: cannot read transcript: {type(exc).__name__}")
         return 0
-    if upto >= 0:
-        turns = [t for t in turns if int(t.get("offset") or 0) < upto]
     if not turns:
         return 0
     last, prev = turns[-1], (turns[-2] if len(turns) > 1 else None)
@@ -280,8 +302,10 @@ def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
                         out_path=moments_path(session), arcs=arcs)
     finally:
         trace.close()
+    scan = ({"offset": prev.get("offset"), "before": int(prev.get("n") or 1) - 1,
+             "uuid": prev.get("uuid")} if prev and prev.get("uuid") else None)
     save_meta(session, advance_turn=int(last.get("n") or 0), repo=repo, cwd=cwd,
-              last_stop_at=time.time())
+              last_stop_at=time.time(), scan=scan)
     _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
          f"moment={stats['moments']} reason={stats['reason'] or '-'} arcs={len(arcs)}")
     return 0
@@ -318,7 +342,10 @@ def nudge_line(session: str, moment: dict, repo: str = "") -> str:
         f"is not project state, and will still be true next month, propose it now with the "
         f"memhub create_rule tool. Resolve the rulebook first with list_rulebooks: with one, "
         f"pass its rulebook_id; with several, ask the user which; with none, say so and stop "
-        f"(no list_rulebooks tool: omit rulebook_id). Then pass title (a short noun phrase "
+        f"(no list_rulebooks tool: omit rulebook_id). Then look for a twin: list_rules with no "
+        f"rulebook_id, include_retired=true and limit=200, paging with offset while has_more. "
+        f"A twin in that rulebook: replace it with supersedes_rule_id, or file nothing; a twin "
+        f"in another rulebook: tell the user. Then pass title (a short noun phrase "
         f"naming the trap), statement "
         f"(one when-X-then-Y sentence with the why), exactly one engine — "
         f"delivery=agent_hook with matcher {{event: bash|edit|output|read, …_rx}} or "
@@ -361,6 +388,8 @@ def cmd_prompt(payload: dict) -> int:
              and last_turn - m["turn"] < NUDGE_MAX_AGE_TURNS]
     if not fresh:
         return 0
+    # children append in the order their classifiers answered, not turn order
+    fresh.sort(key=lambda m: m["turn"])
     chosen = fresh[-NUDGES_PER_PROMPT:]
     now = time.time()
     for m in chosen:

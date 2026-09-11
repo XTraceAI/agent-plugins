@@ -193,18 +193,24 @@ def _target_of(name: str, tool_input: dict) -> str:
     return str(i.get("file_path", "") or "")
 
 
-def turns_from_transcript(path) -> list[dict]:
+def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
     """A Claude Code .jsonl → turns. A turn is one human message plus
     everything the agent did before the next one; tool results arrive as
     `user` records and belong to the turn in progress. Each turn carries
     `offset`, the byte its human message starts at, so a caller holding a
-    byte boundary can pick the turn that was in progress at it."""
+    byte boundary can pick the turn that was in progress at it.
+
+    `start` seeks to a byte where a human message begins and `before` is how
+    many turns precede it, so a reader resuming from a cursor numbers turns
+    exactly as a full read would."""
     turns: list[dict] = []
     cur: dict | None = None
     names: dict[str, str] = {}
     inputs: dict[str, dict] = {}
     with open(path, "rb") as fh:
-        pos = 0
+        if start > 0:
+            fh.seek(start)
+        pos = max(start, 0)
         for raw in fh:
             start, pos = pos, pos + len(raw)
             line = raw.decode("utf-8", errors="replace").strip()
@@ -238,7 +244,7 @@ def turns_from_transcript(path) -> list[dict]:
                 txt = _SYS_BLOCK.sub("", _text_of(content)).strip()
                 if is_harness_text(txt):
                     continue
-                cur = {"n": len(turns) + 1, "user": txt, "tools": [], "results": [],
+                cur = {"n": before + len(turns) + 1, "user": txt, "tools": [], "results": [],
                        "asst": "", "ts": rec.get("timestamp", ""),
                        "cwd": rec.get("cwd", ""), "uuid": rec.get("uuid", ""),
                        "offset": start}
