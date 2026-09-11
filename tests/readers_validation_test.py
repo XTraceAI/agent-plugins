@@ -299,6 +299,8 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
              {"type":"tool_use","id":"call","name":[],"input":{}},
              {"type":"tool-call","toolName":"Read","args":{}},
              {"type":"tool-call","toolCallId":"","toolName":"Read","args":{}},
+             {"type":"tool-call","toolCallId":"  ","toolName":"Read","args":{}},
+             {"type":"tool-call","toolCallId":"call","toolName":"  ","args":{}},
              {"type":"tool_use","id":"","name":"Read","input":{}}]
     supported=[{"type":"text","text":"synthetic output"},{"type":"reasoning","text":"synthetic reasoning"},
                {"type":"tool-call","toolCallId":"one","toolName":"Read","args":{}},
@@ -424,7 +426,8 @@ def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
 
 
 def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
-    for identity in [{}, {"id":"call"}, {"toolCallId":""}, {"toolCallId":None}, {"toolCallId":"call"}]:
+    for identity in [{}, {"id":"call"}, {"toolCallId":""}, {"toolCallId":"  "},
+                     {"toolCallId":None}, {"toolCallId":"call"}]:
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
             block={"type":"tool-result","result":"synthetic output",**identity}

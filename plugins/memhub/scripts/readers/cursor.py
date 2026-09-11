@@ -399,11 +399,11 @@ def _validate_message(message, *, source_kind):
             # identifier actually consumed by normalization.
             requires_identity = (source_kind != "transcript" or kind != "tool_use"
                                  or "toolCallId" in block or "id" in block)
-            if requires_identity and (not isinstance(identity, str) or not identity):
+            if requires_identity and (not isinstance(identity, str) or not identity.strip()):
                 raise ValueError("Cursor tool block requires its native call identifier")
             if kind != "tool-result":
                 name = block.get("toolName") or block.get("name")
-                if not isinstance(name, str) or not name:
+                if not isinstance(name, str) or not name.strip():
                     raise ValueError("Cursor tool call requires its native tool name")
 
 
