@@ -163,8 +163,9 @@ def _read_meta_json(session_dir: Path, *, strict=False) -> dict | None:
     try:
         value = load_json(p.read_text(encoding="utf-8"), strict=strict)
         if strict and isinstance(value, dict):
-            if value.get("cwd") is not None and not isinstance(value["cwd"], str):
-                raise ValueError("Cursor working directory must be text")
+            for key in ("cwd", "gitBranch", "source_surface"):
+                if value.get(key) is not None and not isinstance(value[key], str):
+                    raise ValueError(f"Cursor metadata {key} must be text or null")
             if value.get("createdAtMs") is not None and type(value["createdAtMs"]) not in (int, float):
                 raise ValueError("Cursor creation time must be numeric")
         return value if isinstance(value, dict) else None

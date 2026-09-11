@@ -41,6 +41,7 @@ Mapping (order preserved — gpt-5.x emits a ``reasoning`` item *before* its
 from __future__ import annotations
 
 import glob
+import datetime
 import json
 import re
 import sys
@@ -481,6 +482,11 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
     ``import_session._namespace_from_records`` can resolve the repo. Platform,
     model, session, and cwd provenance live in structured metadata instead of a
     synthetic user turn, keeping titles and turn counts faithful."""
+    if strict:
+        for row in rollout:
+            if isinstance(row, dict) and row.get("type") == "session_meta":
+                _metadata_from_header(row)
+                break
     sm = _session_meta(rollout)
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
@@ -618,8 +624,12 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
         if isinstance(r.get("timestamp"), str):
             ts_holder["ts"] = r["timestamp"]
         if not isinstance(pl, dict):
+            if strict:
+                raise ValueError("Codex response payload is not an object")
             continue
         pt = pl.get("type")
+        if strict and (not isinstance(pt, str) or not pt.strip()):
+            raise ValueError("Codex response payload has no valid type")
 
         if strict and pt in ("function_call", "custom_tool_call",
                              "function_call_output", "custom_tool_call_output"):
@@ -718,9 +728,10 @@ def _rollout_files(on_error=None) -> list[Path]:
 _META_MAX_RECORDS = 200
 
 
-def session_metadata(path, *, strict: bool = True) -> dict:
-    """Validate the bounded prefix through the native metadata header.
+def _session_header(path, *, strict: bool = True) -> dict:
+    """Read the bounded header once, before validating individual field values.
 
+    The CLI counts its native ID before validating other selected header fields.
     Later body records belong to the complete reader, not this metadata probe.
     """
     with open_lines(path) as handle:
@@ -746,15 +757,40 @@ def session_metadata(path, *, strict: bool = True) -> dict:
                 raise ValueError("Codex metadata payload is not an object")
             payload = _session_meta([record])
             if payload or (strict and record.get("type") == "session_meta"):
-                git = payload.get("git")
-                return {
-                    "session_id": payload.get("id"),
-                    "cwd": payload.get("cwd"),
-                    "source_surface": payload.get("originator"),
-                    "started_at": payload.get("timestamp") or record.get("timestamp"),
-                    "git_branch": git.get("branch") if isinstance(git, dict) else None,
-                }
+                return record
     return {}
+
+
+def _metadata_from_header(header: dict, *, strict: bool = True) -> dict:
+    """Project a parsed header into validated metadata without rereading it."""
+    if not header:
+        return {}
+    if strict and not isinstance(header.get("payload"), dict):
+        raise ValueError("Codex metadata payload is not an object")
+    payload = _session_meta([header])
+    git = payload.get("git")
+    if strict and git is not None and not isinstance(git, dict):
+        raise ValueError("Codex git metadata is not an object")
+    started = payload.get("timestamp")
+    if started is None or (not strict and not started):
+        started = header.get("timestamp")
+    result = {"session_id": payload.get("id"), "cwd": payload.get("cwd"),
+              "source_surface": payload.get("originator"), "started_at": started,
+              "git_branch": git.get("branch") if isinstance(git, dict) else None}
+    if strict:
+        for name, value in result.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Codex metadata {name} must be text or null")
+        if started is not None:
+            parsed = datetime.datetime.fromisoformat(started.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("Codex start time requires a timezone")
+    return result
+
+
+def session_metadata(path, *, strict: bool = True) -> dict:
+    """Read typed native metadata; missing optional facts remain unknown."""
+    return _metadata_from_header(_session_header(path, strict=strict), strict=strict)
 
 
 def session_cwd(path) -> str | None:

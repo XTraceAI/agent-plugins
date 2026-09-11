@@ -50,6 +50,8 @@ metadata without deriving a title from a prompt. Missing facts remain unknown.
 Checked Codex metadata validates the bounded prefix through its first header;
 it leaves later body validation to the complete reader. CR, LF and CRLF are
 supported with per-record byte bounds. Cursor schema versions must be integers.
+Returned text fields accept text or null, and Codex start times retain their
+timezone-aware ISO timestamp. A present git container must be an object.
 `list_sessions(..., on_error=callback)` reports inaccessible or skipped sources;
 symlinks and non-regular files such as FIFOs are reported and skipped. Callers
 should keep healthy sessions available while reporting failures for other files.
