@@ -870,6 +870,24 @@ def test_latest_cursor_reports_unreadable_ranking_metadata():
                 assert "Traceback" not in result.stderr and metadata.read_bytes()==data
 
 
+def test_latest_cursor_rejects_finite_out_of_range_update_clocks():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);transcript(home)
+        store=fixtures._make_cursor_store(home/".cursor/chats",uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        metadata=store.parent/"meta.json";original=json.loads(metadata.read_text())
+        for value in (10**18,-10**18,1e300,-1e300):
+            metadata.write_text(json.dumps({**original,'updatedAtMs':value}));before=metadata.read_bytes()
+            for mode in ([],['--metadata-only']):
+                result,rows=run(home,'cursor','--session','latest',*mode)
+                assert result.returncode==2 and rows==[] and 'discovery_incomplete' in result.stderr,(value,result.stdout,result.stderr)
+                assert metadata.read_bytes()==before
+        for value in (0,original['updatedAtMs']):
+            metadata.write_text(json.dumps({**original,'updatedAtMs':value}))
+            for mode in ([],['--metadata-only']):
+                result,rows=run(home,'cursor','--session','latest',*mode)
+                assert result.returncode==0 and rows,result.stderr
+
+
 def test_saved_cursor_store_cannot_bypass_safe_discovery():
     with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
         home=Path(td);safe=transcript(home)

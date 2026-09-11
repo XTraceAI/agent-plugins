@@ -263,6 +263,7 @@ def main(argv=None) -> int:
                         value = metadata.get("updatedAtMs") if isinstance(metadata, dict) else None
                         if type(value) not in (int, float) or not math.isfinite(value):
                             raise ValueError("Cursor latest ordering requires a finite native timestamp")
+                        reader._iso_ms(value, strict=True)
                         return value / 1000
                     return row["mtime"]
                 latest = Path(max(discovered, key=latest_mtime)["path"]).resolve(strict=True)
