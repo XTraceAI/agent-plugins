@@ -48,6 +48,7 @@ import uuid as _uuid
 from collections import deque
 from pathlib import Path
 from .strict_json import loads as load_json
+from .jsonl import open_lines, readline_bytes
 from typing import Any
 
 # The readers are imported both as a package and, by some callers, with
@@ -720,18 +721,28 @@ _META_MAX_RECORDS = 200
 
 
 def session_metadata(path, *, strict: bool = True) -> dict:
-    """Read native session identity without reading prompt-derived titles."""
-    with Path(path).open("r", encoding="utf-8", errors="strict" if strict else "replace") as handle:
+    """Validate the bounded prefix through the native metadata header.
+
+    Later body records belong to the complete reader, not this metadata probe.
+    """
+    with open_lines(path) as handle:
         for _ in range(_META_MAX_RECORDS):
-            line = handle.readline(1024 * 1024 + 1)
-            if not line:
+            raw = readline_bytes(handle, 1024 * 1024)
+            if not raw:
                 break
-            if len(line) > 1024 * 1024:
-                raise ValueError("session metadata probe exceeded its line bound")
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
+            line = raw.decode("utf-8", errors="strict" if strict else "replace")
+            if not (line.strip(" \t\r\n") if strict else line.strip()):
                 continue
+            try:
+                record = load_json(line, strict=strict)
+            except json.JSONDecodeError:
+                if strict and raw.endswith((b"\n", b"\r")):
+                    raise
+                if not raw.endswith((b"\n", b"\r")):
+                    break
+                continue
+            if strict and not isinstance(record, dict):
+                raise ValueError("Codex metadata row is not an object")
             payload = _session_meta([record])
             if payload:
                 git = payload.get("git")

@@ -47,8 +47,11 @@ unsupported message role reports incomplete input instead of hiding a message.
 
 `session_metadata(path)` reads native identity, surface, start and repository
 metadata without deriving a title from a prompt. Missing facts remain unknown.
+Checked Codex metadata validates the bounded prefix through its first header;
+it leaves later body validation to the complete reader. CR, LF and CRLF are
+supported with per-record byte bounds. Cursor schema versions must be integers.
 `list_sessions(..., on_error=callback)` reports inaccessible or skipped sources;
-symlinked subdirectories are reported rather than followed into cycles. Callers
+symlinks and non-regular files such as FIFOs are reported and skipped. Callers
 should keep healthy sessions available while reporting failures for other files.
 
 `cursor_flush.apply_session_state(records, native_id, strict=True)` restores
