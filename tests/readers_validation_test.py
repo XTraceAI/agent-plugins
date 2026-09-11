@@ -32,7 +32,7 @@ def sources(home):
 def test_strict_reads_preserve_existing_canonical_records_and_source_bytes():
     with tempfile.TemporaryDirectory() as td:
         home=Path(td)
-        for reader,path in sources(home)+[(cursor,fixtures._make_cursor_store(home/"native stores #1?"))]:
+        for reader,path in sources(home)+[(cursor,fixtures._make_cursor_store(home/"native stores #1%2"))]:
             before=path.read_bytes();expected=reader.to_canonical(path)
             assert reader.to_canonical(path,strict=True)==expected
             assert path.read_bytes()==before
