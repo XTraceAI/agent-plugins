@@ -276,7 +276,8 @@ def _save_state(uuid: str, **fields) -> None:
             fh.close()
 
 
-def _acquire(uuid: str, blocking: bool = False) -> int | None:
+def _acquire(uuid: str, blocking: bool = False, *,
+             observations: bool = False) -> int | None:
     """Per-session flock. Non-blocking returns None when held; blocking WAITS.
 
     Turn-boundary events (stop / beforeSubmitPrompt) pass blocking=True: a
@@ -307,7 +308,8 @@ def _acquire(uuid: str, blocking: bool = False) -> int | None:
     # already pin this lock past our exit — the flag states the invariant in
     # code so a future refactor cannot quietly drop it. getattr because the
     # constant is Unix-only and the capture scripts run on native Windows.
-    fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.flush.lock",
+    suffix = "observations.lock" if observations else "flush.lock"
+    fd = os.open(STATE_DIR / f"{_safe_uuid(uuid)}.{suffix}",
                  os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
     if not blocking:
         try:
@@ -518,21 +520,15 @@ def _usage_events_with(state: dict, generation: str, target_uuid: str,
         # then-current "last assistant" is not authoritative. Once observed,
         # a generation stays bound to its original deterministic record UUID.
         target_uuid = prior["target_uuid"]
-    # Updating an existing dict key preserves its old insertion position.
-    # Pop first so even an oversized recovered state cannot evict the sample
-    # being refreshed when the bounded map drops its oldest entries below.
-    events.pop(generation, None)
     # If Cursor regenerates a visible turn onto the same deterministic record,
     # retain the latest exact sample rather than summing unlike attempts.
     events = {key: value for key, value in events.items()
               if not (isinstance(value, dict) and
                       value.get("target_uuid") == target_uuid)}
     events[generation] = {"target_uuid": target_uuid, "usage": usage}
-    # Long-running chats must not grow hook state without bound. Removing old
-    # entries cannot corrupt server totals: confirmed UUIDs are immutable and
-    # a later re-send is folded by server dedup.
-    while len(events) > 512:
-        events.pop(next(iter(events)))
+    # Native files cannot reconstruct these exact samples. Keep one sample
+    # per measured record for later local reads, even after cloud acknowledgement.
+    # Like timestamp pins, this map scales with the observed session.
     return events
 
 
@@ -1143,6 +1139,140 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
+_OBSERVATION_FIELDS = (
+    "source_kind", "transcript_path", "cursor_meta", "usage_events",
+    "record_ts", "observed_revision",
+)
+
+
+def _observe_session(uuid, event, payload, event_pr_urls, *, observe_usage=True):
+    """Save native observations before waiting for an upload.
+
+    Only observation readers/writers hold this lock. It is released before
+    acquiring the upload lock; a network request never holds it. Preparing
+    once also gives the common, uncontended path its upload snapshot.
+    """
+    fd = _acquire(uuid, blocking=True, observations=True)
+    if fd is None:
+        return None
+    try:
+        state = _read_state(uuid)
+        pending_pr_urls = pr_provenance.merge_urls(
+            state.get("pending_pr_urls") or [], event_pr_urls)
+        source_kind, source_path, err = _source_for(uuid, payload, state)
+        if source_kind is None or source_path is None:
+            _log(f"{event}: {err or 'no readable Cursor source'}")
+            return None
+
+        cursor_meta = _payload_meta(payload if observe_usage else {}, state)
+        blob_ids: set[str] = set()
+        source_revision: str | None = None
+        try:
+            if source_kind == "store":
+                blob_ids = current_blob_ids(source_path)
+                if not blob_ids:
+                    # A readable empty store is mid-rebuild. Leave every
+                    # watermark untouched so the next hook retries it.
+                    _log(f"{event}: store reports zero blobs (rebuilding?) — "
+                         "skipping")
+                    return None
+                records, meta = cursor_reader.to_canonical(source_path)
+            else:
+                records, meta = cursor_reader.to_canonical(
+                    source_path, session_id=uuid,
+                    cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
+        except Exception as e:  # locked/partial/corrupt source — next hook retries
+            _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
+            return None
+
+        # Persist source identity and exact usage BEFORE any network work —
+        # on EVERY event, flushing or not, so a dormant boundary's usage
+        # sample survives to the eventual send. afterAgentResponse and stop
+        # duplicate the same generation; replacing that dictionary key makes
+        # delivery idempotent, while a later hook can retry an auth/server
+        # failure without needing Cursor to repeat usage. Timestamp pins are
+        # different: a quiet declined edit does not rewrite the large pin
+        # map. An exact usage boundary dates its record even if delivery is
+        # dormant; other eligible events retain the normal flush gate.
+        # The only event that reads
+        # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
+        # exit in main() before reading — see _event_can_flush), and a
+        # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
+        # by the next flushing hook at most that interval later.
+        fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
+        if source_kind == "transcript":
+            fields["transcript_path"] = str(source_path)
+        usage_events = state.get("usage_events")
+        usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
+        boundary_uuids: set[str] = set()
+        sample = _hook_usage(event, payload) if observe_usage else None
+        if sample is not None:
+            generation, usage = sample
+            expected_text = payload.get("text") if event == "afterAgentResponse" else None
+            target = _last_assistant_uuid(records, expected_text)
+            if target is None:
+                _log(f"{event}: exact usage has no matching final assistant "
+                     "record — leaving this turn unmeasured")
+            else:
+                usage_events = _usage_events_with(
+                    state, generation, target, usage)
+                fields["usage_events"] = usage_events
+                # This hook explicitly dates that record: its generation ended
+                # NOW, so it gets a real clock even in a first-observation
+                # backlog (where everything else stays unmeasured).
+                boundary_uuids = {usage_events[generation]["target_uuid"]}
+        elif (observe_usage and event in ("afterAgentResponse", "stop") and
+              any(key in payload for key in _HOOK_USAGE_KEYS)):
+            _log(f"{event}: malformed token counters or generation_id — "
+                 "leaving this turn unmeasured")
+
+        if source_kind == "transcript":
+            # Content identity only — computed BEFORE _stamp_records and
+            # _apply_usage mutate the records. The send gate answers "is
+            # there new CONTENT?"; it must never re-fire because a timestamp
+            # pin was minted or upgraded (stamps ride along on whatever send
+            # happens, and pending usage forces its own send via
+            # usage_pending). Hashing post-stamp would couple the gate's
+            # stability to the pin map's — the fragility a review round
+            # already caught once on the pin-eviction path.
+            source_revision = _records_revision(records)
+
+        fields["observed_revision"] = source_revision or hashlib.sha256(
+            "\n".join(sorted(blob_ids)).encode()).hexdigest()
+        applied_usage = _apply_usage(records, usage_events)
+        sent_usage = set(state.get("sent_usage_generations") or [])
+        usage_pending = bool(applied_usage - sent_usage)
+
+        # should_flush reads only watermark/backoff state (transcript_revision,
+        # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
+        # the decision comes FIRST and a quiet event saves only the small
+        # fields, leaving the pin map untouched on disk. A duplicate
+        # afterShellExecution can also reach this point: pending URL telemetry
+        # retries through the same bounded send path until acknowledged.
+        if sample is None and not should_flush(
+                event, payload, state, blob_ids, time.time(),
+                source_kind=source_kind, source_revision=source_revision,
+                usage_pending=usage_pending,
+                provenance_pending=bool(pending_pr_urls)):
+            _save_state(uuid, **fields)
+            return None
+
+        fields["record_ts"] = _stamp_records(
+            records, state.get("record_ts"), _now_iso(),
+            first_observation="record_ts" not in state,
+            boundary_uuids=boundary_uuids)
+        _save_state(uuid, **fields)
+        observed = {**state, **fields}
+        return {
+            "source_kind": source_kind, "source_path": source_path,
+            "blob_ids": blob_ids, "source_revision": source_revision,
+            "records": records, "meta": meta, "applied_usage": applied_usage,
+            "observation": {key: observed.get(key) for key in _OBSERVATION_FIELDS},
+        }
+    finally:
+        os.close(fd)
+
+
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
@@ -1177,9 +1307,19 @@ def main() -> int:
         # _event_can_flush).
         return 0
 
+    # Only exact hook-only usage needs observation before the upload lock.
+    # Ordinary edits/milestone shells keep the cheap busy-session skip: they
+    # neither parse the source nor queue behind the observation lock. Shell
+    # results still queue their PR provenance before reading the source.
+    prepared = None
+    if _hook_usage(event, payload) is not None:
+        prepared = _observe_session(uuid, event, payload, event_pr_urls)
+        if prepared is None:
+            return 0
+
     # Serialize the whole check-then-act: reading the watermark, sending, and
-    # writing it back must not interleave with a concurrent flush for this
-    # session, or both upload the same transcript and race the watermark.
+    # writing it back must not interleave with another upload. Exact usage
+    # already persisted under its own lock and does not wait for this owner.
     # Turn boundaries (stop / beforeSubmitPrompt) are last-chance events — a
     # session may have no later flush — so they WAIT for a concurrent flush
     # rather than skip and never run again. Mid-turn events (edits, milestone
@@ -1218,107 +1358,35 @@ def main() -> int:
                 "pending_pr_urls": pending_pr_urls,
                 "accepted_pr_urls": accepted_pr_urls,
             }
-        source_kind, source_path, err = _source_for(uuid, payload, state)
-        if source_kind is None or source_path is None:
-            _log(f"{event}: {err or 'no readable Cursor source'}")
-            return 0
-
-        cursor_meta = _payload_meta(payload, state)
-        blob_ids: set[str] = set()
-        source_revision: str | None = None
-        try:
-            if source_kind == "store":
-                blob_ids = current_blob_ids(source_path)
-                if not blob_ids:
-                    # A readable empty store is mid-rebuild. Leave every
-                    # watermark untouched so the next hook retries it.
-                    _log(f"{event}: store reports zero blobs (rebuilding?) — "
-                         "skipping")
-                    return 0
-                records, meta = cursor_reader.to_canonical(source_path)
-            else:
-                records, meta = cursor_reader.to_canonical(
-                    source_path, session_id=uuid,
-                    cwd=cursor_meta.get("cwd"), model=cursor_meta.get("model"))
-        except Exception as e:  # locked/partial/corrupt source — next hook retries
-            _log(f"{event}: {source_kind} source unreadable ({e}) — skipping")
-            return 0
-
-        # Persist source identity and exact usage BEFORE any network work —
-        # on EVERY event, flushing or not, so a dormant boundary's usage
-        # sample survives to the eventual send. afterAgentResponse and stop
-        # duplicate the same generation; replacing that dictionary key makes
-        # delivery idempotent, while a later hook can retry an auth/server
-        # failure without needing Cursor to repeat usage. Timestamp pins are
-        # different: they are minted and persisted ONLY on the flush path
-        # below (still before the network call, so a failed send retries
-        # with identical stamps) — a declined event must not rewrite a large
-        # pin map for nothing (review finding). The only event that reads
-        # yet declines is a DEBOUNCED afterFileEdit (guaranteed non-senders
-        # exit in main() before reading — see _event_can_flush), and a
-        # debounce implies a flush ≤DEBOUNCE_S ago, so what it saw is dated
-        # by the next flushing hook at most that interval later.
-        fields: dict = {"source_kind": source_kind, "cursor_meta": cursor_meta}
-        if source_kind == "transcript":
-            fields["transcript_path"] = str(source_path)
-        usage_events = state.get("usage_events")
-        usage_events = dict(usage_events) if isinstance(usage_events, dict) else {}
-        boundary_uuids: set[str] = set()
-        sample = _hook_usage(event, payload)
-        if sample is not None:
-            generation, usage = sample
-            expected_text = payload.get("text") if event == "afterAgentResponse" else None
-            target = _last_assistant_uuid(records, expected_text)
-            if target is None:
-                _log(f"{event}: exact usage has no matching final assistant "
-                     "record — leaving this turn unmeasured")
-            else:
-                usage_events = _usage_events_with(
-                    state, generation, target, usage)
-                fields["usage_events"] = usage_events
-                # This hook explicitly dates that record: its generation ended
-                # NOW, so it gets a real clock even in a first-observation
-                # backlog (where everything else stays unmeasured).
-                boundary_uuids = {target}
-        elif (event in ("afterAgentResponse", "stop") and
-              any(key in payload for key in _HOOK_USAGE_KEYS)):
-            _log(f"{event}: malformed token counters or generation_id — "
-                 "leaving this turn unmeasured")
-
-        if source_kind == "transcript":
-            # Content identity only — computed BEFORE _stamp_records and
-            # _apply_usage mutate the records. The send gate answers "is
-            # there new CONTENT?"; it must never re-fire because a timestamp
-            # pin was minted or upgraded (stamps ride along on whatever send
-            # happens, and pending usage forces its own send via
-            # usage_pending). Hashing post-stamp would couple the gate's
-            # stability to the pin map's — the fragility a review round
-            # already caught once on the pin-eviction path.
-            source_revision = _records_revision(records)
-
-        applied_usage = _apply_usage(records, usage_events)
-        sent_usage = set(state.get("sent_usage_generations") or [])
-        usage_pending = bool(applied_usage - sent_usage)
-
-        # should_flush reads only watermark/backoff state (transcript_revision,
-        # blob_ids, last_flush_at, dormancy) — nothing ``fields`` writes — so
-        # the decision comes FIRST and a quiet event saves only the small
-        # fields, leaving the pin map untouched on disk. A duplicate
-        # afterShellExecution can also reach this point: pending URL telemetry
-        # retries through the same bounded send path until acknowledged.
+        if prepared is None:
+            prepared = _observe_session(uuid, event, payload, event_pr_urls)
+            if prepared is None:
+                return 0
+            state = _read_state(uuid)
+        # Another hook may have observed/sent a newer source while this one
+        # waited for the upload lock. Refresh only then, without rebinding
+        # this already-observed generation to the newer last assistant.
+        if any(state.get(key) != value
+               for key, value in prepared["observation"].items()):
+            prepared = _observe_session(
+                uuid, event, payload, event_pr_urls, observe_usage=False)
+            if prepared is None:
+                return 0
+            state = _read_state(uuid)
+        source_kind = prepared["source_kind"]
+        source_path = prepared["source_path"]
+        blob_ids = prepared["blob_ids"]
+        source_revision = prepared["source_revision"]
+        records = prepared["records"]
+        meta = prepared["meta"]
+        applied_usage = prepared["applied_usage"]
+        pending_usage = applied_usage - set(state.get("sent_usage_generations") or [])
         if not should_flush(
                 event, payload, state, blob_ids, time.time(),
                 source_kind=source_kind, source_revision=source_revision,
-                usage_pending=usage_pending,
-                provenance_pending=bool(pending_pr_urls)):
-            _save_state(uuid, **fields)
+                usage_pending=bool(pending_usage),
+                provenance_pending=bool(state.get("pending_pr_urls"))):
             return 0
-
-        fields["record_ts"] = _stamp_records(
-            records, state.get("record_ts"), _now_iso(),
-            first_observation="record_ts" not in state,
-            boundary_uuids=boundary_uuids)
-        _save_state(uuid, **fields)
         try:
             mode = _FLUSH_MODE.get(event, "now")
             asyncio.run(asyncio.wait_for(

@@ -391,6 +391,10 @@ def _validate_message(message):
             requires_identity = kind != "tool_use" or "toolCallId" in block or "id" in block
             if requires_identity and (not isinstance(identity, str) or not identity):
                 raise ValueError("Cursor tool block requires its native call identifier")
+            if kind != "tool-result":
+                name = block.get("toolName") or block.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("Cursor tool call requires its native tool name")
 
 
 def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, int | None]]:

@@ -15,8 +15,9 @@ An unfinished final JSON record remains deferred because native writers append
 their transcripts. Existing capture callers retain the default tolerant behavior.
 Canonical record IDs, usage normalization and timestamp rules are unchanged.
 Cursor assistant blocks must match supported text, reasoning and tool-call
-shapes; both native tool-call aliases retain their content and usage. Unknown
-blocks fail strict reads instead of silently dropping their content.
+shapes. Both native tool-call aliases require a nonempty tool name and retain
+their content and usage. Unknown blocks fail strict reads instead of silently
+dropping their content.
 
 `session_metadata(path)` returns native identity, raw observed surface, native
 start and repository metadata without deriving a title from a prompt. Missing

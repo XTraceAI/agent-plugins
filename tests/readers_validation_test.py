@@ -72,19 +72,19 @@ def test_strict_reads_defer_only_unfinished_json_and_reject_invalid_utf8():
 
 
 def test_strict_cursor_store_decodes_message_leaves_without_replacement():
-    with tempfile.TemporaryDirectory() as td:
-        store=fixtures._make_cursor_store(Path(td)/"chats")
-        with sqlite3.connect(store) as connection:
-            identity,data=next((key,value) for key,value in connection.execute("SELECT id,data FROM blobs")
-                               if isinstance(value,bytes) and b'"role": "assistant"' in value)
-            message=json.loads(data);message['content']=[{'type':'text','text':'invalidXtext'}]
-            data=json.dumps(message).encode().replace(b'invalidXtext',b'invalid\xfftext')
-            connection.execute('UPDATE blobs SET data=? WHERE id=?',(data,identity))
-        assert '\ufffd' in json.dumps(cursor.to_canonical(store),ensure_ascii=False)
-        rejected(lambda:cursor.to_canonical(store,strict_utf8=True,strict_json=True))
-        with sqlite3.connect(store) as connection:
-            connection.execute('UPDATE blobs SET data=? WHERE id=?',(b'{"role":',identity))
-        rejected(lambda:cursor.to_canonical(store,strict_utf8=True,strict_json=True))
+    for raw in [b'{"role":"assistant","content":"invalid\xfftext"}', b'{"role":']:
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            identity=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as connection:
+                connection.execute('DELETE FROM blobs')
+                connection.execute('INSERT INTO blobs VALUES (?,?)',(identity,raw))
+                connection.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':identity}),))
+            before=store.read_bytes()
+            legacy=cursor.to_canonical(store)
+            if b'\xff' in raw: assert '\ufffd' in json.dumps(legacy,ensure_ascii=False)
+            rejected(lambda:cursor.to_canonical(store,strict_utf8=True,strict_json=True))
+            assert store.read_bytes()==before
 
 
 def test_title_index_strictness_is_opt_in_and_preserves_incomplete_tail():
@@ -205,7 +205,9 @@ def test_strict_cursor_tree_validates_complete_protobuf_nodes():
             with sqlite3.connect(store) as connection:
                 root=json.loads(connection.execute("SELECT value FROM meta").fetchone()[0])["latestRootBlobId"]
                 data=connection.execute("SELECT data FROM blobs WHERE id=?",(root,)).fetchone()[0]
-                connection.execute("UPDATE blobs SET data=? WHERE id=?",(data+tail,root))
+                updated=data+tail;identity=hashlib.sha256(updated).hexdigest()
+                connection.execute("UPDATE blobs SET id=?,data=? WHERE id=?",(identity,updated,root))
+                connection.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
             before=store.read_bytes()
             cursor.to_canonical(store,strict_utf8=True)
             rejected(lambda:cursor.to_canonical(store,strict_json=True))
@@ -235,9 +237,10 @@ def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
             with sqlite3.connect(store) as connection:
-                identity=next(key for key,value in connection.execute("SELECT id,data FROM blobs")
-                              if isinstance(value,bytes) and b'"role": "assistant"' in value)
-                connection.execute("UPDATE blobs SET data=? WHERE id=?",(json.dumps(message).encode(),identity))
+                raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
+                connection.execute("DELETE FROM blobs")
+                connection.execute("INSERT INTO blobs VALUES (?,?)",(identity,raw))
+                connection.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
             before=store.read_bytes()
             cursor.to_canonical(store)
             rejected(lambda:cursor.to_canonical(store,strict_json=True))
@@ -321,6 +324,12 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
                {"type":"tool_use","id":"two","name":"Read","input":{}},
                {"type":"tool-call","id":"three","toolName":"Read","args":{}},
                {"type":"tool_use","toolCallId":"four","name":"Read","input":{}}]
+    for kind in ("tool-call", "tool_use"):
+        for names in ({}, {"toolName": ""}, {"name": ""}, {"toolName": None, "name": None}):
+            invalid.append({"type": kind, "toolCallId": "call", "args": {}, **names})
+        for names in ({"toolName": "Read"}, {"name": "Read"},
+                      {"toolName": "", "name": "Read"}, {"toolName": "Read", "name": ""}):
+            supported.append({"type": kind, "toolCallId": "call", "args": {}, **names})
     for block in invalid+supported:
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
