@@ -844,6 +844,26 @@ def test_latest_cursor_reports_unreadable_ranking_metadata():
                 assert "Traceback" not in result.stderr and metadata.read_bytes()==data
 
 
+def test_saved_cursor_store_cannot_bypass_safe_discovery():
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
+        home=Path(td);safe=transcript(home)
+        store=fixtures._make_cursor_store(Path(outside)/"chats",uuid=SID)
+        link=home/".cursor/chats/outside";link.parent.mkdir(parents=True)
+        link.symlink_to(store.parent.parent,target_is_directory=True)
+        saved=home/f".config/memhub-plugin/cursorflush/{SID}.json"
+        saved.parent.mkdir(parents=True);saved.write_text(json.dumps({"source_kind":"store"}))
+        before={path:path.read_bytes() for path in [safe,saved,store,store.parent/"meta.json"]}
+        for selection in [[],["--session",SID],["--session","latest"]]:
+            for mode in [[],["--metadata-only"]]:
+                result,rows=run(home,"cursor",*selection,*mode)
+                assert result.returncode==2 and rows==[],(selection,mode,result.stderr,rows)
+                assert "discovery_incomplete" in result.stderr and "Traceback" not in result.stderr
+        # Explicit paths remain an intentional selection, including an alias.
+        result,rows=run(home,"cursor","--session",str(store),"--metadata-only")
+        assert result.returncode==0 and rows[0]["path"]==str(store.resolve()),result.stderr
+        assert all(path.read_bytes()==data for path,data in before.items())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
