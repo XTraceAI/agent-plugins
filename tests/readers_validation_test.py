@@ -570,6 +570,39 @@ def test_cursor_store_hex_encoded_metadata_preserves_the_native_tree():
         assert store.read_bytes()==before
 
 
+def test_checked_codex_text_fields_cannot_silently_drop_supported_content():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];original=path.read_bytes()
+        for shape in ('message','reasoning'):
+            for text in (None,17,{},[]):
+                block={'type':'output_text' if shape=='message' else 'summary_text','text':text}
+                payload=({'type':'message','role':'assistant','content':[block]} if shape=='message'
+                         else {'type':'reasoning','summary':[block]})
+                path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+                codex.to_canonical(path)
+                rejected(lambda:codex.to_canonical(path,strict=True))
+        # String blocks and non-text input retain the established projection.
+        for content in (['native text'],[{'type':'input_image','image_url':'synthetic'}],[]):
+            payload={'type':'message','role':'user','content':content}
+            path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+            assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+
+
+def test_idless_tool_use_exception_is_limited_to_transcripts():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);store=fixtures._make_cursor_store(home/'chats')
+        message={'role':'assistant','content':[{'type':'tool_use','name':'Read','input':{}}]}
+        raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
+        with closing(sqlite3.connect(store)) as sql, sql:
+            sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(identity,raw))
+            sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':identity}),))
+        transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[{'role':'assistant','message':{'content':message['content']}}])
+        original=store.read_bytes()
+        rejected(lambda:cursor.to_canonical(store,strict=True))
+        assert cursor.to_canonical(transcript,strict=True)==cursor.to_canonical(transcript)
+        assert store.read_bytes()==original
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

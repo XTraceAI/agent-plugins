@@ -352,7 +352,7 @@ def _parse_node(data: bytes, *, strict: bool = False) -> tuple[list[str], int | 
     return out, ts
 
 
-def _validate_message(message):
+def _validate_message(message, *, source_kind):
     if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
         raise ValueError("Cursor source has no supported message role")
     content = message.get("content")
@@ -392,7 +392,8 @@ def _validate_message(message):
             # IDE transcripts can contain id-less tool_use observations. Native
             # tool-call/result blocks and explicitly supplied aliases need the
             # identifier actually consumed by normalization.
-            requires_identity = kind != "tool_use" or "toolCallId" in block or "id" in block
+            requires_identity = (source_kind != "transcript" or kind != "tool_use"
+                                 or "toolCallId" in block or "id" in block)
             if requires_identity and (not isinstance(identity, str) or not identity):
                 raise ValueError("Cursor tool block requires its native call identifier")
             if kind != "tool-result":
@@ -461,7 +462,7 @@ def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, i
                     raise
                 return
             if strict:
-                _validate_message(msg)
+                _validate_message(msg, source_kind="store")
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
@@ -722,7 +723,7 @@ def _load_transcript(path: Path, *, strict: bool = False) -> list[tuple[dict, st
             message = dict(body)
             message["role"] = entry["role"]
             if strict:
-                _validate_message(message)
+                _validate_message(message, source_kind="transcript")
             own_ts = (_embedded_timestamp(_text_of(message.get("content")))
                       if entry["role"] == "user" else None)
             messages.append((message, own_ts))
