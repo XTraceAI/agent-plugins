@@ -582,6 +582,11 @@ def test_checked_codex_text_fields_cannot_silently_drop_supported_content():
                 codex.to_canonical(path)
                 rejected(lambda:codex.to_canonical(path,strict=True))
         # String blocks and non-text input retain the established projection.
+        for role in ('future',None,17):
+            payload={'type':'message','role':role,'content':'unsupported role'}
+            path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+            codex.to_canonical(path)
+            rejected(lambda:codex.to_canonical(path,strict=True))
         for content in (['native text'],[{'type':'input_image','image_url':'synthetic'}],[]):
             payload={'type':'message','role':'user','content':content}
             path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')

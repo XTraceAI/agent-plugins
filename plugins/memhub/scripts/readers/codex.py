@@ -628,8 +628,10 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
 
         if pt == "message":
             role = pl.get("role")
-            if role == "developer":
+            if role in ("developer", "system"):
                 continue  # sandbox/permissions system injection — noise
+            if strict and role not in ("user", "assistant"):
+                raise ValueError("Codex message has no supported role")
             text = _text_of(pl.get("content"), strict=strict).strip()
             if not text:
                 continue
