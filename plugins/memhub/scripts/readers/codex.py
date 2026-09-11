@@ -489,6 +489,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
                 _metadata_from_header(row)
                 break
     sm = _session_meta(rollout)
+    if strict and (not isinstance(sm.get("id"), str) or not sm["id"].strip()):
+        raise ValueError("Codex checked reads require a native session identifier")
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
     for r in rollout:

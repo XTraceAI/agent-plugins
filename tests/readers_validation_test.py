@@ -842,6 +842,31 @@ def test_checked_cursor_rejects_finite_out_of_range_creation_times():
             assert cursor.session_metadata(store)
 
 
+def test_checked_codex_requires_native_session_identity_before_record_ids():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td)
+        for shape in ('no-header','missing-id',None,'',' \t',False,17,[],{}):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            if shape=='no-header':
+                rows=[row for row in rows if row.get('type')!='session_meta']
+            elif shape=='missing-id':
+                rows[0]['payload'].pop('id')
+            else:
+                rows[0]['payload']['id']=shape
+            path=fixtures._write_jsonl(home/'rollout.jsonl',rows);before=path.read_bytes()
+            codex.to_canonical(path)  # Existing capture remains tolerant.
+            rejected(lambda:codex.to_canonical(path,strict=True))
+            assert path.read_bytes()==before
+        identities=[]
+        for sid in ('native-session-a','native-session-b'):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH);rows[0]['payload']['id']=sid
+            path=fixtures._write_jsonl(home/(sid+'.jsonl'),rows)
+            expected=codex.to_canonical(path)
+            assert codex.to_canonical(path,strict=True)==expected
+            identities.append({record['uuid'] for record in expected[0]})
+        assert identities[0] and identities[1] and identities[0].isdisjoint(identities[1])
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
