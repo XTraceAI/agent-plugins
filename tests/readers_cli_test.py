@@ -890,6 +890,28 @@ def test_saved_cursor_store_cannot_bypass_safe_discovery():
         assert all(path.read_bytes()==data for path,data in before.items())
 
 
+def test_selected_codex_skips_distinct_malformed_headers_after_counting_ids():
+    for field,value in [('timestamp','bad-clock'),('cwd',17),('originator',[]),('git',{'branch':17})]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);selected=rollout(home)
+            sid=codex.session_metadata(selected)['session_id']
+            bad_rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            bad_rows[0]['payload'].update(id='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',timestamp=STAMP)
+            bad_rows[0]['payload'][field]=value
+            bad=write_jsonl(selected.with_name('rollout-unrelated.jsonl'),bad_rows)
+            os.utime(bad,(MTIME-100,MTIME-100))
+            originals={path:path.read_bytes() for path in (selected,bad)}
+            for selection in [sid,sid+'.jsonl','latest',str(selected)]:
+                for mode in [[],['--metadata-only']]:
+                    result,rows=run(home,'codex','--session',selection,*mode)
+                    assert result.returncode==0,(field,selection,result.stderr)
+                    headers=[row for row in rows if row.get('type')=='session']
+                    assert len(headers)==1 and headers[0]['native_session_id']==sid
+            result,_=run(home,'codex')
+            assert result.returncode==2 and 'session_unreadable' in result.stderr
+            assert all(path.read_bytes()==data for path,data in originals.items())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

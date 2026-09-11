@@ -322,6 +322,14 @@ def main(argv=None) -> int:
             sid = native_text(native.get("session_id"), required=True)
             # A readable identity still collides when another header field is bad.
             counts[f"{reader.HOST}-{sid}"] += 1
+            if args.host == "codex" and args.session and not explicit_path:
+                # Identity must participate in ambiguity checks, but an unrelated
+                # header must not make an otherwise healthy selection incomplete.
+                if args.session == "latest":
+                    if path != latest:
+                        continue
+                elif sid != args.session.removesuffix(".jsonl"):
+                    continue
             header = header_for(reader, path, mtime, native)
             prepared.append((path, revision, header))
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
