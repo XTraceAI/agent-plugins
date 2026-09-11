@@ -8,8 +8,10 @@ from contextlib import closing, contextmanager
 import datetime
 import json
 import math
+import os
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -37,6 +39,29 @@ def native_text(value, *, required=False):
     return value
 
 
+@contextmanager
+def regular_source(path: Path):
+    """Open one source observation without following or blocking on special files."""
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("native source sidecar is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        observed = os.fstat(descriptor)
+        if (not stat.S_ISREG(observed.st_mode)
+                or (before.st_dev, before.st_ino) != (observed.st_dev, observed.st_ino)):
+            raise ValueError("native source changed before it was opened")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            yield handle, observed
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def source_revision(path: Path, host: str) -> tuple:
     paths = [path]
     if path.name == "store.db":
@@ -53,23 +78,27 @@ def source_revision(path: Path, host: str) -> tuple:
     revision = []
     for item in paths:
         try:
-            stat = item.stat()
-            with item.open("rb"):
+            with regular_source(item) as (_, observed):
                 pass
         except FileNotFoundError:
             if item == path:
                 raise
             continue
-        revision.append((str(item), stat.st_size, stat.st_mtime_ns, stat.st_ino))
+        revision.append((str(item), observed.st_size, observed.st_mtime_ns, observed.st_ino))
     return tuple(revision)
 
 
 def cursor_source(path: Path, *, select_saved=False) -> Path:
     """Never restore index-derived pins onto a different representation."""
-    from cursor_flush import _read_state, _UUID_RE, _source_for
+    from cursor_flush import _read_state, _state_path, _UUID_RE, _source_for
     sid = path.parent.name if path.name == "store.db" else path.stem
     if not _UUID_RE.fullmatch(sid):
         return path
+    try:
+        with regular_source(_state_path(sid)):
+            pass
+    except FileNotFoundError:
+        pass
     state = _read_state(sid, strict=True)
     kind = state.get("source_kind")
     if kind is None:
@@ -188,7 +217,7 @@ def source_snapshot(path: Path, host: str):
         for name in ("store.db", "store.db-wal", "store.db-journal", "meta.json"):
             source, target = path.parent / name, directory / name
             try:
-                with source.open("rb") as handle:
+                with regular_source(source) as (handle, _):
                     target.touch(mode=0o600, exist_ok=False)
                     with target.open("wb") as output:
                         shutil.copyfileobj(handle, output)
@@ -259,7 +288,8 @@ def main(argv=None) -> int:
                     if args.host == "cursor" and path.name == "store.db":
                         # Ranking consumes only the update clock. Full metadata
                         # validation belongs to the selected session below.
-                        metadata = load_json((path.parent / "meta.json").read_text(encoding="utf-8"), strict=True)
+                        with regular_source(path.parent / "meta.json") as (handle, _):
+                            metadata = load_json(handle.read().decode("utf-8"), strict=True)
                         value = metadata.get("updatedAtMs") if isinstance(metadata, dict) else None
                         if type(value) not in (int, float) or not math.isfinite(value):
                             raise ValueError("Cursor latest ordering requires a finite native timestamp")

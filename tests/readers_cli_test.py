@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -965,6 +966,25 @@ def test_discovered_posix_fifo_does_not_block_healthy_session_output():
             result,rows=run(home,host,'--metadata-only')
             assert result.returncode==2 and 'discovery_incomplete' in result.stderr
             assert len(rows)==1 and rows[0]['path']==str(good.resolve())
+
+
+def test_cursor_special_file_sidecars_are_rejected_without_blocking():
+    if not hasattr(os,'mkfifo'):
+        return  # Native Windows does not expose POSIX FIFO creation.
+    for sidecar in ('meta.json','store.db-wal','store.db-journal','saved-state'):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/'.cursor/chats',uuid=SID)
+            fifo=(home/f'.config/memhub-plugin/cursorflush/{SID}.json'
+                  if sidecar=='saved-state' else store.parent/sidecar)
+            fifo.parent.mkdir(parents=True,exist_ok=True)
+            if fifo.exists():fifo.unlink()
+            os.mkfifo(fifo);before=fifo.lstat()
+            for mode in ([],['--metadata-only']):
+                result,rows=run(home,'cursor',*mode)
+                assert result.returncode==2 and rows==[],(sidecar,result.stdout,result.stderr)
+                assert 'session_unreadable' in result.stderr and 'Traceback' not in result.stderr
+            after=fifo.lstat();assert stat.S_ISFIFO(after.st_mode)
+            assert (before.st_dev,before.st_ino)==(after.st_dev,after.st_ino)
 
 
 def test_codex_bad_git_container_is_rejected_without_losing_identity_checks():
