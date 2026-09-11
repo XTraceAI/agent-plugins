@@ -1391,6 +1391,19 @@ def main() -> int:
               and "super-secret-value" not in out and "ghp_AAAABBBBCCCCDDDDEEEEFFFF1111" not in out
               and "AKIAIOSFODNN7EXAMPLE" not in out, out)
 
+    # Quoted values are the ordinary shell form and must not slip past.
+    for label, cmd, secret in [
+        ("--flag='quoted'", "deploy --token='s3cr3t-quoted-value' --env prod", "s3cr3t-quoted-value"),
+        ('KEY="double quoted"', 'PGPASSWORD="hunter3 two" psql -h db', "hunter3"),
+        ('--flag "spaced"', 'mysql --password "pa ss" -h db', "pa ss"),
+        ("curl -u 'user:pass'", "curl -u 'admin:pa55w0rd' https://x.com", "pa55w0rd"),
+        ("curl -u user:'pass'", "curl -u admin:'pa55 w0rd' https://x.com", "pa55 w0rd"),
+        ('curl --user user:"pass"', 'curl --user admin:"s3cr3t pw" https://x.com', "s3cr3t pw"),
+    ]:
+        out = rb.redact_secrets(cmd)
+        check("recall redacts a quoted value: %s" % label,
+              "<redacted>" in out and secret not in out, out)
+
     # Over-redaction is not free: it costs the judge the verb of the command.
     for cmd in ["git push --force origin main", "gh auth login", "kubectl get secrets",
                 "npm run build -- --token-budget 500", "pytest tests/ -k rulebook",
