@@ -949,6 +949,27 @@ def test_discovered_posix_fifo_does_not_block_healthy_session_output():
             assert len(rows)==1 and rows[0]['path']==str(good.resolve())
 
 
+def test_codex_bad_git_container_is_rejected_without_losing_identity_checks():
+    for git in (17,[],False,'branch'):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);good=rollout(home);rows=[json.loads(x) for x in good.read_text().splitlines()]
+            sid=rows[0]['payload']['id'];bad_rows=copy.deepcopy(rows);bad_rows[0]['payload']['git']=git
+            bad=write_jsonl(good.with_name('rollout-bad-git.jsonl'),bad_rows)
+            os.utime(bad,(MTIME-100,MTIME-100))
+            for selection in (sid,'latest'):
+                result,output=run(home,'codex','--session',selection)
+                assert result.returncode==2 and output==[],result.stderr
+            result,output=run(home,'codex','--session',str(bad),'--metadata-only')
+            assert result.returncode==2 and output==[],result.stderr
+            bad_rows[0]['payload']['id']='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+            write_jsonl(bad,bad_rows);os.utime(bad,(MTIME-100,MTIME-100))
+            for selection in (sid,'latest'):
+                result,output=run(home,'codex','--session',selection,'--metadata-only')
+                assert result.returncode==0 and len(output)==1,result.stderr
+            result,output=run(home,'codex','--metadata-only')
+            assert result.returncode==2 and len(output)==1,result.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -317,8 +317,15 @@ def main(argv=None) -> int:
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
                 raise ValueError("invalid mtime")
-            native = reader.session_metadata(path)
-            sid = native_text(native.get("session_id"), required=True)
+            if args.host == "codex":
+                # Parse once and count the native identity before validating
+                # other values; malformed duplicates must not appear unique.
+                source_header = reader._session_header(path)
+                sid = native_text(source_header.get("payload", {}).get("id"), required=True)
+                native = None
+            else:
+                native = reader.session_metadata(path)
+                sid = native_text(native.get("session_id"), required=True)
             # A readable identity still collides when another header field is bad.
             counts[f"{reader.HOST}-{sid}"] += 1
             if args.host == "codex" and args.session and not explicit_path:
@@ -329,6 +336,8 @@ def main(argv=None) -> int:
                         continue
                 elif sid != args.session.removesuffix(".jsonl"):
                     continue
+            if native is None:
+                native = reader._metadata_from_header(source_header)
             header = header_for(reader, path, mtime, native)
             prepared.append((path, revision, header))
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
