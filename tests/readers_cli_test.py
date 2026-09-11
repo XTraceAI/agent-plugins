@@ -255,7 +255,7 @@ def test_reader_errors_never_emit_partial_session_records():
 
 def test_store_paths_with_uri_characters_remain_read_only():
     with tempfile.TemporaryDirectory() as td:
-        home = Path(td) / "native stores #1?"
+        home = Path(td) / "native stores #1%2"
         path = fixtures._make_cursor_store(home / ".cursor/chats")
         before = path.read_bytes()
         result, rows = run(home, "cursor")
