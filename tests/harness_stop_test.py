@@ -375,9 +375,39 @@ def test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in():
     print("PASS test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in")
 
 
+def test_an_older_turns_child_never_moves_the_meta_back():
+    with _Env():
+        hs.save_meta("sess", advance_turn=5, repo="new")
+        hs.save_meta("sess", advance_turn=4, repo="old")      # the older child finishes last
+        meta = hs.load_meta("sess")
+        assert meta["last_turn"] == 5 and meta["repo"] == "new", meta
+        # the read and the write are one critical section: another child cannot enter it
+        real, tried = hs.load_meta, []
+
+        def load_while_another_child_tries(session):
+            if not tried:
+                tried.append(hs._meta_lock(session))
+            return real(session)
+
+        hs.load_meta = load_while_another_child_tries
+        try:
+            hs.save_meta("sess", advance_turn=6)
+        finally:
+            hs.load_meta = real
+        assert tried == [None], "the lock is held across the read-merge-write"
+        lock = hs._meta_lock("sess")
+        assert lock is not None, "and released after it"
+        hs._release(lock)
+        assert hs.load_meta("sess")["last_turn"] == 6
+    print("PASS test_an_older_turns_child_never_moves_the_meta_back")
+
+
 def test_the_nudge_line():
     line = hs.nudge_line("sess", _moment(2), "repo")
     assert "Never pass activate" in line and "/Users/" not in line and "@" not in line
+    # the server refuses to guess a rulebook for someone bound to several
+    assert line.index("list_rulebooks") < line.index("Then pass title") and "rulebook_id" in line
+    assert "ask the user which" in line
     assert len(line) < 1600
     assert "may already be written down" in hs.nudge_line("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line

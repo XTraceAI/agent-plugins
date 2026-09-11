@@ -29,7 +29,8 @@ all created private:
 
   <session>.moments.jsonl    flagged moments, then a `handed` row per nudge
                              (append-only: two lanes write it at once)
-  <session>.meta.json        last extracted turn, repo, cwd, nudge count
+  <session>.meta.json        last extracted turn, repo, cwd
+  <session>.meta.json.lock   serializes the meta file's read-merge-write
   <session>.turn-*.claim     the turn an extract child already took
   stop.log / extract.log     one line per step, never prompt text
 
@@ -99,12 +100,48 @@ def _publish(path: Path, text: str) -> None:
         os.replace(tmp, path)
 
 
-def save_meta(session: str, **fields) -> dict:
-    meta = load_meta(session)
-    meta.update(fields)
-    meta["session_id"] = session
-    _publish(meta_path(session), json.dumps(meta, indent=1, default=str))
-    return meta
+def _meta_lock(session: str):
+    """The rulebook hook's session-state lock, taken on this session's meta
+    file. None past its short wait or with no hook: it fails open."""
+    rh = hx._hook()
+    if rh is None or not hasattr(rh, "_state_lock"):
+        return None
+    try:
+        path = meta_path(session)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return rh._state_lock(str(path))
+    except Exception:
+        return None
+
+
+def _release(lock) -> None:
+    if lock is None:
+        return
+    try:
+        hx._hook().portable_lock.unlock(lock.fileno())
+    except Exception:
+        pass
+    lock.close()
+
+
+def save_meta(session: str, *, advance_turn: int | None = None, **fields) -> dict:
+    """Merge `fields` into the session's meta, the read and the write under one
+    lock. With `advance_turn` the write is a turn's: it moves `last_turn`
+    forward, and a child for an OLDER turn than the one recorded (two children
+    overlap on a slow classifier) changes nothing."""
+    lock = _meta_lock(session)
+    try:
+        meta = load_meta(session)
+        if advance_turn is not None:
+            if advance_turn < int(meta.get("last_turn") or 0):
+                return meta
+            fields["last_turn"] = advance_turn
+        meta.update(fields)
+        meta["session_id"] = session
+        _publish(meta_path(session), json.dumps(meta, indent=1, default=str))
+        return meta
+    finally:
+        _release(lock)
 
 
 def env_name() -> str:
@@ -243,9 +280,8 @@ def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
                         out_path=moments_path(session), arcs=arcs)
     finally:
         trace.close()
-    # children for two turns can overlap on a slow classifier: never move back
-    newest = max(int(load_meta(session).get("last_turn") or 0), int(last.get("n") or 0))
-    save_meta(session, repo=repo, cwd=cwd, last_turn=newest, last_stop_at=time.time())
+    save_meta(session, advance_turn=int(last.get("n") or 0), repo=repo, cwd=cwd,
+              last_stop_at=time.time())
     _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
          f"moment={stats['moments']} reason={stats['reason'] or '-'} arcs={len(arcs)}")
     return 0
@@ -280,7 +316,10 @@ def nudge_line(session: str, moment: dict, repo: str = "") -> str:
         f"{kind}{hint}{derivable}. If it carries a lesson that would change what an agent "
         f"DOES next time, is not already in the repo, its docs, CLAUDE.md or the rulebook, "
         f"is not project state, and will still be true next month, propose it now with the "
-        f"memhub create_rule tool: title (a short noun phrase naming the trap), statement "
+        f"memhub create_rule tool. Resolve the rulebook first with list_rulebooks: with one, "
+        f"pass its rulebook_id; with several, ask the user which; with none, say so and stop "
+        f"(no list_rulebooks tool: omit rulebook_id). Then pass title (a short noun phrase "
+        f"naming the trap), statement "
         f"(one when-X-then-Y sentence with the why), exactly one engine — "
         f"delivery=agent_hook with matcher {{event: bash|edit|output|read, …_rx}} or "
         f"ordering, or delivery=anchor_recall with 1-8 concrete identifiers — plus "

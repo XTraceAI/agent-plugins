@@ -289,7 +289,9 @@ Stop, a detached child sends a redacted slice of that turn to MemHub
 moment is worth the agent's attention. At your next prompt, one injected line
 hands a flagged moment to the agent that lived the turn: if there is a lesson
 that would change what an agent does next time, the agent proposes it with the
-memhub `create_rule` tool, asking you first if unsure. The rule lands
+memhub `create_rule` tool, asking you first if unsure. It files the rule into
+the rulebook `list_rulebooks` returns, and asks you which one when you are in
+several. The rule lands
 `proposed` for a person to activate; nothing fires from it, and the plugin
 never activates one. The slice is redacted before it leaves the machine
 (MemHub keys, home directories, e-mail addresses, command-line credentials).
