@@ -827,6 +827,21 @@ def test_checked_codex_consumed_timestamps_are_parseable():
             assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
 
 
+def test_checked_cursor_rejects_finite_out_of_range_creation_times():
+    with tempfile.TemporaryDirectory() as td:
+        store=fixtures._make_cursor_store(Path(td)/'chats');path=store.parent/'meta.json'
+        original=json.loads(path.read_text())
+        for value in (10**18,-10**18,1e300,-1e300,10**400):
+            path.write_text(json.dumps({**original,'createdAtMs':value}));before=path.read_bytes()
+            rejected(lambda:cursor.to_canonical(store,strict=True))
+            rejected(lambda:cursor.session_metadata(store))
+            assert path.read_bytes()==before
+        for value in (None,0,original['createdAtMs']):
+            path.write_text(json.dumps({**original,'createdAtMs':value}))
+            assert cursor.to_canonical(store,strict=True)==cursor.to_canonical(store)
+            assert cursor.session_metadata(store)
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

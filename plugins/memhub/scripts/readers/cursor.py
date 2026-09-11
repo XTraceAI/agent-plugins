@@ -168,6 +168,7 @@ def _read_meta_json(session_dir: Path, *, strict=False) -> dict | None:
                     raise ValueError(f"Cursor metadata {key} must be text or null")
             if value.get("createdAtMs") is not None and type(value["createdAtMs"]) not in (int, float):
                 raise ValueError("Cursor creation time must be numeric")
+            _iso_ms(value.get("createdAtMs"), strict=True)
         return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         if strict:
@@ -504,12 +505,14 @@ def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, i
     return messages
 
 
-def _iso_ms(ms) -> str | None:
+def _iso_ms(ms, *, strict: bool = False) -> str | None:
     try:
         return datetime.datetime.fromtimestamp(
             ms / 1000.0, tz=datetime.timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    except (TypeError, ValueError, OSError):
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError, OverflowError) as error:
+        if strict and ms is not None:
+            raise ValueError("Cursor timestamp is outside the supported range") from error
         return None
 
 
