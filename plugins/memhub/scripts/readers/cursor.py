@@ -61,6 +61,7 @@ import sys
 import uuid as _uuid
 from pathlib import Path
 from .strict_json import loads as load_json
+from .jsonl import open_lines, readline_bytes
 
 # See the same note in ``readers/codex.py`` — shared title rules, stdlib only.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
@@ -692,16 +693,13 @@ def _load_transcript(path: Path, *, strict: bool = False) -> list[tuple[dict, st
     first-seen hook clock instead; backfills leave them unmeasured.
     """
     messages: list[tuple[dict, str | None]] = []
-    with path.open("rb") as handle:
+    with open_lines(path) as handle:
         line_no = 0
         while True:
-            raw = handle.readline(_MAX_TRANSCRIPT_LINE_BYTES + 1)
+            raw = readline_bytes(handle, _MAX_TRANSCRIPT_LINE_BYTES)
             if not raw:
                 break
             line_no += 1
-            if len(raw) > _MAX_TRANSCRIPT_LINE_BYTES:
-                raise ValueError(
-                    f"cursor transcript {path} line {line_no} exceeds 8 MiB")
             terminated = raw.endswith((b"\n", b"\r"))
             try:
                 entry = load_json(raw.decode("utf-8"), strict=strict)
@@ -760,7 +758,7 @@ def to_canonical(path, *, session_id: str | None = None,
     session_dir = source.parent
     mj = _read_meta_json(session_dir, strict=strict) or {}
     version = mj.get("schemaVersion")
-    if version != _SCHEMA_VERSION:
+    if type(version) is not int or version != _SCHEMA_VERSION:
         raise ValueError(
             f"cursor store {session_dir} has schemaVersion {version!r}; this "
             f"reader is pinned to {_SCHEMA_VERSION} — refusing to misparse. "
@@ -782,7 +780,8 @@ def session_metadata(path) -> dict:
     source = Path(path)
     if source.name == "store.db":
         meta = _read_meta_json(source.parent, strict=True)
-        if not isinstance(meta, dict) or meta.get("schemaVersion") != _SCHEMA_VERSION:
+        version = meta.get("schemaVersion") if isinstance(meta, dict) else None
+        if type(version) is not int or version != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
         created = meta.get("createdAtMs")
         return {"session_id": source.parent.name, "cwd": meta.get("cwd"),

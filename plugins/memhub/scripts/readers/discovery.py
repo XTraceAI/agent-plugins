@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import stat
 from pathlib import Path
 
 
@@ -34,8 +35,21 @@ def paths(root: Path, pattern: tuple[str, ...], on_error) -> list[Path]:
                     keep.append(name)
             directories[:] = keep
             if recursive or depth == len(pattern) - 1:
-                found.extend(parent / name for name in files
-                             if fnmatch.fnmatchcase(name, pattern[-1]))
+                for name in files:
+                    if not fnmatch.fnmatchcase(name, pattern[-1]):
+                        continue
+                    child = parent / name
+                    try:
+                        mode = child.lstat().st_mode
+                    except OSError as error:
+                        on_error(error)
+                        continue
+                    if stat.S_ISLNK(mode):
+                        on_error(OSError("symlinked discovery file", str(child)))
+                    elif not stat.S_ISREG(mode):
+                        on_error(OSError("non-regular discovery file", str(child)))
+                    else:
+                        found.append(child)
     except OSError as error:
         on_error(error)
     return found

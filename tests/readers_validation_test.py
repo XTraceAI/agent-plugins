@@ -5,7 +5,9 @@ import copy
 from contextlib import closing
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
 import sqlite3
 import tempfile
 from unittest.mock import patch
@@ -181,7 +183,9 @@ def test_legacy_cwd_probe_tolerates_later_decode_damage():
         assert expected
         path.write_bytes(path.read_bytes()+b'{"bad":"\xff"}\n')
         assert codex.session_cwd(path)==expected
-        rejected(lambda:codex.session_metadata(path))
+        # A bounded metadata probe must not depend on decoder read-ahead into
+        # an unread body. The complete checked read still reports that damage.
+        assert codex.session_metadata(path)['cwd']==expected
         rejected(lambda:codex.to_canonical(path,strict=True))
 
 
@@ -663,6 +667,77 @@ def test_idless_tool_use_exception_is_limited_to_transcripts():
         rejected(lambda:cursor.to_canonical(store,strict=True))
         assert cursor.to_canonical(transcript,strict=True)==cursor.to_canonical(transcript)
         assert store.read_bytes()==original
+
+
+def test_cursor_transcript_line_endings_preserve_records_and_byte_limits():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[1][1]
+        rows=path.read_bytes().splitlines();expected=cursor.to_canonical(path,strict=True)
+        for ending in (b'\n',b'\r',b'\r\n'):
+            for trailing in (True,False):
+                raw=ending.join(rows)+(ending if trailing else b'')
+                path.write_bytes(raw)
+                assert cursor.to_canonical(path,strict=True)==expected
+                assert cursor.to_canonical(path)==expected
+                assert path.read_bytes()==raw
+        # UTF-8 byte limits still apply even when a character spans bytes.
+        row=json.dumps({'role':'user','message':{'content':'界'*16}},ensure_ascii=False).encode()
+        path.write_bytes(row+b'\r')
+        with patch.object(cursor,'_MAX_TRANSCRIPT_LINE_BYTES',len(row)):
+            rejected(lambda:cursor.to_canonical(path,strict=True))
+        with patch.object(cursor,'_MAX_TRANSCRIPT_LINE_BYTES',len(row)+1):
+            assert cursor.to_canonical(path,strict=True)
+
+
+def test_codex_metadata_checks_committed_prefix_and_finite_json():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];original=path.read_bytes()
+        expected=codex.session_metadata(path)
+        for ending in (b'\n',b'\r',b'\r\n'):
+            for prefix in (b'{bad}',b'null',b'[]',b'{"ignored":NaN}',b'{"ignored":1e999}'):
+                path.write_bytes(prefix+ending+original)
+                before=path.read_bytes()
+                rejected(lambda:codex.session_metadata(path))
+                assert codex.session_metadata(path,strict=False)==expected
+                assert path.read_bytes()==before
+            # Metadata probes stop at the header, before damaged body bytes.
+            first=original.splitlines()[0]
+            path.write_bytes(first+ending+b'{"body":"bad\xff"}'+ending)
+            assert codex.session_metadata(path)==expected
+            path.write_bytes(ending+first+ending)
+            assert codex.session_metadata(path)==expected
+        for tail in (b'{unfinished',b'{bad}'):
+            path.write_bytes(tail)
+            assert codex.session_metadata(path)=={}
+
+
+def test_cursor_schema_version_requires_an_integer():
+    with tempfile.TemporaryDirectory() as td:
+        store=fixtures._make_cursor_store(Path(td)/'chats');path=store.parent/'meta.json'
+        original=json.loads(path.read_text());expected=cursor.to_canonical(store,strict=True)
+        for value in (True,False,1.0,'1',None,[],{},2):
+            path.write_text(json.dumps({**original,'schemaVersion':value}))
+            before=path.read_bytes()
+            rejected(lambda:cursor.to_canonical(store,strict=True))
+            rejected(lambda:cursor.to_canonical(store))
+            rejected(lambda:cursor.session_metadata(store))
+            assert path.read_bytes()==before
+        path.write_text(json.dumps(original))
+        assert cursor.to_canonical(store,strict=True)==expected
+        assert cursor.session_metadata(store)['session_id']==store.parent.name
+
+
+def test_discovery_skips_posix_special_files_and_keeps_regular_peers():
+    if not hasattr(os,'mkfifo'):
+        return  # Native Windows does not expose POSIX FIFO creation.
+    with tempfile.TemporaryDirectory(prefix='nr-') as td:
+        root=Path(td);good=root/'good.jsonl';good.write_text('{}\n')
+        fifo=root/'p.jsonl';os.mkfifo(fifo)
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as listener:
+            listener.bind(str(root/'s.jsonl'))
+            errors=[]
+            assert discovery.paths(root,('**','*.jsonl'),errors.append)==[good]
+            assert len(errors)==2
 
 
 if __name__=='__main__':
