@@ -28,7 +28,7 @@ ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST o
 ap.add_argument("--facets", action="append", default=[], help="facets YOU wrote from the digests (see SKILL.md step 3): a JSON list, or a directory of them (one per batch); repeatable. Merged into the facet cache, so a session is read once")
 ap.add_argument("--digest-top", type=int, default=30, help="how many not-yet-faceted sessions to digest for the facet pass (ranked by corrections, errors, reverts)")
 ap.add_argument("--digest-batch", type=int, default=5, help="digests per batch in digest_batches.json — one reader per batch")
-ap.add_argument("--cache-dir", default=os.path.expanduser("~/.config/memhub-plugin/rules-from-sessions"), help="facets and cwd -> repo names kept across runs")
+ap.add_argument("--cache-dir", default=os.path.expanduser("~/.config/memhub-plugin/rules-from-sessions"), help="where facets are kept across runs")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 os.makedirs(args.cache_dir, exist_ok=True)
@@ -68,23 +68,16 @@ def sessions():
     for p in glob.glob(os.path.expanduser("~/.cursor/projects/*/agent-transcripts/*/*.jsonl")): yield "cursor", p
 R = {"claude": claude, "codex": codex, "cursor": cursor}
 corpus, errs = [], collections.Counter()
-_repo_cache = _load_cache("repos.json", {})
-_repo_cache_n = len(_repo_cache)
 def _repo_name(cwd):
     """The repo a transcript's cwd belongs to. `repo_identity` lives beside the
-    hook, which this script already imports as `rh`. Kept across runs: it asks
-    git once per directory, and hundreds of worktree cwds made that the slowest
-    part of reading the sessions. An answer that spent git's whole 0.5 s budget
-    may be a timeout's fallback basename: it is used for this run, never kept."""
-    if cwd in _repo_cache: return _repo_cache[cwd]
-    started = time.time()
+    hook, which this script already imports as `rh`. Not kept across runs: its
+    fallback (the directory's basename) cannot be told apart from a resolved
+    name, and a kept wrong name would drop sessions from `--repo` for good."""
     try:
         from repo_identity import repo_name
-        name = repo_name(cwd.rstrip("/"))
+        return repo_name(cwd.rstrip("/"))
     except Exception:
-        name = os.path.basename(cwd.rstrip("/"))
-    if time.time() - started < 0.4: _repo_cache[cwd] = name
-    return name
+        return os.path.basename(cwd.rstrip("/"))
 
 
 for host, path in sessions():
@@ -119,7 +112,6 @@ for host, path in sessions():
     if args.repo and repo != args.repo: continue
     sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
     corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results, "result_calls": result_calls})
-if len(_repo_cache) != _repo_cache_n: _save_cache("repos.json", _repo_cache)
 CORRECTION = re.compile(r"^(no|nope|wrong|wait|stop)\b|\b(not what i|why did (u|you)|did (u|you) (just )?|actually (read|test|run|check|do)|i said|i meant|revert that|undo that|is (all )?stale|u should|you should|read the (actual|real)|check the (live|actual|latest|agent|other)|this is (prod|staging)|not (prod|staging)|don'?t (code|merge|push|delete|guess)|plan first)\b", re.I)
 PASTED = re.compile(r"^(Base directory for this skill|Approach this as|<command-message>|<task-notification>|This session is being continued)", re.I)
 ERROR = re.compile(r"Traceback \(most recent call last\)|^Exit code [1-9]|\bexit code [1-9]\b|ModuleNotFoundError|FAILED \(|\d+ failed\b|Permission denied|command not found|<tool_use_error>", re.M)
@@ -170,7 +162,11 @@ _facet_cache = {str(d["session_id"]): d for d in _load_cache("facets.json", []) 
 new_here = []
 for d in new:
     full = corpus_id(d.get("session_id"))
-    if full: d["session_id"] = full; d.setdefault("stamp", _stamp[full]); _facet_cache[full] = d; new_here.append(d)
+    if not full: continue
+    d["session_id"] = full; d.setdefault("stamp", _stamp[full])
+    held = _facet_cache.get(full)
+    if held and held.get("stamp") == _stamp[full] and d["stamp"] != _stamp[full]: continue   # a batch file left from an earlier run in a reused --out must not overwrite this run's reading
+    _facet_cache[full] = d; new_here.append(d)
 if new_here: _save_cache("facets.json", list(_facet_cache.values()))
 facets = [d for sid, d in _facet_cache.items() if sid in _stamp] + [d for d in new if not corpus_id(d.get("session_id"))]   # this corpus only: a --repo run keeps to its repo
 json.dump(facets, open(os.path.join(args.out, "facets.merged.json"), "w"), indent=1)   # every facet for these sessions, earlier runs' included — what step 6 sends to the team
@@ -183,6 +179,7 @@ def _faceted(d):
     return f is not None and f.get("stamp", d["stamp"]) == d["stamp"]
 pending = [d for d in digests if d["score"] > 0 and not _faceted(d)]   # score 0: no correction, error, revert or standard — nothing for a facet to hold
 ddir = os.path.join(args.out, "digests"); os.makedirs(ddir, exist_ok=True)
+os.makedirs(os.path.join(args.out, "facets"), exist_ok=True)   # the readers write here, and are told to change nothing else
 for old in glob.glob(os.path.join(ddir, "*.json")): os.remove(old)   # a digest from an earlier pass may be faceted by now
 paths = []
 for d in pending[:args.digest_top]:

@@ -135,11 +135,11 @@ def main() -> int:
         def _offered(): return sorted(os.path.basename(x) for batch in json.load(open(out / "digest_batches.json")) for x in batch)
 
         p = _run("--out", str(out), "--digest-batch", "1", home=home)
-        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"] and len(json.load(open(out / "digest_batches.json"))) == 2
-        print(("ok  " if ok else "FAIL"), "first run: every session with signal is digested, --digest-batch per batch"); fails += not ok
+        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"] and len(json.load(open(out / "digest_batches.json"))) == 2 and (out / "facets").is_dir()
+        print(("ok  " if ok else "FAIL"), "first run: every session with signal is digested, --digest-batch per batch, and the readers' facets/ exists"); fails += not ok
         if not ok: print(p.stdout[-600:], p.stderr[-600:])
 
-        (out / "facets").mkdir()
+        (out / "facets").mkdir(exist_ok=True)
         (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-111", "friction": [{"category": "wrong_source", "detail": "edited the wrong file", "evidence_turn": 0}]}]))
         p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
         cached = json.load(open(cache_dir / "facets.json")) if (cache_dir / "facets.json").is_file() else []
@@ -159,9 +159,14 @@ def main() -> int:
         ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"]
         print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written — by a late tool result alone — is offered again"); fails += not ok
 
-        repos = json.load(open(cache_dir / "repos.json")) if (cache_dir / "repos.json").is_file() else {}
-        ok = "/w/demo" in repos
-        print(("ok  " if ok else "FAIL"), "cwd -> repo names are kept across runs"); fails += not ok
+        # A reused --out: this run's reading lands in batch-1, a stale copy from an earlier run still sits in batch-2 and loads after it
+        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "friction": []}]))
+        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "stamp": "1u0c0r", "friction": []}]))
+        p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
+        stamps = {d["session_id"]: d.get("stamp") for d in json.load(open(cache_dir / "facets.json"))}
+        ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and stamps.get("aaaaaaaa-1111-2222") == "1u0c1r"
+        print(("ok  " if ok else "FAIL"), "a stale batch file from an earlier run does not overwrite this run's reading"); fails += not ok
+        if not ok: print(stamps, _offered())
     return 1 if fails else 0
 
 if __name__ == "__main__":

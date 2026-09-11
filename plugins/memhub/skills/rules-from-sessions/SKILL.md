@@ -138,9 +138,8 @@ split into `mine-out/digest_batches.json` (`--digest-batch`, default 5). Its
 its heading — the input to step 2.
 
 **A session is read once.** Facets from earlier runs live in
-`~/.config/memhub-plugin/rules-from-sessions/facets.json` (the cwd → repo
-names beside them in `repos.json`) and count in every later report without
-being passed; a session is offered for reading again only when it has grown
+`~/.config/memhub-plugin/rules-from-sessions/facets.json` and count in every
+later report without being passed; a session is offered for reading again only when it has grown
 since its facet was written. `mine-out/facets.merged.json` holds every facet
 for this run's sessions, earlier runs' included. Delete `facets.json` to read
 everything again — after changing the facet schema, say.
