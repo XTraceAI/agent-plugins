@@ -382,6 +382,15 @@ def _validate_message(message):
             for key in ("toolCallId", "id", "toolName", "name"):
                 if block.get(key) is not None and not isinstance(block[key], str):
                     raise ValueError("Cursor tool identity must be a string")
+            identity = block.get("toolCallId")
+            if kind != "tool-result":
+                identity = identity or block.get("id")
+            # IDE transcripts can contain id-less tool_use observations. Native
+            # tool-call/result blocks and explicitly supplied aliases need the
+            # identifier actually consumed by normalization.
+            requires_identity = kind != "tool_use" or "toolCallId" in block or "id" in block
+            if requires_identity and (not isinstance(identity, str) or not identity):
+                raise ValueError("Cursor tool block requires its native call identifier")
 
 
 def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, int | None]]:
