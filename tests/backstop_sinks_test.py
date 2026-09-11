@@ -188,6 +188,32 @@ def test_backstop_sidecar_batches_keep_real_message_context_on_retry():
             assert state(home,"local",local[0])["last_ok_at"] and path.read_bytes()==original
 
 
+def test_backstop_preserves_uuidless_messages_without_replaying_them_as_context():
+    for count in (1, 2001):
+        with tempfile.TemporaryDirectory() as td,cases.receiver("local",[]) as local,cases.receiver("cloud",[]) as cloud:
+            home=Path(td);data=cases.payload(home,0);cases.configure(home,local[0],active=["local"])
+            path=Path(data["transcript_path"])
+            rows=[{"type":"user","message":{"role":"user","content":f"message {index}"}}
+                  for index in range(count)]
+            path.write_text("".join(json.dumps(row)+"\n" for row in rows))
+            original=path.read_bytes();local[2].update(require_message=True,all_dropped=True)
+            backstop(home,cloud[0],data)
+            batches=cases.routing.imports(local[1])
+            assert [row for batch in batches for row in batch["messages"]]==rows
+            assert all(len(batch["messages"])<=2000 for batch in batches)
+            assert state(home,"local",local[0])["last_ok_at"] and path.read_bytes()==original
+            # An isolated sidecar needs a stable native context identity. Do
+            # not silently discard it or manufacture/replay a UUIDless record.
+            local[1].clear()
+            prefix=[{"type":"attachment","payload":"sidecar"} for _ in range(2000)]
+            path.write_text("".join(json.dumps(row)+"\n" for row in prefix+rows[:1]))
+            previous=state(home,"local",local[0])["last_ok_at"]
+            backstop(home,cloud[0],data)
+            assert not local[1]
+            current=state(home,"local",local[0])
+            assert current.get("last_ok_at",0)<=previous and current["last_error"]=="error"
+
+
 def test_long_native_ids_capture_through_both_claude_hooks_with_bounded_state_names():
     for length in (200,201,237,238,256):
         with tempfile.TemporaryDirectory() as td,cases.receiver("local",[]) as local,cases.receiver("cloud",[]) as cloud:

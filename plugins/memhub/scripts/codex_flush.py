@@ -646,15 +646,23 @@ def _capture_sink(payload: dict) -> int:
     # rollout, and race the write back.
     # Stop is the last-chance event (no SessionEnd), so it WAITS for a
     # concurrent flush rather than skip and never run again.
-    lock_fd = _acquire(sid, blocking=(event == "Stop"), timeout=remaining)
+    return _flush_locked(event, payload, sid, rollout, size, timeout=remaining)
+
+
+async def _acquire_and_flush(event, payload, sid, rollout, size, budget):
+    started = time.monotonic()
+    lock_fd = await capture_async.resource(
+        lambda: _acquire(sid, blocking=(event == "Stop"), timeout=budget),
+        close=lambda fd: os.close(fd) if fd is not None else None)
     if lock_fd is None:
         _log(f"{event}: another flush is running for this session — skipping")
-        return 0
+        return
     try:
-        remaining = max(0.0, budget - (time.monotonic() - started))
-        return _flush_locked(event, payload, sid, rollout, size, timeout=remaining)
+        remaining = budget - (time.monotonic() - started)
+        if remaining > 0:
+            await _gated_flush(event, payload, sid, rollout, size, remaining)
     finally:
-        os.close(lock_fd)  # releases the flock
+        os.close(lock_fd)  # This coroutine owns the flock through cancellation.
 
 
 async def _gated_flush(event, payload, sid, rollout, size, timeout):
@@ -697,13 +705,13 @@ async def _gated_flush(event, payload, sid, rollout, size, timeout):
 
 def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
                   size: int, *, timeout: float | None = None) -> int:
-    """Bound the entire gated flush while this session's flock is held."""
+    """Bound lock acquisition and the entire gated flush together."""
     budget = FLUSH_TIMEOUT_S if timeout is None else timeout
     if budget <= 0:
         return 0
     try:
         asyncio.run(asyncio.wait_for(
-            _gated_flush(event, payload, sid, rollout, size, budget), timeout=budget))
+            _acquire_and_flush(event, payload, sid, rollout, size, budget), timeout=budget))
     except (TimeoutError, OSError):
         # No synchronous retry write after the deadline: leave the old
         # watermark for replay and release ownership for the next attempt.

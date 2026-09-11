@@ -209,6 +209,41 @@ def test_codex_reuses_prepared_metadata_without_a_second_filesystem_probe():
             assert cases.routing.imports(receiver[1])[0].get("source_surface")==json.loads(path.read_text().splitlines()[0])["payload"].get("originator")
 
 
+def test_codex_slow_lock_open_is_bounded_and_late_descriptor_is_closed():
+    order=[]
+    with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
+        home=Path(td);payload,path=source(home);cases.configure(home,local[0]);env=cases.environment(home,cloud[0])
+        with (home/"guard/sitecustomize.py").open("a") as output:
+            output.write("\nimport os,time,capture_context\n"
+                "original_open=os.open\n"
+                "def slow_open(path,*args,**kwargs):\n"
+                "    selected=capture_context._current.get()\n"
+                "    if selected is not None and selected.is_local and str(path).endswith('.flush.lock'): time.sleep(1.2)\n"
+                "    return original_open(path,*args,**kwargs)\n"
+                "os.open=slow_open\n")
+        result=subprocess.run([sys.executable,"-c", """
+import codex_flush,time,sys,os,portable_lock
+codex_flush.FLUSH_TIMEOUT_S=0.8
+sys.argv=['codex_flush.py','Stop']
+started=time.monotonic()
+codex_flush.main()
+assert time.monotonic()-started<1.1
+saved={p:p.read_bytes() for p in codex_flush.STATE_DIR.rglob('*.json')}
+time.sleep(1.3)
+assert saved=={p:p.read_bytes() for p in codex_flush.STATE_DIR.rglob('*.json')}
+# Prove release while this process is still alive; process exit must not be
+# the thing releasing the timed-out worker's late-acquired lock.
+for path in codex_flush.STATE_DIR.rglob('*.flush.lock'):
+    fd=os.open(path,os.O_RDWR)
+    try: portable_lock.lock_exclusive(fd,blocking=False)
+    finally: os.close(fd)
+"""],env=env,input=json.dumps(payload),text=True,capture_output=True,timeout=5)
+        assert result.returncode==0 and "Traceback" not in result.stderr,result.stderr
+        assert order==["cloud"],order
+        assert state(home,"cloud",local[0])["rollout_size"]==path.stat().st_size
+        assert not state(home,"local",local[0]).get("rollout_size")
+
+
 if __name__=="__main__":
     for name,fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

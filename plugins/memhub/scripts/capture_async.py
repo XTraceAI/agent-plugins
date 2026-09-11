@@ -39,6 +39,35 @@ async def blocking(function, *args):
     return await result
 
 
+async def resource(function, *, close):
+    """Acquire in the existing worker, disposing any unclaimed late result."""
+    guard = threading.Lock()
+    pending = []
+    abandoned = False
+
+    def acquire():
+        value = function()
+        with guard:
+            if not abandoned:
+                pending.append(value)
+                return value
+        close(value)
+        return None
+
+    try:
+        value = await blocking(acquire)
+        with guard:
+            pending.clear()  # Ownership transfers to this awaiting caller.
+        return value
+    finally:
+        with guard:
+            abandoned = True
+            unclaimed = list(pending)
+            pending.clear()
+        for value in unclaimed:
+            close(value)
+
+
 class Session:
     def __init__(self, url, bearer, timeout):
         self.url, self.bearer, self.timeout = url, bearer, timeout
