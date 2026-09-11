@@ -25,6 +25,7 @@ CLI = ROOT / "plugins/memhub/scripts/readers_cli.py"
 SID = "11111111-2222-3333-4444-555555555555"
 STAMP = "2026-01-01T00:00:00.123456789012Z"
 MTIME = 1788825600
+SYSTEM_ENV = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR') if key in os.environ}
 
 
 def write_jsonl(path, records):
@@ -60,7 +61,7 @@ def run(home, host, *arguments):
         "def denied(*args, **kwargs):\n"
         "    raise RuntimeError('reader stream must not connect to a network')\n"
         "socket.socket.connect = denied\n")
-    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home),
+    env = {**SYSTEM_ENV, "PATH": os.environ.get("PATH", ""), "HOME": str(home), "USERPROFILE": str(home),
            "XDG_CONFIG_HOME": str(home / ".config"), "CODEX_HOME": str(home / ".codex"),
            "PYTHONPATH": str(guard), "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
     result = subprocess.run([sys.executable, str(CLI), "--host", host, *arguments],
@@ -275,7 +276,7 @@ def test_invalid_utf8_is_incomplete_without_changing_legacy_reader_tolerance():
         assert result.returncode == 2 and rows == [] and "session_unreadable" in result.stderr
         assert "bad" not in result.stderr and "Traceback" not in result.stderr
         store = fixtures._make_cursor_store(home / ".cursor/chats")
-        with sqlite3.connect(store) as connection:
+        with contextlib.closing(sqlite3.connect(store)) as connection, connection:
             identity, data = next((key, value) for key, value in connection.execute("SELECT id,data FROM blobs")
                                   if isinstance(value, bytes) and b'"role": "assistant"' in value)
             message = json.loads(data)
@@ -318,7 +319,7 @@ con.commit()
 os._exit(0)
 '''
         result = subprocess.run([sys.executable, "-c", script, str(path)],
-                                env={"HOME": td, "USERPROFILE": td}, capture_output=True, timeout=20)
+                                env={**SYSTEM_ENV, "HOME": td, "USERPROFILE": td}, capture_output=True, timeout=20)
         assert result.returncode == 0, result.stderr
         wal = path.with_name("store.db-wal")
         assert wal.exists()
@@ -356,7 +357,7 @@ for number in range(200):
 os._exit(0)
 '''
         result = subprocess.run([sys.executable, "-c", script, str(path)],
-                                env={"HOME": td, "USERPROFILE": td}, capture_output=True, timeout=20)
+                                env={**SYSTEM_ENV, "HOME": td, "USERPROFILE": td}, capture_output=True, timeout=20)
         assert result.returncode == 0, result.stderr
         journal = path.with_name("store.db-journal")
         assert journal.exists() and journal.read_bytes()[:8] != b"\0" * 8
@@ -486,7 +487,7 @@ def test_complete_malformed_native_json_fails_while_unfinished_codex_tail_waits(
         result,rows=run(home,"codex")
         assert result.returncode==0 and rows[1:]==expected,result.stderr
         store=fixtures._make_cursor_store(home/".cursor/chats")
-        with sqlite3.connect(store) as db:
+        with contextlib.closing(sqlite3.connect(store)) as db, db:
             leaf=db.execute("SELECT id FROM blobs WHERE substr(data,1,1)=? LIMIT 1",(b'{',)).fetchone()[0]
             db.execute("UPDATE blobs SET data=? WHERE id=?",(b'{"role":broken}',leaf))
         cursor.to_canonical(store)  # Legacy capture remains tolerant.
