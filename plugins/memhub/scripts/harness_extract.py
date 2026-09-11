@@ -196,14 +196,18 @@ def _target_of(name: str, tool_input: dict) -> str:
 def turns_from_transcript(path) -> list[dict]:
     """A Claude Code .jsonl → turns. A turn is one human message plus
     everything the agent did before the next one; tool results arrive as
-    `user` records and belong to the turn in progress."""
+    `user` records and belong to the turn in progress. Each turn carries
+    `offset`, the byte its human message starts at, so a caller holding a
+    byte boundary can pick the turn that was in progress at it."""
     turns: list[dict] = []
     cur: dict | None = None
     names: dict[str, str] = {}
     inputs: dict[str, dict] = {}
-    with open(path, errors="replace", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
+    with open(path, "rb") as fh:
+        pos = 0
+        for raw in fh:
+            start, pos = pos, pos + len(raw)
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
@@ -236,7 +240,8 @@ def turns_from_transcript(path) -> list[dict]:
                     continue
                 cur = {"n": len(turns) + 1, "user": txt, "tools": [], "results": [],
                        "asst": "", "ts": rec.get("timestamp", ""),
-                       "cwd": rec.get("cwd", ""), "uuid": rec.get("uuid", "")}
+                       "cwd": rec.get("cwd", ""), "uuid": rec.get("uuid", ""),
+                       "offset": start}
                 turns.append(cur)
             elif kind == "assistant" and cur is not None and isinstance(content, list):
                 for b in content:
@@ -542,14 +547,24 @@ def stamp_state(*, session: str, turn: dict, cwd: str, hook_version: str,
     typed: repo, branch and head_sha read now, the environment, the hook
     version, the session and turn, and the time. MemHub refuses a session
     draft without `repo`, `session_id`, `turn`, `hook_version` and `at`."""
-    repo, root = resolve_repo("", "", cwd)
-    if not repo:
-        repo, root = default_repo, ""
-    touched: list[str] = []
+    home, home_root = resolve_repo("", "", cwd)
+    if not home:
+        home, home_root = default_repo, ""
+    touched: list[tuple[str, str]] = []
     for action in turn.get("tools", []):
-        name, _ = resolve_repo(action.get("tool", ""), action.get("target", ""), cwd)
-        if name and name not in touched:
-            touched.append(name)
+        if not action.get("target"):
+            continue        # no command and no path: the action addresses no repository
+        name, root = resolve_repo(action.get("tool", ""), action.get("target", ""), cwd)
+        if name and name not in [t[0] for t in touched]:
+            touched.append((name, root))
+    names = [t[0] for t in touched]
+    # The repo is the one the turn's actions worked in, so a `cd` into another
+    # repository moves the stamp and the proposal's scope with it. A turn that
+    # worked in several keeps the session's own when it is one of them.
+    if touched and (len(touched) == 1 or home not in names):
+        repo, root = touched[0]
+    else:
+        repo, root = home, home_root
     state = {
         "repo": repo,
         "branch": _git(root, "rev-parse", "--abbrev-ref", "HEAD") if root else "",
@@ -565,7 +580,7 @@ def stamp_state(*, session: str, turn: dict, cwd: str, hook_version: str,
     # A turn that worked in more than one repository says so, so whoever
     # reviews a rule from it can see the scope is a judgement, not a fact.
     if len(touched) > 1:
-        state["touched_repos"] = touched
+        state["touched_repos"] = names
     return state
 
 

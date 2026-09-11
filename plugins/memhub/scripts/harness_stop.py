@@ -27,7 +27,8 @@ fires a rule and nothing here activates one.
 Files, under $MEMHUB_HARNESS_DIR (default ~/.config/memhub-plugin/harness),
 all created private:
 
-  <session>.moments.jsonl    flagged moments; `handed_at` once nudged
+  <session>.moments.jsonl    flagged moments, then a `handed` row per nudge
+                             (append-only: two lanes write it at once)
   <session>.meta.json        last extracted turn, repo, cwd, nudge count
   <session>.turn-*.claim     the turn an extract child already took
   stop.log / extract.log     one line per step, never prompt text
@@ -106,11 +107,6 @@ def save_meta(session: str, **fields) -> dict:
     return meta
 
 
-def write_rows(path: Path, rows: list[dict]) -> None:
-    _publish(path, "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n"
-                           for r in rows))
-
-
 def env_name() -> str:
     """Which MemHub the stamp's `env` names, derived from the plugin's own
     backend URL rather than configured a second time."""
@@ -158,6 +154,13 @@ def cmd_stop(payload: dict) -> int:
     if payload.get("stop_hook_active") or _is_subagent(payload):
         return 0
     args = ["extract", "--session", session, "--transcript", transcript, "--cwd", cwd]
+    # The transcript's size NOW is the turn boundary. A queued prompt can be
+    # appended before the detached child opens the file, and the child must
+    # still classify the turn that stopped, not the one that just began.
+    try:
+        args += ["--upto", str(os.path.getsize(transcript))]
+    except OSError:
+        pass
     # The turn's error arcs are taken HERE, at the boundary, not by the child:
     # by the time a detached child gets to them the next turn may have added
     # its own.
@@ -201,8 +204,12 @@ def _claim_turn(session: str, marker: str) -> bool:
     return True
 
 
-def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "") -> int:
-    """The child: the last turn in the transcript, once."""
+def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
+                upto: int = -1) -> int:
+    """The child: the turn in progress at byte `upto` (the transcript's size
+    when Stop fired), once. Its records flushed after Stop still belong to it;
+    a turn whose human message starts at or past `upto` does not. With no
+    boundary, the last turn."""
     arcs: list = []
     if arcs_file:
         try:
@@ -219,6 +226,8 @@ def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "") ->
     except (OSError, ValueError) as exc:
         _log(f"extract {session[:8]}: cannot read transcript: {type(exc).__name__}")
         return 0
+    if upto >= 0:
+        turns = [t for t in turns if int(t.get("offset") or 0) < upto]
     if not turns:
         return 0
     last, prev = turns[-1], (turns[-2] if len(turns) > 1 else None)
@@ -234,17 +243,34 @@ def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "") ->
                         out_path=moments_path(session), arcs=arcs)
     finally:
         trace.close()
-    save_meta(session, repo=repo, cwd=cwd, last_turn=last.get("n"), last_stop_at=time.time())
+    # children for two turns can overlap on a slow classifier: never move back
+    newest = max(int(load_meta(session).get("last_turn") or 0), int(last.get("n") or 0))
+    save_meta(session, repo=repo, cwd=cwd, last_turn=newest, last_stop_at=time.time())
     _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
          f"moment={stats['moments']} reason={stats['reason'] or '-'} arcs={len(arcs)}")
     return 0
 
 
 # ------------------------------------------------------------- prompt lane
-def nudge_line(session: str, moment: dict, repo: str) -> str:
+def proposal_scope(moment: dict, fallback_repo: str = "") -> list[str]:
+    """The repositories a proposal is scoped to: every one the turn's actions
+    worked in, else the stamp's repo, else the session's."""
+    state = moment.get("state") or {}
+    touched = [r for r in (state.get("touched_repos") or []) if isinstance(r, str) and r]
+    if touched:
+        return touched
+    repo = state.get("repo") or fallback_repo
+    return [repo] if repo else []
+
+
+def nudge_line(session: str, moment: dict, repo: str = "") -> str:
     """The one line the agent reads. It carries the stamp verbatim, so the rule
-    the agent files is stamped by the harness and never typed."""
+    the agent files is stamped by the harness and never typed. `repo` is the
+    session's, used only when the moment's own stamp names none."""
     kind = moment.get("kind") or "a signal"
+    scope = proposal_scope(moment, repo)
+    narrow = (f" The turn worked in {len(scope)} repositories: keep in scope_repos only "
+              f"the ones the lesson is about.") if len(scope) > 1 else ""
     hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
     derivable = (" — the classifier thinks it may already be written down in the repo, "
                  "so check before proposing") if moment.get("derivable") else ""
@@ -259,17 +285,25 @@ def nudge_line(session: str, moment: dict, repo: str) -> str:
         f"delivery=agent_hook with matcher {{event: bash|edit|output|read, …_rx}} or "
         f"ordering, or delivery=anchor_recall with 1-8 concrete identifiers — plus "
         f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
-        f"scope_repos={json.dumps([repo] if repo else [])}, state={stamp}. Never pass "
+        f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} Never pass "
         f"activate; it lands proposed for a person. Never put a person's name, home "
         f"directory or e-mail in a rule. Ask the user first if unsure; if there is no "
         f"lesson, say nothing about this."
     )
 
 
+def _moment_key(moment: dict) -> str:
+    return str(moment.get("source_ref") or f"turn-{moment.get('turn')}")
+
+
 def cmd_prompt(payload: dict) -> int:
     """UserPromptSubmit, within milliseconds: the newest fresh un-handed moment
     becomes one line of context, and is marked handed whether or not the agent
-    files anything."""
+    files anything.
+
+    This lane only APPENDS (a `handed` row). A detached extract child appends
+    moments to the same file at any time, and a read-then-replace here would
+    delete a moment appended in between."""
     session = str(payload.get("session_id") or "").strip()
     prompt = str(payload.get("prompt") or "")
     if not session or _is_subagent(payload) or hx.is_harness_text(prompt.strip()):
@@ -277,26 +311,22 @@ def cmd_prompt(payload: dict) -> int:
     path = moments_path(session)
     if not path.is_file():
         return 0
-    moments = hx.read_jsonl(path)
-    if not moments:
+    rows = hx.read_jsonl(path)
+    handed = {str(r["handed"]) for r in rows if r.get("handed")}
+    moments = [r for r in rows if not r.get("handed") and isinstance(r.get("turn"), int)]
+    if not moments or len(handed) >= NUDGE_CAP_PER_SESSION:
         return 0
     meta = load_meta(session)
-    if int(meta.get("nudges") or 0) >= NUDGE_CAP_PER_SESSION:
-        return 0
-    last_turn = int(meta.get("last_turn") or moments[-1].get("turn") or 0)
-    fresh = [m for m in moments if not m.get("handed_at")
-             and isinstance(m.get("turn"), int)
+    last_turn = max(int(meta.get("last_turn") or 0), max(m["turn"] for m in moments))
+    fresh = [m for m in moments if _moment_key(m) not in handed
              and last_turn - m["turn"] < NUDGE_MAX_AGE_TURNS]
     if not fresh:
         return 0
     chosen = fresh[-NUDGES_PER_PROMPT:]
     now = time.time()
     for m in chosen:
-        m["handed_at"] = now
-    write_rows(path, moments)
-    save_meta(session, nudges=int(meta.get("nudges") or 0) + len(chosen))
-    lines = [nudge_line(session, m, meta.get("repo") or (m.get("state") or {}).get("repo") or "")
-             for m in chosen]
+        hx.append_jsonl(path, {"handed": _moment_key(m), "at": now})
+    lines = [nudge_line(session, m, meta.get("repo") or "") for m in chosen]
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                              "additionalContext": "\n".join(lines)}}))
     _log(f"prompt {session[:8]}: handed turn(s) {[m.get('turn') for m in chosen]}")
@@ -311,6 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--transcript", default="")
     p.add_argument("--cwd", default="")
     p.add_argument("--arcs", default="")
+    p.add_argument("--upto", type=int, default=-1)
     return p
 
 
@@ -328,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "prompt":
         return cmd_prompt(_read_payload())
     if args.mode == "extract" and args.session:
-        return cmd_extract(args.session, args.transcript, args.cwd, args.arcs)
+        return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     return 0
 
 
