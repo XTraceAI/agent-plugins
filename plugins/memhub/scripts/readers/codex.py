@@ -196,6 +196,8 @@ def _text_of(content: Any, *, strict: bool = False) -> str:
             if isinstance(b, dict) and isinstance(b.get("text"), str):
                 parts.append(b["text"])
             elif isinstance(b, dict):
+                # This adapter projects text and tools. Native image/media
+                # blocks remain outside that projection, including checked reads.
                 if strict and ("text" in b or b.get("type") in
                                ("input_text", "output_text", "text", "summary_text")):
                     raise ValueError("Codex text block requires string text")
@@ -209,7 +211,7 @@ def _text_of(content: Any, *, strict: bool = False) -> str:
     return ""
 
 
-def _tool_input(payload: dict) -> dict:
+def _tool_input(payload: dict, *, strict: bool = False) -> dict:
     """Normalise a Codex tool call's arguments to a dict.
 
     ``function_call.arguments`` is a JSON string; ``custom_tool_call.input``
@@ -226,6 +228,8 @@ def _tool_input(payload: dict) -> dict:
             return v if isinstance(v, dict) else {"input": v}
         except json.JSONDecodeError:
             return {"input": raw}
+    if strict:
+        raise ValueError("Codex tool input must be a string or object")
     return {}
 
 
@@ -673,7 +677,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
                 "type": "tool_use",
                 "id": call_id,
                 "name": pl.get("name") or "tool",
-                "input": _tool_input(pl),
+                "input": _tool_input(pl, strict=strict),
             })
 
         elif pt in ("function_call_output", "custom_tool_call_output"):

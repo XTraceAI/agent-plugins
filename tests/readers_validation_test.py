@@ -498,7 +498,8 @@ def test_checked_codex_tools_require_consumed_native_identity():
     with tempfile.TemporaryDirectory() as td:
         path=sources(Path(td))[0][1];original=path.read_bytes()
         for kind in ('function_call','custom_tool_call','function_call_output','custom_tool_call_output'):
-            valid={'type':kind,'call_id':'native-call','name':'native-tool','output':'done'}
+            valid={'type':kind,'call_id':'native-call','name':'native-tool','output':'done',
+                   'arguments':'{}' if kind=='function_call' else None,'input':'native command'}
             fields=['call_id','name'] if kind.endswith('_call') else ['call_id']
             for field in fields:
                 for value in (None,'',' ',17,False):
@@ -598,6 +599,50 @@ def test_checked_codex_text_fields_cannot_silently_drop_supported_content():
             payload={'type':'message','role':'user','content':content}
             path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
             assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+
+
+def test_checked_codex_keeps_text_projection_when_native_images_are_present():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];original=path.read_bytes()
+        text={'type':'input_text','text':'readable synthetic prompt'}
+        for content in [[text],[{'type':'input_image','image_url':'synthetic'},text]]:
+            payload={'type':'message','role':'user','content':content}
+            path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+            actual=codex.to_canonical(path,strict=True)
+            assert actual==codex.to_canonical(path)
+            if len(content)==1:
+                expected=actual
+            else:
+                assert actual==expected
+
+
+def test_checked_jsonl_defers_unparseable_unterminated_fragments():
+    with tempfile.TemporaryDirectory() as td:
+        for reader,path in sources(Path(td)):
+            original=path.read_bytes();expected=reader.to_canonical(path,strict=True)
+            for tail in [b'{"unfinished":',b'{bad}',b'{"bad":truX}',b'[1,]']:
+                path.write_bytes(original+tail);before=path.read_bytes()
+                assert reader.to_canonical(path,strict=True)==expected
+                assert path.read_bytes()==before
+                path.write_bytes(before+b'\n')
+                rejected(lambda:reader.to_canonical(path,strict=True))
+
+
+def test_checked_codex_tool_arguments_preserve_supported_values_or_fail():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];original=path.read_bytes()
+        for kind,field in [('function_call','arguments'),('custom_tool_call','input')]:
+            for raw in [[],17,True,None]:
+                payload={'type':kind,'call_id':'native-call','name':'native-tool',field:raw}
+                path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+                before=path.read_bytes()
+                codex.to_canonical(path)
+                rejected(lambda:codex.to_canonical(path,strict=True))
+                assert path.read_bytes()==before
+            for raw in [{}, {'path':'synthetic'}, '{"path":"synthetic"}', '[1,true,null]', 'native raw command']:
+                payload={'type':kind,'call_id':'native-call','name':'native-tool',field:raw}
+                path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+                assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
 
 
 def test_idless_tool_use_exception_is_limited_to_transcripts():
