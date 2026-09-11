@@ -1287,17 +1287,19 @@ def main() -> int:
         # _event_can_flush).
         return 0
 
-    # Shell-result provenance retains its existing queue-before-source-read
-    # ordering under the upload lock. Usage events have no PR URLs and save
-    # their observations first, independently of that lock.
-    prepared = None if event_pr_urls else _observe_session(
-        uuid, event, payload, event_pr_urls)
-    if prepared is None and not event_pr_urls:
-        return 0
+    # Only exact hook-only usage needs observation before the upload lock.
+    # Ordinary edits/milestone shells keep the cheap busy-session skip: they
+    # neither parse the source nor queue behind the observation lock. Shell
+    # results still queue their PR provenance before reading the source.
+    prepared = None
+    if _hook_usage(event, payload) is not None:
+        prepared = _observe_session(uuid, event, payload, event_pr_urls)
+        if prepared is None:
+            return 0
 
     # Serialize the whole check-then-act: reading the watermark, sending, and
-    # writing it back must not interleave with another upload. Observations
-    # already persisted under their own lock and do not wait for this owner.
+    # writing it back must not interleave with another upload. Exact usage
+    # already persisted under its own lock and does not wait for this owner.
     # Turn boundaries (stop / beforeSubmitPrompt) are last-chance events — a
     # session may have no later flush — so they WAIT for a concurrent flush
     # rather than skip and never run again. Mid-turn events (edits, milestone

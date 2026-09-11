@@ -15,6 +15,41 @@ import cursor_flush
 import portable_lock
 
 
+def test_busy_upload_skips_ordinary_edits_and_shell_before_observation():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        projects = root / "projects"
+        path = fixtures._write_transcript(projects)
+        state_dir = root / "state"
+        state_dir.mkdir()
+        fd = os.open(state_dir / f"{fixtures.SESSION}.flush.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        portable_lock.lock_exclusive(fd, blocking=False)
+        sent = []
+
+        async def fake_flush(*args, **kwargs):
+            sent.append(kwargs["records"])
+
+        with patch.multiple(cursor_flush, STATE_DIR=state_dir, _CURSOR_PROJECTS=projects,
+                            LOCK_WAIT_S=0.01, _flush=fake_flush, _log=lambda _: None), \
+             patch.multiple(cursor_flush.cursor_reader, _PROJECTS=projects, _CHATS=root / "chats"), \
+             patch.object(cursor_flush.cursor_reader, "to_canonical",
+                          wraps=cursor_flush.cursor_reader.to_canonical) as reader:
+            try:
+                for event in ("afterFileEdit", "beforeShellExecution"):
+                    payload = dict(fixtures._payload(path, event), command="git commit -m fixture")
+                    assert cursor_flush._event_can_flush(event, payload)
+                    for _ in range(3):
+                        assert fixtures._run_main(event, payload) == 0
+                assert reader.call_count == 0, "busy ordinary events parsed the source"
+                assert not (state_dir / f"{fixtures.SESSION}.observations.lock").exists()
+                assert not cursor_flush._state_path(fixtures.SESSION).exists()
+                assert not sent
+            finally:
+                os.close(fd)
+            assert fixtures._run_main("afterFileEdit", fixtures._payload(path, "afterFileEdit")) == 0
+            assert reader.call_count == 1 and len(sent) == 1
+
+
 def test_busy_upload_keeps_usage_and_restores_it_after_restart():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
