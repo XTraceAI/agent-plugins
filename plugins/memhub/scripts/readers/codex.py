@@ -150,7 +150,7 @@ def clean_user_text(text: str) -> str | None:
     return t
 
 
-def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[dict]:
+def load_rollout(path, *, strict: bool = False) -> list[dict]:
     """Parse a Codex rollout .jsonl tolerantly (skip malformed lines, e.g. a
     truncated final line from an interrupted write).
 
@@ -158,17 +158,17 @@ def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) 
     are UTF-8, a bare read_text() decodes with the OS locale codec, and one
     em-dash then kills the whole import on a cp950/cp1252 box."""
     records: list[dict] = []
-    errors = "strict" if strict_utf8 else "replace"
+    errors = "strict" if strict else "replace"
     # Split bytes first: Unicode separators inside JSON strings are content.
     for encoded in Path(path).read_bytes().splitlines(keepends=True):
         raw = encoded.decode("utf-8", errors=errors)
-        line = raw.strip(" \t\r\n") if strict_json else raw.strip()
+        line = raw.strip(" \t\r\n") if strict else raw.strip()
         if not line:
             continue
         try:
-            record = load_json(line, strict=strict_json)
+            record = load_json(line, strict=strict)
         except json.JSONDecodeError:
-            if strict_json and raw.endswith(("\n", "\r")):
+            if strict and raw.endswith(("\n", "\r")):
                 raise
             continue
         # The return type says list[dict] and every consumer walks these with
@@ -179,7 +179,7 @@ def load_rollout(path, *, strict_utf8: bool = False, strict_json: bool = False) 
         # Dropped here, once, rather than guarded at every walk.
         if isinstance(record, dict):
             records.append(record)
-        elif strict_json:
+        elif strict:
             raise ValueError("Codex rollout row is not an object")
     return records
 
@@ -349,7 +349,7 @@ def _rollout_thread_name(rollout: list[dict]) -> str | None:
     return found
 
 
-def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_json=False) -> str | None:
+def _sidecar_thread_name(session_id: str | None, *, strict=False) -> str | None:
     """The name Codex gave this thread, from the ``session_index.jsonl``
     sidecar — for the sessions whose rollout does not carry one.
 
@@ -390,20 +390,20 @@ def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_js
             # Drop the incomplete byte prefix before strict UTF-8 decoding;
             # the seek may have landed inside a multi-byte character.
             blob = b"".join(blob.splitlines(keepends=True)[1:])
-        lines = [raw.decode("utf-8", errors="strict" if strict_utf8 else "replace")
+        lines = [raw.decode("utf-8", errors="strict" if strict else "replace")
                  for raw in blob.splitlines(keepends=True)]
         for raw in deque(lines, maxlen=_INDEX_MAX_LINES):
-            line = raw.strip(" \t\r\n") if strict_json else raw.strip()
+            line = raw.strip(" \t\r\n") if strict else raw.strip()
             if not line:
                 continue
             try:
-                row = load_json(line, strict=strict_json)
+                row = load_json(line, strict=strict)
             except json.JSONDecodeError:  # a torn final line is normal
-                if strict_json and raw.endswith(("\n", "\r")):
+                if strict and raw.endswith(("\n", "\r")):
                     raise
                 continue
             if not isinstance(row, dict):
-                if strict_json:
+                if strict:
                     raise ValueError("Codex title index row is not an object")
                 continue
             if row.get("id") != session_id:
@@ -415,12 +415,12 @@ def _sidecar_thread_name(session_id: str | None, *, strict_utf8=False, strict_js
     except FileNotFoundError:
         return None
     except Exception:  # noqa: BLE001 — legacy capture remains best-effort
-        if strict_utf8 or strict_json:
+        if strict:
             raise
         return None
 
 
-def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=False, strict_json=False) -> str | None:
+def _title(rollout: list[dict], session_id: str | None = None, *, strict=False) -> str | None:
     """What Codex calls this session, else the best name we can derive.
 
     Precedence, and why: MemHub should show the title Codex's own UI shows.
@@ -435,7 +435,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=Fa
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or _sidecar_thread_name(session_id, strict_utf8=strict_utf8, strict_json=strict_json))
+                   or _sidecar_thread_name(session_id, strict=strict))
     if thread_name:
         return thread_name
 
@@ -460,7 +460,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict_utf8=Fa
     return normalize_title(first_user or last_complete)
 
 
-def rollout_to_claude_records(rollout: list[dict], *, strict_utf8=False, strict_json=False) -> tuple[list[dict], dict]:
+def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -484,7 +484,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict_utf8=False, strict_
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout, sm.get("id"), strict_utf8=strict_utf8, strict_json=strict_json),
+        "title": _title(rollout, sm.get("id"), strict=strict),
         "host": HOST,
     }
 
@@ -692,9 +692,9 @@ def _rollout_files(on_error=None) -> list[Path]:
 _META_MAX_RECORDS = 200
 
 
-def session_metadata(path, *, strict_utf8: bool = True) -> dict:
+def session_metadata(path, *, strict: bool = True) -> dict:
     """Read native session identity without reading prompt-derived titles."""
-    with Path(path).open("r", encoding="utf-8", errors="strict" if strict_utf8 else "replace") as handle:
+    with Path(path).open("r", encoding="utf-8", errors="strict" if strict else "replace") as handle:
         for _ in range(_META_MAX_RECORDS):
             line = handle.readline(1024 * 1024 + 1)
             if not line:
@@ -721,7 +721,7 @@ def session_metadata(path, *, strict_utf8: bool = True) -> dict:
 def session_cwd(path) -> str | None:
     """The native working directory, using the bounded session metadata read."""
     try:
-        cwd = session_metadata(path, strict_utf8=False).get("cwd")
+        cwd = session_metadata(path, strict=False).get("cwd")
         return cwd if isinstance(cwd, str) and cwd else None
     except (OSError, ValueError):
         return None
@@ -767,7 +767,7 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path, *, strict_utf8: bool = False, strict_json: bool = False) -> tuple[list[dict], dict]:
+def to_canonical(path, *, strict: bool = False) -> tuple[list[dict], dict]:
     """Load a rollout and transform it to Claude-shaped records."""
-    return rollout_to_claude_records(load_rollout(path, strict_utf8=strict_utf8, strict_json=strict_json),
-                                    strict_utf8=strict_utf8, strict_json=strict_json)
+    return rollout_to_claude_records(load_rollout(path, strict=strict),
+                                    strict=strict)
