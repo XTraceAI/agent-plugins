@@ -36,16 +36,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import capture_context  # noqa: E402
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
+from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly  # noqa: E402
+from room_map import git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
 FLUSH_TIMEOUT_S = 240.0
@@ -134,8 +134,8 @@ def _note_failure(sid: str, reason: str) -> None:
 def _log(msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [codex-flush] {msg}\n"
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        log = STATE_DIR / "log"
+        capture_context.state_directory(STATE_DIR).mkdir(parents=True, exist_ok=True)
+        log = capture_context.state_directory(STATE_DIR) / "log"
         if log.exists() and log.stat().st_size > 256_000:
             tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
             log.write_text("\n".join(tail) + "\n", encoding="utf-8")
@@ -147,7 +147,7 @@ def _log(msg: str) -> None:
 
 def _read_state(sid: str) -> dict:
     try:
-        return json.loads((STATE_DIR / f"{sid}.json").read_text(encoding="utf-8"))
+        return json.loads((capture_context.state_directory(STATE_DIR) / f"{sid}.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -155,8 +155,8 @@ def _read_state(sid: str) -> dict:
 def _save_state(sid: str, **fields) -> None:
     state = _read_state(sid)
     state.update(fields)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write.publish(STATE_DIR / f"{sid}.json", json.dumps(state))
+    capture_context.state_directory(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    atomic_write.publish(capture_context.state_directory(STATE_DIR) / f"{sid}.json", json.dumps(state))
 
 
 def _acquire(sid: str, blocking: bool = False) -> int | None:
@@ -183,13 +183,13 @@ def _acquire(sid: str, blocking: bool = False) -> int | None:
     exit however that happens — there is no stale flock to reclaim.
     The caller must keep the fd OPEN; closing releases.
     """
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    capture_context.state_directory(STATE_DIR).mkdir(parents=True, exist_ok=True)
     # O_CLOEXEC is belt-and-braces: CPython has made os.open fds
     # non-inheritable by default since PEP 446 (3.4), so a subprocess cannot
     # already pin this lock past our exit — the flag states the invariant in
     # code so a future refactor cannot quietly drop it. getattr because the
     # constant is Unix-only and the capture scripts run on native Windows.
-    fd = os.open(STATE_DIR / f"{_safe_sid(sid)}.flush.lock",
+    fd = os.open(capture_context.state_directory(STATE_DIR) / f"{_safe_sid(sid)}.flush.lock",
                  os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
     if not blocking:
         try:
@@ -525,6 +525,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         "messages": sendable,
         "conversation_id": f"codex-{sid}",
         "source_platform": codex_reader.HOST,
+        **capture_context.identity(sid, lambda: codex_reader.session_metadata(rollout)),
         "flush": "now",
     }
     if room:
@@ -605,10 +606,12 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
+@capture_context.entrypoint
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
         payload = json.loads(sys.stdin.read() or "{}")
+        capture_context.observe(payload)
     except json.JSONDecodeError:
         payload = {}
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import base64
 import json
+import hashlib
 import re
 import os
 import sys
@@ -40,6 +41,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+
+import capture_context
+import sinks
 
 CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 STATE_DIR = CACHE_DIR / "turnflush"
@@ -269,7 +273,7 @@ def _token_problem(host: str) -> str | None:
     return None
 
 
-def _recent_failure() -> tuple[str, float] | None:
+def _recent_failure(directory: Path | None = None) -> tuple[str, float] | None:
     """The newest still-relevant ``(reason, when)`` recorded by a flush.
 
     Newest-first and returns on the first hit: an older breadcrumb cannot say
@@ -277,7 +281,7 @@ def _recent_failure() -> tuple[str, float] | None:
     long-lived state dir off the startup path.
     """
     try:
-        files = sorted(STATE_DIR.glob("*.json"),
+        files = sorted((directory or STATE_DIR).glob("*.json"),
                        key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return None
@@ -289,7 +293,8 @@ def _recent_failure() -> tuple[str, float] | None:
             continue
         if not isinstance(state, dict):
             continue
-        reason, when = state.get("last_error"), state.get("last_error_at")
+        reason = state.get("last_error")
+        when = state.get("last_error_at", state.get("last_flush_at"))
         if not reason or not isinstance(when, (int, float)) or when < cutoff:
             continue
         # A later success retracts the failure — from EITHER capture path, not
@@ -321,8 +326,8 @@ def _succeeded_since(path: Path, when: float) -> bool:
     """Whether any capture path recorded a success for this session after
     ``when``. Reads only that session's files, so the scan stays bounded."""
     session = _session_of(path)
-    for candidate in (STATE_DIR / f"{session}.json",
-                      STATE_DIR / f"{session}.sessionflush.json"):
+    for candidate in (path.parent / f"{session}.json",
+                      path.parent / f"{session}.sessionflush.json"):
         try:
             state = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
@@ -546,6 +551,70 @@ def _already_warned(session_id: str, signature: str) -> bool:
     return False
 
 
+def _renewable_capture_credential(sink: sinks.Sink) -> bool:
+    """Read renewal capability without contacting an authorization server."""
+    import _memhub_auth as auth
+    try:
+        installed = auth._plugin_mcp_config()
+        if sinks._origin(installed["url"]) != sinks._origin(sink.url):
+            return False
+        oauth = installed.get("oauth") or {}
+        if not oauth.get("clientId") or urlparse(oauth.get("authServerMetadataUrl", "")).scheme != "https":
+            return False
+        for url in dict.fromkeys((sink.url, installed["url"])):
+            try:
+                cached = json.loads(auth.token_cache_path(url).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            refresh = cached.get("refresh_token") if isinstance(cached, dict) else None
+            if isinstance(refresh, str) and refresh.strip():
+                return True
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError):
+        pass
+    return False
+
+
+def _failure_category(reason: str) -> str:
+    category = reason.split(":", 1)[0]
+    return category if category in _REASONS else "error"
+
+
+def _separate_capture_health(host: str | None, sink: sinks.Sink | None):
+    """No network and no success inference from a constant local credential."""
+    messages, causes = [], []
+    if sink is not None:
+        endpoint = hashlib.sha256(sink.url.encode("utf-8")).hexdigest()[:24]
+        _, bearer = sinks.resolve_capture_auth(sink, refresh=False)
+        failures = [failure for family in (STATE_DIR, STATE_DIR.parent / "codexflush",
+                                            STATE_DIR.parent / "cursorflush")
+                    if (failure := _recent_failure(capture_context.state_directory(family, sink)))]
+        failure = max(failures, key=lambda item: item[1]) if failures else None
+        if not bearer and not _renewable_capture_credential(sink):
+            messages.append(f"Capture destination '{sink.name}' has no usable credential. "
+                            "Check its configuration or saved login.")
+            causes.append(f"capture:{sink.name}:{endpoint}:auth")
+        elif failure:
+            category = _failure_category(failure[0])
+            reason = _REASONS[category]
+            messages.append(f"Capture destination '{sink.name}': {reason}. "
+                            "Its upload progress is retained for retry.")
+            causes.append(f"capture:{sink.name}:{endpoint}:{category}")
+    if host:
+        problem = _token_problem(host)
+        if problem:
+            messages.append("Cloud services need attention to the plugin's saved login. "
+                            "Run /memhub:login --status. Local capture does not establish "
+                            "cloud authentication.")
+            causes.append(f"cloud:{host}:{problem}")
+        rulebook = _rulebook_problem()
+        if rulebook:
+            message = _message(host, None, None, rulebook)
+            if message:
+                messages.append(f"Cloud services: {message}")
+                causes.append(f"cloud:{host}:{rulebook[0]}")
+    return " ".join(messages), "|".join(causes)
+
+
 def main() -> int:
     # Capture switched off on purpose is not a fault. Checked first so the
     # opt-out is genuinely free and genuinely silent.
@@ -560,13 +629,24 @@ def main() -> int:
     session_id = str(payload.get("session_id") or "").strip()
 
     host = _env_host()
-    if not host:
-        return 0  # not running as an installed plugin — nothing to judge
-
-    token_problem = _token_problem(host)
-    failure = _recent_failure()
-    rulebook = _rulebook_problem()
-    message = _message(host, token_problem, failure, rulebook)
+    try:
+        sink = sinks.resolve_capture_sink()
+        separate = (sink is None or sink.token is not None
+                    or capture_context.state_directory(STATE_DIR, sink) != STATE_DIR)
+        if separate:
+            message, signature = _separate_capture_health(host, sink)
+        else:
+            if not host:
+                return 0
+            token_problem = _token_problem(host)
+            failure = _recent_failure()
+            rulebook = _rulebook_problem()
+            message = _message(host, token_problem, failure, rulebook)
+            signature = (f"{host}|{token_problem or ''}|{_failure_category(failure[0]) if failure else ''}"
+                         f"|{rulebook[0] if rulebook else ''}")
+    except sinks.SinkConfigError as error:
+        message = f"Capture configuration: {error}. No capture destination was selected."
+        signature = "capture:configuration:" + hashlib.sha256(str(error).encode()).hexdigest()[:24]
     if not message:
         return 0
 
@@ -575,8 +655,6 @@ def main() -> int:
     # — and SessionStart fires again on resume and /clear. The cause is what
     # should be shown once; only a genuinely DIFFERENT problem should interrupt
     # again.
-    signature = (f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
-                 f"|{rulebook[0] if rulebook else ''}")
     if _already_warned(session_id, signature):
         return 0
 

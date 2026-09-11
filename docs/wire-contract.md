@@ -111,9 +111,10 @@ Cursor `--session latest` prepares only the resolved native UUID after counting 
 ## Capture destination API
 
 `plugins/memhub/scripts/sinks.py` provides a read-only destination resolver for
-capture consumers. Callers must explicitly adopt it. Existing hooks and the
-cloud-service functions in `_memhub_auth` keep their current routing; adding
-this configuration file alone does not change a running capture pipeline.
+capture consumers. Automatic Claude turn/backstop, Codex and Cursor conversation
+hooks adopt it at their executable entrypoints. Cloud-service functions in
+`_memhub_auth` retain their existing routing. This selection does not redirect
+manual imports, artifact uploads, login, recall or brain briefs.
 
 The resolver reads `~/.config/memhub-plugin/config.json`:
 
@@ -197,4 +198,49 @@ disablement, invalid/unknown selections, loopback/TLS restrictions, distinct
 stored backend credentials, refresh-origin isolation and unchanged service
 resolution. It checks configuration bytes and absence of account writes, and
 runs under bare Python while rejecting MCP imports and network access.
-Hook delivery and capture-health integration are separate acceptance work.
+`python3 tests/capture_routing_test.py` invokes all four real hook entrypoints
+against loopback receivers with a synthetic home. It verifies file selection,
+environment/token overrides, inactive/unknown membership, local room-lookup
+exclusion, raw/absent surface identity, failed-send retry, endpoint switching,
+shared Cursor pins and separate capture/cloud-service health.
+
+### Conversation hook delivery
+
+Each invocation freezes one selected destination for its authentication, state,
+room routing and async work. Empty or invalid selection skips delivery. Cursor
+still preserves local per-generation usage and timestamp observations for a
+later read or configured delivery; this does not authenticate or upload. Multiple active
+names remain unsupported and are reported without selecting another endpoint.
+The installed endpoint keeps its existing room-cache namespace. Other remote
+endpoints use a digest of their complete URL, so one server cannot read or
+overwrite another server's cached room ID. Loopback never resolves cloud rooms.
+The existing installed cloud retains its legacy state. Other named or explicit
+environment destinations store progress under the hook state directory, then
+sink name and a digest of the full endpoint. Changing an endpoint under the same
+name starts independently; returning to it resumes its own progress. Credentials
+are excluded from this identity. This prevents cloud cursors or dormancy from
+skipping an initial local import. An explicit environment override can therefore
+re-send an existing session once; server UUID deduplication handles that replay.
+
+Cursor usage observations, native source metadata and first-seen timestamp pins
+remain in the original shared session file consumed by the reader CLI. Only
+upload watermarks, accepted provenance and failures belong to the destination.
+Its existing per-session flush lock still serializes native observation updates;
+this change supports one selected destination, not concurrent fan-out.
+
+Literal loopback capture skips cloud room resolution and adds native session ID
+plus an observed raw surface when available. Claude reads explicit `source_surface`
+or `entrypoint`; Codex reads native `originator`; Cursor reads explicit metadata
+or its recognized native source location. Missing surfaces remain omitted. Older
+cloud envelopes stay unchanged; multi-destination extension negotiation is
+separate work. Canonical host-prefixed conversation IDs and record UUIDs retain
+the existing reader convention.
+
+Capture health reads failures only from the selected destination. A success at
+another destination cannot clear that failure, and a constant local token cannot
+certify cloud login. Cloud-service authentication and rulebook issues are reported
+separately. The health hook does not contact either destination or report a
+connection as proven merely because credentials exist.
+An expired access token with same-origin renewal metadata and a saved refresh
+token does not produce a missing-credential warning. This is a local capability
+check; it makes no network request and does not clear a recorded delivery error.

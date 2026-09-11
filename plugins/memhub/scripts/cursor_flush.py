@@ -56,17 +56,17 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import capture_context  # noqa: E402
 import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
+from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from readers.strict_json import loads as load_json  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly  # noqa: E402
+from room_map import git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 _CURSOR_PROJECTS = Path.home() / ".cursor" / "projects"
@@ -218,9 +218,16 @@ def _state_path(uuid: str) -> Path:
     return STATE_DIR / f"{_safe_uuid(uuid)}.json"
 
 
-def _read_state(uuid: str, *, strict: bool = False) -> dict:
+# Native observations belong to the session, not to an upload destination.
+# Keep these in the original file so readers_cli sees exactly the hook's pins.
+_SHARED_STATE_FIELDS = frozenset({
+    "usage_events", "record_ts", "cursor_meta", "source_kind", "transcript_path",
+})
+
+
+def _state_at(path: Path, *, strict: bool = False) -> dict:
     try:
-        state = load_json(_state_path(uuid).read_text(encoding="utf-8"), strict=strict)
+        state = load_json(path.read_text(encoding="utf-8"), strict=strict)
         if strict and (not isinstance(state, dict) or any(
                 key in state and not isinstance(state[key], dict)
                 for key in ("record_ts", "usage_events"))):
@@ -235,13 +242,25 @@ def _read_state(uuid: str, *, strict: bool = False) -> dict:
                 if (not isinstance(event, dict) or not isinstance(event.get("target_uuid"), str)
                         or not event["target_uuid"] or cursor_reader.normalize_usage(event.get("usage")) is None):
                     raise ValueError("invalid saved Cursor usage")
-        return state
+        return state if isinstance(state, dict) else {}
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
         if strict:
             raise
         return {}
+
+
+def _delivery_path(uuid: str) -> Path:
+    return capture_context.state_directory(STATE_DIR) / f"{_safe_uuid(uuid)}.json"
+
+
+def _read_state(uuid: str, *, strict: bool = False) -> dict:
+    shared = _state_at(_state_path(uuid), strict=strict)
+    if _delivery_path(uuid) == _state_path(uuid):
+        return shared
+    return {**{key: value for key, value in shared.items() if key in _SHARED_STATE_FIELDS},
+            **_state_at(_delivery_path(uuid), strict=strict)}
 
 
 def _save_state(uuid: str, **fields) -> None:
@@ -264,9 +283,24 @@ def _save_state(uuid: str, **fields) -> None:
     try:
         if fh is not None:
             portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
-        state = _read_state(uuid)
-        state.update(fields)
-        atomic_write.publish(_state_path(uuid), json.dumps(state))
+        if _delivery_path(uuid) == _state_path(uuid):
+            state = _read_state(uuid)
+            state.update(fields)
+            atomic_write.publish(_state_path(uuid), json.dumps(state))
+        else:
+            # The original lock serializes pins and both destination files.
+            # A partial failure can only cause a retry, never acknowledge an
+            # upload that did not commit. Pin updates precede delivery state.
+            shared = {key: value for key, value in fields.items() if key in _SHARED_STATE_FIELDS}
+            delivery = {key: value for key, value in fields.items() if key not in _SHARED_STATE_FIELDS}
+            if shared:
+                state = _state_at(_state_path(uuid))
+                state.update(shared)
+                atomic_write.publish(_state_path(uuid), json.dumps(state))
+            if delivery:
+                state = _state_at(_delivery_path(uuid))
+                state.update(delivery)
+                atomic_write.publish(_delivery_path(uuid), json.dumps(state))
     finally:
         if fh is not None:
             try:
@@ -1032,6 +1066,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # The agentic path detects by STRUCTURE; the records carry a Cursor
         # provenance banner (see readers/cursor.py).
         "source_platform": cursor_reader.HOST,
+        **capture_context.identity(uuid, lambda: cursor_reader.session_metadata(source_path)),
         "flush": flush_mode,
     }
     if room:
@@ -1143,10 +1178,12 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
          + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
 
 
-def main() -> int:
+@capture_context.entrypoint(observe_when_unselected=True)
+def main(*, observations_only: bool = False) -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     try:
         payload = json.loads(sys.stdin.read() or "{}")
+        capture_context.observe(payload)
     except json.JSONDecodeError:
         payload = {}
 
@@ -1204,7 +1241,7 @@ def main() -> int:
                 prior_pending, event_pr_urls)
             if url not in accepted_pr_set
         ]
-        if pending_pr_urls != prior_pending:
+        if not observations_only and pending_pr_urls != prior_pending:
             # Cursor's transcript omits shell results. Persist the hook-only
             # evidence before source reads and network work so any later event
             # can retry it after a crash, missing source, or failed send.
@@ -1306,7 +1343,7 @@ def main() -> int:
         # fields, leaving the pin map untouched on disk. A duplicate
         # afterShellExecution can also reach this point: pending URL telemetry
         # retries through the same bounded send path until acknowledged.
-        if not should_flush(
+        if not observations_only and not should_flush(
                 event, payload, state, blob_ids, time.time(),
                 source_kind=source_kind, source_revision=source_revision,
                 usage_pending=usage_pending,
@@ -1319,6 +1356,8 @@ def main() -> int:
             first_observation="record_ts" not in state,
             boundary_uuids=boundary_uuids)
         _save_state(uuid, **fields)
+        if observations_only:
+            return 0  # Retain native observations without authenticating or uploading.
         try:
             mode = _FLUSH_MODE.get(event, "now")
             asyncio.run(asyncio.wait_for(

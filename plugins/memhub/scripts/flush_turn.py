@@ -66,12 +66,13 @@ from transcript_filter import (  # noqa: E402
 # importable under a bare python3 — that is what lets the cursor/tail/lock
 # logic, where the silent failures live, be tested without the dependency.
 # Nothing here needs the SDK any more, so the indirection went with it.
+import capture_context  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
-from room_map import env_for_url, forget_room  # noqa: E402
+from capture_context import resolve_bearer, env_for_url, resolve_repo_brain  # noqa: E402
+from brain_resolve import is_missing_brain  # noqa: E402
+from room_map import forget_room  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -129,7 +130,7 @@ def _log(msg: str) -> None:
 
 def _read_state(session_id: str) -> dict:
     try:
-        state = json.loads((STATE_DIR / f"{session_id}.json").read_text(encoding="utf-8"))
+        state = json.loads((capture_context.state_directory(STATE_DIR) / f"{session_id}.json").read_text(encoding="utf-8"))
         return state if isinstance(state, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
@@ -171,7 +172,7 @@ def _save_state(session_id: str, **fields) -> None:
     #
     # 0600 by default: not a secret exactly, but it holds the session title, the
     # repo path and server error text, none of which needs to be world-readable.
-    atomic_write.publish(STATE_DIR / f"{session_id}.json", json.dumps(state))
+    atomic_write.publish(capture_context.state_directory(STATE_DIR) / f"{session_id}.json", json.dumps(state))
 
 
 # Everything below exists because this hook is `async: true`, and Claude Code
@@ -226,8 +227,8 @@ def _acquire(session_id: str) -> int | None:
     judge it abandoned and both take it, which is exactly the overlap the lock
     exists to prevent. There is no such thing as a stale flock.
     """
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(STATE_DIR / f"{session_id}.lock",
+    capture_context.state_directory(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    fd = os.open(capture_context.state_directory(STATE_DIR) / f"{session_id}.lock",
                  os.O_CREAT | os.O_RDWR, 0o600)
     try:
         portable_lock.lock_exclusive(fd, blocking=False)
@@ -455,6 +456,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         "messages": sendable,
         "conversation_id": session_id,
         "source_platform": "claude",
+        **capture_context.identity(session_id),
         # The whole point: durable on arrival, extracted in batches.
         "flush": "auto",
     }
@@ -700,6 +702,7 @@ class _NoCredential(RuntimeError):
 # raised on our own stack, so `isinstance` is the whole check.
 
 
+@capture_context.entrypoint
 def main() -> int:
     lock_fd: int | None = None
     # Bound BEFORE the try so the handler can always write a breadcrumb. Reading
@@ -709,9 +712,10 @@ def main() -> int:
     session_id = ""
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
+        capture_context.observe(hook_input)
         session_id = (hook_input.get("session_id") or "").strip()
         transcript_path = (hook_input.get("transcript_path") or "").strip()
-        if not session_id or not transcript_path \
+        if not capture_context.valid_session_id(session_id) or not transcript_path \
                 or not Path(transcript_path).exists():
             return 0
         lock_fd = _acquire(session_id)

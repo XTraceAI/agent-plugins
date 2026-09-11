@@ -38,6 +38,8 @@ from pathlib import Path
 # do not).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import portable_lock  # noqa: E402
+import capture_context  # noqa: E402
+import sinks  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -81,7 +83,7 @@ def main() -> int:
     payload = json.loads(raw)
     session_id = (payload.get("session_id") or "").strip()
     transcript = (payload.get("transcript_path") or "").strip()
-    if not session_id or not transcript:
+    if not capture_context.valid_session_id(session_id) or not transcript:
         return 1
 
     try:
@@ -91,12 +93,16 @@ def main() -> int:
     if size <= 0:
         return 1
 
-    if _lock_is_held(STATE_DIR / f"{session_id}.lock"):
+    sink = sinks.resolve_capture_sink()
+    if sink is None:
+        return 1
+    state_dir = capture_context.state_directory(STATE_DIR, sink)
+    if _lock_is_held(state_dir / f"{session_id}.lock"):
         return 1
 
     try:
         state = json.loads(
-            (STATE_DIR / f"{session_id}.json").read_text(encoding="utf-8"))
+            (state_dir / f"{session_id}.json").read_text(encoding="utf-8"))
         offset = int(state.get("offset", 0))
     except (OSError, ValueError, TypeError):
         return 0  # no cursor yet — first turn of the session, always flush
