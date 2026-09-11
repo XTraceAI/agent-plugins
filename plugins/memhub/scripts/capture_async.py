@@ -46,3 +46,52 @@ class Session:
     async def call_tool(self, name, arguments=None, timeout=None):
         return await blocking(mcp_http.call_tool, self.url, self.bearer, name,
                               arguments or {}, self.timeout if timeout is None else timeout)
+
+
+async def publish_state(path, state):
+    """Stage JSON off-loop; only the awaiting lock owner publishes progress.
+
+    A cancelled worker may finish its private staging file, then removes it.
+    It never replaces the destination. Unique staging names also keep a late
+    worker separate from another attempt in this process.
+    """
+    import json
+    import os
+    import time
+    import uuid
+    import atomic_write
+
+    staged = path.with_name(f"{path.name}.{uuid.uuid4().hex[:16]}.tmp")
+    cancelled = threading.Event()
+
+    def discard():
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def prepare():
+        try:
+            atomic_write._sweep_stale_tmps(path)
+            atomic_write.publish(staged, json.dumps(state))
+        finally:
+            if cancelled.is_set():
+                discard()
+
+    try:
+        await blocking(prepare)
+        # One atomic syscall on the owner. Windows sharing retries yield to
+        # the caller's timeout instead of blocking in atomic_write.replace.
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                staged.replace(path)
+                break
+            except OSError as error:
+                if (os.name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33)
+                        or time.monotonic() >= deadline):
+                    raise
+                await asyncio.sleep(0.004)
+    finally:
+        cancelled.set()
+        discard()

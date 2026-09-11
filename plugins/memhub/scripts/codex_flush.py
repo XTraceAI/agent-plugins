@@ -40,7 +40,6 @@ import capture_context  # noqa: E402
 import capture_async  # noqa: E402
 from capture_redaction import CACHE as _REDACTION_CACHE, redact_once  # noqa: E402
 from transcript_chunks import slices as make_slices  # noqa: E402
-import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
@@ -100,7 +99,7 @@ LOCK_WAIT_S = 60.0
 MAX_UNCONFIRMED = 5
 
 
-def _note_failure(sid: str, reason: str) -> None:
+async def _note_failure(sid: str, reason: str) -> None:
     """Record a SERVER-CONTACTED failure. Stamps last_error_at (feeding the
     60s cooldown for the transient case) and increments a single fail_streak
     over EVERY kind — rate-limit, McpError, timeout, unconfirmed import. At
@@ -113,13 +112,13 @@ def _note_failure(sid: str, reason: str) -> None:
     the server (empty rollout, missing credential), so those neutral no-ops
     cannot accumulate a healthy session into dormancy."""
     now = time.time()
-    st = _read_state(sid)
+    st = await capture_async.blocking(_read_state, sid)
     if st.get("unsupported"):
         # A re-probe of a dormant session FAILED. Stay dormant and reset the
         # timer, so a persistently-down server is attempted exactly once per
         # DORMANT_RETRY_S — not given a fresh MAX_UNCONFIRMED budget that
         # would let it hammer between windows.
-        _save_state(sid, last_error=reason, last_error_at=now,
+        await _save_state(sid, last_error=reason, last_error_at=now,
                     unsupported=True, unsupported_at=now, fail_streak=0)
         return
     streak = int(st.get("fail_streak") or 0) + 1
@@ -127,10 +126,10 @@ def _note_failure(sid: str, reason: str) -> None:
         _log(f"{streak} consecutive failed imports ({reason}) — per-event "
              f"flush is dormant for this session; run /memhub:import-session "
              f"to capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
-        _save_state(sid, last_error=reason, last_error_at=now,
+        await _save_state(sid, last_error=reason, last_error_at=now,
                     unsupported=True, unsupported_at=now, fail_streak=0)
     else:
-        _save_state(sid, last_error=reason, last_error_at=now,
+        await _save_state(sid, last_error=reason, last_error_at=now,
                     unsupported=False, fail_streak=streak)
 
 
@@ -155,11 +154,11 @@ def _read_state(sid: str) -> dict:
         return {}
 
 
-def _save_state(sid: str, **fields) -> None:
-    state = _read_state(sid)
+async def _save_state(sid: str, **fields) -> None:
+    state = await capture_async.blocking(_read_state, sid)
     state.update(fields)
-    capture_context.state_directory(STATE_DIR).mkdir(parents=True, exist_ok=True)
-    atomic_write.publish(capture_context.state_directory(STATE_DIR) / f"{sid}.json", json.dumps(state))
+    await capture_async.publish_state(
+        capture_context.state_directory(STATE_DIR) / f"{sid}.json", state)
 
 
 def _acquire(sid: str, blocking: bool = False, *, timeout: float | None = None) -> int | None:
@@ -459,7 +458,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # Preparation can outlive this destination's budget. The worker only
     # returns values; all state changes remain after the cancellable await.
     records, meta, sendable = await capture_async.blocking(_prepare_transcript, rollout)
-    state = _read_state(sid)
+    state = await capture_async.blocking(_read_state, sid)
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
         pr_provenance.queued_urls(state, records)
     )
@@ -467,7 +466,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
              "canonical GitHub PR URL")
     if pending_pr_urls or accepted_pr_urls:
-        _save_state(
+        await _save_state(
             sid,
             pending_pr_urls=pending_pr_urls,
             accepted_pr_urls=accepted_pr_urls,
@@ -485,7 +484,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         # larger) rollout on every later event just to discard it again. Any
         # future growth re-triggers a full re-read. fail_streak clears: the
         # server was never contacted (see _note_failure).
-        _save_state(sid, rollout_size=size, fail_streak=0)
+        await _save_state(sid, rollout_size=size, fail_streak=0)
         return
 
     url, bearer = await capture_async.blocking(resolve_bearer)
@@ -493,7 +492,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _log("no usable credential — skipping (run /memhub:login)")
         # Local auth gap, not a server failure — clear any failure run rather
         # than let a login blip tip the session toward dormancy.
-        _save_state(sid, last_error="no_credential",
+        await _save_state(sid, last_error="no_credential",
                     last_error_at=time.time(), fail_streak=0)
         return
     env = env_for_url(url)
@@ -530,7 +529,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             # preserve a prior run of contacted failures that a later single
             # failure tips into dormancy (see _note_failure's documented
             # contract).
-            _save_state(sid, last_error="resolve_error",
+            await _save_state(sid, last_error="resolve_error",
                         last_error_at=time.time(), fail_streak=0)
             return
     else:
@@ -577,21 +576,21 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
             res = await capture_context.import_conversation(session, batch_args)
         except mcp_http.McpRateLimited as e:
             _log(f"rate limited: {e}")
-            _note_failure(sid, "rate_limited")
+            await _note_failure(sid, "rate_limited")
             return
         except mcp_http.McpError as e:
             _log(f"import failed: {e}")
-            _note_failure(sid, f"mcp_error: {str(e)[:80]}")
+            await _note_failure(sid, f"mcp_error: {str(e)[:80]}")
             return
         verdict = _verdict(res, f"codex-{sid}", records=batch)
         if verdict == "unsupported":
             _log("server does not report ack_through — capture deferred for this destination")
-            _save_state(sid, unsupported=True, unsupported_at=time.time(), fail_streak=0)
+            await _save_state(sid, unsupported=True, unsupported_at=time.time(), fail_streak=0)
             return
         ack = mcp_http.ack_of(res, f"codex-{sid}", prefer=lambda candidate:
                              capture_context.acknowledges(candidate, f"codex-{sid}", batch))
         if verdict != "ok" or not capture_context.acknowledges(ack or {}, f"codex-{sid}", batch):
-            _note_failure(sid, "unconfirmed_import")
+            await _note_failure(sid, "unconfirmed_import")
             return
         pending_pr_urls, accepted_pr_urls = pr_provenance.acknowledge_confirmed_import(
             pending_pr_urls, accepted_pr_urls, ack)
@@ -600,11 +599,11 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         # The transcript committed, but its optional URL write did not. Hold
         # the byte watermark so the next Stop can retry the same deduplicated
         # transcript with the still-pending URL.
-        _save_state(sid, pending_pr_urls=pending_pr_urls,
+        await _save_state(sid, pending_pr_urls=pending_pr_urls,
                     accepted_pr_urls=accepted_pr_urls)
-        _note_failure(sid, "unconfirmed_provenance")
+        await _note_failure(sid, "unconfirmed_provenance")
         return
-    _save_state(sid, rollout_size=size, last_ok_at=time.time(),
+    await _save_state(sid, rollout_size=size, last_ok_at=time.time(),
                 last_error=None, last_error_at=0,
                 # The re-probe worked: this server confirms after all.
                 unsupported=False, unsupported_at=0,
@@ -658,12 +657,11 @@ def _capture_sink(payload: dict) -> int:
         os.close(lock_fd)  # releases the flock
 
 
-def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
-                  size: int, *, timeout: float | None = None) -> int:
-    """The gated flush, run while this session's flock is held."""
-    if timeout is not None and timeout <= 0:
-        return 0
-    state = _read_state(sid)
+async def _gated_flush(event, payload, sid, rollout, size, timeout):
+    # Leave a small part of this destination's allocation for a retry
+    # breadcrumb. The outer timeout includes reads, writes and that handler.
+    started = time.monotonic()
+    state = await capture_async.blocking(_read_state, sid)
     if not should_flush(event, payload, state, size):
         return 0
     # Cooldown after a failure — including a TIMEOUT, which lands in the
@@ -683,18 +681,33 @@ def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
              f"cooling down ({ERROR_COOLDOWN_S:.0f}s)")
         return 0
 
+    remaining = timeout - (time.monotonic() - started)
+    reserve = min(0.05, timeout / 10)
+    if remaining <= reserve:
+        return
     try:
-        asyncio.run(asyncio.wait_for(_flush(sid, rollout, size),
-                                     timeout=FLUSH_TIMEOUT_S if timeout is None else timeout))
-    except Exception as e:
-        # Local preparation gets a retry breadcrumb, but only an attempted
-        # upload contributes to contacted-server failure/dormancy counts.
-        _log(f"{event}: flush error: {e}")
-        reason = f"flush_error: {type(e).__name__}"
+        await asyncio.wait_for(_flush(sid, rollout, size), timeout=remaining - reserve)
+    except Exception as error:
+        reason = f"flush_error: {type(error).__name__}"
         if capture_context.import_was_attempted():
-            _note_failure(sid, reason)
+            await _note_failure(sid, reason)
         else:
-            _save_state(sid, last_error=reason, last_error_at=time.time(), fail_streak=0)
+            await _save_state(sid, last_error=reason, last_error_at=time.time(), fail_streak=0)
+
+
+def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
+                  size: int, *, timeout: float | None = None) -> int:
+    """Bound the entire gated flush while this session's flock is held."""
+    budget = FLUSH_TIMEOUT_S if timeout is None else timeout
+    if budget <= 0:
+        return 0
+    try:
+        asyncio.run(asyncio.wait_for(
+            _gated_flush(event, payload, sid, rollout, size, budget), timeout=budget))
+    except (TimeoutError, OSError):
+        # No synchronous retry write after the deadline: leave the old
+        # watermark for replay and release ownership for the next attempt.
+        pass
     return 0
 
 

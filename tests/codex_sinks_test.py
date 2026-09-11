@@ -159,16 +159,17 @@ def test_codex_one_unwritable_destination_does_not_abort_the_other():
 
 
 def test_codex_slow_local_preparation_preserves_cloud_budget_without_late_progress():
-    for operation in ["canonicalize","redact","locate"]:
+    for operation in ["canonicalize","redact","locate","state-read","state-stage"]:
         order=[]
         with tempfile.TemporaryDirectory() as td,cases.receiver("local",order) as local,cases.receiver("cloud",order) as cloud:
             home=Path(td);payload,path=source(home);cases.configure(home,local[0])
             env=cases.environment(home,cloud[0]);guard=home/"guard/sitecustomize.py"
             target={"canonicalize":"codex_flush.codex_reader.to_canonical",
-                    "redact":"codex_flush.redact_once", "locate":"codex_flush.codex_reader.locate"}[operation]
+                    "redact":"codex_flush.redact_once", "locate":"codex_flush.codex_reader.locate",
+                    "state-read":"codex_flush._read_state", "state-stage":"atomic_write.publish"}[operation]
             if operation=="locate": payload={"session_id":SID}
             with guard.open("a") as output:
-                output.write("\nimport time,codex_flush,capture_context\n"
+                output.write("\nimport time,codex_flush,capture_context,atomic_write\n"
                     f"original_prepare={target}\n"
                     "def slow_prepare(*args,**kwargs):\n"
                     "    if capture_context._current.get().is_local: time.sleep(1.2)\n"
@@ -176,14 +177,17 @@ def test_codex_slow_local_preparation_preserves_cloud_budget_without_late_progre
                     f"{target}=slow_prepare\n")
             started=time.monotonic()
             result=subprocess.run([sys.executable,"-c",
-                "import codex_flush,time,sys;codex_flush.FLUSH_TIMEOUT_S=0.8;sys.argv=['codex_flush.py','Stop'];codex_flush.main();time.sleep(1.3)"],
+                "import codex_flush,time,sys;codex_flush.FLUSH_TIMEOUT_S=0.8;sys.argv=['codex_flush.py','Stop'];codex_flush.main();"
+                "saved={p:p.read_bytes() for p in codex_flush.STATE_DIR.rglob('*.json')};time.sleep(1.3);"
+                "assert saved=={p:p.read_bytes() for p in codex_flush.STATE_DIR.rglob('*.json')},'late state write';"
+                "assert not list(codex_flush.STATE_DIR.rglob('*.tmp'))"],
                 env=env,input=json.dumps(payload),text=True,capture_output=True,timeout=5)
             assert result.returncode==0 and "Traceback" not in result.stderr,result.stderr
             assert time.monotonic()-started<2.5
-            assert order==["cloud"],(operation,order)
+            assert order==(["local","cloud"] if operation=="state-stage" else ["cloud"]),(operation,order)
             assert state(home,"cloud",local[0])["rollout_size"]==path.stat().st_size
             assert not state(home,"local",local[0]).get("rollout_size")
-            if operation!="locate":
+            if operation not in ("locate", "state-read", "state-stage"):
                 assert "TimeoutError" in state(home,"local",local[0])["last_error"]
             assert not state(home,"local",local[0]).get("fail_streak")
             assert not state(home,"local",local[0]).get("unsupported")
