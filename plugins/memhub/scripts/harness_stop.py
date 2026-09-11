@@ -222,19 +222,43 @@ def cmd_stop(payload: dict) -> int:
     return 0
 
 
-def _claim_turn(session: str, marker: str) -> bool:
+def _supersede_claim(claim: Path, arcs: int) -> bool:
+    """Take over a turn whose winning child carried no error arcs. A claim
+    that is empty or unreadable (its winner has not written it yet) is left
+    alone."""
+    try:
+        held = json.loads(claim.read_text(encoding="utf-8") or "null")
+    except (OSError, ValueError):
+        return False
+    if not isinstance(held, dict) or int(held.get("arcs") or 0) > 0:
+        return False
+    try:
+        _publish(claim, json.dumps({"arcs": arcs, "superseded": True}))
+    except Exception:
+        return False
+    return True
+
+
+def _claim_turn(session: str, marker: str, arcs: int = 0) -> bool:
     """Exactly one child takes a turn. Two Stops for one turn, or two children
-    racing on a slow classifier, would otherwise both spend a call on it."""
+    racing on a slow classifier, would otherwise both spend a call on it.
+
+    The claim records how many error arcs its child carries. A session's arcs
+    are taken once, by whichever Stop ran first, so when two Stops fire for one
+    turn only one child holds them. If the child holding none won, the child
+    holding them takes the turn over: one extra classifier call, and the
+    prompt lane hands a turn once however many moments it has."""
     digest = hashlib.sha1(marker.encode("utf-8")).hexdigest()[:12]
     claim = hx.session_file(session, f".turn-{digest}.claim")
     try:
         claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        return False
+        return arcs > 0 and _supersede_claim(claim, arcs)
     except OSError:
         return True             # fail open: an unwritable claim does not stop the sensor
-    os.close(fd)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"arcs": arcs}))
     prefix = hx.session_file(session, ".turn-").name
     for old in claim.parent.glob(f"{prefix}*.claim"):
         if old != claim:
@@ -294,7 +318,7 @@ def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
     if not turns:
         return 0
     last, prev = turns[-1], (turns[-2] if len(turns) > 1 else None)
-    if not _claim_turn(session, f"{last.get('n')}:{last.get('uuid', '')}"):
+    if not _claim_turn(session, f"{last.get('n')}:{last.get('uuid', '')}", arcs=len(arcs)):
         return 0
     cwd = cwd or last.get("cwd") or ""
     repo = repo_of(cwd)

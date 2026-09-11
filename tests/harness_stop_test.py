@@ -236,6 +236,41 @@ def test_extract_classifies_the_last_turn_once_and_consumes_its_arcs():
     print("PASS test_extract_classifies_the_last_turn_once_and_consumes_its_arcs")
 
 
+def test_the_child_holding_the_turns_error_arcs_is_never_the_one_dropped():
+    with _Env() as env:
+        repo = _git_repo(env.base)
+        tp = env.base / "s.jsonl"
+        _transcript(tp, [("do the thing", "done", []),
+                         ("ok ship it", "shipped", [("Bash", {"command": "ls"}, "a", False)])])
+
+        def arcs_file(ns):
+            path = hx.session_file("dup", f".arcs-{ns}.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps([{"signature": "boom", "target": "make", "fix": "make", "cost": 6}]))
+            return path
+
+        calls = []
+        real = hx.server_classify
+        hx.server_classify = _classify(calls, {"signal": False, "reason": "classified"})
+        try:
+            size = tp.stat().st_size
+            # two Stops for one turn: the first took the session's arcs, but the
+            # other's child, holding none, claims the turn first
+            hs.cmd_extract("dup", str(tp), str(repo), "", size)
+            held = arcs_file(1)
+            hs.cmd_extract("dup", str(tp), str(repo), str(held), size)
+            assert len(calls) == 2, "the child holding the arcs takes the turn over"
+            assert "closed error arc on 'make'" in calls[1]["window"]
+            assert not held.exists()
+            # once a child with arcs holds the turn, nobody else spends a call on it
+            hs.cmd_extract("dup", str(tp), str(repo), str(arcs_file(2)), size)
+            hs.cmd_extract("dup", str(tp), str(repo), "", size)
+            assert len(calls) == 2, len(calls)
+        finally:
+            hx.server_classify = real
+    print("PASS test_the_child_holding_the_turns_error_arcs_is_never_the_one_dropped")
+
+
 def test_extract_takes_the_turn_that_stopped_not_the_prompt_queued_after_it():
     with _Env() as env:
         repo = _git_repo(env.base)
