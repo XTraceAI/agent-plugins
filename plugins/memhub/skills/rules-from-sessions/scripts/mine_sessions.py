@@ -153,10 +153,11 @@ for path in args.facets:   # the facets YOU wrote from the digests (fixed schema
         except Exception as e: print(f"[warn] --facets {fp} unreadable: {e}", file=sys.stderr); continue
         for d in (lst if isinstance(lst, list) else [lst]):
             if not isinstance(d, dict): continue
-            bad = [x.get("category") for x in (d.get("friction") or []) if x.get("category") not in FRICTION_VOCAB]
+            fr = d.get("friction")
+            if not (isinstance(fr, list) and all(isinstance(x, dict) for x in fr) and d.get("outcome") in ("achieved", "mostly", "partial", "not")):   # a cached facet marks its session read for good
+                print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: incomplete (needs a friction list of objects and an outcome) — skipped, so the session stays unread", file=sys.stderr); continue
+            bad = [x.get("category") for x in fr if x.get("category") not in FRICTION_VOCAB]
             if bad: print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: unknown friction category {bad} (allowed: {', '.join(FRICTION_VOCAB)})", file=sys.stderr)
-            if not (isinstance(d.get("friction"), list) and d.get("outcome") in ("achieved", "mostly", "partial", "not")):   # a cached facet marks its session read for good
-                print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: incomplete (needs a friction list and an outcome) — skipped, so the session stays unread", file=sys.stderr); continue
             new.append(d)
 # Reading a session is the expensive, model-side step, so each one is read once: facets accumulate in the cache,
 # and a session is offered for reading again only if it has grown since (its stamp changed).

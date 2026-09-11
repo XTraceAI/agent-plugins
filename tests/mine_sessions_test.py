@@ -142,7 +142,8 @@ def main() -> int:
         (out / "facets").mkdir(exist_ok=True)
         (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-111", "outcome": "mostly", "friction": [{"category": "wrong_source", "detail": "edited the wrong file", "evidence_turn": 0}],
                                                                "standards": [{"statement": "always TTL new tables", "quote": "always ttl these", "scope": "org"}], "worked_well": "kickoff brief landed clean"}]))
-        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "bbbbbbbb-333"}]))   # a reader that returned parseable but incomplete output
+        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "bbbbbbbb-333"},   # readers that returned parseable but incomplete output —
+                                                               {"session_id": "bbbbbbbb-333", "outcome": "mostly", "friction": [None]}]))   # …or a friction entry that is not an object: warned, never a crash
         p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
         cached = json.load(open(cache_dir / "facets.json")) if (cache_dir / "facets.json").is_file() else []
         ok = (p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and [d["session_id"] for d in cached] == ["aaaaaaaa-1111-2222"] and "wrong_source" in p.stdout
