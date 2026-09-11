@@ -196,8 +196,9 @@ paths, the schema and the rules below, and its one output path,
 (first prompt, user turns with corrections marked, errors, reverts — not the
 transcript), write only that file, run no git or any other command that
 changes state, and reply with the path alone. When they return, check each
-file exists and parses; a batch that failed stays unfaceted, and the next run
-offers it again. Each file holds one object per session, `session_id` and
+file exists and parses; a batch that failed stays unfaceted, and so does a
+facet missing its `friction` list or `outcome` (the script warns and skips
+it) — the next run offers those sessions again. Each file holds one object per session, `session_id` and
 `stamp` copied from its digest:
 
 ```json

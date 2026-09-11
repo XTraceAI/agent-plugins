@@ -42,8 +42,8 @@ def main() -> int:
         (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
                                                             {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
         p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
-        ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "WHAT WENT WRONG" in p.stdout and "PROPOSED RULES" in p.stdout and "wrong_source" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and (out / "digests").is_dir()
-        print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md and --facets (fixed vocab enforced), writes digests/"); fails += not ok
+        ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "PROPOSED RULES" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and "=== WHAT WENT WRONG" not in p.stdout and (out / "digests").is_dir()
+        print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md, warns on --facets vocab but reports no facet for a session not in the corpus, writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
         rows = json.load(open(out / "proposals.json")) if (out / "proposals.json").is_file() else []
         probe = next((r for r in rows if r.get("title") == "probe-rule"), None)
@@ -73,8 +73,8 @@ def main() -> int:
         ok = sed_hook is not None and "[0-9]+" in cmd and "\\d" not in cmd and "[[:space:]]" in cmd and "test)\\b" in pcmd
         print(("ok  " if ok else "FAIL"), "emitted PreToolUse snippet is grep -E syntax (\\d -> [0-9], \\s -> [[:space:]], \\b kept — GNU and BSD grep honour it)"); fails += not ok
         if not ok: print(cmd)
-        ok = "ENGINEERING STANDARDS ASSERTED" in p.stdout and "always TTL new tables" in p.stdout and "WHAT WORKED" in p.stdout and "REPEATED WORKFLOWS" in p.stdout
-        print(("ok  " if ok else "FAIL"), "asserted standards and worked_well are surfaced; the workflows lane prints"); fails += not ok
+        ok = "REPEATED WORKFLOWS" in p.stdout
+        print(("ok  " if ok else "FAIL"), "the workflows lane prints"); fails += not ok
         g = out / "grabs"
         ok = (g / "claude-md-additions.md").is_file() and (g / "hooks.settings.json").is_file() and (g / "Makefile.suggested").is_file()
         print(("ok  " if ok else "FAIL"), "grabs/ holds claude-md-additions.md, hooks.settings.json, Makefile.suggested"); fails += not ok
@@ -140,11 +140,14 @@ def main() -> int:
         if not ok: print(p.stdout[-600:], p.stderr[-600:])
 
         (out / "facets").mkdir(exist_ok=True)
-        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-111", "friction": [{"category": "wrong_source", "detail": "edited the wrong file", "evidence_turn": 0}]}]))
+        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-111", "outcome": "mostly", "friction": [{"category": "wrong_source", "detail": "edited the wrong file", "evidence_turn": 0}],
+                                                               "standards": [{"statement": "always TTL new tables", "quote": "always ttl these", "scope": "org"}], "worked_well": "kickoff brief landed clean"}]))
+        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "bbbbbbbb-333"}]))   # a reader that returned parseable but incomplete output
         p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
         cached = json.load(open(cache_dir / "facets.json")) if (cache_dir / "facets.json").is_file() else []
-        ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and [d["session_id"] for d in cached] == ["aaaaaaaa-1111-2222"] and "wrong_source" in p.stdout
-        print(("ok  " if ok else "FAIL"), "a directory of batch facets: the short id resolves, the facet is cached, and its session is not offered again"); fails += not ok
+        ok = (p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and [d["session_id"] for d in cached] == ["aaaaaaaa-1111-2222"] and "wrong_source" in p.stdout
+              and "ENGINEERING STANDARDS ASSERTED" in p.stdout and "always TTL new tables" in p.stdout and "WHAT WORKED" in p.stdout and "incomplete" in p.stderr)
+        print(("ok  " if ok else "FAIL"), "batch facets: the short id resolves, the facet is cached and reported (standards, worked_well), its session is not offered again; an incomplete facet is skipped and its session stays unread"); fails += not ok
         if not ok: print(p.stdout[-600:], p.stderr[-600:], cached)
 
         shutil.rmtree(out / "facets")
@@ -160,8 +163,8 @@ def main() -> int:
         print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written — by a late tool result alone — is offered again"); fails += not ok
 
         # A reused --out: this run's reading lands in batch-1, a stale copy from an earlier run still sits in batch-2 and loads after it
-        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "friction": []}]))
-        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "stamp": "1u0c0r", "friction": []}]))
+        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "outcome": "mostly", "friction": []}]))
+        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "stamp": "1u0c0r", "outcome": "mostly", "friction": []}]))
         p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
         stamps = {d["session_id"]: d.get("stamp") for d in json.load(open(cache_dir / "facets.json"))}
         ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and stamps.get("aaaaaaaa-1111-2222") == "1u0c1r"

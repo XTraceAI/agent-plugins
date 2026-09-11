@@ -155,6 +155,8 @@ for path in args.facets:   # the facets YOU wrote from the digests (fixed schema
             if not isinstance(d, dict): continue
             bad = [x.get("category") for x in (d.get("friction") or []) if x.get("category") not in FRICTION_VOCAB]
             if bad: print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: unknown friction category {bad} (allowed: {', '.join(FRICTION_VOCAB)})", file=sys.stderr)
+            if not (isinstance(d.get("friction"), list) and d.get("outcome") in ("achieved", "mostly", "partial", "not")):   # a cached facet marks its session read for good
+                print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: incomplete (needs a friction list and an outcome) — skipped, so the session stays unread", file=sys.stderr); continue
             new.append(d)
 # Reading a session is the expensive, model-side step, so each one is read once: facets accumulate in the cache,
 # and a session is offered for reading again only if it has grown since (its stamp changed).
@@ -168,7 +170,7 @@ for d in new:
     if held and held.get("stamp") == _stamp[full] and d["stamp"] != _stamp[full]: continue   # a batch file left from an earlier run in a reused --out must not overwrite this run's reading
     _facet_cache[full] = d; new_here.append(d)
 if new_here: _save_cache("facets.json", list(_facet_cache.values()))
-facets = [d for sid, d in _facet_cache.items() if sid in _stamp] + [d for d in new if not corpus_id(d.get("session_id"))]   # this corpus only: a --repo run keeps to its repo
+facets = [d for sid, d in _facet_cache.items() if sid in _stamp]   # this corpus only: a --repo run keeps to its repo, and another repo's batch left in a reused --out is not reported or uploaded
 json.dump(facets, open(os.path.join(args.out, "facets.merged.json"), "w"), indent=1)   # every facet for these sessions, earlier runs' included — what step 6 sends to the team
 for d in facets:
     fr = [x for x in (d.get("friction") or []) if isinstance(x, dict)]
