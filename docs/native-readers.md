@@ -8,7 +8,7 @@ that need explicit read failures can enable one checked-read mode:
 records, metadata = reader.to_canonical(path, strict=True)
 ```
 
-Default capture behavior stays unchanged. Checked reads reject invalid UTF-8
+Checked mode adds validation to the existing normalization. It rejects invalid UTF-8
 text, malformed complete JSON rows, non-finite numbers, and Cursor content
 shapes the normalizer cannot preserve. Existing Cursor blob hashes, references
 and framing are checked before returning the tree. Original files are not

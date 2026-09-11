@@ -743,8 +743,11 @@ def session_metadata(path, *, strict: bool = True) -> dict:
                 continue
             if strict and not isinstance(record, dict):
                 raise ValueError("Codex metadata row is not an object")
+            if (strict and record.get("type") == "session_meta"
+                    and not isinstance(record.get("payload"), dict)):
+                raise ValueError("Codex metadata payload is not an object")
             payload = _session_meta([record])
-            if payload:
+            if payload or (strict and record.get("type") == "session_meta"):
                 git = payload.get("git")
                 return {
                     "session_id": payload.get("id"),
