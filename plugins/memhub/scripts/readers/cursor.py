@@ -411,19 +411,17 @@ def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, i
     try:
         blobs = {row[0]: row[1] for row in con.execute("SELECT id, data FROM blobs")}
         root = None
+        hex_root = False
         for (value,) in con.execute("SELECT value FROM meta"):
             try:
                 if isinstance(value, (bytes, bytearray)):
                     value = value.decode("utf-8")
-                # Native Cursor stores can serialize the JSON metadata as hex
-                # text. Decode that representation before checking the JSON.
-                if isinstance(value, str) and re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value):
-                    try:
-                        value = bytes.fromhex(value).decode("utf-8")
-                    except UnicodeError:
-                        if strict:
-                            raise
-                        continue
+                # Default capture historically treats hex metadata as an
+                # unreadable root and uses insertion order. Preserve that
+                # projection: existing UUIDs depend on record positions.
+                encoded = isinstance(value, str) and re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value)
+                if encoded and strict:
+                    value = bytes.fromhex(value).decode("utf-8")
                 m = load_json(value, strict=strict)
             except (TypeError, json.JSONDecodeError):
                 if strict:
@@ -431,6 +429,7 @@ def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, i
                 continue
             if isinstance(m, dict) and m.get("latestRootBlobId"):
                 root = m["latestRootBlobId"]
+                hex_root = bool(encoded)
                 break
     finally:
         con.close()
@@ -478,15 +477,26 @@ def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, i
         walk(root, None)
     elif strict and blobs:
         raise ValueError("Cursor tree has no root")
-    if not messages and not strict:
+    if hex_root:
+        # Validate the native tree above, but retain the pre-existing flat
+        # projection below. Tree order/checkpoint clocks would change the
+        # contents or timestamps associated with already-published UUIDs.
+        messages.clear()
+    if hex_root or (not messages and not strict):
         # Fallback: no walkable root (interrupted write). Take JSON blobs in
         # insertion order — degraded but better than losing the session.
-        for data in blobs.values():
+        for blob_id, data in blobs.items():
             if isinstance(data, (bytes, bytearray)) and data[:1] == b"{":
+                if strict and hashlib.sha256(data).hexdigest() != blob_id:
+                    raise ValueError("Cursor blob content does not match its hash")
                 try:
-                    msg = json.loads(bytes(data).decode("utf-8", errors="replace"))
+                    msg = load_json(bytes(data).decode("utf-8", errors="strict" if strict else "replace"), strict=strict)
                 except json.JSONDecodeError:
+                    if strict:
+                        raise
                     continue
+                if strict:
+                    _validate_message(msg, source_kind="store")
                 if isinstance(msg, dict) and msg.get("role"):
                     messages.append((msg, None))
     return messages

@@ -16,7 +16,9 @@ record is deferred because native writers append their transcripts. Original
 files are not edited, and healthy inputs keep their IDs, usage and timestamps.
 
 Cursor store metadata supports the native plain-JSON and hex-encoded JSON
-representations; both resolve the same content-addressed tree.
+representations. Checked reads validate the decoded tree. Hex metadata retains
+the existing insertion-order projection and nullable clocks because changing
+that projection would reassign content to previously captured record IDs.
 
 This mode checks the supported input structure; it does not certify that every
 optional measurement is available. Missing or unusable native token counters
