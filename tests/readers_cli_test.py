@@ -912,6 +912,43 @@ def test_selected_codex_skips_distinct_malformed_headers_after_counting_ids():
             assert all(path.read_bytes()==data for path,data in originals.items())
 
 
+def test_title_index_cr_records_preserve_titles_and_per_record_byte_bound():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=rollout(home);sid=codex.session_metadata(path)['session_id']
+        index=home/'.codex/session_index.jsonl'
+        entries=[{'id':'other','thread_name':'Other title'},
+                 {'id':sid,'thread_name':'标题\u2028native title'}]
+        rows=[json.dumps(row,ensure_ascii=False).encode() for row in entries]
+        for ending in (b'\n',b'\r',b'\r\n'):
+            for trailing in (True,False):
+                raw=ending.join(rows)+(ending if trailing else b'')
+                index.write_bytes(raw)
+                result,output=run(home,'codex')
+                assert result.returncode==0,result.stderr
+                assert output[0]['title']==codex._one_line(entries[1]['thread_name'])
+                assert index.read_bytes()==raw
+                with patch.object(codex,'_SESSION_INDEX',index),patch.object(codex,'_INDEX_TAIL_BYTES',max(map(len,rows))+len(ending)):
+                    assert readers_cli.historical_titles(codex,{sid})[sid][0]==output[0]['title']
+        index.write_bytes(rows[1]+b'\r')
+        with patch.object(codex,'_SESSION_INDEX',index),patch.object(codex,'_INDEX_TAIL_BYTES',len(rows[1])):
+            try:readers_cli.historical_titles(codex,{sid})
+            except ValueError:pass
+            else:raise AssertionError('title index accepted an oversized UTF-8 record')
+
+
+def test_discovered_posix_fifo_does_not_block_healthy_session_output():
+    if not hasattr(os,'mkfifo'):
+        return
+    for host in ('codex','cursor'):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);good=rollout(home) if host=='codex' else transcript(home)
+            fifo=good.with_name('rollout-pipe.jsonl') if host=='codex' else home/'.cursor/projects/other/agent-transcripts/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl'
+            fifo.parent.mkdir(parents=True,exist_ok=True);os.mkfifo(fifo)
+            result,rows=run(home,host,'--metadata-only')
+            assert result.returncode==2 and 'discovery_incomplete' in result.stderr
+            assert len(rows)==1 and rows[0]['path']==str(good.resolve())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

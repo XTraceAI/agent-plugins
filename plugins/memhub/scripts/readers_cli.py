@@ -16,6 +16,7 @@ from pathlib import Path
 
 from readers import reader_for, validate_canonical
 from readers.strict_json import loads as load_json
+from readers.jsonl import open_lines, readline_bytes
 
 
 def since_instant(value: str) -> float:
@@ -117,13 +118,11 @@ def historical_titles(reader, session_ids):
     """Read the complete title index once, keeping only selected identities."""
     found = {}
     try:
-        handle = reader._SESSION_INDEX.open("rb")
+        handle = open_lines(reader._SESSION_INDEX)
     except FileNotFoundError:
         return found
     with handle:
-        while raw := handle.readline(reader._INDEX_TAIL_BYTES + 1):
-            if len(raw) > reader._INDEX_TAIL_BYTES:
-                raise ValueError("Codex title index line exceeds its read bound")
+        while raw := readline_bytes(handle, reader._INDEX_TAIL_BYTES):
             text = raw.decode("utf-8")
             if not text.strip():
                 continue
