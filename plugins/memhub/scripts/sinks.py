@@ -115,6 +115,12 @@ def _unique_object(pairs):
     return result
 
 
+def _mcp_path(value) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
+        raise SinkConfigError("capture MCP path must start with a single slash")
+    return value
+
+
 def load_config(path: Path | None = None) -> dict | None:
     """Read version-one configuration; missing/corrupt files use legacy defaults.
 
@@ -145,9 +151,7 @@ def load_config(path: Path | None = None) -> dict | None:
         base = _endpoint(item.get("url"))
         if "?" in base:
             raise SinkConfigError("capture base URL cannot contain a query")
-        path = item.get("mcp_path", DEFAULT_MCP_PATH)
-        if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
-            raise SinkConfigError("capture MCP path must start with a single slash")
+        path = _mcp_path(item.get("mcp_path", DEFAULT_MCP_PATH))
         registry[name] = Sink(name, base.rstrip("/") + path, item.get("token"))
     active = tuple(dict.fromkeys(_name(name) for name in config["active"]))
     return {"sinks": registry, "active": active}
@@ -158,6 +162,7 @@ def _selection() -> tuple[tuple[str, ...], dict[str, Sink]]:
     if os.environ.get("MEMHUB_MCP_BASE_URL"):
         if "?" in os.environ["MEMHUB_MCP_BASE_URL"]:
             raise SinkConfigError("capture base URL cannot contain a query")
+        _mcp_path(os.environ.get("MEMHUB_MCP_SERVER_PATH", DEFAULT_MCP_PATH))
         sink = Sink("env", _memhub_auth.default_url())
         return (sink.name,), {sink.name: sink}
     config = load_config()
