@@ -922,6 +922,64 @@ def test_checked_codex_tool_results_require_present_output():
             assert checked==codex.to_canonical(path)
 
 
+def test_checked_native_models_are_nonblank_text_or_unknown():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);path=sources(home)[0][1]
+        for value in (17,False,[],{},'  '):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            context=next(row for row in rows if row.get('type')=='turn_context')
+            context['payload']['model']=value;fixtures._write_jsonl(path,rows)
+            rejected(lambda:codex.to_canonical(path,strict=True))
+        for value in (None,'native-model'):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            context=next(row for row in rows if row.get('type')=='turn_context')
+            context['payload']['model']=value;fixtures._write_jsonl(path,rows)
+            assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+
+    for provider_options in (17,False,[],{'cursor':17},{'cursor':{'modelName':17}},
+                             {'cursor':{'modelName':False}},{'cursor':{'modelName':[]}},
+                             {'cursor':{'modelName':{}}},{'cursor':{'modelName':'  '}}):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/'chats')
+            message={'role':'assistant','content':'synthetic output',
+                     'providerOptions':provider_options}
+            raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+            with closing(sqlite3.connect(store)) as sql,sql:
+                sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw))
+                sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':key}),))
+            transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[
+                {'role':'assistant','message':{k:v for k,v in message.items() if k!='role'}}])
+            for source in (store,transcript):
+                before=source.read_bytes()
+                rejected(lambda:cursor.to_canonical(source,strict=True))
+                assert source.read_bytes()==before
+    for model in (None,'native-model'):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/'chats')
+            message={'role':'assistant','content':'synthetic output',
+                     'providerOptions':{'cursor':{'modelName':model}}}
+            raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+            with closing(sqlite3.connect(store)) as sql,sql:
+                sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw))
+                sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':key}),))
+            transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[
+                {'role':'assistant','message':{k:v for k,v in message.items() if k!='role'}}])
+            for source in (store,transcript):
+                assert cursor.to_canonical(source,strict=True)==cursor.to_canonical(source)
+
+
+def test_checked_codex_metadata_rejects_nontext_cli_version():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1]
+        for value in (17,False,[],{}):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH);rows[0]['payload']['cli_version']=value
+            fixtures._write_jsonl(path,rows);rejected(lambda:codex.to_canonical(path,strict=True))
+        for value in (None,'1.2.3'):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH);rows[0]['payload']['cli_version']=value
+            fixtures._write_jsonl(path,rows)
+            assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
