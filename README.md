@@ -577,6 +577,11 @@ soft (not a git repo / hook error → silent no-op).
 To point at a different MemHub instance, edit `plugins/memhub/.mcp.json`
 (`url` and `oauth.clientId`).
 
+Local consumers can opt into the separate [capture destination API](docs/wire-contract.md#capture-destination-api).
+It reads named destinations without changing cloud-service authentication.
+Capture hooks have not adopted this API yet; creating its configuration file
+alone does not redirect their current capture traffic.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 XTrace Inc.
