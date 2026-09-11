@@ -187,6 +187,18 @@ async flush hooks can't surface anything to the user) that reports via
 `systemMessage` when the capture credential has expired or a recent flush
 failed; silent on the healthy path so it doesn't become wallpaper.
 
+### Cursor observation history
+
+Cursor's native session files omit some usage and timing information. Hooks
+save available usage by generation and timestamp pins locally before waiting
+for an upload, so a busy cloud upload does not discard a completed-turn usage
+observation. Existing cloud delivery keeps its own upload lock and progress.
+
+Saved usage remains available beyond 512 measured records for later local
+reads and manual imports. The state retains one exact sample per measured
+record rather than a second transcript archive. Unobserved historical usage
+stays unknown; a later read never invents missing measurements.
+
 ### Directive recall
 
 Independent of capture: `PreToolUse` (Edit/Write/NotebookEdit/Bash) and

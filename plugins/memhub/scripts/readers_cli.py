@@ -257,7 +257,9 @@ def main(argv=None) -> int:
                 def latest_mtime(row):
                     path = Path(row["path"])
                     if args.host == "cursor" and path.name == "store.db":
-                        metadata = reader._read_meta_json(path.parent, strict_json=True, strict_utf8=True)
+                        # Ranking consumes only the update clock. Full metadata
+                        # validation belongs to the selected session below.
+                        metadata = load_json((path.parent / "meta.json").read_text(encoding="utf-8"), strict=True)
                         value = metadata.get("updatedAtMs") if isinstance(metadata, dict) else None
                         if type(value) not in (int, float) or not math.isfinite(value):
                             raise ValueError("Cursor latest ordering requires a finite native timestamp")
@@ -362,7 +364,7 @@ def main(argv=None) -> int:
                         header["mtime"] = max(header["mtime"], titles.mtime(observation))
                         return observation[0]
                     options = {"title_index": fallback_title} if titles is not None else {}
-                    records, native = reader.to_canonical(snapshot, strict_utf8=True, strict_json=True, **options)
+                    records, native = reader.to_canonical(snapshot, strict=True, **options)
                 if native.get("session_id") != header["native_session_id"]:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":

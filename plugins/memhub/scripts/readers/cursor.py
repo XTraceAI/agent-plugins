@@ -157,14 +157,18 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return normalize_usage(raw)
 
 
-def _read_meta_json(session_dir: Path, *, strict_json=False, strict_utf8=False) -> dict | None:
+def _read_meta_json(session_dir: Path, *, strict=False) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        errors = "replace" if strict_json and not strict_utf8 else "strict"
-        value = load_json(p.read_text(encoding="utf-8", errors=errors), strict=strict_json)
+        value = load_json(p.read_text(encoding="utf-8"), strict=strict)
+        if strict and isinstance(value, dict):
+            if value.get("cwd") is not None and not isinstance(value["cwd"], str):
+                raise ValueError("Cursor working directory must be text")
+            if value.get("createdAtMs") is not None and type(value["createdAtMs"]) not in (int, float):
+                raise ValueError("Cursor creation time must be numeric")
         return value if isinstance(value, dict) else None
-    except (OSError, ValueError) as error:
-        if strict_json or (strict_utf8 and isinstance(error, UnicodeError)):
+    except (OSError, ValueError):
+        if strict:
             raise
         return None
 
@@ -391,9 +395,13 @@ def _validate_message(message):
             requires_identity = kind != "tool_use" or "toolCallId" in block or "id" in block
             if requires_identity and (not isinstance(identity, str) or not identity):
                 raise ValueError("Cursor tool block requires its native call identifier")
+            if kind != "tool-result":
+                name = block.get("toolName") or block.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("Cursor tool call requires its native tool name")
 
 
-def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, int | None]]:
+def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, int | None]]:
     """Walk the hash tree from latestRootBlobId; return ordered JSON leaves
     paired with their nearest ancestor node's wall clock (ms epoch, or None).
     Checkpoint nodes are timestamped; their leaves inherit that clock, which
@@ -405,11 +413,10 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
         for (value,) in con.execute("SELECT value FROM meta"):
             try:
                 if isinstance(value, (bytes, bytearray)):
-                    errors = "replace" if strict_json and not strict_utf8 else "strict"
-                    value = value.decode("utf-8", errors=errors)
-                m = load_json(value, strict=strict_json)
+                    value = value.decode("utf-8")
+                m = load_json(value, strict=strict)
             except (TypeError, json.JSONDecodeError):
-                if strict_json:
+                if strict:
                     raise
                 continue
             if isinstance(m, dict) and m.get("latestRootBlobId"):
@@ -424,10 +431,10 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
 
     def walk(blob_id: str, inherited_ts: int | None) -> None:
         if not isinstance(blob_id, str) or blob_id not in blobs:
-            if strict_json:
+            if strict:
                 raise ValueError("Cursor tree references a missing blob")
             return
-        if blob_id in active and strict_json:
+        if blob_id in active and strict:
             raise ValueError("Cursor tree contains a cycle")
         if blob_id in seen:
             return
@@ -435,21 +442,21 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
         data = blobs[blob_id]
         if isinstance(data, str):
             data = data.encode("utf-8")
-        if strict_json and hashlib.sha256(data).hexdigest() != blob_id:
+        if strict and hashlib.sha256(data).hexdigest() != blob_id:
             raise ValueError("Cursor blob content does not match its hash")
         if data[:1] == b"{":
             try:
-                msg = load_json(data.decode("utf-8", errors="strict" if strict_utf8 else "replace"), strict=strict_json)
+                msg = load_json(data.decode("utf-8", errors="strict" if strict else "replace"), strict=strict)
             except json.JSONDecodeError:
-                if strict_json:
+                if strict:
                     raise
                 return
-            if strict_json:
+            if strict:
                 _validate_message(msg)
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
-        children, node_ts = _parse_node(data, strict=strict_json)
+        children, node_ts = _parse_node(data, strict=strict)
         active.add(blob_id)
         try:
             for child in children:
@@ -459,18 +466,16 @@ def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: boo
 
     if root:
         walk(root, None)
-    elif strict_json and blobs:
+    elif strict and blobs:
         raise ValueError("Cursor tree has no root")
-    if not messages and not strict_json:
+    if not messages and not strict:
         # Fallback: no walkable root (interrupted write). Take JSON blobs in
         # insertion order — degraded but better than losing the session.
         for data in blobs.values():
             if isinstance(data, (bytes, bytearray)) and data[:1] == b"{":
                 try:
-                    msg = json.loads(bytes(data).decode("utf-8", errors="strict" if strict_utf8 else "replace"))
+                    msg = json.loads(bytes(data).decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
-                    if strict_json:
-                        raise
                     continue
                 if isinstance(msg, dict) and msg.get("role"):
                     messages.append((msg, None))
@@ -651,7 +656,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 _MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
 
 
-def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, str | None]]:
+def _load_transcript(path: Path, *, strict: bool = False) -> list[tuple[dict, str | None]]:
     """Read Cursor hook JSONL, ignoring only an unfinished final line.
 
     A message's clock is its OWN embedded ``<timestamp>`` tag (user turns
@@ -675,12 +680,9 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
                     f"cursor transcript {path} line {line_no} exceeds 8 MiB")
             terminated = raw.endswith((b"\n", b"\r"))
             try:
-                # JSON-only validation permits replacement decoding. Leaving
-                # both flags off retains legacy unfinished-byte-tail handling.
-                errors = "replace" if strict_json and not strict_utf8 else "strict"
-                entry = load_json(raw.decode("utf-8", errors=errors), strict=strict_json)
+                entry = load_json(raw.decode("utf-8"), strict=strict)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if not terminated and not (strict_utf8 and isinstance(exc, UnicodeDecodeError)):
+                if not terminated and not (strict and isinstance(exc, UnicodeDecodeError)):
                     # Cursor appends records. A hook can race the writer, so a
                     # genuinely unfinished tail is deferred to the next event.
                     # A complete final JSON object needs no trailing newline
@@ -690,7 +692,7 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
                 raise ValueError(
                     f"cursor transcript {path} line {line_no} is invalid JSON") from exc
             if not isinstance(entry, dict):
-                if strict_json:
+                if strict:
                     raise ValueError("Cursor transcript row is not an object")
                 continue
             if entry.get("role") not in (
@@ -698,12 +700,12 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
                 continue
             body = entry.get("message")
             if not isinstance(body, dict):
-                if strict_json:
+                if strict:
                     raise ValueError("Cursor transcript message is not an object")
                 continue
             message = dict(body)
             message["role"] = entry["role"]
-            if strict_json:
+            if strict:
                 _validate_message(message)
             own_ts = (_embedded_timestamp(_text_of(message.get("content")))
                       if entry["role"] == "user" else None)
@@ -713,13 +715,13 @@ def _load_transcript(path: Path, *, strict_utf8: bool = False, strict_json: bool
 
 def to_canonical(path, *, session_id: str | None = None,
                  cwd: str | None = None, model: str | None = None,
-                 strict_utf8: bool = False, strict_json: bool = False
+                 strict: bool = False
                  ) -> tuple[list[dict], dict]:
     """Load either a legacy ``store.db`` or current hook transcript."""
     source = Path(path)
     if source.name != "store.db":
         sid = session_id or source.stem
-        messages = _load_transcript(source, strict_utf8=strict_utf8, strict_json=strict_json)
+        messages = _load_transcript(source, strict=strict)
         # The banner's clock: the first embedded user-turn tag — the earliest
         # source-carried instant the transcript offers (None when it offers
         # none; the flush's first-seen stamp covers live sessions).
@@ -729,7 +731,7 @@ def to_canonical(path, *, session_id: str | None = None,
             created_ts=created_ts)
 
     session_dir = source.parent
-    mj = _read_meta_json(session_dir, strict_json=strict_json, strict_utf8=strict_utf8) or {}
+    mj = _read_meta_json(session_dir, strict=strict) or {}
     version = mj.get("schemaVersion")
     if version != _SCHEMA_VERSION:
         raise ValueError(
@@ -742,18 +744,17 @@ def to_canonical(path, *, session_id: str | None = None,
     # ``updatedAtMs`` is NOT a substitute: it moves with every write, so using
     # it dates the whole undated remainder at flush-adjacent time.
     messages = [(message, _iso_ms(node_ts))
-                for message, node_ts in _load_messages(source, strict_utf8=strict_utf8, strict_json=strict_json)]
+                for message, node_ts in _load_messages(source, strict=strict)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_created_at(mj, strict=strict_json))
+        model_hint=None, created_ts=_created_at(mj, strict=strict))
 
 
 def session_metadata(path) -> dict:
     """Native identity and start; a first user message is not a session start."""
     source = Path(path)
     if source.name == "store.db":
-        with (source.parent / "meta.json").open(encoding="utf-8") as handle:
-            meta = load_json(handle.read(), strict=True)
+        meta = _read_meta_json(source.parent, strict=True)
         if not isinstance(meta, dict) or meta.get("schemaVersion") != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
         return {"session_id": source.parent.name, "cwd": meta.get("cwd"),

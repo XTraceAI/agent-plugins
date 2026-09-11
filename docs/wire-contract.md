@@ -105,3 +105,10 @@ deduplication and unobserved usage. No network or MCP import is needed by the
 reader CLI; subprocess tests reject both.
 
 Cursor `--session latest` prepares only the resolved native UUID after counting same-ID copies. Invalid metadata or state from an unrelated UUID cannot fail a healthy selected export; whole-host exports still report those damaged sessions.
+
+`--session latest` selects from the ranking observations collected during discovery.
+It then checks the selected source for changes while reading it. An unrelated
+session may become newer afterward; that does not invalidate the selected read.
+This is a one-shot selection, not an atomic snapshot or a live subscription to
+all sessions. Call again to obtain a new selection. Missing or malformed ranking
+metadata still reports incomplete discovery.

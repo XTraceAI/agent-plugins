@@ -1,42 +1,44 @@
-# Native reader validation
+# Reading native session files
 
-The existing Codex and Cursor readers expose opt-in strict reads for consumers
-that must distinguish a damaged source from complete coverage:
+A native reader understands the session files an agent already writes locally.
+The Codex and Cursor readers reuse their existing normalization code. Callers
+that need explicit read failures can enable one checked-read mode:
 
 ```python
-records, metadata = reader.to_canonical(path, strict_utf8=True, strict_json=True)
+records, metadata = reader.to_canonical(path, strict=True)
 ```
 
-Strict reads reject invalid UTF-8, malformed complete JSON rows, non-standard
-JSON constants and numbers that overflow to a non-finite value. This includes
-opted-in title indexes, native store metadata and saved observations. Cursor JSONL
-rows must be objects, and recognized message roles need an object message body.
-An unfinished final JSON record remains deferred because native writers append
-their transcripts. Existing capture callers retain the default tolerant behavior.
-Canonical record IDs, usage normalization and timestamp rules are unchanged.
-Cursor assistant blocks must match supported text, reasoning and tool-call
-shapes; both native tool-call aliases retain their content and usage. Unknown
-blocks fail strict reads instead of silently dropping their content.
+Default capture behavior stays unchanged. Checked reads reject invalid UTF-8
+text, malformed complete JSON rows, non-finite numbers, and Cursor content
+shapes the normalizer cannot preserve. Existing Cursor blob hashes, references
+and framing are checked before returning the tree. An unfinished final JSON
+record is deferred because native writers append their transcripts. Original
+files are not edited, and healthy inputs keep their IDs, usage and timestamps.
 
-`session_metadata(path)` returns native identity, raw observed surface, native
-start and repository metadata without deriving a title from a prompt. Missing
-surface or start remains unknown. `list_sessions(..., on_error=callback)` reports
-unreadable or skipped discovery sources; symlinked subdirectories are reported
-rather than followed into cycles.
+This mode checks the supported input structure; it does not certify that every
+optional measurement is available. Missing or unusable native token counters
+remain unmeasured, not zero. A readable session is retained when only its usage
+sample is unusable. Tool calls need usable names/identifiers so normalization
+cannot silently invent a tool identity or disconnect its result. A malformed
+working-directory value or creation-time type fails the checked store read
+because copying it could assign the wrong project or a fabricated date.
+
+`session_metadata(path)` reads native identity, surface, start and repository
+metadata without deriving a title from a prompt. Missing facts remain unknown.
+`list_sessions(..., on_error=callback)` reports inaccessible or skipped sources;
+symlinked subdirectories are reported rather than followed into cycles. Callers
+should keep healthy sessions available while reporting failures for other files.
 
 `cursor_flush.apply_session_state(records, native_id, strict=True)` restores
-saved observations while rejecting malformed existing state. Missing optional
-files and explicitly unmeasured timestamp pins remain valid. Reads do not advance
-upload progress or rewrite saved observations.
+saved observations and rejects malformed saved state. Missing optional files
+and explicitly unmeasured clock pins are valid. Reads do not advance upload
+progress or rewrite saved observations.
 
-Strict decoding is separate from SQLite snapshot ownership: a consumer that must
-avoid native WAL/shared-memory changes must supply a private snapshot. This API
-change adds no standalone stream command, destination selection or network call.
+Checked parsing does not own SQLite snapshots. A consumer that must avoid
+native WAL/shared-memory changes supplies a private snapshot. This PR adds no
+reader service, alternate text encoding, full schema validator or repair pass.
+The standalone command and snapshots are in #198; Desktop indexing is separate.
 
-Run `python3 tests/readers_validation_test.py` for strict/legacy parity, malformed
-rows, incomplete tails, byte decoding, saved observations, discovery errors and
-native metadata. Existing reader, usage and timestamp suites remain required.
-
-Strict Cursor validation also checks user text blocks in both store leaves and hook transcripts. Unsupported block kinds or non-string text reject the read. Store metadata honors JSON and UTF-8 strictness independently; JSON-only mode permits replacement-decoded text while UTF-8 strict mode rejects invalid bytes. Default capture behavior remains unchanged.
-
-Codex rollout/title-index and Claude transcript/working-directory probes split JSONL at byte-level LF/CR boundaries. Literal Unicode line separators inside JSON strings remain content. Cursor strict assistant text/reasoning blocks require a string text value; empty strings remain valid.
+Run `python3 tests/readers_validation_test.py` and the existing plugin test
+contract. Corruption fixtures demonstrate behavior under synthetic failures;
+they are not claims that real user session files were found corrupted.

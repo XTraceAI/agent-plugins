@@ -33,7 +33,7 @@ def test_strict_reads_preserve_existing_canonical_records_and_source_bytes():
         home=Path(td)
         for reader,path in sources(home)+[(cursor,fixtures._make_cursor_store(home/"native stores #1?"))]:
             before=path.read_bytes();expected=reader.to_canonical(path)
-            assert reader.to_canonical(path,strict_utf8=True,strict_json=True)==expected
+            assert reader.to_canonical(path,strict=True)==expected
             assert path.read_bytes()==before
 
 
@@ -44,7 +44,7 @@ def test_complete_non_object_rows_fail_but_legacy_capture_stays_tolerant():
             for row in [b'null\n',b'17\n',b'[]\n',b'"text"\n',b'null']:
                 path.write_bytes(original+row)
                 assert reader.to_canonical(path)==expected
-                rejected(lambda:reader.to_canonical(path,strict_json=True))
+                rejected(lambda:reader.to_canonical(path,strict=True))
             path.write_bytes(original)
 
 
@@ -55,7 +55,7 @@ def test_cursor_recognized_roles_require_object_messages_in_strict_reads():
             for body in [None,[],17]:
                 path.write_bytes(original+json.dumps({'role':role,'message':body}).encode()+b'\n')
                 assert reader.to_canonical(path)==expected
-                rejected(lambda:reader.to_canonical(path,strict_json=True))
+                rejected(lambda:reader.to_canonical(path,strict=True))
 
 
 def test_strict_reads_defer_only_unfinished_json_and_reject_invalid_utf8():
@@ -63,28 +63,28 @@ def test_strict_reads_defer_only_unfinished_json_and_reject_invalid_utf8():
         for reader,path in sources(Path(td)):
             original=path.read_bytes();expected=reader.to_canonical(path)
             path.write_bytes(original+b'{"unfinished":')
-            assert reader.to_canonical(path,strict_utf8=True,strict_json=True)==expected
+            assert reader.to_canonical(path,strict=True)==expected
             path.write_bytes(original+b'{bad}\n')
-            rejected(lambda:reader.to_canonical(path,strict_utf8=True,strict_json=True))
+            rejected(lambda:reader.to_canonical(path,strict=True))
             for ending in [b'\n',b'']:
                 path.write_bytes(original+b'{"bad":"\xff"}'+ending)
-                rejected(lambda:reader.to_canonical(path,strict_utf8=True,strict_json=True))
+                rejected(lambda:reader.to_canonical(path,strict=True))
 
 
 def test_strict_cursor_store_decodes_message_leaves_without_replacement():
-    with tempfile.TemporaryDirectory() as td:
-        store=fixtures._make_cursor_store(Path(td)/"chats")
-        with sqlite3.connect(store) as connection:
-            identity,data=next((key,value) for key,value in connection.execute("SELECT id,data FROM blobs")
-                               if isinstance(value,bytes) and b'"role": "assistant"' in value)
-            message=json.loads(data);message['content']=[{'type':'text','text':'invalidXtext'}]
-            data=json.dumps(message).encode().replace(b'invalidXtext',b'invalid\xfftext')
-            connection.execute('UPDATE blobs SET data=? WHERE id=?',(data,identity))
-        assert '\ufffd' in json.dumps(cursor.to_canonical(store),ensure_ascii=False)
-        rejected(lambda:cursor.to_canonical(store,strict_utf8=True,strict_json=True))
-        with sqlite3.connect(store) as connection:
-            connection.execute('UPDATE blobs SET data=? WHERE id=?',(b'{"role":',identity))
-        rejected(lambda:cursor.to_canonical(store,strict_utf8=True,strict_json=True))
+    for raw in [b'{"role":"assistant","content":"invalid\xfftext"}', b'{"role":']:
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            identity=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as connection:
+                connection.execute('DELETE FROM blobs')
+                connection.execute('INSERT INTO blobs VALUES (?,?)',(identity,raw))
+                connection.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':identity}),))
+            before=store.read_bytes()
+            legacy=cursor.to_canonical(store)
+            if b'\xff' in raw: assert '\ufffd' in json.dumps(legacy,ensure_ascii=False)
+            rejected(lambda:cursor.to_canonical(store,strict=True))
+            assert store.read_bytes()==before
 
 
 def test_title_index_strictness_is_opt_in_and_preserves_incomplete_tail():
@@ -94,22 +94,10 @@ def test_title_index_strictness_is_opt_in_and_preserves_incomplete_tail():
         with patch.object(codex,'_SESSION_INDEX',index):
             for content in [b'null\n',b'{bad}\n',b'{"bad":"\xff"}']:
                 index.write_bytes(content);codex.to_canonical(path)
-                rejected(lambda:codex.to_canonical(path,strict_utf8=True,strict_json=True))
+                rejected(lambda:codex.to_canonical(path,strict=True))
             index.write_text(json.dumps({'id':sid,'thread_name':'native title'})+'\n{"unfinished":')
-            assert codex.to_canonical(path,strict_utf8=True,strict_json=True)[1]['title']=='native title'
+            assert codex.to_canonical(path,strict=True)[1]['title']=='native title'
 
-
-def test_title_index_utf8_and_json_flags_are_independent():
-    with tempfile.TemporaryDirectory() as td:
-        home=Path(td);path=sources(home)[0][1];index=home/'session_index.jsonl'
-        with patch.object(codex,'_SESSION_INDEX',index):
-            for body in [b'{bad}\n',b'null\n']:
-                index.write_bytes(body)
-                codex.to_canonical(path,strict_utf8=True)
-                rejected(lambda:codex.to_canonical(path,strict_json=True))
-            index.write_bytes(b'{"thread_name":"invalid\xfftext"}\n')
-            codex.to_canonical(path,strict_json=True)
-            rejected(lambda:codex.to_canonical(path,strict_utf8=True))
 
 
 def test_saved_observations_are_strict_only_when_requested_and_never_written():
@@ -179,9 +167,9 @@ def test_strict_cursor_tree_rejects_missing_references_and_cycles_but_allows_sha
             before=store.read_bytes()
             expected=cursor.to_canonical(store)
             if damage=="shared":
-                assert cursor.to_canonical(store,strict_json=True)==expected
+                assert cursor.to_canonical(store,strict=True)==expected
             else:
-                rejected(lambda:cursor.to_canonical(store,strict_json=True))
+                rejected(lambda:cursor.to_canonical(store,strict=True))
             assert store.read_bytes()==before
 
 
@@ -193,7 +181,7 @@ def test_legacy_cwd_probe_tolerates_later_decode_damage():
         path.write_bytes(path.read_bytes()+b'{"bad":"\xff"}\n')
         assert codex.session_cwd(path)==expected
         rejected(lambda:codex.session_metadata(path))
-        rejected(lambda:codex.to_canonical(path,strict_utf8=True))
+        rejected(lambda:codex.to_canonical(path,strict=True))
 
 
 def test_strict_cursor_tree_validates_complete_protobuf_nodes():
@@ -205,24 +193,14 @@ def test_strict_cursor_tree_validates_complete_protobuf_nodes():
             with sqlite3.connect(store) as connection:
                 root=json.loads(connection.execute("SELECT value FROM meta").fetchone()[0])["latestRootBlobId"]
                 data=connection.execute("SELECT data FROM blobs WHERE id=?",(root,)).fetchone()[0]
-                connection.execute("UPDATE blobs SET data=? WHERE id=?",(data+tail,root))
+                updated=data+tail;identity=hashlib.sha256(updated).hexdigest()
+                connection.execute("UPDATE blobs SET id=?,data=? WHERE id=?",(identity,updated,root))
+                connection.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
             before=store.read_bytes()
-            cursor.to_canonical(store,strict_utf8=True)
-            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            cursor.to_canonical(store)
+            rejected(lambda:cursor.to_canonical(store,strict=True))
             assert store.read_bytes()==before
 
-
-def test_cursor_json_only_mode_does_not_enable_utf8_strictness():
-    with tempfile.TemporaryDirectory() as td:
-        path=sources(Path(td))[1][1];original=path.read_bytes();expected=cursor.to_canonical(path)
-        row=b'{"role":"assistant","message":{"content":"invalid\xfftext"}}'
-        for ending in (b"\n",b""):
-            path.write_bytes(original+row+ending)
-            result=cursor.to_canonical(path,strict_json=True,strict_utf8=False)
-            assert "invalid\ufffdtext" in json.dumps(result,ensure_ascii=False)
-            rejected(lambda:cursor.to_canonical(path,strict_json=True,strict_utf8=True))
-        # Original capture still defers an unterminated undecodable byte tail.
-        assert cursor.to_canonical(path)==expected
 
 
 def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
@@ -235,12 +213,13 @@ def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
             with sqlite3.connect(store) as connection:
-                identity=next(key for key,value in connection.execute("SELECT id,data FROM blobs")
-                              if isinstance(value,bytes) and b'"role": "assistant"' in value)
-                connection.execute("UPDATE blobs SET data=? WHERE id=?",(json.dumps(message).encode(),identity))
+                raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
+                connection.execute("DELETE FROM blobs")
+                connection.execute("INSERT INTO blobs VALUES (?,?)",(identity,raw))
+                connection.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
             before=store.read_bytes()
             cursor.to_canonical(store)
-            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            rejected(lambda:cursor.to_canonical(store,strict=True))
             assert store.read_bytes()==before
 
 
@@ -256,7 +235,7 @@ def test_strict_cursor_hashes_reject_structurally_valid_modified_blobs():
                 connection.execute("UPDATE blobs SET data=? WHERE id=?",(changed,identity))
             before=store.read_bytes()
             cursor.to_canonical(store)
-            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            rejected(lambda:cursor.to_canonical(store,strict=True))
             assert store.read_bytes()==before
 
 
@@ -273,13 +252,13 @@ def test_strict_json_rejects_nonstandard_numbers_on_all_opted_in_loaders():
                 for ending in ["\n", ""]:
                     path.write_bytes(original+raw.encode()+ending.encode())
                     reader.to_canonical(path)
-                    rejected(lambda:reader.to_canonical(path,strict_json=True))
+                    rejected(lambda:reader.to_canonical(path,strict=True))
             index=home/"session_index.jsonl"
             rollout=fixtures._write_jsonl(home/"rollout-index.jsonl",copy.deepcopy(fixtures.CODEX_SYNTH))
             for ending in ["\n", ""]:
                 index.write_text('{"id":"synthetic","extra":'+constant+'}'+ending)
                 with patch.object(codex,"_SESSION_INDEX",index):
-                    rejected(lambda:codex.to_canonical(rollout,strict_json=True))
+                    rejected(lambda:codex.to_canonical(rollout,strict=True))
             with patch.object(cursor_flush,"STATE_DIR",home/"state"):
                 cursor_flush.STATE_DIR.mkdir(exist_ok=True)
                 saved=cursor_flush._state_path(SID)
@@ -294,19 +273,19 @@ def test_strict_json_rejects_nonstandard_numbers_on_all_opted_in_loaders():
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
                 sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
             cursor.to_canonical(store)
-            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            rejected(lambda:cursor.to_canonical(store,strict=True))
             # Validate both native metadata locations, independent of leaf content.
             clean=b'{"role":"assistant","content":"synthetic output"}'
             key=hashlib.sha256(clean).hexdigest()
             with sqlite3.connect(store) as sql:
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,clean))
                 sql.execute("UPDATE meta SET value=?",('{"latestRootBlobId":"'+key+'","extra":'+constant+'}',))
-            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            rejected(lambda:cursor.to_canonical(store,strict=True))
             with sqlite3.connect(store) as sql:
                 sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
             meta=store.parent/"meta.json";original=meta.read_text()
             meta.write_text(original.rstrip()[:-1]+',"extra":'+constant+'}')
-            rejected(lambda:cursor.to_canonical(store,strict_json=True))
+            rejected(lambda:cursor.to_canonical(store,strict=True))
 
 
 def test_strict_cursor_content_blocks_match_the_canonicalizer():
@@ -321,6 +300,12 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
                {"type":"tool_use","id":"two","name":"Read","input":{}},
                {"type":"tool-call","id":"three","toolName":"Read","args":{}},
                {"type":"tool_use","toolCallId":"four","name":"Read","input":{}}]
+    for kind in ("tool-call", "tool_use"):
+        for names in ({}, {"toolName": ""}, {"name": ""}, {"toolName": None, "name": None}):
+            invalid.append({"type": kind, "toolCallId": "call", "args": {}, **names})
+        for names in ({"toolName": "Read"}, {"name": "Read"},
+                      {"toolName": "", "name": "Read"}, {"toolName": "Read", "name": ""}):
+            supported.append({"type": kind, "toolCallId": "call", "args": {}, **names})
     for block in invalid+supported:
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
@@ -333,29 +318,13 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
             transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"assistant","message":{k:v for k,v in message.items() if k!="role"}}])
             for source in [store,transcript]:
                 before=source.read_bytes()
-                if block in invalid: rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                if block in invalid: rejected(lambda:cursor.to_canonical(source,strict=True))
                 else:
-                    actual=cursor.to_canonical(source,strict_json=True)
+                    actual=cursor.to_canonical(source,strict=True)
                     assert actual==cursor.to_canonical(source)
                     assert any(row.get("message",{}).get("usage",{}).get("input_tokens")==3 for row in actual[0])
                 assert source.read_bytes()==before
 
-
-def test_cursor_store_metadata_utf8_and_json_modes_are_independent():
-    with tempfile.TemporaryDirectory() as td:
-        store=fixtures._make_cursor_store(Path(td)/"chats")
-        path=store.parent/"meta.json";meta=json.loads(path.read_text());meta["cwd"]="invalidXtext"
-        path.write_bytes(json.dumps(meta).encode().replace(b"invalidXtext",b"invalid\xfftext"))
-        before=path.read_bytes()
-        actual=cursor.to_canonical(store,strict_json=True,strict_utf8=False)
-        assert "invalid\ufffdtext" in json.dumps(actual,ensure_ascii=False)
-        rejected(lambda:cursor.to_canonical(store,strict_json=True,strict_utf8=True))
-        rejected(lambda:cursor.to_canonical(store,strict_utf8=True))
-        assert cursor._read_meta_json(store.parent) is None, "legacy metadata handling stays tolerant"
-        assert path.read_bytes()==before
-        path.write_text("{bad}")
-        assert cursor._read_meta_json(store.parent,strict_utf8=True) is None
-        rejected(lambda:cursor._read_meta_json(store.parent,strict_json=True))
 
 
 def test_strict_cursor_user_blocks_preserve_text_or_reject_unsupported_content():
@@ -373,8 +342,8 @@ def test_strict_cursor_user_blocks_preserve_text_or_reject_unsupported_content()
             transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"user","message":{"content":[block]}}])
             for source in [store,transcript]:
                 before=source.read_bytes();legacy=cursor.to_canonical(source)
-                if block in invalid:rejected(lambda:cursor.to_canonical(source,strict_json=True))
-                else:assert cursor.to_canonical(source,strict_json=True)==legacy
+                if block in invalid:rejected(lambda:cursor.to_canonical(source,strict=True))
+                else:assert cursor.to_canonical(source,strict=True)==legacy
                 assert source.read_bytes()==before
 
 
@@ -386,11 +355,11 @@ def test_jsonl_unicode_separators_remain_inside_codex_and_claude_records():
                 record={"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}
                 path=sources(home)[0][1];original=path.read_bytes();path.write_bytes(original+json.dumps(record,ensure_ascii=False).encode()+ending.encode())
                 for strict in [False,True]:
-                    assert codex.load_rollout(path,strict_json=strict,strict_utf8=strict)[-1]==record
-                    assert text in json.dumps(codex.to_canonical(path,strict_json=strict,strict_utf8=strict),ensure_ascii=False)
+                    assert codex.load_rollout(path,strict=strict)[-1]==record
+                    assert text in json.dumps(codex.to_canonical(path,strict=strict),ensure_ascii=False)
                 index=home/'session_index.jsonl';index.write_bytes(json.dumps({'id':SID,'thread_name':text},ensure_ascii=False).encode()+ending.encode())
                 with patch.object(codex,'_SESSION_INDEX',index):
-                    for strict in [False,True]:assert codex._sidecar_thread_name(SID,strict_json=strict,strict_utf8=strict)=='before'
+                    for strict in [False,True]:assert codex._sidecar_thread_name(SID,strict=strict)=='before'
                 native={'type':'user','cwd':'/synthetic/'+text,'message':{'role':'user','content':text}}
                 path=home/'claude.jsonl';path.write_bytes(json.dumps(native,ensure_ascii=False).encode()+ending.encode())
                 assert claude.load(path)==[native]
@@ -399,7 +368,7 @@ def test_jsonl_unicode_separators_remain_inside_codex_and_claude_records():
                 malformed=home/'invalid.jsonl'
                 for suffix in ['\v','\f',separator]:
                     malformed.write_bytes(json.dumps(record).encode()+suffix.encode()+b'\n')
-                    rejected(lambda:codex.load_rollout(malformed,strict_json=True))
+                    rejected(lambda:codex.load_rollout(malformed,strict=True))
 
 
 def test_strict_cursor_assistant_text_and_reasoning_require_string_values():
@@ -414,7 +383,7 @@ def test_strict_cursor_assistant_text_and_reasoning_require_string_values():
                     meta=json.loads(sql.execute('SELECT value FROM meta').fetchone()[0]);meta['latestRootBlobId']=key
                     sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw));sql.execute('UPDATE meta SET value=?',(json.dumps(meta),))
                 transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[{'role':'assistant','message':{'content':[block]}}])
-                for source in [store,transcript]:rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                for source in [store,transcript]:rejected(lambda:cursor.to_canonical(source,strict=True))
 
 
 def test_bounded_codex_index_keeps_cr_and_crlf_records_after_partial_prefix():
@@ -425,7 +394,7 @@ def test_bounded_codex_index_keeps_cr_and_crlf_records_after_partial_prefix():
             path.write_bytes(b"x"*200+newline+wanted)
             with patch.object(codex,"_SESSION_INDEX",path),patch.object(codex,"_INDEX_TAIL_BYTES",len(wanted)+20):
                 for strict in (False,True):
-                    assert codex._sidecar_thread_name(SID,strict_json=strict,strict_utf8=strict)=="synthetic title"
+                    assert codex._sidecar_thread_name(SID,strict=strict)=="synthetic title"
 
 
 def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
@@ -443,8 +412,8 @@ def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
             transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"tool","message":{"content":[block]}}])
             for source in [store,transcript]:
                 before=source.read_bytes()
-                if fallback in invalid:rejected(lambda:cursor.to_canonical(source,strict_json=True))
-                else:assert cursor.to_canonical(source,strict_json=True)==cursor.to_canonical(source)
+                if fallback in invalid:rejected(lambda:cursor.to_canonical(source,strict=True))
+                else:assert cursor.to_canonical(source,strict=True)==cursor.to_canonical(source)
                 assert source.read_bytes()==before
 
 
@@ -460,9 +429,9 @@ def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
             transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"tool","message":{"content":[block]}}])
             for source in [store,transcript]:
                 before=source.read_bytes();legacy=cursor.to_canonical(source)
-                if identity.get("toolCallId")!="call":rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                if identity.get("toolCallId")!="call":rejected(lambda:cursor.to_canonical(source,strict=True))
                 else:
-                    records,metadata=cursor.to_canonical(source,strict_json=True)
+                    records,metadata=cursor.to_canonical(source,strict=True)
                     assert (records,metadata)==legacy
                     results=[part for row in records for part in row.get("message",{}).get("content",[])
                              if isinstance(part,dict) and part.get("type")=="tool_result"]
@@ -470,20 +439,58 @@ def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
                 assert source.read_bytes()==before
 
 
-def test_sqlite_metadata_bytes_honor_the_requested_utf8_policy():
-    with tempfile.TemporaryDirectory() as td:
-        store=fixtures._make_cursor_store(Path(td)/"chats")
-        with sqlite3.connect(store) as sql:
-            meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0])
-            meta["extra"]="invalidXtext"
-            raw=json.dumps(meta).encode().replace(b"invalidXtext",b"invalid\xfftext")
-            sql.execute("UPDATE meta SET value=?",(raw,))
-        before=store.read_bytes()
-        records,_=cursor.to_canonical(store,strict_json=True,strict_utf8=False)
-        assert records
-        for json_mode in [False,True]:
-            rejected(lambda:cursor.to_canonical(store,strict_json=json_mode,strict_utf8=True))
-        assert store.read_bytes()==before
+
+def test_optional_bad_usage_remains_unknown_without_rejecting_the_session():
+    for key in ("usage", "tokenCount"):
+        for usage in (None, {}, {"inputTokens": "not-a-number"}, {"inputTokens": True},
+                      {"inputTokens": -1}, {"inputTokens": 3}):
+            with tempfile.TemporaryDirectory() as td:
+                home=Path(td);store=fixtures._make_cursor_store(home/"chats")
+                message={"role":"assistant","content":"readable response",key:usage}
+                raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
+                with sqlite3.connect(store) as sql:
+                    sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(identity,raw))
+                    sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
+                transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[
+                    {"role":"assistant","message":{k:v for k,v in message.items() if k!="role"}}])
+                for source in (store,transcript):
+                    before=source.read_bytes();records,_=cursor.to_canonical(source,strict=True)
+                    assistant=next(row["message"] for row in records if row["type"]=="assistant")
+                    assert assistant["content"][0]["text"]=="readable response"
+                    if usage=={"inputTokens":3}:assert assistant["usage"]["input_tokens"]==3
+                    else:assert "usage" not in assistant, "unusable usage must not become measured zero"
+                    assert source.read_bytes()==before
+
+
+def test_checked_store_metadata_rejects_values_that_would_fabricate_path_or_time():
+    for field,value in [("cwd",17),("cwd",False),("createdAtMs",True),("createdAtMs","123")]:
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            path=store.parent/"meta.json";meta=json.loads(path.read_text());meta[field]=value
+            path.write_text(json.dumps(meta));before=path.read_bytes()
+            rejected(lambda:cursor.to_canonical(store,strict=True))
+            rejected(lambda:cursor.session_metadata(store))
+            assert path.read_bytes()==before
+            # Missing optional facts remain valid unknowns, not manufactured values.
+            meta[field]=None;path.write_text(json.dumps(meta))
+            cursor.to_canonical(store,strict=True)
+            cursor.session_metadata(store)
+
+
+def test_checked_metadata_decoding_rejects_invalid_utf8_at_both_store_locations():
+    for location in ("meta.json", "sqlite"):
+        with tempfile.TemporaryDirectory() as td:
+            store=fixtures._make_cursor_store(Path(td)/"chats")
+            if location=="meta.json":
+                path=store.parent/"meta.json";raw=path.read_bytes()
+                path.write_bytes(raw.rstrip()[:-1]+b',"extra":"invalid\xfftext"}')
+            else:
+                with sqlite3.connect(store) as sql:
+                    raw=sql.execute("SELECT value FROM meta").fetchone()[0].encode()
+                    sql.execute("UPDATE meta SET value=?",(raw.rstrip()[:-1]+b',"extra":"invalid\xfftext"}',))
+            originals={path:path.read_bytes() for path in (store,store.parent/"meta.json")}
+            rejected(lambda:cursor.to_canonical(store,strict=True))
+            assert all(path.read_bytes()==raw for path,raw in originals.items())
 
 
 if __name__=='__main__':
