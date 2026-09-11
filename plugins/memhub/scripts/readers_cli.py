@@ -94,8 +94,9 @@ def discovered_source(path: Path, discovered) -> bool:
     return False
 
 
-def header_for(reader, path: Path, mtime: float) -> dict:
-    native = reader.session_metadata(path)
+def header_for(reader, path: Path, mtime: float, native=None) -> dict:
+    if native is None:
+        native = reader.session_metadata(path)
     sid = native_text(native.get("session_id"), required=True)
     start = native_text(native.get("started_at"))
     if start is not None:
@@ -302,6 +303,7 @@ def main(argv=None) -> int:
     elif args.host != "cursor":
         cursor_counts = None
     prepared = []
+    counts = Counter()
     for session in sessions:
         path = Path(session["path"])
         try:
@@ -316,14 +318,17 @@ def main(argv=None) -> int:
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
                 raise ValueError("invalid mtime")
-            header = header_for(reader, path, mtime)
+            native = reader.session_metadata(path)
+            sid = native_text(native.get("session_id"), required=True)
+            # A readable identity still collides when another header field is bad.
+            counts[f"{reader.HOST}-{sid}"] += 1
+            header = header_for(reader, path, mtime, native)
             prepared.append((path, revision, header))
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
                 OverflowError, RecursionError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
-    counts = Counter(header["conversation_id"] for _, _, header in prepared)
     if cursor_counts is not None:
         counts |= cursor_counts
     if args.session == "latest":

@@ -443,6 +443,31 @@ def test_duplicate_native_identities_are_excluded_before_any_session_is_emitted(
             assert result.returncode==0 and len(rows)==1,result.stderr
 
 
+def test_codex_malformed_header_still_counts_toward_duplicate_identity():
+    for field,value in [('timestamp','not-a-date'),('cwd',17),('originator',False),('git',{'branch':17})]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);original=rollout(home)
+            records=[json.loads(line) for line in original.read_text().splitlines()]
+            native_id=records[0]['payload']['id']
+            records[0]['payload'][field]=value
+            duplicate=write_jsonl(original.with_name('rollout-malformed-copy.jsonl'),records)
+            healthy_records=[json.loads(line) for line in original.read_text().splitlines()]
+            healthy_records[0]['payload']['id']='independent-native-id'
+            healthy=write_jsonl(original.with_name('rollout-healthy-peer.jsonl'),healthy_records)
+            os.utime(original,(MTIME+100,MTIME+100))
+            before={p:p.read_bytes() for p in (original,duplicate,healthy)}
+            for selection in ([],['--session',native_id],['--session','latest']):
+                for mode in ([],['--metadata-only']):
+                    result,rows=run(home,'codex',*selection,*mode)
+                    headers=[row for row in rows if row.get('type')=='session']
+                    assert result.returncode==2 and 'discovery_incomplete' in result.stderr,result.stderr
+                    assert all(row['native_session_id']!=native_id for row in headers),headers
+                    assert len(headers)==(0 if selection else 1)
+            result,rows=run(home,'codex','--session',str(original),'--metadata-only')
+            assert result.returncode==0 and rows[0]['native_session_id']==native_id,result.stderr
+            assert all(p.read_bytes()==raw for p,raw in before.items())
+
+
 def test_complete_malformed_native_json_fails_while_unfinished_codex_tail_waits():
     with tempfile.TemporaryDirectory() as td:
         home=Path(td);path=rollout(home);original=path.read_bytes()
