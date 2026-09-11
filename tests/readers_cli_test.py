@@ -800,6 +800,35 @@ def test_metadata_only_rejects_nonfinite_cursor_metadata():
             assert result.returncode == 0 and len(rows) == 1 and rows[0]["started_at"]
 
 
+def test_cursor_creation_timestamp_requires_a_number_or_unknown():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        store = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+        metadata = store.parent / "meta.json"
+        original = json.loads(metadata.read_text())
+        for value in (True, False, "123", [], {}):
+            metadata.write_text(json.dumps({**original, "createdAtMs": value}))
+            before = {p.name: p.read_bytes() for p in store.parent.iterdir() if p.is_file()}
+            for mode in ([], ["--metadata-only"]):
+                result, rows = run(home, "cursor", "--session", str(store), *mode)
+                assert result.returncode == 2 and rows == [], (value, result.stdout, result.stderr)
+                assert "session_unreadable" in result.stderr and "Traceback" not in result.stderr
+            assert before == {p.name: p.read_bytes() for p in store.parent.iterdir() if p.is_file()}
+        for value in (None, 0, original["createdAtMs"], float(original["createdAtMs"])):
+            metadata.write_text(json.dumps({**original, "createdAtMs": value}))
+            for mode in ([], ["--metadata-only"]):
+                result, rows = run(home, "cursor", "--session", str(store), *mode)
+                assert result.returncode == 0, result.stderr
+                header = next(row for row in rows if row.get("type") == "session")
+                assert (header["started_at"] is None) == (value is None), header
+        del original["createdAtMs"]
+        metadata.write_text(json.dumps(original))
+        for mode in ([], ["--metadata-only"]):
+            result, rows = run(home, "cursor", "--session", str(store), *mode)
+            assert result.returncode == 0, result.stderr
+            assert next(row for row in rows if row.get("type") == "session")["started_at"] is None
+
+
 def test_latest_cursor_reports_unreadable_ranking_metadata():
     for data in [b"{broken", b"null", b"[]", b'{"updatedAtMs":"later"}', b"{}",
                  b'{"updatedAtMs":NaN}', b'{"updatedAtMs":1e999}',
