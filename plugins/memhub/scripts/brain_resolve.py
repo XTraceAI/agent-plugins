@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Find the repo's agent brain on the server, once, and cache it.
 
-``room_map`` routes every writer to one brain — but only once its cache holds an
-id, and until now the only things that filled it were ``/memhub:onboard`` and
-``/memhub:spec init``. So a user who never ran either had every automatic
-capture land in personal memory even when their team's repo brain existed.
+``room_map`` routes every ARTIFACT writer to one brain — but only once its cache
+holds an id, and the only things that fill it deliberately are
+``/memhub:onboard`` and ``/memhub:spec init``. So an artifact saved in a repo
+whose room was never cached would land in personal memory even when the team's
+repo brain existed.
 
-On a cache miss the capture path asks the server once, matches the repo's
-canonical room name, and writes the id back. Every later flush is a local
-lookup again.
+On a cache miss the artifact writers (``save_artifact.py``,
+``md_capture_flush.py``) ask the server once, match the repo's canonical room
+name, and write the id back. Every later write is a local lookup again. Session
+capture never routes to a brain and does not call this.
 
 **Resolve, never create.** A brain is team-visible — teammates see it appear and
-it shapes where memory lands. A background hook firing after a turn is the wrong
-place to make that decision on someone's behalf, so an absent brain stays absent
-and capture continues to personal memory exactly as before. Creating one remains
-an explicit ``/memhub:onboard``.
+it shapes where memory lands. A background hook is the wrong place to make that
+decision on someone's behalf, so an absent brain stays absent and the write
+continues to personal memory exactly as before. Creating one remains an explicit
+``/memhub:onboard``.
 
 **Exact name match only.** The room name is ``Repo: <org>/<name>`` (see
 ``room_map.room_name``), derived from the git remote. Fuzzy matching here would

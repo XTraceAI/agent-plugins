@@ -12,6 +12,7 @@ Mirrors the SessionEnd hook's contract exactly:
   the same session are INCREMENTAL: the server-side watermark admits only
   records it hasn't seen, and the session gist folds forward instead of
   duplicating.
+- no brain: a session always lands in personal memory, as capture sends it.
 
 Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
 $MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
@@ -40,7 +41,7 @@ from mcp.client.streamable_http import streamablehttp_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 import pr_provenance  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly, read_room  # noqa: E402
+from room_map import git_env, git_readonly  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -135,22 +136,18 @@ def resolve_session_file(session: str) -> tuple[Path | None, str]:
     return candidates[0], ""
 
 
-async def _gist_hash(
-    session, agent_brain_id: str | None, org_id: str | None = None,
-) -> str | None:
+async def _gist_hash(session, org_id: str | None = None) -> str | None:
     """Content hash of the session gist (episode starting '## GOAL'), or None.
 
-    ``org_id`` must match the one the import itself uses. A brain is resolved
-    inside ONE org, so searching without it falls back to the caller's default
-    org and finds nothing for a brain that lives elsewhere — which does not
-    read as an error, it reads as "the gist has not appeared yet", and every
-    inter-slice wait then burns its full timeout.
+    ``org_id`` must match the one the import itself uses. The import lands in
+    that org's personal memory, so searching without it falls back to the
+    caller's default org and finds nothing — which does not read as an error,
+    it reads as "the gist has not appeared yet", and every inter-slice wait
+    then burns its full timeout.
     """
     import hashlib
     args = {"query": "GOAL INTENT OUTCOME ROUTE RESUME STATE next step",
             "memory_type": "episodes", "top_k": 5}
-    if agent_brain_id:
-        args["agent_brain_id"] = agent_brain_id
     if org_id:
         args["org_id"] = org_id
     try:
@@ -175,9 +172,7 @@ async def _gist_hash(
     return None
 
 
-async def _wait_gist_change(
-    session, agent_brain_id, prev_hash, timeout=1800, org_id=None,
-):
+async def _wait_gist_change(session, prev_hash, timeout=1800, org_id=None):
     """Block until the gist appears (prev None) or its content changes
     (fold-forward happened) — the end-of-slice extraction signal. On timeout,
     warn and proceed (the next slice still imports safely; worst case the
@@ -192,7 +187,7 @@ async def _wait_gist_change(
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline:
         await asyncio.sleep(20)
-        h = await _gist_hash(session, agent_brain_id, org_id)
+        h = await _gist_hash(session, org_id)
         if h is not None and h != prev_hash:
             print("  slice extraction complete (gist updated)")
             return h
@@ -272,7 +267,7 @@ async def main() -> int:
                     help="override the conversation id. Default (and what you "
                          "almost always want): the session id, which is what "
                          "per-turn capture uses — so the session stays ONE "
-                         "conversation per room and re-imports are incremental. "
+                         "conversation and re-imports are incremental. "
                          "An id that is not the session's SPLITS that session "
                          "across two conversations; only pass one for a "
                          "transcript that has no session id of its own (e.g. a "
@@ -281,23 +276,17 @@ async def main() -> int:
                     default="claude",
                     help="originating host recorded on the imported session")
     ap.add_argument("--title", default=None)
-    ap.add_argument("--agent-brain-id", default=None,
-                    help="route the extracted facts/episodes into an agent brain "
-                         "(isolated, shareable) instead of raw workspace memory. "
-                         "Default: the repo's cached room "
-                         "(~/.config/memhub-plugin/rooms.json), if any")
-    ap.add_argument("--no-room", action="store_true",
-                    help="ignore the repo's cached room and import into personal "
-                         "memory")
+    # No brain flag: a session is never imported into a brain. Capture sends
+    # every session to personal memory, and an import that routed one would
+    # reopen the room-copy/personal-copy split capture no longer makes.
     ap.add_argument("--namespace", default=None,
                     help="Working-context name for captured directives (the "
                          "repo). Default: resolved from the transcript's cwd "
                          "via the git remote basename; pass '' to disable.")
     ap.add_argument("--org-id", default=None,
-                    help="Organization to import into, for accounts in more "
-                         "than one. Default: the connection's default org — "
-                         "which is why an --agent-brain-id created in ANOTHER "
-                         "org fails with 'Agent brain not found'.")
+                    help="Organization whose personal memory receives the "
+                         "import, for accounts in more than one. Default: the "
+                         "connection's default org.")
     ap.add_argument("--url", default=None)
     ap.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES,
                     help="transcripts larger than this are sent as sequential "
@@ -387,22 +376,6 @@ async def main() -> int:
 
     url, headers, auth = resolve_url_and_auth(args.url)
 
-    # An explicit --agent-brain-id always wins; otherwise fall back to the repo's
-    # cached room so a plain `--session X` import lands in team memory instead of
-    # personal memory. Keyed by the resolved endpoint's backend, and derived from
-    # the TRANSCRIPT's cwd rather than the caller's — the script is often run
-    # from a different directory than the session it is importing.
-    room = None
-    if not args.agent_brain_id and not args.no_room:
-        # Only when the transcript says where it ran. read_room(None) would fall
-        # back to THIS process's cwd — and this script is routinely run from a
-        # different repo than the session it imports, so that would file the
-        # session under an unrelated room. Unknown origin → stays personal.
-        rec_cwd = _cwd_from_records(records)
-        room = read_room(rec_cwd, env_for_url(url)) if rec_cwd else None
-        if room:
-            args.agent_brain_id = room["brain_id"]
-
     slices = make_slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
     print(f"session file    : {f}")
@@ -415,9 +388,7 @@ async def main() -> int:
         src = "explicit" if args.title else "from transcript"
         print(f'title           : "{title}"   ({src})')
     print(f"endpoint        : {url}")
-    if args.agent_brain_id:
-        src = f' (repo room "{room.get("name", "?")}")' if room else ""
-        print(f"agent brain     : {args.agent_brain_id}{src}")
+    print("destination     : personal memory")
     if namespace:
         print(f"namespace       : {namespace}")
     if provenance:
@@ -434,21 +405,14 @@ async def main() -> int:
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
-            prev_gist_hash = await _gist_hash(
-                s, args.agent_brain_id, args.org_id)
+            prev_gist_hash = await _gist_hash(s, args.org_id)
             for i, sl in enumerate(slices, 1):
                 call_args = import_call_args(
                     sl, conv_id, args.source_platform, provenance)
                 if args.org_id:
-                    # Brains are looked up inside ONE org. Without this, an
-                    # --agent-brain-id belonging to a non-default org fails
-                    # with "Agent brain not found" — which reads like a stale
-                    # or deleted id rather than a wrong-org lookup.
                     call_args["org_id"] = args.org_id
                 if title:
                     call_args["title"] = title
-                if args.agent_brain_id:
-                    call_args["agent_brain_id"] = args.agent_brain_id
                 if namespace:
                     # Older servers ignore unknown arguments; newer ones
                     # stamp the directive scope from it. Safe either way.
@@ -475,7 +439,7 @@ async def main() -> int:
                     print(f"waiting for slice {i} extraction "
                           "(gist appear/fold-forward) before next slice ...")
                     prev_gist_hash = await _wait_gist_change(
-                        s, args.agent_brain_id, prev_gist_hash,
+                        s, prev_gist_hash,
                         timeout=args.slice_timeout, org_id=args.org_id,
                     )
     print("-" * 56)

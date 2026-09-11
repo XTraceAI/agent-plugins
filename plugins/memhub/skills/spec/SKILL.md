@@ -242,23 +242,27 @@ whole repo.
    latest rationale plus any recent related activity, and stop.
 2. With a topic, pick the spec (as in revise), then `search_memory` the room
    with `memory_type: "all"`, a raised `top_k` (~30), and the spec title +
-   topic as the query. The room is repo-wide — facts and episodes from OTHER
-   specs' sessions will surface; filter by relevance and drop them rather
-   than padding the report.
+   topic as the query — then run the SAME query once more WITHOUT
+   `agent_brain_id` and merge. The room holds the repo's artifacts (reviews,
+   ADRs, handoffs); decisions from implementation sessions live in your own
+   personal memory, because sessions are always captured there. Both span
+   more than this spec — filter by relevance and drop other specs' results
+   rather than padding the report.
 3. Report, citing memory types: current version + how many revisions and the
-   latest rationale; decisions recorded (facts/episodes from imported
+   latest rationale; decisions recorded (episodes/directives from your own
    implementation sessions); related artifacts (reviews, ADRs, handoffs);
    open questions still in the spec. If nothing relevant exists beyond the
-   spec artifact itself, say so plainly — no implementation session touching
-   this spec has been imported yet.
+   spec artifact itself, say so plainly — no captured implementation session
+   touches this spec yet.
 
 Do NOT import implementation sessions. Per-turn capture already ships each one
-into this same room as it happens, under the session's own id, and the server
-has already extracted it — an import would re-upload the transcript to have the
-watermark discard it. If a session genuinely never landed (capture dormant, or
-it predates capture), tell the user to run `/memhub:import-session`; that is the
-one skill that backfills, and it imports under the session's own id so the
-session stays a single conversation.
+into its author's personal memory as it happens, under the session's own id,
+and the server has already extracted it — an import would re-upload the
+transcript to have the watermark discard it. Teammates cannot read another
+person's session memory, so a decision the team needs belongs in the spec
+revision's rationale. If a session genuinely never landed (capture dormant, or
+it predates capture), tell the user to run `/memhub:import-session`; it
+backfills into their personal memory under the session's own id.
 
 Plain-English output throughout; surface ids only where the user needs them
 (artifact id, agent brain id for scripts). On first ever script run the

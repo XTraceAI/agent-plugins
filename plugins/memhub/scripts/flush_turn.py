@@ -70,8 +70,6 @@ import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
-from room_map import env_for_url, forget_room  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 
@@ -357,10 +355,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Only user / assistant / attachment records carry ``cwd`` — the UI sidecar
     # types (mode, last-prompt, ai-title, …) never do. A delta made up solely of
     # sidecars therefore resolves no cwd, and without the remembered one this
-    # flush would route to personal memory AND key the conversation on the
-    # un-namespaced source_id — splitting one session across two conversations,
-    # half in the repo's room and half outside it. So the first flush that
-    # resolves a cwd remembers it for the rest of the session.
+    # flush would lose its namespace — its directives would extract unscoped
+    # and recall in every repo. So the first flush that resolves a cwd
+    # remembers it for the rest of the session.
     # Checked BEFORE resolving cwd, because resolving shells out to git and an
     # inert delta should cost nothing at all.
     # Slash-command bookkeeping never leaves the machine. Dropped from what is
@@ -429,28 +426,20 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # Raised rather than returned so the one handler in main() records the
         # breadcrumb, keeping every failure path reported the same way.
         raise _NoCredential("no usable credential (key, token or cached login)")
-    # Resolved AFTER the url — prod and staging hold different brain ids for the
-    # same repo. Only when the TRANSCRIPT said where it ran: a hook can fire
-    # from a different repo than the session's, and an unknown origin must
-    # degrade to personal memory rather than guess a room.
-    env = env_for_url(url)
 
     # No connection to open: the server is stateless, so a Session is just
     # the endpoint and the credential. Verified against the live server —
     # it negotiates no session id and does not require `initialize`, so this
     # is ONE round trip where the SDK did three.
-    # Per call, and deliberately less than the whole flush budget: this hook
-    # makes TWO calls on a cold cache — the room lookup and the import — so
-    # granting each the full timeout lets a stalled lookup consume the budget
-    # and the import, the only call that actually captures anything, never
-    # happens. Half guarantees the second call still gets a turn.
+    # Per call, and less than the whole flush budget, so a stalled import
+    # fails inside the transport with headroom left under main()'s deadline.
     session = mcp_http.Session(url, bearer, timeout=_flush_timeout_s() / 2)
-    # No `initialize` handshake: verified against the live server, a fresh
-    # process can call a tool directly and get a result. Dropping it removes two
-    # of the three round trips this hook used to make per turn.
-    # Cached hit is a dict lookup; a miss asks the server once and
-    # caches the answer, so this is not a per-turn round-trip.
-    room = await resolve_repo_brain(session, cwd, env) if cwd else None
+    # Never an ``agent_brain_id``: a session is ALWAYS captured into personal
+    # memory. The server keys a routed conversation ``cb:<brain>:<sid>`` and an
+    # unrouted one ``<sid>``, so a room decision that changed between flushes —
+    # a session that started outside its repo, a worktree deleted mid-session,
+    # a room lookup that succeeded late — split one session into two
+    # conversations. Not routing sessions at all makes that impossible.
     arguments = {
         "messages": sendable,
         "conversation_id": session_id,
@@ -458,18 +447,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # The whole point: durable on arrival, extracted in batches.
         "flush": "auto",
     }
-    if room:
-        arguments["agent_brain_id"] = room["brain_id"]
-        # The org that OWNS the room, when it is not the caller's
-        # default. A brain resolves inside exactly ONE org, and the
-        # default follows whichever org was last selected in the MemHub
-        # app — so it changes under a running session. Sending the id
-        # without its org is how every capture into such a room failed
-        # with "Agent brain not found": silently, because this hook is
-        # async and its output goes nowhere, and indistinguishably from
-        # a deleted brain.
-        if room.get("org_id"):
-            arguments["org_id"] = room["org_id"]
     if namespace:
         arguments["namespace"] = namespace
     if title:
@@ -491,14 +468,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # The cursor is unmoved in every branch, so all of them retry next turn.
     async def _import(args: dict):
         """Send one import, classifying transport failures. None = already
-        reported, and the caller must return without touching the cursor.
-
-        A closure rather than the straight-line ladder it replaces because this
-        hook can now send TWICE — once routed to the repo's room, and again
-        unrouted when the server says that room does not exist. A 401 or a 429
-        must be classified identically on both, and keeping one copy is what
-        guarantees that; a second inline ladder is exactly how the two drift.
-        """
+        reported, and the caller must return without touching the cursor."""
         try:
             return await session.call_tool("import_conversation", arguments=args)
         except mcp_http.McpRateLimited as e:
@@ -545,28 +515,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # exception. Without this the cursor would advance past records the
     # server rejected, losing them permanently.
     texts = _texts(res)
-
-    # A cached room the backend does not have must not cost the turn. Routing
-    # already degrades to long-term memory when NO room is cached — but that
-    # check reads the CACHE, not the server, so a present-but-wrong id sailed
-    # past it and the flush simply died. That is how a `production` entry
-    # holding a staging brain id took out per-turn capture and the SessionEnd
-    # backstop together, for days: every turn re-sent an id the server had
-    # already rejected, and `write_miss` refused to overwrite it, so nothing
-    # could ever correct the cache. Forget the id — so the next turn resolves
-    # honestly — and send again unrouted, which is where the no-room path
-    # would have put this turn anyway.
-    if getattr(res, "isError", False) and room and is_missing_brain(texts):
-        _log(f"room {room['brain_id'][:8]} does not exist on this backend — "
-             "dropping it from the cache and flushing to long-term memory")
-        forget_room(cwd, env)
-        room = None
-        arguments.pop("agent_brain_id", None)
-        arguments.pop("org_id", None)
-        res = await _import(arguments)
-        if res is None:
-            return
-        texts = _texts(res)
 
     if getattr(res, "isError", False):
         detail = (texts[0] if texts else "no detail")[:200]

@@ -136,8 +136,8 @@ off = _brief()
 check("says so when capture is switched off", "capture is OFF" in _ctx(off))
 os.environ.pop("MEMHUB_TURN_FLUSH")
 on = _brief()
-check("says sessions are captured when it is on",
-      "captured into it automatically" in _ctx(on))
+check("says sessions go to personal memory when it is on",
+      "captured into your personal memory" in _ctx(on))
 
 # ── the overview: injected, and clipped ────────────────────────────────────
 cache = brain_brief._cache_path("staging", BRAIN)

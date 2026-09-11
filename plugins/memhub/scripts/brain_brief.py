@@ -464,18 +464,18 @@ def cmd_brief(payload: dict) -> int:
     session_id = _session_id(payload)
 
     writes = (
-        "Per-turn capture is OFF (MEMHUB_TURN_FLUSH=0), so nothing is being "
-        "written there this session."
+        "Per-turn capture is OFF (MEMHUB_TURN_FLUSH=0), so this session is "
+        "captured into your personal memory only at commit/PR and session end."
         if _capture_is_off() else
-        "Sessions in this repo are captured into it automatically."
+        "Sessions are captured into your personal memory, not into this brain."
     )
     head = [
         f"MemHub: this repo's agent brain is **{name}** (`{brain_id}`, {env}).",
         writes,
-        "It is the DEFAULT target for memory in this repo — pass it as "
-        "`agent_brain_id` when you search, save an artifact, or record a "
-        "decision, so what you write is findable where the next session will "
-        "look. Another brain is still reachable by naming it explicitly.",
+        "It is the DEFAULT target for team artifacts in this repo — pass it as "
+        "`agent_brain_id` when you search or save an artifact, so what you "
+        "write is findable where the next session will look. Another brain is "
+        "still reachable by naming it explicitly.",
     ]
     cached = _read_json(_cache_path(env, brain_id))
     map_lines = _render_map(brain_id, str(cached.get("overview") or ""))

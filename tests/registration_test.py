@@ -79,11 +79,11 @@ def _check_every_failure_leaves_a_trace() -> None:
     # Walk the function's lines; every failing return must have a _breadcrumb
     # call somewhere in the handful of lines before it.
     #
-    # Matched on the `False` PREFIX, not the whole line: `_send` also hands the
-    # room back to its caller (`return False, room`), so pinning this to the
-    # bare `return False` would have quietly stopped matching anything the day
-    # that shape changed — and the check below, which exists to catch a scan
-    # that inspects nothing, is the only reason that was noticed.
+    # Matched on the `False` PREFIX, not the whole line: `_send` once returned
+    # a tuple (`return False, room`), and pinning this to one shape would
+    # quietly stop matching anything the day that shape changes — the check
+    # below, which exists to catch a scan that inspects nothing, is the only
+    # reason that was noticed.
     def _is_failure_exit(line: str) -> bool:
         stripped = line.strip()
         return stripped == "return False" or stripped.startswith("return False,")
