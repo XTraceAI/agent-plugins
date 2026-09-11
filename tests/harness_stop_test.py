@@ -166,6 +166,10 @@ def test_a_failure_and_its_fix_are_one_moment_taken_at_the_boundary():
         _post(repo, "arc", "uv pip install y", {"stdout": "ok", "exit_code": 0})
         _post(repo, "arc", "pytest tests/x.py", {"stdout": "1 passed", "exit_code": 0})
         _post(repo, "arc", "make x", {"stdout": "", "stderr": "boom", "exit_code": 1})
+        if os.name != "nt":
+            import stat  # noqa: PLC0415
+            mode = stat.S_IMODE(os.stat(rh.arcs_path("arc")).st_mode)
+            assert mode == 0o600, f"a failed command's text is private, got {oct(mode)}"
         # the session state the rulebook merges by delta is not where arcs live
         assert "arcs" not in json.dumps(rh.load_state(rh.state_path("arc")))
         tp = env.base / "s.jsonl"
@@ -471,13 +475,43 @@ def test_the_hooks_are_wired_behind_the_guard():
                 if "harness_stop.py" in handler["command"]:
                     wired[event] = handler
     assert set(wired) == {"Stop", "UserPromptSubmit"}, set(wired)
-    assert wired["Stop"].get("async") is True
+    # synchronous: the transcript size and the error arcs it takes ARE the boundary
+    assert not wired["Stop"].get("async") and wired["Stop"]["timeout"] <= 10
     assert wired["Stop"]["command"].rstrip("; fi").endswith('harness_stop.py" stop')
     assert wired["UserPromptSubmit"]["command"].rstrip("; fi").endswith('harness_stop.py" prompt')
     assert wired["UserPromptSubmit"]["timeout"] <= 5
     for h in wired.values():
         assert 'claude_hook_guard.py" ignore' in h["command"]
     print("PASS test_the_hooks_are_wired_behind_the_guard")
+
+
+def test_the_hook_commands_start_nothing_unless_the_flag_is_on():
+    if os.name == "nt":
+        print("SKIP test_the_hook_commands_start_nothing_unless_the_flag_is_on (POSIX hook command)")
+        return
+    doc = json.loads((ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
+    commands = [h["command"] for groups in doc["hooks"].values() for g in groups
+                for h in g["hooks"] if "harness_stop.py" in h["command"]]
+    assert len(commands) == 2
+    with tempfile.TemporaryDirectory() as td:
+        root, ran = Path(td) / "plugin", Path(td) / "ran"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "claude_hook_guard.py").write_text("import sys\nsys.stdin.read()\n")
+        (root / "scripts" / "harness_stop.py").write_text(
+            "import sys\nsys.stdin.read()\nopen(%r, 'a').write(sys.argv[1] + ' ')\n" % str(ran))
+        for value, runs in (("", False), ("0", False), ("off", False), ("no", False),
+                            ("1", True), ("on", True), ("TRUE", True), ("Yes", True)):
+            env = {k: v for k, v in os.environ.items() if k != "MEMHUB_HARNESS_EXTRACT"}
+            env.update(CLAUDE_PLUGIN_ROOT=str(root), MEMHUB_HARNESS_EXTRACT=value)
+            for command in commands:
+                proc = subprocess.run(["bash", "-c", command], input="{}", text=True,
+                                      capture_output=True, env=env, timeout=10)
+                assert proc.returncode == 0, proc.stderr
+            got = sorted(ran.read_text().split()) if ran.exists() else []
+            assert got == (["prompt", "stop"] if runs else []), (value, got)
+            if ran.exists():
+                ran.unlink()
+    print("PASS test_the_hook_commands_start_nothing_unless_the_flag_is_on")
 
 
 def test_the_sensor_never_sends_activate():

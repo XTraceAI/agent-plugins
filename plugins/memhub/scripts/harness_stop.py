@@ -182,7 +182,10 @@ def _is_subagent(payload: dict) -> bool:
 # --------------------------------------------------------------- stop lane
 def cmd_stop(payload: dict) -> int:
     """Millisecond budget: one small state read, one spawn, no transcript and
-    no network."""
+    no network. The hook is SYNCHRONOUS, so what it records is the turn's
+    boundary: Claude Code appends no queued prompt and runs no next-turn tool
+    hook until it returns. (The shell gate in claude-hooks.json keeps it free
+    with the flag off.)"""
     session = str(payload.get("session_id") or "").strip()
     transcript = str(payload.get("transcript_path") or "").strip()
     cwd = str(payload.get("cwd") or "").strip()
@@ -191,9 +194,10 @@ def cmd_stop(payload: dict) -> int:
     if payload.get("stop_hook_active") or _is_subagent(payload):
         return 0
     args = ["extract", "--session", session, "--transcript", transcript, "--cwd", cwd]
-    # The transcript's size NOW is the turn boundary. A queued prompt can be
-    # appended before the detached child opens the file, and the child must
-    # still classify the turn that stopped, not the one that just began.
+    # The transcript's size NOW is the turn boundary, taken inside the
+    # synchronous hook. A queued prompt can be appended before the detached
+    # child opens the file, and the child must still classify the turn that
+    # stopped, not the one that just began.
     try:
         args += ["--upto", str(os.path.getsize(transcript))]
     except OSError:

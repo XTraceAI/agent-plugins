@@ -3045,8 +3045,15 @@ def _update_arcs(session_id, change):
         if not isinstance(arcs, dict):
             arcs = {}
         out = change(arcs)
+        # Private (0600): a failed command's text can carry a credential, and
+        # the rename keeps the temp file's mode.
         tmp = f"{p}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(arcs, f)
         os.replace(tmp, p)
         return out
