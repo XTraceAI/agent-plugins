@@ -382,6 +382,15 @@ def _validate_message(message):
             for key in ("toolCallId", "id", "toolName", "name"):
                 if block.get(key) is not None and not isinstance(block[key], str):
                     raise ValueError("Cursor tool identity must be a string")
+            identity = block.get("toolCallId")
+            if kind != "tool-result":
+                identity = identity or block.get("id")
+            # IDE transcripts can contain id-less tool_use observations. Native
+            # tool-call/result blocks and explicitly supplied aliases need the
+            # identifier actually consumed by normalization.
+            requires_identity = kind != "tool_use" or "toolCallId" in block or "id" in block
+            if requires_identity and (not isinstance(identity, str) or not identity):
+                raise ValueError("Cursor tool block requires its native call identifier")
 
 
 def _load_messages(db_path: Path, *, strict_utf8: bool = False, strict_json: bool = False) -> list[tuple[dict, int | None]]:
@@ -472,6 +481,15 @@ def _iso_ms(ms) -> str | None:
         ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _created_at(meta: dict, *, strict: bool) -> str | None:
+    value = meta.get("createdAtMs")
+    if value is not None and type(value) not in (int, float):
+        if strict:
+            raise ValueError("invalid Cursor creation timestamp")
+        return None
+    return _iso_ms(value)
 
 
 def _embedded_timestamp(text: str) -> str | None:
@@ -724,7 +742,7 @@ def to_canonical(path, *, session_id: str | None = None,
                 for message, node_ts in _load_messages(source, strict_utf8=strict_utf8, strict_json=strict_json)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))
+        model_hint=None, created_ts=_created_at(mj, strict=strict_json))
 
 
 def session_metadata(path) -> dict:
@@ -735,10 +753,9 @@ def session_metadata(path) -> dict:
             meta = load_json(handle.read(), strict=True)
         if not isinstance(meta, dict) or meta.get("schemaVersion") != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
-        created = meta.get("createdAtMs")
         return {"session_id": source.parent.name, "cwd": meta.get("cwd"),
                 "git_branch": meta.get("gitBranch"),
-                "started_at": _iso_ms(created) if type(created) in (int, float) else None,
+                "started_at": _created_at(meta, strict=True),
                 "source_surface": meta.get("source_surface")}
     # This observed location identifies IDE transcripts. An arbitrary file does
     # not establish a CLI or IDE surface, and absent native start stays unknown.

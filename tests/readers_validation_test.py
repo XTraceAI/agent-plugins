@@ -312,10 +312,15 @@ def test_strict_json_rejects_nonstandard_numbers_on_all_opted_in_loaders():
 def test_strict_cursor_content_blocks_match_the_canonicalizer():
     invalid=[{"type":"future","text":"lost output"},{"type":"text","text":17},
              {"type":"reasoning","text":[]},{"type":"tool-call","toolCallId":17,"toolName":"Read","args":{}},
-             {"type":"tool_use","id":"call","name":[],"input":{}}]
+             {"type":"tool_use","id":"call","name":[],"input":{}},
+             {"type":"tool-call","toolName":"Read","args":{}},
+             {"type":"tool-call","toolCallId":"","toolName":"Read","args":{}},
+             {"type":"tool_use","id":"","name":"Read","input":{}}]
     supported=[{"type":"text","text":"synthetic output"},{"type":"reasoning","text":"synthetic reasoning"},
                {"type":"tool-call","toolCallId":"one","toolName":"Read","args":{}},
-               {"type":"tool_use","id":"two","name":"Read","input":{}}]
+               {"type":"tool_use","id":"two","name":"Read","input":{}},
+               {"type":"tool-call","id":"three","toolName":"Read","args":{}},
+               {"type":"tool_use","toolCallId":"four","name":"Read","input":{}}]
     for block in invalid+supported:
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
@@ -440,6 +445,28 @@ def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
                 before=source.read_bytes()
                 if fallback in invalid:rejected(lambda:cursor.to_canonical(source,strict_json=True))
                 else:assert cursor.to_canonical(source,strict_json=True)==cursor.to_canonical(source)
+                assert source.read_bytes()==before
+
+
+def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
+    for identity in [{}, {"id":"call"}, {"toolCallId":""}, {"toolCallId":None}, {"toolCallId":"call"}]:
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/"chats")
+            block={"type":"tool-result","result":"synthetic output",**identity}
+            raw=json.dumps({"role":"tool","content":[block]}).encode();key=hashlib.sha256(raw).hexdigest()
+            with sqlite3.connect(store) as sql:
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
+                sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
+            transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"tool","message":{"content":[block]}}])
+            for source in [store,transcript]:
+                before=source.read_bytes();legacy=cursor.to_canonical(source)
+                if identity.get("toolCallId")!="call":rejected(lambda:cursor.to_canonical(source,strict_json=True))
+                else:
+                    records,metadata=cursor.to_canonical(source,strict_json=True)
+                    assert (records,metadata)==legacy
+                    results=[part for row in records for part in row.get("message",{}).get("content",[])
+                             if isinstance(part,dict) and part.get("type")=="tool_result"]
+                    assert len(results)==1 and results[0]["tool_use_id"]=="call"
                 assert source.read_bytes()==before
 
 
