@@ -361,6 +361,24 @@ def test_non_ascii_endpoint_paths_and_queries_reject_before_auth():
         assert sinks.Sink("selected",url).url==url
 
 
+def test_environment_mcp_path_is_validated_before_url_composition():
+    with isolated() as (_, config):
+        os.environ.update(MEMHUB_MCP_BASE_URL="https://trusted.example",
+                          MEMHUB_TOKEN="synthetic-test-token")
+        for path in ["", "mcp", ".attacker.example/mcp", "?mode=x", "//other.example/mcp"]:
+            os.environ["MEMHUB_MCP_SERVER_PATH"] = path
+            with patch.object(auth, "default_url", side_effect=AssertionError("invalid path reached composition")), \
+                    patch.object(auth, "resolve_bearer", side_effect=AssertionError("invalid path reached credentials")):
+                rejected(sinks.resolve_capture_sink)
+                rejected(sinks.active_sink_names)
+        os.environ["MEMHUB_MCP_SERVER_PATH"] = "/custom/mcp?mode=x"
+        assert sinks.resolve_capture_sink().url == "https://trusted.example/custom/mcp?mode=x"
+        os.environ.pop("MEMHUB_MCP_BASE_URL")
+        os.environ["MEMHUB_MCP_SERVER_PATH"] = ".unused.example/mcp"
+        assert sinks.resolve_capture_sink().url == CLOUD, "an unused override must not change installed routing"
+        assert not config.exists()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
