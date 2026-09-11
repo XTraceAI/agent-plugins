@@ -405,7 +405,8 @@ def test_bounded_codex_index_keeps_cr_and_crlf_records_after_partial_prefix():
 def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
     invalid=[[{"type":"image","data":"synthetic"}],[{"type":"text","text":17}],
              [{"type":"text"}],{},17]
-    supported=["synthetic",[{"type":"text","text":"synthetic"}],[],None]
+    invalid.append(None)
+    supported=["synthetic",[{"type":"text","text":"synthetic"}],[]]
     for fallback in invalid+supported:
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
@@ -441,6 +442,26 @@ def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
                     results=[part for row in records for part in row.get("message",{}).get("content",[])
                              if isinstance(part,dict) and part.get("type")=="tool_result"]
                     assert len(results)==1 and results[0]["tool_use_id"]=="call"
+                assert source.read_bytes()==before
+
+
+def test_checked_cursor_tool_results_require_a_present_payload():
+    for block in ({"type":"tool-result","toolCallId":"call"},
+                  {"type":"tool-result","toolCallId":"call","result":None},
+                  {"type":"tool-result","toolCallId":"call","result":None,
+                   "experimental_content":None}):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);store=fixtures._make_cursor_store(home/"chats")
+            raw=json.dumps({"role":"tool","content":[block]}).encode()
+            key=hashlib.sha256(raw).hexdigest()
+            with closing(sqlite3.connect(store)) as sql,sql:
+                sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
+                sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
+            transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[
+                {"role":"tool","message":{"content":[block]}}])
+            for source in (store,transcript):
+                before=source.read_bytes();cursor.to_canonical(source)
+                rejected(lambda:cursor.to_canonical(source,strict=True))
                 assert source.read_bytes()==before
 
 
