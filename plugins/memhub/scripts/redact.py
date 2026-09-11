@@ -66,6 +66,30 @@ def redact(value):
     return value
 
 
+# ── identities, for text bound for a MODEL, not for the archive ────────────
+#
+# The capture path above removes only prefixed credentials, so the archive
+# stays trustworthy. The harness-tied memory window is a different object: a
+# short slice of a session sent to a classifier, whose tool output is
+# untrusted and can carry a teammate's name, e-mail or home directory. Over-
+# redacting it costs little; passing an identity on cannot be undone.
+#
+# Two shapes, coarse on purpose: a home directory (`/Users/<name>`,
+# `/home/<name>`, `C:\\Users\\<name>`) becomes `~`, which is how the path
+# reads to every teammate anyway, and an e-mail address becomes `<email>`.
+_HOME_DIR = re.compile(r"(?<![\w.~-])(?:/(?:Users|home)/|[A-Za-z]:\\Users\\)"
+                       r"[^/\\\s'\"`:;,)]+")
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def redact_identities(text: str) -> str:
+    """Home directories to ``~``, e-mail addresses to ``<email>``. For text
+    about to reach a model, never for records being captured."""
+    if not text:
+        return text
+    return _EMAIL.sub("<email>", _HOME_DIR.sub("~", text))
+
+
 def redact_records(records: list) -> list:
     """Redact a batch of transcript records. Never raises.
 

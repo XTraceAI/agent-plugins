@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""The harness-tied memory sensor. FLAGGED OFF by default.
+
+Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on. With it on,
+MemHub classifies each turn's moment and the coding agent that lived the turn
+decides whether it holds a lesson:
+
+  Stop(turn N)       `stop`     returns in milliseconds. Takes the turn's
+                                closed error arcs from the rulebook hook, then
+                                spawns a detached `extract` child, which builds
+                                the redacted window, asks the classifier, and
+                                on a signal records the MOMENT (turn, kind,
+                                router hint, state stamp).
+  next user prompt   `prompt`   hands the newest un-handed moment to the agent
+                                in ONE injected line: which turn, what kind,
+                                and the stamp to pass. The agent decides
+                                whether there is a lesson, asks the person if
+                                unsure, and files it with the memhub
+                                `create_rule` tool. It lands `proposed`, and a
+                                person activates it.
+
+A moment the classifier has not answered for by the next prompt is handed on a
+later prompt while it is still recent. A moment nobody was handed (the
+terminal closed, a host with no prompt hook) stays in its file. Nothing here
+fires a rule and nothing here activates one.
+
+Files, under $MEMHUB_HARNESS_DIR (default ~/.config/memhub-plugin/harness),
+all created private:
+
+  <session>.moments.jsonl    flagged moments; `handed_at` once nudged
+  <session>.meta.json        last extracted turn, repo, cwd, nudge count
+  <session>.turn-*.claim     the turn an extract child already took
+  stop.log / extract.log     one line per step, never prompt text
+
+Every path fails open and silent: a broken sensor must never touch the tool
+call or the session. Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import harness_extract as hx  # noqa: E402
+
+NUDGE_MAX_AGE_TURNS = 3      # an older moment is left in its file, never nudged stale
+NUDGE_CAP_PER_SESSION = 8    # at most this many nudges in one session
+NUDGES_PER_PROMPT = 1        # one line, the newest moment
+
+
+# --------------------------------------------------------------- plumbing
+def _log(msg: str) -> None:
+    try:
+        path = hx.log_path("stop.log")
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def meta_path(session: str) -> Path:
+    return hx.session_file(session, ".meta.json")
+
+
+def moments_path(session: str) -> Path:
+    return hx.session_file(session, ".moments.jsonl")
+
+
+def load_meta(session: str) -> dict:
+    try:
+        got = json.loads(meta_path(session).read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _publish(path: Path, text: str) -> None:
+    """Atomic and 0600, through `atomic_write.publish` beside this file."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        import atomic_write  # noqa: PLC0415
+        atomic_write.publish(path, text)
+    except Exception:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+
+
+def save_meta(session: str, **fields) -> dict:
+    meta = load_meta(session)
+    meta.update(fields)
+    meta["session_id"] = session
+    _publish(meta_path(session), json.dumps(meta, indent=1, default=str))
+    return meta
+
+
+def write_rows(path: Path, rows: list[dict]) -> None:
+    _publish(path, "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n"
+                           for r in rows))
+
+
+def env_name() -> str:
+    """Which MemHub the stamp's `env` names, derived from the plugin's own
+    backend URL rather than configured a second time."""
+    try:
+        from _memhub_auth import default_url  # noqa: PLC0415
+        host = default_url()
+    except Exception:
+        return "unknown"
+    return "staging" if "staging" in host else "production"
+
+
+def repo_of(cwd: str) -> str:
+    rh = hx._hook()
+    if rh is None or not cwd:
+        return ""
+    try:
+        return rh.repo_info(cwd)[0] or ""
+    except Exception:
+        return ""
+
+
+def _read_payload() -> dict:
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _is_subagent(payload: dict) -> bool:
+    """A subagent's hook call carries a top-level `agent_id`. Its turns are not
+    the person's, and its prompts must not take the main agent's moment."""
+    return bool(str(payload.get("agent_id") or "").strip())
+
+
+# --------------------------------------------------------------- stop lane
+def cmd_stop(payload: dict) -> int:
+    """Millisecond budget: one small state read, one spawn, no transcript and
+    no network."""
+    session = str(payload.get("session_id") or "").strip()
+    transcript = str(payload.get("transcript_path") or "").strip()
+    cwd = str(payload.get("cwd") or "").strip()
+    if not session or not transcript or not os.path.isfile(transcript):
+        return 0
+    if payload.get("stop_hook_active") or _is_subagent(payload):
+        return 0
+    args = ["extract", "--session", session, "--transcript", transcript, "--cwd", cwd]
+    # The turn's error arcs are taken HERE, at the boundary, not by the child:
+    # by the time a detached child gets to them the next turn may have added
+    # its own.
+    rh = hx._hook()
+    if rh is not None and hasattr(rh, "take_error_arcs"):
+        try:
+            arcs = rh.take_error_arcs(session)
+        except Exception:
+            arcs = []
+        if arcs:
+            arcs_path = hx.session_file(session, f".arcs-{time.time_ns()}.json")
+            try:
+                _publish(arcs_path, json.dumps(arcs))
+                args += ["--arcs", str(arcs_path)]
+            except Exception:
+                pass
+    hx.spawn_detached(args, script=Path(__file__).resolve(), log_name="stop.log")
+    return 0
+
+
+def _claim_turn(session: str, marker: str) -> bool:
+    """Exactly one child takes a turn. Two Stops for one turn, or two children
+    racing on a slow classifier, would otherwise both spend a call on it."""
+    digest = hashlib.sha1(marker.encode("utf-8")).hexdigest()[:12]
+    claim = hx.session_file(session, f".turn-{digest}.claim")
+    try:
+        claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return True             # fail open: an unwritable claim does not stop the sensor
+    os.close(fd)
+    prefix = hx.session_file(session, ".turn-").name
+    for old in claim.parent.glob(f"{prefix}*.claim"):
+        if old != claim:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "") -> int:
+    """The child: the last turn in the transcript, once."""
+    arcs: list = []
+    if arcs_file:
+        try:
+            got = json.loads(Path(arcs_file).read_text(encoding="utf-8"))
+            arcs = got if isinstance(got, list) else []
+        except (OSError, ValueError):
+            arcs = []
+        try:
+            Path(arcs_file).unlink()
+        except OSError:
+            pass
+    try:
+        turns = hx.turns_from_transcript(transcript)
+    except (OSError, ValueError) as exc:
+        _log(f"extract {session[:8]}: cannot read transcript: {type(exc).__name__}")
+        return 0
+    if not turns:
+        return 0
+    last, prev = turns[-1], (turns[-2] if len(turns) > 1 else None)
+    if not _claim_turn(session, f"{last.get('n')}:{last.get('uuid', '')}"):
+        return 0
+    cwd = cwd or last.get("cwd") or ""
+    repo = repo_of(cwd)
+    stats = hx.new_stats()
+    trace = hx.Trace(str(hx.log_path("extract.log")))
+    try:
+        hx.extract_turn(last, prev, session=session, cwd=cwd, repo=repo,
+                        env_name=env_name(), stats=stats, trace=trace,
+                        out_path=moments_path(session), arcs=arcs)
+    finally:
+        trace.close()
+    save_meta(session, repo=repo, cwd=cwd, last_turn=last.get("n"), last_stop_at=time.time())
+    _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
+         f"moment={stats['moments']} reason={stats['reason'] or '-'} arcs={len(arcs)}")
+    return 0
+
+
+# ------------------------------------------------------------- prompt lane
+def nudge_line(session: str, moment: dict, repo: str) -> str:
+    """The one line the agent reads. It carries the stamp verbatim, so the rule
+    the agent files is stamped by the harness and never typed."""
+    kind = moment.get("kind") or "a signal"
+    hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
+    derivable = (" — the classifier thinks it may already be written down in the repo, "
+                 "so check before proposing") if moment.get("derivable") else ""
+    stamp = json.dumps(moment.get("state") or {}, ensure_ascii=False, default=str)
+    return (
+        f"MemHub harness: your previous turn (turn {moment.get('turn')}) was classified as "
+        f"{kind}{hint}{derivable}. If it carries a lesson that would change what an agent "
+        f"DOES next time, is not already in the repo, its docs, CLAUDE.md or the rulebook, "
+        f"is not project state, and will still be true next month, propose it now with the "
+        f"memhub create_rule tool: title (a short noun phrase naming the trap), statement "
+        f"(one when-X-then-Y sentence with the why), exactly one engine — "
+        f"delivery=agent_hook with matcher {{event: bash|edit|output|read, …_rx}} or "
+        f"ordering, or delivery=anchor_recall with 1-8 concrete identifiers — plus "
+        f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
+        f"scope_repos={json.dumps([repo] if repo else [])}, state={stamp}. Never pass "
+        f"activate; it lands proposed for a person. Never put a person's name, home "
+        f"directory or e-mail in a rule. Ask the user first if unsure; if there is no "
+        f"lesson, say nothing about this."
+    )
+
+
+def cmd_prompt(payload: dict) -> int:
+    """UserPromptSubmit, within milliseconds: the newest fresh un-handed moment
+    becomes one line of context, and is marked handed whether or not the agent
+    files anything."""
+    session = str(payload.get("session_id") or "").strip()
+    prompt = str(payload.get("prompt") or "")
+    if not session or _is_subagent(payload) or hx.is_harness_text(prompt.strip()):
+        return 0
+    path = moments_path(session)
+    if not path.is_file():
+        return 0
+    moments = hx.read_jsonl(path)
+    if not moments:
+        return 0
+    meta = load_meta(session)
+    if int(meta.get("nudges") or 0) >= NUDGE_CAP_PER_SESSION:
+        return 0
+    last_turn = int(meta.get("last_turn") or moments[-1].get("turn") or 0)
+    fresh = [m for m in moments if not m.get("handed_at")
+             and isinstance(m.get("turn"), int)
+             and last_turn - m["turn"] < NUDGE_MAX_AGE_TURNS]
+    if not fresh:
+        return 0
+    chosen = fresh[-NUDGES_PER_PROMPT:]
+    now = time.time()
+    for m in chosen:
+        m["handed_at"] = now
+    write_rows(path, moments)
+    save_meta(session, nudges=int(meta.get("nudges") or 0) + len(chosen))
+    lines = [nudge_line(session, m, meta.get("repo") or (m.get("state") or {}).get("repo") or "")
+             for m in chosen]
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                             "additionalContext": "\n".join(lines)}}))
+    _log(f"prompt {session[:8]}: handed turn(s) {[m.get('turn') for m in chosen]}")
+    return 0
+
+
+# ------------------------------------------------------------------- main
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("mode", choices=("stop", "prompt", "extract"))
+    p.add_argument("--session", default="")
+    p.add_argument("--transcript", default="")
+    p.add_argument("--cwd", default="")
+    p.add_argument("--arcs", default="")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if not hx.extract_enabled():
+        if args.mode in ("stop", "prompt"):
+            try:
+                sys.stdin.read()          # drain the hook payload, say nothing
+            except Exception:
+                pass
+        return 0
+    if args.mode == "stop":
+        return cmd_stop(_read_payload())
+    if args.mode == "prompt":
+        return cmd_prompt(_read_payload())
+    if args.mode == "extract" and args.session:
+        return cmd_extract(args.session, args.transcript, args.cwd, args.arcs)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        rc = main()
+    except BaseException:                 # noqa: BLE001 — silent, exit 0
+        if os.environ.get("MEMHUB_HARNESS_DEBUG"):
+            import traceback
+            traceback.print_exc()
+        rc = 0
+    sys.exit(rc or 0)
