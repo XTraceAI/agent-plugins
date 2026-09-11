@@ -799,6 +799,34 @@ def test_cursor_optional_metadata_text_fields_have_valid_types():
                 assert cursor.session_metadata(store)
 
 
+def test_checked_codex_consumed_timestamps_are_parseable():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1]
+        for source in ('response','usage-only','initial-fallback'):
+            for value in ('not-a-time','',17,False,[],{}):
+                rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+                if source=='response':
+                    item=next(row for row in rows if row.get('type')=='response_item' and row['payload'].get('role')=='user')
+                    item['timestamp']=value
+                elif source=='usage-only':
+                    rows=[rows[0],{'type':'event_msg','timestamp':value,'payload':{'type':'token_count','info':{'total_token_usage':{'input_tokens':10,'cached_input_tokens':2,'output_tokens':3}}}}]
+                else:
+                    if not isinstance(value,str):
+                        continue  # The existing initial fallback selects a text clock.
+                    rows[0]['payload']['timestamp']='2026-01-01T00:00:00Z'
+                    rows[0]['timestamp']=value
+                    rows=[rows[0],{'type':'response_item','payload':{'type':'message','role':'user','content':'synthetic'}}]
+                fixtures._write_jsonl(path,rows);before=path.read_bytes()
+                codex.to_canonical(path)
+                rejected(lambda:codex.to_canonical(path,strict=True))
+                assert path.read_bytes()==before
+        for value in (None,'2026-01-01T00:00:00.123456789012Z','2026-01-01T02:00:00+02:00'):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            item=next(row for row in rows if row.get('type')=='response_item' and row['payload'].get('role')=='user')
+            item['timestamp']=value;fixtures._write_jsonl(path,rows)
+            assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

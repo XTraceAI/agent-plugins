@@ -485,6 +485,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
     model, session, and cwd provenance live in structured metadata instead of a
     synthetic user turn, keeping titles and turn counts faithful."""
     if strict:
+        from . import _parseable_timestamp
         for row in rollout:
             if isinstance(row, dict) and row.get("type") == "session_meta":
                 _metadata_from_header(row)
@@ -512,6 +513,12 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
     out: list[dict] = []
     sid_key = sm.get("id") or "unknown"
     ts_holder = {"ts": None}
+
+    def observe_timestamp(value) -> None:
+        if strict and value is not None and not _parseable_timestamp(value):
+            raise ValueError("Codex record timestamp is not valid ISO-8601")
+        if isinstance(value, str):
+            ts_holder["ts"] = value
     # Reader versions through 0.27.4 emitted a provenance banner at identity
     # index 0. Keep a virtual slot for it so every real record retains its UUID
     # on incremental re-import even though the banner is no longer emitted.
@@ -566,8 +573,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
             message["model"] = model
         return rec({"type": "assistant", "message": message})
 
-    ts_holder["ts"] = next((r.get("timestamp") for r in rollout
-                            if isinstance(r.get("timestamp"), str)), None)
+    observe_timestamp(next((r.get("timestamp") for r in rollout
+                            if isinstance(r.get("timestamp"), str)), None))
 
     last_assistant: dict | None = None
     previous_usage_total: dict[str, int] | None = None
@@ -595,8 +602,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
         pl = r.get("payload")
         if (r.get("type") == "event_msg" and isinstance(pl, dict)
                 and pl.get("type") == "token_count"):
-            if isinstance(r.get("timestamp"), str):
-                ts_holder["ts"] = r["timestamp"]
+            observe_timestamp(r.get("timestamp"))
             info = pl.get("info")
             total = _usage_total(
                 info.get("total_token_usage") if isinstance(info, dict) else None
@@ -623,8 +629,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
             continue
         if r.get("type") != "response_item":
             continue
-        if isinstance(r.get("timestamp"), str):
-            ts_holder["ts"] = r["timestamp"]
+        observe_timestamp(r.get("timestamp"))
         if not isinstance(pl, dict):
             if strict:
                 raise ValueError("Codex response payload is not an object")
