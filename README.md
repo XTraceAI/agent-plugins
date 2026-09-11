@@ -280,6 +280,25 @@ you. The conflict check spans every book you can see, and flags a collision in
 a book you are *not* filing into: nothing you file can supersede that rule, and
 both will fire, so it goes to you as a decision.
 
+### Harness-tied memory (flagged off)
+
+With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin helps a
+correction you make in a session become a proposed team rule. At each turn's
+Stop, a detached child sends a redacted slice of that turn to MemHub
+(`POST /v1/team/rulebook/harness/classify`), whose classifier says whether the
+moment is worth the agent's attention. At your next prompt, one injected line
+hands a flagged moment to the agent that lived the turn: if there is a lesson
+that would change what an agent does next time, the agent proposes it with the
+memhub `create_rule` tool, asking you first if unsure. It files the rule into
+the rulebook `list_rulebooks` returns, asking you which one when you are in
+several, and replaces an existing rule on the same lesson instead of adding a
+twin. The rule lands
+`proposed` for a person to activate; nothing fires from it, and the plugin
+never activates one. The slice is redacted before it leaves the machine
+(MemHub keys, home directories, e-mail addresses, command-line credentials,
+quoted or not).
+With the variable unset, the default, none of this runs.
+
 ## Skills
 
 Thirteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
