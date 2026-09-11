@@ -5,13 +5,14 @@ Run: uv run --with 'mcp<2' python plugins/memhub/scripts/flush_session_test.py
 (the module imports the MCP SDK through ``_memhub_auth``)
 
 Covers the arguments assembly and the success/failure contract of one slice —
-the parts that decide whether a capture lands in the right brain, under the
-right name, and whether a rejected slice stops the run instead of leaving a
-hole in the middle of the conversation.
+the parts that decide whether a capture lands under the right name, never in a
+brain, and whether a rejected slice stops the run instead of leaving a hole in
+the middle of the conversation.
 """
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import os
 import sys
 import tempfile
@@ -73,180 +74,46 @@ OK = FakeResult(structured={"conversation_id": "c1", "messages_received": 3,
                             "path": "agentic"})
 
 
-def send(result, room=None, title=None, namespace=None, index=1, total=1):
+def send(result, title=None, namespace=None, index=1, total=1, budget=None):
     session = FakeSession(result)
     args = {"messages": [{"type": "user"}], "conversation_id": "s1",
             "source_platform": "claude"}
-    ok, _room = asyncio.run(fs._send(session, args, room, title, namespace,
-                                     index, total))
-    return ok, (session.sent[0][1] if session.sent else None)
+    ok = asyncio.run(fs._send(session, args, title, namespace,
+                              index, total, budget=budget))
+    return ok, session
 
 
-ok, args = send(OK)
+ok, session = send(OK)
+args = session.sent[0][1]
 check("a bare send succeeds", ok is True)
-check("no room means no brain id", "agent_brain_id" not in args)
-check("no room means no org", "org_id" not in args)
+# A session is ALWAYS captured into personal memory. A brain id on the wire
+# re-keys the conversation `cb:<brain>:<sid>`, and a room decision that changed
+# between flushes is how one session became two conversations.
+check("never a brain id", "agent_brain_id" not in args)
+check("never an org", "org_id" not in args)
 check("nothing invents a title", "title" not in args)
 
-# A brain resolves inside exactly ONE org. Sending the id without its org is
-# how every capture into a non-default-org room failed with "Agent brain not
-# found" — the bug this path had and the per-turn path had already fixed.
-ok, args = send(OK, room={"brain_id": "b1", "org_id": "o1"})
-check("the room's brain id is sent", args.get("agent_brain_id") == "b1")
-check("the org that OWNS the room rides along", args.get("org_id") == "o1")
-
-ok, args = send(OK, room={"brain_id": "b1"})
-check("an org-less room still routes", args.get("agent_brain_id") == "b1")
-check("an org-less room sends no org", "org_id" not in args)
-
-ok, args = send(OK, title="Fix the flush hook", namespace="memhub")
+ok, session = send(OK, title="Fix the flush hook", namespace="memhub")
+args = session.sent[0][1]
 check("the title is sent", args.get("title") == "Fix the flush hook")
 check("the namespace is sent", args.get("namespace") == "memhub")
+check("a named send still carries no brain id", "agent_brain_id" not in args)
 
 
 # MCP signals tool failure with isError, NOT an exception. Treating that as
 # success would report a capture that never happened.
-ok, _ = send(FakeResult(texts=["Agent brain not found"], is_error=True))
+ok, session = send(FakeResult(texts=["server rejected it"], is_error=True),
+                   budget=30.0)
 check("an isError reply stops the run", ok is False)
+# One attempt, bounded by the budget it was handed: there is no second,
+# re-routed send any more, so nothing can spend the slice's time twice.
+check("a rejected slice is not retried", len(session.sent) == 1)
+check("the slice is bounded by its budget", session.timeouts == [30.0])
 
 # Not an error per the protocol, but not the shape import_conversation
 # returns either — a slice that cannot be confirmed did not land.
 ok, _ = send(FakeResult(structured={"something": "else"}))
 check("an unrecognized body stops the run", ok is False)
-
-
-# ── a room the backend does not have ──────────────────────────────────
-#
-# The hole this closes: routing degrades to long-term memory when NO room is
-# cached, but that reads the CACHE, not the server. A cached id the backend has
-# never heard of walked past that check and killed the whole backstop — which is
-# exactly what a `production` entry holding a staging brain id did for days.
-
-class FakeSequenceSession:
-    """Replies with a different result per call, so a retry can be observed."""
-
-    def __init__(self, *results):
-        self.results = list(results)
-        self.sent = []
-        self.timeouts = []
-
-    async def call_tool(self, name, arguments=None, timeout=None):
-        # Copy: `_send` mutates the caller's dict, so keeping the reference
-        # would make the first call's record show the SECOND call's arguments
-        # and the retry assertions below would pass vacuously.
-        self.sent.append((name, dict(arguments or {})))
-        self.timeouts.append(timeout)
-        # Consume real wall clock, so "the retry is bounded by what is LEFT"
-        # stays observable where time.monotonic ticks coarsely (Windows on
-        # Python ≤3.12: GetTickCount64, 15.6ms) — a zero-cost reply would
-        # leave the remaining budget equal to the whole budget there.
-        await asyncio.sleep(0.05)
-        return self.results[min(len(self.sent), len(self.results)) - 1]
-
-
-MISSING = FakeResult(texts=["Error executing tool import_conversation: "
-                            "Agent brain not found"], is_error=True)
-
-
-def send_seq(*results, room=None, budget=None, cwd="/repo"):
-    session = FakeSequenceSession(*results)
-    args = {"messages": [{"type": "user"}], "conversation_id": "s1",
-            "source_platform": "claude"}
-    forgot = []
-    real, fs.forget_room = fs.forget_room, lambda cwd=None, env=None: (
-        forgot.append((cwd, env)) or True)
-    try:
-        ok, room_after = asyncio.run(
-            fs._send(session, args, room, None, None, 1, 1, budget=budget,
-                     cwd=cwd, env="production"))
-    finally:
-        fs.forget_room = real
-    return ok, room_after, session.sent, forgot, session.timeouts
-
-
-ok, room_after, sent, forgot, timeouts = send_seq(
-    MISSING, OK, room={"brain_id": "b1", "org_id": "o1"})
-check("a missing brain does not fail the slice", ok is True)
-check("a missing brain is retried", len(sent) == 2)
-check("the retry drops the brain id", "agent_brain_id" not in sent[1][1])
-check("the retry drops the org too", "org_id" not in sent[1][1])
-check("the first attempt did carry the brain id",
-      sent[0][1].get("agent_brain_id") == "b1")
-check("the dead room is forgotten", forgot == [("/repo", "production")])
-check("the caller is told the room is gone", room_after is None)
-
-# Only THIS error licenses forgetting a room. A rejected token or an unreachable
-# server says nothing about whether the brain exists, and dropping a good cache
-# entry over a transient outage would re-resolve — or mis-resolve — on the next
-# turn for no reason.
-ok, room_after, sent, forgot, timeouts = send_seq(
-    FakeResult(texts=["Not authenticated"], is_error=True),
-    OK, room={"brain_id": "b1"})
-check("an unrelated error is not retried", len(sent) == 1)
-check("an unrelated error keeps the room", room_after == {"brain_id": "b1"})
-check("an unrelated error forgets nothing", forgot == [])
-check("an unrelated error still stops the run", ok is False)
-
-# Both attempts failing is a real failure — the fallback is one retry, not a
-# loop, and the caller must still stop rather than send later slices into a
-# conversation whose first slice never landed.
-ok, room_after, sent, forgot, timeouts = send_seq(
-    MISSING, FakeResult(texts=["still broken"], is_error=True),
-    room={"brain_id": "b1"})
-check("a failed fallback stops the run", ok is False)
-check("a failed fallback still forgot the room", forgot != [])
-
-# The retry must be bounded by the time LEFT, not by the budget the slice
-# started with. Closing over one `budget` value granted the second attempt the
-# first attempt's time all over again — two sequential calls, each up to the
-# full per-slice budget, overrunning the deadline that clamp exists to hold.
-ok, room_after, sent, forgot, timeouts = send_seq(
-    MISSING, OK, room={"brain_id": "b1"}, budget=30.0)
-check("the first attempt gets the whole budget", timeouts[0] == 30.0)
-check("the retry is bounded by what is left",
-      timeouts[1] is not None and timeouts[1] < 30.0)
-
-# ...and below the floor a call cannot plausibly finish, so it is not made at
-# all — the same doomed-call reasoning `_stop_before_slice` applies to slices.
-# Skipping is cheap because the dead id is ALREADY forgotten: the next flush
-# reaches long-term memory with a fresh budget.
-ok, room_after, sent, forgot, timeouts = send_seq(
-    MISSING, OK, room={"brain_id": "b1"}, budget=0.0)
-check("an exhausted budget makes no doomed retry", len(sent) == 1)
-check("an exhausted budget still forgets the room", forgot != [])
-check("an exhausted budget still reports the failure", ok is False)
-
-# ...and it reports the CLOCK, not the brain. Falling through to the isError
-# branch would have breadcrumbed the original "Agent brain not found" — the one
-# thing no longer true, since the id was just forgotten — and `capture_health`
-# shows that breadcrumb to the user at SessionStart. They would go chasing a
-# brain problem that had already fixed itself.
-import json as _json  # noqa: E402 — local to this assertion
-
-_crumb = _json.loads(
-    (Path(_TMP_HOME) / ".config" / "memhub-plugin" / "turnflush"
-     / "s1.sessionflush.json").read_text(encoding="utf-8"))
-check("the breadcrumb names the budget, not the brain",
-      _crumb.get("last_error") == "budget_exhausted")
-check("the detail does not blame the forgotten brain",
-      "Agent brain not found" not in (_crumb.get("last_error_detail") or ""))
-
-# An UNKNOWN origin must never touch the cache. `forget_room` keys on the repo
-# at `cwd`, and `room_name(None)` falls back to the calling PROCESS's directory
-# — a hook can fire from a different repo than the session's, so forgetting here
-# could delete an unrelated repo's room. Unrouting still rescues the slice.
-ok, room_after, sent, forgot, timeouts = send_seq(
-    MISSING, OK, room={"brain_id": "b1"}, cwd=None)
-check("an unknown origin forgets nothing", forgot == [])
-check("an unknown origin still re-sends unrouted", len(sent) == 2)
-check("the unrouted re-send still drops the brain id",
-      "agent_brain_id" not in sent[1][1])
-
-# An unbudgeted send (no deadline in play) must keep retrying as before.
-ok, room_after, sent, forgot, timeouts = send_seq(
-    MISSING, OK, room={"brain_id": "b1"})
-check("an unbudgeted slice still retries", len(sent) == 2)
-check("an unbudgeted retry stays unbounded", timeouts[1] is None)
 
 ok, _ = send(FakeResult(texts=['{"conversation_id": "c1"}']))
 check("a JSON text body is understood", ok is True)
@@ -254,8 +121,6 @@ check("a JSON text body is understood", ok is True)
 ok, _ = send(FakeResult(structured={"result": {"conversation_id": "c1"}}))
 check("a FastMCP-wrapped body is unwrapped", ok is True)
 
-
-import os  # noqa: E402
 
 for raw, want, why in (
     ("", fs._DEFAULT_DEADLINE_S, "absent"),

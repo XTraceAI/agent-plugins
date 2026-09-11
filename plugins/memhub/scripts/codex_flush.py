@@ -4,8 +4,9 @@
 The Codex sibling of ``cursor_flush.py``, one seam simpler: rollouts are
 append-only JSONL, so "anything new?" is a byte-size comparison rather than a
 blob-set. Everything downstream is the shared machinery (``readers.codex``
-transform, ``redact``, ``resolve_bearer``, ``brain_resolve``, ``room_map``,
-``mcp_http`` — bare python3, no mcp SDK).
+transform, ``redact``, ``resolve_bearer``, ``room_map``'s git helpers,
+``mcp_http`` — bare python3, no mcp SDK). Like every session capture path it
+sends no brain: a Codex session always lands in personal memory.
 
 Codex clones Claude's hook contract (same ``hooks.json`` shape, same
 ``${CLAUDE_PLUGIN_ROOT}``), so the payload is EXPECTED Claude-shaped —
@@ -41,11 +42,10 @@ import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly  # noqa: E402
+from room_map import git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
 FLUSH_TIMEOUT_S = 240.0
@@ -271,8 +271,8 @@ def locate_rollout(payload: dict) -> tuple[Path | None, str | None]:
     # hostile session_id is no more trustworthy than a stale transcript_path
     # (codex_reader.locate resolves a bare uuid too, so a session_id that is
     # a valid uuid of ANOTHER stored session would flush that one). Picking
-    # either side risks folding the wrong conversation's gist forward, into
-    # whatever room the current cwd resolves to. So the single rule is: use
+    # either side risks folding the wrong conversation's gist forward. So the
+    # single rule is: use
     # a field only when nothing contradicts it; on conflict, refuse and let
     # the import-session sweep capture the real session.
     if isinstance(tp, str) and tp.strip():
@@ -412,7 +412,7 @@ def _cwd_ok(cwd) -> bool:
 
 
 def _git_remote_basename(cwd: str) -> str | None:
-    """Namespace for brain-routed dedup: the origin remote's basename.
+    """The session's namespace (directive scope): the origin remote's basename.
 
     ``cwd`` comes out of the rollout, so it is validated before it becomes
     a `git -C` argument: an absolute, existing directory that cannot be read
@@ -428,7 +428,10 @@ def _git_remote_basename(cwd: str) -> str | None:
         u = out.stdout.strip()
         if out.returncode == 0 and u:
             return u.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-    except (OSError, subprocess.SubprocessError):
+    # ValueError too: `text=True` decodes git's output, and a remote URL that is
+    # not valid in the locale's encoding raises UnicodeDecodeError. A namespace
+    # we cannot read is no namespace, never a failed flush.
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return None
 
@@ -480,46 +483,20 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         _save_state(sid, last_error="no_credential",
                     last_error_at=time.time(), fail_streak=0)
         return
-    env = env_for_url(url)
     session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
 
     cwd = meta.get("cwd")
-    # Both derive from cwd alone and neither feeds the other, so they run
-    # CONCURRENTLY: one is a network round trip, the other a git subprocess
-    # off the loop (like resolve_bearer above). Serial awaits spent the flush
-    # deadline twice for no ordering reason. Same shape as cursor_flush.
+    # Never an ``agent_brain_id``: a session is always captured into personal
+    # memory, so a room decision that changed between flushes can never split
+    # it into two conversations. The namespace still scopes its directives.
+    # Off the loop, like resolve_bearer above: it is a git subprocess, and
+    # ``_git_remote_basename`` never raises (a failure is simply no namespace).
     if _cwd_ok(cwd):
-        try:
-            room, namespace = await asyncio.gather(
-                resolve_repo_brain(session, cwd, env),
-                asyncio.to_thread(_git_remote_basename, cwd),
-            )
-        except Exception as e:  # noqa: BLE001
-            # resolve_repo_brain is documented never to raise — belt-and-
-            # braces: if it ever did, ABORT and retry rather than degrade
-            # room to None (the first receive would set the partition to
-            # personal stickily) or propagate (a routing hiccup would count
-            # toward dormancy via _note_failure).
-            # Stamp the cooldown so a persistently-raising resolver backs
-            # off (non-Stop events skip for ERROR_COOLDOWN_S) instead of
-            # re-parsing the whole rollout every event. NOT _note_failure:
-            # this is a local routing hiccup, not a server-import failure, so
-            # it must not count toward dormancy (and must not degrade room to
-            # None, which would mis-home the partition).
-            _log(f"room/namespace resolve failed transiently ({e!r}) — "
-                 f"retrying next event")
-            # Like the empty-redaction / no-credential paths, CLEAR fail_streak:
-            # the server was never contacted, so this neutral no-op must not
-            # preserve a prior run of contacted failures that a later single
-            # failure tips into dormancy (see _note_failure's documented
-            # contract).
-            _save_state(sid, last_error="resolve_error",
-                        last_error_at=time.time(), fail_streak=0)
-            return
+        namespace = await asyncio.to_thread(_git_remote_basename, cwd)
     else:
         if cwd:
             _log(f"ignoring unusable cwd from rollout: {str(cwd)[:60]!r}")
-        room, namespace = None, None
+        namespace = None
 
     arguments = {
         "messages": sendable,
@@ -527,10 +504,6 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         "source_platform": codex_reader.HOST,
         "flush": "now",
     }
-    if room:
-        arguments["agent_brain_id"] = room["brain_id"]
-        if room.get("org_id"):
-            arguments["org_id"] = room["org_id"]
     if namespace:
         arguments["namespace"] = namespace
     provenance = pr_provenance.import_provenance(pending_pr_urls)
@@ -601,8 +574,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
                 pending_pr_urls=pending_pr_urls,
                 accepted_pr_urls=accepted_pr_urls,
                 fail_streak=0)
-    _log(f"flushed {len(sendable)} records → codex-{sid}"
-         + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
+    _log(f"flushed {len(sendable)} records → codex-{sid} (personal)")
 
 
 def main() -> int:

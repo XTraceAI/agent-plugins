@@ -77,8 +77,8 @@ def test_capture_passes_reader_host_to_import_session() -> None:
         return types.SimpleNamespace(returncode=0)
 
     args = types.SimpleNamespace(
-        host=None, session="session-1", title=None, agent_brain_id=None,
-        no_room=True, namespace=None, url=None, conversation_id=None,
+        host=None, session="session-1", title=None,
+        namespace=None, url=None, conversation_id=None,
         dry_run=False)
     try:
         capture.subprocess.run = fake_run
@@ -95,7 +95,10 @@ def test_capture_passes_reader_host_to_import_session() -> None:
     for host, command in zip(("claude", "codex", "cursor"), captured):
         index = command.index("--source-platform")
         assert command[index + 1] == host, command
-        assert command.count("--no-room") == 1, command
+        # A session is never imported into a brain: no routing flag reaches
+        # the importer, which no longer accepts one.
+        assert "--no-room" not in command, command
+        assert "--agent-brain-id" not in command, command
     print("PASS test_capture_passes_reader_host_to_import_session")
 
 
@@ -120,8 +123,8 @@ def test_capture_claude_dry_run_never_imports() -> None:
         raise AssertionError("Claude dry-run launched the importer")
 
     args = types.SimpleNamespace(
-        host="auto", session="session-1", title=None, agent_brain_id=None,
-        no_room=False, namespace=None, url=None, conversation_id=None,
+        host="auto", session="session-1", title=None,
+        namespace=None, url=None, conversation_id=None,
         dry_run=True)
     try:
         capture._resolve = lambda _args: (

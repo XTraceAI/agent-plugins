@@ -122,7 +122,7 @@ def test_cursor_trust():
                        namespace="my-project")
         check("round-trips", ft._read_cursor(ft._read_state("s1"), 500), 120)
         # Remembered so a delta of sidecar-only records (which never carry cwd)
-        # still routes to the repo's room instead of personal memory.
+        # keeps the session's namespace.
         check("cwd remembered", ft._read_state("s1").get("cwd"), "/repo")
         # Merging, not replacing: a later flush that only knows the offset must
         # not erase the repo, namespace and title resolved earlier.
@@ -347,8 +347,6 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
         "state_dir": ft.STATE_DIR,
         "namespace": ft._namespace,
         "resolve_bearer": ft.resolve_bearer,
-        "resolve_repo_brain": ft.resolve_repo_brain,
-        "env_for_url": ft.env_for_url,
         "session": ft.mcp_http.Session,
         "log": ft._log,
     }
@@ -379,9 +377,6 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
                 isError=False,
             )
 
-    async def no_room(_session, _cwd, _env):
-        return None
-
     with tempfile.TemporaryDirectory() as tmp:
         transcript = Path(tmp) / "session.jsonl"
         _write(transcript, [
@@ -398,8 +393,6 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
         ])
         ft.STATE_DIR = Path(tmp) / "state"
         ft._namespace = lambda _records: ("/repo", "agent-plugins")
-        ft.resolve_repo_brain = no_room
-        ft.env_for_url = lambda _url: "staging"
         ft._log = lambda _message: None
         try:
             ft.resolve_bearer = lambda: ("https://example.test/mcp", None)
@@ -445,8 +438,6 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
             ft.STATE_DIR = originals["state_dir"]
             ft._namespace = originals["namespace"]
             ft.resolve_bearer = originals["resolve_bearer"]
-            ft.resolve_repo_brain = originals["resolve_repo_brain"]
-            ft.env_for_url = originals["env_for_url"]
             ft.mcp_http.Session = originals["session"]
             ft._log = originals["log"]
 

@@ -142,11 +142,15 @@ Capture runs on independent paths that all feed one server-side watermark
    narratives.
 4. **Routing.** Whichever path fires, the server auto-detects the Claude Code
    shape and runs the **agentic** extraction path (tool-bearing events, the
-   agent treated as a valid belief source). The session routes into the
-   repo's own agent brain via a per-user cache at
-   `~/.config/memhub-plugin/rooms.json` — resolved once by `/memhub:onboard`
-   and read by every writer, capture included; until then, everything lands
-   in personal memory instead of the repo's room.
+   agent treated as a valid belief source). Every session — and the memory
+   extracted from it — lands in **your personal memory**, never in a brain.
+   The server keys a conversation differently in a brain than in personal
+   memory, so routing a session by a room decision that could change
+   mid-session (it started outside its repo, its worktree was deleted, a room
+   lookup succeeded late) split one session into two conversations. The
+   per-user room cache at `~/.config/memhub-plugin/rooms.json` — resolved by
+   `/memhub:onboard` — still routes artifacts into the repo's own agent brain
+   and names it at session start.
 
 5. **Naming.** A captured session is called what its host calls it, so the
    sessions list in MemHub reads the same as the one in the editor: Claude
@@ -312,16 +316,17 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   login. `--status` reports without opening a browser; `--force` discards the
   cached credential and redoes the browser flow.
 - `/memhub:onboard [session-id-or-path]` — crosses the empty-brain cold
-  start for a repo: resolves or creates its agent brain, caches the room so
-  automatic capture routes there, seeds it from one real session, and proves
-  proactive directive recall on the repo's own symbols before reporting an
-  activation funnel.
+  start for a repo: resolves or creates its agent brain and caches the room
+  (where artifacts and specs land), seeds your memory from one real session,
+  and proves proactive directive recall on the repo's own symbols before
+  reporting an activation funnel.
 - `/memhub:import-session <id-or-path> [title]` — terminal upload of a past
   session transcript; auto-chunks very large sessions. The ONLY skill that
   imports: live sessions are captured per turn, so importing is for backfill —
   sessions that predate capture, or ran while it was dormant. It imports under
   the session's own id, the same id capture uses, so a session is one
-  conversation rather than two competing copies.
+  conversation rather than two competing copies — and, like capture, into
+  your personal memory.
 - `/memhub:save-artifact <file> [name]` — terminal upload of a file as an
   artifact. Both upload skills exist so the model never re-emits file or
   transcript content token by token — a helper script ships the bytes.
@@ -334,9 +339,9 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 - `/memhub:handoff-session <teammate> [title]` — hand the current session to a
   teammate: creates an agent brain holding a composed handoff brief (goal,
   state, decisions, next steps, gotchas) and shares it read-only via
-  `share_agent_brain`, alongside the repo room where per-turn capture already
-  extracted the session. No re-import: the session's memory exists once, and
-  the brief points into it.
+  `share_agent_brain`, alongside the repo room when one is cached. The brief
+  carries the session across: the session itself is captured into your
+  personal memory, which teammates cannot read.
 - `/memhub:spec <init|revise|check|status>` — spec-driven development on team
   memory. Each repo gets **one shared agent brain** (`Repo: <org>/<name>`,
   derived from the git remote) holding ALL its specs alongside reviews, ADRs,

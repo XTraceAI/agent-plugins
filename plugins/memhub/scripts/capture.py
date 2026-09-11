@@ -9,8 +9,7 @@ sessions through one command, using the per-host readers.
 
     uv run --with 'mcp<2' python capture.py import --session <ref> \
         [--host auto|claude|codex|cursor] [--conversation-id <id>] [--title "..."] \
-        [--agent-brain-id <id>] [--no-room] [--namespace <ns>] [--url <mcp-url>] \
-        [--dry-run]
+        [--namespace <ns>] [--url <mcp-url>] [--dry-run]
 
 ``--session`` accepts a transcript/rollout path, a bare session id, or
 ``latest``. ``--host auto`` (default) sniffs the host from a path shape or
@@ -273,10 +272,6 @@ def cmd_import(args) -> int:
     passthrough: list[str] = []
     if args.title:
         passthrough += ["--title", args.title]
-    if args.agent_brain_id:
-        passthrough += ["--agent-brain-id", args.agent_brain_id]
-    if args.no_room:
-        passthrough.append("--no-room")
     if args.namespace is not None:
         passthrough += ["--namespace", args.namespace]
     if args.url:
@@ -395,16 +390,13 @@ def main() -> int:
     cp.add_argument("--json", action="store_true")
     cp.set_defaults(fn=cmd_current)
 
-    ip = sub.add_parser("import", help="import one session into MemHub")
+    ip = sub.add_parser("import",
+                        help="import one session into your personal memory")
     ip.add_argument("--session", required=True,
                     help="transcript/rollout path, bare session id, or 'latest'")
     ip.add_argument("--host", default="auto", choices=["auto", *readers.READERS])
     ip.add_argument("--conversation-id", default=None)
     ip.add_argument("--title", default=None)
-    ip.add_argument("--agent-brain-id", default=None)
-    ip.add_argument("--no-room", action="store_true",
-                    help="ignore the repo's cached room and import into "
-                         "workspace memory")
     ip.add_argument("--namespace", default=None,
                     help="repo scope for captured directives; default resolves "
                          "from the session's cwd via git remote, '' disables")

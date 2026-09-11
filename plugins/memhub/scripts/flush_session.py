@@ -53,8 +53,6 @@ import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 import pr_provenance  # noqa: E402
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
-from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
-from room_map import env_for_url, forget_room  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
     generated_title,
@@ -278,18 +276,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         raise NonInteractiveAuthRequired(
             "no usable credential (key, token or cached login)")
 
-    # Route into the repo's room. Read AFTER the url resolves so the lookup is
-    # keyed by the backend we're actually about to write to — prod and staging
-    # hold different brain ids for the same repo. No cache (or no repo) → the
-    # import stays personal, exactly as it behaved before, rather than guessing
-    # a brain. `/memhub:onboard` and `/memhub:spec init` populate the cache.
-    #
-    # Only when the TRANSCRIPT told us where it ran. read_room(None) would fall
-    # back to this process's cwd, and a hook can fire from a different repo than
-    # the session's — routing the session into a room it has nothing to do with.
-    # Unknown origin must degrade to personal, never to a guess.
-    env = env_for_url(url)
-
     # Stateless server, no handshake needed — see mcp_http for the probe
     # that established this. One round trip instead of three.
     # A PER-CALL cap, not the whole budget. This path sends a transcript in
@@ -306,9 +292,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     deadline = _deadline_s()
     session = mcp_http.Session(url, bearer,
                                timeout=min(deadline, max(30.0, deadline / 4)))
-    # Cached hit is a dict lookup; a miss asks the server once and
-    # caches the answer, so this is not a per-flush round-trip.
-    room = await resolve_repo_brain(session, cwd, env) if cwd else None
 
     # Chunked, because this path sends the WHOLE transcript in one
     # call and real sessions can outgrow a single payload. Unchunked,
@@ -338,6 +321,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                  f"/memhub:import-session --session {session_id} to "
                  "finish (it resumes from the server's watermark).")
             return
+        # Never an ``agent_brain_id``: a session is always captured into
+        # personal memory — see ``flush_turn._flush`` for how routing it split
+        # one session into two conversations.
         arguments = {
             "messages": payload,
             "conversation_id": session_id,
@@ -353,42 +339,23 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # 300s cap, so the process is killed mid-upload and the summary
         # naming the unsent slices never gets written. That summary is the
         # entire reason this path stops itself rather than being stopped.
-        # ``room`` is fed back in: a slice that discovered the cached brain
-        # does not exist has already dropped it, and slices 2..N must not
-        # re-send an id the server just disowned.
-        ok, room = await _send(session, arguments, room, title, namespace,
-                               index, len(payloads),
-                               budget=max(_MIN_SLICE_BUDGET_S,
-                                          deadline - time.monotonic()),
-                               cwd=cwd, env=env)
+        ok = await _send(session, arguments, title, namespace,
+                         index, len(payloads),
+                         budget=max(_MIN_SLICE_BUDGET_S,
+                                    deadline - time.monotonic()))
         if not ok:
             return
 
 
-async def _send(session, arguments, room, title, namespace,
-                index: int, total: int, budget: float | None = None,
-                cwd=None, env=None) -> tuple[bool, dict | None]:
-    """Send one slice. Returns ``(keep_going, room)``.
+async def _send(session, arguments, title, namespace,
+                index: int, total: int, budget: float | None = None) -> bool:
+    """Send one slice. Returns whether to keep going.
 
-    ``keep_going`` False means stop — a later slice cannot help. Sequential and
-    fail-closed: the slices are ordered, so pressing on after a rejection would
-    leave a hole in the middle of the conversation while the log reported the
-    later slices as fine.
-
-    ``room`` comes back because this function may DISCOVER that the cached room
-    is not real — a backend answering "Agent brain not found" for the id it was
-    handed — and drop it. The caller loops over slices, so it needs the updated
-    value or every later slice re-sends the same disowned id.
+    False means stop — a later slice cannot help. Sequential and fail-closed:
+    the slices are ordered, so pressing on after a rejection would leave a hole
+    in the middle of the conversation while the log reported the later slices
+    as fine.
     """
-    if room:
-        arguments["agent_brain_id"] = room["brain_id"]
-        # The org that OWNS the room, when it is not the caller's default. A
-        # brain resolves inside exactly ONE org, and the default follows
-        # whichever org was last selected in the MemHub app. Sending the id
-        # without its org is how every capture into such a room fails with
-        # "Agent brain not found" — an error that reads like a deleted brain.
-        if room.get("org_id"):
-            arguments["org_id"] = room["org_id"]
     if title:
         arguments["title"] = title
     if namespace:
@@ -406,33 +373,9 @@ async def _send(session, arguments, room, title, namespace,
     # would leave it failing invisibly, which is the precise bug this whole
     # series exists to remove — and it would be worse here than in the per-turn
     # path, because nothing downstream is left to notice.
-    # An ABSOLUTE deadline for this slice, derived once from the budget the
-    # caller measured when it called. The closure below can run twice, and
-    # closing over `budget` itself granted the second call the first call's
-    # time all over again — two sequential attempts, each up to the full
-    # per-slice budget, overrunning the very deadline that clamp exists to
-    # hold. Time already spent has to come off the second attempt, and only an
-    # absolute deadline says that.
-    slice_deadline = None if budget is None else time.monotonic() + budget
-
-    def _remaining() -> float | None:
-        """Seconds left for this slice, or None when it is unbudgeted."""
-        return (None if slice_deadline is None
-                else slice_deadline - time.monotonic())
-
     async def _import(args: dict, timeout: float | None):
         """Send one import, classifying transport failures. None = already
-        logged and breadcrumbed, and the caller must stop.
-
-        A closure rather than the straight-line ladder it replaces because a
-        slice can now be sent TWICE — once routed to the room, once unrouted
-        after the server disowns it — and both must classify a 401 or a 429 the
-        same way. One copy is what keeps that true.
-
-        ``timeout`` is a parameter and NOT the enclosing ``budget``, so each
-        call is bounded by the time actually left rather than by what was left
-        when the slice started.
-        """
+        logged and breadcrumbed, and the caller must stop."""
         try:
             return await session.call_tool("import_conversation",
                                            arguments=args, timeout=timeout)
@@ -462,56 +405,8 @@ async def _send(session, arguments, room, title, namespace,
 
     res = await _import(arguments, budget)
     if res is None:
-        return False, room
+        return False
     texts = _texts(res)
-
-    # A cached room the backend does not have must not cost the session. This
-    # path already degrades to long-term memory when NO room is cached, but
-    # that reads the CACHE, not the server — so a present-but-wrong id walked
-    # straight past it and killed the backstop, at the same time and for the
-    # same reason as the per-turn flush. Drop the id and re-send unrouted.
-    if getattr(res, "isError", False) and room and is_missing_brain(texts):
-        _log(f"{label}room {room['brain_id'][:8]} does not exist on this "
-             "backend — dropping it from the cache and flushing to long-term "
-             "memory")
-        # Only when the caller told us where this session ran. `forget_room`
-        # keys on the repo at `cwd`, and `room_name(None)` falls back to THIS
-        # PROCESS's directory — a hook can fire from a different repo than the
-        # session's, so forgetting on an unknown origin could delete an
-        # unrelated repo's cached room. `read_room`'s docstring warns about
-        # precisely this substitution. Unrouting still happens either way: it
-        # rescues the slice and touches no cache.
-        if cwd is not None:
-            forget_room(cwd, env)
-        room = None
-        arguments.pop("agent_brain_id", None)
-        arguments.pop("org_id", None)
-        # Only re-send if there is plausibly time to finish. Below
-        # `_MIN_SLICE_BUDGET_S` a call buys a guaranteed timeout reported as a
-        # failure, which is the same doomed-call reasoning `_stop_before_slice`
-        # already applies to whole slices. Skipping costs little here: the dead
-        # id is ALREADY forgotten, so the next flush — SessionEnd, or the next
-        # commit — routes this session to long-term memory with a fresh budget.
-        left = _remaining()
-        if left is None or left >= _MIN_SLICE_BUDGET_S:
-            res = await _import(arguments, left)
-            if res is None:
-                return False, room
-            texts = _texts(res)
-        else:
-            # Reported HERE rather than by falling through to the isError
-            # branch. Falling through would breadcrumb the original "Agent
-            # brain not found" — the one thing that is no longer true, since
-            # the id has just been forgotten — and `capture_health` renders
-            # that breadcrumb to the user at SessionStart. They would go
-            # hunting a brain problem that has already fixed itself, while the
-            # thing that actually stopped this slice, the clock, went unnamed.
-            _log(f"{label}no budget left to re-send unrouted; the room is "
-                 "dropped, so the next flush reaches long-term memory")
-            _breadcrumb(arguments.get("conversation_id"), "budget_exhausted",
-                        f"ran out of time before re-sending slice {index} "
-                        "unrouted")
-            return False, room
 
     # MCP signals tool failure via isError + a message in content, NOT via an
     # exception — without this check a bad token or server error logs as
@@ -524,7 +419,7 @@ async def _send(session, arguments, room, title, namespace,
         # the server rejects — the one it reported least, which is the same
         # asymmetry the transport paths were fixed for one round earlier.
         _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
-        return False, room
+        return False
     out = getattr(res, "structuredContent", None)
     if isinstance(out, dict) and "conversation_id" not in out \
             and isinstance(out.get("result"), dict):
@@ -537,21 +432,16 @@ async def _send(session, arguments, room, title, namespace,
             except json.JSONDecodeError:
                 continue
     if isinstance(out, dict) and "conversation_id" in out:
-        # Name the destination: "flushed N records" alone can't distinguish a
-        # room write from a personal one, which is the failure mode this
-        # routing exists to fix.
-        dest = (f'room {room["brain_id"][:8]}' if room
-                else "personal memory (no room cached)")
         _log(f"{label}flushed {out.get('messages_received')} records "
              f"(conv {str(out.get('conversation_id'))[:8]}, "
-             f"path={out.get('path')}) -> {dest} "
+             f"path={out.get('path')}) -> personal memory "
              "— server processes the delta")
         # Retract any earlier failure on this path. Without it a single
         # throttled slice would keep warning for a day even though the backstop
         # went on to work — the same crying-wolf the per-turn hook clears with
         # `_mark_success`.
         _breadcrumb(arguments.get("conversation_id"), "", ok=True)
-        return True, room
+        return True
     # Not an error per the protocol, but not the shape import_conversation
     # returns either — log what came back instead of claiming success on an
     # arbitrary body, and stop: an unrecognised reply is not a slice landing.
@@ -560,7 +450,7 @@ async def _send(session, arguments, room, title, namespace,
     # The last silent exit on this path. Every way `_send` can return False now
     # leaves a trace — the guarantee is only worth something if it has no holes.
     _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", detail)
-    return False, room
+    return False
 
 
 def _auth_required(e: BaseException) -> bool:

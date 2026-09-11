@@ -76,12 +76,10 @@ already resolved.
 
 Save a **PR-scoped artifact** — the review record — into the repo's room.
 Do NOT import the session transcript. The Stop-hook capture already ships
-this session to this same room continuously, routed by the same room cache the
-capture hooks use,
-so an import would write a SECOND copy of the same conversation under a
-different id. Two transcripts of one session in one room produce competing
-facts and episodes that BOTH surface in retrieval — the exact failure
-artifact versioning exists to prevent — and it costs megabytes to do it.
+this session continuously into the user's personal memory — sessions are never
+captured into a brain — so an import would only re-upload megabytes for the
+server's watermark to discard. The review record is the only team-visible
+output of a babysit.
 
 What capture does not record is the judgment: which findings were real,
 which were rejected and why, and which commit answered each. That is this
@@ -114,18 +112,10 @@ step's whole value, and it is a page of text.
    ONCE (re-run "Every pass" step 2); still failing → report the error in
    step 4 rather than retrying.
 3. **Never import the transcript.** Per-turn capture already ships this
-   session, as it happens, into the room its `cwd` resolves to. Importing it
-   again would re-upload megabytes for the watermark to discard, and into a
-   different room it would extract the same session's facts and episodes a
-   second time.
-
-   The one gap: capture routes by the session's `cwd`, this babysit routes by
-   the PR's repo, so if you babysat a PR in repo B from a checkout of repo A,
-   B's room gets the artifact but not the reasoning trail. Do not paper over
-   it with an import — say so in the report (step 4), naming the room the
-   session DID land in, and let the user run `/memhub:import-session` if they
-   want it in B as well. That skill is the only one that imports, and it
-   imports under the session's own id.
+   session, as it happens, into the user's personal memory. Importing it again
+   would re-upload megabytes for the watermark to discard, and an import cannot
+   put it into a brain either: sessions always stay personal. The reasoning a
+   teammate needs belongs in the review record from step 1.
 4. Add one short top-level outcome note IN THE REPORT to the user: PR url
    and title, branch, findings per bot with accepted/rejected counts, and
    any repo-specific gotcha or bot false-positive tendency observed.

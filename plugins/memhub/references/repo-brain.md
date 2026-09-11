@@ -160,21 +160,25 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" name   # the §1 name
 ```
 
-Why this exists: the AUTOMATIC capture paths — the per-turn Stop flush, the
-SessionEnd hook and the commit/PR flush — run with no model in the loop. Before
-the cache they passed only `namespace` and their memories landed in **personal
-memory, never in the room**. Today the hooks resolve the room themselves on a
-cache miss (`brain_resolve.resolve_repo_brain` does the exact-name lookup and
-caches the answer), so capture only falls back to personal memory when no brain
-of the repo's exact name exists on this backend. The cache is what makes that
+Why this exists: everything that writes ARTIFACTS into the repo's room —
+`save_artifact.py`, the automatic `.md` spec capture (`md_capture_flush.py`),
+`/memhub:spec`, pr-babysit — needs one agreed id, and the SessionStart brief
+names the room from the same cache. On a cache miss the artifact writers
+resolve the room themselves (`brain_resolve.resolve_repo_brain` does the
+exact-name lookup and caches the answer). The cache is what makes that
 resolution a once-per-repo cost, records the org that owns the room
 (`set --org-id`, needed for writes outside the caller's default org), and
 collapses five skills' worth of independent re-derivation into one answer,
 which is the drift §1 warns about.
 
-`import_session.py` and `save_artifact.py` read it automatically when
-`--agent-brain-id` is not passed (`--no-room` opts out), so a plain invocation
-lands in the room.
+Session capture does NOT use it. The automatic capture hooks (Claude, Codex,
+Cursor) and `import_session.py` always send a session to **personal memory**,
+never to a brain: routing a session made its conversation's identity depend on
+a room decision that could change mid-session, and that split one session into
+two conversations.
+
+`save_artifact.py` reads the cache automatically when `--agent-brain-id` is not
+passed (`--no-room` opts out), so a plain invocation lands in the room.
 
 Because the key is the room NAME (derived from the remote), every worktree and
 subdirectory of a repo shares one entry automatically, with no dependence on

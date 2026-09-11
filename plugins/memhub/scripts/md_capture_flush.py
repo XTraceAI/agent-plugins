@@ -57,10 +57,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from artifact_sync_reminder import MAP_RELPATH, link_for_path  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from md_capture import MAX_BYTES, MIN_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly, read_room, repo_root  # noqa: E402
+from room_map import env_for_url, forget_room, git_env, git_readonly, read_room, repo_root  # noqa: E402
 
 TAG = "auto-captured"
 MAX_PER_TURN = 5          # a turn that rewrote 40 .md files is a migration, not deliverables
@@ -314,6 +314,10 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                 await s.initialize()
                 for raw, p, text, d in todo:
                     pending.pop(raw, None)
+                    # Reset per item, BEFORE the guarded body: the eviction in
+                    # the handler below must never act on the previous file's
+                    # room when this item fails before resolving its own.
+                    room = None
                     # The whole per-item body is guarded, not just the save:
                     # a malformed room file or odd content must skip ONE item
                     # (which stays dirty), never the rest of the turn.
@@ -333,18 +337,24 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                             "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
                                          f"re-save with save_artifact.py to publish",
                         }
-                        room = None
                         if root is not None:
                             # Cache first; on a miss, resolve from the server
-                            # over the session already open (same as the
-                            # transcript capture hooks) so an auto-captured
-                            # spec lands in the repo room when one exists.
+                            # over the session already open (the same lookup
+                            # save_artifact.py does) so an auto-captured spec
+                            # lands in the repo room when one exists.
                             room = read_room(p.parent, env) or \
                                 await resolve_repo_brain(s, p.parent, env)
                         if room:
                             call_args["agent_brain_id"] = room["brain_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
                     except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
+                        # A cached room the backend disowns is evicted, so the
+                        # next Stop resolves the room again instead of
+                        # re-sending the dead id until MAX_ATTEMPTS gives up on
+                        # the file. Session capture used to do this as a side
+                        # effect; it no longer routes sessions.
+                        if room and isinstance(e, SaveRejected) and is_missing_brain(str(e)):
+                            forget_room(p.parent, env)
                         _bump(attempts, raw, processed, f"{type(e).__name__}: {str(e)[:120]}",
                               gaveup, d)
                         continue

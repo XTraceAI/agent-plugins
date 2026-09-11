@@ -89,8 +89,7 @@ It prints `environment`, `mode`, `status`, then one of `credential` or
 
 ## After a successful first login
 
-If this was a first-time setup, mention that `/memhub:onboard` creates and
-seeds the repo's team brain. Capture already runs, and the hooks route to a
-brain named `Repo: <org>/<name>` on their own if one exists — but a repo with
-no such brain yet saves to personal memory until onboard creates it. Do not
-run it unprompted.
+If this was a first-time setup, mention that `/memhub:onboard` creates the
+repo's team brain, where specs and artifacts land. Capture already runs: every
+session is saved into the user's personal memory, never into a brain. Do not
+run onboard unprompted.

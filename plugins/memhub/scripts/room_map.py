@@ -4,19 +4,18 @@ writer routes to the same brain.
 
 Before this, each writer re-derived the room independently: five SKILL.md files
 each told the agent to build the name `Repo: <org>/<name>` and exact-match it in
-`list_agent_brains`, while the two AUTOMATIC capture paths (the SessionEnd hook
-and the commit/PR flush) passed only `namespace` and so never reached a brain at
-all — their memories landed in personal memory. A cached id makes the routing a
-property of the repo rather than something each caller rediscovers (and
-occasionally gets wrong).
+`list_agent_brains`. A cached id makes the routing a property of the repo rather
+than something each caller rediscovers (and occasionally gets wrong).
 
-The capture hooks no longer depend on `set` having run: on a cache miss they
-call `brain_resolve.resolve_repo_brain`, which does the same exact-name lookup
+Session capture does NOT read this cache: every session is captured into
+personal memory, never into a brain. The cache routes ARTIFACT writers
+(`save_artifact.py`, `md_capture_flush.py`) and names the room in the
+SessionStart brief. On a cache miss the artifact writers call
+`brain_resolve.resolve_repo_brain`, which does the same exact-name lookup
 against the server and caches what it finds. `set` is how a skill records a
-room it just resolved or created — so the first capture after onboarding
+room it just resolved or created — so the first artifact after onboarding
 routes without a lookup, and so the ORG that owns the room is recorded (see
-`--org-id`). Capture only falls back to personal memory when no brain of the
-repo's exact name exists on this backend.
+`--org-id`).
 
 The cache lives in the user's own config dir, NEVER inside the repo:
 
