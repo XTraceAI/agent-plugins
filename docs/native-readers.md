@@ -11,9 +11,21 @@ records, metadata = reader.to_canonical(path, strict=True)
 Default capture behavior stays unchanged. Checked reads reject invalid UTF-8
 text, malformed complete JSON rows, non-finite numbers, and Cursor content
 shapes the normalizer cannot preserve. Existing Cursor blob hashes, references
-and framing are checked before returning the tree. An unfinished final JSON
-record is deferred because native writers append their transcripts. Original
-files are not edited, and healthy inputs keep their IDs, usage and timestamps.
+and framing are checked before returning the tree. Original files are not
+edited, and healthy inputs keep their IDs, usage and timestamps.
+
+For JSONL, CR/LF terminates a committed row. An unparseable final fragment
+without that delimiter is deferred until a later read, even if its current
+bytes cannot be repaired solely by appending. This conservative framing rule
+does not attempt incremental JSON-prefix validation. A parseable final row
+is consumed and validated even without a delimiter; malformed terminated rows
+and invalid UTF-8 still fail.
+
+The Codex adapter retains its existing text/tool projection. Image and other
+non-text message blocks are outside that projection; their presence does not
+make an otherwise readable session fail. Checked mode validates consumed text
+and tool fields, not complete multimodal transcript fidelity. Tool input must
+be an object or string, which the normalizer can retain without dropping it.
 
 Cursor store metadata supports the native plain-JSON and hex-encoded JSON
 representations. Checked reads validate the decoded tree. Hex metadata retains
