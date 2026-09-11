@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -76,7 +77,7 @@ def test_strict_cursor_store_decodes_message_leaves_without_replacement():
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
             identity=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as connection:
+            with closing(sqlite3.connect(store)) as connection, connection:
                 connection.execute('DELETE FROM blobs')
                 connection.execute('INSERT INTO blobs VALUES (?,?)',(identity,raw))
                 connection.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':identity}),))
@@ -145,7 +146,7 @@ def test_strict_cursor_tree_rejects_missing_references_and_cycles_but_allows_sha
     for damage in ("missing_root", "missing_leaf", "missing_root_pointer", "cycle", "shared"):
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
-            with sqlite3.connect(store) as connection:
+            with closing(sqlite3.connect(store)) as connection, connection:
                 meta=json.loads(connection.execute("SELECT value FROM meta").fetchone()[0])
                 root=meta["latestRootBlobId"]
                 data=connection.execute("SELECT data FROM blobs WHERE id=?",(root,)).fetchone()[0]
@@ -190,7 +191,7 @@ def test_strict_cursor_tree_validates_complete_protobuf_nodes():
     for tail in tails:
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
-            with sqlite3.connect(store) as connection:
+            with closing(sqlite3.connect(store)) as connection, connection:
                 root=json.loads(connection.execute("SELECT value FROM meta").fetchone()[0])["latestRootBlobId"]
                 data=connection.execute("SELECT data FROM blobs WHERE id=?",(root,)).fetchone()[0]
                 updated=data+tail;identity=hashlib.sha256(updated).hexdigest()
@@ -212,7 +213,7 @@ def test_strict_cursor_store_rejects_non_message_leaves_and_invalid_content():
     for message in invalid:
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
-            with sqlite3.connect(store) as connection:
+            with closing(sqlite3.connect(store)) as connection, connection:
                 raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
                 connection.execute("DELETE FROM blobs")
                 connection.execute("INSERT INTO blobs VALUES (?,?)",(identity,raw))
@@ -227,7 +228,7 @@ def test_strict_cursor_hashes_reject_structurally_valid_modified_blobs():
     for leaf in (True,False):
         with tempfile.TemporaryDirectory() as td:
             store=fixtures._make_cursor_store(Path(td)/"chats")
-            with sqlite3.connect(store) as connection:
+            with closing(sqlite3.connect(store)) as connection, connection:
                 identity,data=next((key,value) for key,value in connection.execute("SELECT id,data FROM blobs")
                                    if value.startswith(b"{")==leaf)
                 changed=(json.dumps({"role":"assistant","content":"changed message"}).encode()
@@ -268,7 +269,7 @@ def test_strict_json_rejects_nonstandard_numbers_on_all_opted_in_loaders():
             store=fixtures._make_cursor_store(home/"chats")
             raw=('{"role":"assistant","content":"synthetic output","extra":'+constant+'}').encode()
             key=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0]);meta["latestRootBlobId"]=key
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
                 sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
@@ -277,11 +278,11 @@ def test_strict_json_rejects_nonstandard_numbers_on_all_opted_in_loaders():
             # Validate both native metadata locations, independent of leaf content.
             clean=b'{"role":"assistant","content":"synthetic output"}'
             key=hashlib.sha256(clean).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,clean))
                 sql.execute("UPDATE meta SET value=?",('{"latestRootBlobId":"'+key+'","extra":'+constant+'}',))
             rejected(lambda:cursor.to_canonical(store,strict=True))
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
             meta=store.parent/"meta.json";original=meta.read_text()
             meta.write_text(original.rstrip()[:-1]+',"extra":'+constant+'}')
@@ -311,7 +312,7 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
             message={"role":"assistant","content":[block],"usage":{"input_tokens":3}}
             raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0]);meta["latestRootBlobId"]=key
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
                 sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
@@ -335,7 +336,7 @@ def test_strict_cursor_user_blocks_preserve_text_or_reject_unsupported_content()
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
             message={"role":"user","content":[block]};raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 meta=json.loads(sql.execute("SELECT value FROM meta").fetchone()[0]);meta["latestRootBlobId"]=key
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
                 sql.execute("UPDATE meta SET value=?",(json.dumps(meta),))
@@ -379,7 +380,7 @@ def test_strict_cursor_assistant_text_and_reasoning_require_string_values():
             with tempfile.TemporaryDirectory() as td:
                 home=Path(td);store=fixtures._make_cursor_store(home/'chats');message={'role':'assistant','content':[block]}
                 raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
-                with sqlite3.connect(store) as sql:
+                with closing(sqlite3.connect(store)) as sql, sql:
                     meta=json.loads(sql.execute('SELECT value FROM meta').fetchone()[0]);meta['latestRootBlobId']=key
                     sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw));sql.execute('UPDATE meta SET value=?',(json.dumps(meta),))
                 transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[{'role':'assistant','message':{'content':[block]}}])
@@ -406,7 +407,7 @@ def test_strict_cursor_tool_result_fallback_preserves_supported_payloads():
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
             block={"type":"tool-result","toolCallId":"call","experimental_content":fallback}
             message={"role":"tool","content":[block]};raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
                 sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
             transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"tool","message":{"content":[block]}}])
@@ -423,7 +424,7 @@ def test_strict_cursor_tool_results_require_the_consumed_call_identifier():
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
             block={"type":"tool-result","result":"synthetic output",**identity}
             raw=json.dumps({"role":"tool","content":[block]}).encode();key=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(key,raw))
                 sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":key}),))
             transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[{"role":"tool","message":{"content":[block]}}])
@@ -448,7 +449,7 @@ def test_optional_bad_usage_remains_unknown_without_rejecting_the_session():
                 home=Path(td);store=fixtures._make_cursor_store(home/"chats")
                 message={"role":"assistant","content":"readable response",key:usage}
                 raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
-                with sqlite3.connect(store) as sql:
+                with closing(sqlite3.connect(store)) as sql, sql:
                     sql.execute("DELETE FROM blobs");sql.execute("INSERT INTO blobs VALUES (?,?)",(identity,raw))
                     sql.execute("UPDATE meta SET value=?",(json.dumps({"latestRootBlobId":identity}),))
                 transcript=fixtures._write_jsonl(home/f"{SID}.jsonl",[
@@ -485,7 +486,7 @@ def test_checked_metadata_decoding_rejects_invalid_utf8_at_both_store_locations(
                 path=store.parent/"meta.json";raw=path.read_bytes()
                 path.write_bytes(raw.rstrip()[:-1]+b',"extra":"invalid\xfftext"}')
             else:
-                with sqlite3.connect(store) as sql:
+                with closing(sqlite3.connect(store)) as sql, sql:
                     raw=sql.execute("SELECT value FROM meta").fetchone()[0].encode()
                     sql.execute("UPDATE meta SET value=?",(raw.rstrip()[:-1]+b',"extra":"invalid\xfftext"}',))
             originals={path:path.read_bytes() for path in (store,store.parent/"meta.json")}
@@ -535,7 +536,7 @@ def test_checked_cursor_empty_assistants_preserve_usage_and_legacy_identities():
                 {'role':'assistant','message':{'content':[{'type':'tool_use','name':'native-tool'}]}}])
             store=fixtures._make_cursor_store(home/'chats')
             raw=json.dumps(message).encode();identity=hashlib.sha256(raw).hexdigest()
-            with sqlite3.connect(store) as sql:
+            with closing(sqlite3.connect(store)) as sql, sql:
                 sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(identity,raw))
                 sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':identity}),))
             for source in (transcript,store):
@@ -553,6 +554,20 @@ def test_checked_cursor_empty_assistants_preserve_usage_and_legacy_identities():
             with transcript.open('a') as handle:
                 handle.write(json.dumps({'role':'assistant','message':{'content':'later'}})+'\n')
             assert cursor.to_canonical(transcript,strict=True)[0][:-1]==first
+
+
+def test_cursor_store_hex_encoded_metadata_preserves_the_native_tree():
+    with tempfile.TemporaryDirectory() as td:
+        store=fixtures._make_cursor_store(Path(td)/'chats')
+        expected=cursor.to_canonical(store,strict=True)
+        with closing(sqlite3.connect(store)) as sql, sql:
+            value=sql.execute('SELECT value FROM meta').fetchone()[0]
+            encoded=value.encode('utf-8').hex()
+            sql.execute('UPDATE meta SET value=?',(encoded,))
+        before=store.read_bytes()
+        assert cursor.to_canonical(store,strict=True)==expected
+        assert cursor.to_canonical(store)==expected
+        assert store.read_bytes()==before
 
 
 if __name__=='__main__':
