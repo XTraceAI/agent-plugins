@@ -6,6 +6,7 @@ import argparse
 from collections import Counter
 from contextlib import closing, contextmanager
 import datetime
+import io
 import json
 import math
 import os
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from readers import reader_for, validate_canonical
 from readers.strict_json import loads as load_json
-from readers.jsonl import open_lines, readline_bytes
+from readers.jsonl import readline_bytes
 
 
 def since_instant(value: str) -> float:
@@ -147,25 +148,29 @@ def historical_titles(reader, session_ids):
     """Read the complete title index once, keeping only selected identities."""
     found = {}
     try:
-        handle = open_lines(reader._SESSION_INDEX)
+        source = regular_source(reader._SESSION_INDEX)
     except FileNotFoundError:
         return found
-    with handle:
-        while raw := readline_bytes(handle, reader._INDEX_TAIL_BYTES):
-            text = raw.decode("utf-8")
-            if not text.strip():
-                continue
-            try:
-                row = load_json(text, strict=True)
-            except json.JSONDecodeError:
-                if raw.endswith((b"\n", b"\r")):
-                    raise
-                break
-            if not isinstance(row, dict):
-                raise ValueError("Codex title index row is not an object")
-            sid, name = row.get("id"), row.get("thread_name")
-            if isinstance(sid, str) and sid in session_ids and isinstance(name, str) and name.strip():
-                found[sid] = (reader._one_line(name), row.get("updated_at"))
+    try:
+        with source as (binary, _), io.TextIOWrapper(
+                binary, encoding="utf-8", errors="surrogateescape", newline="") as handle:
+            while raw := readline_bytes(handle, reader._INDEX_TAIL_BYTES):
+                text = raw.decode("utf-8")
+                if not text.strip():
+                    continue
+                try:
+                    row = load_json(text, strict=True)
+                except json.JSONDecodeError:
+                    if raw.endswith((b"\n", b"\r")):
+                        raise
+                    break
+                if not isinstance(row, dict):
+                    raise ValueError("Codex title index row is not an object")
+                sid, name = row.get("id"), row.get("thread_name")
+                if isinstance(sid, str) and sid in session_ids and isinstance(name, str) and name.strip():
+                    found[sid] = (reader._one_line(name), row.get("updated_at"))
+    except FileNotFoundError:
+        return found
     return found
 
 

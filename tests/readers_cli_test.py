@@ -987,6 +987,19 @@ def test_cursor_special_file_sidecars_are_rejected_without_blocking():
             assert (before.st_dev,before.st_ino)==(after.st_dev,after.st_ino)
 
 
+def test_codex_special_title_index_is_rejected_only_when_consumed():
+    if not hasattr(os,'mkfifo'):
+        return  # Native Windows does not expose POSIX FIFO creation.
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);rollout(home)
+        index=home/'.codex/session_index.jsonl';os.mkfifo(index)
+        result,rows=run(home,'codex','--metadata-only')
+        assert result.returncode==0 and len(rows)==1,result.stderr
+        result,rows=run(home,'codex')
+        assert result.returncode==2 and rows==[] and 'session_unreadable' in result.stderr
+        assert stat.S_ISFIFO(index.lstat().st_mode)
+
+
 def test_codex_bad_git_container_is_rejected_without_losing_identity_checks():
     for git in (17,[],False,'branch'):
         with tempfile.TemporaryDirectory() as td:
