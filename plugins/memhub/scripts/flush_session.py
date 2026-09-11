@@ -279,18 +279,21 @@ def _prepare_transcript(transcript_path: str):
     # smallest native message when a byte/count boundary isolates sidecars.
     # Its original UUID makes that context idempotent; never invent a record
     # or acknowledge an attachment-only transcript before its message exists.
-    messages = [row for row in records if isinstance(row.get("message"), dict) and row.get("uuid")]
+    messages = [row for row in records if isinstance(row.get("message"), dict)]
     if not messages:
         return
     encoded_size = lambda row: len(json.dumps(row, separators=(",", ":")))
-    context = min(messages, key=encoded_size)
+    context = min((row for row in messages if row.get("uuid")), key=encoded_size, default=None)
+    context_size = encoded_size(context) if context is not None else 0
     payloads = []
-    for part in make_slices(records, max(1, DEFAULT_CHUNK_BYTES - encoded_size(context))):
+    for part in make_slices(records, max(1, DEFAULT_CHUNK_BYTES - context_size)):
         for start in range(0, len(part), 2000):
             capped = part[start:start + 2000]
             if any(isinstance(row.get("message"), dict) for row in capped):
                 payloads.append(capped)
             else:
+                if context is None:
+                    raise ValueError("message-free batch has no stable native context UUID")
                 for offset in range(0, len(capped), 1999):
                     payloads.append(capped[offset:offset + 1999] + [context])
     return payloads, provenance, title, cwd, namespace
