@@ -24,6 +24,7 @@ import readers_cli
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "plugins/memhub/scripts/readers_cli.py"
 SID = "11111111-2222-3333-4444-555555555555"
+GENERATION_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 STAMP = "2026-01-01T00:00:00.123456789012Z"
 MTIME = 1788825600
 SYSTEM_ENV = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR') if key in os.environ}
@@ -146,7 +147,7 @@ def test_cursor_restores_saved_pins_without_writing_capture_state():
         assert "usage" not in target["message"]
         state = {"source_kind": "transcript", "transcript_path": str(path),
                  "offset": 73, "record_ts": {target["uuid"]: STAMP},
-                 "usage_events": cursor_flush._usage_events_with({}, "synthetic-generation", target["uuid"],
+                 "usage_events": cursor_flush._usage_events_with({}, GENERATION_ID, target["uuid"],
                      {"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 0,
                       "cache_creation_input_tokens": 0})}
         state_path = home / f".config/memhub-plugin/cursorflush/{SID}.json"
@@ -532,7 +533,9 @@ def test_existing_malformed_cursor_pins_are_incomplete_but_missing_is_optional()
             result,rows=run(home,"cursor")
             assert result.returncode==2 and rows==[] and "session_unreadable" in result.stderr
             assert "truncated" not in result.stderr and state.read_bytes()==before
-        state.write_text('{"record_ts":{"record":null},"usage_events":{}}')
+        target=next(row['uuid'] for row in reversed(cursor.to_canonical(path)[0])
+                    if row.get('type')=='assistant')
+        state.write_text(json.dumps({'record_ts':{target:None},'usage_events':{}}))
         result,rows=run(home,"cursor")
         assert result.returncode==0 and rows,result.stderr
         state.unlink()
@@ -578,7 +581,7 @@ def test_cursor_pins_follow_the_saved_representation_and_reject_mismatched_paths
         state_path=home/f".config/memhub-plugin/cursorflush/{SID}.json";state_path.parent.mkdir(parents=True)
         state={"source_kind":"transcript","transcript_path":str(path),
                "record_ts":{target["uuid"]:STAMP},"usage_events":cursor_flush._usage_events_with(
-                   {},"synthetic-generation",target["uuid"],{"input_tokens":7,"output_tokens":3})}
+                   {},GENERATION_ID,target["uuid"],{"input_tokens":7,"output_tokens":3})}
         state_path.write_text(json.dumps(state));saved=state_path.read_bytes()
         store=fixtures._make_cursor_store(home/".cursor/chats",uuid=SID)
         original={p:p.read_bytes() for p in [path,store,store.parent/"meta.json"]}
