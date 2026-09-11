@@ -703,6 +703,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
             # duplicate-linking — an unrelated call. Never happens for real Codex.
             call_id = pl.get("call_id") or pl.get("id") or f"codex-out-{idx}"
             output = pl.get("output")
+            if strict and output is None:
+                raise ValueError("Codex tool output must be present")
             if not isinstance(output, str):
                 output = json.dumps(output) if output is not None else ""
             out.append(user([{

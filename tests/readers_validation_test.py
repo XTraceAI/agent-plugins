@@ -867,6 +867,32 @@ def test_checked_codex_requires_native_session_identity_before_record_ids():
         assert identities[0] and identities[1] and identities[0].isdisjoint(identities[1])
 
 
+def test_checked_codex_tool_results_require_present_output():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1]
+        for missing in (True,False):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            result=next(row for row in rows if row.get('type')=='response_item'
+                        and row.get('payload',{}).get('type') in
+                        ('function_call_output','custom_tool_call_output'))
+            if missing:
+                result['payload'].pop('output',None)
+            else:
+                result['payload']['output']=None
+            fixtures._write_jsonl(path,rows);before=path.read_bytes()
+            codex.to_canonical(path)  # Existing capture remains tolerant.
+            rejected(lambda:codex.to_canonical(path,strict=True))
+            assert path.read_bytes()==before
+        for value in ('',{},[],False,0):
+            rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+            result=next(row for row in rows if row.get('type')=='response_item'
+                        and row.get('payload',{}).get('type') in
+                        ('function_call_output','custom_tool_call_output'))
+            result['payload']['output']=value;fixtures._write_jsonl(path,rows)
+            checked=codex.to_canonical(path,strict=True)
+            assert checked==codex.to_canonical(path)
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
