@@ -380,6 +380,8 @@ def _validate_message(message, *, source_kind):
             raise ValueError("Cursor message text must be a string")
         if kind == "tool-result" and not isinstance(block.get("result"), str):
             fallback = block.get("experimental_content")
+            if block.get("result") is None and fallback is None:
+                raise ValueError("Cursor tool result requires a result payload")
             if fallback is not None and not isinstance(fallback, str):
                 if not isinstance(fallback, list) or any(
                         not isinstance(item, dict) or item.get("type") != "text"
