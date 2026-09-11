@@ -522,7 +522,7 @@ def _created_at(meta: dict, *, strict: bool) -> str | None:
         if strict:
             raise ValueError("invalid Cursor creation timestamp")
         return None
-    return _iso_ms(value)
+    return _iso_ms(value, strict=strict)
 
 
 def _embedded_timestamp(text: str) -> str | None:

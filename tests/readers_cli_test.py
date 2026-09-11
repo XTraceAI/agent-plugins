@@ -970,6 +970,20 @@ def test_codex_bad_git_container_is_rejected_without_losing_identity_checks():
             assert result.returncode==2 and len(output)==1,result.stderr
 
 
+def test_cursor_out_of_range_start_is_incomplete_in_both_export_modes():
+    with tempfile.TemporaryDirectory() as td:
+        home=Path(td);store=fixtures._make_cursor_store(home/'.cursor/chats',uuid=SID)
+        path=store.parent/'meta.json';original=json.loads(path.read_text())
+        for value in (10**18,-10**18,1e300,10**400):
+            path.write_text(json.dumps({**original,'createdAtMs':value}))
+            for mode in ([],['--metadata-only']):
+                result,rows=run(home,'cursor',*mode)
+                assert result.returncode==2 and rows==[] and 'session_unreadable' in result.stderr
+            try:cursor._created_at({'createdAtMs':value},strict=True)
+            except ValueError:pass
+            else:raise AssertionError('checked creation conversion accepted out-of-range time')
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
