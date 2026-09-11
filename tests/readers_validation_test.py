@@ -556,18 +556,25 @@ def test_checked_cursor_empty_assistants_preserve_usage_and_legacy_identities():
             assert cursor.to_canonical(transcript,strict=True)[0][:-1]==first
 
 
-def test_cursor_store_hex_encoded_metadata_preserves_the_native_tree():
+def test_cursor_store_hex_metadata_validates_tree_without_changing_legacy_ids():
     with tempfile.TemporaryDirectory() as td:
         store=fixtures._make_cursor_store(Path(td)/'chats')
-        expected=cursor.to_canonical(store,strict=True)
         with closing(sqlite3.connect(store)) as sql, sql:
+            # Deliberately insert leaves in a different order than the tree.
+            rows=sql.execute('SELECT id,data FROM blobs').fetchall()
+            sql.execute('DELETE FROM blobs')
+            sql.executemany('INSERT INTO blobs VALUES (?,?)',reversed(rows))
             value=sql.execute('SELECT value FROM meta').fetchone()[0]
-            encoded=value.encode('utf-8').hex()
-            sql.execute('UPDATE meta SET value=?',(encoded,))
+            sql.execute('UPDATE meta SET value=?',(value.encode('utf-8').hex(),))
         before=store.read_bytes()
+        expected=cursor.to_canonical(store)
         assert cursor.to_canonical(store,strict=True)==expected
-        assert cursor.to_canonical(store)==expected
         assert store.read_bytes()==before
+        # Decoding hex must still expose corrupt/missing references.
+        with closing(sqlite3.connect(store)) as sql, sql:
+            sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':'0'*64}).encode().hex(),))
+        assert cursor.to_canonical(store)==expected
+        rejected(lambda:cursor.to_canonical(store,strict=True))
 
 
 def test_checked_codex_text_fields_cannot_silently_drop_supported_content():
