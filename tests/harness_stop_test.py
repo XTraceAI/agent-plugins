@@ -147,10 +147,12 @@ def test_stop_spawns_one_detached_child_and_returns():
     print("PASS test_stop_spawns_one_detached_child_and_returns")
 
 
-def _post(repo: Path, session: str, cmd: str, resp: dict):
+def _post(repo: Path, session: str, cmd: str, resp: dict, agent_id: str = ""):
     payload = {"session_id": session, "cwd": str(repo), "tool_name": "Bash",
                "hook_event_name": "PostToolUse", "tool_input": {"command": cmd},
                "tool_response": resp}
+    if agent_id:
+        payload["agent_id"] = agent_id
     proc = subprocess.run([sys.executable, str(SCRIPTS / "rulebook_hook.py"), "post"],
                           input=json.dumps(payload), capture_output=True, text=True,
                           timeout=30, env=dict(os.environ))
@@ -184,6 +186,12 @@ def test_a_failure_and_its_fix_are_one_moment_taken_at_the_boundary():
         assert rh.take_error_arcs("arc") == []
         _post(repo, "arc", "make x", {"stdout": "ok", "exit_code": 0})
         assert rh.take_error_arcs("arc") == []
+        # a subagent's failure and fix are its own: its Stop is ignored, so the
+        # main agent's next Stop must not take them
+        _post(repo, "arc", "pytest tests/y.py", {"stdout": "", "stderr": "E boom", "exit_code": 1},
+              agent_id="agent-7f")
+        _post(repo, "arc", "pytest tests/y.py", {"stdout": "1 passed", "exit_code": 0}, agent_id="agent-7f")
+        assert rh.take_error_arcs("arc") == [], "subagent arcs never reach the main turn"
         # the router sees the arc on a turn whose transcript shows no error
         hits = hx.route({"n": 1, "user": "ok", "asst": "done", "tools": [], "results": []}, None, arcs=arcs)
         assert dict(hits)["error_arc"] == "missing-module"

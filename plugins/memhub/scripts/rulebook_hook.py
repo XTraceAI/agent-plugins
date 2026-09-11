@@ -3795,7 +3795,9 @@ def main():
                     if mode == "pre" and tool in EDIT_TOOLS else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
-    if resp is not None and cmd and harness_extract_on():
+    # A subagent's arcs are its own: its Stop is ignored by harness_stop.py, so
+    # recording them under the session would hand them to the main agent's turn.
+    if resp is not None and cmd and not ctx["agent_id"] and harness_extract_on():
         try:
             pair_error_arc(session, cmd, resp)     # taken by harness_stop.py at Stop
         except Exception:
