@@ -153,10 +153,11 @@ def main() -> int:
         ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and "wrong_source" in p.stdout and [d["session_id"] for d in merged] == ["aaaaaaaa-1111-2222"]
         print(("ok  " if ok else "FAIL"), "a later run without --facets still reports the cached facet and writes it to facets.merged.json"); fails += not ok
 
-        a.write_text(_turns(3))
+        # grown by a tool result alone — a call still running when the facet was written — which moves neither the turn nor the call count
+        a.write_text(_turns(1) + "\n" + json.dumps({"type": "user", "cwd": "/w/demo", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Exit code 1"}]}}))
         p = _run("--out", str(out), home=home)
         ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"]
-        print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written is offered again"); fails += not ok
+        print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written — by a late tool result alone — is offered again"); fails += not ok
 
         repos = json.load(open(cache_dir / "repos.json")) if (cache_dir / "repos.json").is_file() else {}
         ok = "/w/demo" in repos

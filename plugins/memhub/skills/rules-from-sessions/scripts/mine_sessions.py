@@ -74,14 +74,16 @@ def _repo_name(cwd):
     """The repo a transcript's cwd belongs to. `repo_identity` lives beside the
     hook, which this script already imports as `rh`. Kept across runs: it asks
     git once per directory, and hundreds of worktree cwds made that the slowest
-    part of reading the sessions."""
+    part of reading the sessions. An answer that spent git's whole 0.5 s budget
+    may be a timeout's fallback basename: it is used for this run, never kept."""
     if cwd in _repo_cache: return _repo_cache[cwd]
+    started = time.time()
     try:
         from repo_identity import repo_name
         name = repo_name(cwd.rstrip("/"))
     except Exception:
         name = os.path.basename(cwd.rstrip("/"))
-    _repo_cache[cwd] = name
+    if time.time() - started < 0.4: _repo_cache[cwd] = name
     return name
 
 
@@ -136,7 +138,7 @@ def digest(s):
             "first_prompt": (turns[0] if turns else "")[:300],
             "user_turns": [{"i": i, "correction": bool(CORRECTION.search(t[:200])), "standard": bool(STANDARD.search(t[:300])), "text": t[:220]} for i, t in enumerate(turns[:25])],
             "tool_counts": dict(tools), "errors": errs[:4], "reverts": rev[:4]}
-_stamp = {s["id"]: f"{len(s['users'])}u{len(s['calls'])}c" for s in corpus}   # grows when a session is resumed: a facet read off an older stamp is stale
+_stamp = {s["id"]: f"{len(s['users'])}u{len(s['calls'])}c{len(s['results'])}r" for s in corpus}   # grows when a session does — a resumed turn, or a result that landed after its call: a facet read off an older stamp is stale
 digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
 M = len(corpus); by_host = collections.Counter(s["host"] for s in corpus)
 print(f"sessions read: {dict(by_host)} (M={M})  read errors: {dict(errs)}  ({time.time()-t0:.0f}s)")
