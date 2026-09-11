@@ -227,13 +227,17 @@ def _read_state(uuid: str, *, strict: bool = False) -> dict:
             raise ValueError("invalid saved Cursor observations")
         if strict:
             import datetime
-            for stamp in state.get("record_ts", {}).values():
-                if stamp is not None and (not isinstance(stamp, str) or
-                        datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).tzinfo is None):
+            for target_uuid, stamp in state.get("record_ts", {}).items():
+                if (not isinstance(target_uuid, str) or not _UUID_RE.fullmatch(target_uuid)
+                        or (stamp is not None and (not isinstance(stamp, str) or
+                        datetime.datetime.fromisoformat(
+                            stamp.replace("Z", "+00:00")).tzinfo is None))):
                     raise ValueError("invalid saved Cursor timestamp")
-            for event in state.get("usage_events", {}).values():
-                if (not isinstance(event, dict) or not isinstance(event.get("target_uuid"), str)
-                        or not event["target_uuid"] or cursor_reader.normalize_usage(event.get("usage")) is None):
+            for generation, event in state.get("usage_events", {}).items():
+                target_uuid = event.get("target_uuid") if isinstance(event, dict) else None
+                if (not isinstance(generation, str) or not _UUID_RE.fullmatch(generation)
+                        or not isinstance(target_uuid, str) or not _UUID_RE.fullmatch(target_uuid)
+                        or cursor_reader.normalize_usage(event.get("usage")) is None):
                     raise ValueError("invalid saved Cursor usage")
         return state
     except FileNotFoundError:
