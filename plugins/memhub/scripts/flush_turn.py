@@ -37,7 +37,6 @@ pop a browser, so it can only consume a token ``/memhub:login`` already minted.
 from __future__ import annotations
 
 import asyncio
-import copy
 from contextvars import ContextVar
 import math
 import json
@@ -71,6 +70,7 @@ from transcript_filter import (  # noqa: E402
 # Nothing here needs the SDK any more, so the indirection went with it.
 import capture_context  # noqa: E402
 import capture_async  # noqa: E402
+from capture_redaction import CACHE as _REDACTION_CACHE, redact_once as _redact_once
 import sinks  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
@@ -817,31 +817,6 @@ def _run_sink(hook_input: dict) -> int:
 # projection gets its own copy, so endpoint-specific arguments cannot mutate it.
 _DORMANCY_ALLOWED: ContextVar[bool] = ContextVar("turn_dormancy_allowed", default=True)
 
-_REDACTION_CACHE: ContextVar[dict | None] = ContextVar("turn_redaction_cache", default=None)
-
-
-def _redact_once(records):
-    cache = _REDACTION_CACHE.get()
-    if cache is None:
-        return redact_records(records)
-    result = []
-    items = cache["items"]
-    for record in records:
-        key = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        if key not in items:
-            redacted = redact_records([record])[0]
-            # Keep memory bounded for long catch-up sessions. Eviction only
-            # repeats redaction; it can never skip or change a record.
-            if len(key) > 8 * 1024 * 1024:
-                result.append(redacted)
-                continue
-            if cache["bytes"] + len(key) > 8 * 1024 * 1024:
-                items.clear()
-                cache["bytes"] = 0
-            items[key] = redacted
-            cache["bytes"] += len(key)
-        result.append(copy.deepcopy(items[key]))
-    return result
 
 
 async def _drain(session_id, transcript_path):
