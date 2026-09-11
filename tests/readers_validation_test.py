@@ -745,6 +745,60 @@ def test_discovery_skips_posix_special_files_and_keeps_regular_peers():
             assert len(errors)==2
 
 
+def test_checked_codex_rejects_malformed_response_envelopes():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];original=path.read_bytes()
+        expected=codex.to_canonical(path)
+        for payload in (None,17,False,'text',[],{}, {'type':None},{'type':17},{'type':''}):
+            path.write_bytes(original+json.dumps({'type':'response_item','payload':payload}).encode()+b'\n')
+            before=path.read_bytes()
+            assert codex.to_canonical(path)==expected
+            rejected(lambda:codex.to_canonical(path,strict=True))
+            assert path.read_bytes()==before
+
+
+def test_checked_codex_metadata_validates_returned_types_and_git_container():
+    with tempfile.TemporaryDirectory() as td:
+        path=sources(Path(td))[0][1];rows=copy.deepcopy(fixtures.CODEX_SYNTH)
+        for field in ('id','cwd','originator','timestamp'):
+            for value in ([],{},17,False):
+                changed=copy.deepcopy(rows);changed[0]['payload'][field]=value
+                fixtures._write_jsonl(path,changed);before=path.read_bytes()
+                rejected(lambda:codex.session_metadata(path))
+                codex.session_metadata(path,strict=False)
+                rejected(lambda:codex.to_canonical(path,strict=True))
+                assert path.read_bytes()==before
+        for git in (17,[],False,'branch',{'branch':[]},{'branch':17}):
+            changed=copy.deepcopy(rows);changed[0]['payload']['git']=git
+            fixtures._write_jsonl(path,changed)
+            rejected(lambda:codex.session_metadata(path))
+            codex.session_metadata(path,strict=False)
+            rejected(lambda:codex.to_canonical(path,strict=True))
+        for stamp in ('not-a-clock','2026-01-01T00:00:00',True):
+            changed=copy.deepcopy(rows);changed[0]['payload']['timestamp']=stamp
+            fixtures._write_jsonl(path,changed)
+            rejected(lambda:codex.session_metadata(path))
+        for git in (None,{}, {'branch':None},{'branch':'native-branch'}):
+            changed=copy.deepcopy(rows);changed[0]['payload'].update(git=git,timestamp=None)
+            fixtures._write_jsonl(path,changed)
+            meta=codex.session_metadata(path)
+            assert meta['session_id']==rows[0]['payload']['id']
+            assert meta['started_at']==rows[0]['timestamp']
+
+
+def test_cursor_optional_metadata_text_fields_have_valid_types():
+    with tempfile.TemporaryDirectory() as td:
+        store=fixtures._make_cursor_store(Path(td)/'chats');path=store.parent/'meta.json'
+        original=json.loads(path.read_text())
+        for field in ('gitBranch','source_surface'):
+            for value in ([],{},17,False):
+                path.write_text(json.dumps({**original,field:value}))
+                rejected(lambda:cursor.session_metadata(store))
+            for value in (None,'future-value'):
+                path.write_text(json.dumps({**original,field:value}))
+                assert cursor.session_metadata(store)
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
