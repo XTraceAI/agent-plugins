@@ -639,10 +639,9 @@ def new_stats() -> dict:
 def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
                  repo: str, env_name: str, stats: dict, trace, out_path: Path,
                  arcs: list[dict] | None = None, hook_version: str = "",
-                 timeout: float = 0, may_publish=None) -> dict | None:
+                 timeout: float = 0) -> dict | None:
     """One turn through router → window → classifier → moment. Returns the
-    moment appended to `out_path`, or None. `may_publish`, when given, is
-    asked once a signal comes back, and a False drops the moment."""
+    moment appended to `out_path`, or None."""
     hits = route(turn, prev, arcs)
     stats["router_hits"] += len(hits)
     trace(f"turn {turn.get('n')} | router: {[k for k, _ in hits] or '-'}")
@@ -671,9 +670,6 @@ def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
     moment = {"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
               "hint": hint, "kind": kind, "derivable": reply.get("derivable"),
               "state": state}
-    if may_publish is not None and not may_publish():
-        trace("   signal dropped: another child now holds this turn")
-        return None
     append_jsonl(out_path, moment)
     stats["moments"] += 1
     trace(f"   classifier ({dt}s): signal [{kind}], moment recorded")
