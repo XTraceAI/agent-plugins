@@ -8,8 +8,7 @@ each host's native plugin system.
 
 ## What's in here
 
-This repository publishes the `memhub` plugin to all three hosts. It also
-contains the Claude Code-only `fleet` plugin for coordinating parallel agents.
+This repository publishes the `memhub` plugin to all three hosts.
 
 ```
 .agents/plugins/marketplace.json    # Codex and Cursor marketplace
@@ -24,8 +23,6 @@ plugins/memhub/                     # production plugin installed by every host
 ├── hooks/                          # host-specific capture and recall hooks
 ├── scripts/                        # shared readers, capture, auth, and setup code
 └── skills/                         # model-invoked MemHub workflows
-plugins/fleet/
-└── ...                             # optional Claude Code fleet coordination
 codex/                              # legacy forwarding shims and Codex reference guide
 ```
 
@@ -297,6 +294,25 @@ you. The conflict check spans every book you can see, and flags a collision in
 a book you are *not* filing into: nothing you file can supersede that rule, and
 both will fire, so it goes to you as a decision.
 
+### Harness-tied memory (flagged off)
+
+With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin helps a
+correction you make in a session become a proposed team rule. At each turn's
+Stop, a detached child sends a redacted slice of that turn to MemHub
+(`POST /v1/team/rulebook/harness/classify`), whose classifier says whether the
+moment is worth the agent's attention. At your next prompt, one injected line
+hands a flagged moment to the agent that lived the turn: if there is a lesson
+that would change what an agent does next time, the agent proposes it with the
+memhub `create_rule` tool, asking you first if unsure. It files the rule into
+the rulebook `list_rulebooks` returns, asking you which one when you are in
+several, and replaces an existing rule on the same lesson instead of adding a
+twin. The rule lands
+`proposed` for a person to activate; nothing fires from it, and the plugin
+never activates one. The slice is redacted before it leaves the machine
+(MemHub keys, home directories, e-mail addresses, command-line credentials,
+quoted or not).
+With the variable unset, the default, none of this runs.
+
 ## Skills
 
 Thirteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
@@ -526,44 +542,6 @@ Hooks cannot call MCP tools, so this only **reminds** — the agent performs the
 bump stays visible and auditable instead of team memory being silently
 rewritten on every keystroke. Missing or malformed map, no git root, unwritable
 state → exit 0, no output; a reminder never blocks an edit.
-
-## Fleet plugin
-
-`plugins/fleet/` is a separate, local-only plugin for running **many Claude
-Code agents in parallel git worktrees of one repo**. All worktrees share the
-repo's common `.git` directory, so a single board file at
-`$(git rev-parse --git-common-dir)/fleet-board.json` is visible to every
-agent with no server and no auth. Hooks keep it current:
-
-- **SessionStart** — registers the session (branch, worktree, session id),
-  prunes stale/ghost entries, and injects a snapshot of the other active
-  agents into context.
-- **UserPromptSubmit** — heartbeats the entry, refreshes its one-line
-  "working on" from your prompt, and injects only the *delta* of sibling
-  changes since this agent last looked (joined / ended / committed /
-  changed focus). No changes → no injection, no token cost.
-- **PostToolUse** (git commits) — records the commit message and files
-  touched on this agent's entry, so siblings get collision warnings before
-  editing the same files.
-- **SessionEnd** — marks the entry ended (siblings see it; pruned later).
-
-For a human-facing view, `/fleet:status` (also triggered by "what's the
-fleet doing?") pretty-prints the board: who's active where, what each agent
-is working on, last commits with age, and any file overlaps between agents.
-
-To *start* a fleet instead of assembling it by hand, `/fleet:start <task>`
-decomposes the task into 2–4 independent workstreams (confirming the
-split first), provisions a worktree + branch + kickoff brief per stream, and
-launches a real session in each — interactive tabs (tmux/iTerm/Terminal) or
-`--headless` detached runs. Launched sessions register on the board through
-the normal hooks, so coordination from there is automatic.
-
-Pairs with the memhub plugin: the board says *who is doing what right now*
-(seconds, one line each); per-turn capture already lands every session's
-history in MemHub, so an agent that needs the *why* behind a sibling's
-change searches team memory with the session id from the board entry.
-Each board entry costs ~1 short line of injected context; everything fails
-soft (not a git repo / hook error → silent no-op).
 
 ## Notes & trade-offs
 
