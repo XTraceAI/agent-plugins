@@ -273,7 +273,9 @@ def test_real_platform_is_unconditional():
         }], {"cwd": None, "title": None})
         codex_flush.redact_once = lambda records: records
         codex_flush.mcp_http.Session = Session
-        codex_flush._save_state = lambda *_args, **_kwargs: None
+        async def save_state(*_args, **_kwargs):
+            pass
+        codex_flush._save_state = save_state
         codex_flush._log = lambda *_args, **_kwargs: None
         for url in ("https://api.memhub.xtrace.ai/mcp-server/mcp",
                     "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"):
@@ -331,7 +333,7 @@ def test_pr_url_is_queued_before_send_and_cleared_on_ack():
                 isError=False,
             )
 
-    def save_state(_sid, **fields):
+    async def save_state(_sid, **fields):
         state.update(fields)
 
     try:
