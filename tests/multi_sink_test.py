@@ -27,6 +27,7 @@ import capture_context
 import capture_redaction
 import capture_health
 import flush_turn as ft
+import capture_redaction
 import mcp_http
 import portable_lock
 import sinks

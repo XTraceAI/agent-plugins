@@ -1,6 +1,6 @@
 """Bounded background capture can exit without joining blocked network threads.
 
-The worker owns only blocking transport/authentication; cursor writes remain on
+The worker owns blocking transport, authentication and preparation; cursor writes remain on
 the awaiting event loop. Cancelling an await never schedules a later cursor
 advance. Daemon workers cannot keep the short-lived hook process alive.
 """
