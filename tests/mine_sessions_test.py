@@ -2,7 +2,7 @@
 to its own location (no env var), and run to completion on an empty HOME (zero
 sessions, no book, no facets) — the state a fresh teammate is in."""
 from __future__ import annotations
-import hashlib, json, os, subprocess, sys, tempfile
+import hashlib, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,6 +121,46 @@ def main() -> int:
         ok = "result-lane" in panel and "result-lane" not in retired
         print(("ok  " if ok else "FAIL"), "a result rule already on is replayed against tool output"); fails += not ok
         if fails: print("panel was:", panel)
+
+    # Reading a session is the expensive, model-side step, so each one is read once:
+    # facets written in one run stay in the cache, a later run offers only what is
+    # still unread, and a session that grew since its facet was written is offered again.
+    with tempfile.TemporaryDirectory() as home:
+        proj = Path(home) / ".claude" / "projects" / "demo"; proj.mkdir(parents=True)
+        def _turns(n): return "\n".join(json.dumps({"type": "user", "cwd": "/w/demo", "message": {"content": f"no, that is the wrong file ({i})"}}) for i in range(n))
+        a, b = proj / "aaaaaaaa-1111-2222.jsonl", proj / "bbbbbbbb-3333-4444.jsonl"
+        a.write_text(_turns(1)); b.write_text(_turns(2))
+        out = Path(home) / "out"
+        cache_dir = Path(home) / ".config" / "memhub-plugin" / "rules-from-sessions"
+        def _offered(): return sorted(os.path.basename(x) for batch in json.load(open(out / "digest_batches.json")) for x in batch)
+
+        p = _run("--out", str(out), "--digest-batch", "1", home=home)
+        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"] and len(json.load(open(out / "digest_batches.json"))) == 2
+        print(("ok  " if ok else "FAIL"), "first run: every session with signal is digested, --digest-batch per batch"); fails += not ok
+        if not ok: print(p.stdout[-600:], p.stderr[-600:])
+
+        (out / "facets").mkdir()
+        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-111", "friction": [{"category": "wrong_source", "detail": "edited the wrong file", "evidence_turn": 0}]}]))
+        p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
+        cached = json.load(open(cache_dir / "facets.json")) if (cache_dir / "facets.json").is_file() else []
+        ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and [d["session_id"] for d in cached] == ["aaaaaaaa-1111-2222"] and "wrong_source" in p.stdout
+        print(("ok  " if ok else "FAIL"), "a directory of batch facets: the short id resolves, the facet is cached, and its session is not offered again"); fails += not ok
+        if not ok: print(p.stdout[-600:], p.stderr[-600:], cached)
+
+        shutil.rmtree(out / "facets")
+        p = _run("--out", str(out), home=home)
+        merged = json.load(open(out / "facets.merged.json"))
+        ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and "wrong_source" in p.stdout and [d["session_id"] for d in merged] == ["aaaaaaaa-1111-2222"]
+        print(("ok  " if ok else "FAIL"), "a later run without --facets still reports the cached facet and writes it to facets.merged.json"); fails += not ok
+
+        a.write_text(_turns(3))
+        p = _run("--out", str(out), home=home)
+        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"]
+        print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written is offered again"); fails += not ok
+
+        repos = json.load(open(cache_dir / "repos.json")) if (cache_dir / "repos.json").is_file() else {}
+        ok = "/w/demo" in repos
+        print(("ok  " if ok else "FAIL"), "cwd -> repo names are kept across runs"); fails += not ok
     return 1 if fails else 0
 
 if __name__ == "__main__":

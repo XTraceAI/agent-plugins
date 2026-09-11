@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants rules for the Rulebook from what their team actually does — "/memhub:rules-from-sessions", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. One run reads the repo's CLAUDE.md AND the local Claude Code / Codex / Cursor transcripts, replays every candidate through the real hook, and proposes rules that each state why they exist (the CLAUDE.md sentence, or the sessions and the user's own words), what they cost, and what changes with them on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.
 argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--rulebook "<name or id>"] [--dry-run]
-allowed-tools: Bash, Read, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
+allowed-tools: Bash, Read, Write, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
 ---
 
 # Rules from sessions (and CLAUDE.md) — one run
@@ -86,8 +86,9 @@ parses.
   finds the plugin's `scripts/` next to it — no env var.
 - Inputs it takes: `--claude-md <path>` (repeatable), `--candidates <json
   list>` (repeatable: the checks you derive in step 2), `--rule-file <body>`
-  (one check — what `create-rule` calls for its backtest), `--facets`,
-  `--skills-file`, `--repo`, `--baseline-date`, `--digest-top`.
+  (one check — what `create-rule` calls for its backtest), `--facets <file
+  or dir>` (repeatable), `--skills-file`, `--repo`, `--baseline-date`,
+  `--digest-top`, `--digest-batch`, `--cache-dir`.
 - The memhub plugin installed (any host): the script reuses its
   `scripts/readers/` and `scripts/rulebook_hook.py` (`to_hook_rule`,
   `evaluate`, `shell_only`) — the real hook, never a re-implementation.
@@ -130,10 +131,19 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.
 
 It prints the report (§4) with the built-in checks replayed, writes
 `mine-out/proposals.json` and `mine-out/corpus.json`, and writes
-`mine-out/digests/<session>.json` for the top sessions (`--digest-top`,
-default 30) ranked by correction turns, errors and reverts. Its
+`mine-out/digests/<session>.json` for the top sessions not yet faceted
+(`--digest-top`, default 30) ranked by correction turns, errors and reverts,
+split into `mine-out/digest_batches.json` (`--digest-batch`, default 5). Its
 **WHAT CLAUDE.MD DECLARES** section lists every imperative sentence with
 its heading — the input to step 2.
+
+**A session is read once.** Facets from earlier runs live in
+`~/.config/memhub-plugin/rules-from-sessions/facets.json` (the cwd → repo
+names beside them in `repos.json`) and count in every later report without
+being passed; a session is offered for reading again only when it has grown
+since its facet was written. `mine-out/facets.merged.json` holds every facet
+for this run's sessions, earlier runs' included. Delete `facets.json` to read
+everything again — after changing the facet schema, say.
 
 ## 2. Give CLAUDE.md its checks — in your own reading, no model call
 
@@ -173,14 +183,26 @@ lanes first (table above), and write a `create_rule` body into a JSON list:
   "session"` by default. Output rules must be anchored to the line start —
   prose that merely mentions the error is the main false hit.
 
-## 3. Facet pass — you read the digests, you write facets.json
+## 3. Facet pass — one reader per batch, in parallel
 
-Read each digest (first prompt, user turns with corrections marked, errors,
-reverts — not the transcript) and write one object per session to
-`mine-out/facets.json`:
+`mine-out/digest_batches.json` lists the digests still to read, in batches.
+If it is `[]`, every session with signal is already faceted: go straight to
+the clustering below.
+
+Each batch gets one reader. In Claude Code, send one Agent call per batch,
+all in a single message so they run at once; on a host without subagents,
+read the batches yourself in turn. A reader's prompt carries its digest
+paths, the schema and the rules below, and its one output path,
+`mine-out/facets/batch-<n>.json` — and tells it: read only those digests
+(first prompt, user turns with corrections marked, errors, reverts — not the
+transcript), write only that file, run no git or any other command that
+changes state, and reply with the path alone. When they return, check each
+file exists and parses; a batch that failed stays unfaceted, and the next run
+offers it again. Each file holds one object per session, `session_id` and
+`stamp` copied from its digest:
 
 ```json
-[{"session_id": "…", "host": "claude", "repo": "…",
+[{"session_id": "…", "stamp": "…", "host": "claude", "repo": "…",
   "underlying_goal": "one sentence",
   "outcome": "achieved | mostly | partial | not",
   "friction": [{"category": "wrong_approach | misunderstood_request | buggy_code | unverified_claim | wrong_environment | wrong_source | autonomy_overreach | environment_issue | tool_failure",
@@ -198,8 +220,11 @@ error or revert is `friction: []` — do not invent one. `standards` is where
 org rules come from: any turn where a human asserts how the system must be
 built (the digests mark candidate turns with `standard: true` — read those
 even in sessions with no friction). `worked_well` is how strengths get
-mined instead of guessed; leave it out rather than flatter. Then cluster the
-details by eye and give each cluster a check the same way as step 2 (hook
+mined instead of guessed; leave it out rather than flatter.
+
+Then cluster the details — this run's in `mine-out/facets/*.json` and
+earlier runs' in `mine-out/facets.merged.json` — by eye, and give each
+cluster a check the same way as step 2 (hook
 lanes first): a `git` / `pytest` / `sed` form → `matcher`; an error
 signature → `matcher {event: output}`; an identifier (a repo name,
 `arxiv.org`, `README.md`) → `anchors`; none of those → a session-start
@@ -210,7 +235,7 @@ origin. Add the checkable ones to the same candidates list.
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" --out mine-out \
-  --candidates mine-out/candidates.json --facets mine-out/facets.json \
+  --candidates mine-out/candidates.json --facets mine-out/facets \
   --skills-file skills.json --claude-md ./CLAUDE.md
 ```
 
@@ -330,11 +355,12 @@ origin) and `quote_rx`.
 
 ```bash
 uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
-  --file mine-out/facets.json --name "session-facets" --agent-brain-id <repo brain id>
+  --file mine-out/facets.merged.json --name "session-facets" --agent-brain-id <repo brain id>
 ```
 
 Same name every time, so it versions. That is what makes friction a TEAM
-number: the next run (anyone's) can pull it, and the fires ledger shares
+number: it carries every facet for these sessions, earlier runs' included, so
+each version is the whole picture rather than one run's slice, and the fires ledger shares
 `session_id` with it, so "rule fired, friction still happened" is a join.
 
 Report per row: filed (with its trigger, and into which rulebook — name who
