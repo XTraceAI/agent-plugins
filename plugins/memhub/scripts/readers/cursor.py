@@ -377,6 +377,9 @@ def _validate_message(message, *, source_kind):
     if not isinstance(content, (str, list)) or (isinstance(content, list)
             and any(not isinstance(block, dict) for block in content)):
         raise ValueError("Cursor message has invalid content")
+    if isinstance(content, list):
+        for block in content:
+            _validate_model_options(block)
     role = message["role"]
     if role == "tool" and not isinstance(content, list):
         raise ValueError("Cursor tool message has invalid result blocks")
@@ -387,7 +390,6 @@ def _validate_message(message, *, source_kind):
     if role not in ("assistant", "tool") or isinstance(content, str):
         return
     for block in content:
-        _validate_model_options(block)
         kind = block.get("type")
         allowed = ("reasoning", "text", "tool-call", "tool_use") if role == "assistant" else ("tool-result",)
         if kind not in allowed:
