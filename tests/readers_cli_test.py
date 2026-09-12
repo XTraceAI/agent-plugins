@@ -1091,16 +1091,16 @@ def test_saved_state_is_applied_from_the_validated_descriptor():
             cursor_flush.STATE_DIR = original
 
 def test_absent_saved_state_is_never_reopened_by_path():
-    """If the state file was absent at validation time, nothing may reopen the
-    path afterwards (a FIFO swapped in would block). Proven by making any
-    path-based _read_state call fail loudly."""
+    """Absent at validation must stay absent through apply: cursor_source
+    returns an explicit empty state and apply_session_state consults no path.
+    A trap on _read_state proves neither step reopens it."""
     import tempfile
     import readers_cli, cursor_flush
     sid = "11111111-2222-4333-8444-555555555555"
     original_dir, original_read = cursor_flush.STATE_DIR, cursor_flush._read_state
     def trap(uuid, *, strict=False, text=None):
         if text is None:
-            raise AssertionError("cursor_source reopened an absent state path")
+            raise AssertionError("a state path was reopened")
         return original_read(uuid, strict=strict, text=text)
     with tempfile.TemporaryDirectory() as tmp:
         cursor_flush.STATE_DIR = pathlib.Path(tmp)
@@ -1108,11 +1108,41 @@ def test_absent_saved_state_is_never_reopened_by_path():
         try:
             src = pathlib.Path(tmp) / (sid + ".jsonl")
             src.write_text("", encoding="utf-8")
-            resolved, text = readers_cli.cursor_source(src, want_state=True)
-            assert resolved == src and text is None
+            resolved, state = readers_cli.cursor_source(src, want_state=True)
+            assert resolved == src and state == {}
+            records = [{"uuid": sid, "type": "assistant",
+                        "message": {"role": "assistant", "content": []}}]
+            cursor_flush.apply_session_state(records, sid, strict=True, state=state)
         finally:
             cursor_flush.STATE_DIR = original_dir
             cursor_flush._read_state = original_read
+
+
+def test_undated_fallback_title_is_bound_to_the_index_stamp():
+    """An undated matching row keeps an identical tuple across an unrelated
+    index append, but its effective mtime came from the index stamp, so the
+    changed stamp must count as a change."""
+    import tempfile, json as _json
+    import readers_cli, readers.codex as codex_reader
+    sid = "01a0" + "0" * 28
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = pathlib.Path(tmp) / "session_index.jsonl"
+        idx.write_text(_json.dumps({"id": sid, "thread_name": "Old"}) + "\n", encoding="utf-8")
+        original = codex_reader._SESSION_INDEX
+        codex_reader._SESSION_INDEX = idx
+        try:
+            titles = readers_cli.TitleIndex(codex_reader, {sid})
+            observation = titles.get(sid)
+            assert observation[0] == "Old" and titles.stamp_bound(observation)
+            stamp_used = titles.stamp
+            with open(idx, "a", encoding="utf-8") as fh:   # unrelated append
+                fh.write(_json.dumps({"id": "other", "thread_name": "x"}) + "\n")
+            assert titles.get(sid) == observation          # same tuple ...
+            assert titles.stamp != stamp_used              # ... different stamp
+            dated = ("T", "2026-09-12T00:00:00Z")
+            assert not titles.stamp_bound(dated)
+        finally:
+            codex_reader._SESSION_INDEX = original
 
 def test_checked_title_index_rejects_malformed_matching_row():
     """A matching historical title row with a non-string thread_name must fail

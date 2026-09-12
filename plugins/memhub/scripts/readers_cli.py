@@ -92,13 +92,14 @@ def source_revision(path: Path, host: str) -> tuple:
 def cursor_source(path: Path, *, select_saved=False, want_state=False):
     """Never restore index-derived pins onto a different representation.
 
-    ``want_state`` also returns the saved-state bytes this call validated, so
-    the caller can apply them without reopening the path.
+    ``want_state`` also returns the saved state this call validated and parsed
+    (``{}`` when the file was absent), so the caller can apply it without any
+    path being reopened afterwards.
     """
     from cursor_flush import _read_state, _state_path, _UUID_RE, _source_for
     sid = path.parent.name if path.name == "store.db" else path.stem
     if not _UUID_RE.fullmatch(sid):
-        return (path, None) if want_state else path
+        return (path, {}) if want_state else path
     saved_text = None
     saved_absent = False
     try:
@@ -115,13 +116,13 @@ def cursor_source(path: Path, *, select_saved=False, want_state=False):
     if kind is None:
         if state.get("usage_events") or any(state.get("record_ts", {}).values()):
             raise ValueError("saved observations have no source provenance")
-        return (path, saved_text) if want_state else path
+        return (path, state) if want_state else path
     if kind in {"store", "transcript"}:
         _, saved, error = _source_for(sid, {}, state)
         if saved is not None:
             saved = saved.resolve(strict=True)
             if select_saved or saved == path:
-                return (saved, saved_text) if want_state else saved
+                return (saved, state) if want_state else saved
     raise ValueError("saved observations belong to another source")
 
 
@@ -210,6 +211,18 @@ class TitleIndex:
                 raise ValueError("title index changed while reading")
             self.rows, self.stamp = rows, stamp
         return self.rows.get(sid, (None, None))
+
+    def stamp_bound(self, observation):
+        """True when this observation's time falls back to the index file's
+        stamp, so a changed index invalidates it even if the row is identical."""
+        title, updated = observation
+        if title is None:
+            return False
+        try:
+            since_instant(updated)
+            return False
+        except (TypeError, AttributeError, argparse.ArgumentTypeError):
+            return True
 
     def mtime(self, observation):
         title, updated = observation
@@ -432,7 +445,10 @@ def main(argv=None) -> int:
                 with source_snapshot(path, args.host) as snapshot:
                     def fallback_title(sid):
                         observation = titles.get(sid)
-                        used_title.append(observation)
+                        # Remember the index stamp too: an undated row keeps
+                        # its tuple across unrelated index changes, but its
+                        # effective mtime came from that stamp.
+                        used_title.append((observation, titles.stamp))
                         header["mtime"] = max(header["mtime"], titles.mtime(observation))
                         return observation[0]
                     options = {"title_index": fallback_title} if titles is not None else {}
@@ -441,17 +457,22 @@ def main(argv=None) -> int:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
                     from cursor_flush import apply_session_state
-                    # Revalidate against the state covered by this revision, and
-                    # apply the bytes that validation actually read.
-                    _, saved_text = cursor_source(path, want_state=True)
+                    # Revalidate against the state covered by this revision and
+                    # apply the state that validation parsed; an absent file is
+                    # an explicit empty state, so no path is reopened here.
+                    _, saved_state = cursor_source(path, want_state=True)
                     apply_session_state(records, header["native_session_id"],
-                                        strict=True, state_text=saved_text)
+                                        strict=True, state=saved_state)
                 if records and validate_canonical(records):
                     raise ValueError("reader emitted invalid canonical records")
                 header["title"] = native_text(native.get("title"))
-            if used_title and titles.get(header["native_session_id"]) != used_title[0]:
-                diagnostic("source_changed", path)
-                continue
+            if used_title:
+                observation, stamp_used = used_title[0]
+                current = titles.get(header["native_session_id"])
+                if current != observation or (
+                        titles.stamp_bound(observation) and titles.stamp != stamp_used):
+                    diagnostic("source_changed", path)
+                    continue
             if source_revision(path, args.host) != revision:
                 diagnostic("source_changed", path)
                 continue
