@@ -2,6 +2,7 @@
 """Native reader stream: real CLI, existing reader parity and read-only state."""
 from __future__ import annotations
 
+import pathlib
 import copy
 import contextlib
 import io
@@ -1054,6 +1055,40 @@ def test_cursor_out_of_range_start_is_incomplete_in_both_export_modes():
             except ValueError:pass
             else:raise AssertionError('checked creation conversion accepted out-of-range time')
 
+
+def test_saved_state_is_applied_from_the_validated_descriptor():
+    """Proof the check/use race is closed. The state path is swapped for a
+    directory after its bytes are read; applying those bytes still succeeds,
+    while the old reopen-by-path behaviour refuses. STATE_DIR is patched
+    directly because cursor_flush resolves it at import time."""
+    import tempfile, json as _json
+    import cursor_flush
+    sid = "11111111-2222-4333-8444-555555555555"
+    target_uuid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+    original = cursor_flush.STATE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        cursor_flush.STATE_DIR = pathlib.Path(tmp)
+        try:
+            path = cursor_flush._state_path(sid)
+            path.write_text(_json.dumps({"usage_events": {sid: {
+                "target_uuid": target_uuid, "usage": {"inputTokens": 5}}}}), encoding="utf-8")
+            with open(path, "rb") as handle:          # the validated descriptor
+                validated = handle.read().decode("utf-8")
+            path.unlink()
+            path.mkdir()                              # any reopen-by-path now fails
+            records = [{"uuid": target_uuid, "type": "assistant",
+                        "message": {"role": "assistant", "content": [], "model": "m"}}]
+            cursor_flush.apply_session_state(records, sid, strict=True,
+                                             state_text=validated)
+            assert records[0]["message"]["usage"]["input_tokens"] == 5
+            reopened = False
+            try:
+                cursor_flush.apply_session_state(records, sid, strict=True)
+            except (OSError, ValueError):
+                reopened = True
+            assert reopened, "apply_session_state still reopened the swapped path"
+        finally:
+            cursor_flush.STATE_DIR = original
 
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):

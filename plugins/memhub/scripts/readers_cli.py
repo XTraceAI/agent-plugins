@@ -89,29 +89,36 @@ def source_revision(path: Path, host: str) -> tuple:
     return tuple(revision)
 
 
-def cursor_source(path: Path, *, select_saved=False) -> Path:
-    """Never restore index-derived pins onto a different representation."""
+def cursor_source(path: Path, *, select_saved=False, want_state=False):
+    """Never restore index-derived pins onto a different representation.
+
+    ``want_state`` also returns the saved-state bytes this call validated, so
+    the caller can apply them without reopening the path.
+    """
     from cursor_flush import _read_state, _state_path, _UUID_RE, _source_for
     sid = path.parent.name if path.name == "store.db" else path.stem
     if not _UUID_RE.fullmatch(sid):
-        return path
+        return (path, None) if want_state else path
+    saved_text = None
     try:
-        with regular_source(_state_path(sid)):
-            pass
+        with regular_source(_state_path(sid)) as (handle, _observed):
+            # Parse these exact bytes: reopening by path would let another
+            # process swap in a FIFO or symlink after the check.
+            saved_text = handle.read().decode("utf-8")
     except FileNotFoundError:
         pass
-    state = _read_state(sid, strict=True)
+    state = _read_state(sid, strict=True, text=saved_text)
     kind = state.get("source_kind")
     if kind is None:
         if state.get("usage_events") or any(state.get("record_ts", {}).values()):
             raise ValueError("saved observations have no source provenance")
-        return path
+        return (path, saved_text) if want_state else path
     if kind in {"store", "transcript"}:
         _, saved, error = _source_for(sid, {}, state)
         if saved is not None:
             saved = saved.resolve(strict=True)
             if select_saved or saved == path:
-                return saved
+                return (saved, saved_text) if want_state else saved
     raise ValueError("saved observations belong to another source")
 
 
@@ -426,8 +433,11 @@ def main(argv=None) -> int:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
                     from cursor_flush import apply_session_state
-                    cursor_source(path)  # Revalidate against the state covered by this revision.
-                    apply_session_state(records, header["native_session_id"], strict=True)
+                    # Revalidate against the state covered by this revision, and
+                    # apply the bytes that validation actually read.
+                    _, saved_text = cursor_source(path, want_state=True)
+                    apply_session_state(records, header["native_session_id"],
+                                        strict=True, state_text=saved_text)
                 if records and validate_canonical(records):
                     raise ValueError("reader emitted invalid canonical records")
                 header["title"] = native_text(native.get("title"))
