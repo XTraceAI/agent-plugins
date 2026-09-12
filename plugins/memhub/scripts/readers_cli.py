@@ -100,14 +100,17 @@ def cursor_source(path: Path, *, select_saved=False, want_state=False):
     if not _UUID_RE.fullmatch(sid):
         return (path, None) if want_state else path
     saved_text = None
+    saved_absent = False
     try:
         with regular_source(_state_path(sid)) as (handle, _observed):
             # Parse these exact bytes: reopening by path would let another
             # process swap in a FIFO or symlink after the check.
             saved_text = handle.read().decode("utf-8")
     except FileNotFoundError:
-        pass
-    state = _read_state(sid, strict=True, text=saved_text)
+        # Absent stays absent. Falling through to _read_state would reopen the
+        # path, and a FIFO created in the meantime would block there.
+        saved_absent = True
+    state = {} if saved_absent else _read_state(sid, strict=True, text=saved_text)
     kind = state.get("source_kind")
     if kind is None:
         if state.get("usage_events") or any(state.get("record_ts", {}).values()):
@@ -174,8 +177,13 @@ def historical_titles(reader, session_ids):
                 if not isinstance(row, dict):
                     raise ValueError("Codex title index row is not an object")
                 sid, name = row.get("id"), row.get("thread_name")
-                if isinstance(sid, str) and sid in session_ids and isinstance(name, str) and name.strip():
-                    found[sid] = (reader._one_line(name), row.get("updated_at"))
+                if isinstance(sid, str) and sid in session_ids:
+                    if name is not None and not isinstance(name, str):
+                        # A matching row is the native title; ignoring a
+                        # malformed one would hide it behind a derived name.
+                        raise ValueError("Codex title index row has a malformed thread name")
+                    if isinstance(name, str) and name.strip():
+                        found[sid] = (reader._one_line(name), row.get("updated_at"))
     except FileNotFoundError:
         return found
     return found

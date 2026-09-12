@@ -1090,6 +1090,53 @@ def test_saved_state_is_applied_from_the_validated_descriptor():
         finally:
             cursor_flush.STATE_DIR = original
 
+def test_absent_saved_state_is_never_reopened_by_path():
+    """If the state file was absent at validation time, nothing may reopen the
+    path afterwards (a FIFO swapped in would block). Proven by making any
+    path-based _read_state call fail loudly."""
+    import tempfile
+    import readers_cli, cursor_flush
+    sid = "11111111-2222-4333-8444-555555555555"
+    original_dir, original_read = cursor_flush.STATE_DIR, cursor_flush._read_state
+    def trap(uuid, *, strict=False, text=None):
+        if text is None:
+            raise AssertionError("cursor_source reopened an absent state path")
+        return original_read(uuid, strict=strict, text=text)
+    with tempfile.TemporaryDirectory() as tmp:
+        cursor_flush.STATE_DIR = pathlib.Path(tmp)
+        cursor_flush._read_state = trap
+        try:
+            src = pathlib.Path(tmp) / (sid + ".jsonl")
+            src.write_text("", encoding="utf-8")
+            resolved, text = readers_cli.cursor_source(src, want_state=True)
+            assert resolved == src and text is None
+        finally:
+            cursor_flush.STATE_DIR = original_dir
+            cursor_flush._read_state = original_read
+
+def test_checked_title_index_rejects_malformed_matching_row():
+    """A matching historical title row with a non-string thread_name must fail
+    the checked read instead of silently yielding a derived title."""
+    import tempfile, json as _json
+    import readers_cli, readers.codex as codex_reader
+    sid = "01a0" + "0" * 28
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = pathlib.Path(tmp) / "session_index.jsonl"
+        idx.write_text(_json.dumps({"id": sid, "thread_name": 17}) + "\n", encoding="utf-8")
+        original = codex_reader._SESSION_INDEX
+        codex_reader._SESSION_INDEX = idx
+        try:
+            ok = True
+            try:
+                readers_cli.TitleIndex(codex_reader, {sid}).get(sid)
+                ok = False
+            except ValueError:
+                pass
+            assert ok, "checked title index accepted a malformed matching row"
+        finally:
+            codex_reader._SESSION_INDEX = original
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
