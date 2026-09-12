@@ -192,23 +192,45 @@ def discovery_roots(reader) -> list[Path]:
     return [reader._CHATS, reader._PROJECTS]
 
 
-def discovered_path(reader, path) -> tuple[Path, tuple]:
+def root_anchors(reader) -> dict:
+    """Where each configured root led before discovery ran.
+
+    A configured root may be a stable symlink. Its target is recorded here,
+    before list_sessions(), so a root retargeted after discovery cannot make a
+    same-named file under the new target pass as the discovered one.
+    """
+    anchors = {}
+    for root in discovery_roots(reader):
+        try:
+            anchors[root] = root.resolve(strict=True)
+        except OSError:
+            continue
+    return anchors
+
+
+def discovered_path(reader, path, anchors) -> tuple[Path, tuple]:
     """Resolve one discovered row without following an alias below its root.
 
     Discovery lstat()s every component beneath a configured root and reports
     aliases as incomplete. A symlink swapped in after that observation must
     not be followed here either, or the command would validate and emit the
     external target under a discovered name. The root itself may be a
-    configured symlink, so components stop at the root. The recheck and the
-    resolution are separate operations, so the result is anchored to the
-    identity the recheck observed: whatever resolve() returns must be that
-    very file, and the identity is returned for later reads to demand.
+    configured symlink, so components stop at the root; the resolved file
+    must then sit exactly where the root led before discovery. The recheck
+    and the resolution are separate operations, so the result is also
+    anchored to the identity the recheck observed: whatever resolve()
+    returns must be that very file, and the identity is returned for later
+    reads to demand.
     """
     path = Path(path)
+    expected = None
     for root in discovery_roots(reader):
         if path.is_relative_to(root):
             components = [item for item in (path, *path.parents) if item != root
                           and item.is_relative_to(root)]
+            if root not in anchors:
+                raise ValueError("discovered source root appeared after discovery")
+            expected = anchors[root] / path.relative_to(root)
             break
     else:
         components = [path]
@@ -222,17 +244,19 @@ def discovered_path(reader, path) -> tuple[Path, tuple]:
     if leaf is None or not stat.S_ISREG(leaf.st_mode):
         raise ValueError("discovered source is not a regular file")
     resolved = path.resolve(strict=True)
+    if expected is not None and resolved != expected:
+        raise ValueError("discovered source root was retargeted after discovery")
     after = resolved.lstat()
     if not stat.S_ISREG(after.st_mode) or identity(after) != identity(leaf):
         raise ValueError("discovered source changed while it was resolved")
     return resolved, identity(leaf)
 
 
-def discovered_source(reader, path: Path, discovered):
+def discovered_source(reader, path: Path, discovered, anchors):
     """The anchored identity of the discovered row resolving to ``path``, or None."""
     for row in discovered:
         try:
-            resolved, anchor = discovered_path(reader, row["path"])
+            resolved, anchor = discovered_path(reader, row["path"], anchors)
         except (OSError, ValueError):
             continue
         if resolved == path:
@@ -418,6 +442,7 @@ def main(argv=None) -> int:
                 return 2
             sessions = [{"path": str(path)}]
         else:
+            anchors = root_anchors(reader)
             options = {"include_representations": True} if args.host == "cursor" else {}
             sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"), **options)
             discovered = list(sessions)
@@ -452,10 +477,10 @@ def main(argv=None) -> int:
                         reader._iso_ms(value, strict=True)
                         return value / 1000
                     return row["mtime"]
-                latest, _ = discovered_path(reader, max(discovered, key=latest_mtime)["path"])
+                latest, _ = discovered_path(reader, max(discovered, key=latest_mtime)["path"], anchors)
                 if args.host == "cursor":
                     latest, _, latest_seen = cursor_selection(latest, select_saved=True)
-                    if discovered_source(reader, latest, discovered) is None:
+                    if discovered_source(reader, latest, discovered, anchors) is None:
                         diagnostic("session_unavailable")
                         return 2
                     # Discovery prefers stores, whereas native latest may
@@ -469,7 +494,7 @@ def main(argv=None) -> int:
                     # Same-ID copies were counted above. Other UUIDs are not
                     # part of this request and must not prepare metadata/state.
                     sessions = ([{"path": str(latest)}] if len(matches) == 1 else matches)
-                if discovered_source(reader, latest, sessions) is None:
+                if discovered_source(reader, latest, sessions, anchors) is None:
                     sessions.append({"path": str(latest)})
     except (OSError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
         diagnostic("discovery_incomplete")
@@ -499,13 +524,13 @@ def main(argv=None) -> int:
             if explicit_path:
                 path, anchor = path.resolve(strict=True), None
             else:
-                path, anchor = discovered_path(reader, path)
+                path, anchor = discovered_path(reader, path, anchors)
             if args.host == "cursor":
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
                 path, _, seen = cursor_selection(path, select_saved=select_saved)
                 if not explicit_path:
-                    anchor = discovered_source(reader, path, discovered)
+                    anchor = discovered_source(reader, path, discovered, anchors)
                     if anchor is None:
                         raise ValueError("saved Cursor source was excluded by discovery")
             revision = source_revision(path, args.host, expect=anchor)

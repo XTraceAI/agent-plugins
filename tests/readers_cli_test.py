@@ -1453,6 +1453,71 @@ def test_root_level_sources_get_their_own_snapshot_directory():
             os.chdir(previous)
 
 
+def test_configured_root_symlinks_are_anchored_across_discovery():
+    """A configured root may be a stable symlink. Retargeting it after
+    list_sessions() returns must not let a same-named file under the new
+    target pass as the discovered one: the resolved file has to sit exactly
+    where the root led before discovery."""
+    import tempfile
+    import readers_cli, cursor_flush
+    other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    for host in ("codex", "cursor"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            reader = codex if host == "codex" else cursor
+            before, after = home / "before", home / "after"
+            if host == "codex":
+                rollout(before)
+                rows = copy.deepcopy(fixtures.CODEX_SYNTH)
+                rows[0]["payload"].update(id=other, timestamp=STAMP)
+                write_jsonl(after / ".codex/sessions/2026/01/01/rollout-synthetic.jsonl", rows)
+                link, targets = home / "sessions", (before / ".codex/sessions", after / ".codex/sessions")
+                roots = {"_SESSIONS": link}
+            else:
+                transcript(before)
+                write_jsonl(after / f".cursor/projects/synthetic/agent-transcripts/{SID}/{SID}.jsonl",
+                            [dict(row, uuid=row["uuid"].replace("a", "b")) if isinstance(row, dict) and "uuid" in row else row
+                             for row in fixtures.CURSOR_TRANSCRIPT])
+                link, targets = home / "projects", (before / ".cursor/projects", after / ".cursor/projects")
+                roots = {"_CHATS": home / ".cursor/chats", "_PROJECTS": link}
+            link.symlink_to(targets[0], target_is_directory=True)
+            real_list = reader.list_sessions
+
+            def retargeted(*args, **kwargs):
+                discovered = real_list(*args, **kwargs)
+                assert discovered, "discovery through the stable root symlink must find the session"
+                link.unlink()
+                link.symlink_to(targets[1], target_is_directory=True)   # retarget after discovery
+                return discovered
+
+            original_dir = cursor_flush.STATE_DIR
+            cursor_flush.STATE_DIR = home / ".config/memhub-plugin/cursorflush"
+            try:
+                with patch.multiple(reader, list_sessions=retargeted, **roots):
+                    for selection in ([], ["--session", "latest"]):
+                        for mode in ([], ["--metadata-only"]):
+                            link.unlink()
+                            link.symlink_to(targets[0], target_is_directory=True)
+                            output, errors = io.StringIO(), io.StringIO()
+                            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                                status = readers_cli.main(["--host", host, *selection, *mode])
+                            emitted = [json.loads(line) for line in output.getvalue().splitlines()]
+                            headers = [row for row in emitted if row.get("type") == "session"]
+                            assert status == 2 and not headers, (host, selection, mode, headers, errors.getvalue())
+                            assert "session_unreadable" in errors.getvalue() or "discovery_incomplete" in errors.getvalue()
+                # A stable root symlink keeps working.
+                link.unlink()
+                link.symlink_to(targets[0], target_is_directory=True)
+                with patch.multiple(reader, **roots):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                        status = readers_cli.main(["--host", host, "--metadata-only"])
+                headers = [json.loads(line) for line in output.getvalue().splitlines()]
+                assert status == 0 and len(headers) == 1 and headers[0]["path"].startswith(str(targets[0].resolve())), (host, headers)
+            finally:
+                cursor_flush.STATE_DIR = original_dir
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the
