@@ -1074,6 +1074,25 @@ def test_saved_state_can_be_parsed_from_prevalidated_bytes():
     assert records[0]["message"]["usage"]["input_tokens"] == 5
 
 
+def test_strict_codex_rejects_malformed_in_rollout_thread_name():
+    """A thread_name_updated event carries the native title; a non-string value
+    must fail a checked read rather than fall back to sidecar or first prompt."""
+    import readers.codex as codex_reader
+    rollout = [{"type": "event_msg",
+                "payload": {"type": "thread_name_updated", "thread_name": 17}}]
+    ok = True
+    try:
+        codex_reader._rollout_thread_name(rollout, strict=True)
+        ok = False
+    except ValueError:
+        pass
+    assert ok, "checked read accepted a malformed thread_name_updated"
+    assert codex_reader._rollout_thread_name(rollout, strict=False) is None
+    good = [{"type": "event_msg",
+             "payload": {"type": "thread_name_updated", "thread_name": "Real name"}}]
+    assert codex_reader._rollout_thread_name(good, strict=True) == "Real name"
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

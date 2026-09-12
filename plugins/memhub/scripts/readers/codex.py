@@ -332,7 +332,7 @@ def _one_line(name: str) -> str | None:
     return first[0].strip()[:_MAX_NAME] if first and first[0].strip() else None
 
 
-def _rollout_thread_name(rollout: list[dict]) -> str | None:
+def _rollout_thread_name(rollout: list[dict], *, strict: bool = False) -> str | None:
     """The name CODEX gave this thread, as recorded in the rollout itself.
 
     Codex names a substantive thread and shows that name in its own UI, writing
@@ -358,6 +358,10 @@ def _rollout_thread_name(rollout: list[dict]) -> str | None:
         if pl.get("type") != "thread_name_updated":
             continue
         name = pl.get("thread_name")
+        if strict and name is not None and not isinstance(name, str):
+            # Symmetric with the sidecar title: a checked read must not
+            # silently replace a corrupted native title with a fallback.
+            raise ValueError("Codex thread name update is malformed")
         if isinstance(name, str) and name.strip():
             found = _one_line(name) or found
     return found
@@ -452,7 +456,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict=False, 
     and reshaping it would reintroduce the very disagreement this ladder
     exists to remove. Only the derived fallbacks are normalized.
     """
-    thread_name = (_rollout_thread_name(rollout)
+    thread_name = (_rollout_thread_name(rollout, strict=strict)
                    or (title_index(session_id) if callable(title_index) else
                        title_index.get(session_id) if title_index is not None else
                        _sidecar_thread_name(session_id, strict=strict)))
