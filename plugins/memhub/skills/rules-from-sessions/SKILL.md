@@ -198,7 +198,10 @@ transcript), write only that file, run no git or any other command that
 changes state, and reply with the path alone. When they return, check each
 file exists and parses; a batch that failed stays unfaceted, and so does a
 facet missing its `friction` list or `outcome` (the script warns and skips
-it) — the next run offers those sessions again. Each file holds one object per session, `session_id` and
+it) — the next run offers those sessions again. The script empties
+`mine-out/facets/` when it writes the batches, so a file there is always this
+round's and a reader that wrote nothing leaves none — which is why step 1 is
+run once per round, not again between the readers and step 4. Each file holds one object per session, `session_id` and
 `stamp` copied from its digest:
 
 ```json

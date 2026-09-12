@@ -171,18 +171,21 @@ for d in new:
     if held and held.get("stamp") == _stamp[full] and d["stamp"] != _stamp[full]: continue   # a batch file left from an earlier run in a reused --out must not overwrite this run's reading
     _facet_cache[full] = d; new_here.append(d)
 if new_here: _save_cache("facets.json", list(_facet_cache.values()))
-facets = [d for sid, d in _facet_cache.items() if sid in _stamp]   # this corpus only: a --repo run keeps to its repo, and another repo's batch left in a reused --out is not reported or uploaded
+# This corpus only (a --repo run keeps to its repo, and another repo's batch left in a reused --out is neither
+# reported nor uploaded), and only readings of the session AS IT IS NOW: a session that has grown since its facet
+# was written is pending, and its old reading must not be clustered beside the new one.
+_fresh = {sid: d for sid, d in _facet_cache.items() if sid in _stamp and d.get("stamp", _stamp[sid]) == _stamp[sid]}
+facets = list(_fresh.values())
 json.dump(facets, open(os.path.join(args.out, "facets.merged.json"), "w"), indent=1)   # every facet for these sessions, earlier runs' included — what step 6 sends to the team
 for d in facets:
     fr = [x for x in (d.get("friction") or []) if isinstance(x, dict)]
     d["friction_counts"] = dict(collections.Counter(x.get("category") for x in fr if x.get("category") in FRICTION_VOCAB))
     d["friction_detail"] = d.get("friction_detail") or "; ".join(x.get("detail", "") for x in fr)
-def _faceted(d):
-    f = _facet_cache.get(d["session_id"])
-    return f is not None and f.get("stamp", d["stamp"]) == d["stamp"]
+def _faceted(d): return d["session_id"] in _fresh   # read, and read as the session is now — the same test the report uses
 pending = [d for d in digests if d["score"] > 0 and not _faceted(d)]   # score 0: no correction, error, revert or standard — nothing for a facet to hold
 ddir = os.path.join(args.out, "digests"); os.makedirs(ddir, exist_ok=True)
-os.makedirs(os.path.join(args.out, "facets"), exist_ok=True)   # the readers write here, and are told to change nothing else
+fdir = os.path.join(args.out, "facets"); os.makedirs(fdir, exist_ok=True)   # the readers write here, and are told to change nothing else
+for old in glob.glob(os.path.join(fdir, "*.json")): os.remove(old)   # cleared at dispatch (after the import above), so a file here is always this round's: a reader that wrote nothing leaves none, rather than an earlier round's file passing for its output
 for old in glob.glob(os.path.join(ddir, "*.json")): os.remove(old)   # a digest from an earlier pass may be faceted by now
 paths = []
 for d in pending[:args.digest_top]:

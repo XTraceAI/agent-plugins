@@ -160,16 +160,17 @@ def main() -> int:
         # grown by a tool result alone — a call still running when the facet was written — which moves neither the turn nor the call count
         a.write_text(_turns(1) + "\n" + json.dumps({"type": "user", "cwd": "/w/demo", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Exit code 1"}]}}))
         p = _run("--out", str(out), home=home)
-        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"]
-        print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written — by a late tool result alone — is offered again"); fails += not ok
+        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"] and json.load(open(out / "facets.merged.json")) == []
+        print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written — by a late tool result alone — is offered again, and its stale reading leaves the report"); fails += not ok
 
         # A reused --out: this run's reading lands in batch-1, a stale copy from an earlier run still sits in batch-2 and loads after it
         (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "outcome": "mostly", "friction": []}]))
         (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "stamp": "1u0c0r", "outcome": "mostly", "friction": []}]))
         p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
         stamps = {d["session_id"]: d.get("stamp") for d in json.load(open(cache_dir / "facets.json"))}
-        ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and stamps.get("aaaaaaaa-1111-2222") == "1u0c1r"
-        print(("ok  " if ok else "FAIL"), "a stale batch file from an earlier run does not overwrite this run's reading"); fails += not ok
+        ok = (p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and stamps.get("aaaaaaaa-1111-2222") == "1u0c1r"
+              and not list((out / "facets").glob("*.json")))   # cleared at dispatch: a reader that writes nothing leaves no file to pass for its output
+        print(("ok  " if ok else "FAIL"), "a stale batch file does not overwrite this run's reading, and the readers' files are cleared for the next round"); fails += not ok
         if not ok: print(stamps, _offered())
     return 1 if fails else 0
 
