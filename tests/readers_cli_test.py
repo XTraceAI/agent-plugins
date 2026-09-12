@@ -1121,6 +1121,54 @@ def test_absent_saved_state_is_never_reopened_by_path():
             cursor_flush._read_state = original_read
 
 
+def test_header_probes_never_reopen_the_native_path():
+    """Metadata probes and full reads must consume the validated descriptor or
+    the private snapshot: a trap on every by-name open under the native home
+    proves the rollout, store and meta.json are never reopened by path."""
+    import builtins, tempfile
+    import readers_cli, cursor_flush
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td).resolve()
+        sources = {"codex": [rollout(home)],
+                   "cursor": [fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID),
+                              transcript(home)]}
+        real_open, real_path_open = builtins.open, pathlib.Path.open
+        violations = []
+
+        def native(target):
+            try:
+                return pathlib.Path(os.fsdecode(target)).resolve().is_relative_to(home)
+            except (TypeError, ValueError, OSError):
+                return False
+
+        def trap_open(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)) and native(file):
+                violations.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        def trap_path_open(self, *args, **kwargs):
+            if native(self):
+                violations.append(str(self))
+            return real_path_open(self, *args, **kwargs)
+
+        original_dir = cursor_flush.STATE_DIR
+        cursor_flush.STATE_DIR = home / ".config/memhub-plugin/cursorflush"
+        try:
+            for host, paths_ in sources.items():
+                for source in paths_:
+                    for mode in ([], ["--metadata-only"]):
+                        output = io.StringIO()
+                        with patch("builtins.open", trap_open), \
+                                patch.object(pathlib.Path, "open", trap_path_open), \
+                                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                            status = readers_cli.main(["--host", host, "--session", str(source), *mode])
+                        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+                        assert status == 0 and [row["type"] for row in rows].count("session") == 1, (host, source, mode)
+                        assert not violations, (host, source, mode, violations)
+        finally:
+            cursor_flush.STATE_DIR = original_dir
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

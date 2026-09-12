@@ -158,10 +158,12 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return normalize_usage(raw)
 
 
-def _read_meta_json(session_dir: Path, *, strict=False) -> dict | None:
+def _read_meta_json(session_dir: Path, *, strict=False, text=None) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        value = load_json(p.read_text(encoding="utf-8"), strict=strict)
+        if text is None:
+            text = p.read_text(encoding="utf-8")
+        value = load_json(text, strict=strict)
         if strict and isinstance(value, dict):
             for key in ("cwd", "gitBranch", "source_surface"):
                 if value.get(key) is not None and not isinstance(value[key], str):
@@ -818,11 +820,14 @@ def to_canonical(path, *, session_id: str | None = None,
         model_hint=None, created_ts=_created_at(mj, strict=strict), strict=strict)
 
 
-def session_metadata(path) -> dict:
-    """Native identity and start; a first user message is not a session start."""
+def session_metadata(path, *, meta_text: str | None = None) -> dict:
+    """Native identity and start; a first user message is not a session start.
+
+    ``meta_text`` carries meta.json already read through a validated
+    descriptor, so the sidecar is not reopened by name."""
     source = Path(path)
     if source.name == "store.db":
-        meta = _read_meta_json(source.parent, strict=True)
+        meta = _read_meta_json(source.parent, strict=True, text=meta_text)
         version = meta.get("schemaVersion") if isinstance(meta, dict) else None
         if type(version) is not int or version != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")

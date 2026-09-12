@@ -399,14 +399,23 @@ def main(argv=None) -> int:
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
                 raise ValueError("invalid mtime")
+            # Header probes read through the validated descriptor, like the
+            # snapshot below: nothing reopens the native path by name after
+            # source_revision(), so a swapped-in FIFO or alias cannot block or
+            # redirect the probe before the final revision check.
             if args.host == "codex":
                 # Parse once and count the native identity before validating
                 # other values; malformed duplicates must not appear unique.
-                source_header = reader._session_header(path)
+                with regular_source(path) as (handle, _):
+                    source_header = reader._session_header(handle)
                 sid = native_text(source_header.get("payload", {}).get("id"), required=True)
                 native = None
             else:
-                native = reader.session_metadata(path)
+                meta_text = None
+                if path.name == "store.db":
+                    with regular_source(path.parent / "meta.json") as (handle, _):
+                        meta_text = handle.read().decode("utf-8")
+                native = reader.session_metadata(path, meta_text=meta_text)
                 sid = native_text(native.get("session_id"), required=True)
             # A readable identity still collides when another header field is bad.
             counts[f"{reader.HOST}-{sid}"] += 1
