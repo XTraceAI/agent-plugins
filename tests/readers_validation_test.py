@@ -997,6 +997,40 @@ def test_checked_codex_metadata_rejects_nontext_cli_version():
             assert codex.to_canonical(path,strict=True)==codex.to_canonical(path)
 
 
+def test_strict_codex_validates_every_turn_context_model():
+    """A later malformed turn_context.model must fail a checked read even when
+    an earlier turn context already supplied a valid session model."""
+    import readers.codex as codex_reader
+    rollout = [
+        {"type": "session_meta", "payload": {"id": "01a0" + "0" * 28, "cwd": "/tmp",
+                                             "originator": "codex-tui", "cli_version": "0.149.0"}},
+        {"type": "turn_context", "payload": {"model": "gpt-6-astra"}},
+        {"type": "turn_context", "payload": {"model": 17}},
+    ]
+    ok = True
+    try:
+        codex_reader.rollout_to_claude_records(rollout, strict=True)
+        ok = False
+    except ValueError:
+        pass
+    assert ok, "checked read accepted a malformed later turn_context.model"
+    records, meta = codex_reader.rollout_to_claude_records(rollout[:2], strict=True)
+    assert meta["model"] == "gpt-6-astra"
+
+
+def test_saved_cursor_usage_is_normalized_before_emit():
+    """Saved alias spellings must reach canonical records as canonical counters;
+    validate_canonical does not inspect usage, so a raw map would ship as-is."""
+    import cursor_flush
+    records = [{"uuid": "u1", "type": "assistant",
+                "message": {"role": "assistant", "content": [], "model": "m"}}]
+    cursor_flush._apply_usage(records, {"g1": {"target_uuid": "u1",
+                                               "usage": {"inputTokens": 7}}})
+    usage = records[0]["message"]["usage"]
+    assert "inputTokens" not in usage, usage
+    assert usage["input_tokens"] == 7, usage
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
