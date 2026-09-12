@@ -954,19 +954,22 @@ def test_checked_native_models_are_nonblank_text_or_unknown():
                 rejected(lambda:cursor.to_canonical(source,strict=True))
                 assert source.read_bytes()==before
     for model in (17,False,[],{},'  '):
-        with tempfile.TemporaryDirectory() as td:
-            home=Path(td);store=fixtures._make_cursor_store(home/'chats')
-            block={'type':'text','text':'synthetic output',
-                   'providerOptions':{'cursor':{'modelName':model}}}
-            message={'role':'assistant','content':[block]}
-            raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
-            with closing(sqlite3.connect(store)) as sql,sql:
-                sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw))
-                sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':key}),))
-            transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[
-                {'role':'assistant','message':{'content':[block]}}])
-            for source in (store,transcript):
-                rejected(lambda:cursor.to_canonical(source,strict=True))
+        for role,base in (('assistant',{'type':'text','text':'synthetic output'}),
+                          ('user',{'type':'text','text':'synthetic input'}),
+                          ('system',{'type':'text','text':'synthetic context'}),
+                          ('tool',{'type':'tool-result','toolCallId':'call','result':'done'})):
+            with tempfile.TemporaryDirectory() as td:
+                home=Path(td);store=fixtures._make_cursor_store(home/'chats')
+                block={**base,'providerOptions':{'cursor':{'modelName':model}}}
+                message={'role':role,'content':[block]}
+                raw=json.dumps(message).encode();key=hashlib.sha256(raw).hexdigest()
+                with closing(sqlite3.connect(store)) as sql,sql:
+                    sql.execute('DELETE FROM blobs');sql.execute('INSERT INTO blobs VALUES (?,?)',(key,raw))
+                    sql.execute('UPDATE meta SET value=?',(json.dumps({'latestRootBlobId':key}),))
+                transcript=fixtures._write_jsonl(home/f'{SID}.jsonl',[
+                    {'role':role,'message':{'content':[block]}}])
+                for source in (store,transcript):
+                    rejected(lambda:cursor.to_canonical(source,strict=True))
     for model in (None,'native-model'):
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/'chats')
