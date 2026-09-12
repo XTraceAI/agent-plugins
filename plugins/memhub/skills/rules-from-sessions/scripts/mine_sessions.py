@@ -15,7 +15,7 @@ Friction delta: --baseline-date splits facet friction before/after a rulebook ch
 Stdlib + the memhub plugin's readers + the real hook evaluate() (never re-implemented).
 Usage: mine_sessions.py [--out DIR] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
 """
-import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex
+import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex, functools
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="mine-out")
@@ -25,10 +25,19 @@ ap.add_argument("--repo", help="only sessions in this repo (resolved, so a workt
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
 ap.add_argument("--rule-file", action="append", default=[], help="a create_rule body (matcher / ordering / anchors) to backtest as a candidate (repeatable) — used by create-rule")
 ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST of create_rule bodies (repeatable) — the checks you derived from CLAUDE.md in step 2; each may carry `claude_md: {heading, text}` (its origin sentence), `did`, `what`, `quote_rx`, `source_ref`")
-ap.add_argument("--facets", help="facets.json YOU wrote from the digests (see SKILL.md step 2) — replaces the need to run /insights")
-ap.add_argument("--digest-top", type=int, default=30, help="how many sessions to digest for the facet pass (ranked by corrections, errors, reverts)")
+ap.add_argument("--facets", action="append", default=[], help="facets YOU wrote from the digests (see SKILL.md step 3): a JSON list, or a directory of them (one per batch); repeatable. Merged into the facet cache, so a session is read once")
+ap.add_argument("--digest-top", type=int, default=30, help="how many not-yet-faceted sessions to digest for the facet pass (ranked by corrections, errors, reverts)")
+ap.add_argument("--digest-batch", type=int, default=5, help="digests per batch in digest_batches.json — one reader per batch")
+ap.add_argument("--cache-dir", default=os.path.expanduser("~/.config/memhub-plugin/rules-from-sessions"), help="where facets are kept across runs")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
+os.makedirs(args.cache_dir, exist_ok=True)
+def _load_cache(name, default):
+    try: return json.load(open(os.path.join(args.cache_dir, name)))
+    except Exception: return default
+def _save_cache(name, data):
+    tmp = os.path.join(args.cache_dir, name + ".tmp")
+    json.dump(data, open(tmp, "w")); os.replace(tmp, os.path.join(args.cache_dir, name))
 
 def _plugin_scripts():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +53,11 @@ def _plugin_scripts():
 P = _plugin_scripts(); sys.path.insert(0, P)
 from readers import claude, codex, cursor  # noqa: E402
 spec = importlib.util.spec_from_file_location("rh", os.path.join(P, "rulebook_hook.py")); rh = importlib.util.module_from_spec(spec); spec.loader.exec_module(rh)
+# The replay asks every rule about every call, so the hook re-normalises the same command text once per rule —
+# three quarters of a run. These are pure str -> str: memoising them on this copy of the module leaves every
+# answer byte-identical and the live hook untouched.
+for _fn in ("strip_leading_assignments", "strip_comments", "shell_only"):
+    setattr(rh, _fn, functools.lru_cache(maxsize=None)(getattr(rh, _fn)))
 t0 = time.time()
 
 # ---------------------------------------------------------------- corpus
@@ -56,7 +70,9 @@ R = {"claude": claude, "codex": codex, "cursor": cursor}
 corpus, errs = [], collections.Counter()
 def _repo_name(cwd):
     """The repo a transcript's cwd belongs to. `repo_identity` lives beside the
-    hook, which this script already imports as `rh`."""
+    hook, which this script already imports as `rh`. Not kept across runs: its
+    fallback (the directory's basename) cannot be told apart from a resolved
+    name, and a kept wrong name would drop sessions from `--repo` for good."""
     try:
         from repo_identity import repo_name
         return repo_name(cwd.rstrip("/"))
@@ -110,14 +126,12 @@ def digest(s):
     tools = collections.Counter(c["tool"] for c in s["calls"])
     stds = [t for t in turns if STANDARD.search(t[:300])]
     score = 3 * len(corr) + min(len(errs), 10) + 2 * len(rev) + 2 * min(len(stds), 5)
-    return {"session_id": s["id"], "host": s["host"], "repo": s["repo"], "start": s["start"], "score": score,
+    return {"session_id": s["id"], "stamp": _stamp[s["id"]], "host": s["host"], "repo": s["repo"], "start": s["start"], "score": score,
             "first_prompt": (turns[0] if turns else "")[:300],
             "user_turns": [{"i": i, "correction": bool(CORRECTION.search(t[:200])), "standard": bool(STANDARD.search(t[:300])), "text": t[:220]} for i, t in enumerate(turns[:25])],
             "tool_counts": dict(tools), "errors": errs[:4], "reverts": rev[:4]}
+_stamp = {s["id"]: f"{len(s['users'])}u{len(s['calls'])}c{len(s['results'])}r" for s in corpus}   # grows when a session does — a resumed turn, or a result that landed after its call: a facet read off an older stamp is stale
 digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
-os.makedirs(os.path.join(args.out, "digests"), exist_ok=True)
-for d in digests[:args.digest_top]: json.dump(d, open(os.path.join(args.out, "digests", d["session_id"][:12] + ".json"), "w"), indent=1)
-print(f"digests: top {min(args.digest_top, len(digests))} of {len(corpus)} sessions written to {args.out}/digests/ (ranked by corrections/errors/reverts; read these and write facets.json — SKILL.md step 2)")
 M = len(corpus); by_host = collections.Counter(s["host"] for s in corpus)
 print(f"sessions read: {dict(by_host)} (M={M})  read errors: {dict(errs)}  ({time.time()-t0:.0f}s)")
 print("tool calls per host:", {h: sum(len(s['calls']) for s in corpus if s['host'] == h) for h in R})
@@ -125,17 +139,60 @@ def sample(s, text): return {"session": s["id"][:8], "host": s["host"], "repo": 
 
 # ---------------------------------------------------------------- seed: /insights facets
 FRICTION_VOCAB = ("wrong_approach", "misunderstood_request", "buggy_code", "unverified_claim", "wrong_environment", "wrong_source", "autonomy_overreach", "environment_issue", "tool_failure")
-facets = []
-if args.facets:   # the facets YOU wrote from the digests (fixed schema; see SKILL.md)
-    try:
-        for d in json.load(open(args.facets)):
-            fr = d.get("friction") or []
+def corpus_id(sid):
+    """The full corpus id for a facet's session_id — a reader may copy the 12-char prefix a digest's file is named by."""
+    sid = str(sid or "")
+    if sid in _stamp: return sid
+    hits = [k for k in _stamp if k.startswith(sid)] if len(sid) >= 6 else []
+    return hits[0] if len(hits) == 1 else None
+new = []
+for path in args.facets:   # the facets YOU wrote from the digests (fixed schema; see SKILL.md) — a file, or a directory of batch files
+    p = os.path.expanduser(path)
+    for fp in (sorted(glob.glob(os.path.join(p, "*.json"))) if os.path.isdir(p) else [p]):
+        try: lst = json.load(open(fp))
+        except Exception as e: print(f"[warn] --facets {fp} unreadable: {e}", file=sys.stderr); continue
+        for d in (lst if isinstance(lst, list) else [lst]):
+            if not isinstance(d, dict): continue
+            fr = d.get("friction")
+            if not (isinstance(fr, list) and all(isinstance(x, dict) for x in fr) and d.get("outcome") in ("achieved", "mostly", "partial", "not")):   # a cached facet marks its session read for good
+                print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: incomplete (needs a friction list of objects and an outcome) — skipped, so the session stays unread", file=sys.stderr); continue
             bad = [x.get("category") for x in fr if x.get("category") not in FRICTION_VOCAB]
-            if bad: print(f"[warn] facets.json {d.get('session_id','?')[:8]}: unknown friction category {bad} (allowed: {', '.join(FRICTION_VOCAB)})", file=sys.stderr)
-            d["friction_counts"] = dict(collections.Counter(x.get("category") for x in fr if x.get("category") in FRICTION_VOCAB))
-            d["friction_detail"] = d.get("friction_detail") or "; ".join(x.get("detail", "") for x in fr)
-            facets.append(d)
-    except Exception as e: print(f"[warn] --facets unreadable: {e}", file=sys.stderr)
+            if bad: print(f"[warn] facets {str(d.get('session_id','?'))[:8]}: unknown friction category {bad} (allowed: {', '.join(FRICTION_VOCAB)})", file=sys.stderr)
+            new.append(d)
+# Reading a session is the expensive, model-side step, so each one is read once: facets accumulate in the cache,
+# and a session is offered for reading again only if it has grown since (its stamp changed).
+_facet_cache = {str(d["session_id"]): d for d in _load_cache("facets.json", []) if isinstance(d, dict) and d.get("session_id")}
+new_here = []
+for d in new:
+    full = corpus_id(d.get("session_id"))
+    if not full: continue
+    d["session_id"] = full; d.setdefault("stamp", _stamp[full])
+    held = _facet_cache.get(full)
+    if held and held.get("stamp") == _stamp[full] and d["stamp"] != _stamp[full]: continue   # a batch file left from an earlier run in a reused --out must not overwrite this run's reading
+    _facet_cache[full] = d; new_here.append(d)
+if new_here: _save_cache("facets.json", list(_facet_cache.values()))
+# This corpus only (a --repo run keeps to its repo, and another repo's batch left in a reused --out is neither
+# reported nor uploaded), and only readings of the session AS IT IS NOW: a session that has grown since its facet
+# was written is pending, and its old reading must not be clustered beside the new one.
+_fresh = {sid: d for sid, d in _facet_cache.items() if sid in _stamp and d.get("stamp", _stamp[sid]) == _stamp[sid]}
+facets = list(_fresh.values())
+json.dump(facets, open(os.path.join(args.out, "facets.merged.json"), "w"), indent=1)   # every facet for these sessions, earlier runs' included — what step 6 sends to the team
+for d in facets:
+    fr = [x for x in (d.get("friction") or []) if isinstance(x, dict)]
+    d["friction_counts"] = dict(collections.Counter(x.get("category") for x in fr if x.get("category") in FRICTION_VOCAB))
+    d["friction_detail"] = d.get("friction_detail") or "; ".join(x.get("detail", "") for x in fr)
+def _faceted(d): return d["session_id"] in _fresh   # read, and read as the session is now — the same test the report uses
+pending = [d for d in digests if d["score"] > 0 and not _faceted(d)]   # score 0: no correction, error, revert or standard — nothing for a facet to hold
+ddir = os.path.join(args.out, "digests"); os.makedirs(ddir, exist_ok=True)
+fdir = os.path.join(args.out, "facets"); os.makedirs(fdir, exist_ok=True)   # the readers write here, and are told to change nothing else
+for old in glob.glob(os.path.join(fdir, "*.json")): os.remove(old)   # cleared at dispatch (after the import above), so a file here is always this round's: a reader that wrote nothing leaves none, rather than an earlier round's file passing for its output
+for old in glob.glob(os.path.join(ddir, "*.json")): os.remove(old)   # a digest from an earlier pass may be faceted by now
+paths = []
+for d in pending[:args.digest_top]:
+    paths.append(os.path.join(ddir, d["session_id"][:12] + ".json")); json.dump(d, open(paths[-1], "w"), indent=1)
+k = max(1, args.digest_batch); batches = [paths[i:i + k] for i in range(0, len(paths), k)]
+json.dump(batches, open(os.path.join(args.out, "digest_batches.json"), "w"), indent=1)
+print(f"digests: {len(paths)} to read in {len(batches)} batches ({args.out}/digest_batches.json) — {len(pending)} sessions with signal not yet faceted, {sum(1 for d in digests if _faceted(d))} already faceted in earlier runs (SKILL.md step 3)")
 for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):   # optional extra seed if Claude Code /insights was ever run
     try: d = json.load(open(f)); d.setdefault("source", "insights"); facets.append(d)
     except Exception: pass
@@ -160,7 +217,7 @@ if worked:
     print(f"\n=== WHAT WORKED — {len(worked)} sessions carry a worked_well line (patterns to keep, and skill material)")
     for d in worked[:8]: print(f"  [{str(d.get('session_id',''))[:8]}] {str(d['worked_well'])[:150]}")
 if facets:
-    print(f"\n=== WHAT WENT WRONG — {len(facets)} sessions with facets ({sum(1 for d in facets if d.get('source') != 'insights')} from your facets.json, {sum(1 for d in facets if d.get('source') == 'insights')} from /insights). Cluster the details into candidate sentences; a cluster with no command shape becomes a session-start note")
+    print(f"\n=== WHAT WENT WRONG — {len(facets)} sessions with facets ({sum(1 for d in facets if d.get('source') != 'insights')} from your facets, earlier runs' included, {sum(1 for d in facets if d.get('source') == 'insights')} from /insights). Cluster the details into candidate sentences; a cluster with no command shape becomes a session-start note")
     cat = collections.Counter(); 
     for d in facets: cat.update(d.get("friction_counts") or {})
     print("  friction_counts:", cat.most_common(8))
