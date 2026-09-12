@@ -349,7 +349,10 @@ def source_snapshot(path: Path, host: str, revision=()):
     # file must also be the very file the revision baseline observed, so a
     # swap that is reverted before the final comparison cannot feed the read.
     with tempfile.TemporaryDirectory(prefix="native-reader-") as temporary:
-        directory = Path(temporary) / path.parent.name
+        # Stores derive identity from the session directory name; a source
+        # directly under a filesystem root has no parent name, so the snapshot
+        # always gets its own nonempty subdirectory.
+        directory = Path(temporary) / (path.parent.name or "root")
         directory.mkdir(mode=0o700)
         if host != "cursor" or path.name != "store.db":
             # Codex rollouts and Cursor transcripts derive identity from the

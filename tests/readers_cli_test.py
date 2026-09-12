@@ -1431,6 +1431,28 @@ def test_empty_session_selectors_are_rejected():
                 assert "--session" in result.stderr, (host, value, result.stderr)
 
 
+def test_root_level_sources_get_their_own_snapshot_directory():
+    """A source directly under a filesystem root (``/rollout.jsonl``) has an empty
+    parent name. The snapshot must still land in a fresh subdirectory instead of
+    colliding with the temporary directory itself. A bare relative name has the
+    same empty parent and stands in for the root here."""
+    import readers_cli
+    with tempfile.TemporaryDirectory() as td:
+        source = Path(td) / "rollout-root.jsonl"
+        source.write_text('{"marker": true}\n', encoding="utf-8")
+        previous = os.getcwd()
+        os.chdir(td)
+        try:
+            bare = Path("rollout-root.jsonl")
+            assert bare.parent.name == ""
+            for host in ("codex", "cursor"):
+                with readers_cli.source_snapshot(bare, host) as snapshot:
+                    assert snapshot.name == bare.name and snapshot.parent.name
+                    assert snapshot.read_text(encoding="utf-8") == '{"marker": true}\n'
+        finally:
+            os.chdir(previous)
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the
