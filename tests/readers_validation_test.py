@@ -1153,6 +1153,28 @@ def test_strict_cursor_requires_kind_specific_tool_payload():
         cursor_reader._validate_message(msg(block), source_kind="store")
 
 
+def test_apply_session_state_with_explicit_state_never_reads_a_path():
+    """A pre-parsed state (including the explicit empty state for an absent
+    file) must be applied without _read_state being consulted at all."""
+    import cursor_flush
+    original = cursor_flush._read_state
+    def trap(*a, **k):
+        raise AssertionError("apply_session_state consulted the state path")
+    cursor_flush._read_state = trap
+    try:
+        sid = "11111111-2222-4333-8444-555555555555"
+        tu = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        records = [{"uuid": tu, "type": "assistant",
+                    "message": {"role": "assistant", "content": [], "model": "m"}}]
+        cursor_flush.apply_session_state(records, sid, strict=True, state={})
+        assert "usage" not in records[0]["message"]
+        cursor_flush.apply_session_state(records, sid, strict=True, state={
+            "usage_events": {sid: {"target_uuid": tu, "usage": {"inputTokens": 5}}}})
+        assert records[0]["message"]["usage"]["input_tokens"] == 5
+    finally:
+        cursor_flush._read_state = original
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

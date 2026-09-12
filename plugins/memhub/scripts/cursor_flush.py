@@ -677,7 +677,8 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
 
 
 def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False,
-                        state_text: str | None = None) -> None:
+                        state_text: str | None = None,
+                        state: dict | None = None) -> None:
     """Restore live-observed fidelity onto an out-of-band re-read.
 
     capture.py (the manual import / sweep backstop for sessions whose
@@ -693,8 +694,12 @@ def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False,
         # must not select a state file (even a sanitized one) — skipping the
         # restore just leaves the records with their artifact-carried clocks.
         return
-    state = (_read_state(uuid, strict=True, text=state_text) if strict
-             else _read_state(uuid, text=state_text))
+    if state is None:
+        # ``state`` lets a caller that already validated and parsed the saved
+        # observations (or established their absence) apply them without any
+        # path being reopened here.
+        state = (_read_state(uuid, strict=True, text=state_text) if strict
+                 else _read_state(uuid, text=state_text))
     _stamp_records(records, state.get("record_ts"), None,
                    first_observation=True)
     _apply_usage(records, state.get("usage_events"))
