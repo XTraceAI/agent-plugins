@@ -545,13 +545,14 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
         if not isinstance(event, dict):
             continue
         record = by_uuid.get(event.get("target_uuid"))
-        usage = event.get("usage")
+        normalized = cursor_reader.normalize_usage(event.get("usage"))
         message = record.get("message") if isinstance(record, dict) else None
         if (not isinstance(record, dict) or record.get("type") != "assistant" or
-                not isinstance(message, dict) or
-                cursor_reader.normalize_usage(usage) is None):
+                not isinstance(message, dict) or normalized is None):
             continue
-        message["usage"] = usage
+        # Canonical counters, never the saved alias spelling: validate_canonical
+        # does not inspect usage, so a camelCase map would otherwise ship as-is.
+        message["usage"] = normalized
         applied.add(generation)
     return applied
 

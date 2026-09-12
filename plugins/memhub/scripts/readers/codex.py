@@ -503,9 +503,12 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
             value = pl.get("model")
             if strict and value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError("Codex model must be nonblank text or null")
-            if value:
+            if value and model is None:
                 model = value
-                break
+                if not strict:
+                    # A checked read keeps scanning: a later malformed turn
+                    # context must still fail, not hide behind the first model.
+                    break
     meta = {
         "session_id": sm.get("id"),
         "cwd": cwd,
