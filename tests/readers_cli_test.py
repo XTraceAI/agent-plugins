@@ -1169,6 +1169,69 @@ def test_header_probes_never_reopen_the_native_path():
             cursor_flush.STATE_DIR = original_dir
 
 
+def test_transcript_snapshots_ignore_sibling_metadata():
+    """Only stores carry meta.json. An unrelated sibling of that name beside a
+    Cursor transcript is never read, so it must not decide whether the healthy
+    transcript exports in full mode when metadata-only mode emits it."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        path = transcript(home)
+        (path.parent / "meta.json").mkdir()               # not a regular file
+        for mode in ([], ["--metadata-only"]):
+            result, rows = run(home, "cursor", "--session", str(path), *mode)
+            assert result.returncode == 0, (mode, result.stderr)
+            assert [row["type"] for row in rows].count("session") == 1 and rows[0]["native_session_id"] == SID
+
+
+def test_discovered_aliases_are_rechecked_before_resolving():
+    """A discovered rollout or transcript swapped for a symlink after discovery's
+    lstat() must not be followed: resolving it would validate and emit the
+    external target under the discovered name, in listing and latest mode."""
+    import tempfile
+    import readers_cli, cursor_flush
+    other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    for host in ("codex", "cursor"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            reader = codex if host == "codex" else cursor
+            if host == "codex":
+                rows = copy.deepcopy(fixtures.CODEX_SYNTH)
+                rows[0]["payload"].update(id=other, timestamp=STAMP)
+                external = write_jsonl(home / "outside/rollout-outside.jsonl", rows)
+                roots = {"_SESSIONS": home / ".codex/sessions"}
+                restore = lambda: rollout(home)
+            else:
+                external = write_jsonl(home / f"outside/{other}.jsonl", fixtures.CURSOR_TRANSCRIPT)
+                roots = {"_CHATS": home / ".cursor/chats", "_PROJECTS": home / ".cursor/projects"}
+                restore = lambda: transcript(home)
+            real_list = reader.list_sessions
+
+            def swapped(*args, **kwargs):
+                discovered = real_list(*args, **kwargs)
+                assert [Path(row["path"]) for row in discovered] == [path], discovered
+                path.unlink()
+                path.symlink_to(external)             # alias arrives after discovery
+                return discovered
+
+            original_dir = cursor_flush.STATE_DIR
+            cursor_flush.STATE_DIR = home / ".config/memhub-plugin/cursorflush"
+            try:
+                with patch.multiple(reader, list_sessions=swapped, **roots):
+                    for selection in ([], ["--session", "latest"]):
+                        for mode in ([], ["--metadata-only"]):
+                            path = restore()
+                            output, errors = io.StringIO(), io.StringIO()
+                            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                                status = readers_cli.main(["--host", host, *selection, *mode])
+                            emitted = [json.loads(line) for line in output.getvalue().splitlines()]
+                            assert status == 2 and not [row for row in emitted if row.get("type") == "session"], (host, selection, mode, emitted)
+                            assert "session_unreadable" in errors.getvalue() or "discovery_incomplete" in errors.getvalue(), errors.getvalue()
+                            path.unlink()                 # remove the alias before the next discovery
+            finally:
+                cursor_flush.STATE_DIR = original_dir
+            assert external.read_bytes()                  # the target was never touched
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the
@@ -1230,14 +1293,10 @@ def test_non_sqlite_sources_are_read_from_a_private_snapshot():
             src = pathlib.Path(tmp) / host / rel
             src.parent.mkdir(parents=True)
             src.write_text('{"marker": true}\n', encoding="utf-8")
-            if host == "cursor":
-                (src.parent / "meta.json").write_text('{"schemaVersion": 1}', encoding="utf-8")
             with readers_cli.source_snapshot(src, host) as snap:
                 assert snap != src and snap.name == src.name and snap.parent.name == src.parent.name
                 src.unlink(); src.mkdir()                 # swap after the snapshot
                 assert snap.read_text(encoding="utf-8") == '{"marker": true}\n'
-                if host == "cursor":
-                    assert (snap.parent / "meta.json").exists()
             assert not snap.exists()                      # private copy is cleaned up
             # And a source that is already a special file is refused, never opened.
             fifo = pathlib.Path(tmp) / host / "fifo.jsonl"

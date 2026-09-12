@@ -126,12 +126,40 @@ def cursor_source(path: Path, *, select_saved=False, want_state=False):
     raise ValueError("saved observations belong to another source")
 
 
-def discovered_source(path: Path, discovered) -> bool:
+def discovery_roots(reader) -> list[Path]:
+    if reader.HOST == "codex":
+        return [reader._SESSIONS]
+    return [reader._CHATS, reader._PROJECTS]
+
+
+def discovered_path(reader, path) -> Path:
+    """Resolve one discovered row without following an alias below its root.
+
+    Discovery lstat()s every component beneath a configured root and reports
+    aliases as incomplete. A symlink swapped in after that observation must
+    not be followed here either, or the command would validate and emit the
+    external target under a discovered name. The root itself may be a
+    configured symlink, so components stop at the root."""
+    path = Path(path)
+    for root in discovery_roots(reader):
+        if path.is_relative_to(root):
+            components = [item for item in (path, *path.parents) if item != root
+                          and item.is_relative_to(root)]
+            break
+    else:
+        components = [path]
+    for item in components:
+        if stat.S_ISLNK(item.lstat().st_mode):
+            raise ValueError("discovered source became an alias")
+    return path.resolve(strict=True)
+
+
+def discovered_source(reader, path: Path, discovered) -> bool:
     for row in discovered:
         try:
-            if Path(row["path"]).resolve(strict=True) == path:
+            if discovered_path(reader, row["path"]) == path:
                 return True
-        except OSError:
+        except (OSError, ValueError):
             continue
     return False
 
@@ -248,20 +276,15 @@ def source_snapshot(path: Path, host: str):
         directory.mkdir(mode=0o700)
         if host != "cursor" or path.name != "store.db":
             # Codex rollouts and Cursor transcripts derive identity from the
-            # file name (and Cursor may consult a sibling meta.json), so the
-            # snapshot keeps <parent>/<name>.
-            names = [path.name] + (["meta.json"] if host == "cursor" else [])
-            for name in names:
-                source, target = path.parent / name, directory / name
-                try:
-                    with regular_source(source) as (handle, _):
-                        target.touch(mode=0o600, exist_ok=False)
-                        with target.open("wb") as output:
-                            shutil.copyfileobj(handle, output)
-                except FileNotFoundError:
-                    if name == path.name:
-                        raise
-            yield directory / path.name
+            # file name, so the snapshot keeps <parent>/<name>. Only stores
+            # carry a meta.json sidecar; an unrelated sibling of that name
+            # beside a transcript is never consulted, so it is never copied.
+            target = directory / path.name
+            with regular_source(path) as (handle, _):
+                target.touch(mode=0o600, exist_ok=False)
+                with target.open("wb") as output:
+                    shutil.copyfileobj(handle, output)
+            yield target
             return
         # SQLite mode=ro may still create an SHM file. Copy stable source bytes
         # to a private snapshot so journal handling never writes in the store.
@@ -347,10 +370,10 @@ def main(argv=None) -> int:
                         reader._iso_ms(value, strict=True)
                         return value / 1000
                     return row["mtime"]
-                latest = Path(max(discovered, key=latest_mtime)["path"]).resolve(strict=True)
+                latest = discovered_path(reader, max(discovered, key=latest_mtime)["path"])
                 if args.host == "cursor":
                     latest = cursor_source(latest, select_saved=True)
-                    if not discovered_source(latest, discovered):
+                    if not discovered_source(reader, latest, discovered):
                         diagnostic("session_unavailable")
                         return 2
                     # Discovery prefers stores, whereas native latest may
@@ -364,7 +387,7 @@ def main(argv=None) -> int:
                     # Same-ID copies were counted above. Other UUIDs are not
                     # part of this request and must not prepare metadata/state.
                     sessions = ([{"path": str(latest)}] if len(matches) == 1 else matches)
-                if not any(Path(row["path"]).resolve() == latest for row in sessions):
+                if not discovered_source(reader, latest, sessions):
                     sessions.append({"path": str(latest)})
     except (OSError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
         diagnostic("discovery_incomplete")
@@ -388,12 +411,14 @@ def main(argv=None) -> int:
     for session in sessions:
         path = Path(session["path"])
         try:
-            path = path.resolve(strict=True)
+            # An explicit path is the caller's own alias to follow; a
+            # discovered row must still be the regular file discovery saw.
+            path = path.resolve(strict=True) if explicit_path else discovered_path(reader, path)
             if args.host == "cursor":
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
                 path = cursor_source(path, select_saved=select_saved)
-                if not explicit_path and not discovered_source(path, discovered):
+                if not explicit_path and not discovered_source(reader, path, discovered):
                     raise ValueError("saved Cursor source was excluded by discovery")
             revision = source_revision(path, args.host)
             mtime = max(item[2] for item in revision) / 1_000_000_000
