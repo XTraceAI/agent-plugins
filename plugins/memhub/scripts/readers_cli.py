@@ -258,8 +258,8 @@ def main(argv=None) -> int:
                           "code": code, "path": str(path) if path else None}), file=sys.stderr)
 
     try:
-        explicit_path = (args.session is not None and args.session != "latest"
-                         and ("/" in args.session or Path(args.session).expanduser().exists()))
+        path_syntax = bool(args.session and any(mark in args.session for mark in ("/", "\\")))
+        explicit_path = args.session is not None and args.session != "latest" and path_syntax
         if explicit_path:
             path, error = reader.locate(args.session)
             if error or path is None:

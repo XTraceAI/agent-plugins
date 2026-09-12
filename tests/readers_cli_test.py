@@ -49,7 +49,7 @@ def transcript(home):
                        fixtures.CURSOR_TRANSCRIPT)
 
 
-def run(home, host, *arguments):
+def run(home, host, *arguments, cwd=None):
     guard = home / "guard"
     guard.mkdir(exist_ok=True)
     (guard / "sitecustomize.py").write_text(
@@ -67,7 +67,7 @@ def run(home, host, *arguments):
            "XDG_CONFIG_HOME": str(home / ".config"), "CODEX_HOME": str(home / ".codex"),
            "PYTHONPATH": str(guard), "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1"}
     result = subprocess.run([sys.executable, str(CLI), "--host", host, *arguments],
-                            env=env, text=True, capture_output=True, timeout=20)
+                            cwd=cwd, env=env, text=True, capture_output=True, timeout=20)
     rows = [json.loads(line) for line in result.stdout.splitlines()]
     return result, rows
 
@@ -624,6 +624,23 @@ def test_native_id_selection_cannot_substitute_a_misleading_rollout_filename():
         assert result.returncode==0 and rows[0]["native_session_id"]==actual,result.stderr
         result,rows=run(home,"codex","--session","x"*5000)
         assert result.returncode==2 and rows==[] and "Traceback" not in result.stderr
+
+
+def test_native_ids_win_over_coincidental_relative_files():
+    for host in ('codex','cursor'):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td);source=rollout(home) if host=='codex' else transcript(home)
+            native_id=(codex.session_metadata(source)['session_id'] if host=='codex' else SID)
+            working=home/'working';working.mkdir();collision=working/native_id
+            collision.write_text('not a native session')
+            result,rows=run(home,host,'--session',native_id,cwd=working)
+            assert result.returncode==0 and rows[0]['native_session_id']==native_id,result.stderr
+            assert rows[0]['path']==str(source.resolve())
+            result,rows=run(home,host,'--session',f'./{native_id}',cwd=working)
+            if host=='codex':
+                assert result.returncode==2 and rows==[] and str(collision.resolve()) in result.stderr
+            else:
+                assert result.returncode==0 and rows[0]['path']==str(collision.resolve()),result.stderr
 
 
 def test_latest_cursor_uses_newer_transcript_without_losing_saved_source():
