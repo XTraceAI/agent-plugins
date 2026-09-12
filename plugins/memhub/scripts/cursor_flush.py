@@ -218,9 +218,13 @@ def _state_path(uuid: str) -> Path:
     return STATE_DIR / f"{_safe_uuid(uuid)}.json"
 
 
-def _read_state(uuid: str, *, strict: bool = False) -> dict:
+def _read_state(uuid: str, *, strict: bool = False, text: str | None = None) -> dict:
+    """``text`` lets a caller that already validated and opened the state file
+    parse those exact bytes, instead of reopening the path and racing a swap."""
     try:
-        state = load_json(_state_path(uuid).read_text(encoding="utf-8"), strict=strict)
+        if text is None:
+            text = _state_path(uuid).read_text(encoding="utf-8")
+        state = load_json(text, strict=strict)
         if strict and (not isinstance(state, dict) or any(
                 key in state and not isinstance(state[key], dict)
                 for key in ("record_ts", "usage_events"))):
@@ -672,7 +676,8 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     return stamps
 
 
-def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False) -> None:
+def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False,
+                        state_text: str | None = None) -> None:
     """Restore live-observed fidelity onto an out-of-band re-read.
 
     capture.py (the manual import / sweep backstop for sessions whose
@@ -688,7 +693,8 @@ def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False)
         # must not select a state file (even a sanitized one) — skipping the
         # restore just leaves the records with their artifact-carried clocks.
         return
-    state = _read_state(uuid, strict=True) if strict else _read_state(uuid)
+    state = (_read_state(uuid, strict=True, text=state_text) if strict
+             else _read_state(uuid, text=state_text))
     _stamp_records(records, state.get("record_ts"), None,
                    first_observation=True)
     _apply_usage(records, state.get("usage_events"))
