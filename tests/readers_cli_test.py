@@ -638,7 +638,7 @@ def test_native_ids_win_over_coincidental_relative_files():
             assert rows[0]['path']==str(source.resolve())
             result,rows=run(home,host,'--session',f'./{native_id}',cwd=working)
             if host=='codex':
-                assert result.returncode==2 and rows==[] and str(collision.resolve()) in result.stderr
+                assert result.returncode==2 and rows==[] and 'session_unreadable' in result.stderr
             else:
                 assert result.returncode==0 and rows[0]['path']==str(collision.resolve()),result.stderr
 
