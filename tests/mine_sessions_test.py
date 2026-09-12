@@ -2,7 +2,7 @@
 to its own location (no env var), and run to completion on an empty HOME (zero
 sessions, no book, no facets) — the state a fresh teammate is in."""
 from __future__ import annotations
-import hashlib, json, os, subprocess, sys, tempfile
+import hashlib, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +42,8 @@ def main() -> int:
         (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
                                                             {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
         p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
-        ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "WHAT WENT WRONG" in p.stdout and "PROPOSED RULES" in p.stdout and "wrong_source" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and (out / "digests").is_dir()
-        print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md and --facets (fixed vocab enforced), writes digests/"); fails += not ok
+        ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "PROPOSED RULES" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and "=== WHAT WENT WRONG" not in p.stdout and (out / "digests").is_dir()
+        print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md, warns on --facets vocab but reports no facet for a session not in the corpus, writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
         rows = json.load(open(out / "proposals.json")) if (out / "proposals.json").is_file() else []
         probe = next((r for r in rows if r.get("title") == "probe-rule"), None)
@@ -73,8 +73,8 @@ def main() -> int:
         ok = sed_hook is not None and "[0-9]+" in cmd and "\\d" not in cmd and "[[:space:]]" in cmd and "test)\\b" in pcmd
         print(("ok  " if ok else "FAIL"), "emitted PreToolUse snippet is grep -E syntax (\\d -> [0-9], \\s -> [[:space:]], \\b kept — GNU and BSD grep honour it)"); fails += not ok
         if not ok: print(cmd)
-        ok = "ENGINEERING STANDARDS ASSERTED" in p.stdout and "always TTL new tables" in p.stdout and "WHAT WORKED" in p.stdout and "REPEATED WORKFLOWS" in p.stdout
-        print(("ok  " if ok else "FAIL"), "asserted standards and worked_well are surfaced; the workflows lane prints"); fails += not ok
+        ok = "REPEATED WORKFLOWS" in p.stdout
+        print(("ok  " if ok else "FAIL"), "the workflows lane prints"); fails += not ok
         g = out / "grabs"
         ok = (g / "claude-md-additions.md").is_file() and (g / "hooks.settings.json").is_file() and (g / "Makefile.suggested").is_file()
         print(("ok  " if ok else "FAIL"), "grabs/ holds claude-md-additions.md, hooks.settings.json, Makefile.suggested"); fails += not ok
@@ -121,6 +121,57 @@ def main() -> int:
         ok = "result-lane" in panel and "result-lane" not in retired
         print(("ok  " if ok else "FAIL"), "a result rule already on is replayed against tool output"); fails += not ok
         if fails: print("panel was:", panel)
+
+    # Reading a session is the expensive, model-side step, so each one is read once:
+    # facets written in one run stay in the cache, a later run offers only what is
+    # still unread, and a session that grew since its facet was written is offered again.
+    with tempfile.TemporaryDirectory() as home:
+        proj = Path(home) / ".claude" / "projects" / "demo"; proj.mkdir(parents=True)
+        def _turns(n): return "\n".join(json.dumps({"type": "user", "cwd": "/w/demo", "message": {"content": f"no, that is the wrong file ({i})"}}) for i in range(n))
+        a, b = proj / "aaaaaaaa-1111-2222.jsonl", proj / "bbbbbbbb-3333-4444.jsonl"
+        a.write_text(_turns(1)); b.write_text(_turns(2))
+        out = Path(home) / "out"
+        cache_dir = Path(home) / ".config" / "memhub-plugin" / "rules-from-sessions"
+        def _offered(): return sorted(os.path.basename(x) for batch in json.load(open(out / "digest_batches.json")) for x in batch)
+
+        p = _run("--out", str(out), "--digest-batch", "1", home=home)
+        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"] and len(json.load(open(out / "digest_batches.json"))) == 2 and (out / "facets").is_dir()
+        print(("ok  " if ok else "FAIL"), "first run: every session with signal is digested, --digest-batch per batch, and the readers' facets/ exists"); fails += not ok
+        if not ok: print(p.stdout[-600:], p.stderr[-600:])
+
+        (out / "facets").mkdir(exist_ok=True)
+        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-111", "outcome": "mostly", "friction": [{"category": "wrong_source", "detail": "edited the wrong file", "evidence_turn": 0}],
+                                                               "standards": [{"statement": "always TTL new tables", "quote": "always ttl these", "scope": "org"}], "worked_well": "kickoff brief landed clean"}]))
+        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "bbbbbbbb-333"},   # readers that returned parseable but incomplete output —
+                                                               {"session_id": "bbbbbbbb-333", "outcome": "mostly", "friction": [None]}]))   # …or a friction entry that is not an object: warned, never a crash
+        p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
+        cached = json.load(open(cache_dir / "facets.json")) if (cache_dir / "facets.json").is_file() else []
+        ok = (p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and [d["session_id"] for d in cached] == ["aaaaaaaa-1111-2222"] and "wrong_source" in p.stdout
+              and "ENGINEERING STANDARDS ASSERTED" in p.stdout and "always TTL new tables" in p.stdout and "WHAT WORKED" in p.stdout and "incomplete" in p.stderr)
+        print(("ok  " if ok else "FAIL"), "batch facets: the short id resolves, the facet is cached and reported (standards, worked_well), its session is not offered again; an incomplete facet is skipped and its session stays unread"); fails += not ok
+        if not ok: print(p.stdout[-600:], p.stderr[-600:], cached)
+
+        shutil.rmtree(out / "facets")
+        p = _run("--out", str(out), home=home)
+        merged = json.load(open(out / "facets.merged.json"))
+        ok = p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and "wrong_source" in p.stdout and [d["session_id"] for d in merged] == ["aaaaaaaa-1111-2222"]
+        print(("ok  " if ok else "FAIL"), "a later run without --facets still reports the cached facet and writes it to facets.merged.json"); fails += not ok
+
+        # grown by a tool result alone — a call still running when the facet was written — which moves neither the turn nor the call count
+        a.write_text(_turns(1) + "\n" + json.dumps({"type": "user", "cwd": "/w/demo", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Exit code 1"}]}}))
+        p = _run("--out", str(out), home=home)
+        ok = p.returncode == 0 and _offered() == ["aaaaaaaa-111.json", "bbbbbbbb-333.json"] and json.load(open(out / "facets.merged.json")) == []
+        print(("ok  " if ok else "FAIL"), "a session that grew since its facet was written — by a late tool result alone — is offered again, and its stale reading leaves the report"); fails += not ok
+
+        # A reused --out: this run's reading lands in batch-1, a stale copy from an earlier run still sits in batch-2 and loads after it
+        (out / "facets" / "batch-1.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "outcome": "mostly", "friction": []}]))
+        (out / "facets" / "batch-2.json").write_text(json.dumps([{"session_id": "aaaaaaaa-1111-2222", "stamp": "1u0c0r", "outcome": "mostly", "friction": []}]))
+        p = _run("--out", str(out), "--facets", str(out / "facets"), home=home)
+        stamps = {d["session_id"]: d.get("stamp") for d in json.load(open(cache_dir / "facets.json"))}
+        ok = (p.returncode == 0 and _offered() == ["bbbbbbbb-333.json"] and stamps.get("aaaaaaaa-1111-2222") == "1u0c1r"
+              and not list((out / "facets").glob("*.json")))   # cleared at dispatch: a reader that writes nothing leaves no file to pass for its output
+        print(("ok  " if ok else "FAIL"), "a stale batch file does not overwrite this run's reading, and the readers' files are cleared for the next round"); fails += not ok
+        if not ok: print(stamps, _offered())
     return 1 if fails else 0
 
 if __name__ == "__main__":
