@@ -63,6 +63,7 @@ import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
+from readers.strict_json import loads as load_json  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly  # noqa: E402
@@ -217,10 +218,33 @@ def _state_path(uuid: str) -> Path:
     return STATE_DIR / f"{_safe_uuid(uuid)}.json"
 
 
-def _read_state(uuid: str) -> dict:
+def _read_state(uuid: str, *, strict: bool = False) -> dict:
     try:
-        return json.loads(_state_path(uuid).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        state = load_json(_state_path(uuid).read_text(encoding="utf-8"), strict=strict)
+        if strict and (not isinstance(state, dict) or any(
+                key in state and not isinstance(state[key], dict)
+                for key in ("record_ts", "usage_events"))):
+            raise ValueError("invalid saved Cursor observations")
+        if strict:
+            import datetime
+            for target_uuid, stamp in state.get("record_ts", {}).items():
+                if (not isinstance(target_uuid, str) or not _UUID_RE.fullmatch(target_uuid)
+                        or (stamp is not None and (not isinstance(stamp, str) or
+                        datetime.datetime.fromisoformat(
+                            stamp.replace("Z", "+00:00")).tzinfo is None))):
+                    raise ValueError("invalid saved Cursor timestamp")
+            for generation, event in state.get("usage_events", {}).items():
+                target_uuid = event.get("target_uuid") if isinstance(event, dict) else None
+                if (not isinstance(generation, str) or not _UUID_RE.fullmatch(generation)
+                        or not isinstance(target_uuid, str) or not _UUID_RE.fullmatch(target_uuid)
+                        or cursor_reader.normalize_usage(event.get("usage")) is None):
+                    raise ValueError("invalid saved Cursor usage")
+        return state
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        if strict:
+            raise
         return {}
 
 
@@ -521,13 +545,14 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
         if not isinstance(event, dict):
             continue
         record = by_uuid.get(event.get("target_uuid"))
-        usage = event.get("usage")
+        normalized = cursor_reader.normalize_usage(event.get("usage"))
         message = record.get("message") if isinstance(record, dict) else None
         if (not isinstance(record, dict) or record.get("type") != "assistant" or
-                not isinstance(message, dict) or
-                cursor_reader.normalize_usage(usage) is None):
+                not isinstance(message, dict) or normalized is None):
             continue
-        message["usage"] = usage
+        # Canonical counters, never the saved alias spelling: validate_canonical
+        # does not inspect usage, so a camelCase map would otherwise ship as-is.
+        message["usage"] = normalized
         applied.add(generation)
     return applied
 
@@ -647,7 +672,7 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     return stamps
 
 
-def apply_session_state(records: list[dict], uuid: str) -> None:
+def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False) -> None:
     """Restore live-observed fidelity onto an out-of-band re-read.
 
     capture.py (the manual import / sweep backstop for sessions whose
@@ -663,7 +688,7 @@ def apply_session_state(records: list[dict], uuid: str) -> None:
         # must not select a state file (even a sanitized one) — skipping the
         # restore just leaves the records with their artifact-carried clocks.
         return
-    state = _read_state(uuid)
+    state = _read_state(uuid, strict=True) if strict else _read_state(uuid)
     _stamp_records(records, state.get("record_ts"), None,
                    first_observation=True)
     _apply_usage(records, state.get("usage_events"))

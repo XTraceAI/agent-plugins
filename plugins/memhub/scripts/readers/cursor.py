@@ -54,11 +54,14 @@ from __future__ import annotations
 
 import datetime
 import json
+import hashlib
 import re
 import sqlite3
 import sys
 import uuid as _uuid
 from pathlib import Path
+from .strict_json import loads as load_json
+from .jsonl import open_lines, readline_bytes
 
 # See the same note in ``readers/codex.py`` — shared title rules, stdlib only.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
@@ -155,11 +158,21 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return normalize_usage(raw)
 
 
-def _read_meta_json(session_dir: Path) -> dict | None:
+def _read_meta_json(session_dir: Path, *, strict=False) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        value = load_json(p.read_text(encoding="utf-8"), strict=strict)
+        if strict and isinstance(value, dict):
+            for key in ("cwd", "gitBranch", "source_surface"):
+                if value.get(key) is not None and not isinstance(value[key], str):
+                    raise ValueError(f"Cursor metadata {key} must be text or null")
+            if value.get("createdAtMs") is not None and type(value["createdAtMs"]) not in (int, float):
+                raise ValueError("Cursor creation time must be numeric")
+            _iso_ms(value.get("createdAtMs"), strict=True)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        if strict:
+            raise
         return None
 
 
@@ -181,22 +194,55 @@ def session_cwd(path) -> str | None:
     return cwd if isinstance(cwd, str) and cwd else None
 
 
-def list_sessions(limit: int = 20) -> list[dict]:
+def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
     """Most recent Cursor sessions, preferring the richer store per UUID."""
     rows: list[dict] = []
     store_ids: set[str] = set()
-    for d in _session_dirs():
+    if on_error is None:
+        stores, transcripts = _session_dirs(), _transcript_paths()
+    else:
+        from .discovery import paths
+        # Either layout may legitimately be absent; both absent is incomplete.
+        roots = []
+        for root in (_CHATS, _PROJECTS):
+            try:
+                root.stat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                on_error(error)
+            else:
+                roots.append(root)
+        if not roots:
+            on_error(FileNotFoundError("Cursor session stores are unavailable"))
+        stores = [path.parent for path in paths(_CHATS, ("*", "*", "store.db"), on_error)] if _CHATS in roots else []
+        transcripts = paths(_PROJECTS, ("*", "agent-transcripts", "*", "*.jsonl"), on_error) if _PROJECTS in roots else []
+    for d in stores:
+        if on_error is not None:
+            # Discovery uses filesystem observations. Bad session metadata is
+            # diagnosed per session by the CLI, without hiding healthy peers.
+            try:
+                mtime = (d / "store.db").stat().st_mtime
+            except OSError as error:
+                on_error(error)
+                continue
+            store_ids.add(d.name)
+            rows.append({"id": d.name, "path": str(d / "store.db"),
+                         "mtime": mtime, "host": HOST, "cwd": None})
+            continue
         m = _read_meta_json(d) or {}
         store_ids.add(d.name)
         rows.append({"id": d.name, "path": str(d / "store.db"),
                      "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
                      "host": HOST, "cwd": m.get("cwd")})
-    for p in _transcript_paths():
+    for p in transcripts:
         if p.stem in store_ids:
             continue
         try:
             mtime = p.stat().st_mtime
-        except OSError:
+        except OSError as error:
+            if on_error is not None:
+                on_error(error)
             continue
         rows.append({"id": p.stem, "path": str(p), "mtime": mtime,
                      "host": HOST, "cwd": None})
@@ -253,14 +299,14 @@ _MS_EPOCH_MIN = 1_500_000_000_000
 _MS_EPOCH_MAX = 4_000_000_000_000
 
 
-def _parse_node(data: bytes) -> tuple[list[str], int | None]:
+def _parse_node(data: bytes, *, strict: bool = False) -> tuple[list[str], int | None]:
     """(ordered child blob ids, node timestamp ms) of a protobuf tree node.
 
     Minimal TLV walk (stdlib only — no protobuf dependency): field 1
     length-delimited (tag 0x0A) with len 32 is a child hash; a varint in the
     ms-epoch window is the checkpoint's wall clock (observed as field 26 on
     cursor-agent 2026.08); everything else is skipped by wire type. Malformed
-    input just yields what parsed."""
+    input just yields what parsed unless strict validation is requested."""
     out: list[str] = []
     ts: int | None = None
     i, n = 0, len(data)
@@ -269,18 +315,26 @@ def _parse_node(data: bytes) -> tuple[list[str], int | None]:
         v, shift = 0, 0
         while j < n:
             b = data[j]
+            if strict and (shift > 63 or (shift == 63 and b > 1)):
+                raise ValueError("invalid protobuf varint")
             v |= (b & 0x7F) << shift
             j += 1
             if not b & 0x80:
-                break
+                return v, j
             shift += 7
+        if strict:
+            raise ValueError("truncated protobuf varint")
         return v, j
 
     while i < n:
         tag, i = varint(i)
+        if strict and not 1 <= tag >> 3 <= (1 << 29) - 1:
+            raise ValueError("invalid protobuf field")
         wire = tag & 7
         if wire == 2:                      # length-delimited
             ln, i = varint(i)
+            if strict and (i + ln > n or (tag >> 3 == 1 and ln != 32)):
+                raise ValueError("invalid protobuf child or field length")
             if tag >> 3 == 1 and ln == 32 and i + 32 <= n:
                 out.append(data[i:i + 32].hex())
             i += ln
@@ -293,74 +347,192 @@ def _parse_node(data: bytes) -> tuple[list[str], int | None]:
         elif wire == 1:
             i += 8
         else:                              # unknown wire type — stop safely
+            if strict:
+                raise ValueError("unsupported protobuf wire type")
             break
+        if strict and i > n:
+            raise ValueError("truncated protobuf fixed field")
     return out, ts
 
 
-def _load_messages(db_path: Path) -> list[tuple[dict, int | None]]:
+def _validate_model_options(value) -> None:
+    provider_options = value.get("providerOptions") if isinstance(value, dict) else None
+    if provider_options is not None:
+        if not isinstance(provider_options, dict):
+            raise ValueError("Cursor provider options must be an object")
+        cursor_options = provider_options.get("cursor")
+        if cursor_options is not None:
+            if not isinstance(cursor_options, dict):
+                raise ValueError("Cursor provider options must contain an object")
+            model = cursor_options.get("modelName")
+            if model is not None and (not isinstance(model, str) or not model.strip()):
+                raise ValueError("Cursor model must be nonblank text or null")
+
+
+def _validate_message(message, *, source_kind):
+    if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
+        raise ValueError("Cursor source has no supported message role")
+    content = message.get("content")
+    _validate_model_options(message)
+    if not isinstance(content, (str, list)) or (isinstance(content, list)
+            and any(not isinstance(block, dict) for block in content)):
+        raise ValueError("Cursor message has invalid content")
+    if isinstance(content, list):
+        for block in content:
+            _validate_model_options(block)
+    role = message["role"]
+    if role == "tool" and not isinstance(content, list):
+        raise ValueError("Cursor tool message has invalid result blocks")
+    if role == "user" and isinstance(content, list):
+        if any(block.get("type") != "text" or not isinstance(block.get("text"), str)
+               for block in content):
+            raise ValueError("Cursor user message requires text blocks")
+    if role not in ("assistant", "tool") or isinstance(content, str):
+        return
+    for block in content:
+        kind = block.get("type")
+        allowed = ("reasoning", "text", "tool-call", "tool_use") if role == "assistant" else ("tool-result",)
+        if kind not in allowed:
+            raise ValueError("Cursor message has unsupported content block")
+        if kind in ("text", "reasoning") and not isinstance(block.get("text"), str):
+            raise ValueError("Cursor message text must be a string")
+        if kind == "tool-result" and not isinstance(block.get("result"), str):
+            fallback = block.get("experimental_content")
+            if block.get("result") is None and fallback is None:
+                raise ValueError("Cursor tool result requires a result payload")
+            if fallback is not None and not isinstance(fallback, str):
+                if not isinstance(fallback, list) or any(
+                        not isinstance(item, dict) or item.get("type") != "text"
+                        or not isinstance(item.get("text"), str) for item in fallback):
+                    raise ValueError("Cursor tool result has unsupported fallback content")
+        if kind in ("tool-call", "tool_use", "tool-result"):
+            for key in ("toolCallId", "id", "toolName", "name"):
+                if block.get(key) is not None and not isinstance(block[key], str):
+                    raise ValueError("Cursor tool identity must be a string")
+            identity = block.get("toolCallId")
+            if kind != "tool-result":
+                identity = identity or block.get("id")
+            # IDE transcripts can contain id-less tool_use observations. Native
+            # tool-call/result blocks and explicitly supplied aliases need the
+            # identifier actually consumed by normalization.
+            requires_identity = (source_kind != "transcript" or kind != "tool_use"
+                                 or "toolCallId" in block or "id" in block)
+            if requires_identity and (not isinstance(identity, str) or not identity.strip()):
+                raise ValueError("Cursor tool block requires its native call identifier")
+            if kind != "tool-result":
+                name = block.get("toolName") or block.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("Cursor tool call requires its native tool name")
+
+
+def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, int | None]]:
     """Walk the hash tree from latestRootBlobId; return ordered JSON leaves
     paired with their nearest ancestor node's wall clock (ms epoch, or None).
     Checkpoint nodes are timestamped; their leaves inherit that clock, which
     is what turns "the whole session is one instant" into a real timeline."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         blobs = {row[0]: row[1] for row in con.execute("SELECT id, data FROM blobs")}
         root = None
+        hex_root = False
         for (value,) in con.execute("SELECT value FROM meta"):
             try:
-                m = json.loads(value)
+                if isinstance(value, (bytes, bytearray)):
+                    value = value.decode("utf-8")
+                # Default capture historically treats hex metadata as an
+                # unreadable root and uses insertion order. Preserve that
+                # projection: existing UUIDs depend on record positions.
+                encoded = isinstance(value, str) and re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value)
+                if encoded and strict:
+                    value = bytes.fromhex(value).decode("utf-8")
+                m = load_json(value, strict=strict)
             except (TypeError, json.JSONDecodeError):
+                if strict:
+                    raise
                 continue
             if isinstance(m, dict) and m.get("latestRootBlobId"):
                 root = m["latestRootBlobId"]
+                hex_root = bool(encoded)
                 break
     finally:
         con.close()
 
     messages: list[tuple[dict, int | None]] = []
     seen: set[str] = set()
+    active: set[str] = set()
 
     def walk(blob_id: str, inherited_ts: int | None) -> None:
-        if blob_id in seen or blob_id not in blobs:
+        if not isinstance(blob_id, str) or blob_id not in blobs:
+            if strict:
+                raise ValueError("Cursor tree references a missing blob")
+            return
+        if blob_id in active and strict:
+            raise ValueError("Cursor tree contains a cycle")
+        if blob_id in seen:
             return
         seen.add(blob_id)
         data = blobs[blob_id]
         if isinstance(data, str):
             data = data.encode("utf-8")
+        if strict and hashlib.sha256(data).hexdigest() != blob_id:
+            raise ValueError("Cursor blob content does not match its hash")
         if data[:1] == b"{":
             try:
-                msg = json.loads(data.decode("utf-8", errors="replace"))
+                msg = load_json(data.decode("utf-8", errors="strict" if strict else "replace"), strict=strict)
             except json.JSONDecodeError:
+                if strict:
+                    raise
                 return
+            if strict:
+                _validate_message(msg, source_kind="store")
             if isinstance(msg, dict) and msg.get("role"):
                 messages.append((msg, inherited_ts))
             return
-        children, node_ts = _parse_node(data)
-        for child in children:
-            walk(child, node_ts or inherited_ts)
+        children, node_ts = _parse_node(data, strict=strict)
+        active.add(blob_id)
+        try:
+            for child in children:
+                walk(child, node_ts or inherited_ts)
+        finally:
+            active.remove(blob_id)
 
     if root:
         walk(root, None)
-    if not messages:
+    elif strict and blobs:
+        raise ValueError("Cursor tree has no root")
+    if hex_root:
+        # Validate the native tree above, but retain the pre-existing flat
+        # projection below. Tree order/checkpoint clocks would change the
+        # contents or timestamps associated with already-published UUIDs.
+        messages.clear()
+    if hex_root or (not messages and not strict):
         # Fallback: no walkable root (interrupted write). Take JSON blobs in
         # insertion order — degraded but better than losing the session.
-        for data in blobs.values():
+        for blob_id, data in blobs.items():
             if isinstance(data, (bytes, bytearray)) and data[:1] == b"{":
+                if strict and hashlib.sha256(data).hexdigest() != blob_id:
+                    raise ValueError("Cursor blob content does not match its hash")
                 try:
-                    msg = json.loads(bytes(data).decode("utf-8", errors="replace"))
+                    msg = load_json(bytes(data).decode("utf-8", errors="strict" if strict else "replace"), strict=strict)
                 except json.JSONDecodeError:
+                    if strict:
+                        raise
                     continue
+                if strict:
+                    _validate_message(msg, source_kind="store")
                 if isinstance(msg, dict) and msg.get("role"):
                     messages.append((msg, None))
     return messages
 
 
-def _iso_ms(ms) -> str | None:
+def _iso_ms(ms, *, strict: bool = False) -> str | None:
     try:
         return datetime.datetime.fromtimestamp(
             ms / 1000.0, tz=datetime.timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    except (TypeError, ValueError, OSError):
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError, OverflowError) as error:
+        if strict and ms is not None:
+            raise ValueError("Cursor timestamp is outside the supported range") from error
         return None
 
 
@@ -389,7 +561,7 @@ def _model_of(obj) -> str | None:
 
 def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                   session_id: str, cwd: str | None, model_hint: str | None,
-                  created_ts: str | None) -> tuple[list[dict], dict]:
+                  created_ts: str | None, strict: bool = False) -> tuple[list[dict], dict]:
     """Transform either native source after it has yielded ordered messages.
 
     Each message's ``ts`` is a clock the artifact carries FOR IT (or None —
@@ -397,6 +569,11 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
     """
     ts_holder: dict = {"ts": None}
     out: list[dict] = []
+    usage_only_count = 0
+
+    def legacy_index() -> int:
+        # Recovered measurements must not shift existing record or tool IDs.
+        return len(out) - usage_only_count
 
     def rec(record: dict) -> dict:
         if cwd:
@@ -405,7 +582,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
         # one are SKIPPED by the agentic parser (imported as nothing).
         # Deterministic over (session, output index) so re-flushes fold.
         record["uuid"] = str(_uuid.uuid5(
-            _uuid.NAMESPACE_URL, f"memhub:cursor:{session_id}:{len(out)}"))
+            _uuid.NAMESPACE_URL, f"memhub:cursor:{session_id}:{legacy_index()}"))
         if ts_holder["ts"]:
             record["timestamp"] = ts_holder["ts"]
         return record
@@ -438,7 +615,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
     out.append(user(banner))
 
     title = None
-    for msg, message_ts in dated_messages:
+    for message_index, (msg, message_ts) in enumerate(dated_messages):
         ts_holder["ts"] = message_ts
         role = msg.get("role")
         content = msg.get("content")
@@ -486,13 +663,21 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                     record = assistant({
                         "type": "tool_use",
                         "id": (b.get("toolCallId") or b.get("id") or
-                               f"cursor-call-{len(out)}"),
+                               f"cursor-call-{legacy_index()}"),
                         "name": b.get("toolName") or b.get("name") or "tool",
                         "input": args if isinstance(args, dict) else {"input": args},
                     }, block_model)
                     out.append(record)
                     emitted.append(record)
             usage = _usage_of(msg)
+            if strict and usage and not emitted:
+                record = assistant({"type": "text", "text": ""}, _model_of(msg))
+                record["uuid"] = str(_uuid.uuid5(
+                    _uuid.NAMESPACE_URL,
+                    f"memhub:cursor:{session_id}:usage-only:{message_index}"))
+                out.append(record)
+                emitted.append(record)
+                usage_only_count += 1
             if emitted and usage:
                 emitted[-1]["message"]["usage"] = usage
             continue
@@ -508,7 +693,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                         json.dumps(result) if result is not None else "")
                 out.append(user([{
                     "type": "tool_result",
-                    "tool_use_id": b.get("toolCallId") or f"cursor-out-{len(out)}",
+                    "tool_use_id": b.get("toolCallId") or f"cursor-out-{legacy_index()}",
                     "content": result,
                 }]))
 
@@ -520,7 +705,7 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 _MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
 
 
-def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
+def _load_transcript(path: Path, *, strict: bool = False) -> list[tuple[dict, str | None]]:
     """Read Cursor hook JSONL, ignoring only an unfinished final line.
 
     A message's clock is its OWN embedded ``<timestamp>`` tag (user turns
@@ -532,36 +717,45 @@ def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
     first-seen hook clock instead; backfills leave them unmeasured.
     """
     messages: list[tuple[dict, str | None]] = []
-    with path.open("rb") as handle:
+    with open_lines(path) as handle:
         line_no = 0
         while True:
-            raw = handle.readline(_MAX_TRANSCRIPT_LINE_BYTES + 1)
+            raw = readline_bytes(handle, _MAX_TRANSCRIPT_LINE_BYTES)
             if not raw:
                 break
             line_no += 1
-            if len(raw) > _MAX_TRANSCRIPT_LINE_BYTES:
-                raise ValueError(
-                    f"cursor transcript {path} line {line_no} exceeds 8 MiB")
             terminated = raw.endswith((b"\n", b"\r"))
             try:
-                entry = json.loads(raw.decode("utf-8"))
+                entry = load_json(raw.decode("utf-8"), strict=strict)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if not terminated:
+                if not terminated and not (strict and isinstance(exc, UnicodeDecodeError)):
                     # Cursor appends records. A hook can race the writer, so a
                     # genuinely unfinished tail is deferred to the next event.
                     # A complete final JSON object needs no trailing newline
                     # and is accepted by the same parse above.
+                    # Strict consumers defer incomplete JSON, never bad UTF-8.
                     break
                 raise ValueError(
                     f"cursor transcript {path} line {line_no} is invalid JSON") from exc
-            if not isinstance(entry, dict) or entry.get("role") not in (
+            if not isinstance(entry, dict):
+                if strict:
+                    raise ValueError("Cursor transcript row is not an object")
+                continue
+            if entry.get("role") not in (
                     "system", "user", "assistant", "tool"):
+                if strict and ("role" in entry or "message" in entry):
+                    raise ValueError("Cursor transcript has no supported message role")
+                # Native lifecycle events such as turn_ended are not messages.
                 continue
             body = entry.get("message")
             if not isinstance(body, dict):
+                if strict:
+                    raise ValueError("Cursor transcript message is not an object")
                 continue
             message = dict(body)
             message["role"] = entry["role"]
+            if strict:
+                _validate_message(message, source_kind="transcript")
             own_ts = (_embedded_timestamp(_text_of(message.get("content")))
                       if entry["role"] == "user" else None)
             messages.append((message, own_ts))
@@ -569,25 +763,26 @@ def _load_transcript(path: Path) -> list[tuple[dict, str | None]]:
 
 
 def to_canonical(path, *, session_id: str | None = None,
-                 cwd: str | None = None, model: str | None = None
+                 cwd: str | None = None, model: str | None = None,
+                 strict: bool = False
                  ) -> tuple[list[dict], dict]:
     """Load either a legacy ``store.db`` or current hook transcript."""
     source = Path(path)
     if source.name != "store.db":
         sid = session_id or source.stem
-        messages = _load_transcript(source)
+        messages = _load_transcript(source, strict=strict)
         # The banner's clock: the first embedded user-turn tag — the earliest
         # source-carried instant the transcript offers (None when it offers
         # none; the flush's first-seen stamp covers live sessions).
         created_ts = next((ts for _, ts in messages if ts), None)
         return _canonicalize(
             messages, session_id=sid, cwd=cwd, model_hint=model,
-            created_ts=created_ts)
+            created_ts=created_ts, strict=strict)
 
     session_dir = source.parent
-    mj = _read_meta_json(session_dir) or {}
+    mj = _read_meta_json(session_dir, strict=strict) or {}
     version = mj.get("schemaVersion")
-    if version != _SCHEMA_VERSION:
+    if type(version) is not int or version != _SCHEMA_VERSION:
         raise ValueError(
             f"cursor store {session_dir} has schemaVersion {version!r}; this "
             f"reader is pinned to {_SCHEMA_VERSION} — refusing to misparse. "
@@ -598,7 +793,31 @@ def to_canonical(path, *, session_id: str | None = None,
     # ``updatedAtMs`` is NOT a substitute: it moves with every write, so using
     # it dates the whole undated remainder at flush-adjacent time.
     messages = [(message, _iso_ms(node_ts))
-                for message, node_ts in _load_messages(source)]
+                for message, node_ts in _load_messages(source, strict=strict)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")))
+        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")), strict=strict)
+
+
+def session_metadata(path) -> dict:
+    """Native identity and start; a first user message is not a session start."""
+    source = Path(path)
+    if source.name == "store.db":
+        meta = _read_meta_json(source.parent, strict=True)
+        version = meta.get("schemaVersion") if isinstance(meta, dict) else None
+        if type(version) is not int or version != _SCHEMA_VERSION:
+            raise ValueError("unsupported Cursor store metadata")
+        created = meta.get("createdAtMs")
+        return {"session_id": source.parent.name, "cwd": meta.get("cwd"),
+                "git_branch": meta.get("gitBranch"),
+                "started_at": _iso_ms(created) if type(created) in (int, float) else None,
+                "source_surface": meta.get("source_surface")}
+    # This observed location identifies IDE transcripts. An arbitrary file does
+    # not establish a CLI or IDE surface, and absent native start stays unknown.
+    try:
+        relative = source.resolve().relative_to(_PROJECTS.resolve())
+        known_ide = len(relative.parts) == 4 and relative.parts[1] == "agent-transcripts"
+    except ValueError:
+        known_ide = False
+    return {"session_id": source.stem, "cwd": None, "git_branch": None,
+            "started_at": None, "source_surface": "cursor-ide" if known_ide else None}

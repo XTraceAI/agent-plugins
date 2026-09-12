@@ -41,12 +41,15 @@ Mapping (order preserved — gpt-5.x emits a ``reasoning`` item *before* its
 from __future__ import annotations
 
 import glob
+import datetime
 import json
 import re
 import sys
 import uuid as _uuid
 from collections import deque
 from pathlib import Path
+from .strict_json import loads as load_json
+from .jsonl import open_lines, readline_bytes
 from typing import Any
 
 # The readers are imported both as a package and, by some callers, with
@@ -149,7 +152,7 @@ def clean_user_text(text: str) -> str | None:
     return t
 
 
-def load_rollout(path) -> list[dict]:
+def load_rollout(path, *, strict: bool = False) -> list[dict]:
     """Parse a Codex rollout .jsonl tolerantly (skip malformed lines, e.g. a
     truncated final line from an interrupted write).
 
@@ -157,13 +160,18 @@ def load_rollout(path) -> list[dict]:
     are UTF-8, a bare read_text() decodes with the OS locale codec, and one
     em-dash then kills the whole import on a cp950/cp1252 box."""
     records: list[dict] = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
+    errors = "strict" if strict else "replace"
+    # Split bytes first: Unicode separators inside JSON strings are content.
+    for encoded in Path(path).read_bytes().splitlines(keepends=True):
+        raw = encoded.decode("utf-8", errors=errors)
+        line = raw.strip(" \t\r\n") if strict else raw.strip()
         if not line:
             continue
         try:
-            record = json.loads(line)
+            record = load_json(line, strict=strict)
         except json.JSONDecodeError:
+            if strict and raw.endswith(("\n", "\r")):
+                raise
             continue
         # The return type says list[dict] and every consumer walks these with
         # ``r.get(...)``. A line holding a bare JSON scalar (``null``, a number,
@@ -173,10 +181,12 @@ def load_rollout(path) -> list[dict]:
         # Dropped here, once, rather than guarded at every walk.
         if isinstance(record, dict):
             records.append(record)
+        elif strict:
+            raise ValueError("Codex rollout row is not an object")
     return records
 
 
-def _text_of(content: Any) -> str:
+def _text_of(content: Any, *, strict: bool = False) -> str:
     """Join the text pieces of a Responses-API content value (a list of
     ``{type: input_text|output_text|text|summary_text, text}`` blocks, or a
     bare string)."""
@@ -187,13 +197,23 @@ def _text_of(content: Any) -> str:
         for b in content:
             if isinstance(b, dict) and isinstance(b.get("text"), str):
                 parts.append(b["text"])
+            elif isinstance(b, dict):
+                # This adapter projects text and tools. Native image/media
+                # blocks remain outside that projection, including checked reads.
+                if strict and ("text" in b or b.get("type") in
+                               ("input_text", "output_text", "text", "summary_text")):
+                    raise ValueError("Codex text block requires string text")
             elif isinstance(b, str):
                 parts.append(b)
+            elif strict:
+                raise ValueError("Codex content has an unsupported text block")
         return "\n".join(parts)
+    if strict:
+        raise ValueError("Codex text content must be a string or block list")
     return ""
 
 
-def _tool_input(payload: dict) -> dict:
+def _tool_input(payload: dict, *, strict: bool = False) -> dict:
     """Normalise a Codex tool call's arguments to a dict.
 
     ``function_call.arguments`` is a JSON string; ``custom_tool_call.input``
@@ -206,10 +226,12 @@ def _tool_input(payload: dict) -> dict:
         return raw
     if isinstance(raw, str):
         try:
-            v = json.loads(raw)
+            v = load_json(raw, strict=strict)
             return v if isinstance(v, dict) else {"input": v}
         except json.JSONDecodeError:
             return {"input": raw}
+    if strict:
+        raise ValueError("Codex tool input must be a string or object")
     return {}
 
 
@@ -341,7 +363,7 @@ def _rollout_thread_name(rollout: list[dict]) -> str | None:
     return found
 
 
-def _sidecar_thread_name(session_id: str | None) -> str | None:
+def _sidecar_thread_name(session_id: str | None, *, strict=False) -> str | None:
     """The name Codex gave this thread, from the ``session_index.jsonl``
     sidecar — for the sessions whose rollout does not carry one.
 
@@ -378,28 +400,41 @@ def _sidecar_thread_name(session_id: str | None) -> str | None:
             start = max(0, size - _INDEX_TAIL_BYTES)
             fh.seek(start)
             blob = fh.read()
-        lines = blob.decode("utf-8", errors="replace").splitlines()
-        if start and lines:
-            lines = lines[1:]   # the seek landed mid-row; that is not a record
-        for line in deque(lines, maxlen=_INDEX_MAX_LINES):
-            line = line.strip()
+        if start:
+            # Drop the incomplete byte prefix before strict UTF-8 decoding;
+            # the seek may have landed inside a multi-byte character.
+            blob = b"".join(blob.splitlines(keepends=True)[1:])
+        lines = [raw.decode("utf-8", errors="strict" if strict else "replace")
+                 for raw in blob.splitlines(keepends=True)]
+        for raw in deque(lines, maxlen=_INDEX_MAX_LINES):
+            line = raw.strip(" \t\r\n") if strict else raw.strip()
             if not line:
                 continue
             try:
-                row = json.loads(line)
-            except Exception:  # noqa: BLE001 — a torn final line is normal
+                row = load_json(line, strict=strict)
+            except json.JSONDecodeError:  # a torn final line is normal
+                if strict and raw.endswith(("\n", "\r")):
+                    raise
                 continue
-            if not isinstance(row, dict) or row.get("id") != session_id:
+            if not isinstance(row, dict):
+                if strict:
+                    raise ValueError("Codex title index row is not an object")
+                continue
+            if row.get("id") != session_id:
                 continue
             name = row.get("thread_name")
             if isinstance(name, str) and name.strip():
                 found = _one_line(name)
         return found
-    except Exception:  # noqa: BLE001 — no index, unreadable, anything
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — legacy capture remains best-effort
+        if strict:
+            raise
         return None
 
 
-def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
+def _title(rollout: list[dict], session_id: str | None = None, *, strict=False) -> str | None:
     """What Codex calls this session, else the best name we can derive.
 
     Precedence, and why: MemHub should show the title Codex's own UI shows.
@@ -414,7 +449,7 @@ def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or _sidecar_thread_name(session_id))
+                   or _sidecar_thread_name(session_id, strict=strict))
     if thread_name:
         return thread_name
 
@@ -439,7 +474,7 @@ def _title(rollout: list[dict], session_id: str | None = None) -> str | None:
     return normalize_title(first_user or last_complete)
 
 
-def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
+def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -447,29 +482,52 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
     ``import_session._namespace_from_records`` can resolve the repo. Platform,
     model, session, and cwd provenance live in structured metadata instead of a
     synthetic user turn, keeping titles and turn counts faithful."""
+    if strict:
+        from . import _parseable_timestamp
+        for row in rollout:
+            if isinstance(row, dict) and row.get("type") == "session_meta":
+                _metadata_from_header(row)
+                break
     sm = _session_meta(rollout)
+    if strict and (not isinstance(sm.get("id"), str) or not sm["id"].strip()):
+        raise ValueError("Codex checked reads require a native session identifier")
+    if strict and sm.get("cli_version") is not None and not isinstance(sm["cli_version"], str):
+        raise ValueError("Codex CLI version must be text or null")
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
     model = None
     for r in rollout:
         if not isinstance(r, dict):  # see _rollout_thread_name
             continue
         pl = r.get("payload")
-        if isinstance(pl, dict) and r.get("type") == "turn_context" and pl.get("model"):
-            model = pl["model"]
-            break
+        if isinstance(pl, dict) and r.get("type") == "turn_context":
+            value = pl.get("model")
+            if strict and value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("Codex model must be nonblank text or null")
+            if value and model is None:
+                model = value
+                if not strict:
+                    # A checked read keeps scanning: a later malformed turn
+                    # context must still fail, not hide behind the first model.
+                    break
     meta = {
         "session_id": sm.get("id"),
         "cwd": cwd,
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout, sm.get("id")),
+        "title": _title(rollout, sm.get("id"), strict=strict),
         "host": HOST,
     }
 
     out: list[dict] = []
     sid_key = sm.get("id") or "unknown"
     ts_holder = {"ts": None}
+
+    def observe_timestamp(value) -> None:
+        if strict and value is not None and not _parseable_timestamp(value):
+            raise ValueError("Codex record timestamp is not valid ISO-8601")
+        if isinstance(value, str):
+            ts_holder["ts"] = value
     # Reader versions through 0.27.4 emitted a provenance banner at identity
     # index 0. Keep a virtual slot for it so every real record retains its UUID
     # on incremental re-import even though the banner is no longer emitted.
@@ -524,8 +582,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
             message["model"] = model
         return rec({"type": "assistant", "message": message})
 
-    ts_holder["ts"] = next((r.get("timestamp") for r in rollout
-                            if isinstance(r.get("timestamp"), str)), None)
+    observe_timestamp(next((r.get("timestamp") for r in rollout
+                            if isinstance(r.get("timestamp"), str)), None))
 
     last_assistant: dict | None = None
     previous_usage_total: dict[str, int] | None = None
@@ -553,8 +611,7 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
         pl = r.get("payload")
         if (r.get("type") == "event_msg" and isinstance(pl, dict)
                 and pl.get("type") == "token_count"):
-            if isinstance(r.get("timestamp"), str):
-                ts_holder["ts"] = r["timestamp"]
+            observe_timestamp(r.get("timestamp"))
             info = pl.get("info")
             total = _usage_total(
                 info.get("total_token_usage") if isinstance(info, dict) else None
@@ -581,17 +638,32 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
             continue
         if r.get("type") != "response_item":
             continue
-        if isinstance(r.get("timestamp"), str):
-            ts_holder["ts"] = r["timestamp"]
+        observe_timestamp(r.get("timestamp"))
         if not isinstance(pl, dict):
+            if strict:
+                raise ValueError("Codex response payload is not an object")
             continue
         pt = pl.get("type")
+        if strict and (not isinstance(pt, str) or not pt.strip()):
+            raise ValueError("Codex response payload has no valid type")
+
+        if strict and pt in ("function_call", "custom_tool_call",
+                             "function_call_output", "custom_tool_call_output"):
+            identity = pl.get("call_id") or pl.get("id")
+            if not isinstance(identity, str) or not identity.strip():
+                raise ValueError("Codex tool record requires its native call identifier")
+            if pt in ("function_call", "custom_tool_call"):
+                name = pl.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("Codex tool call requires its native tool name")
 
         if pt == "message":
             role = pl.get("role")
-            if role == "developer":
+            if role in ("developer", "system"):
                 continue  # sandbox/permissions system injection — noise
-            text = _text_of(pl.get("content")).strip()
+            if strict and role not in ("user", "assistant"):
+                raise ValueError("Codex message has no supported role")
+            text = _text_of(pl.get("content"), strict=strict).strip()
             if not text:
                 continue
             if role == "user":
@@ -616,7 +688,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                 append_assistant({"type": "text", "text": text})
 
         elif pt == "reasoning":
-            summary = _text_of(pl.get("summary")).strip()
+            value = pl.get("summary")
+            summary = _text_of(value, strict=strict and value is not None).strip()
             if summary:
                 append_assistant({"type": "thinking", "thinking": summary})
 
@@ -629,7 +702,7 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
                 "type": "tool_use",
                 "id": call_id,
                 "name": pl.get("name") or "tool",
-                "input": _tool_input(pl),
+                "input": _tool_input(pl, strict=strict),
             })
 
         elif pt in ("function_call_output", "custom_tool_call_output"):
@@ -639,6 +712,8 @@ def rollout_to_claude_records(rollout: list[dict]) -> tuple[list[dict], dict]:
             # duplicate-linking — an unrelated call. Never happens for real Codex.
             call_id = pl.get("call_id") or pl.get("id") or f"codex-out-{idx}"
             output = pl.get("output")
+            if strict and output is None:
+                raise ValueError("Codex tool output must be present")
             if not isinstance(output, str):
                 output = json.dumps(output) if output is not None else ""
             out.append(user([{
@@ -657,7 +732,10 @@ def rollout_uuid(path) -> str | None:
     return m.group(1) if m else None
 
 
-def _rollout_files() -> list[Path]:
+def _rollout_files(on_error=None) -> list[Path]:
+    if on_error is not None:
+        from .discovery import paths
+        return paths(_SESSIONS, ("**", "rollout-*.jsonl"), on_error)
     return [Path(f) for f in glob.glob(str(_SESSIONS / "**" / "rollout-*.jsonl"),
                                        recursive=True)]
 
@@ -668,38 +746,92 @@ def _rollout_files() -> list[Path]:
 _META_MAX_RECORDS = 200
 
 
-def session_cwd(path) -> str | None:
-    """The directory this session was started in, from ``session_meta.cwd``.
+def _session_header(path, *, strict: bool = True) -> dict:
+    """Read the bounded header once, before validating individual field values.
 
-    Same read ``to_canonical`` already does through ``_session_meta``, without
-    parsing the rollout to get there.
+    The CLI counts its native ID before validating other selected header fields.
+    Later body records belong to the complete reader, not this metadata probe.
     """
+    with open_lines(path) as handle:
+        for _ in range(_META_MAX_RECORDS):
+            raw = readline_bytes(handle, 1024 * 1024)
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="strict" if strict else "replace")
+            if not (line.strip(" \t\r\n") if strict else line.strip()):
+                continue
+            try:
+                record = load_json(line, strict=strict)
+            except json.JSONDecodeError:
+                if strict and raw.endswith((b"\n", b"\r")):
+                    raise
+                if not raw.endswith((b"\n", b"\r")):
+                    break
+                continue
+            if strict and not isinstance(record, dict):
+                raise ValueError("Codex metadata row is not an object")
+            if (strict and record.get("type") == "session_meta"
+                    and not isinstance(record.get("payload"), dict)):
+                raise ValueError("Codex metadata payload is not an object")
+            payload = _session_meta([record])
+            if payload or (strict and record.get("type") == "session_meta"):
+                return record
+    return {}
+
+
+def _metadata_from_header(header: dict, *, strict: bool = True) -> dict:
+    """Project a parsed header into validated metadata without rereading it."""
+    if not header:
+        return {}
+    if strict and not isinstance(header.get("payload"), dict):
+        raise ValueError("Codex metadata payload is not an object")
+    payload = _session_meta([header])
+    git = payload.get("git")
+    if strict and git is not None and not isinstance(git, dict):
+        raise ValueError("Codex git metadata is not an object")
+    started = payload.get("timestamp")
+    if started is None or (not strict and not started):
+        started = header.get("timestamp")
+    result = {"session_id": payload.get("id"), "cwd": payload.get("cwd"),
+              "source_surface": payload.get("originator"), "started_at": started,
+              "git_branch": git.get("branch") if isinstance(git, dict) else None}
+    if strict:
+        for name, value in result.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Codex metadata {name} must be text or null")
+        if started is not None:
+            parsed = datetime.datetime.fromisoformat(started.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("Codex start time requires a timezone")
+    return result
+
+
+def session_metadata(path, *, strict: bool = True) -> dict:
+    """Read typed native metadata; missing optional facts remain unknown."""
+    return _metadata_from_header(_session_header(path, strict=strict), strict=strict)
+
+
+def session_cwd(path) -> str | None:
+    """The native working directory, using the bounded session metadata read."""
     try:
-        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-            for _, line in zip(range(_META_MAX_RECORDS), handle):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, dict) or record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                cwd = payload.get("cwd") if isinstance(payload, dict) else None
-                return cwd if isinstance(cwd, str) and cwd else None
-    except OSError:
+        cwd = session_metadata(path, strict=False).get("cwd")
+        return cwd if isinstance(cwd, str) and cwd else None
+    except (OSError, ValueError):
         return None
-    return None
 
 
-def list_sessions(limit: int = 20) -> list[dict]:
-    """Most recent rollouts, newest first."""
-    files = sorted(_rollout_files(), key=lambda f: f.stat().st_mtime, reverse=True)
-    return [{"id": rollout_uuid(f) or f.stem, "path": str(f),
-             "mtime": f.stat().st_mtime, "host": HOST, "cwd": None}
-            for f in files[:limit]]
+def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
+    """Most recent rollouts; discovery callers can receive access failures."""
+    rows = []
+    for path in _rollout_files(on_error):
+        try:
+            rows.append({"id": rollout_uuid(path) or path.stem, "path": str(path),
+                         "mtime": path.stat().st_mtime, "host": HOST, "cwd": None})
+        except OSError as error:
+            if on_error is None:
+                raise
+            on_error(error)
+    return sorted(rows, key=lambda row: row["mtime"], reverse=True)[:limit]
 
 
 def locate(ref: str) -> tuple[Path | None, str]:
@@ -728,6 +860,7 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path) -> tuple[list[dict], dict]:
+def to_canonical(path, *, strict: bool = False) -> tuple[list[dict], dict]:
     """Load a rollout and transform it to Claude-shaped records."""
-    return rollout_to_claude_records(load_rollout(path))
+    return rollout_to_claude_records(load_rollout(path, strict=strict),
+                                    strict=strict)
