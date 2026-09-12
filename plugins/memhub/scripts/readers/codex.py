@@ -423,6 +423,10 @@ def _sidecar_thread_name(session_id: str | None, *, strict=False) -> str | None:
             if row.get("id") != session_id:
                 continue
             name = row.get("thread_name")
+            if strict and name is not None and not isinstance(name, str):
+                # A matching row is the native title this checked read
+                # consumes; silently falling back would hide its corruption.
+                raise ValueError("Codex title index row has a malformed thread name")
             if isinstance(name, str) and name.strip():
                 found = _one_line(name)
         return found

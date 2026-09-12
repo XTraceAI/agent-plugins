@@ -1031,6 +1031,49 @@ def test_saved_cursor_usage_is_normalized_before_emit():
     assert usage["input_tokens"] == 7, usage
 
 
+def test_strict_codex_rejects_malformed_matching_sidecar_title():
+    """A matching session_index.jsonl row is the native title a checked read
+    consumes; a non-string thread_name must fail rather than silently fall back."""
+    import json as _json, tempfile, pathlib
+    import readers.codex as codex_reader
+    sid = "01a0" + "0" * 28
+    with tempfile.TemporaryDirectory() as d:
+        idx = pathlib.Path(d) / "session_index.jsonl"
+        idx.write_text(_json.dumps({"id": sid, "thread_name": 17}) + "\n", encoding="utf-8")
+        original = codex_reader._SESSION_INDEX
+        codex_reader._SESSION_INDEX = idx
+        try:
+            ok = True
+            try:
+                codex_reader._sidecar_thread_name(sid, strict=True)
+                ok = False
+            except ValueError:
+                pass
+            assert ok, "checked read accepted a malformed matching thread_name"
+            # Tolerant capture must still degrade rather than fail.
+            assert codex_reader._sidecar_thread_name(sid, strict=False) is None
+            # A well-formed row still resolves.
+            idx.write_text(_json.dumps({"id": sid, "thread_name": "Real title"}) + "\n",
+                           encoding="utf-8")
+            assert codex_reader._sidecar_thread_name(sid, strict=True) == "Real title"
+        finally:
+            codex_reader._SESSION_INDEX = original
+
+
+def test_saved_state_can_be_parsed_from_prevalidated_bytes():
+    """apply_session_state must be able to use bytes a caller already read from a
+    validated descriptor, so a swapped path cannot be reopened underneath it."""
+    import cursor_flush, json as _json
+    sid = "11111111-2222-4333-8444-555555555555"
+    target = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+    text = _json.dumps({"usage_events": {sid: {"target_uuid": target,
+                                               "usage": {"inputTokens": 5}}}})
+    records = [{"uuid": target, "type": "assistant",
+                "message": {"role": "assistant", "content": [], "model": "m"}}]
+    cursor_flush.apply_session_state(records, sid, strict=True, state_text=text)
+    assert records[0]["message"]["usage"]["input_tokens"] == 5
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
