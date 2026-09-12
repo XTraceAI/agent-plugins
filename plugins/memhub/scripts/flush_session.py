@@ -443,6 +443,13 @@ async def _send(session, arguments, room, title, namespace,
         except mcp_http.McpNoResponse as e:
             _log(f"{label}no response frame: {e}")
             _breadcrumb(args.get("conversation_id"), "unrecognized_response", str(e))
+        except mcp_http.McpEgressBlocked as e:
+            # A proxy refused the CONNECT (Claude Code on the web, host not in
+            # the environment's network allowlist). Not the server's fault and
+            # not the credential's, so its own breadcrumb — same as the
+            # per-turn path, or the two hooks would disagree about one outage.
+            _log(f"{label}network refused the connection: {e}")
+            _breadcrumb(args.get("conversation_id"), "egress_blocked", str(e))
         except mcp_http.McpError as e:
             if e.status == 401:
                 _log(f"{label}credential rejected (401); run /memhub:login")

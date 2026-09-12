@@ -244,34 +244,28 @@ def _is_live(key: dict) -> bool:
     return not key.get("revoked_at")
 
 
-def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, str]:
-    """Return ``(record, how)`` — the key this machine should use.
+def issue(mcp_url: str, bearer: str, label: str) -> tuple[dict, str]:
+    """Mint a key under ``label`` on the server and return ``(record, how)``.
 
-    ``how`` is ``reused`` when the stored key is still good, ``replaced`` when a
-    same-label orphan had to be cleared first, or ``minted``.
+    ``how`` is ``replaced`` when a same-label orphan had to be cleared first,
+    else ``minted``. The local store is NOT touched: this is the server half of
+    ``ensure``, split out so a key destined for somewhere else — a Claude Code
+    on the web environment's variables — can be minted without displacing the
+    key this machine runs on.
 
-    Reuse is decided from the LOCAL record, because the server cannot help: it
-    never shows a secret twice, so a key listed under our label whose secret we
-    do not hold is unusable no matter how healthy it looks. Revoking it before
-    minting is what keeps the five-key cap counting credentials that exist
-    rather than ghosts of lost caches.
+    The server never shows a secret twice, so a live key under our label whose
+    secret we do not hold is unusable however healthy it looks. Revoking it
+    before minting is what keeps the five-key cap counting credentials that
+    exist rather than ghosts of lost caches.
     """
-    label = label or default_label()
     base = api_base(mcp_url)
-
-    stored = load(mcp_url)
-    if stored and stored.get("label") == label:
-        remaining = expires_in_s(stored)
-        if remaining is None or remaining > 0:
-            return stored, "reused"
-
     keys = list_keys(base, bearer)
     orphans = [k for k in keys
                if k.get("label") == label and _is_live(k) and k.get("id")]
 
     # Cap FIRST, and never counting our own orphan — which is about to be
     # freed and is not competing for a slot. Checking after revoking would
-    # destroy this machine's only key and only then discover it cannot mint a
+    # destroy this label's only key and only then discover it cannot mint a
     # replacement, stranding it with no credential at all and no way back
     # except a manual revoke elsewhere. Refusing before touching anything
     # leaves the existing key working, which is the strictly better failure.
@@ -294,5 +288,28 @@ def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, s
             pass
 
     record = mint(base, bearer, label)
-    save(mcp_url, record)
     return record, ("replaced" if orphans else "minted")
+
+
+def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, str]:
+    """Return ``(record, how)`` — the key this machine should use.
+
+    ``how`` is ``reused`` when the stored key is still good, ``replaced`` when a
+    same-label orphan had to be cleared first, or ``minted``.
+
+    Reuse is decided from the LOCAL record, because the server cannot help: it
+    never shows a secret twice, so a key listed under our label whose secret we
+    do not hold is unusable no matter how healthy it looks. Everything past
+    that check is ``issue``, which owns the cap and the orphan housekeeping.
+    """
+    label = label or default_label()
+
+    stored = load(mcp_url)
+    if stored and stored.get("label") == label:
+        remaining = expires_in_s(stored)
+        if remaining is None or remaining > 0:
+            return stored, "reused"
+
+    record, how = issue(mcp_url, bearer, label)
+    save(mcp_url, record)
+    return record, how

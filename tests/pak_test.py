@@ -384,6 +384,46 @@ def test_envelope_errors_surface():
         pak._call = real
 
 
+def test_issue_leaves_this_machines_key_alone():
+    """A key minted for another environment must not displace this one's.
+
+    ``--cloud-key`` mints a key that will live in a Claude Code on the web
+    environment's variables. Going through ``ensure`` would have written it
+    over the local store — so this machine's hooks would silently switch to a
+    credential that is about to be pasted somewhere else and, if the user then
+    rotates the cloud key, revoked under them.
+    """
+    print("\nissue for another environment")
+    _reset()
+    pak.save(MCP, {"secret": "mhk_local", "label": "test-machine"})
+    state = _fake_server([
+        {"id": "old-cloud", "label": "claude-code-cloud", "revoked_at": None},
+        {"id": "mine", "label": "test-machine", "revoked_at": None},
+    ])
+    record, how = pak.issue(MCP, "bearer", "claude-code-cloud")
+    check("same-label orphan replaced", how, "replaced")
+    check("orphan was revoked", bool(state["keys"][0]["revoked_at"]), True)
+    check("this machine's server key untouched",
+          state["keys"][1]["revoked_at"], None)
+    check("minted under the asked-for label", record["label"], "claude-code-cloud")
+    check("secret returned to the caller", record["secret"].startswith("mhk_"), True)
+    check("local store still holds this machine's key",
+          pak.load(MCP)["secret"], "mhk_local")
+
+    # The cap applies here too, and never counts the orphan being replaced.
+    _fake_server([{"id": f"k{i}", "label": f"other-{i}", "revoked_at": None}
+                  for i in range(pak.MAX_KEYS)]
+                 + [{"id": "old-cloud", "label": "claude-code-cloud",
+                     "revoked_at": None}])
+    try:
+        pak.issue(MCP, "bearer", "claude-code-cloud")
+        check("cap refused", False, True)
+    except pak.PakError as exc:
+        check("cap refused", "maximum" in str(exc), True)
+    check("nothing revoked under the cap",
+          [c for c in calls if c[0] == "DELETE"], [])
+
+
 if __name__ == "__main__":
     real_call = pak._call
     for test in (test_paths_and_labels, test_credentials_never_go_over_cleartext,
@@ -394,7 +434,8 @@ if __name__ == "__main__":
                  test_a_failed_orphan_revoke_does_not_block_minting,
                  test_reuses_a_good_stored_key, test_expired_stored_key_is_replaced,
                  test_orphan_is_revoked_before_minting, test_mints_when_nothing_exists,
-                 test_cap_is_reported_not_hit, test_envelope_errors_surface):
+                 test_cap_is_reported_not_hit, test_envelope_errors_surface,
+                 test_issue_leaves_this_machines_key_alone):
         test()
     pak._call = real_call
     if failures:

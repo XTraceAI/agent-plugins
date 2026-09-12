@@ -93,6 +93,15 @@ the current repo still needs MemHub onboarding.
 
 Claude Code and Cursor load their bundled MemHub hooks natively, so never write
 Codex's bridge into their config. On those hosts, only run the authentication
-and health checks above. Cursor Teams/Enterprise policy can block unofficial
+and health checks above.
+
+On Claude Code on the web (`CLAUDE_CODE_REMOTE=true`), the login status check
+above cannot mint anything: there is no browser and the container's home is
+discarded. It reports `NOT LOGGED IN` unless `$MEMHUB_TOKEN` is set, and the
+health check names the same fix — a key minted on the user's own machine with
+`/memhub:login --cloud-key`, stored in the environment's variables — plus the
+network allowlist entry for the MemHub host if the probe finds it blocked.
+Report those as environment settings to change at claude.ai/code, not as
+something to install in the session. Cursor Teams/Enterprise policy can block unofficial
 marketplaces before this skill is available; that is an admin installation
 policy, not something this plugin should attempt to bypass.

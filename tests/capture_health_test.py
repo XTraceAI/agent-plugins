@@ -37,6 +37,9 @@ os.environ["USERPROFILE"] = _TMP_HOME
 os.environ.pop("MEMHUB_TOKEN", None)
 os.environ.pop("MEMHUB_TURN_FLUSH", None)
 os.environ.pop("MEMHUB_MCP_BASE_URL", None)
+# Running this suite INSIDE a Claude Code on the web session must not turn every
+# assertion below into the cloud variant (and start probing the network).
+os.environ.pop("CLAUDE_CODE_REMOTE", None)
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.
@@ -344,6 +347,95 @@ def test_messages() -> None:
           bool(msg and "/memhub:login" not in msg), True)
 
 
+def test_cloud_messages() -> None:
+    """On Claude Code on the web the DIAGNOSIS is the same and the FIX is not.
+
+    A cloud session has no browser and no persistent home, so "run
+    /memhub:login" is advice that cannot work there — the credential is an
+    environment variable, and a refused connection is the environment's
+    network policy. Both must be named as such, and the local wording must be
+    untouched by the cloud branch.
+    """
+    print("\ncloud sessions")
+    import urllib.error
+
+    msg = ch._message(HOST, "never", None, cloud=True)
+    check("cloud never-authed names the variable",
+          bool(msg and "MEMHUB_TOKEN" in msg), True)
+    check("cloud never-authed names where to mint it",
+          bool(msg and "--cloud-key" in msg), True)
+    check("cloud never-authed does not send them to a browser login",
+          "Run /memhub:login to authenticate" not in (msg or ""), True)
+    local = ch._message(HOST, "never", None)
+    check("local never-authed still sends them to /memhub:login",
+          bool(local and "Run /memhub:login to authenticate" in local), True)
+
+    # A live probe is present tense and outranks any breadcrumb — it is true
+    # now, and the breadcrumb only proves something was broken when written.
+    msg = ch._message(HOST, None, ("timeout", time.time()),
+                      cloud=True, egress_blocked=True)
+    check("egress probe names the host", bool(msg and HOST in msg), True)
+    check("egress probe names the setting",
+          bool(msg and "network access" in msg), True)
+    check("egress probe outranks a breadcrumb",
+          "stopped responding" not in (msg or ""), True)
+
+    # The same breadcrumb reads differently by where the session runs: the
+    # remedy is wherever the network policy lives.
+    msg = ch._message(HOST, None, ("egress_blocked", time.time()), cloud=True)
+    check("cloud egress breadcrumb names the allowlist",
+          bool(msg and "network access" in msg), True)
+    check("cloud egress breadcrumb does not send them to --status",
+          "--status" not in (msg or ""), True)
+    msg = ch._message(HOST, None, ("egress_blocked", time.time()))
+    check("local egress breadcrumb names the machine's network",
+          bool(msg and "proxy or firewall" in msg), True)
+    check("neither wording claims the server failed",
+          "server" not in (msg or "").split("refused")[0], True)
+
+    # A 401 on a cloud session is the environment's variable, not a saved
+    # login — there is none to have expired.
+    msg = ch._message(HOST, None, ("auth", time.time()), cloud=True)
+    check("cloud auth failure names the variable",
+          bool(msg and "MEMHUB_TOKEN this environment supplies" in msg), True)
+    check("cloud auth failure names the fix", bool(msg and "--cloud-key" in msg), True)
+    msg = ch._message(HOST, None, ("auth", time.time()))
+    check("local auth failure unchanged",
+          bool(msg and "saved login expired" in msg and "/memhub:login" in msg), True)
+
+    # The probe itself: only urllib's tunnel refusal counts. Anything else is
+    # "don't know", which must read as healthy rather than guessed.
+    real = ch.urllib.request.urlopen
+
+    def _raising(exc):
+        def _open(*a, **k):
+            raise exc
+        return _open
+    try:
+        ch.urllib.request.urlopen = _raising(urllib.error.URLError(
+            OSError("Tunnel connection failed: 403 Forbidden")))
+        check("tunnel refusal -> blocked", ch._egress_blocked(HOST), True)
+        ch.urllib.request.urlopen = _raising(urllib.error.URLError(
+            OSError("[Errno 111] Connection refused")))
+        check("other URLError -> not blocked", ch._egress_blocked(HOST), False)
+        ch.urllib.request.urlopen = _raising(urllib.error.HTTPError(
+            f"https://{HOST}/", 404, "Not Found", {}, None))
+        check("an HTTP answer proves reachability", ch._egress_blocked(HOST), False)
+        ch.urllib.request.urlopen = _raising(TimeoutError("slow"))
+        check("a timeout is not a verdict", ch._egress_blocked(HOST), False)
+    finally:
+        ch.urllib.request.urlopen = real
+
+    # End to end: a cloud session with nothing set gets the variable named,
+    # via the field the user actually sees — and no probe runs, because the
+    # missing credential is reported first.
+    _reset()
+    out = _run({"session_id": "e2e-cloud"}, {"CLAUDE_CODE_REMOTE": "true"})
+    payload = json.loads(out)
+    check("cloud e2e warns via systemMessage",
+          "MEMHUB_TOKEN" in payload.get("systemMessage", ""), True)
+
+
 def test_debounce() -> None:
     print("\ndebounce")
     _reset()
@@ -568,7 +660,7 @@ def test_rulebook_health() -> None:
 
 if __name__ == "__main__":
     for test in (test_token_states, test_stored_key_outranks_the_oauth_cache,
-                 test_breadcrumbs, test_messages,
+                 test_breadcrumbs, test_messages, test_cloud_messages,
                  test_debounce, test_rulebook_health, test_end_to_end,
                  test_never_raises):
         test()

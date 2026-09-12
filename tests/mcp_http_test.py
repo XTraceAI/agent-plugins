@@ -236,12 +236,63 @@ def test_redirects_are_refused():
           any(isinstance(h, m._NoRedirects) for h in m._opener().handlers), True)
 
 
+def test_egress_denial_is_its_own_error():
+    """A proxy that refuses the CONNECT is not a server fault.
+
+    On Claude Code on the web every host outside the environment's allowlist
+    fails this way, and urllib reports it as a bare URLError — which the
+    generic branch recorded as "the capture hook hit an unexpected error",
+    sending the user to check a server and a credential that were both fine.
+    """
+    print("\negress denial")
+    import urllib.error
+
+    denied = urllib.error.URLError(
+        OSError("Tunnel connection failed: 403 Forbidden"))
+    refused = urllib.error.URLError(OSError("[Errno 111] Connection refused"))
+    check("tunnel refusal is recognised", m.is_egress_denial(denied), True)
+    check("a plain connection failure is not", m.is_egress_denial(refused), False)
+    check("a bare OSError with the text is",
+          m.is_egress_denial(OSError("tunnel connection failed: 407")), True)
+
+    exc = m.transport_error("tools/call failed", denied)
+    check("classified as egress", isinstance(exc, m.McpEgressBlocked), True)
+    check("still an McpError for callers that only know that",
+          isinstance(exc, m.McpError), True)
+    check("carries no HTTP status — nothing completed", exc.status, None)
+    check("names the proxy", "proxy refused" in str(exc), True)
+    exc = m.transport_error("tools/call failed", refused)
+    check("other failures stay generic",
+          type(exc) is m.McpError and "Connection refused" in str(exc), True)
+
+    # And both transports are wired to it.
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise denied
+    real = m._OPENER
+    m._OPENER = _Opener()
+    try:
+        for label, call in (("request", lambda: m.request(
+                                "https://h.example/mcp", "b", "tools/list")),
+                            ("rest", lambda: m.rest(
+                                "https://h.example/v1/rules", "b"))):
+            try:
+                call()
+                check(f"{label} raises", False, True)
+            except m.McpEgressBlocked:
+                check(f"{label} raises McpEgressBlocked", True, True)
+            except m.McpError as e:
+                check(f"{label} raises McpEgressBlocked (got {e!r})", False, True)
+    finally:
+        m._OPENER = real
+
+
 if __name__ == "__main__":
     for test in (test_sse_parsing, test_decode_picks_the_response,
                  test_tool_result_shape, test_rate_limit_is_its_own_error,
                  test_jsonrpc_error_raises,
                  test_a_missing_result_is_not_an_empty_one,
-                 test_redirects_are_refused):
+                 test_redirects_are_refused, test_egress_denial_is_its_own_error):
         test()
     if failures:
         print("\nFAILED:")

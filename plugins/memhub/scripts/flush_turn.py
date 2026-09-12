@@ -71,6 +71,7 @@ import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
+from cloud_session import is_cloud_session  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
@@ -511,6 +512,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             # not a generic fault.
             _log(f"no response frame: {e}")
             _mark_failure(session_id, "unrecognized_response", str(e))
+        except mcp_http.McpEgressBlocked as e:
+            # The request never left the machine: a proxy refused the CONNECT.
+            # Seen on Claude Code on the web whenever the environment's network
+            # policy does not list the MemHub host. Neither the server nor the
+            # credential is at fault, so neither of those breadcrumbs — the fix
+            # is an allowlist entry, and the health check names it.
+            _log(f"network refused the connection: {e}")
+            _mark_failure(session_id, "egress_blocked", str(e))
         except mcp_http.McpError as e:
             if e.status == 401:
                 # Unauthenticated: no credential, or one the server won't
@@ -735,7 +744,12 @@ def main() -> int:
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
             reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
         elif isinstance(e, _NoCredential):
-            _log("no usable credential; run /memhub:login "
+            # A cloud session has no browser and no cache: the only credential
+            # it can ever have is the one its environment supplies.
+            _log("no usable credential; set MEMHUB_TOKEN in the environment's "
+                 "variables to enable per-turn capture — skipping"
+                 if is_cloud_session() else
+                 "no usable credential; run /memhub:login "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
             # The one failure the user must act on personally, and the one that
             # stays broken forever until they do: no retry can mint a token.

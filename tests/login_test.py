@@ -30,6 +30,9 @@ _TMP_HOME = tempfile.mkdtemp(prefix="login-test-")
 # real token caches.
 os.environ["HOME"] = _TMP_HOME
 os.environ["USERPROFILE"] = _TMP_HOME
+# Inside a Claude Code on the web session every in-process login call would
+# otherwise take the cloud refusal path and never reach what is under test.
+os.environ.pop("CLAUDE_CODE_REMOTE", None)
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.
@@ -220,6 +223,43 @@ def test_failure_slugs_all_have_health_messages() -> None:
         check(f"{slug!r} has a health message", slug in ch._REASONS, True)
 
 
+def test_cloud_session_refuses_the_browser_flow() -> None:
+    """A cloud session must be told the fix, not walked into a hang.
+
+    There is no browser to open and no ``~/.config`` for a token to survive
+    in, so the flow cannot succeed — it would sit on a localhost redirect that
+    never arrives until the approval timeout. With ``$MEMHUB_TOKEN`` supplied
+    the normal path applies (that IS the cloud login), so the refusal is
+    specific to a cloud session that has nothing.
+    """
+    print("\ncloud session")
+    base = dict(os.environ, HOME=_TMP_HOME, USERPROFILE=_TMP_HOME,
+                CLAUDE_CODE_REMOTE="true")
+    base.pop("MEMHUB_TOKEN", None)
+    for argv in ([], ["--status"], ["--force"], ["--cloud-key"]):
+        out = subprocess.run(
+            [sys.executable, str(SCRIPTS / "login.py"), *argv],
+            capture_output=True, text=True, env=base)
+        label = " ".join(argv) or "(no args)"
+        check(f"{label}: exits non-zero", out.returncode, 1)
+        check(f"{label}: says it is a cloud session",
+              "Claude Code on the web" in out.stdout, True)
+        check(f"{label}: names the variable", "MEMHUB_TOKEN" in out.stdout, True)
+        check(f"{label}: names where to mint", "--cloud-key" in out.stdout, True)
+        check(f"{label}: no traceback", "Traceback" in out.stderr, False)
+    # --force must not "set aside" a cache that does not exist and then hang.
+    check("--force left no stash behind",
+          list(Path(_TMP_HOME).glob("**/*.prelogin")), [])
+
+    out = subprocess.run(
+        [sys.executable, str(SCRIPTS / "login.py"), "--cloud-key", "--status"],
+        capture_output=True, text=True, env=base)
+    check("--cloud-key --status is refused", out.returncode != 0, True)
+    check("--cloud-key --force is refused", subprocess.run(
+        [sys.executable, str(SCRIPTS / "login.py"), "--cloud-key", "--force"],
+        capture_output=True, text=True, env=base).returncode != 0, True)
+
+
 def test_flag_conflict() -> None:
     print("\nflag conflict")
     out = subprocess.run(
@@ -240,6 +280,7 @@ if __name__ == "__main__":
             test(login)
         test_failure_slugs_all_have_health_messages()
         test_flag_conflict()
+        test_cloud_session_refuses_the_browser_flow()
     if failures:
         print("\nFAILED:")
         for f in failures:

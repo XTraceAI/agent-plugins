@@ -87,6 +87,45 @@ class McpRateLimited(McpError):
         self.retry_after = retry_after
 
 
+class McpEgressBlocked(McpError):
+    """A proxy between this process and the server refused to connect.
+
+    Observed on Claude Code on the web: outbound HTTPS goes through an egress
+    proxy that answers CONNECT with 403 for any host the environment's network
+    policy does not allow, and urllib surfaces that as
+    ``URLError(OSError("Tunnel connection failed: 403 Forbidden"))``. The
+    request never left the machine, so this is not a server fault and not a
+    credential problem — and reporting it as "the capture hook hit an
+    unexpected error" sends the user to check the two things that are fine.
+    Its own type so the breadcrumb can name the real fix: an allowlist entry.
+    """
+
+
+# What urllib's tunnel handshake says when the proxy declines the CONNECT.
+# Matched case-folded on the OSError's text because that is all urllib gives:
+# no status attribute survives the wrapping.
+_TUNNEL_REFUSED = "tunnel connection failed"
+
+
+def is_egress_denial(exc: BaseException) -> bool:
+    """True when ``exc`` is urllib reporting a proxy that refused to connect.
+
+    Shared with the health check, which probes the host at session start on
+    Claude Code on the web, so both sides recognise the same failure.
+    """
+    reason = getattr(exc, "reason", None)
+    return _TUNNEL_REFUSED in str(reason if reason is not None else exc).lower()
+
+
+def transport_error(prefix: str, exc: BaseException) -> McpError:
+    """Classify a failure raised below HTTP — no status, nothing completed."""
+    if is_egress_denial(exc):
+        return McpEgressBlocked(
+            f"{prefix}: the network proxy refused the connection "
+            f"({getattr(exc, 'reason', exc)})")
+    return McpError(f"{prefix}: {exc}")
+
+
 class _Block:
     """One content block. Only ``.text`` is consumed by this codebase."""
 
@@ -257,7 +296,7 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
             raise McpRateLimited(f"rate limited: {detail}", retry_after) from exc
         raise McpError(f"{method} failed ({exc.code}): {detail}", exc.code) from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise McpError(f"{method} failed: {exc}") from exc
+        raise transport_error(f"{method} failed", exc) from exc
 
     envelope = _decode(body, content_type)
     if "error" in envelope:
@@ -343,7 +382,7 @@ def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
             raise McpRateLimited(f"rate limited: {detail}", retry_after) from exc
         raise McpError(f"{method} {url} failed ({exc.code}): {detail}", exc.code) from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise McpError(f"{method} {url} failed: {exc}") from exc
+        raise transport_error(f"{method} {url} failed", exc) from exc
     if not raw.strip():
         return RestReply(status, etag, None)
     try:

@@ -26,6 +26,15 @@ Stdlib only and no network: this runs before the user's first prompt, and every
 millisecond here is one they wait. Measured ~20ms. Never raises — a broken
 health check must not be the thing that breaks a session.
 
+The one exception to "no network" is Claude Code on the web. There the
+capture hooks fail in a way nothing else can report: the environment's egress
+policy refuses the CONNECT, the async flush records a breadcrumb nobody reads
+until the next SessionStart, and the container is usually gone before then.
+So on a cloud session — and only when a credential is present, since a missing
+one is reported first — this probes the MemHub host once (a denied CONNECT
+answers in milliseconds, a real network in well under the hook's budget) and
+names the allowlist fix at the start of the session where it can still help.
+
 Run the self-test:  python3 tests/capture_health_test.py  (from the repo root;
 tests live outside the plugin so they are not shipped to installs)
 """
@@ -37,9 +46,16 @@ import re
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+
+# Siblings, stdlib-only. The scripts dir is sys.path[0] when a hook runs this
+# file, and the tests insert it explicitly.
+from cloud_session import egress_fix, is_cloud_session, token_fix
+from mcp_http import is_egress_denial
 
 CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 STATE_DIR = CACHE_DIR / "turnflush"
@@ -95,6 +111,10 @@ _REASONS = {
     "unconfirmed_provenance": ("the session reached memory, but its captured "
                                "pull-request URL was not acknowledged"),
     "timeout": "the server stopped responding",
+    # The request never left the machine. On Claude Code on the web this is
+    # the environment's network policy; elsewhere a proxy or firewall. Worded
+    # so it does not read as a server outage — the server was never reached.
+    "egress_blocked": "the network refused the connection to the MemHub API",
     # Ran out of its own clock, not a fault of the server or the credential.
     # Named separately because the alternative was reporting whatever error the
     # attempt BEFORE it produced, which pointed at a cause that had already been
@@ -416,20 +436,63 @@ def _lane_recovered(what: str, when: float) -> bool:
         return False
 
 
+# Generous: a denied CONNECT answers in milliseconds and a reachable host in a
+# round trip, so this only ever elapses on a genuinely dead network — where the
+# answer is "not blocked" and the check stays silent rather than guessing.
+_PROBE_TIMEOUT_S = 3.0
+
+
+def _egress_blocked(host: str) -> bool:
+    """True when the proxy in front of this process refuses to reach ``host``.
+
+    A bare GET with no credential: any HTTP answer at all, a 404 included,
+    proves the host is reachable. Only the tunnel refusal counts as blocked;
+    a timeout, a DNS failure or anything else is "don't know", which must read
+    as healthy — a health check that guesses is one people learn to ignore.
+    """
+    try:
+        with urllib.request.urlopen(f"https://{host}/",
+                                    timeout=_PROBE_TIMEOUT_S):
+            return False
+    except urllib.error.HTTPError:
+        return False  # reached the server; the status is irrelevant here
+    except urllib.error.URLError as exc:
+        return is_egress_denial(exc)
+    except Exception:  # noqa: BLE001 — unknown is not blocked
+        return False
+
+
+def _reason_text(reason: str, cloud: bool) -> str:
+    """What a breadcrumb means, in words that fit where the session runs."""
+    if reason == "auth" and cloud:
+        # There is no saved login on a cloud session to have expired; the only
+        # credential it has is the one its environment supplies.
+        return "the MEMHUB_TOKEN this environment supplies was rejected"
+    return _REASONS.get(reason, "the capture hook failed")
+
+
 def _message(host: str, token_problem: str | None,
              failure: tuple[str, float] | None,
-             rulebook: tuple[str, float] | None = None) -> str | None:
+             rulebook: tuple[str, float] | None = None,
+             cloud: bool = False, egress_blocked: bool = False) -> str | None:
     """The warning to show, or None when there is nothing worth saying.
 
     The token check leads when it fires, because it names a cause the user can
     act on and it is true right now — a breadcrumb only proves something was
-    broken when it was written.
+    broken when it was written. A live egress probe (cloud only) comes next
+    for the same reason: it is true now, and a breadcrumb about it is not.
+
+    ``cloud`` changes the FIX, never the diagnosis: the same missing credential
+    is cured by /memhub:login on a laptop and by an environment variable on
+    Claude Code on the web, and sending a cloud user to open a browser the
+    container does not have is advice that cannot work.
     """
     # /memhub:login, not /memhub:import-session — importing a session is a
     # different operation that does real unrequested work and can fail for
     # reasons unrelated to auth, which muddies the very signal being reported.
-    fix = ("Run /memhub:login to authenticate "
-           "(the plugin has its own login, separate from /mcp).")
+    fix = token_fix(host) if cloud else (
+        "Run /memhub:login to authenticate "
+        "(the plugin has its own login, separate from /mcp).")
     if token_problem == "never":
         return (f"MemHub capture is not authenticated for {host}, so this "
                 f"session is not being saved to memory. {fix}")
@@ -457,9 +520,17 @@ def _message(host: str, token_problem: str | None,
                 f"Enable 'Allow Offline Access' on that API, or set "
                 f"$MEMHUB_TOKEN to a personal access key (mhk_…), which the "
                 f"hooks use directly and which does not expire.")
+    if egress_blocked:
+        # Probed live, so it is stated as present tense. Only ever set on a
+        # cloud session, where the fix is a settings change the user can make
+        # and nothing on the machine can.
+        return (f"MemHub capture cannot reach {host} from this Claude Code on "
+                "the web environment: the network policy refused the "
+                "connection, so nothing from this session is reaching memory. "
+                f"{egress_fix(host)}")
     if failure:
         reason, when = failure
-        detail = _REASONS.get(reason, "the capture hook failed")
+        detail = _reason_text(reason, cloud)
         ago = max(0, int((time.time() - when) / 60))
         when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
         # NOT "check /mcp" — the connector is a separate token store, so its
@@ -467,6 +538,13 @@ def _message(host: str, token_problem: str | None,
         # diagnose this would contradict the whole reason this check exists.
         if reason == "auth":
             tail = fix
+        elif reason == "egress_blocked":
+            # Not a credential question, so `--status` would confirm the one
+            # thing that was fine. The remedy is wherever the network policy
+            # lives, and that differs by where the session runs.
+            tail = (egress_fix(host) if cloud else
+                    f"Check the proxy or firewall between this machine and "
+                    f"{host}; the next turn retries on its own.")
         elif reason == "budget_exhausted":
             # Not a credential question at all, so `--status` would send them
             # to inspect the one thing that was definitely fine. The session is
@@ -563,10 +641,16 @@ def main() -> int:
     if not host:
         return 0  # not running as an installed plugin — nothing to judge
 
+    cloud = is_cloud_session()
     token_problem = _token_problem(host)
+    # Cloud only, and only once a credential exists: a missing one is the
+    # first thing to fix and is reported on its own, so the probe would just
+    # be a round trip spent confirming a fact the user cannot act on yet.
+    egress = cloud and token_problem is None and _egress_blocked(host)
     failure = _recent_failure()
     rulebook = _rulebook_problem()
-    message = _message(host, token_problem, failure, rulebook)
+    message = _message(host, token_problem, failure, rulebook,
+                       cloud=cloud, egress_blocked=egress)
     if not message:
         return 0
 
@@ -576,7 +660,7 @@ def main() -> int:
     # should be shown once; only a genuinely DIFFERENT problem should interrupt
     # again.
     signature = (f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
-                 f"|{rulebook[0] if rulebook else ''}")
+                 f"|{rulebook[0] if rulebook else ''}|{'egress' if egress else ''}")
     if _already_warned(session_id, signature):
         return 0
 

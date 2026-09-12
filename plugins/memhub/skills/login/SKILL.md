@@ -1,6 +1,6 @@
 ---
 description: Use when the user wants to authenticate or re-authenticate the MemHub plugin, or when memory capture is not working because of auth (e.g. "log in to memhub", "memhub login", "authenticate memhub", "memhub says I'm not authenticated", "my sessions aren't being saved", "capture stopped working", "re-auth memhub"). Provisions the plugin's own OAuth token — which is SEPARATE from the /mcp connector's login — and verifies it works.
-argument-hint: [--status | --force]
+argument-hint: [--status | --force | --cloud-key [--label NAME]]
 allowed-tools: Bash
 ---
 
@@ -35,6 +35,11 @@ Run exactly one command and report what it says:
   when the user is asking *whether* they are logged in.
 - `--force` → append `--force`. Discards the cached token and redoes the browser
   flow. Use when a login exists but is broken or unrenewable.
+- `--cloud-key` → append `--cloud-key` (and `--label NAME` to name it; default
+  `claude-code-cloud`). Mints a SEPARATE 90-day key for a Claude Code on the
+  web environment and prints it once, for the user to paste into that
+  environment's variables as `MEMHUB_TOKEN`. Run this on the user's own
+  machine, never in a cloud session (it needs a browser). See below.
 
 The command opens a browser tab on the first run. Tell the user to expect it and
 to complete the approval; it waits up to 5 minutes.
@@ -86,6 +91,32 @@ It prints `environment`, `mode`, `status`, then one of `credential` or
   will go silent with no further warning. Do not report this as a clean success.
   Surface the fix the command prints: enable *Allow Offline Access* on that
   environment's API in Auth0 so the grant includes `offline_access`.
+
+## Claude Code on the web
+
+A cloud session (`CLAUDE_CODE_REMOTE=true` in its environment) has no browser
+and nothing under `~/.config` outlives the container, so the browser flow
+cannot run there and a cached login would not survive anyway. `login.py`
+detects this and prints `mode: Claude Code on the web` with `status: NOT
+LOGGED IN` and the fix; never try to work around it. The hooks authenticate
+there with `$MEMHUB_TOKEN` alone, so the setup is:
+
+1. On the user's OWN machine: `/memhub:login --cloud-key`. It uses the cached
+   OAuth token (renewing it, or opening the browser once if there is none —
+   a stored `mhk_` key cannot mint a key), mints a key labelled
+   `claude-code-cloud`, and prints `MEMHUB_TOKEN=mhk_…` exactly once. Re-running
+   replaces it; the previous cloud key is revoked.
+2. In the environment's settings at claude.ai/code → Environments: add
+   `MEMHUB_TOKEN` to the environment variables, allow `api.memhub.xtrace.ai`
+   under network access (the staging host if that plugin is in use), and make
+   sure the plugin is installed in the session — either declared in the repo's
+   `.claude/settings.json` or installed by the environment's setup script (the
+   root README's "Claude Code on the web" section has both).
+
+With `$MEMHUB_TOKEN` set, `--status` in a cloud session reports `mode: bearer
+($MEMHUB_TOKEN)` and verifies it against the server like anywhere else. The
+session-start health check says which of the two settings is missing when
+capture cannot run: the variable, or the network allowlist entry.
 
 ## After a successful first login
 

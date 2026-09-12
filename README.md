@@ -89,6 +89,55 @@ Cursor's hooks are observational — `afterShellExecution` defines no reply the
 agent can see — so the rulebook and the session ↔ PR link hook do not run
 there. Cursor links a session to a pull request with `/memhub:link-pr`.
 
+### Claude Code on the web
+
+A cloud session starts from a fresh container: nothing installed or logged in
+on your machine is there, `~/.config` does not survive it, there is no browser,
+and outbound traffic is limited to the environment's network allowlist. Capture
+works there once the environment supplies what a laptop's `/memhub:login`
+normally would. Three settings, all on the environment at
+[claude.ai/code](https://claude.ai/code) → Environments:
+
+1. **A credential.** On your own machine run `/memhub:login --cloud-key`. It
+   mints a separate 90-day key labelled `claude-code-cloud` and prints it
+   once; add it to the environment's variables as `MEMHUB_TOKEN`. The hooks use
+   `$MEMHUB_TOKEN` directly, so no login happens in the session at all.
+   Re-running `--cloud-key` rotates it (the previous cloud key is revoked).
+2. **Network access.** Allow `api.memhub.xtrace.ai` (or
+   `api.staging.memhub.xtrace.ai` for the staging build). Without it the
+   environment's egress proxy refuses the connection and nothing is captured;
+   the session-start health check probes the host and says so.
+3. **The plugin itself.** Either declare it in the repository, so every cloud
+   session of that repo installs it at start:
+
+   ```json
+   // <repo>/.claude/settings.json
+   {
+     "extraKnownMarketplaces": {
+       "memhub": { "source": { "source": "github", "repo": "XTraceAI/agent-plugins" } }
+     },
+     "enabledPlugins": { "memhub@memhub": true }
+   }
+   ```
+
+   or install it from the environment's **setup script**, which runs before
+   Claude Code launches and is cached with the environment — this keeps the
+   plugin a property of the cloud environment rather than of the repo, so
+   teammates' local setups are untouched:
+
+   ```bash
+   claude plugin marketplace add XTraceAI/agent-plugins
+   claude plugin install memhub@memhub --scope user
+   ```
+
+What runs there is the same capture pipeline: the per-turn `Stop` flush is
+the path that matters, since a container reclaimed after inactivity may never
+fire `SessionEnd`. The repo's room resolves from the git remote exactly as it
+does locally (the room cache is rebuilt once per session). `/memhub:login`
+inside a cloud session reports `NOT LOGGED IN` with the fix above rather than
+attempting a browser flow, and `/memhub:login --status` verifies
+`$MEMHUB_TOKEN` against the server like anywhere else.
+
 ### Capture credential
 
 The foreground login skill opens a browser once and mints a 90-day personal
@@ -549,6 +598,11 @@ state → exit 0, no output; a reminder never blocks an edit.
 
 To point at a different MemHub instance, edit `plugins/memhub/.mcp.json`
 (`url` and `oauth.clientId`).
+
+`MEMHUB_TOKEN` (a personal access key, `mhk_…`) overrides every stored
+credential for the hooks and skills — the CI/headless escape hatch, and the
+only credential a Claude Code on the web session has (see Install). Set
+`MEMHUB_TURN_FLUSH=0` to switch per-turn capture off.
 
 ## License
 

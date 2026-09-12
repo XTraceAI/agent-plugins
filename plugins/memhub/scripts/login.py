@@ -21,6 +21,14 @@ Usage (all optional):
     login.py             log in if needed, then verify and report
     login.py --status    report only; never opens a browser
     login.py --force     discard the cached token and re-run the browser flow
+    login.py --cloud-key mint a key for a Claude Code on the web environment
+                         and print it once, to paste into that environment's
+                         variables as MEMHUB_TOKEN (``--label`` names it)
+
+**On Claude Code on the web** there is no browser and nothing under ``~/.config``
+outlives the container, so the login flow cannot run there at all. The hooks
+authenticate with ``$MEMHUB_TOKEN`` from the environment's variables instead;
+this command says exactly that rather than attempting a flow that cannot work.
 
 Which backend it targets follows the INSTALL: run from the ``memhub`` plugin it
 authenticates production, from ``memhub-staging`` it authenticates staging.
@@ -58,11 +66,22 @@ if "--status" in sys.argv:
 from _memhub_auth import (  # noqa: E402
     NonInteractiveAuthRequired,
     _access_token_expiry,
+    _cached_access_token,
+    _refresh_cached_token_if_stale,
+    build_oauth,
     default_url,
     resolve_url_and_auth,
     token_cache_path,
 )
+from cloud_session import is_cloud_session, token_fix  # noqa: E402
 from room_map import env_for_url  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
+
+# The label a cloud key is minted under unless --label says otherwise. Fixed
+# rather than hostname-derived like a machine's own label: every cloud session
+# is a fresh container with a throwaway hostname, and the key lives in the
+# environment's settings, not on any machine.
+DEFAULT_CLOUD_LABEL = "claude-code-cloud"
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -168,10 +187,92 @@ def _ensure_key(url: str, env: str) -> bool:
     return True
 
 
+def _refuse_on_cloud(url: str, env: str) -> bool:
+    """Say why login cannot run here, if here is Claude Code on the web.
+
+    True means the report was printed and the caller must stop. With
+    ``$MEMHUB_TOKEN`` supplied the normal path applies — that IS the cloud
+    login — so this only fires when a cloud session has nothing at all.
+    """
+    if not is_cloud_session() or os.environ.get("MEMHUB_TOKEN", "").strip():
+        return False
+    print(f"environment : {env} ({url})")
+    print("mode        : Claude Code on the web (no browser, nothing cached)")
+    print("status      : NOT LOGGED IN")
+    print(f"fix         : {token_fix(urlparse(url).netloc)}")
+    return True
+
+
+async def _cloud_key(url: str, env: str, label: str) -> int:
+    """Mint a key for a Claude Code on the web environment and print it ONCE.
+
+    A cloud session cannot log in — no browser, and nothing under ~/.config
+    survives the container — so its hooks can only consume a key provisioned
+    elsewhere and carried in as ``$MEMHUB_TOKEN``. This is the elsewhere.
+
+    Deliberately a SEPARATE key from this machine's own: it will live in an
+    environment's settings rather than a 0600 file here, so it has to be
+    revocable on its own without taking this machine's capture down with it.
+    Hence ``pak.issue`` (server only) and never ``pak.ensure`` (which would
+    replace the local store's key).
+
+    Minting needs the OAuth access token: the server refuses to let a key mint
+    a key (anti-self-replication), so the stored ``mhk_`` is no use here. The
+    cached token is renewed if stale, and the browser flow runs only when there
+    is no usable one — the common case on a machine that logged in long ago
+    and has been running on its key since.
+    """
+    host = urlparse(url).netloc
+    print(f"environment : {env} ({url})")
+    _refresh_cached_token_if_stale(url)
+    bearer = _cached_access_token(url)
+    if bearer:
+        print("mode        : cached OAuth token")
+    else:
+        print("mode        : browser OAuth (plugin client)")
+        try:
+            await _verify(url, None, build_oauth(url, interactive=True))
+        except BaseException as exc:  # noqa: BLE001 — anyio wraps failures
+            leaf = _leaf(exc)
+            print(f"status      : FAILED ({type(leaf).__name__}: {leaf})")
+            return 1
+        bearer = _cached_access_token(url)
+        if not bearer:
+            print("status      : FAILED (the login left no access token to "
+                  "mint with)")
+            return 1
+    try:
+        record, how = pak.issue(url, bearer, label)
+    except PakError as exc:
+        print(f"status      : FAILED ({exc})")
+        return 1
+    verb = {"replaced": "replaced orphaned key", "minted": "created"}.get(how, how)
+    print(f"cloud key   : {verb} '{record.get('label')}' "
+          f"({_describe_expiry(record)})")
+    print()
+    print("Shown ONCE — the server never returns it again. Put it in your Claude")
+    print("Code on the web environment (claude.ai/code → Environments → the")
+    print(f"environment → Environment variables), and allow {host} under that")
+    print("environment's network access, or the hooks cannot reach MemHub:")
+    print()
+    print(f"  MEMHUB_TOKEN={record['secret']}")
+    print()
+    print("Re-run --cloud-key to replace it (the old key is revoked); revoke it in")
+    print("the MemHub app if it leaks. The capture hooks redact mhk_ keys from")
+    print("anything they upload, this terminal included.")
+    return 0
+
+
 async def _run(status_only: bool, force: bool) -> int:
     url = default_url()
     env = env_for_url(url)
     cache = token_cache_path(url)
+
+    # Before any stash or browser: a cloud session has neither a cache to set
+    # aside nor a browser to open, and --force would otherwise "set aside" a
+    # file that does not exist and then hang on a redirect that never comes.
+    if _refuse_on_cloud(url, env):
+        return 1
 
     # --force must move the old credential OUT OF THE WAY, not destroy it.
     #
@@ -406,10 +507,28 @@ def main() -> int:
                         help="report only; never opens a browser")
     parser.add_argument("--force", action="store_true",
                         help="discard the cached token and log in again")
+    parser.add_argument("--cloud-key", action="store_true",
+                        help="mint a key for a Claude Code on the web "
+                             "environment and print it once")
+    parser.add_argument("--label", default=DEFAULT_CLOUD_LABEL,
+                        help="the label a --cloud-key is minted under "
+                             f"(default: {DEFAULT_CLOUD_LABEL})")
     args = parser.parse_args()
     if args.status and args.force:
         parser.error("--status and --force are contradictory: --status must "
                      "never open a browser, and --force exists to open one.")
+    if args.cloud_key and (args.status or args.force):
+        parser.error("--cloud-key stands alone: it mints a key for another "
+                     "environment and neither reports on nor replaces this "
+                     "machine's login.")
+    if args.cloud_key:
+        url = default_url()
+        env = env_for_url(url)
+        if _refuse_on_cloud(url, env):
+            # Minting needs a browser, which is the one thing a cloud session
+            # lacks — the key has to come from the user's own machine.
+            return 1
+        return asyncio.run(_cloud_key(url, env, args.label[:64]))
     return asyncio.run(_run(args.status, args.force))
 
 
