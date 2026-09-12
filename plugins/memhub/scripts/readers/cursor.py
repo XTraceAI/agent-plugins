@@ -194,7 +194,7 @@ def session_cwd(path) -> str | None:
     return cwd if isinstance(cwd, str) and cwd else None
 
 
-def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
+def list_sessions(limit: int | None = 20, *, on_error=None, include_representations=False) -> list[dict]:
     """Most recent Cursor sessions, preferring the richer store per UUID."""
     rows: list[dict] = []
     store_ids: set[str] = set()
@@ -236,7 +236,7 @@ def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
                      "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
                      "host": HOST, "cwd": m.get("cwd")})
     for p in transcripts:
-        if p.stem in store_ids:
+        if p.stem in store_ids and not include_representations:
             continue
         try:
             mtime = p.stat().st_mtime
@@ -536,6 +536,15 @@ def _iso_ms(ms, *, strict: bool = False) -> str | None:
         return None
 
 
+def _created_at(meta: dict, *, strict: bool) -> str | None:
+    value = meta.get("createdAtMs")
+    if value is not None and type(value) not in (int, float):
+        if strict:
+            raise ValueError("invalid Cursor creation timestamp")
+        return None
+    return _iso_ms(value, strict=strict)
+
+
 def _embedded_timestamp(text: str) -> str | None:
     match = _TIMESTAMP_RE.search(text or "")
     if not match:
@@ -796,7 +805,7 @@ def to_canonical(path, *, session_id: str | None = None,
                 for message, node_ts in _load_messages(source, strict=strict)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")), strict=strict)
+        model_hint=None, created_ts=_created_at(mj, strict=strict), strict=strict)
 
 
 def session_metadata(path) -> dict:
@@ -807,10 +816,9 @@ def session_metadata(path) -> dict:
         version = meta.get("schemaVersion") if isinstance(meta, dict) else None
         if type(version) is not int or version != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
-        created = meta.get("createdAtMs")
         return {"session_id": source.parent.name, "cwd": meta.get("cwd"),
                 "git_branch": meta.get("gitBranch"),
-                "started_at": _iso_ms(created) if type(created) in (int, float) else None,
+                "started_at": _created_at(meta, strict=True),
                 "source_surface": meta.get("source_surface")}
     # This observed location identifies IDE transcripts. An arbitrary file does
     # not establish a CLI or IDE surface, and absent native start stays unknown.

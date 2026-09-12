@@ -26,6 +26,23 @@ plugins/memhub/                     # production plugin installed by every host
 codex/                              # legacy forwarding shims and Codex reference guide
 ```
 
+## Read native sessions locally
+
+The plugin also exposes the existing Codex and Cursor readers as a local JSONL
+command. This is useful for discovery or importing history into another local
+consumer:
+
+```bash
+python3 plugins/memhub/scripts/readers_cli.py --host codex --metadata-only
+python3 plugins/memhub/scripts/readers_cli.py --host cursor --since 2026-01-01T00:00:00Z
+```
+
+Each session has an identity header followed by canonical records. Metadata-only
+mode omits records and prompt-derived titles. Missing or unreadable sources
+return an incomplete-coverage error; the command does not upload data or advance
+capture cursors. See the [reader stream contract](docs/wire-contract.md) for
+fields, filtering and exit codes.
+
 ## Install
 
 There are two separate authentications on every host:

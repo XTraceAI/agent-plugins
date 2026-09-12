@@ -434,7 +434,7 @@ def _sidecar_thread_name(session_id: str | None, *, strict=False) -> str | None:
         return None
 
 
-def _title(rollout: list[dict], session_id: str | None = None, *, strict=False) -> str | None:
+def _title(rollout: list[dict], session_id: str | None = None, *, strict=False, title_index=None) -> str | None:
     """What Codex calls this session, else the best name we can derive.
 
     Precedence, and why: MemHub should show the title Codex's own UI shows.
@@ -449,7 +449,9 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict=False) 
     exists to remove. Only the derived fallbacks are normalized.
     """
     thread_name = (_rollout_thread_name(rollout)
-                   or _sidecar_thread_name(session_id, strict=strict))
+                   or (title_index(session_id) if callable(title_index) else
+                       title_index.get(session_id) if title_index is not None else
+                       _sidecar_thread_name(session_id, strict=strict)))
     if thread_name:
         return thread_name
 
@@ -474,7 +476,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict=False) 
     return normalize_title(first_user or last_complete)
 
 
-def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[list[dict], dict]:
+def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=None) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -515,7 +517,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
         "model": model,
         "originator": sm.get("originator"),
         "cli_version": sm.get("cli_version"),
-        "title": _title(rollout, sm.get("id"), strict=strict),
+        "title": _title(rollout, sm.get("id"), strict=strict, title_index=title_index),
         "host": HOST,
     }
 
@@ -860,7 +862,7 @@ def locate(ref: str) -> tuple[Path | None, str]:
     return hits[0], ""
 
 
-def to_canonical(path, *, strict: bool = False) -> tuple[list[dict], dict]:
-    """Load a rollout and transform it to Claude-shaped records."""
+def to_canonical(path, *, strict: bool = False, title_index=None) -> tuple[list[dict], dict]:
+    """Normalize a rollout; an optional complete title index supports historical exports."""
     return rollout_to_claude_records(load_rollout(path, strict=strict),
-                                    strict=strict)
+                                    strict=strict, title_index=title_index)
