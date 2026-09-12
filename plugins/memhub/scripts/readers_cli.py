@@ -238,15 +238,33 @@ class TitleIndex:
 
 @contextmanager
 def source_snapshot(path: Path, host: str):
-    if host != "cursor" or path.name != "store.db":
-        yield path
-        return
-    # SQLite mode=ro may still create an SHM file. Copy stable source bytes to
-    # a private snapshot so journal handling never writes in the native store.
-    # The caller compares source revisions before and after the entire read.
+    # Every source is read from a private snapshot taken through the validated
+    # descriptor, never by reopening the native path: a FIFO or symlink swapped
+    # in after source_revision() would otherwise block the read or be followed
+    # before the final revision check can report source_changed. The caller
+    # compares source revisions before and after the entire read.
     with tempfile.TemporaryDirectory(prefix="native-reader-") as temporary:
         directory = Path(temporary) / path.parent.name
         directory.mkdir(mode=0o700)
+        if host != "cursor" or path.name != "store.db":
+            # Codex rollouts and Cursor transcripts derive identity from the
+            # file name (and Cursor may consult a sibling meta.json), so the
+            # snapshot keeps <parent>/<name>.
+            names = [path.name] + (["meta.json"] if host == "cursor" else [])
+            for name in names:
+                source, target = path.parent / name, directory / name
+                try:
+                    with regular_source(source) as (handle, _):
+                        target.touch(mode=0o600, exist_ok=False)
+                        with target.open("wb") as output:
+                            shutil.copyfileobj(handle, output)
+                except FileNotFoundError:
+                    if name == path.name:
+                        raise
+            yield directory / path.name
+            return
+        # SQLite mode=ro may still create an SHM file. Copy stable source bytes
+        # to a private snapshot so journal handling never writes in the store.
         for name in ("store.db", "store.db-wal", "store.db-journal", "meta.json"):
             source, target = path.parent / name, directory / name
             try:

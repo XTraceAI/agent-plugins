@@ -243,8 +243,11 @@ def test_reader_errors_never_emit_partial_session_records():
             return records, native
 
         def changing(source, **kwargs):
+            # The reader consumes a private snapshot; a write to the native
+            # rollout during the read must still surface as source_changed.
+            assert source != path
             result = original(source, **kwargs)
-            with source.open("a") as handle:
+            with path.open("a") as handle:
                 handle.write('{}\n')
             return result
 
@@ -1165,6 +1168,39 @@ def test_checked_title_index_rejects_malformed_matching_row():
             assert ok, "checked title index accepted a malformed matching row"
         finally:
             codex_reader._SESSION_INDEX = original
+
+
+def test_non_sqlite_sources_are_read_from_a_private_snapshot():
+    """A Codex rollout or Cursor transcript must be parsed from a snapshot taken
+    through the validated descriptor: once the snapshot exists, the native
+    path is swapped for a directory and the read still succeeds untouched."""
+    import tempfile, os
+    import readers_cli
+    with tempfile.TemporaryDirectory() as tmp:
+        for host, rel in (("codex", "2026/09/12/rollout-2026-09-12T00-00-00-01a0" + "0" * 28 + ".jsonl"),
+                          ("cursor", "11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl")):
+            src = pathlib.Path(tmp) / host / rel
+            src.parent.mkdir(parents=True)
+            src.write_text('{"marker": true}\n', encoding="utf-8")
+            if host == "cursor":
+                (src.parent / "meta.json").write_text('{"schemaVersion": 1}', encoding="utf-8")
+            with readers_cli.source_snapshot(src, host) as snap:
+                assert snap != src and snap.name == src.name and snap.parent.name == src.parent.name
+                src.unlink(); src.mkdir()                 # swap after the snapshot
+                assert snap.read_text(encoding="utf-8") == '{"marker": true}\n'
+                if host == "cursor":
+                    assert (snap.parent / "meta.json").exists()
+            assert not snap.exists()                      # private copy is cleaned up
+            # And a source that is already a special file is refused, never opened.
+            fifo = pathlib.Path(tmp) / host / "fifo.jsonl"
+            os.mkfifo(fifo)
+            refused = False
+            try:
+                with readers_cli.source_snapshot(fifo, host):
+                    pass
+            except ValueError:
+                refused = True
+            assert refused
 
 
 if __name__ == "__main__":
