@@ -1249,10 +1249,10 @@ def test_saved_source_selection_is_bound_to_the_state_revision():
         pin = json.dumps({"source_kind": "transcript", "transcript_path": str(path)})
         real_revision = readers_cli.source_revision
 
-        def vanishing(source, host):
+        def vanishing(source, host, **options):
             if state_path.exists():
                 state_path.unlink()              # the pin vanishes after it chose the transcript
-            return real_revision(source, host)
+            return real_revision(source, host, **options)
 
         def export(*arguments):
             output, errors = io.StringIO(), io.StringIO()
@@ -1281,6 +1281,121 @@ def test_saved_source_selection_is_bound_to_the_state_revision():
                             assert not headers, (selection, mode, headers)
         finally:
             cursor_flush.STATE_DIR = original_dir
+
+
+def test_resolution_is_anchored_to_the_rechecked_identity():
+    """The alias recheck and resolve() are separate operations. A rollout, or
+    one of its parent directories, swapped for a symlink in between must not
+    hand back the alias target: the resolved file has to be the very inode the
+    recheck observed."""
+    import tempfile
+    import readers_cli
+    other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    for swap in ("leaf", "parent"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            path = rollout(home)
+            rows = copy.deepcopy(fixtures.CODEX_SYNTH)
+            rows[0]["payload"].update(id=other, timestamp=STAMP)
+            external = write_jsonl(home / "outside/01/rollout-synthetic.jsonl", rows)
+            real_resolve = pathlib.Path.resolve
+            swapped = []
+
+            def resolve(self, strict=False):
+                if self == path and not swapped:
+                    swapped.append(self)
+                    if swap == "leaf":
+                        path.unlink()
+                        path.symlink_to(external)
+                    else:
+                        import shutil
+                        shutil.rmtree(path.parent)
+                        path.parent.symlink_to(external.parent, target_is_directory=True)
+                return real_resolve(self, strict=strict)
+
+            with patch.object(codex, "_SESSIONS", home / ".codex/sessions"), \
+                    patch.object(pathlib.Path, "resolve", resolve):
+                output, errors = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    status = readers_cli.main(["--host", "codex", "--metadata-only"])
+            emitted = [json.loads(line) for line in output.getvalue().splitlines()]
+            assert swapped and status == 2, (swap, errors.getvalue())
+            assert not [row for row in emitted if row.get("type") == "session"], (swap, emitted)
+            assert "session_unreadable" in errors.getvalue() or "discovery_incomplete" in errors.getvalue()
+
+
+def test_reads_after_the_baseline_demand_the_baseline_identity():
+    """A source or saved state swapped after the revision baseline and swapped
+    back before the final comparison must not feed the read: the snapshot copy
+    and the applied state must be the very files the baseline observed."""
+    import tempfile, shutil
+    import readers_cli, cursor_flush
+    other_rows = [dict(row, uuid=row["uuid"].replace("a", "b")) if isinstance(row, dict) and "uuid" in row else row
+                  for row in fixtures.CURSOR_TRANSCRIPT]
+    for swap in ("source", "state"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td).resolve()
+            path = transcript(home)
+            state_dir = home / ".config/memhub-plugin/cursorflush"
+            state_dir.mkdir(parents=True)
+            state_path = state_dir / f"{SID}.json"
+            state_path.write_text(json.dumps({"source_kind": "transcript", "transcript_path": str(path)}))
+            keep = home / "keep"
+            real_snapshot, real_selection = readers_cli.source_snapshot, readers_cli.cursor_selection
+
+            def exchange():
+                # Replace with a distinct inode carrying different bytes.
+                target = path if swap == "source" else state_path
+                shutil.move(target, keep)
+                if swap == "source":
+                    write_jsonl(target, other_rows)
+                else:
+                    # Same pin, different bytes and inode: identity, not content, is at stake.
+                    target.write_text(json.dumps({"source_kind": "transcript", "transcript_path": str(path)}, indent=2))
+
+            def restore():
+                target = path if swap == "source" else state_path
+                target.unlink()
+                shutil.move(keep, target)
+
+            @contextlib.contextmanager
+            def swapped_snapshot(source, host, *rest):
+                exchange() if swap == "source" else None
+                try:
+                    with real_snapshot(source, host, *rest) as snapshot:
+                        yield snapshot
+                finally:
+                    if swap == "source":
+                        restore()
+
+            calls = []
+
+            def swapped_selection(source, **options):
+                calls.append(options)
+                if swap == "state" and len(calls) == 2:    # the apply-time read
+                    exchange()
+                    try:
+                        return real_selection(source, **options)
+                    finally:
+                        restore()
+                return real_selection(source, **options)
+
+            original_dir = cursor_flush.STATE_DIR
+            cursor_flush.STATE_DIR = state_dir
+            try:
+                with patch.multiple(cursor, _CHATS=home / ".cursor/chats", _PROJECTS=home / ".cursor/projects"), \
+                        patch.object(cursor_flush, "_CURSOR_PROJECTS", home / ".cursor/projects"), \
+                        patch.object(readers_cli, "source_snapshot", swapped_snapshot), \
+                        patch.object(readers_cli, "cursor_selection", swapped_selection):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                        status = readers_cli.main(["--host", "cursor", "--session", SID])
+                emitted = [json.loads(line) for line in output.getvalue().splitlines()]
+                assert status == 2 and "source_changed" in errors.getvalue(), (swap, errors.getvalue())
+                assert not [row for row in emitted if row.get("type") == "session"], (swap, emitted)
+                assert path.read_text() == "".join(json.dumps(row) + "\n" for row in fixtures.CURSOR_TRANSCRIPT)
+            finally:
+                cursor_flush.STATE_DIR = original_dir
 
 
 def test_undated_fallback_title_is_bound_to_the_index_stamp():

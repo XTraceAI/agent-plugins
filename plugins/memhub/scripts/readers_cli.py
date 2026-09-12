@@ -40,9 +40,30 @@ def native_text(value, *, required=False):
     return value
 
 
+class SourceChanged(ValueError):
+    """A native source or sidecar is no longer the file this run validated."""
+
+
+def identity(observed) -> tuple:
+    return observed.st_dev, observed.st_ino
+
+
+def entry_identity(entry) -> tuple:
+    return entry[4], entry[3]
+
+
+def revision_identity(revision, path: Path):
+    """The identity a revision recorded for one file, or None when absent."""
+    return next((entry_identity(item) for item in revision if item[0] == str(path)), None)
+
+
 @contextmanager
-def regular_source(path: Path):
-    """Open one source observation without following or blocking on special files."""
+def regular_source(path: Path, expect=None):
+    """Open one source observation without following or blocking on special files.
+
+    ``expect`` is the identity an earlier observation of this run recorded for
+    the same name; a different file there is a source change, not new input.
+    """
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("native source sidecar is not a regular file")
@@ -52,9 +73,10 @@ def regular_source(path: Path):
     descriptor = os.open(path, flags)
     try:
         observed = os.fstat(descriptor)
-        if (not stat.S_ISREG(observed.st_mode)
-                or (before.st_dev, before.st_ino) != (observed.st_dev, observed.st_ino)):
+        if not stat.S_ISREG(observed.st_mode) or identity(before) != identity(observed):
             raise ValueError("native source changed before it was opened")
+        if expect is not None and identity(observed) != expect:
+            raise SourceChanged("native source is no longer the validated file")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
             yield handle, observed
@@ -63,7 +85,8 @@ def regular_source(path: Path):
             os.close(descriptor)
 
 
-def source_revision(path: Path, host: str) -> tuple:
+def source_revision(path: Path, host: str, expect=None) -> tuple:
+    """Observe the source and its sidecars; ``expect`` anchors the source itself."""
     paths = [path]
     if path.name == "store.db":
         # SQLite can keep current changes in WAL; --since must not skip them.
@@ -79,13 +102,14 @@ def source_revision(path: Path, host: str) -> tuple:
     revision = []
     for item in paths:
         try:
-            with regular_source(item) as (_, observed):
+            with regular_source(item, expect if item == path else None) as (_, observed):
                 pass
         except FileNotFoundError:
             if item == path:
                 raise
             continue
-        revision.append((str(item), observed.st_size, observed.st_mtime_ns, observed.st_ino))
+        revision.append((str(item), observed.st_size, observed.st_mtime_ns,
+                         observed.st_ino, observed.st_dev))
     return tuple(revision)
 
 
@@ -114,7 +138,8 @@ def cursor_selection(path: Path, *, select_saved=False):
             # Parse these exact bytes: reopening by path would let another
             # process swap in a FIFO or symlink after the check.
             saved_text = handle.read().decode("utf-8")
-            seen = (str(_state_path(sid)), observed.st_size, observed.st_mtime_ns, observed.st_ino)
+            seen = (str(_state_path(sid)), observed.st_size, observed.st_mtime_ns,
+                    observed.st_ino, observed.st_dev)
     except FileNotFoundError:
         # Absent stays absent. Falling through to _read_state would reopen the
         # path, and a FIFO created in the meantime would block there.
@@ -152,14 +177,18 @@ def discovery_roots(reader) -> list[Path]:
     return [reader._CHATS, reader._PROJECTS]
 
 
-def discovered_path(reader, path) -> Path:
+def discovered_path(reader, path) -> tuple[Path, tuple]:
     """Resolve one discovered row without following an alias below its root.
 
     Discovery lstat()s every component beneath a configured root and reports
     aliases as incomplete. A symlink swapped in after that observation must
     not be followed here either, or the command would validate and emit the
     external target under a discovered name. The root itself may be a
-    configured symlink, so components stop at the root."""
+    configured symlink, so components stop at the root. The recheck and the
+    resolution are separate operations, so the result is anchored to the
+    identity the recheck observed: whatever resolve() returns must be that
+    very file, and the identity is returned for later reads to demand.
+    """
     path = Path(path)
     for root in discovery_roots(reader):
         if path.is_relative_to(root):
@@ -168,20 +197,32 @@ def discovered_path(reader, path) -> Path:
             break
     else:
         components = [path]
+    leaf = None
     for item in components:
-        if stat.S_ISLNK(item.lstat().st_mode):
+        observed = item.lstat()
+        if stat.S_ISLNK(observed.st_mode):
             raise ValueError("discovered source became an alias")
-    return path.resolve(strict=True)
+        if item == path:
+            leaf = observed
+    if leaf is None or not stat.S_ISREG(leaf.st_mode):
+        raise ValueError("discovered source is not a regular file")
+    resolved = path.resolve(strict=True)
+    after = resolved.lstat()
+    if not stat.S_ISREG(after.st_mode) or identity(after) != identity(leaf):
+        raise ValueError("discovered source changed while it was resolved")
+    return resolved, identity(leaf)
 
 
-def discovered_source(reader, path: Path, discovered) -> bool:
+def discovered_source(reader, path: Path, discovered):
+    """The anchored identity of the discovered row resolving to ``path``, or None."""
     for row in discovered:
         try:
-            if discovered_path(reader, row["path"]) == path:
-                return True
+            resolved, anchor = discovered_path(reader, row["path"])
         except (OSError, ValueError):
             continue
-    return False
+        if resolved == path:
+            return anchor
+    return None
 
 
 def header_for(reader, path: Path, mtime: float, native=None) -> dict:
@@ -285,12 +326,13 @@ class TitleIndex:
 
 
 @contextmanager
-def source_snapshot(path: Path, host: str):
+def source_snapshot(path: Path, host: str, revision=()):
     # Every source is read from a private snapshot taken through the validated
     # descriptor, never by reopening the native path: a FIFO or symlink swapped
     # in after source_revision() would otherwise block the read or be followed
-    # before the final revision check can report source_changed. The caller
-    # compares source revisions before and after the entire read.
+    # before the final revision check can report source_changed. Each copied
+    # file must also be the very file the revision baseline observed, so a
+    # swap that is reverted before the final comparison cannot feed the read.
     with tempfile.TemporaryDirectory(prefix="native-reader-") as temporary:
         directory = Path(temporary) / path.parent.name
         directory.mkdir(mode=0o700)
@@ -300,7 +342,7 @@ def source_snapshot(path: Path, host: str):
             # carry a meta.json sidecar; an unrelated sibling of that name
             # beside a transcript is never consulted, so it is never copied.
             target = directory / path.name
-            with regular_source(path) as (handle, _):
+            with regular_source(path, revision_identity(revision, path)) as (handle, _):
                 target.touch(mode=0o600, exist_ok=False)
                 with target.open("wb") as output:
                     shutil.copyfileobj(handle, output)
@@ -311,7 +353,7 @@ def source_snapshot(path: Path, host: str):
         for name in ("store.db", "store.db-wal", "store.db-journal", "meta.json"):
             source, target = path.parent / name, directory / name
             try:
-                with regular_source(source) as (handle, _):
+                with regular_source(source, revision_identity(revision, source)) as (handle, _):
                     target.touch(mode=0o600, exist_ok=False)
                     with target.open("wb") as output:
                         shutil.copyfileobj(handle, output)
@@ -391,10 +433,10 @@ def main(argv=None) -> int:
                         reader._iso_ms(value, strict=True)
                         return value / 1000
                     return row["mtime"]
-                latest = discovered_path(reader, max(discovered, key=latest_mtime)["path"])
+                latest, _ = discovered_path(reader, max(discovered, key=latest_mtime)["path"])
                 if args.host == "cursor":
                     latest, _, latest_seen = cursor_selection(latest, select_saved=True)
-                    if not discovered_source(reader, latest, discovered):
+                    if discovered_source(reader, latest, discovered) is None:
                         diagnostic("session_unavailable")
                         return 2
                     # Discovery prefers stores, whereas native latest may
@@ -408,7 +450,7 @@ def main(argv=None) -> int:
                     # Same-ID copies were counted above. Other UUIDs are not
                     # part of this request and must not prepare metadata/state.
                     sessions = ([{"path": str(latest)}] if len(matches) == 1 else matches)
-                if not discovered_source(reader, latest, sessions):
+                if discovered_source(reader, latest, sessions) is None:
                     sessions.append({"path": str(latest)})
     except (OSError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
         diagnostic("discovery_incomplete")
@@ -433,15 +475,21 @@ def main(argv=None) -> int:
         path = Path(session["path"])
         try:
             # An explicit path is the caller's own alias to follow; a
-            # discovered row must still be the regular file discovery saw.
-            path = path.resolve(strict=True) if explicit_path else discovered_path(reader, path)
+            # discovered row must still be the regular file discovery saw,
+            # and that identity anchors every later read of it.
+            if explicit_path:
+                path, anchor = path.resolve(strict=True), None
+            else:
+                path, anchor = discovered_path(reader, path)
             if args.host == "cursor":
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
                 path, _, seen = cursor_selection(path, select_saved=select_saved)
-                if not explicit_path and not discovered_source(reader, path, discovered):
-                    raise ValueError("saved Cursor source was excluded by discovery")
-            revision = source_revision(path, args.host)
+                if not explicit_path:
+                    anchor = discovered_source(reader, path, discovered)
+                    if anchor is None:
+                        raise ValueError("saved Cursor source was excluded by discovery")
+            revision = source_revision(path, args.host, expect=anchor)
             if args.host == "cursor" and (state_observation(revision, path) != seen or (
                     args.session == "latest" and cursor_sid(path) == cursor_sid(latest)
                     and seen != latest_seen)):
@@ -461,14 +509,15 @@ def main(argv=None) -> int:
             if args.host == "codex":
                 # Parse once and count the native identity before validating
                 # other values; malformed duplicates must not appear unique.
-                with regular_source(path) as (handle, _):
+                with regular_source(path, revision_identity(revision, path)) as (handle, _):
                     source_header = reader._session_header(handle)
                 sid = native_text(source_header.get("payload", {}).get("id"), required=True)
                 native = None
             else:
                 meta_text = None
                 if path.name == "store.db":
-                    with regular_source(path.parent / "meta.json") as (handle, _):
+                    meta = path.parent / "meta.json"
+                    with regular_source(meta, revision_identity(revision, meta)) as (handle, _):
                         meta_text = handle.read().decode("utf-8")
                 native = reader.session_metadata(path, meta_text=meta_text)
                 sid = native_text(native.get("session_id"), required=True)
@@ -486,6 +535,8 @@ def main(argv=None) -> int:
                 native = reader._metadata_from_header(source_header)
             header = header_for(reader, path, mtime, native)
             prepared.append((path, revision, header))
+        except SourceChanged:
+            diagnostic("source_changed", path)
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
                 OverflowError, RecursionError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
@@ -524,7 +575,7 @@ def main(argv=None) -> int:
             records = []
             used_title = []
             if not args.metadata_only:
-                with source_snapshot(path, args.host) as snapshot:
+                with source_snapshot(path, args.host, revision) as snapshot:
                     def fallback_title(sid):
                         observation = titles.get(sid)
                         # Remember the index stamp too: an undated row keeps
@@ -541,8 +592,11 @@ def main(argv=None) -> int:
                     from cursor_flush import apply_session_state
                     # Revalidate against the state covered by this revision and
                     # apply the state that validation parsed; an absent file is
-                    # an explicit empty state, so no path is reopened here.
-                    _, saved_state = cursor_source(path, want_state=True)
+                    # an explicit empty state, so no path is reopened here. The
+                    # state read must be the one the baseline observed.
+                    _, saved_state, seen = cursor_selection(path)
+                    if seen != state_observation(revision, path):
+                        raise SourceChanged("saved state changed during the read")
                     apply_session_state(records, header["native_session_id"],
                                         strict=True, state=saved_state)
                 if records and validate_canonical(records):
@@ -565,6 +619,8 @@ def main(argv=None) -> int:
             lines = [encode(header)] + [encode(record) for record in records]
             for line in lines:
                 print(line)
+        except SourceChanged:
+            diagnostic("source_changed", path)
         except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error,
                 OverflowError, RecursionError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
