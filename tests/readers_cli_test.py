@@ -1232,6 +1232,57 @@ def test_discovered_aliases_are_rechecked_before_resolving():
             assert external.read_bytes()                  # the target was never touched
 
 
+def test_saved_source_selection_is_bound_to_the_state_revision():
+    """The saved pin that selected a representation must be the state the
+    revision baseline records. A pin deleted between the selection and the
+    baseline reports source_changed instead of emitting the stale choice, in
+    listing, native-ID and latest selection, full and metadata-only."""
+    import tempfile
+    import readers_cli, cursor_flush
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td).resolve()
+        path = transcript(home)
+        fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)   # discovery prefers the store
+        state_dir = home / ".config/memhub-plugin/cursorflush"
+        state_dir.mkdir(parents=True)
+        state_path = state_dir / f"{SID}.json"
+        pin = json.dumps({"source_kind": "transcript", "transcript_path": str(path)})
+        real_revision = readers_cli.source_revision
+
+        def vanishing(source, host):
+            if state_path.exists():
+                state_path.unlink()              # the pin vanishes after it chose the transcript
+            return real_revision(source, host)
+
+        def export(*arguments):
+            output, errors = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                status = readers_cli.main(["--host", "cursor", *arguments])
+            rows = [json.loads(line) for line in output.getvalue().splitlines()]
+            return status, [row for row in rows if row.get("type") == "session"], errors.getvalue()
+
+        original_dir = cursor_flush.STATE_DIR
+        cursor_flush.STATE_DIR = state_dir
+        try:
+            with patch.multiple(cursor, _CHATS=home / ".cursor/chats", _PROJECTS=home / ".cursor/projects"), \
+                    patch.object(cursor_flush, "_CURSOR_PROJECTS", home / ".cursor/projects"):
+                selections = ([], ["--session", SID], ["--session", "latest"])
+                for selection in selections:
+                    # Control: an intact pin selects exactly the pinned transcript.
+                    state_path.write_text(pin)
+                    status, headers, diagnostics = export(*selection, "--metadata-only")
+                    assert status == 0 and [row["path"] for row in headers] == [str(path)], (selection, diagnostics)
+                with patch.object(readers_cli, "source_revision", vanishing):
+                    for selection in selections:
+                        for mode in ([], ["--metadata-only"]):
+                            state_path.write_text(pin)
+                            status, headers, diagnostics = export(*selection, *mode)
+                            assert status == 2 and "source_changed" in diagnostics, (selection, mode, diagnostics)
+                            assert not headers, (selection, mode, headers)
+        finally:
+            cursor_flush.STATE_DIR = original_dir
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

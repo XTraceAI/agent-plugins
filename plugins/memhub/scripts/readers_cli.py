@@ -89,41 +89,61 @@ def source_revision(path: Path, host: str) -> tuple:
     return tuple(revision)
 
 
-def cursor_source(path: Path, *, select_saved=False, want_state=False):
+def cursor_sid(path: Path) -> str:
+    return path.parent.name if path.name == "store.db" else path.stem
+
+
+def cursor_selection(path: Path, *, select_saved=False):
     """Never restore index-derived pins onto a different representation.
 
-    ``want_state`` also returns the saved state this call validated and parsed
-    (``{}`` when the file was absent), so the caller can apply it without any
-    path being reopened afterwards.
+    Returns ``(source, state, observation)``: the saved state this call
+    validated and parsed (``{}`` when the file was absent) and the state
+    file's identity as seen by the very read that made this selection, in
+    source_revision()'s shape (``None`` when absent). The caller binds the
+    selection to its revision baseline through that observation and applies
+    the state without any path being reopened afterwards.
     """
     from cursor_flush import _read_state, _state_path, _UUID_RE, _source_for
-    sid = path.parent.name if path.name == "store.db" else path.stem
+    sid = cursor_sid(path)
     if not _UUID_RE.fullmatch(sid):
-        return (path, {}) if want_state else path
+        return path, {}, None
     saved_text = None
-    saved_absent = False
+    seen = None
     try:
-        with regular_source(_state_path(sid)) as (handle, _observed):
+        with regular_source(_state_path(sid)) as (handle, observed):
             # Parse these exact bytes: reopening by path would let another
             # process swap in a FIFO or symlink after the check.
             saved_text = handle.read().decode("utf-8")
+            seen = (str(_state_path(sid)), observed.st_size, observed.st_mtime_ns, observed.st_ino)
     except FileNotFoundError:
         # Absent stays absent. Falling through to _read_state would reopen the
         # path, and a FIFO created in the meantime would block there.
-        saved_absent = True
-    state = {} if saved_absent else _read_state(sid, strict=True, text=saved_text)
+        pass
+    state = {} if saved_text is None else _read_state(sid, strict=True, text=saved_text)
     kind = state.get("source_kind")
     if kind is None:
         if state.get("usage_events") or any(state.get("record_ts", {}).values()):
             raise ValueError("saved observations have no source provenance")
-        return (path, state) if want_state else path
+        return path, state, seen
     if kind in {"store", "transcript"}:
         _, saved, error = _source_for(sid, {}, state)
         if saved is not None:
             saved = saved.resolve(strict=True)
             if select_saved or saved == path:
-                return (saved, state) if want_state else saved
+                return saved, state, seen
     raise ValueError("saved observations belong to another source")
+
+
+def cursor_source(path: Path, *, select_saved=False, want_state=False):
+    source, state, _ = cursor_selection(path, select_saved=select_saved)
+    return (source, state) if want_state else source
+
+
+def state_observation(revision: tuple, path: Path):
+    """The state file entry a source revision recorded for this session."""
+    from cursor_flush import _state_path
+    expected = str(_state_path(cursor_sid(path)))
+    return next((item for item in revision if item[0] == expected), None)
 
 
 def discovery_roots(reader) -> list[Path]:
@@ -316,6 +336,7 @@ def main(argv=None) -> int:
     reader = reader_for(args.host)
     explicit_path = False
     latest = None
+    latest_seen = None
     incomplete = False
     cursor_counts = Counter()
 
@@ -372,7 +393,7 @@ def main(argv=None) -> int:
                     return row["mtime"]
                 latest = discovered_path(reader, max(discovered, key=latest_mtime)["path"])
                 if args.host == "cursor":
-                    latest = cursor_source(latest, select_saved=True)
+                    latest, _, latest_seen = cursor_selection(latest, select_saved=True)
                     if not discovered_source(reader, latest, discovered):
                         diagnostic("session_unavailable")
                         return 2
@@ -417,10 +438,19 @@ def main(argv=None) -> int:
             if args.host == "cursor":
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
-                path = cursor_source(path, select_saved=select_saved)
+                path, _, seen = cursor_selection(path, select_saved=select_saved)
                 if not explicit_path and not discovered_source(reader, path, discovered):
                     raise ValueError("saved Cursor source was excluded by discovery")
             revision = source_revision(path, args.host)
+            if args.host == "cursor" and (state_observation(revision, path) != seen or (
+                    args.session == "latest" and cursor_sid(path) == cursor_sid(latest)
+                    and seen != latest_seen)):
+                # The saved state that chose this representation must be the
+                # state the baseline (and the latest selection) observed. A pin
+                # that changed or vanished in between is a source change, not a
+                # fresh selection: report it rather than emit the stale choice.
+                diagnostic("source_changed", path)
+                continue
             mtime = max(item[2] for item in revision) / 1_000_000_000
             if not math.isfinite(mtime):
                 raise ValueError("invalid mtime")
