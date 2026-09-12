@@ -1398,6 +1398,39 @@ def test_reads_after_the_baseline_demand_the_baseline_identity():
                 cursor_flush.STATE_DIR = original_dir
 
 
+def test_saved_store_pins_ignore_the_working_directory():
+    """A pinned store is resolved from the native chats root. A working-directory
+    entry named after the UUID must not be selected by the legacy locator and
+    make the healthy discovered store unreadable."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        store = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+        state_path = home / f".config/memhub-plugin/cursorflush/{SID}.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(json.dumps({"source_kind": "store"}))
+        work = home / "work"
+        work.mkdir()
+        (work / SID).write_text("not a session\n")
+        for selection in ([], ["--session", SID], ["--session", "latest"]):
+            result, rows = run(home, "cursor", *selection, "--metadata-only", cwd=work)
+            assert result.returncode == 0, (selection, result.stderr)
+            assert [row["path"] for row in rows if row["type"] == "session"] == [str(store.resolve())], (selection, rows)
+
+
+def test_empty_session_selectors_are_rejected():
+    """``--session ""`` (an unset shell variable) must be a usage error, never a
+    silent fall-through into enumerating every discovered session."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        rollout(home)
+        transcript(home)
+        for host in ("codex", "cursor"):
+            for value in ("", "  "):
+                result, rows = run(home, host, "--session", value)
+                assert result.returncode == 2 and rows == [], (host, value, result.stdout)
+                assert "--session" in result.stderr, (host, value, result.stderr)
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

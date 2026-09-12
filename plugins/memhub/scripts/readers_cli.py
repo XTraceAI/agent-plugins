@@ -22,6 +22,12 @@ from readers.strict_json import loads as load_json
 from readers.jsonl import readline_bytes
 
 
+def session_selector(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("--session requires a native session ID, latest, or a path")
+    return value
+
+
 def since_instant(value: str) -> float:
     try:
         parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -127,7 +133,8 @@ def cursor_selection(path: Path, *, select_saved=False):
     selection to its revision baseline through that observation and applies
     the state without any path being reopened afterwards.
     """
-    from cursor_flush import _read_state, _state_path, _UUID_RE, _source_for
+    from cursor_flush import _read_state, _state_path, _UUID_RE, _valid_transcript_path
+    from readers import cursor as cursor_reader
     sid = cursor_sid(path)
     if not _UUID_RE.fullmatch(sid):
         return path, {}, None
@@ -150,12 +157,20 @@ def cursor_selection(path: Path, *, select_saved=False):
         if state.get("usage_events") or any(state.get("record_ts", {}).values()):
             raise ValueError("saved observations have no source provenance")
         return path, state, seen
-    if kind in {"store", "transcript"}:
-        _, saved, error = _source_for(sid, {}, state)
-        if saved is not None:
-            saved = saved.resolve(strict=True)
-            if select_saved or saved == path:
-                return saved, state, seen
+    if kind == "store":
+        # Resolve the pinned store from the native chats root only. The legacy
+        # locator also accepts a working-directory entry named after the UUID,
+        # which must never decide what a saved pin points at.
+        stores = [item for item in cursor_reader._CHATS.glob(f"*/{sid}/store.db") if item.is_file()]
+        saved = stores[0] if len(stores) == 1 else None
+    elif kind == "transcript":
+        saved, _ = _valid_transcript_path(state.get("transcript_path"), sid)
+    else:
+        saved = None
+    if saved is not None:
+        saved = saved.resolve(strict=True)
+        if select_saved or saved == path:
+            return saved, state, seen
     raise ValueError("saved observations belong to another source")
 
 
@@ -373,7 +388,8 @@ def main(argv=None) -> int:
     parser.add_argument("--host", choices=("codex", "cursor"), required=True)
     parser.add_argument("--since", type=since_instant)
     parser.add_argument("--metadata-only", action="store_true")
-    parser.add_argument("--session", help="Select one native session ID, latest, or an explicit path")
+    parser.add_argument("--session", type=session_selector,
+                        help="Select one native session ID, latest, or an explicit path")
     args = parser.parse_args(argv)
     reader = reader_for(args.host)
     explicit_path = False
