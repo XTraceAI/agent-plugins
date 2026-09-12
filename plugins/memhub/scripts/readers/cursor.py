@@ -423,6 +423,16 @@ def _validate_message(message, *, source_kind):
                 name = block.get("toolName") or block.get("name")
                 if not isinstance(name, str) or not name.strip():
                     raise ValueError("Cursor tool call requires its native tool name")
+                # Normalization consumes ``args`` for tool-call and ``input`` for
+                # tool_use; the other alias must not stand in for a missing or
+                # malformed payload in a checked read. The one carve-out is the
+                # same id-less IDE-transcript tool_use observation tolerated
+                # above: it may omit its payload, but a present one must parse.
+                payload = block.get("args" if kind == "tool-call" else "input")
+                if payload is None and not requires_identity:
+                    pass
+                elif not isinstance(payload, (dict, str)):
+                    raise ValueError("Cursor tool call requires its kind-specific payload")
 
 
 def _load_messages(db_path: Path, *, strict: bool = False) -> list[tuple[dict, int | None]]:

@@ -313,11 +313,17 @@ def test_strict_cursor_content_blocks_match_the_canonicalizer():
                {"type":"tool-call","id":"three","toolName":"Read","args":{}},
                {"type":"tool_use","toolCallId":"four","name":"Read","input":{}}]
     for kind in ("tool-call", "tool_use"):
+        # The canonicalizer consumes args for tool-call and input for tool_use;
+        # build each kind with the payload it actually reads.
+        payload = {"args": {}} if kind == "tool-call" else {"input": {}}
         for names in ({}, {"toolName": ""}, {"name": ""}, {"toolName": None, "name": None}):
-            invalid.append({"type": kind, "toolCallId": "call", "args": {}, **names})
+            invalid.append({"type": kind, "toolCallId": "call", **payload, **names})
         for names in ({"toolName": "Read"}, {"name": "Read"},
                       {"toolName": "", "name": "Read"}, {"toolName": "Read", "name": ""}):
-            supported.append({"type": kind, "toolCallId": "call", "args": {}, **names})
+            supported.append({"type": kind, "toolCallId": "call", **payload, **names})
+        # The other alias must not stand in for the consumed payload.
+        other = {"input": {}} if kind == "tool-call" else {"args": {}}
+        invalid.append({"type": kind, "toolCallId": "call", "toolName": "Read", **other})
     for block in invalid+supported:
         with tempfile.TemporaryDirectory() as td:
             home=Path(td);store=fixtures._make_cursor_store(home/"chats")
@@ -1120,6 +1126,31 @@ def test_strict_codex_selects_the_kind_specific_tool_payload():
     assert codex_reader._tool_input({"input": "patch"}, strict=True,
                                     kind="custom_tool_call") == {"input": "patch"}
     assert codex_reader._tool_input({"input": "{}"}, strict=False) == {}
+
+
+def test_strict_cursor_requires_kind_specific_tool_payload():
+    """tool-call consumes args and tool_use consumes input; a checked read must
+    not accept a block whose consumed payload is missing or malformed just
+    because the other alias is present."""
+    import readers.cursor as cursor_reader
+    def msg(block):
+        return {"role": "assistant", "content": [block]}
+    base = {"toolCallId": "c1", "toolName": "Read"}
+    bad = [dict(base, type="tool-call", input={"a": 1}),           # only the wrong alias
+           dict(base, type="tool_use", args={"a": 1}),
+           dict(base, type="tool-call", args=[]),                   # malformed consumed field
+           dict(base, type="tool_use", input=7)]
+    for block in bad:
+        ok = True
+        try:
+            cursor_reader._validate_message(msg(block), source_kind="store")
+            ok = False
+        except ValueError:
+            pass
+        assert ok, f"checked read accepted {block}"
+    for block in (dict(base, type="tool-call", args={"a": 1}),
+                  dict(base, type="tool_use", input="raw text")):
+        cursor_reader._validate_message(msg(block), source_kind="store")
 
 
 if __name__=='__main__':
