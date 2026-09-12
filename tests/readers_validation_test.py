@@ -1093,6 +1093,35 @@ def test_strict_codex_rejects_malformed_in_rollout_thread_name():
     assert codex_reader._rollout_thread_name(good, strict=True) == "Real name"
 
 
+def test_strict_codex_selects_the_kind_specific_tool_payload():
+    """A checked read must read arguments for function_call and input for
+    custom_tool_call, so one alias cannot mask the other being malformed."""
+    import readers.codex as codex_reader
+    # function_call with no arguments must not fall back to a synthetic input.
+    ok = True
+    try:
+        codex_reader._tool_input({"input": "{}"}, strict=True, kind="function_call")
+        ok = False
+    except ValueError:
+        pass
+    assert ok, "function_call accepted an input alias"
+    # custom_tool_call with malformed input must not be rescued by arguments.
+    ok = True
+    try:
+        codex_reader._tool_input({"input": [], "arguments": "{}"},
+                                 strict=True, kind="custom_tool_call")
+        ok = False
+    except ValueError:
+        pass
+    assert ok, "custom_tool_call accepted an arguments alias"
+    # Correct fields still parse, and tolerant capture still accepts either.
+    assert codex_reader._tool_input({"arguments": '{"a": 1}'}, strict=True,
+                                    kind="function_call") == {"a": 1}
+    assert codex_reader._tool_input({"input": "patch"}, strict=True,
+                                    kind="custom_tool_call") == {"input": "patch"}
+    assert codex_reader._tool_input({"input": "{}"}, strict=False) == {}
+
+
 if __name__=='__main__':
     for name,fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

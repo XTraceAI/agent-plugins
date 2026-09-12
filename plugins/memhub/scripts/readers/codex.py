@@ -213,15 +213,23 @@ def _text_of(content: Any, *, strict: bool = False) -> str:
     return ""
 
 
-def _tool_input(payload: dict, *, strict: bool = False) -> dict:
+def _tool_input(payload: dict, *, strict: bool = False, kind: str | None = None) -> dict:
     """Normalise a Codex tool call's arguments to a dict.
 
     ``function_call.arguments`` is a JSON string; ``custom_tool_call.input``
     (apply_patch etc.) is a raw string. Parse JSON when possible, else wrap the
-    raw text so nothing is lost."""
-    raw = payload.get("arguments")
-    if raw is None:
-        raw = payload.get("input")
+    raw text so nothing is lost.
+
+    A checked read selects the field the record type actually defines, so a
+    malformed or absent native payload cannot be hidden behind the other
+    alias. Tolerant capture keeps accepting either field.
+    """
+    if strict and kind in ("function_call", "custom_tool_call"):
+        raw = payload.get("arguments" if kind == "function_call" else "input")
+    else:
+        raw = payload.get("arguments")
+        if raw is None:
+            raw = payload.get("input")
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
@@ -710,7 +718,7 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False) -> tuple[lis
                 "type": "tool_use",
                 "id": call_id,
                 "name": pl.get("name") or "tool",
-                "input": _tool_input(pl, strict=strict),
+                "input": _tool_input(pl, strict=strict, kind=pt),
             })
 
         elif pt in ("function_call_output", "custom_tool_call_output"):
