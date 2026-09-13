@@ -1848,6 +1848,30 @@ def test_non_sqlite_sources_are_read_from_a_private_snapshot():
             assert refused
 
 
+def test_explicit_paths_do_not_require_discovery_roots():
+    """An explicitly selected readable file is complete on its own; broken or
+    unavailable configured roots are irrelevant because no discovery occurs."""
+    import tempfile
+    import readers_cli
+    for host in ("codex", "cursor"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            source = rollout(home) if host == "codex" else transcript(home)
+            outside = home / "outside" / source.name
+            outside.parent.mkdir();outside.write_bytes(source.read_bytes())
+            for mode in ([], ["--metadata-only"]):
+                output, errors = io.StringIO(), io.StringIO()
+                with patch.object(readers_cli, "root_anchors",
+                                  side_effect=AssertionError("explicit path consulted discovery roots")), \
+                        patch.object(cursor_flush, "STATE_DIR", home / "state"), \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    status = readers_cli.main(["--host", host, "--session", str(outside), *mode])
+                rows = [json.loads(line) for line in output.getvalue().splitlines()]
+                assert status == 0 and rows and rows[0]["path"] == str(outside.resolve()), errors.getvalue()
+                if host == "cursor":
+                    assert rows[0]["source_surface"] is None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

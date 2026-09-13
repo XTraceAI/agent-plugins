@@ -181,15 +181,28 @@ def cursor_selection(path: Path, *, select_saved=False, anchors=None):
             from readers.discovery import paths as safe_paths
             stores = safe_paths(cursor_reader._CHATS, ("*", sid, "store.db"), lambda error: None)
         else:
-            # An explicit path is an intentional selection, aliases included;
-            # only a second distinct store of the same session is ambiguous.
+            # The explicit source is authorized, but store-only saved state has
+            # no path provenance. Keep duplicate-store ambiguity checks before
+            # attaching those observations to the chosen representation.
             stores = list({item.resolve(strict=True): item
                            for item in cursor_reader._CHATS.glob(f"*/{sid}/store.db")
                            if item.is_file()}.values())
         saved = stores[0] if len(stores) == 1 else None
     elif kind == "transcript":
-        root = anchors.get(cursor_reader._PROJECTS) if anchors else None
-        saved, _ = _valid_transcript_path(state.get("transcript_path"), sid, root=root)
+        if select_saved:
+            root = anchors.get(cursor_reader._PROJECTS) if anchors else None
+            saved, _ = _valid_transcript_path(state.get("transcript_path"), sid, root=root)
+        else:
+            raw = state.get("transcript_path")
+            candidate = Path(raw).expanduser() if isinstance(raw, str) else None
+            if (candidate is None or not candidate.is_absolute()
+                    or candidate.parent.name != sid or candidate.name != f"{sid}.jsonl"):
+                saved = None
+            else:
+                try:
+                    saved = candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    saved = None
     else:
         saved = None
     if saved is not None:
@@ -470,7 +483,8 @@ def main(argv=None) -> int:
         explicit_path = args.session is not None and args.session != "latest" and path_syntax
         # Where each configured root leads, recorded once before any lookup:
         # discovery rechecks and transcript classification both use it.
-        anchors = root_anchors(reader, lambda error: diagnostic("discovery_incomplete"))
+        anchors = ({} if explicit_path else
+                   root_anchors(reader, lambda error: diagnostic("discovery_incomplete")))
         if explicit_path:
             path, error = reader.locate(args.session)
             if error or path is None:
@@ -630,8 +644,11 @@ def main(argv=None) -> int:
                     meta = path.parent / "meta.json"
                     with regular_source(meta, revision_identity(revision, meta)) as (handle, _):
                         meta_text = handle.read().decode("utf-8")
-                native = reader.session_metadata(path, meta_text=meta_text,
-                                                 projects_root=anchors.get(reader._PROJECTS))
+                native = reader.session_metadata(
+                    path, meta_text=meta_text,
+                    # Explicit files are intentionally outside discovery. Pass
+                    # the file itself as a nonmatching classification anchor.
+                    projects_root=(path if explicit_path else anchors.get(reader._PROJECTS)))
                 sid = native_text(native.get("session_id"), required=True)
             # A readable identity still collides when another header field is bad.
             counts[f"{reader.HOST}-{sid}"] += 1
