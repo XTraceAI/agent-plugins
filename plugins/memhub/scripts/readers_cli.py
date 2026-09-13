@@ -506,8 +506,12 @@ def main(argv=None) -> int:
                 kept = []
                 for row in sessions:
                     path = Path(row["path"])
-                    if path.name != "store.db" and not (
-                            _UUID_RE.fullmatch(path.stem) and path.stem == path.parent.name):
+                    valid_store = (path.name == "store.db" and
+                                   bool(_UUID_RE.fullmatch(path.parent.name)))
+                    valid_transcript = (path.name != "store.db" and
+                                        bool(_UUID_RE.fullmatch(path.stem)) and
+                                        path.stem == path.parent.name)
+                    if not (valid_store or valid_transcript):
                         diagnostic("discovery_incomplete", path)
                         continue
                     kept.append(row)

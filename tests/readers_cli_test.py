@@ -224,7 +224,8 @@ def test_missing_unreadable_and_incomplete_discovery_are_not_empty_success():
 def test_bad_store_metadata_keeps_healthy_peer_sessions():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
-        path = fixtures._make_cursor_store(home / ".cursor/chats", uuid="bad-store")
+        path = fixtures._make_cursor_store(
+            home / ".cursor/chats", uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         (path.parent / "meta.json").write_text('{"updatedAtMs":"bad value"}')
         transcript(home)
         result, rows = run(home, "cursor", "--metadata-only")
@@ -298,7 +299,8 @@ def test_invalid_utf8_is_incomplete_without_changing_legacy_reader_tolerance():
 def test_oversized_native_start_keeps_healthy_peer_sessions():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
-        path = fixtures._make_cursor_store(home / ".cursor/chats", uuid="bad-start")
+        path = fixtures._make_cursor_store(
+            home / ".cursor/chats", uuid="bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
         meta_path = path.parent / "meta.json"
         meta = json.loads(meta_path.read_text());meta["createdAtMs"] = 10 ** 400
         meta_path.write_text(json.dumps(meta))
@@ -1684,6 +1686,24 @@ def test_discovered_transcripts_must_match_their_session_directory():
         assert result.returncode == 2 and rows == [], (rows, result.stderr)
         result, rows = run(home, "cursor", "--session", str(stray), "--metadata-only")
         assert result.returncode == 0 and rows[0]["native_session_id"] == other and rows[0]["source_surface"] is None
+
+
+def test_discovered_stores_require_uuid_session_directories():
+    """A misplaced store cannot invent a native session ID from its directory;
+    an explicit path remains available for caller-directed inspection."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        healthy = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+        stray = fixtures._make_cursor_store(home / ".cursor/chats", uuid="not-a-session")
+        for mode in ([], ["--metadata-only"]):
+            result, rows = run(home, "cursor", *mode)
+            headers = [row for row in rows if row.get("type") == "session"]
+            assert result.returncode == 2 and "discovery_incomplete" in result.stderr
+            assert [row["native_session_id"] for row in headers] == [SID]
+            assert headers[0]["path"] == str(healthy.resolve())
+            result, rows = run(home, "cursor", "--session", str(stray), *mode)
+            assert result.returncode == 0 and rows[0]["native_session_id"] == "not-a-session"
 
 
 def test_symlink_loops_are_reported_not_raised():
