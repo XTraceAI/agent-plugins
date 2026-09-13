@@ -179,14 +179,18 @@ def cursor_selection(path: Path, *, select_saved=False, anchors=None):
             # from regular store.db files below unaliased directories, so an
             # alias discovery reports and skips cannot make the pin ambiguous.
             from readers.discovery import paths as safe_paths
-            stores = safe_paths(cursor_reader._CHATS, ("*", sid, "store.db"), lambda error: None)
+            stores = [discovered_path(cursor_reader, item, anchors)[0]
+                      for item in safe_paths(cursor_reader._CHATS,
+                                             ("*", sid, "store.db"),
+                                             lambda error: None)]
         else:
             # The explicit source is authorized, but store-only saved state has
             # no path provenance. Keep duplicate-store ambiguity checks before
             # attaching those observations to the chosen representation.
-            stores = list({item.resolve(strict=True): item
-                           for item in cursor_reader._CHATS.glob(f"*/{sid}/store.db")
-                           if item.is_file()}.values())
+            stores = list(dict.fromkeys(
+                item.resolve(strict=True)
+                for item in cursor_reader._CHATS.glob(f"*/{sid}/store.db")
+                if item.is_file()))
         saved = stores[0] if len(stores) == 1 else None
     elif kind == "transcript":
         if select_saved:
@@ -206,7 +210,6 @@ def cursor_selection(path: Path, *, select_saved=False, anchors=None):
     else:
         saved = None
     if saved is not None:
-        saved = saved.resolve(strict=True)
         if select_saved or saved == path:
             return saved, state, seen
     raise ValueError("saved observations belong to another source")

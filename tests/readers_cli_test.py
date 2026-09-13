@@ -1544,6 +1544,38 @@ def test_saved_store_pins_resolve_from_safe_discovery():
                 assert [row["path"] for row in headers] == [str(store.resolve())], (alias_kind, selection, rows, result.stderr)
 
 
+def test_saved_store_selection_keeps_the_anchored_store_identity():
+    """A saved store selected through safe discovery is not resolved again after
+    its identity check, where a transient alias could substitute a transcript."""
+    import tempfile
+    import readers_cli, cursor_flush
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td);store = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+        transcript_path = transcript(home).resolve()
+        state_dir = home / ".config/memhub-plugin/cursorflush";state_dir.mkdir(parents=True)
+        (state_dir / f"{SID}.json").write_text(json.dumps({"source_kind":"store"}))
+        real_resolve = pathlib.Path.resolve
+        calls = 0
+
+        def swapped_resolve(self, strict=False):
+            nonlocal calls
+            if self == store:
+                calls += 1
+                if calls > 1:
+                    return transcript_path
+            return real_resolve(self, strict=strict)
+
+        with patch.multiple(cursor, _CHATS=home / ".cursor/chats",
+                            _PROJECTS=home / ".cursor/projects"), \
+                patch.object(cursor_flush, "STATE_DIR", state_dir), \
+                patch.object(pathlib.Path, "resolve", swapped_resolve):
+            anchors = readers_cli.root_anchors(cursor)
+            selected, state, _ = readers_cli.cursor_selection(
+                store, select_saved=True, anchors=anchors)
+        assert selected == real_resolve(store, strict=True)
+        assert state["source_kind"] == "store" and calls == 1
+
+
 def test_transcript_classification_uses_the_anchored_projects_root():
     """A transcript is classified against where the configured projects root led
     when it was anchored for discovery. Retargeting the root symlink between
