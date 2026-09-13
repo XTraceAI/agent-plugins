@@ -1627,6 +1627,33 @@ def test_transcript_pins_validate_against_the_anchored_projects_root():
             cursor_flush.STATE_DIR = original_dir
 
 
+def test_discovered_transcripts_must_match_their_session_directory():
+    """A native transcript is <uuid>/<uuid>.jsonl. A discovered file whose name
+    and directory disagree is reported as incomplete discovery and never
+    exported under its file name, selected by that name, or ranked as latest;
+    the healthy sibling still exports. An explicit path stays the caller's
+    choice but is not classified as an IDE transcript."""
+    other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        healthy = transcript(home)
+        stray = write_jsonl(healthy.parent / f"{other}.jsonl", fixtures.CURSOR_TRANSCRIPT)
+        notes = write_jsonl(healthy.parent / "notes.jsonl", fixtures.CURSOR_TRANSCRIPT)
+        for path in (stray, notes):
+            os.utime(path, (MTIME + 100, MTIME + 100))     # newer than the healthy transcript
+        for selection in ([], ["--session", "latest"], ["--session", SID]):
+            for mode in ([], ["--metadata-only"]):
+                result, rows = run(home, "cursor", *selection, *mode)
+                headers = [row for row in rows if row["type"] == "session"]
+                assert result.returncode == 2 and "discovery_incomplete" in result.stderr, (selection, mode, result.stderr)
+                assert [row["native_session_id"] for row in headers] == [SID], (selection, mode, headers)
+                assert headers[0]["path"] == str(healthy.resolve())
+        result, rows = run(home, "cursor", "--session", other, "--metadata-only")
+        assert result.returncode == 2 and rows == [], (rows, result.stderr)
+        result, rows = run(home, "cursor", "--session", str(stray), "--metadata-only")
+        assert result.returncode == 0 and rows[0]["native_session_id"] == other and rows[0]["source_surface"] is None
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

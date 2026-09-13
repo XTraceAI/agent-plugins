@@ -459,6 +459,21 @@ def main(argv=None) -> int:
         else:
             options = {"include_representations": True} if args.host == "cursor" else {}
             sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"), **options)
+            if args.host == "cursor":
+                from cursor_flush import _UUID_RE
+                # A native transcript lives at <uuid>/<uuid>.jsonl, the layout the
+                # capture path enforces too. A discovered file whose name and
+                # directory disagree has no established identity: it must not be
+                # exported under its file name nor vouch for either session.
+                kept = []
+                for row in sessions:
+                    path = Path(row["path"])
+                    if path.name != "store.db" and not (
+                            _UUID_RE.fullmatch(path.stem) and path.stem == path.parent.name):
+                        diagnostic("discovery_incomplete", path)
+                        continue
+                    kept.append(row)
+                sessions = kept
             discovered = list(sessions)
             if args.host == "cursor":
                 # One store and one transcript are alternative representations.
