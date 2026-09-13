@@ -1654,6 +1654,38 @@ def test_discovered_transcripts_must_match_their_session_directory():
         assert result.returncode == 0 and rows[0]["native_session_id"] == other and rows[0]["source_surface"] is None
 
 
+def test_symlink_loops_are_reported_not_raised():
+    """Python before 3.13 raises RuntimeError from Path.resolve(strict=True) on a
+    symlink loop (3.13+ raises OSError). A looping configured root must yield
+    discovery_incomplete with exit 2, and a looping discovered source
+    session_unreadable, never a traceback; both flavours are simulated."""
+    import tempfile
+    import readers_cli
+    for flavour in (RuntimeError("Symlink loop from 'loop'"), OSError(62, "Too many levels of symbolic links")):
+        for looping in ("root", "source"):
+            with tempfile.TemporaryDirectory() as td:
+                home = Path(td).resolve()
+                path = rollout(home)
+                root = home / ".codex/sessions"
+                target = root if looping == "root" else path
+                real_resolve = pathlib.Path.resolve
+
+                def resolve(self, strict=False):
+                    if self == target:
+                        raise type(flavour)(*flavour.args)
+                    return real_resolve(self, strict=strict)
+
+                with patch.object(codex, "_SESSIONS", root), patch.object(pathlib.Path, "resolve", resolve):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                        status = readers_cli.main(["--host", "codex", "--metadata-only"])
+                headers = [row for row in (json.loads(line) for line in output.getvalue().splitlines())
+                           if row.get("type") == "session"]
+                expected = "discovery_incomplete" if looping == "root" else "session_unreadable"
+                assert status == 2 and not headers, (type(flavour).__name__, looping, headers, errors.getvalue())
+                assert expected in errors.getvalue(), (type(flavour).__name__, looping, errors.getvalue())
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

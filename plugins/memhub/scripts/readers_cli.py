@@ -204,19 +204,26 @@ def discovery_roots(reader) -> list[Path]:
     return [reader._CHATS, reader._PROJECTS]
 
 
-def root_anchors(reader) -> dict:
+def root_anchors(reader, on_error=None) -> dict:
     """Where each configured root led before discovery ran.
 
     A configured root may be a stable symlink. Its target is recorded here,
     before list_sessions(), so a root retargeted after discovery cannot make a
-    same-named file under the new target pass as the discovered one.
+    same-named file under the new target pass as the discovered one. An
+    absent root simply has no anchor; a root that exists but cannot be
+    resolved (unreadable, or a symlink loop, which raises RuntimeError before
+    Python 3.13) is reported through ``on_error`` as incomplete discovery,
+    and rows under it are rejected rather than resolved through the loop.
     """
     anchors = {}
     for root in discovery_roots(reader):
         try:
             anchors[root] = root.resolve(strict=True)
-        except OSError:
+        except FileNotFoundError:
             continue
+        except (OSError, RuntimeError) as error:
+            if on_error is not None:
+                on_error(error)
     return anchors
 
 
@@ -269,7 +276,7 @@ def discovered_source(reader, path: Path, discovered, anchors):
     for row in discovered:
         try:
             resolved, anchor = discovered_path(reader, row["path"], anchors)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             continue
         if resolved == path:
             return anchor
@@ -449,7 +456,7 @@ def main(argv=None) -> int:
         explicit_path = args.session is not None and args.session != "latest" and path_syntax
         # Where each configured root leads, recorded once before any lookup:
         # discovery rechecks and transcript classification both use it.
-        anchors = root_anchors(reader)
+        anchors = root_anchors(reader, lambda error: diagnostic("discovery_incomplete"))
         if explicit_path:
             path, error = reader.locate(args.session)
             if error or path is None:
@@ -525,7 +532,7 @@ def main(argv=None) -> int:
                     sessions = ([{"path": str(latest)}] if len(matches) == 1 else matches)
                 if discovered_source(reader, latest, sessions, anchors) is None:
                     sessions.append({"path": str(latest)})
-    except (OSError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError, RuntimeError):
         diagnostic("discovery_incomplete")
         return 2
 
@@ -612,7 +619,7 @@ def main(argv=None) -> int:
         except SourceChanged:
             diagnostic("source_changed", path)
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
-                OverflowError, RecursionError, argparse.ArgumentTypeError):
+                OverflowError, RuntimeError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
@@ -626,7 +633,7 @@ def main(argv=None) -> int:
             if not prepared:
                 diagnostic("session_unavailable")
                 return 2
-        except (OSError, ValueError, TypeError, AttributeError):
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
             diagnostic("session_unavailable")
             return 2
     elif args.session and not explicit_path:
@@ -696,7 +703,7 @@ def main(argv=None) -> int:
         except SourceChanged:
             diagnostic("source_changed", path)
         except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error,
-                OverflowError, RecursionError, argparse.ArgumentTypeError):
+                OverflowError, RuntimeError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
     return 2 if incomplete else 0
 
