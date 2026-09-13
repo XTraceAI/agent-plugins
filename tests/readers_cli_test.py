@@ -1835,6 +1835,8 @@ def test_non_sqlite_sources_are_read_from_a_private_snapshot():
                 assert snap.read_text(encoding="utf-8") == '{"marker": true}\n'
             assert not snap.exists()                      # private copy is cleaned up
             # And a source that is already a special file is refused, never opened.
+            if not hasattr(os, "mkfifo"):
+                continue  # Windows still exercises the snapshot/cleanup path above.
             fifo = pathlib.Path(tmp) / host / "fifo.jsonl"
             os.mkfifo(fifo)
             refused = False
