@@ -1872,6 +1872,26 @@ def test_explicit_paths_do_not_require_discovery_roots():
                     assert rows[0]["source_surface"] is None
 
 
+def test_cursor_surface_classification_uses_the_anchored_source_path():
+    """A discovered transcript's surface comes from the source/root paths the
+    caller already anchored, without resolving the mutable source name again."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td);source = transcript(home).resolve()
+        root = (home / ".cursor/projects").resolve()
+        real_resolve = pathlib.Path.resolve
+
+        def swapped_resolve(self, strict=False):
+            if self == source:
+                raise AssertionError("anchored source path was resolved again")
+            return real_resolve(self, strict=strict)
+
+        with patch.object(pathlib.Path, "resolve", swapped_resolve):
+            metadata = cursor.session_metadata(source, projects_root=root)
+        assert metadata["session_id"] == SID
+        assert metadata["source_surface"] == "cursor-ide"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

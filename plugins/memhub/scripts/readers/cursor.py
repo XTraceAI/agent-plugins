@@ -843,7 +843,11 @@ def session_metadata(path, *, meta_text: str | None = None,
     # not establish a CLI or IDE surface, and absent native start stays unknown.
     try:
         root = _PROJECTS.resolve() if projects_root is None else Path(projects_root)
-        relative = source.resolve().relative_to(root)
+        # A supplied root means the caller already anchored and resolved this
+        # source. Resolving the live pathname again would reopen a swap window
+        # between its revision baseline and final consistency check.
+        observed_source = source.resolve() if projects_root is None else source
+        relative = observed_source.relative_to(root)
         # The native layout is <hash>/agent-transcripts/<uuid>/<uuid>.jsonl; a
         # file whose name disagrees with its session directory is not one.
         known_ide = (len(relative.parts) == 4 and relative.parts[1] == "agent-transcripts"
