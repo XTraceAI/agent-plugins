@@ -446,6 +446,9 @@ def main(argv=None) -> int:
     try:
         path_syntax = bool(args.session and any(mark in args.session for mark in ("/", "\\")))
         explicit_path = args.session is not None and args.session != "latest" and path_syntax
+        # Where each configured root leads, recorded once before any lookup:
+        # discovery rechecks and transcript classification both use it.
+        anchors = root_anchors(reader)
         if explicit_path:
             path, error = reader.locate(args.session)
             if error or path is None:
@@ -453,7 +456,6 @@ def main(argv=None) -> int:
                 return 2
             sessions = [{"path": str(path)}]
         else:
-            anchors = root_anchors(reader)
             options = {"include_representations": True} if args.host == "cursor" else {}
             sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"), **options)
             discovered = list(sessions)
@@ -574,7 +576,8 @@ def main(argv=None) -> int:
                     meta = path.parent / "meta.json"
                     with regular_source(meta, revision_identity(revision, meta)) as (handle, _):
                         meta_text = handle.read().decode("utf-8")
-                native = reader.session_metadata(path, meta_text=meta_text)
+                native = reader.session_metadata(path, meta_text=meta_text,
+                                                 projects_root=anchors.get(reader._PROJECTS))
                 sid = native_text(native.get("session_id"), required=True)
             # A readable identity still collides when another header field is bad.
             counts[f"{reader.HOST}-{sid}"] += 1

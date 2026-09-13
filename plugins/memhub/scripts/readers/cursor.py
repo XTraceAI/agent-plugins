@@ -820,11 +820,15 @@ def to_canonical(path, *, session_id: str | None = None,
         model_hint=None, created_ts=_created_at(mj, strict=strict), strict=strict)
 
 
-def session_metadata(path, *, meta_text: str | None = None) -> dict:
+def session_metadata(path, *, meta_text: str | None = None,
+                     projects_root: Path | None = None) -> dict:
     """Native identity and start; a first user message is not a session start.
 
     ``meta_text`` carries meta.json already read through a validated
-    descriptor, so the sidecar is not reopened by name."""
+    descriptor, so the sidecar is not reopened by name. ``projects_root`` is
+    where the configured projects root led when the caller anchored it, so a
+    root retargeted since then cannot change how a transcript is classified.
+    """
     source = Path(path)
     if source.name == "store.db":
         meta = _read_meta_json(source.parent, strict=True, text=meta_text)
@@ -838,7 +842,8 @@ def session_metadata(path, *, meta_text: str | None = None) -> dict:
     # This observed location identifies IDE transcripts. An arbitrary file does
     # not establish a CLI or IDE surface, and absent native start stays unknown.
     try:
-        relative = source.resolve().relative_to(_PROJECTS.resolve())
+        root = _PROJECTS.resolve() if projects_root is None else Path(projects_root)
+        relative = source.resolve().relative_to(root)
         known_ide = len(relative.parts) == 4 and relative.parts[1] == "agent-transcripts"
     except ValueError:
         known_ide = False
