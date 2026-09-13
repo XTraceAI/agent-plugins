@@ -1518,6 +1518,32 @@ def test_configured_root_symlinks_are_anchored_across_discovery():
                 cursor_flush.STATE_DIR = original_dir
 
 
+def test_saved_store_pins_resolve_from_safe_discovery():
+    """An alias under the chats root that safe discovery reports and skips must
+    not influence a saved store pin: the pinned store still resolves to the one
+    real store, whether the alias is a symlinked session directory or a
+    symlinked store.db."""
+    for alias_kind in ("directory", "file"):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            store = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+            alias_dir = home / ".cursor/chats/00ff00ff00ff00ff" / SID
+            if alias_kind == "directory":
+                alias_dir.parent.mkdir(parents=True)
+                alias_dir.symlink_to(store.parent, target_is_directory=True)
+            else:
+                alias_dir.mkdir(parents=True)
+                (alias_dir / "store.db").symlink_to(store)
+            state_path = home / f".config/memhub-plugin/cursorflush/{SID}.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({"source_kind": "store"}))
+            for selection in ([], ["--session", SID], ["--session", "latest"]):
+                result, rows = run(home, "cursor", *selection, "--metadata-only")
+                headers = [row for row in rows if row["type"] == "session"]
+                assert "session_unreadable" not in result.stderr, (alias_kind, selection, result.stderr)
+                assert [row["path"] for row in headers] == [str(store.resolve())], (alias_kind, selection, rows, result.stderr)
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

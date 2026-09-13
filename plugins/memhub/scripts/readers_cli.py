@@ -158,10 +158,21 @@ def cursor_selection(path: Path, *, select_saved=False):
             raise ValueError("saved observations have no source provenance")
         return path, state, seen
     if kind == "store":
-        # Resolve the pinned store from the native chats root only. The legacy
-        # locator also accepts a working-directory entry named after the UUID,
-        # which must never decide what a saved pin points at.
-        stores = [item for item in cursor_reader._CHATS.glob(f"*/{sid}/store.db") if item.is_file()]
+        # The legacy locator also accepts a working-directory entry named
+        # after the UUID; only the native chats root may decide what a saved
+        # pin points at.
+        if select_saved:
+            # Selecting: resolve the pinned store the way safe discovery does,
+            # from regular store.db files below unaliased directories, so an
+            # alias discovery reports and skips cannot make the pin ambiguous.
+            from readers.discovery import paths as safe_paths
+            stores = safe_paths(cursor_reader._CHATS, ("*", sid, "store.db"), lambda error: None)
+        else:
+            # An explicit path is an intentional selection, aliases included;
+            # only a second distinct store of the same session is ambiguous.
+            stores = list({item.resolve(strict=True): item
+                           for item in cursor_reader._CHATS.glob(f"*/{sid}/store.db")
+                           if item.is_file()}.values())
         saved = stores[0] if len(stores) == 1 else None
     elif kind == "transcript":
         saved, _ = _valid_transcript_path(state.get("transcript_path"), sid)
