@@ -1585,6 +1585,48 @@ def test_transcript_classification_uses_the_anchored_projects_root():
             cursor_flush.STATE_DIR = original_dir
 
 
+def test_transcript_pins_validate_against_the_anchored_projects_root():
+    """A saved transcript pin is validated against where the configured projects
+    root led when it was anchored. Retargeting the root symlink after the
+    anchor must not make the caller's explicit, unchanged transcript unreadable."""
+    import tempfile
+    import readers_cli, cursor_flush
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td).resolve()
+        before, after = home / "before", home / "after"
+        path = transcript(before)
+        (after / ".cursor/projects").mkdir(parents=True)
+        link = home / "projects"
+        link.symlink_to(before / ".cursor/projects", target_is_directory=True)
+        state_dir = home / ".config/memhub-plugin/cursorflush"
+        state_dir.mkdir(parents=True)
+        (state_dir / f"{SID}.json").write_text(json.dumps({"source_kind": "transcript", "transcript_path": str(path)}))
+        real_locate = cursor.locate
+
+        def retargeting(ref):
+            located = real_locate(ref)               # anchors were taken before this
+            link.unlink()
+            link.symlink_to(after / ".cursor/projects", target_is_directory=True)
+            return located
+
+        original_dir = cursor_flush.STATE_DIR
+        cursor_flush.STATE_DIR = state_dir
+        try:
+            with patch.multiple(cursor, _CHATS=home / ".cursor/chats", _PROJECTS=link, locate=retargeting), \
+                    patch.object(cursor_flush, "_CURSOR_PROJECTS", link):
+                for mode in ([], ["--metadata-only"]):
+                    link.unlink()
+                    link.symlink_to(before / ".cursor/projects", target_is_directory=True)
+                    output, errors = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                        status = readers_cli.main(["--host", "cursor", "--session", str(path), *mode])
+                    headers = [row for row in (json.loads(line) for line in output.getvalue().splitlines())
+                               if row.get("type") == "session"]
+                    assert status == 0 and [row["path"] for row in headers] == [str(path)], (mode, errors.getvalue())
+        finally:
+            cursor_flush.STATE_DIR = original_dir
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

@@ -123,7 +123,7 @@ def cursor_sid(path: Path) -> str:
     return path.parent.name if path.name == "store.db" else path.stem
 
 
-def cursor_selection(path: Path, *, select_saved=False):
+def cursor_selection(path: Path, *, select_saved=False, anchors=None):
     """Never restore index-derived pins onto a different representation.
 
     Returns ``(source, state, observation)``: the saved state this call
@@ -175,7 +175,8 @@ def cursor_selection(path: Path, *, select_saved=False):
                            if item.is_file()}.values())
         saved = stores[0] if len(stores) == 1 else None
     elif kind == "transcript":
-        saved, _ = _valid_transcript_path(state.get("transcript_path"), sid)
+        root = anchors.get(cursor_reader._PROJECTS) if anchors else None
+        saved, _ = _valid_transcript_path(state.get("transcript_path"), sid, root=root)
     else:
         saved = None
     if saved is not None:
@@ -492,7 +493,7 @@ def main(argv=None) -> int:
                     return row["mtime"]
                 latest, _ = discovered_path(reader, max(discovered, key=latest_mtime)["path"], anchors)
                 if args.host == "cursor":
-                    latest, _, latest_seen = cursor_selection(latest, select_saved=True)
+                    latest, _, latest_seen = cursor_selection(latest, select_saved=True, anchors=anchors)
                     if discovered_source(reader, latest, discovered, anchors) is None:
                         diagnostic("session_unavailable")
                         return 2
@@ -541,7 +542,7 @@ def main(argv=None) -> int:
             if args.host == "cursor":
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
-                path, _, seen = cursor_selection(path, select_saved=select_saved)
+                path, _, seen = cursor_selection(path, select_saved=select_saved, anchors=anchors)
                 if not explicit_path:
                     anchor = discovered_source(reader, path, discovered, anchors)
                     if anchor is None:
@@ -652,7 +653,7 @@ def main(argv=None) -> int:
                     # apply the state that validation parsed; an absent file is
                     # an explicit empty state, so no path is reopened here. The
                     # state read must be the one the baseline observed.
-                    _, saved_state, seen = cursor_selection(path)
+                    _, saved_state, seen = cursor_selection(path, anchors=anchors)
                     if seen != state_observation(revision, path):
                         raise SourceChanged("saved state changed during the read")
                     apply_session_state(records, header["native_session_id"],
