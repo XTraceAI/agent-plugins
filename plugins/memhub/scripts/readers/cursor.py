@@ -158,10 +158,12 @@ def _usage_of(message: dict) -> dict[str, int] | None:
     return normalize_usage(raw)
 
 
-def _read_meta_json(session_dir: Path, *, strict=False) -> dict | None:
+def _read_meta_json(session_dir: Path, *, strict=False, text=None) -> dict | None:
     p = session_dir / "meta.json"
     try:
-        value = load_json(p.read_text(encoding="utf-8"), strict=strict)
+        if text is None:
+            text = p.read_text(encoding="utf-8")
+        value = load_json(text, strict=strict)
         if strict and isinstance(value, dict):
             for key in ("cwd", "gitBranch", "source_surface"):
                 if value.get(key) is not None and not isinstance(value[key], str):
@@ -194,7 +196,7 @@ def session_cwd(path) -> str | None:
     return cwd if isinstance(cwd, str) and cwd else None
 
 
-def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
+def list_sessions(limit: int | None = 20, *, on_error=None, include_representations=False) -> list[dict]:
     """Most recent Cursor sessions, preferring the richer store per UUID."""
     rows: list[dict] = []
     store_ids: set[str] = set()
@@ -236,7 +238,7 @@ def list_sessions(limit: int | None = 20, *, on_error=None) -> list[dict]:
                      "mtime": (m.get("updatedAtMs") or 0) / 1000.0,
                      "host": HOST, "cwd": m.get("cwd")})
     for p in transcripts:
-        if p.stem in store_ids:
+        if p.stem in store_ids and not include_representations:
             continue
         try:
             mtime = p.stat().st_mtime
@@ -546,6 +548,15 @@ def _iso_ms(ms, *, strict: bool = False) -> str | None:
         return None
 
 
+def _created_at(meta: dict, *, strict: bool) -> str | None:
+    value = meta.get("createdAtMs")
+    if value is not None and type(value) not in (int, float):
+        if strict:
+            raise ValueError("invalid Cursor creation timestamp")
+        return None
+    return _iso_ms(value, strict=strict)
+
+
 def _embedded_timestamp(text: str) -> str | None:
     match = _TIMESTAMP_RE.search(text or "")
     if not match:
@@ -806,27 +817,41 @@ def to_canonical(path, *, session_id: str | None = None,
                 for message, node_ts in _load_messages(source, strict=strict)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_iso_ms(mj.get("createdAtMs")), strict=strict)
+        model_hint=None, created_ts=_created_at(mj, strict=strict), strict=strict)
 
 
-def session_metadata(path) -> dict:
-    """Native identity and start; a first user message is not a session start."""
+def session_metadata(path, *, meta_text: str | None = None,
+                     projects_root: Path | None = None) -> dict:
+    """Native identity and start; a first user message is not a session start.
+
+    ``meta_text`` carries meta.json already read through a validated
+    descriptor, so the sidecar is not reopened by name. ``projects_root`` is
+    where the configured projects root led when the caller anchored it, so a
+    root retargeted since then cannot change how a transcript is classified.
+    """
     source = Path(path)
     if source.name == "store.db":
-        meta = _read_meta_json(source.parent, strict=True)
+        meta = _read_meta_json(source.parent, strict=True, text=meta_text)
         version = meta.get("schemaVersion") if isinstance(meta, dict) else None
         if type(version) is not int or version != _SCHEMA_VERSION:
             raise ValueError("unsupported Cursor store metadata")
-        created = meta.get("createdAtMs")
         return {"session_id": source.parent.name, "cwd": meta.get("cwd"),
                 "git_branch": meta.get("gitBranch"),
-                "started_at": _iso_ms(created) if type(created) in (int, float) else None,
+                "started_at": _created_at(meta, strict=True),
                 "source_surface": meta.get("source_surface")}
     # This observed location identifies IDE transcripts. An arbitrary file does
     # not establish a CLI or IDE surface, and absent native start stays unknown.
     try:
-        relative = source.resolve().relative_to(_PROJECTS.resolve())
-        known_ide = len(relative.parts) == 4 and relative.parts[1] == "agent-transcripts"
+        root = _PROJECTS.resolve() if projects_root is None else Path(projects_root)
+        # A supplied root means the caller already anchored and resolved this
+        # source. Resolving the live pathname again would reopen a swap window
+        # between its revision baseline and final consistency check.
+        observed_source = source.resolve() if projects_root is None else source
+        relative = observed_source.relative_to(root)
+        # The native layout is <hash>/agent-transcripts/<uuid>/<uuid>.jsonl; a
+        # file whose name disagrees with its session directory is not one.
+        known_ide = (len(relative.parts) == 4 and relative.parts[1] == "agent-transcripts"
+                     and relative.parts[2] == source.stem)
     except ValueError:
         known_ide = False
     return {"session_id": source.stem, "cwd": None, "git_branch": None,

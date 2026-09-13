@@ -377,7 +377,7 @@ def session_uuid(payload: dict) -> str | None:
     return None
 
 
-def _valid_transcript_path(raw, uuid: str) -> tuple[Path | None, str]:
+def _valid_transcript_path(raw, uuid: str, *, root: Path | None = None) -> tuple[Path | None, str]:
     """Resolve a hook transcript without granting arbitrary-file upload.
 
     A project can invoke the launcher itself and controls hook JSON. Requiring
@@ -397,7 +397,9 @@ def _valid_transcript_path(raw, uuid: str) -> tuple[Path | None, str]:
         return None, "transcript_path does not match the session UUID"
     try:
         resolved = candidate.resolve(strict=True)
-        root = _CURSOR_PROJECTS.resolve(strict=True)
+        # A caller that anchored the configured root earlier in its run passes
+        # that target, so a root retargeted since cannot change the verdict.
+        root = _CURSOR_PROJECTS.resolve(strict=True) if root is None else Path(root)
         resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return None, "transcript_path does not resolve under ~/.cursor/projects"

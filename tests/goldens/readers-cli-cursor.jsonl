@@ -1,0 +1,8 @@
+{"conversation_id": "cursor-11111111-2222-3333-4444-555555555555", "cwd": null, "git_branch": null, "host": "cursor", "mtime": 1788825600.0, "native_session_id": "11111111-2222-3333-4444-555555555555", "path": "synthetic/11111111-2222-3333-4444-555555555555.jsonl", "source_surface": "cursor-ide", "started_at": null, "title": "Reply once", "type": "session"}
+{"message": {"content": "[Imported from Cursor \u00b7 session 11111111-2222-3333-4444-555555555555]", "role": "user"}, "timestamp": "2026-08-23T18:16:00.000Z", "type": "user", "uuid": "fbf215c4-c5df-57d7-8d2c-355c8fe13477"}
+{"message": {"content": "Reply once", "role": "user"}, "timestamp": "2026-08-23T18:16:00.000Z", "type": "user", "uuid": "757355c0-79e3-57f9-a1ad-47b06a641c36"}
+{"message": {"content": [{"text": "FIRST", "type": "text"}], "role": "assistant"}, "type": "assistant", "uuid": "dbbd702b-460f-590e-9334-332eb32449f2"}
+{"message": {"content": "Edit it", "role": "user"}, "timestamp": "2026-08-23T18:18:00.000Z", "type": "user", "uuid": "dfe99c76-49b0-59aa-ba99-888bcf14cc58"}
+{"message": {"content": [{"text": "Working.", "type": "text"}], "role": "assistant"}, "type": "assistant", "uuid": "60f9a226-8cf7-5485-b003-fcd93e69acbb"}
+{"message": {"content": [{"id": "cursor-call-5", "input": {"contents": "ok\n", "path": "/repo/proj/out.txt"}, "name": "Write", "type": "tool_use"}], "role": "assistant"}, "type": "assistant", "uuid": "3aab3f94-68a7-5c60-8d82-6a2d8e7d2213"}
+{"message": {"content": [{"text": "DONE", "type": "text"}], "role": "assistant"}, "type": "assistant", "uuid": "63c0f3d9-591d-573a-811b-0c4737b6e2f6"}
