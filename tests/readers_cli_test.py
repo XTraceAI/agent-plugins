@@ -1686,6 +1686,88 @@ def test_symlink_loops_are_reported_not_raised():
                 assert expected in errors.getvalue(), (type(flavour).__name__, looping, errors.getvalue())
 
 
+def test_latest_ranking_is_bound_to_the_clock_it_consumed():
+    """`--session latest` keeps the observation of the clock file it ranked on
+    (a store's meta.json, a rollout or transcript itself). If that file changes
+    between ranking and the baseline, or between the baseline and emission, the
+    command reports source_changed instead of emitting a selection a fresh
+    invocation might not make."""
+    import tempfile
+    import readers_cli, cursor_flush
+    other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    for host in ("cursor", "codex"):
+        for window in ("before_baseline", "after_baseline"):
+            with tempfile.TemporaryDirectory() as td:
+                home = Path(td).resolve()
+                if host == "cursor":
+                    winner = fixtures._make_cursor_store(home / ".cursor/chats", uuid=SID)
+                    runner_up = fixtures._make_cursor_store(home / ".cursor/chats/other-hash", uuid=other)
+                    for store, clock in ((winner, 2_000_000), (runner_up, 1_000_000)):
+                        meta = json.loads((store.parent / "meta.json").read_text())
+                        meta["updatedAtMs"] = clock
+                        (store.parent / "meta.json").write_text(json.dumps(meta))
+                    basis = winner.parent / "meta.json"
+
+                    def alter():
+                        meta = json.loads(basis.read_text())
+                        meta["updatedAtMs"] = 500_000            # now older than the runner-up
+                        basis.write_text(json.dumps(meta))
+                    roots = {cursor: {"_CHATS": home / ".cursor/chats", "_PROJECTS": home / ".cursor/projects"}}
+                else:
+                    winner = rollout(home)
+                    rows = copy.deepcopy(fixtures.CODEX_SYNTH)
+                    rows[0]["payload"].update(id=other, timestamp=STAMP)
+                    runner_up = write_jsonl(home / ".codex/sessions/2026/01/02/rollout-other.jsonl", rows)
+                    os.utime(winner, (MTIME + 100, MTIME + 100))
+                    basis = winner
+
+                    def alter():
+                        os.utime(basis, (MTIME - 100, MTIME - 100))  # now older than the runner-up
+                    roots = {codex: {"_SESSIONS": home / ".codex/sessions"}}
+                real_revision, real_snapshot = readers_cli.source_revision, readers_cli.source_snapshot
+                fired = []
+
+                def altering_revision(source, host_, **options):
+                    revision = real_revision(source, host_, **options)
+                    if window == "before_baseline" and not fired:
+                        fired.append(True)
+                        alter()
+                        revision = real_revision(source, host_, **options)   # the baseline the CLI keeps
+                    return revision
+
+                @contextlib.contextmanager
+                def altering_snapshot(source, host_, *rest):
+                    with real_snapshot(source, host_, *rest) as snapshot:
+                        yield snapshot
+                    if window == "after_baseline" and not fired:
+                        fired.append(True)
+                        alter()
+
+                original_dir = cursor_flush.STATE_DIR
+                cursor_flush.STATE_DIR = home / ".config/memhub-plugin/cursorflush"
+                try:
+                    module, attributes = next(iter(roots.items()))
+                    with patch.multiple(module, **attributes):
+                        # Control: the intact clock selects the winner.
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                            status = readers_cli.main(["--host", host, "--session", "latest", "--metadata-only"])
+                        headers = [json.loads(line) for line in output.getvalue().splitlines()]
+                        assert status == 0 and [row["native_session_id"] for row in headers] != [other], (host, headers)
+                        with patch.object(readers_cli, "source_revision", altering_revision), \
+                                patch.object(readers_cli, "source_snapshot", altering_snapshot):
+                            mode = ["--metadata-only"] if window == "before_baseline" else []
+                            output, errors = io.StringIO(), io.StringIO()
+                            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                                status = readers_cli.main(["--host", host, "--session", "latest", *mode])
+                            headers = [row for row in (json.loads(line) for line in output.getvalue().splitlines())
+                                       if row.get("type") == "session"]
+                            assert fired, (host, window)
+                            assert status == 2 and not headers and "source_changed" in errors.getvalue(), (host, window, headers, errors.getvalue())
+                finally:
+                    cursor_flush.STATE_DIR = original_dir
+
+
 def test_undated_fallback_title_is_bound_to_the_index_stamp():
     """An undated matching row keeps an identical tuple across an unrelated
     index append, but its effective mtime came from the index stamp, so the

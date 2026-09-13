@@ -58,6 +58,21 @@ def entry_identity(entry) -> tuple:
     return entry[4], entry[3]
 
 
+def file_observation(item: Path, observed) -> tuple:
+    """One file as a revision entry: name, size, mtime and identity."""
+    return (str(item), observed.st_size, observed.st_mtime_ns, observed.st_ino, observed.st_dev)
+
+
+def basis_unchanged(basis) -> bool:
+    """Re-observe the file a ranking was based on; absent or altered is a change."""
+    item, expected = basis
+    try:
+        with regular_source(item) as (_, observed):
+            return file_observation(item, observed) == expected
+    except (OSError, ValueError):
+        return False
+
+
 def revision_identity(revision, path: Path):
     """The identity a revision recorded for one file, or None when absent."""
     return next((entry_identity(item) for item in revision if item[0] == str(path)), None)
@@ -114,8 +129,7 @@ def source_revision(path: Path, host: str, expect=None) -> tuple:
             if item == path:
                 raise
             continue
-        revision.append((str(item), observed.st_size, observed.st_mtime_ns,
-                         observed.st_ino, observed.st_dev))
+        revision.append(file_observation(item, observed))
     return tuple(revision)
 
 
@@ -145,8 +159,7 @@ def cursor_selection(path: Path, *, select_saved=False, anchors=None):
             # Parse these exact bytes: reopening by path would let another
             # process swap in a FIFO or symlink after the check.
             saved_text = handle.read().decode("utf-8")
-            seen = (str(_state_path(sid)), observed.st_size, observed.st_mtime_ns,
-                    observed.st_ino, observed.st_dev)
+            seen = file_observation(_state_path(sid), observed)
     except FileNotFoundError:
         # Absent stays absent. Falling through to _read_state would reopen the
         # path, and a FIFO created in the meantime would block there.
@@ -441,6 +454,7 @@ def main(argv=None) -> int:
     explicit_path = False
     latest = None
     latest_seen = None
+    latest_basis = None
     incomplete = False
     cursor_counts = Counter()
 
@@ -500,20 +514,32 @@ def main(argv=None) -> int:
                 if not discovered:
                     diagnostic("session_unavailable")
                     return 2
+                ranked = {}
+
                 def latest_mtime(row):
+                    # Ranking keeps the observation it consumed: the winner's
+                    # clock file must still match when the baseline is taken
+                    # and when the session is emitted, or a fresh invocation
+                    # could rank differently than the selection being emitted.
                     path = Path(row["path"])
                     if args.host == "cursor" and path.name == "store.db":
                         # Ranking consumes only the update clock. Full metadata
                         # validation belongs to the selected session below.
-                        with regular_source(path.parent / "meta.json") as (handle, _):
+                        clock = path.parent / "meta.json"
+                        with regular_source(clock) as (handle, observed):
                             metadata = load_json(handle.read().decode("utf-8"), strict=True)
+                        ranked[row["path"]] = (clock, file_observation(clock, observed))
                         value = metadata.get("updatedAtMs") if isinstance(metadata, dict) else None
                         if type(value) not in (int, float) or not math.isfinite(value):
                             raise ValueError("Cursor latest ordering requires a finite native timestamp")
                         reader._iso_ms(value, strict=True)
                         return value / 1000
-                    return row["mtime"]
-                latest, _ = discovered_path(reader, max(discovered, key=latest_mtime)["path"], anchors)
+                    with regular_source(path) as (_, observed):
+                        ranked[row["path"]] = (path, file_observation(path, observed))
+                    return observed.st_mtime_ns / 1_000_000_000
+                winner = max(discovered, key=latest_mtime)
+                latest_basis = ranked[winner["path"]]
+                latest, _ = discovered_path(reader, winner["path"], anchors)
                 if args.host == "cursor":
                     latest, _, latest_seen = cursor_selection(latest, select_saved=True, anchors=anchors)
                     if discovered_source(reader, latest, discovered, anchors) is None:
@@ -570,6 +596,11 @@ def main(argv=None) -> int:
                     if anchor is None:
                         raise ValueError("saved Cursor source was excluded by discovery")
             revision = source_revision(path, args.host, expect=anchor)
+            if latest_basis is not None and not basis_unchanged(latest_basis):
+                # The clock this selection was ranked on changed before the
+                # baseline: a fresh invocation might rank another session.
+                diagnostic("source_changed", path)
+                continue
             if args.host == "cursor" and (state_observation(revision, path) != seen or (
                     args.session == "latest" and cursor_sid(path) == cursor_sid(latest)
                     and seen != latest_seen)):
@@ -690,7 +721,8 @@ def main(argv=None) -> int:
                         titles.stamp_bound(observation) and titles.stamp != stamp_used):
                     diagnostic("source_changed", path)
                     continue
-            if source_revision(path, args.host) != revision:
+            if source_revision(path, args.host) != revision or (
+                    latest_basis is not None and not basis_unchanged(latest_basis)):
                 diagnostic("source_changed", path)
                 continue
             if args.since is not None and header["mtime"] < args.since:
