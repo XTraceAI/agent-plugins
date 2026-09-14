@@ -5,29 +5,35 @@ Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on. With it on,
 MemHub classifies each turn's moment and the coding agent that lived the turn
 decides whether it holds a lesson:
 
-  Stop(turn N)       `stop`     returns in milliseconds. Takes the turn's
-                                closed error arcs from the rulebook hook, then
-                                spawns a detached `extract` child, which builds
-                                the redacted window, asks the classifier, and
-                                on a signal records the MOMENT (turn, kind,
-                                router hint, state stamp).
-  next user prompt   `prompt`   hands the newest un-handed moment to the agent
-                                in ONE injected line: which turn, what kind,
-                                and the stamp to pass. The agent decides
-                                whether there is a lesson, asks the person if
-                                unsure, and files it with the memhub
-                                `create_rule` tool. It lands `proposed`, and a
-                                person activates it.
+  Stop(turn N)       `stop`     takes the turn's closed error arcs from the
+                                rulebook hook and spawns a detached `extract`
+                                child, which builds the redacted window, asks
+                                the classifier, and on a signal records the
+                                MOMENT (turn, kind, router hint, state stamp).
+                                Then, if an earlier turn's moment is waiting,
+                                it BLOCKS the stop: the agent that lived the
+                                turn, its work for the person done and nothing
+                                else competing, must decide whether the moment
+                                holds a lesson — run the create-rule skill on
+                                it, or say in one line why there is none.
 
-A moment the classifier has not answered for by the next prompt is handed on a
-later prompt while it is still recent. A moment nobody was handed (the
-terminal closed, a host with no prompt hook) stays in its file. Nothing here
-fires a rule and nothing here activates one.
+Why a blocking Stop and not a line injected with the next prompt: that lane
+reached the agent 19 times in five real sessions and produced 0 `create_rule`
+calls. A line stapled to the person's live request lost to the request every
+time, and "say nothing if there is no lesson" made ignoring it look exactly like
+judging it. At Stop the agent is idle, and the one-line verdict makes the
+outcome visible either way.
+
+The block hands an EARLIER turn's moment: this turn's classifier is still
+running in the child. A moment from a session's last turn is never handed.
+The continuation's own Stop carries `stop_hook_active` and passes, so one
+block is one continuation. Whatever the agent decides, a proposal lands
+`proposed` and a person activates it: nothing here fires or activates a rule.
 
 Files, under $MEMHUB_HARNESS_DIR (default ~/.config/memhub-plugin/harness),
 all created private:
 
-  <session>.moments.jsonl    flagged moments, then a `handed` row per nudge
+  <session>.moments.jsonl    flagged moments, then a `handed` row per block
                              (append-only: two lanes write it at once)
   <session>.meta.json        last extracted turn, repo, cwd, transcript cursor
   <session>.meta.json.lock   serializes the meta file's read-merge-write
@@ -53,9 +59,8 @@ if str(HERE) not in sys.path:
 
 import harness_extract as hx  # noqa: E402
 
-NUDGE_MAX_AGE_TURNS = 3      # an older moment is left in its file, never nudged stale
-NUDGE_CAP_PER_SESSION = 8    # at most this many nudges in one session
-NUDGES_PER_PROMPT = 1        # one line, the newest moment
+HANDOFF_MAX_AGE_TURNS = 3    # an older moment is left in its file, never handed stale
+HANDOFF_CAP_PER_SESSION = 8  # at most this many blocked stops in one session
 
 
 # --------------------------------------------------------------- plumbing
@@ -181,11 +186,14 @@ def _is_subagent(payload: dict) -> bool:
 
 # --------------------------------------------------------------- stop lane
 def cmd_stop(payload: dict) -> int:
-    """Millisecond budget: one small state read, one spawn, no transcript and
+    """Millisecond budget: two small file reads, one spawn, no transcript and
     no network. The hook is SYNCHRONOUS, so what it records is the turn's
     boundary: Claude Code appends no queued prompt and runs no next-turn tool
     hook until it returns. (The shell gate in claude-hooks.json keeps it free
-    with the flag off.)"""
+    with the flag off.)
+
+    The spawn comes first: the child is bounded by the transcript's size NOW,
+    so whatever the blocked continuation appends is not this turn's."""
     session = str(payload.get("session_id") or "").strip()
     transcript = str(payload.get("transcript_path") or "").strip()
     cwd = str(payload.get("cwd") or "").strip()
@@ -219,7 +227,7 @@ def cmd_stop(payload: dict) -> int:
             except Exception:
                 pass
     hx.spawn_detached(args, script=Path(__file__).resolve(), log_name="stop.log")
-    return 0
+    return hand_off(session)
 
 
 def _claim_turn(session: str, marker: str) -> bool:
@@ -327,61 +335,43 @@ def proposal_scope(moment: dict, fallback_repo: str = "") -> list[str]:
     return [repo] if repo else []
 
 
-def nudge_line(session: str, moment: dict, repo: str = "") -> str:
-    """The one line the agent reads. It carries the stamp verbatim, so the rule
-    the agent files is stamped by the harness and never typed. `repo` is the
-    session's, used only when the moment's own stamp names none.
+BLOCK_PREFIX = "MemHub harness: before you stop"
 
-    It files ADVICE only. A blocking rule has rules of its own — who the block
-    reaches, which shapes the hook can actually stop before the call (a file
-    written by a shell command is discovered post-hoc and only advises), and
-    the `--fires`/`--silent` proof — and they live in
-    `skills/create-rule/SKILL.md`. Restating a subset of them here is what put
-    three Codex findings on #222: whatever this line does not copy, the harness
-    path silently drops, and whatever it does copy drifts from the skill. So a
-    gate candidate is handed to the skill instead of re-derived (Codex, #222).
 
-    The handoff carries the STAMP with it. The skill files through the same
-    `create_rule` tool but knows nothing of `source='session_draft'` or the
-    `state` block, and the server refuses a draft without `repo`, `session_id`,
-    `turn`, `hook_version` and `at` — so a gate handed over bare either lands
-    under manual provenance with this turn's branch and environment lost, or is
-    refused outright. Provenance is the harness's own data, not a rule of the
-    skill's being restated: this line is the only place that has it.
-    """
+def block_reason(session: str, moment: dict, repo: str = "") -> str:
+    """What the blocked agent reads. Two jobs only: the verdict it owes, and
+    the harness's own provenance. `repo` is the session's, used only when the
+    moment's own stamp names none.
+
+    HOW to file a rule — the rulebook question, the twin check, the engine
+    shapes, advise vs gate, the proof — lives in `skills/create-rule/SKILL.md`
+    and is not restated here. The line that restated it drew five of six Codex
+    findings on #222: whatever it did not copy the harness path silently
+    dropped, and whatever it did copy drifted from the skill.
+
+    The STAMP is carried, because it is the one thing only this line has: the
+    server refuses a `session_draft` without `repo`, `session_id`, `turn`,
+    `hook_version` and `at`, and a rule filed without it loses the turn's
+    branch and environment."""
+    turn = moment.get("turn")
     kind = moment.get("kind") or "a signal"
     scope = proposal_scope(moment, repo)
     narrow = (f" The turn worked in {len(scope)} repositories: keep in scope_repos only "
               f"the ones the lesson is about.") if len(scope) > 1 else ""
     hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
-    derivable = (" — the classifier thinks it may already be written down in the repo, "
-                 "so check before proposing") if moment.get("derivable") else ""
+    derivable = (" The classifier thinks it may already be written down, so check "
+                 "first.") if moment.get("derivable") else ""
     stamp = json.dumps(moment.get("state") or {}, ensure_ascii=False, default=str)
     return (
-        f"MemHub harness: your previous turn (turn {moment.get('turn')}) was classified as "
-        f"{kind}{hint}{derivable}. If it carries a lesson that would change what an agent "
-        f"DOES next time, is not already in the repo, its docs, CLAUDE.md or the rulebook, "
-        f"is not project state, and will still be true next month, propose it now with the "
-        f"memhub create_rule tool. Resolve the rulebook with list_rulebooks (several: ask "
-        f"which; none or no such tool: stop). "
-        f"Then look for a twin: list_rules with no rulebook_id, include_retired=true, "
-        f"limit=200, paging with offset while has_more — a dismissed rule is exactly "
-        f"the twin not to re-file, and the default view hides it. A twin in that "
-        f"rulebook: supersedes_rule_id or file nothing; in another: tell the user. "
-        f"Then pass title (a short noun phrase naming the trap), statement "
-        f"(one when-X-then-Y sentence with the why), exactly one engine — "
-        f"delivery=agent_hook with matcher {{event: bash|edit|output|read, …_rx}} or "
-        f"ordering, or delivery=anchor_recall with 1-8 concrete identifiers — plus "
+        f"{BLOCK_PREFIX}: turn {turn} of this session was flagged as {kind}{hint}."
+        f"{derivable} Decide now whether it holds a lesson that would change what an "
+        f"agent DOES next time, is not already in the repo, its docs, CLAUDE.md or the "
+        f"rulebook, is not project state, and will still be true next month. If it does, "
+        f"run the memhub create-rule skill on it, and pass these to create_rule verbatim: "
         f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
-        f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} Never pass "
-        f"activate or mode; what you file here advises. If the user asked for the "
-        f"action to be STOPPED, run the memhub create-rule skill instead — it "
-        f"carries the disclosure, the shapes that can block and the --fires/--silent "
-        f"proof — and hand it this turn's source, source_ref, scope_repos and state "
-        f"above, which the skill does not know and MemHub refuses a draft without. "
-        f"Never put a person's name, home "
-        f"directory or e-mail in a rule. Ask the user first if unsure; if there is no "
-        f"lesson, say nothing about this."
+        f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} If it does not, or the "
+        f"user declines, end with exactly one line: \"No rule from turn {turn}: <why>\". "
+        f"Never pass activate. Never put a person's name, home directory or e-mail in a rule."
     )
 
 
@@ -389,49 +379,40 @@ def _moment_key(moment: dict) -> str:
     return str(moment.get("source_ref") or f"turn-{moment.get('turn')}")
 
 
-def cmd_prompt(payload: dict) -> int:
-    """UserPromptSubmit, within milliseconds: the newest fresh un-handed moment
-    becomes one line of context, and is marked handed whether or not the agent
-    files anything.
+def hand_off(session: str) -> int:
+    """At Stop: the newest fresh un-handed moment BLOCKS the stop, and is
+    marked handed whether or not the agent files anything.
 
     This lane only APPENDS (a `handed` row). A detached extract child appends
     moments to the same file at any time, and a read-then-replace here would
     delete a moment appended in between."""
-    session = str(payload.get("session_id") or "").strip()
-    prompt = str(payload.get("prompt") or "")
-    if not session or _is_subagent(payload) or hx.is_harness_text(prompt.strip()):
-        return 0
     path = moments_path(session)
     if not path.is_file():
         return 0
     rows = hx.read_jsonl(path)
     handed = {str(r["handed"]) for r in rows if r.get("handed")}
     moments = [r for r in rows if not r.get("handed") and isinstance(r.get("turn"), int)]
-    if not moments or len(handed) >= NUDGE_CAP_PER_SESSION:
+    if not moments or len(handed) >= HANDOFF_CAP_PER_SESSION:
         return 0
     meta = load_meta(session)
     last_turn = max(int(meta.get("last_turn") or 0), max(m["turn"] for m in moments))
     fresh = [m for m in moments if _moment_key(m) not in handed
-             and last_turn - m["turn"] < NUDGE_MAX_AGE_TURNS]
+             and last_turn - m["turn"] < HANDOFF_MAX_AGE_TURNS]
     if not fresh:
         return 0
     # children append in the order their classifiers answered, not turn order
-    fresh.sort(key=lambda m: m["turn"])
-    chosen = fresh[-NUDGES_PER_PROMPT:]
-    now = time.time()
-    for m in chosen:
-        hx.append_jsonl(path, {"handed": _moment_key(m), "at": now})
-    lines = [nudge_line(session, m, meta.get("repo") or "") for m in chosen]
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
-                                             "additionalContext": "\n".join(lines)}}))
-    _log(f"prompt {session[:8]}: handed turn(s) {[m.get('turn') for m in chosen]}")
+    chosen = max(fresh, key=lambda m: m["turn"])
+    hx.append_jsonl(path, {"handed": _moment_key(chosen), "at": time.time()})
+    print(json.dumps({"decision": "block",
+                      "reason": block_reason(session, chosen, meta.get("repo") or "")}))
+    _log(f"stop {session[:8]}: blocked on turn {chosen.get('turn')}")
     return 0
 
 
 # ------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("mode", choices=("stop", "prompt", "extract"))
+    p.add_argument("mode", choices=("stop", "extract"))
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
     p.add_argument("--cwd", default="")
@@ -443,7 +424,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     if not hx.extract_enabled():
-        if args.mode in ("stop", "prompt"):
+        if args.mode == "stop":
             try:
                 sys.stdin.read()          # drain the hook payload, say nothing
             except Exception:
@@ -451,8 +432,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.mode == "stop":
         return cmd_stop(_read_payload())
-    if args.mode == "prompt":
-        return cmd_prompt(_read_payload())
     if args.mode == "extract" and args.session:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     return 0
