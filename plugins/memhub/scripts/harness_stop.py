@@ -330,7 +330,17 @@ def proposal_scope(moment: dict, fallback_repo: str = "") -> list[str]:
 def nudge_line(session: str, moment: dict, repo: str = "") -> str:
     """The one line the agent reads. It carries the stamp verbatim, so the rule
     the agent files is stamped by the harness and never typed. `repo` is the
-    session's, used only when the moment's own stamp names none."""
+    session's, used only when the moment's own stamp names none.
+
+    It files ADVICE only. A blocking rule has rules of its own — who the block
+    reaches, which shapes the hook can actually stop before the call (a file
+    written by a shell command is discovered post-hoc and only advises), and
+    the `--fires`/`--silent` proof — and they live in
+    `skills/create-rule/SKILL.md`. Restating a subset of them here is what put
+    three Codex findings on #222: whatever this line does not copy, the harness
+    path silently drops, and whatever it does copy drifts from the skill. So a
+    gate candidate is handed to the skill instead of re-derived (Codex, #222).
+    """
     kind = moment.get("kind") or "a signal"
     scope = proposal_scope(moment, repo)
     narrow = (f" The turn worked in {len(scope)} repositories: keep in scope_repos only "
@@ -356,11 +366,11 @@ def nudge_line(session: str, moment: dict, repo: str = "") -> str:
         f"ordering, or delivery=anchor_recall with 1-8 concrete identifiers — plus "
         f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
         f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} Never pass "
-        f"activate; it lands proposed for a person. Pass mode=\"gate\" ONLY if the "
-        f"user asked for the action to be stopped, and only with a bash, edit or "
-        f"read matcher, or an ordering; omit mode otherwise. Before filing a gate "
-        f"tell them, in these words, that it stops every teammate the book binds, "
-        f"not just the author. Never put a person's name, home "
+        f"activate or mode; what you file here advises. If the user asked for the "
+        f"action to be STOPPED, run the memhub create-rule skill instead — it "
+        f"carries the disclosure, the shapes that can block and the --fires/--silent "
+        f"proof. "
+        f"Never put a person's name, home "
         f"directory or e-mail in a rule. Ask the user first if unsure; if there is no "
         f"lesson, say nothing about this."
     )
