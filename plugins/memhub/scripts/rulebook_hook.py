@@ -2910,7 +2910,14 @@ def save_state(p, st, before=None):
                         merged.pop(rid, None)
                 for rid, v in st[k].items():
                     if rid not in before[k] or before[k][rid] != v:
-                        merged[rid] = v                # armed or re-versioned here
+                        # A close is a TRANSITION, open → closed, and lands
+                        # only if the file still holds that fire as open: a
+                        # tool hook that converted it meanwhile consumed both
+                        # entries, and re-adding the closed half would make a
+                        # resolved fire dismissable again.
+                        if k == "closed" and (cur.get("open") or {}).get(rid) != v:
+                            continue
+                        merged[rid] = v                # armed, re-versioned or closed here
                 st[k] = merged
             for k in _APPEND_KEYS:
                 seen = list(cur.get(k) or [])
@@ -4434,7 +4441,12 @@ def main():
             # a no-signal advisory — an ordering advisory included, whose
             # obligation lives in the engine, not in `open` — is the fire a
             # named dismissal points at. A gate's fire is answered on the
-            # call itself; a signal rule's lives in `open`/`closed`.
+            # call itself; a signal rule's lives in `open`/`closed`. As with
+            # `open`, one pending slot per rule: an earlier fire still here
+            # when the same advice fires again was not followed, and says so.
+            prior = st["last_fire"].get(r["id"])
+            if prior and prior != ids[r["id"]]:
+                log_conversion(prior, "refired", converted=False)
             st["last_fire"][r["id"]] = ids[r["id"]]
         if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
             st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]

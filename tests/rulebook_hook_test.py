@@ -2693,6 +2693,10 @@ def min_hook_version_checks() -> None:
             {"id": "lint-first", "title": "lint-first", "on": "bash", "rx": r"\bmake\s+release\b",
              "fire_scope": "call", "repo_scope": "any", "converted_rx": r"\bruff\b",
              "text": "Lint before a release", "why": "w"},
+            # a call-scoped advisory with NO signal: only `last_fire` points at it
+            {"id": "nosig-call", "title": "nosig-call", "on": "bash", "rx": r"\bcurl\b",
+             "fire_scope": "call", "repo_scope": "any",
+             "text": "Prefer the SDK over raw curl", "why": "w"},
             # an ordering ADVISORY: its obligation lives in the engine, not in `open`
             {"id": "ord-adv", "title": "ord-adv", "on": "ordering", "repo_scope": "any",
              "ordering": {"required_command_rx": r"pytest\s+\S*tests/architecture",
@@ -2876,9 +2880,41 @@ def min_hook_version_checks() -> None:
         st["open_at"].pop("a", None)
         H.save_state(sp, st, before=before)
         cur = H.load_state(sp)
+        # (the replaced fire is not re-added as closed either: the re-fire that
+        # displaced it already recorded its outcome — `refired` — so a closed
+        # entry for it would only make a resolved fire dismissable)
         check("outcomes: delta merge — a fire that replaced the one the Stop saw is not dropped",
-              cur["open"] == {"a": "new"} and cur["closed"] == {"a": "old"} and cur["open_at"] == {"a": 1},
+              cur["open"] == {"a": "new"} and cur["closed"] == {} and cur["open_at"] == {"a": 1},
               str(cur))
+        # the inverse: the fire the Stop is closing was CONVERTED meanwhile
+        # (a tool hook forgot it); the close must not resurrect it as closed
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"open": {"a": "fa"}, "closed": {}, "open_at": {"a": 0}, "stops": 1}, f)
+        st = H.load_state(sp)
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: converted → forgotten
+            json.dump({"open": {}, "closed": {}, "open_at": {}, "stops": 1}, f)
+        st["stops"] = 2
+        st["closed"]["a"] = st["open"].pop("a")
+        st["open_at"].pop("a", None)
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — a close of a fire converted meanwhile lands nowhere",
+              cur["open"] == {} and cur["closed"] == {} and cur["open_at"] == {}, str(cur))
+
+        # 5g. a call-scoped NO-signal advisory firing twice: the earlier fire
+        #     is closed `refired`; a named dismissal answers only the latest
+        bash("o10", "curl https://x")
+        n1 = fire_id("o10", "nosig-call")
+        bash("o10", "curl https://y")
+        n2 = fire_id("o10", "nosig-call")
+        c = convs_for(n1["fire_id"])
+        check("outcomes: no-signal call-scoped — the displaced fire is closed refired",
+              n1["fire_id"] != n2["fire_id"] and len(c) == 1 and c[0]["how"] == "refired", str(c))
+        bash("o10", "RULEBOOK_OVERRIDE='[nosig-call] sdk lacks this endpoint' ls")
+        check("outcomes: …and a named dismissal lands on the latest fire only",
+              [x["how"] for x in convs_for(n2["fire_id"])] == ["dismissed"]
+              and len(convs_for(n1["fire_id"])) == 1)
 
         # 5e. a call-scoped signal rule firing twice before its action: the
         #     first fire is closed `refired`, the second converts
