@@ -330,7 +330,25 @@ def proposal_scope(moment: dict, fallback_repo: str = "") -> list[str]:
 def nudge_line(session: str, moment: dict, repo: str = "") -> str:
     """The one line the agent reads. It carries the stamp verbatim, so the rule
     the agent files is stamped by the harness and never typed. `repo` is the
-    session's, used only when the moment's own stamp names none."""
+    session's, used only when the moment's own stamp names none.
+
+    It files ADVICE only. A blocking rule has rules of its own — who the block
+    reaches, which shapes the hook can actually stop before the call (a file
+    written by a shell command is discovered post-hoc and only advises), and
+    the `--fires`/`--silent` proof — and they live in
+    `skills/create-rule/SKILL.md`. Restating a subset of them here is what put
+    three Codex findings on #222: whatever this line does not copy, the harness
+    path silently drops, and whatever it does copy drifts from the skill. So a
+    gate candidate is handed to the skill instead of re-derived (Codex, #222).
+
+    The handoff carries the STAMP with it. The skill files through the same
+    `create_rule` tool but knows nothing of `source='session_draft'` or the
+    `state` block, and the server refuses a draft without `repo`, `session_id`,
+    `turn`, `hook_version` and `at` — so a gate handed over bare either lands
+    under manual provenance with this turn's branch and environment lost, or is
+    refused outright. Provenance is the harness's own data, not a rule of the
+    skill's being restated: this line is the only place that has it.
+    """
     kind = moment.get("kind") or "a signal"
     scope = proposal_scope(moment, repo)
     narrow = (f" The turn worked in {len(scope)} repositories: keep in scope_repos only "
@@ -344,19 +362,24 @@ def nudge_line(session: str, moment: dict, repo: str = "") -> str:
         f"{kind}{hint}{derivable}. If it carries a lesson that would change what an agent "
         f"DOES next time, is not already in the repo, its docs, CLAUDE.md or the rulebook, "
         f"is not project state, and will still be true next month, propose it now with the "
-        f"memhub create_rule tool. Resolve the rulebook first with list_rulebooks: with one, "
-        f"pass its rulebook_id; with several, ask the user which; with none, say so and stop "
-        f"(no list_rulebooks tool: omit rulebook_id). Then look for a twin: list_rules with no "
-        f"rulebook_id, include_retired=true and limit=200, paging with offset while has_more. "
-        f"A twin in that rulebook: replace it with supersedes_rule_id, or file nothing; a twin "
-        f"in another rulebook: tell the user. Then pass title (a short noun phrase "
-        f"naming the trap), statement "
+        f"memhub create_rule tool. Resolve the rulebook with list_rulebooks (several: ask "
+        f"which; none or no such tool: stop). "
+        f"Then look for a twin: list_rules with no rulebook_id, include_retired=true, "
+        f"limit=200, paging with offset while has_more — a dismissed rule is exactly "
+        f"the twin not to re-file, and the default view hides it. A twin in that "
+        f"rulebook: supersedes_rule_id or file nothing; in another: tell the user. "
+        f"Then pass title (a short noun phrase naming the trap), statement "
         f"(one when-X-then-Y sentence with the why), exactly one engine — "
         f"delivery=agent_hook with matcher {{event: bash|edit|output|read, …_rx}} or "
         f"ordering, or delivery=anchor_recall with 1-8 concrete identifiers — plus "
         f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
         f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} Never pass "
-        f"activate; it lands proposed for a person. Never put a person's name, home "
+        f"activate or mode; what you file here advises. If the user asked for the "
+        f"action to be STOPPED, run the memhub create-rule skill instead — it "
+        f"carries the disclosure, the shapes that can block and the --fires/--silent "
+        f"proof — and hand it this turn's source, source_ref, scope_repos and state "
+        f"above, which the skill does not know and MemHub refuses a draft without. "
+        f"Never put a person's name, home "
         f"directory or e-mail in a rule. Ask the user first if unsure; if there is no "
         f"lesson, say nothing about this."
     )
