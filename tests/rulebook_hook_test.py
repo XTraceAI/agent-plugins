@@ -2697,6 +2697,11 @@ def min_hook_version_checks() -> None:
             {"id": "sig-gate", "title": "sig-gate", "on": "bash", "rx": r"\brm\s+-rf\b",
              "fire_scope": "session", "repo_scope": "any", "mode": "gate",
              "converted_rx": r"\btrash\b", "text": "Use trash, not rm -rf", "why": "w"},
+            # one rule's ID equals another's displayed LABEL
+            {"id": "alias", "_label": "alias-x", "on": "bash", "rx": r"\bwget\b",
+             "fire_scope": "session", "repo_scope": "any", "text": "wget (rule id alias)", "why": "w"},
+            {"id": "other", "_label": "alias", "on": "bash", "rx": r"\bwget\b",
+             "fire_scope": "session", "repo_scope": "any", "text": "wget (label alias)", "why": "w"},
             # a call-scoped advisory with NO signal: only `last_fire` points at it
             {"id": "nosig-call", "title": "nosig-call", "on": "bash", "rx": r"\bcurl\b",
              "fire_scope": "call", "repo_scope": "any",
@@ -3021,6 +3026,31 @@ def min_hook_version_checks() -> None:
         cur = H.load_state(os.path.join(td, "state", "o13.json"))
         check("outcomes: a subagent's or re-entered Stop leaves the counter and the obligations alone",
               cur["stops"] == 1 and cur["open"] == {"x": "fx"} and cur["closed"] == {}, str(cur))
+
+        # 5m. the companion maps follow the fire `open` holds: resolving the
+        #     fire this process saw must not strip the replacement's wait/file
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"open": {"e": "old"}, "closed": {}, "open_at": {"e": 0}, "open_file": {"e": "/f"},
+                       "stops": 1}, f)
+        st = H.load_state(sp)
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: the same rule re-fired on another file
+            json.dump({"open": {"e": "new"}, "closed": {}, "open_at": {"e": 2}, "open_file": {"e": "/g"},
+                       "stops": 2}, f)
+        H._forget_obligation(st, "e")                 # this process resolves `old`
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — resolving the fire seen leaves the replacement's open_at/open_file intact",
+              cur["open"] == {"e": "new"} and cur["open_at"] == {"e": 2} and cur["open_file"] == {"e": "/g"},
+              str(cur))
+
+        # 5n. a rule id outranks another rule's label when resolving a dismissal
+        bash("o14", "wget https://x")
+        fa, fo = fire_id("o14", "alias"), fire_id("o14", "other")
+        rc, out = bash("o14", "RULEBOOK_OVERRIDE='[alias] by id' ls")
+        check("outcomes: `[alias]` resolves to the rule WITH THAT ID, not the rule labelled alias",
+              [x["how"] for x in convs_for(fa["fire_id"])] == ["dismissed"] and convs_for(fo["fire_id"]) == []
+              and "set aside" in ctx(out), out + str(convs_for(fo["fire_id"])))
 
         # 5i. the Stop lane never writes stale copies of the non-delta fields
         with open(os.path.join(td, "state", "o11.json"), "w", encoding="utf-8") as f:

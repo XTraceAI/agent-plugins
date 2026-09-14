@@ -2918,6 +2918,14 @@ def save_state(p, st, before=None):
                                     and (cur.get("closed") or {}).get(rid) == before[k][rid]:
                                 consumed[rid] = before[k][rid]
                             continue
+                        # `open_at` / `open_file` carry no fire id of their
+                        # own: they belong to whatever fire `open` holds. If
+                        # the file's open fire is no longer the one this
+                        # process saw, so does the companion — leave it.
+                        if k in ("open_at", "open_file") and "open" in before:
+                            live = (cur.get("open") or {}).get(rid)
+                            if live is not None and live != before["open"].get(rid):
+                                continue
                         merged.pop(rid, None)
                 for rid, v in st[k].items():
                     if rid not in before[k] or before[k][rid] != v:
@@ -3697,11 +3705,16 @@ def apply_dismissals(st, rules, dismissals, *, allow_last_fire):
     for label, why in dismissals.items():
         if not label or not why:
             continue
-        pending = [
+        def _pending(r):
+            return (r["id"] in st["open"] or r["id"] in st["closed"]
+                    or (allow_last_fire and r["id"] in st["last_fire"]))
+
+        # an exact rule id outranks a displayed label — as the gate resolver
+        # does — so the recovery from an ambiguous label ("name it by id")
+        # works even when one rule's id equals another's label
+        pending = [r for r in rules if str(r["id"]).lower() == label and _pending(r)] or [
             r for r in rules
-            if label in (str(r.get("_label") or r["id"]).lower(), str(r["id"]).lower())
-            and (r["id"] in st["open"] or r["id"] in st["closed"]
-                 or (allow_last_fire and r["id"] in st["last_fire"]))
+            if str(r.get("_label") or r["id"]).lower() == label and _pending(r)
         ]
         if len(pending) > 1:
             ambiguous.append((label, len(pending)))
