@@ -2895,10 +2895,18 @@ def save_state(p, st, before=None):
     try:
         if lock is not None:
             cur = load_state(p)
+            consumed = {}      # fires this process resolved that a Stop closed meanwhile
             for k in _DELTA_KEYS:
                 if k not in before:                    # a snapshot an older caller took
                     continue
                 merged = dict(cur.get(k) or {})
+                if k == "closed":
+                    # a resolved fire's close, added by a Stop AFTER this
+                    # process's snapshot, is consumed with it — the close
+                    # was of a fire that no longer exists to be closed
+                    for rid, v in consumed.items():
+                        if merged.get(rid) == v:
+                            merged.pop(rid, None)
                 for rid in before[k]:
                     if rid not in st[k]:
                         # discharged by this process — but only the value it
@@ -2906,6 +2914,9 @@ def save_state(p, st, before=None):
                         # (call-scoped, between this process's load and save)
                         # is another hook's fire and stays.
                         if k in _OBLIGATION_KEYS and merged.get(rid) != before[k][rid]:
+                            if k == "open" and rid not in st["closed"] \
+                                    and (cur.get("closed") or {}).get(rid) == before[k][rid]:
+                                consumed[rid] = before[k][rid]
                             continue
                         merged.pop(rid, None)
                 for rid, v in st[k].items():
@@ -3896,7 +3907,13 @@ def main():
         except Exception:
             data = {}
         session = data.get("session_id") if isinstance(data, dict) else None
-        if session:
+        # A turn is the PERSON's turn: a subagent's Stop (top-level agent_id,
+        # as harness_stop.py reads it) and a Stop re-entered while a stop hook
+        # is already running (`stop_hook_active`) advance nothing, or one
+        # parent turn would count as two and close its fires a turn early.
+        own_turn = isinstance(data, dict) and not data.get("stop_hook_active") \
+            and not str(data.get("agent_id") or "").strip()
+        if session and own_turn:
             try:
                 close_open_obligations(session, final=final)
             except Exception:
@@ -4477,7 +4494,10 @@ def main():
             st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
         elif is_ordering and ordering and ids.get(r["id"]):
             ordering.mark_fired(r["id"], ids[r["id"]])
-        if has_signal or (is_ordering and r["id"] not in gate_ids):
+        if (has_signal or is_ordering) and r["id"] not in gate_ids:
+            # Advisories only: a gate's fire is answered on its own call —
+            # blocked, or excused with a reason — never waited on, closed or
+            # dismissed later, whatever signal its matcher also carries.
             # One pending slot per rule. The same advice firing AGAIN before
             # its action landed is the earlier fire's outcome — it was not
             # followed — recorded now so a call-scoped rule's every fire

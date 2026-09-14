@@ -2693,6 +2693,10 @@ def min_hook_version_checks() -> None:
             {"id": "lint-first", "title": "lint-first", "on": "bash", "rx": r"\bmake\s+release\b",
              "fire_scope": "call", "repo_scope": "any", "converted_rx": r"\bruff\b",
              "text": "Lint before a release", "why": "w"},
+            # a GATE that also carries a conversion signal: never an obligation
+            {"id": "sig-gate", "title": "sig-gate", "on": "bash", "rx": r"\brm\s+-rf\b",
+             "fire_scope": "session", "repo_scope": "any", "mode": "gate",
+             "converted_rx": r"\btrash\b", "text": "Use trash, not rm -rf", "why": "w"},
             # a call-scoped advisory with NO signal: only `last_fire` points at it
             {"id": "nosig-call", "title": "nosig-call", "on": "bash", "rx": r"\bcurl\b",
              "fire_scope": "call", "repo_scope": "any",
@@ -2982,6 +2986,41 @@ def min_hook_version_checks() -> None:
         cur = H.load_state(sp)
         check("outcomes: open_at is stamped with the counter as saved, never a stale snapshot",
               cur["open"] == {"q": "fq"} and cur["open_at"] == {"q": 4} and cur["stops"] == 4, str(cur))
+
+        # 5j. a tool hook that resolved a fire AFTER a locked Stop closed it
+        #     consumes that close on save — the resolved fire leaves `closed`
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"open": {"a": "fa"}, "closed": {}, "open_at": {"a": 0}, "stops": 1}, f)
+        st = H.load_state(sp)                         # the tool hook's snapshot
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: a locked Stop closed it
+            json.dump({"open": {}, "closed": {"a": "fa"}, "open_at": {}, "stops": 2}, f)
+        H._forget_obligation(st, "a")                 # the tool hook converts it
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — a close added after the tool's snapshot is consumed by its conversion",
+              cur["open"] == {} and cur["closed"] == {} and cur["stops"] == 2, str(cur))
+
+        # 5k. a gate that also carries a conversion signal never becomes an
+        #     obligation: blocked on its call, never closed or dismissed later
+        rc, out = bash("o12", "rm -rf build")
+        sg = fire_id("o12", "sig-gate")
+        check("outcomes: the signal gate blocked", decision(out) == "deny" and sg is not None, out)
+        stop("o12"); stop("o12")
+        rc, out = bash("o12", "RULEBOOK_OVERRIDE='[sig-gate] whatever' ls")
+        check("outcomes: a gate's fire is neither closed by Stops nor dismissable by name",
+              convs_for(sg["fire_id"]) == [] and out.strip() == "", out + str(convs_for(sg["fire_id"])))
+
+        # 5l. a subagent's Stop, or a re-entered one, advances nothing
+        with open(os.path.join(td, "state", "o13.json"), "w", encoding="utf-8") as f:
+            json.dump({"open": {"x": "fx"}, "closed": {}, "open_at": {"x": 0}, "stops": 1}, f)
+        for extra in ({"agent_id": "sub-1"}, {"stop_hook_active": True}):
+            subprocess.run([sys.executable, HOOK, "flush"],
+                           input=json.dumps({"session_id": "o13", "hook_event_name": "Stop", **extra}),
+                           capture_output=True, text=True, env=dict(os.environ, **oenv), timeout=30)
+        cur = H.load_state(os.path.join(td, "state", "o13.json"))
+        check("outcomes: a subagent's or re-entered Stop leaves the counter and the obligations alone",
+              cur["stops"] == 1 and cur["open"] == {"x": "fx"} and cur["closed"] == {}, str(cur))
 
         # 5i. the Stop lane never writes stale copies of the non-delta fields
         with open(os.path.join(td, "state", "o11.json"), "w", encoding="utf-8") as f:
