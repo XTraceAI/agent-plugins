@@ -358,7 +358,9 @@ def nudge_line(session: str, moment: dict, repo: str = "") -> str:
         f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} Never pass "
         f"activate; it lands proposed for a person. Pass mode=\"gate\" ONLY if the "
         f"user asked for the action to be stopped, and only with a bash, edit or "
-        f"read matcher, or an ordering; omit mode otherwise. Never put a person's name, home "
+        f"read matcher, or an ordering; omit mode otherwise. Before filing a gate "
+        f"tell them, in these words, that it stops every teammate the book binds, "
+        f"not just the author. Never put a person's name, home "
         f"directory or e-mail in a rule. Ask the user first if unsure; if there is no "
         f"lesson, say nothing about this."
     )

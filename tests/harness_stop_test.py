@@ -477,10 +477,14 @@ def test_the_nudge_line():
     # engine that can: the server refuses a gate on an anchor recall
     assert 'mode="gate" ONLY if' in line and "omit mode otherwise" in line
     assert line.index("bash, edit or read matcher") < line.index("Never put a person")
+    # skills/create-rule/SKILL.md requires this disclosure before a gate is
+    # filed, in those words — the harness must not bypass it (Codex, #222)
+    assert "stops every teammate the book binds, not just the author" in line
     # The line grew when a draft became able to ASK to block: the agent needs
-    # the condition (the user asked) and the shape (an engine that can block)
-    # or it will guess at both. Still one line, still bounded.
-    assert len(line) < 1700
+    # the condition (the user asked), the shape (an engine that can block) and
+    # the disclosure the create-rule skill mandates, or it will guess at all
+    # three. Still one line, still bounded.
+    assert len(line) < 1800
     assert "may already be written down" in hs.nudge_line("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
     print("PASS test_the_nudge_line")
