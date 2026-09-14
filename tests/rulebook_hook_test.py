@@ -2966,6 +2966,15 @@ def min_hook_version_checks() -> None:
         check("outcomes: an ordering advisory is dismissable by name",
               len(c) == 1 and c[0]["how"] == "dismissed" and c[0]["override_reason"] == "CI runs it"
               and "set aside" in ctx(out), str(c) + ctx(out))
+        # the receipt landing AFTER the dismissal must find nothing to convert:
+        # the person's explicit false stands (sticky-true would keep a later
+        # true), and the arming is discharged as usual
+        bash("o9", "uv run pytest tests/architecture -q", mode="post",
+             resp={"stdout": "3 passed", "exit_code": 0})
+        check("outcomes: a receipt after a dismissal does not convert the dismissed fire",
+              [x["how"] for x in convs_for(o9["fire_id"])] == ["dismissed"], str(convs_for(o9["fire_id"])))
+        rc, out = bash("o9", "git push origin feat")
+        check("outcomes: …and the arming was still discharged by that receipt", out.strip() == "", out)
         run("post", {"cwd": orepo, "session_id": "o9", "tool_name": "Edit",
                      "tool_input": {"file_path": os.path.join(orepo, "pkg", "y.py")}}, oenv)   # re-arm
         bash("o9", "git push origin feat")
@@ -3039,6 +3048,17 @@ def min_hook_version_checks() -> None:
         cur = H.load_state(os.path.join(td, "state", "o13.json"))
         check("outcomes: a subagent's or re-entered Stop leaves the counter and the records alone",
               cur["stops"] == 1 and cur["obligations"] == {"fx": rec("x")}, str(cur))
+
+        # 5o. a SESSION-armed ordering fire lives in armed_fire; a dismissal
+        #     consumes that reference too (in-process — the map is the point)
+        st = {"obligations": {"fo": rec("ord", kind="ordering")}, "armed_fire": {"ord": "fo"},
+              "armed": {"ord": True}, "stops": 0}
+        forgotten = []
+        H.apply_dismissals(st, [{"id": "ord", "_label": "ord"}], {"ord": "why"},
+                           forget_ordering_fire=lambda rid, fid: forgotten.append((rid, fid)))
+        check("outcomes: dismissing a session-armed ordering fire drops armed_fire and tells the engine",
+              st["obligations"] == {} and st["armed_fire"] == {} and st["armed"] == {"ord": True}
+              and forgotten == [("ord", "fo")], str(st) + str(forgotten))
 
         # 5n. a rule id outranks another rule's label when resolving a dismissal
         bash("o14", "wget https://x")

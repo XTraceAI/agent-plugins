@@ -1064,6 +1064,25 @@ class OrderingEngine:
             portable_lock.unlock(lock.fileno())
             lock.close()
 
+    def forget_fire(self, rule_id, fire_id):
+        """The inverse, for a fire resolved some other way — a named
+        dismissal. A receipt that lands later must find nothing to convert:
+        the person's explicit non-conversion outranks it, and the server's
+        sticky-true merge would otherwise let the receipt overwrite it.
+        Only THAT fire is forgotten; a newer open fire of the rule stays."""
+        lock = self._locked()
+        if lock is None:
+            return
+        try:
+            st = self._read()
+            slot = (st.get(self.branch) or {}).get(rule_id)
+            if isinstance(slot, dict) and slot.get("open_fire") == fire_id:
+                slot.pop("open_fire", None)
+                self._write(st)
+        finally:
+            portable_lock.unlock(lock.fileno())
+            lock.close()
+
     def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None, armed=None):
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
         under lock; None on lock timeout (fail open).
@@ -3698,11 +3717,18 @@ def split_named_override(reason):
     return m.group(1).strip().lower(), m.group(2).strip()
 
 
-def apply_dismissals(st, rules, dismissals):
+def apply_dismissals(st, rules, dismissals, *, forget_ordering_fire=None):
     """Record each `{label: why}` as a dismissal — `converted=false` with the
     reason — of every pending fire of the rule it names, closed or not. A
     resolved fire (converted, or dismissed once) has no record and cannot be
     dismissed again.
+
+    An ordering fire is also held by the engine (`open_fire`, worktree
+    state) or by this session's arming (`armed_fire`), which is how a later
+    receipt finds it to convert. A dismissed fire is consumed from there too
+    — `forget_ordering_fire(rule_id, fire_id)` for the engine — or the
+    receipt would log `true` over the person's explicit `false` and the
+    server's sticky-true merge would keep the receipt.
 
     Titles are not unique across the union of books, so a label is resolved
     against the rules with a fire PENDING: exactly one → recorded; more than
@@ -3724,7 +3750,16 @@ def apply_dismissals(st, rules, dismissals):
         if not pending:
             continue
         hit = pending[0]
+        ordering_fids = [fid for fid, _rec in pending_fires(st, hit["id"], ("ordering",))]
         resolve_fires(st, hit["id"], "dismissed", converted=False, override_reason=why)
+        for fid in ordering_fids:
+            if st.get("armed_fire", {}).get(hit["id"]) == fid:
+                st["armed_fire"].pop(hit["id"], None)
+            if forget_ordering_fire is not None:
+                try:
+                    forget_ordering_fire(hit["id"], fid)
+                except Exception:
+                    pass
         done.append((hit.get("_label") or hit["id"], why))
     return done, ambiguous
 
@@ -4257,8 +4292,14 @@ def main():
             fired_now.append(r)
             fired_on[rid] = ev
 
+    def _forget_ordering_fire(rid, fid):
+        # the engine is built lazily on this path — the usual dismissal
+        # command fires nothing and never needed it
+        OrderingEngine(root, branch).forget_fire(rid, fid)
+
     if not fired_now:
-        set_aside, ambiguous = apply_dismissals(st, rules, dismissals) if dismissals else ([], [])
+        set_aside, ambiguous = apply_dismissals(
+            st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
         save_state(sp, st, before=before)
         if set_aside or ambiguous:
             # Say so on both channels: a recorded reason nobody can see is
@@ -4340,7 +4381,8 @@ def main():
             elif named:
                 ambiguous_gate = (label, len(named))
                 dismissals.pop(label, None)
-    set_aside, ambiguous = apply_dismissals(st, rules, dismissals) if dismissals else ([], [])
+    set_aside, ambiguous = apply_dismissals(
+        st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
