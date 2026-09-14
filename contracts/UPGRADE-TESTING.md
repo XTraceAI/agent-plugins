@@ -1,6 +1,6 @@
 # Upgrade-capable plugin candidate (ENG-1063)
 
-The 0.55.1 candidate understands structured `PLUGIN_UPGRADE_REQUIRED` HTTP 426
+The 0.55.2 candidate understands structured `PLUGIN_UPGRADE_REQUIRED` HTTP 426
 responses on rulebook fetches. It preserves cache bytes for rollback but stops
 using cached rules while the backend has rejected the client. A successful
 200/304 is required to clear that state; a network failure cannot hide it.
