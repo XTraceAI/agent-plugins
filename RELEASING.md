@@ -39,6 +39,11 @@ guard also runs the manifest parity and test-registration suites.
 
 ## The procedure
 
+Backend-dependent releases must also satisfy the [compatibility contract](contracts/README.md).
+The local rulebook integration test is implemented; a required production check
+and branch/deployment protection remain follow-up work in ENG-1063. A passing
+local test is not evidence that backend support has reached production.
+
 1. **Verify BEFORE any bump merges.** The bump is the release on two
    channels. On the exact `origin/main` SHA:
 
