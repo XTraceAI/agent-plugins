@@ -2917,6 +2917,11 @@ def save_state(p, st, before=None):
                         # resolved fire dismissable again.
                         if k == "closed" and (cur.get("open") or {}).get(rid) != v:
                             continue
+                        # A wait starts at the counter as it is WHEN THE FIRE
+                        # LANDS: a Stop that advanced it after this process
+                        # loaded would otherwise close the fire a turn early.
+                        if k == "open_at":
+                            v = max(int(v or 0), int(cur.get("stops") or 0))
                         merged[rid] = v                # armed, re-versioned or closed here
                 st[k] = merged
             for k in _APPEND_KEYS:
@@ -3611,22 +3616,41 @@ def close_open_obligations(session, *, final):
     records `converted=true` (and the server keeps a true over a false). What
     a close changes is the default: a fire nobody acted on now says so."""
     sp = state_path(session)
-    st = load_state(sp)
-    before = snapshot_arming(st)
-    if not final:
-        st["stops"] = int(st.get("stops") or 0) + 1
-    for rid, fid in list(st["open"].items()):
-        # an obligation an older hook opened carries no wait; close it now
-        opened = int(st["open_at"].get(rid, 0) or 0)
-        if not final and st["stops"] - opened < CLOSE_OPEN_AFTER_STOPS:
-            continue
-        if fid:
-            log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
-                           converted=False)
-            st["closed"][rid] = fid
-        del st["open"][rid]
-        st["open_at"].pop(rid, None)
-    save_state(sp, st, before=before)
+    # The Stop hook runs asynchronously beside the next turn's tool hooks, so
+    # the whole read-modify-write is done under the session lock: nothing
+    # loaded here can go stale before it is written back, and a tool hook
+    # that loaded earlier merges its own delta against this write. Only if
+    # the lock cannot be had (LOCK_WAIT_S) does it fall back to the delta
+    # save every hook uses.
+    lock = _state_lock(sp)
+    try:
+        st = load_state(sp)
+        before = None if lock is not None else snapshot_arming(st)
+        if not final:
+            st["stops"] = int(st.get("stops") or 0) + 1
+        for rid, fid in list(st["open"].items()):
+            # an obligation an older hook opened carries no wait; close it now
+            opened = int(st["open_at"].get(rid, 0) or 0)
+            if not final and st["stops"] - opened < CLOSE_OPEN_AFTER_STOPS:
+                continue
+            if fid:
+                log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
+                               converted=False)
+                st["closed"][rid] = fid
+            del st["open"][rid]
+            st["open_at"].pop(rid, None)
+        if lock is not None:
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(st, f)
+        else:
+            save_state(sp, st, before=before)
+    finally:
+        if lock is not None:
+            try:
+                portable_lock.unlock(lock.fileno())
+            except Exception:
+                pass
+            lock.close()
 
 
 # `RULEBOOK_OVERRIDE='[<label>] <why>'` — the label rides INSIDE the value.
@@ -4136,8 +4160,9 @@ def main():
                 except Exception:
                     outcome = None
                 if outcome == "discharged":
-                    # a discharged ordering fire is resolved, not dismissable
-                    st["last_fire"].pop(rid, None)
+                    # a discharged ordering fire is resolved: not dismissable,
+                    # not closeable — its obligation is gone from every map
+                    _forget_obligation(st, rid)
                     # The session's own arming is discharged here, not in the
                     # worktree state: it was never written there. Its open
                     # fire lives beside it for the same reason — a sibling
@@ -4437,26 +4462,30 @@ def main():
     for r in shown:
         st["raw"][r["id"]] = 0
         has_signal = r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r)
-        if ids.get(r["id"]) and r["id"] not in gate_ids and not has_signal:
-            # a no-signal advisory — an ordering advisory included, whose
-            # obligation lives in the engine, not in `open` — is the fire a
-            # named dismissal points at. A gate's fire is answered on the
-            # call itself; a signal rule's lives in `open`/`closed`. As with
+        is_ordering = r.get("on") == "ordering"
+        if ids.get(r["id"]) and r["id"] not in gate_ids and not has_signal and not is_ordering:
+            # a no-signal advisory is the fire a named dismissal points at.
+            # A gate's fire is answered on the call itself; a signal rule's —
+            # and an ordering advisory's — lives in `open`/`closed`. As with
             # `open`, one pending slot per rule: an earlier fire still here
             # when the same advice fires again was not followed, and says so.
             prior = st["last_fire"].get(r["id"])
             if prior and prior != ids[r["id"]]:
                 log_conversion(prior, "refired", converted=False)
             st["last_fire"][r["id"]] = ids[r["id"]]
-        if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
+        if is_ordering and session_scoped(r) and ids.get(r["id"]):
             st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
-        elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):
+        elif is_ordering and ordering and ids.get(r["id"]):
             ordering.mark_fired(r["id"], ids[r["id"]])
-        elif has_signal:
+        if has_signal or (is_ordering and r["id"] not in gate_ids):
             # One pending slot per rule. The same advice firing AGAIN before
             # its action landed is the earlier fire's outcome — it was not
             # followed — recorded now so a call-scoped rule's every fire
             # leaves with one instead of the first being silently dropped.
+            # An ordering ADVISORY sits here too: its receipt is judged by
+            # the engine, but the wait, the Stop close and a named
+            # dismissal are this map's — a rule ignored until the session
+            # ends must still leave with an outcome.
             prior = st["open"].get(r["id"])
             if prior and prior != ids.get(r["id"]):
                 log_conversion(prior, "refired", converted=False)

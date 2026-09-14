@@ -2952,6 +2952,46 @@ def min_hook_version_checks() -> None:
         check("outcomes: a DISCHARGED ordering advisory is not dismissable",
               out.strip() == "" and [x["how"] for x in convs_for(o9b["fire_id"])] == ["discharged"],
               out + str(convs_for(o9b["fire_id"])))
+        # an ordering advisory neither discharged nor dismissed is closed by
+        # the Stop lane like any other obligation
+        run("post", {"cwd": orepo, "session_id": "o9", "tool_name": "Edit",
+                     "tool_input": {"file_path": os.path.join(orepo, "pkg", "z.py")}}, oenv)   # re-arm
+        bash("o9", "git push origin feat")
+        o9c = fire_id("o9", "ord-adv")
+        stop("o9"); stop("o9")
+        c = convs_for(o9c["fire_id"])
+        check("outcomes: an IGNORED ordering advisory is closed at the second Stop",
+              len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "open_after_turns", str(c))
+        bash("o9", "uv run pytest tests/architecture -q", mode="post",
+             resp={"stdout": "3 passed", "exit_code": 0})                                     # late receipt
+        check("outcomes: …and a late receipt still converts it",
+              [x["how"] for x in convs_for(o9c["fire_id"])] == ["open_after_turns", "discharged"])
+
+        # 5h. the wait is stamped against the file's counter at save time: a
+        #     fire opened from a snapshot taken before a Stop advanced the
+        #     counter is not closed a turn early
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"open": {}, "closed": {}, "open_at": {}, "stops": 3}, f)
+        st = H.load_state(sp)
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: a Stop advanced the counter
+            json.dump({"open": {}, "closed": {}, "open_at": {}, "stops": 4}, f)
+        st["open"]["q"] = "fq"
+        st["open_at"]["q"] = st["stops"]              # 3, the stale snapshot
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: open_at is stamped with the counter as saved, never a stale snapshot",
+              cur["open"] == {"q": "fq"} and cur["open_at"] == {"q": 4} and cur["stops"] == 4, str(cur))
+
+        # 5i. the Stop lane never writes stale copies of the non-delta fields
+        with open(os.path.join(td, "state", "o11.json"), "w", encoding="utf-8") as f:
+            json.dump({"fired": ["keep-me"], "counts": {"c": 2}, "raw": {"c": 1}, "bash_t0": 12.5,
+                       "open": {"x": "fx"}, "closed": {}, "open_at": {"x": 0}, "stops": 1}, f)
+        stop("o11")
+        cur = H.load_state(os.path.join(td, "state", "o11.json"))
+        check("outcomes: a Stop close keeps every field it did not touch",
+              cur["fired"] == ["keep-me"] and cur["counts"] == {"c": 2} and cur["raw"] == {"c": 1}
+              and cur["bash_t0"] == 12.5 and cur["closed"] == {"x": "fx"} and cur["stops"] == 2, str(cur))
 
         # 6. the flush merge: a close never downgrades a conversion, in either order
         merge_script = (
