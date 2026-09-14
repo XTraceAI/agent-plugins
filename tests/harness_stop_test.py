@@ -469,10 +469,12 @@ def test_the_nudge_line():
     assert "Never pass activate" in line and "/Users/" not in line and "@" not in line
     # the server refuses to guess a rulebook for someone bound to several
     assert line.index("list_rulebooks") < line.index("Then pass title") and "rulebook_id" in line
-    assert "ask the user which" in line
-    # the server refuses a proposed twin itself (409, naming it); what it cannot
-    # see is an ACTIVE twin in another book, which is what the agent is sent to do
-    assert line.index("list_rulebooks") < line.index("ACTIVE twin") < line.index("Then pass title")
+    assert "ask which" in line          # several books: the agent asks, never guesses
+    # SKILL.md:107-112: include_retired matters because a DISMISSED rule is the
+    # twin you must not re-file and the default view hides it, and an unpaged
+    # scan silently misses whatever fell off page one (Codex, #222)
+    assert line.index("list_rulebooks") < line.index("include_retired=true") < line.index("Then pass title")
+    assert "has_more" in line and "dismissed rule" in line
     assert "supersedes_rule_id" in line
     # a draft may ask to BLOCK, but only when the person did and only on an
     # engine that can: the server refuses a gate on an anchor recall
