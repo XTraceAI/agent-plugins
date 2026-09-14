@@ -35,3 +35,5 @@ that checkout; the controller and contract pin remain fixed. Backend CI uses
 this to exercise releases that predate the probe itself. Set
 `MEMHUB_CONTRACT_PLUGIN_SOURCE_ROOT` when running the backend tests to select
 that released source. Omitting it tests the controller checkout's own plugin.
+
+See [upgrade candidate testing](UPGRADE-TESTING.md) for policy rejection and recovery.

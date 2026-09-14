@@ -250,7 +250,20 @@ def _dispatch(root: Path, payload: bytes, event: str) -> None:
     if not isinstance(hook, dict):
         return
     if event == "PreToolUse":
-        _directive(root, payload, reactive=False)
+        contexts = []
+        jobs = [
+            lambda: _run(root, "rulebook_hook.py", payload, "upgrade", timeout=2),
+            lambda: _directive_result(root, payload, reactive=False),
+        ]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(_fail_open_job, jobs))
+        for result in results:
+            context = _additional_context(result)
+            if context:
+                contexts.append(context)
+        if contexts:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": event, "additionalContext": "\n\n".join(contexts)}}))
     elif event == "PostToolUse":
         _dispatch_post(root, payload, hook)
     elif event == "Stop":
