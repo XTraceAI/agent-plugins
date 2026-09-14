@@ -2807,7 +2807,7 @@ def load_state(p):
         pass
     if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
         st["armed"] = {}
-    for k in ("closed", "open_at", "last_fire", "open"):
+    for k in ("closed", "open_at", "last_fire", "open", "open_file"):
         if not isinstance(st.get(k), dict):
             st[k] = {}
     if not isinstance(st.get("stops"), int):
@@ -2850,13 +2850,19 @@ def drop_arming(st, rid):
 # is added, what it discharged is removed, and everything else is whatever
 # is on disk now.
 _ARMING_KEYS = ("armed", "armed_fire", "armed_version")
+# The obligation keys ride the same delta merge. The Stop lane closes fires
+# (open → closed) while the next turn's tool hook may open or convert one —
+# each must write its own delta against the file as it is NOW, never its
+# snapshot, or a close resurrects a conversion and a fire loses its outcome.
+_OBLIGATION_KEYS = ("open", "closed", "open_at", "open_file", "last_fire")
+_DELTA_KEYS = _ARMING_KEYS + _OBLIGATION_KEYS
 _APPEND_KEYS = ("armed_once",)      # only ever appended to
 
 
 def snapshot_arming(st):
-    """What the arming keys looked like when this process loaded the state —
-    the baseline `save_state` diffs against."""
-    return {k: dict(st.get(k) or {}) for k in _ARMING_KEYS}
+    """What the delta-merged keys looked like when this process loaded the
+    state — the baseline `save_state` diffs against."""
+    return {k: dict(st.get(k) or {}) for k in _DELTA_KEYS}
 
 
 def _state_lock(p):
@@ -2889,7 +2895,9 @@ def save_state(p, st, before=None):
     try:
         if lock is not None:
             cur = load_state(p)
-            for k in _ARMING_KEYS:
+            for k in _DELTA_KEYS:
+                if k not in before:                    # a snapshot an older caller took
+                    continue
                 merged = dict(cur.get(k) or {})
                 for rid in before[k]:
                     if rid not in st[k]:
@@ -2901,6 +2909,8 @@ def save_state(p, st, before=None):
             for k in _APPEND_KEYS:
                 seen = list(cur.get(k) or [])
                 st[k] = seen + [x for x in st[k] if x not in seen]
+            # a monotonic counter: only the Stop lane moves it, forward
+            st["stops"] = max(int(cur.get("stops") or 0), int(st.get("stops") or 0))
         with open(p, "w", encoding="utf-8") as f:
             json.dump(st, f)
     except Exception:
@@ -3561,12 +3571,15 @@ CLOSE_OPEN_AFTER_STOPS = 2   # a fire still open at the 2nd Stop after it is rec
 
 
 def _forget_obligation(st, rid):
-    """Drop every trace of a rule's obligation: open or closed, its wait, and
-    the file an edit rule was watching."""
+    """Drop every trace of a rule's obligation: open or closed, its wait, the
+    file an edit rule was watching, and the fire a named dismissal could
+    still point at — a resolved fire (converted, or dismissed once) is not
+    dismissable again."""
     st["open"].pop(rid, None)
     st.setdefault("closed", {}).pop(rid, None)
     st.setdefault("open_at", {}).pop(rid, None)
     st.setdefault("open_file", {}).pop(rid, None)
+    st.setdefault("last_fire", {}).pop(rid, None)
 
 
 def close_open_obligations(session, *, final):
@@ -3621,29 +3634,50 @@ def split_named_override(reason):
 def apply_dismissals(st, rules, dismissals, *, allow_last_fire):
     """Record each `{label: why}` as a dismissal of that rule's fire in this
     session — `converted=false` with the reason — on the fire still waiting
-    on its conversion, or, when `allow_last_fire`, on the rule's most recent
-    fire (a rule with no conversion signal has no obligation to point at; the
-    one-shot shell form may still answer it, a durable edit marker may not).
-    Returns `[(label, why)]` for what was recorded, so the caller can say so.
-    A label naming nothing that fired this session records nothing."""
-    done = []
+    on its conversion, or, when `allow_last_fire`, on a no-signal advisory's
+    pending fire (`st["last_fire"]`: a rule with no conversion signal has no
+    obligation to point at; the one-shot shell form may still answer it, a
+    durable edit marker may not). A fire that is resolved — converted, or
+    dismissed once — is gone from all three maps and cannot be dismissed.
+
+    Titles are not unique across the union of books, so a label is resolved
+    against the rules with a fire PENDING: exactly one → recorded; more than
+    one → nothing recorded and the label reported back as ambiguous, so the
+    agent can name the rule by its id (the named form takes either).
+    Returns `(recorded, ambiguous)`: `[(label, why)]` and `[(label, n)]`."""
+    done, ambiguous = [], []
     for label, why in dismissals.items():
         if not label or not why:
             continue
-        hit = next((r for r in rules
-                    if str(r.get("_label") or r["id"]).lower() == label
-                    or str(r["id"]).lower() == label), None)
-        if not hit:
+        pending = [
+            r for r in rules
+            if label in (str(r.get("_label") or r["id"]).lower(), str(r["id"]).lower())
+            and (r["id"] in st["open"] or r["id"] in st["closed"]
+                 or (allow_last_fire and r["id"] in st["last_fire"]))
+        ]
+        if len(pending) > 1:
+            ambiguous.append((label, len(pending)))
             continue
+        if not pending:
+            continue
+        hit = pending[0]
         rid = hit["id"]
-        fid = st["open"].get(rid) or st["closed"].get(rid) \
-            or (st["last_fire"].get(rid) if allow_last_fire else None)
-        if not fid:
-            continue
+        fid = st["open"].get(rid) or st["closed"].get(rid) or st["last_fire"].get(rid)
         log_conversion(fid, "dismissed", converted=False, override_reason=why)
         _forget_obligation(st, rid)
         done.append((hit.get("_label") or rid, why))
-    return done
+    return done, ambiguous
+
+
+def _dismissal_lines(set_aside, ambiguous):
+    """The acknowledgement, on both channels: (agent lines, user lines)."""
+    agent = [f"_Recorded: [{label}] set aside — {why}_" for label, why in set_aside]
+    user = [f"{BRAND} ▸ [{label}] set aside: {why}" for label, why in set_aside]
+    for label, n in ambiguous:
+        agent.append(f"_`[{label}]` fits {n} rules with a fire pending — nothing recorded; "
+                     "name one by its rule id instead_")
+        user.append(f"{BRAND} ▸ [{label}] fits {n} rules — name one by its rule id")
+    return agent, user
 
 
 # §2. A CONSTANT, not a template: no rule counts, no repo name, nothing that
@@ -4146,17 +4180,15 @@ def main():
             fired_on[rid] = ev
 
     if not fired_now:
-        set_aside = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
-            if dismissals else []
+        set_aside, ambiguous = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
+            if dismissals else ([], [])
         save_state(sp, st, before=before)
-        if set_aside:
+        if set_aside or ambiguous:
             # Say so on both channels: a recorded reason nobody can see is
             # the silence this exists to replace.
+            agent_lines, user_lines = _dismissal_lines(set_aside, ambiguous)
             try:
-                emit("PreToolUse",
-                     "\n".join(f"_Recorded: [{label}] set aside — {why}_" for label, why in set_aside),
-                     user_line="\n".join(f"{BRAND} ▸ [{label}] set aside: {why}"
-                                         for label, why in set_aside))
+                emit("PreToolUse", "\n".join(agent_lines), user_line="\n".join(user_lines))
             except Exception:
                 pass
         return 0
@@ -4196,24 +4228,43 @@ def main():
         return str(r.get("_label") or r["id"]).lower()
 
     overridden = {}
+    # Titles are not unique across the union of books (the server matches no
+    # titles at filing time), so a NAMED excuse that fits more than one gate
+    # on this call excuses none of them — fail closed — and the deny says to
+    # name the rule by its id, which the named form also takes.
+    gates_here = [r for r in fired_now if r["id"] in gate_ids]
+    label_count = {}
+    for r in gates_here:
+        label_count[_label_of(r)] = label_count.get(_label_of(r), 0) + 1
+    ambiguous_gate = None                # (label, n) when a named excuse fit n gates
+
+    def _named_gates(label):
+        by_id = [r for r in gates_here if str(r["id"]).lower() == label]
+        return by_id or [r for r in gates_here if _label_of(r) == label]
+
     if override_reason is not None and override_label is None:
-        overridden = {r["id"]: override_reason for r in fired_now if r["id"] in gate_ids}
+        overridden = {r["id"]: override_reason for r in gates_here}
     elif override_reason is not None:
         # the named shell form excuses exactly the gate it names, as an edit
         # marker does; a label that names no gate here stays a dismissal
-        for r in (r for r in fired_now if r["id"] in gate_ids):
-            if override_label in (_label_of(r), str(r["id"]).lower()):
-                overridden[r["id"]] = override_reason
-                dismissals.pop(override_label, None)
+        named = _named_gates(override_label)
+        if len(named) == 1:
+            overridden[named[0]["id"]] = override_reason
+            dismissals.pop(override_label, None)
+        elif named:
+            ambiguous_gate = (override_label, len(named))
+            dismissals.pop(override_label, None)
     elif edit_markers:
-        for r in (r for r in fired_now if r["id"] in gate_ids):
-            named = edit_markers.get(_label_of(r)) or edit_markers.get(str(r["id"]).lower())
-            if named:
-                overridden[r["id"]] = named
-                dismissals.pop(_label_of(r), None)
-                dismissals.pop(str(r["id"]).lower(), None)
-    set_aside = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
-        if dismissals else []
+        for label, why in edit_markers.items():
+            named = _named_gates(label) if label else []
+            if len(named) == 1:
+                overridden[named[0]["id"]] = why
+                dismissals.pop(label, None)
+            elif named:
+                ambiguous_gate = (label, len(named))
+                dismissals.pop(label, None)
+    set_aside, ambiguous = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
+        if dismissals else ([], [])
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4235,9 +4286,10 @@ def main():
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
     user_lines, deny_lines = [], []
-    for label, why in set_aside:
-        lines.append(f"_Recorded: [{label}] set aside — {why}_")
-        user_lines.append(f"{BRAND} ▸ [{label}] set aside: {why}")
+    if set_aside or ambiguous:
+        agent_ack, user_ack = _dismissal_lines(set_aside, ambiguous)
+        lines.extend(agent_ack)
+        user_lines.extend(user_ack)
 
     def _where(r):
         """A fire from a file the Bash call wrote names the file: the model
@@ -4284,7 +4336,9 @@ def main():
         else:
             lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
             detail_line = f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}"
-            deny_lines.append(f"[{label}] {r['text']}{detail}{_where(r)}")
+            # a label shared by two gates is no address; give the id alongside
+            ident = f" (rule id {r['id']})" if label_count.get(_label_of(r), 0) > 1 else ""
+            deny_lines.append(f"[{label}]{ident} {r['text']}{detail}{_where(r)}")
         # A gate that was overridden still FIRED and the call still ran, so it
         # takes 📏; ⛔️ is reserved for a call that was actually stopped.
         line = disclosure_line(r, blocked=blocked_here)
@@ -4325,6 +4379,10 @@ def main():
                 how += (". A `rulebook-override:` with no rule in brackets excuses nothing — "
                         "it would mean something different as soon as a second edit gate "
                         "covers this line")
+        if ambiguous_gate:
+            how = (f"`[{ambiguous_gate[0]}]` fits {ambiguous_gate[1]} of this call's gates, so it "
+                   f"excused none — name the one you mean by its rule id, "
+                   f"`[<rule id>] <why>`, in the same override form; {how}")
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
                 + f"\nIf this is a legitimate exception, {how}.")
         lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")
@@ -4363,8 +4421,13 @@ def main():
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
-        if ids.get(r["id"]):
-            st["last_fire"][r["id"]] = ids[r["id"]]    # what a named dismissal points at
+        has_signal = r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r)
+        if ids.get(r["id"]) and r["id"] not in gate_ids and not has_signal \
+                and r.get("on") != "ordering":
+            # a no-signal advisory: the only fire a named dismissal can point
+            # at, since it opens no obligation. A gate's fire is answered on
+            # the call itself; a signal rule's lives in `open`/`closed`.
+            st["last_fire"][r["id"]] = ids[r["id"]]
         if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
             st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
         elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):

@@ -2681,6 +2681,14 @@ def min_hook_version_checks() -> None:
             {"id": "push-gate", "title": "push-gate", "on": "bash", "rx": r"git\s+push\s+--force",
              "fire_scope": "session", "repo_scope": "any", "mode": "gate",
              "text": "No force push", "why": "w"},
+            # two gates with ONE displayed label — the collision the server does
+            # not prevent (a pilot-shape row carries its label as `_label`)
+            {"id": "dup-a", "_label": "deploy-gate", "on": "bash", "rx": r"deploy\s+prod",
+             "fire_scope": "session", "repo_scope": "any", "mode": "gate",
+             "text": "Deploys go through CI (a)", "why": "w"},
+            {"id": "dup-b", "_label": "deploy-gate", "on": "bash", "rx": r"deploy\s+prod",
+             "fire_scope": "session", "repo_scope": "any", "mode": "gate",
+             "text": "Deploys go through CI (b)", "why": "w"},
         ])
         fires_path = os.path.join(td, "ledger", "fires.jsonl")
         convs_path = os.path.join(td, "ledger", "conversions.jsonl")
@@ -2788,6 +2796,63 @@ def min_hook_version_checks() -> None:
               len(c) == 1 and c[0]["how"] == "dismissed" and c[0]["override_reason"] == "not this box", str(c))
         rc, out = bash("o6", "RULEBOOK_OVERRIDE='[push-gate]' git push --force")
         check("outcomes: a label with no reason is no override — the gate stands", decision(out) == "deny", out)
+
+        # 5b. a resolved fire cannot be dismissed: o1's tests-first converted
+        #     (2 sidecar rows), o5's push-gate was a GATE fire
+        rc, out = bash("o1", "RULEBOOK_OVERRIDE='[tests-first] too late' ls")
+        check("outcomes: a CONVERTED advisory is not dismissable afterwards",
+              out.strip() == "" and len(convs_for(f1["fire_id"])) == 2, out)
+        g5 = fire_id("o5", "push-gate")
+        rc, out = bash("o5", "RULEBOOK_OVERRIDE='[push-gate] later' ls")
+        check("outcomes: a gate's fire is never a dismissal target",
+              out.strip() == "" and convs_for(g5["fire_id"]) == [], out)
+        rc, out = bash("o3", "RULEBOOK_OVERRIDE='[no-sudo] twice' ls")
+        check("outcomes: a dismissed fire is consumed — a second dismissal records nothing",
+              out.strip() == "" and len(convs_for(f3["fire_id"])) == 1, out)
+
+        # 5c. titles are not unique: a named excuse that fits two gates on the
+        #     call excuses NEITHER; the id form addresses one; the unnamed
+        #     form still excuses both
+        rc, out = bash("o7", "RULEBOOK_OVERRIDE='[deploy-gate] hotfix' deploy prod")
+        j = json.loads(out)
+        check("outcomes: an ambiguous label fails closed — both gates stand",
+              decision(out) == "deny" and fire_id("o7", "dup-a")["override_reason"] is None
+              and fire_id("o7", "dup-b")["override_reason"] is None, out)
+        check("outcomes: …and the deny says so, with the rule ids to use",
+              "fits 2 of this call's gates" in j["hookSpecificOutput"]["permissionDecisionReason"]
+              and "rule id dup-a" in j["hookSpecificOutput"]["permissionDecisionReason"], out)
+        rc, out = bash("o7b", "RULEBOOK_OVERRIDE='[dup-a] hotfix' deploy prod")
+        check("outcomes: the id form excuses exactly that gate — the other still blocks",
+              decision(out) == "deny" and fire_id("o7b", "dup-a")["override_reason"] == "hotfix"
+              and fire_id("o7b", "dup-b")["override_reason"] is None, out)
+        rc, out = bash("o7c", "RULEBOOK_OVERRIDE='hotfix' deploy prod")
+        check("outcomes: the unnamed form is unchanged — excuses every gate on the call",
+              decision(out) != "deny" and fire_id("o7c", "dup-a")["override_reason"] == "hotfix"
+              and fire_id("o7c", "dup-b")["override_reason"] == "hotfix", out)
+
+        # 5d. the state file is delta-merged for the obligation keys: a Stop
+        #     lane that loaded before a tool hook opened/converted fires must
+        #     neither resurrect the converted one nor drop the new one
+        sys.path.insert(0, os.path.dirname(HOOK))
+        import rulebook_hook as H  # noqa: E402
+        sp = os.path.join(td, "state", "merge-race.json")
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"open": {"a": "fa", "b": "fb"}, "closed": {}, "open_at": {"a": 0, "b": 0},
+                       "last_fire": {"n": "fn"}, "stops": 1}, f)
+        st = H.load_state(sp)                # the Stop lane's snapshot
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile a tool hook: converts b, opens c
+            json.dump({"open": {"a": "fa", "c": "fc"}, "closed": {}, "open_at": {"a": 0, "c": 1},
+                       "last_fire": {"n": "fn", "m": "fm"}, "stops": 1}, f)
+        st["stops"] = 2
+        st["closed"]["a"] = st["open"].pop("a")     # the Stop lane closes a
+        st["open_at"].pop("a", None)
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — the close lands, the conversion is not resurrected, the new fire survives",
+              cur["open"] == {"c": "fc"} and cur["closed"] == {"a": "fa"} and cur["open_at"] == {"c": 1}
+              and cur["last_fire"] == {"n": "fn", "m": "fm"} and cur["stops"] == 2, str(cur))
 
         # 6. the flush merge: a close never downgrades a conversion, in either order
         merge_script = (
