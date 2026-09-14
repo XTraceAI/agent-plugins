@@ -2689,6 +2689,16 @@ def min_hook_version_checks() -> None:
             {"id": "dup-b", "_label": "deploy-gate", "on": "bash", "rx": r"deploy\s+prod",
              "fire_scope": "session", "repo_scope": "any", "mode": "gate",
              "text": "Deploys go through CI (b)", "why": "w"},
+            # a call-scoped signal rule: every fire must leave with an outcome
+            {"id": "lint-first", "title": "lint-first", "on": "bash", "rx": r"\bmake\s+release\b",
+             "fire_scope": "call", "repo_scope": "any", "converted_rx": r"\bruff\b",
+             "text": "Lint before a release", "why": "w"},
+            # an ordering ADVISORY: its obligation lives in the engine, not in `open`
+            {"id": "ord-adv", "title": "ord-adv", "on": "ordering", "repo_scope": "any",
+             "ordering": {"required_command_rx": r"pytest\s+\S*tests/architecture",
+                          "gated_command_rx": r"git\s+push", "armed_by_events": ["edit", "write"],
+                          "min_edits": 1, "display_name": "the architecture suite"},
+             "text": "Run the architecture suite before pushing", "why": "w"},
         ])
         fires_path = os.path.join(td, "ledger", "fires.jsonl")
         convs_path = os.path.join(td, "ledger", "conversions.jsonl")
@@ -2853,6 +2863,59 @@ def min_hook_version_checks() -> None:
         check("outcomes: delta merge — the close lands, the conversion is not resurrected, the new fire survives",
               cur["open"] == {"c": "fc"} and cur["closed"] == {"a": "fa"} and cur["open_at"] == {"c": 1}
               and cur["last_fire"] == {"n": "fn", "m": "fm"} and cur["stops"] == 2, str(cur))
+        # the SAME rule re-fired between the Stop's load and save: the Stop
+        # closes the fire it saw, and the replacement it never saw survives
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"open": {"a": "old"}, "closed": {}, "open_at": {"a": 0}, "stops": 1}, f)
+        st = H.load_state(sp)
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: rule a fires again
+            json.dump({"open": {"a": "new"}, "closed": {}, "open_at": {"a": 1}, "stops": 1}, f)
+        st["stops"] = 2
+        st["closed"]["a"] = st["open"].pop("a")
+        st["open_at"].pop("a", None)
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — a fire that replaced the one the Stop saw is not dropped",
+              cur["open"] == {"a": "new"} and cur["closed"] == {"a": "old"} and cur["open_at"] == {"a": 1},
+              str(cur))
+
+        # 5e. a call-scoped signal rule firing twice before its action: the
+        #     first fire is closed `refired`, the second converts
+        bash("o8", "make release")
+        first = fire_id("o8", "lint-first")
+        bash("o8", "make release")
+        second = fire_id("o8", "lint-first")
+        check("outcomes: call-scoped — two fires, two ids", first["fire_id"] != second["fire_id"])
+        c = convs_for(first["fire_id"])
+        check("outcomes: the first fire is closed converted=false, how=refired, when the rule fires again",
+              len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "refired", str(c))
+        bash("o8", "uv run ruff check .", mode="post", resp={"stdout": "ok", "exit_code": 0})
+        check("outcomes: …and the second converts",
+              [x["how"] for x in convs_for(second["fire_id"])] == ["converted_rx"])
+
+        # 5f. an ordering ADVISORY can be dismissed by name (its obligation is
+        #     in the engine, not `open`), and is not dismissable once discharged
+        run("post", {"cwd": orepo, "session_id": "o9", "tool_name": "Edit",
+                     "tool_input": {"file_path": os.path.join(orepo, "pkg", "x.py")}}, oenv)   # arm
+        rc, out = bash("o9", "git push origin feat")
+        o9 = fire_id("o9", "ord-adv")
+        check("outcomes: the ordering advisory fired", o9 is not None and "[ord-adv]" in ctx(out), ctx(out))
+        rc, out = bash("o9", "RULEBOOK_OVERRIDE='[ord-adv] CI runs it' ls")
+        c = convs_for(o9["fire_id"])
+        check("outcomes: an ordering advisory is dismissable by name",
+              len(c) == 1 and c[0]["how"] == "dismissed" and c[0]["override_reason"] == "CI runs it"
+              and "set aside" in ctx(out), str(c) + ctx(out))
+        run("post", {"cwd": orepo, "session_id": "o9", "tool_name": "Edit",
+                     "tool_input": {"file_path": os.path.join(orepo, "pkg", "y.py")}}, oenv)   # re-arm
+        bash("o9", "git push origin feat")
+        o9b = fire_id("o9", "ord-adv")
+        bash("o9", "uv run pytest tests/architecture -q", mode="post",
+             resp={"stdout": "3 passed", "exit_code": 0})                                     # discharge
+        rc, out = bash("o9", "RULEBOOK_OVERRIDE='[ord-adv] too late' ls")
+        check("outcomes: a DISCHARGED ordering advisory is not dismissable",
+              out.strip() == "" and [x["how"] for x in convs_for(o9b["fire_id"])] == ["discharged"],
+              out + str(convs_for(o9b["fire_id"])))
 
         # 6. the flush merge: a close never downgrades a conversion, in either order
         merge_script = (

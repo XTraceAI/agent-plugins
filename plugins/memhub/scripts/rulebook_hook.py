@@ -2901,7 +2901,13 @@ def save_state(p, st, before=None):
                 merged = dict(cur.get(k) or {})
                 for rid in before[k]:
                     if rid not in st[k]:
-                        merged.pop(rid, None)          # discharged by this process
+                        # discharged by this process — but only the value it
+                        # SAW. An obligation the same rule re-fired meanwhile
+                        # (call-scoped, between this process's load and save)
+                        # is another hook's fire and stays.
+                        if k in _OBLIGATION_KEYS and merged.get(rid) != before[k][rid]:
+                            continue
+                        merged.pop(rid, None)
                 for rid, v in st[k].items():
                     if rid not in before[k] or before[k][rid] != v:
                         merged[rid] = v                # armed or re-versioned here
@@ -4123,6 +4129,8 @@ def main():
                 except Exception:
                     outcome = None
                 if outcome == "discharged":
+                    # a discharged ordering fire is resolved, not dismissable
+                    st["last_fire"].pop(rid, None)
                     # The session's own arming is discharged here, not in the
                     # worktree state: it was never written there. Its open
                     # fire lives beside it for the same reason — a sibling
@@ -4422,20 +4430,27 @@ def main():
     for r in shown:
         st["raw"][r["id"]] = 0
         has_signal = r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r)
-        if ids.get(r["id"]) and r["id"] not in gate_ids and not has_signal \
-                and r.get("on") != "ordering":
-            # a no-signal advisory: the only fire a named dismissal can point
-            # at, since it opens no obligation. A gate's fire is answered on
-            # the call itself; a signal rule's lives in `open`/`closed`.
+        if ids.get(r["id"]) and r["id"] not in gate_ids and not has_signal:
+            # a no-signal advisory — an ordering advisory included, whose
+            # obligation lives in the engine, not in `open` — is the fire a
+            # named dismissal points at. A gate's fire is answered on the
+            # call itself; a signal rule's lives in `open`/`closed`.
             st["last_fire"][r["id"]] = ids[r["id"]]
         if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
             st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
         elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):
             ordering.mark_fired(r["id"], ids[r["id"]])
-        elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
+        elif has_signal:
+            # One pending slot per rule. The same advice firing AGAIN before
+            # its action landed is the earlier fire's outcome — it was not
+            # followed — recorded now so a call-scoped rule's every fire
+            # leaves with one instead of the first being silently dropped.
+            prior = st["open"].get(r["id"])
+            if prior and prior != ids.get(r["id"]):
+                log_conversion(prior, "refired", converted=False)
+            st["closed"].pop(r["id"], None)                      # already has its outcome
             st["open"][r["id"]] = ids.get(r["id"])
             st["open_at"][r["id"]] = int(st.get("stops") or 0)   # the wait starts now
-            st["closed"].pop(r["id"], None)                      # a fresh fire replaces a closed one
             if r.get("on") == "edit":
                 ev = fired_on.get(r["id"])
                 st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
