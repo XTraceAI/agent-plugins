@@ -2797,9 +2797,9 @@ def state_path(session_id):
 
 
 def load_state(p):
-    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {},
+    st = {"fired": [], "counts": {}, "raw": {}, "armed": {},
           "armed_once": [], "armed_fire": {}, "armed_version": {},
-          "closed": {}, "open_at": {}, "last_fire": {}, "stops": 0}
+          "obligations": {}, "stops": 0}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2807,9 +2807,13 @@ def load_state(p):
         pass
     if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
         st["armed"] = {}
-    for k in ("closed", "open_at", "last_fire", "open", "open_file"):
-        if not isinstance(st.get(k), dict):
-            st[k] = {}
+    if not isinstance(st.get("obligations"), dict):
+        st["obligations"] = {}
+    # The pre-outcome hook kept its conversion watch in `open`/`open_file`,
+    # keyed by RULE. Those entries are dropped, not migrated: that hook never
+    # wrote an outcome for them, so nothing is lost that was ever recorded.
+    for k in ("open", "open_file", "closed", "open_at", "last_fire"):
+        st.pop(k, None)
     if not isinstance(st.get("stops"), int):
         st["stops"] = 0
     if not isinstance(st.get("armed_once"), list):
@@ -2850,19 +2854,24 @@ def drop_arming(st, rid):
 # is added, what it discharged is removed, and everything else is whatever
 # is on disk now.
 _ARMING_KEYS = ("armed", "armed_fire", "armed_version")
-# The obligation keys ride the same delta merge. The Stop lane closes fires
-# (open → closed) while the next turn's tool hook may open or convert one —
-# each must write its own delta against the file as it is NOW, never its
-# snapshot, or a close resurrects a conversion and a fire loses its outcome.
-_OBLIGATION_KEYS = ("open", "closed", "open_at", "open_file", "last_fire")
-_DELTA_KEYS = _ARMING_KEYS + _OBLIGATION_KEYS
 _APPEND_KEYS = ("armed_once",)      # only ever appended to
+# `obligations` — one record per advisory FIRE, keyed by fire id — rides the
+# same delta merge and needs none of the conditions a rule-keyed map would:
+# a fire id is minted by exactly one hook, so an id this process removed was
+# resolved HERE and an id it added was fired HERE, and neither can collide
+# with another hook's. The Stop lane only FLAGS records (`closed`), under
+# the lock; it never adds or removes one, so a resolution always beats a
+# close and two fires of one rule are two keys, not one slot.
+_DELTA_KEYS = _ARMING_KEYS + ("obligations",)
 
 
 def snapshot_arming(st):
     """What the delta-merged keys looked like when this process loaded the
-    state — the baseline `save_state` diffs against."""
-    return {k: dict(st.get(k) or {}) for k in _DELTA_KEYS}
+    state — the baseline `save_state` diffs against. Records are copied, so
+    a flag set on one after the snapshot reads as a change."""
+    return {k: {kk: (dict(vv) if isinstance(vv, dict) else vv)
+                for kk, vv in (st.get(k) or {}).items()}
+            for k in _DELTA_KEYS}
 
 
 def _state_lock(p):
@@ -2895,53 +2904,30 @@ def save_state(p, st, before=None):
     try:
         if lock is not None:
             cur = load_state(p)
-            consumed = {}      # fires this process resolved that a Stop closed meanwhile
             for k in _DELTA_KEYS:
                 if k not in before:                    # a snapshot an older caller took
                     continue
                 merged = dict(cur.get(k) or {})
-                if k == "closed":
-                    # a resolved fire's close, added by a Stop AFTER this
-                    # process's snapshot, is consumed with it — the close
-                    # was of a fire that no longer exists to be closed
-                    for rid, v in consumed.items():
-                        if merged.get(rid) == v:
-                            merged.pop(rid, None)
-                for rid in before[k]:
-                    if rid not in st[k]:
-                        # discharged by this process — but only the value it
-                        # SAW. An obligation the same rule re-fired meanwhile
-                        # (call-scoped, between this process's load and save)
-                        # is another hook's fire and stays.
-                        if k in _OBLIGATION_KEYS and merged.get(rid) != before[k][rid]:
-                            if k == "open" and rid not in st["closed"] \
-                                    and (cur.get("closed") or {}).get(rid) == before[k][rid]:
-                                consumed[rid] = before[k][rid]
+                for key in before[k]:
+                    if key not in st[k]:
+                        merged.pop(key, None)          # discharged / resolved by this process
+                for key, v in st[k].items():
+                    if key not in before[k]:
+                        if k == "obligations" and isinstance(v, dict):
+                            # A wait starts at the counter as it is WHEN THE
+                            # FIRE LANDS: a Stop that advanced it after this
+                            # process loaded would otherwise close the fire a
+                            # turn early.
+                            v = dict(v, opened_at=max(int(v.get("opened_at") or 0),
+                                                      int(cur.get("stops") or 0)))
+                        merged[key] = v                # armed or fired here
+                    elif before[k][key] != v:
+                        # re-versioned, or a record flagged closed by the
+                        # unlocked Stop fallback — never resurrected if the
+                        # file no longer holds it (resolved meanwhile)
+                        if k == "obligations" and key not in merged:
                             continue
-                        # `open_at` / `open_file` carry no fire id of their
-                        # own: they belong to whatever fire `open` holds. If
-                        # the file's open fire is no longer the one this
-                        # process saw, so does the companion — leave it.
-                        if k in ("open_at", "open_file") and "open" in before:
-                            live = (cur.get("open") or {}).get(rid)
-                            if live is not None and live != before["open"].get(rid):
-                                continue
-                        merged.pop(rid, None)
-                for rid, v in st[k].items():
-                    if rid not in before[k] or before[k][rid] != v:
-                        # A close is a TRANSITION, open → closed, and lands
-                        # only if the file still holds that fire as open: a
-                        # tool hook that converted it meanwhile consumed both
-                        # entries, and re-adding the closed half would make a
-                        # resolved fire dismissable again.
-                        if k == "closed" and (cur.get("open") or {}).get(rid) != v:
-                            continue
-                        # A wait starts at the counter as it is WHEN THE FIRE
-                        # LANDS: a Stop that advanced it after this process
-                        # loaded would otherwise close the fire a turn early.
-                        if k == "open_at":
-                            v = max(int(v or 0), int(cur.get("stops") or 0))
-                        merged[rid] = v                # armed, re-versioned or closed here
+                        merged[key] = v
                 st[k] = merged
             for k in _APPEND_KEYS:
                 seen = list(cur.get(k) or [])
@@ -3604,19 +3590,45 @@ def log_conversion(fire_id, how, converted=True, override_reason=None):
         pass
 
 
-CLOSE_OPEN_AFTER_STOPS = 2   # a fire still open at the 2nd Stop after it is recorded not converted
+CLOSE_OPEN_AFTER_STOPS = 2   # a fire still pending at the 2nd Stop after it is recorded not converted
+
+# A record's `kind` says what can resolve it:
+#   signal    the rule carries converted_rx / content_rx — an action converts
+#             it, the Stop lane closes it
+#   ordering  an ordering advisory — the engine's receipt converts it, the
+#             Stop lane closes it
+#   plain     no conversion signal — no deterministic outcome exists, so it
+#             is never closed; it stays pending for a named dismissal only
+_STOP_CLOSES = ("signal", "ordering")
 
 
-def _forget_obligation(st, rid):
-    """Drop every trace of a rule's obligation: open or closed, its wait, the
-    file an edit rule was watching, and the fire a named dismissal could
-    still point at — a resolved fire (converted, or dismissed once) is not
-    dismissable again."""
-    st["open"].pop(rid, None)
-    st.setdefault("closed", {}).pop(rid, None)
-    st.setdefault("open_at", {}).pop(rid, None)
-    st.setdefault("open_file", {}).pop(rid, None)
-    st.setdefault("last_fire", {}).pop(rid, None)
+def open_obligation(st, fid, rid, kind, file=None):
+    """One record per advisory fire. `opened_at` is re-stamped at save time
+    against the file's counter (`save_state`), so a Stop racing this hook
+    cannot shorten the wait."""
+    st["obligations"][fid] = {"rule": rid, "kind": kind, "opened_at": int(st.get("stops") or 0),
+                              "file": file, "closed": False}
+
+
+def pending_fires(st, rid, kinds=None):
+    """`[(fire_id, record)]` of the rule's records, closed or not — a closed
+    fire is still pending until an action or a dismissal resolves it."""
+    return [(fid, rec) for fid, rec in st["obligations"].items()
+            if isinstance(rec, dict) and rec.get("rule") == rid
+            and (kinds is None or rec.get("kind") in kinds)]
+
+
+def resolve_fires(st, rid, how, *, kinds=None, converted=True, override_reason=None):
+    """Write the outcome for EVERY pending fire of the rule and drop the
+    records. Every fire, because the action (or the dismissal) answers all
+    the times the advice was given — and resolved is resolved, whatever a
+    concurrent Stop flagged meanwhile."""
+    done = []
+    for fid, _rec in pending_fires(st, rid, kinds):
+        log_conversion(fid, how, converted=converted, override_reason=override_reason)
+        st["obligations"].pop(fid, None)
+        done.append(fid)
+    return done
 
 
 def close_open_obligations(session, *, final):
@@ -3630,10 +3642,12 @@ def close_open_obligations(session, *, final):
     SessionEnd is not reliable (a closed window skips it), which is why the
     per-turn close is the writer and the sweep is only a sweep.
 
-    A close is not a verdict. The fire moves from `open` to `closed` and the
-    conversion pass keeps watching both, so an action that lands later still
-    records `converted=true` (and the server keeps a true over a false). What
-    a close changes is the default: a fire nobody acted on now says so."""
+    A close is not a verdict. The record is FLAGGED, never removed: the
+    conversion pass keeps watching a closed fire, so an action that lands
+    later still records `converted=true` (and the server keeps a true over a
+    false). What a close changes is the default: a fire nobody acted on now
+    says so. Only `signal` and `ordering` records close — a `plain` fire has
+    no deterministic outcome and stays null unless dismissed."""
     sp = state_path(session)
     # The Stop hook runs asynchronously beside the next turn's tool hooks, so
     # the whole read-modify-write is done under the session lock: nothing
@@ -3647,17 +3661,14 @@ def close_open_obligations(session, *, final):
         before = None if lock is not None else snapshot_arming(st)
         if not final:
             st["stops"] = int(st.get("stops") or 0) + 1
-        for rid, fid in list(st["open"].items()):
-            # an obligation an older hook opened carries no wait; close it now
-            opened = int(st["open_at"].get(rid, 0) or 0)
-            if not final and st["stops"] - opened < CLOSE_OPEN_AFTER_STOPS:
+        for fid, rec in st["obligations"].items():
+            if not isinstance(rec, dict) or rec.get("closed") or rec.get("kind") not in _STOP_CLOSES:
                 continue
-            if fid:
-                log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
-                               converted=False)
-                st["closed"][rid] = fid
-            del st["open"][rid]
-            st["open_at"].pop(rid, None)
+            if not final and st["stops"] - int(rec.get("opened_at") or 0) < CLOSE_OPEN_AFTER_STOPS:
+                continue
+            log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
+                           converted=False)
+            rec["closed"] = True
         if lock is not None:
             with open(sp, "w", encoding="utf-8") as f:
                 json.dump(st, f)
@@ -3687,46 +3698,34 @@ def split_named_override(reason):
     return m.group(1).strip().lower(), m.group(2).strip()
 
 
-def apply_dismissals(st, rules, dismissals, *, allow_last_fire):
-    """Record each `{label: why}` as a dismissal of that rule's fire in this
-    session — `converted=false` with the reason — on the fire still waiting
-    on its conversion, or, when `allow_last_fire`, on a no-signal advisory's
-    pending fire (`st["last_fire"]`: a rule with no conversion signal has no
-    obligation to point at; the one-shot shell form may still answer it, a
-    durable edit marker may not). A fire that is resolved — converted, or
-    dismissed once — is gone from all three maps and cannot be dismissed.
+def apply_dismissals(st, rules, dismissals):
+    """Record each `{label: why}` as a dismissal — `converted=false` with the
+    reason — of every pending fire of the rule it names, closed or not. A
+    resolved fire (converted, or dismissed once) has no record and cannot be
+    dismissed again.
 
     Titles are not unique across the union of books, so a label is resolved
     against the rules with a fire PENDING: exactly one → recorded; more than
     one → nothing recorded and the label reported back as ambiguous, so the
-    agent can name the rule by its id (the named form takes either).
+    agent can name the rule by its id — and an exact id outranks a displayed
+    label, as the gate resolver does, so that recovery works even when one
+    rule's id equals another's label.
     Returns `(recorded, ambiguous)`: `[(label, why)]` and `[(label, n)]`."""
     done, ambiguous = [], []
     for label, why in dismissals.items():
         if not label or not why:
             continue
-        def _pending(r):
-            return (r["id"] in st["open"] or r["id"] in st["closed"]
-                    or (allow_last_fire and r["id"] in st["last_fire"]))
-
-        # an exact rule id outranks a displayed label — as the gate resolver
-        # does — so the recovery from an ambiguous label ("name it by id")
-        # works even when one rule's id equals another's label
-        pending = [r for r in rules if str(r["id"]).lower() == label and _pending(r)] or [
-            r for r in rules
-            if str(r.get("_label") or r["id"]).lower() == label and _pending(r)
-        ]
+        pending = [r for r in rules if str(r["id"]).lower() == label and pending_fires(st, r["id"])] \
+            or [r for r in rules
+                if str(r.get("_label") or r["id"]).lower() == label and pending_fires(st, r["id"])]
         if len(pending) > 1:
             ambiguous.append((label, len(pending)))
             continue
         if not pending:
             continue
         hit = pending[0]
-        rid = hit["id"]
-        fid = st["open"].get(rid) or st["closed"].get(rid) or st["last_fire"].get(rid)
-        log_conversion(fid, "dismissed", converted=False, override_reason=why)
-        _forget_obligation(st, rid)
-        done.append((hit.get("_label") or rid, why))
+        resolve_fires(st, hit["id"], "dismissed", converted=False, override_reason=why)
+        done.append((hit.get("_label") or hit["id"], why))
     return done, ambiguous
 
 
@@ -4105,25 +4104,27 @@ def main():
     # Deterministic, under-counts, never over-counts (spec §5.1). A fire the
     # Stop lane already closed is still watched: a late action is still the
     # action, and its `true` outranks the close.
-    for rid, fid in list(st["open"].items()) + list(st["closed"].items()):
-        r = by_id.get(rid)
+    for fid, rec in list(st["obligations"].items()):
+        if not isinstance(rec, dict) or rec.get("kind") != "signal":
+            continue
+        r = by_id.get(rec.get("rule"))
         if not r:
             continue
         crx = r.get("converted_rx")
         if mode == "post" and tool == "Bash" and crx and cmd \
                 and re.search(crx, strip_comments(shell_only(cmd)), re.I | re.M):
             log_conversion(fid, "converted_rx")
-            _forget_obligation(st, rid)
+            st["obligations"].pop(fid, None)
             continue
         if r.get("on") != "edit" or "content_rx" not in r:
             continue
         for ev in events:
             if ev["phase"] == "pre" and ev["tool"] in EDIT_TOOLS \
-                    and ev["fp"] == st.get("open_file", {}).get(rid) \
+                    and ev["fp"] == rec.get("file") \
                     and not evaluate(r, hook_phase="pre", tool=ev["tool"], file_path=ev["fp"],
                                      body=ev["body"]):
                 log_conversion(fid, "re-edit-clears")
-                _forget_obligation(st, rid)
+                st["obligations"].pop(fid, None)
                 break
 
     # A named override, or an edit marker, that names no gate on this call is
@@ -4190,18 +4191,25 @@ def main():
                 except Exception:
                     outcome = None
                 if outcome == "discharged":
-                    # a discharged ordering fire is resolved: not dismissable,
-                    # not closeable — its obligation is gone from every map
-                    _forget_obligation(st, rid)
                     # The session's own arming is discharged here, not in the
                     # worktree state: it was never written there. Its open
                     # fire lives beside it for the same reason — a sibling
                     # session sharing the checkout must not convert it.
+                    logged = set()
                     fid = drop_arming(st, rid)
                     if fid:
                         log_conversion(fid, "discharged")
-                if outcome == "discharged" and r.get("_converted_fire"):
-                    log_conversion(r["_converted_fire"], "discharged")
+                        logged.add(fid)
+                    if r.get("_converted_fire"):
+                        log_conversion(r["_converted_fire"], "discharged")
+                        logged.add(r["_converted_fire"])
+                    # The receipt answers EVERY fire of the rule this session
+                    # is waiting on, not only the one the engine marked last:
+                    # the earlier ones were the same advice, given earlier.
+                    for pf, _rec in pending_fires(st, rid, ("ordering",)):
+                        if pf not in logged:
+                            log_conversion(pf, "discharged")
+                        st["obligations"].pop(pf, None)
                 elif outcome == "fired":
                     dedup_keys[rid] = f"{rid}@{root}:{branch}"
                     fired_now.append(r)
@@ -4250,8 +4258,7 @@ def main():
             fired_on[rid] = ev
 
     if not fired_now:
-        set_aside, ambiguous = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
-            if dismissals else ([], [])
+        set_aside, ambiguous = apply_dismissals(st, rules, dismissals) if dismissals else ([], [])
         save_state(sp, st, before=before)
         if set_aside or ambiguous:
             # Say so on both channels: a recorded reason nobody can see is
@@ -4333,8 +4340,7 @@ def main():
             elif named:
                 ambiguous_gate = (label, len(named))
                 dismissals.pop(label, None)
-    set_aside, ambiguous = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
-        if dismissals else ([], [])
+    set_aside, ambiguous = apply_dismissals(st, rules, dismissals) if dismissals else ([], [])
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4491,43 +4497,24 @@ def main():
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
+        fid = ids.get(r["id"])
         has_signal = r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r)
         is_ordering = r.get("on") == "ordering"
-        if ids.get(r["id"]) and r["id"] not in gate_ids and not has_signal and not is_ordering:
-            # a no-signal advisory is the fire a named dismissal points at.
-            # A gate's fire is answered on the call itself; a signal rule's —
-            # and an ordering advisory's — lives in `open`/`closed`. As with
-            # `open`, one pending slot per rule: an earlier fire still here
-            # when the same advice fires again was not followed, and says so.
-            prior = st["last_fire"].get(r["id"])
-            if prior and prior != ids[r["id"]]:
-                log_conversion(prior, "refired", converted=False)
-            st["last_fire"][r["id"]] = ids[r["id"]]
-        if is_ordering and session_scoped(r) and ids.get(r["id"]):
-            st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
-        elif is_ordering and ordering and ids.get(r["id"]):
-            ordering.mark_fired(r["id"], ids[r["id"]])
-        if (has_signal or is_ordering) and r["id"] not in gate_ids:
-            # Advisories only: a gate's fire is answered on its own call —
-            # blocked, or excused with a reason — never waited on, closed or
-            # dismissed later, whatever signal its matcher also carries.
-            # One pending slot per rule. The same advice firing AGAIN before
-            # its action landed is the earlier fire's outcome — it was not
-            # followed — recorded now so a call-scoped rule's every fire
-            # leaves with one instead of the first being silently dropped.
-            # An ordering ADVISORY sits here too: its receipt is judged by
-            # the engine, but the wait, the Stop close and a named
-            # dismissal are this map's — a rule ignored until the session
-            # ends must still leave with an outcome.
-            prior = st["open"].get(r["id"])
-            if prior and prior != ids.get(r["id"]):
-                log_conversion(prior, "refired", converted=False)
-            st["closed"].pop(r["id"], None)                      # already has its outcome
-            st["open"][r["id"]] = ids.get(r["id"])
-            st["open_at"][r["id"]] = int(st.get("stops") or 0)   # the wait starts now
-            if r.get("on") == "edit":
-                ev = fired_on.get(r["id"])
-                st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
+        if is_ordering and session_scoped(r) and fid:
+            st.setdefault("armed_fire", {})[r["id"]] = fid
+        elif is_ordering and ordering and fid:
+            ordering.mark_fired(r["id"], fid)
+        if fid and r["id"] not in gate_ids:
+            # Every advisory fire gets its own record — a call-scoped rule
+            # firing five times is five records, each closed at its own age
+            # and all converted by the action that answers them. A gate's
+            # fire is answered on its own call (blocked, or excused with a
+            # reason) and is never waited on, closed or dismissed later,
+            # whatever signal its matcher also carries.
+            kind = "ordering" if is_ordering else ("signal" if has_signal else "plain")
+            ev = fired_on.get(r["id"])
+            open_obligation(st, fid, r["id"], kind,
+                            file=((ev["fp"] if ev else fp) if r.get("on") == "edit" else None))
     save_state(sp, st, before=before)
     return 0
 

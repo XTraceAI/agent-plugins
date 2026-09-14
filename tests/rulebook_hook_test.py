@@ -1285,9 +1285,16 @@ def main() -> int:
         run("post", dict(suite, tool_response={"stdout": "3 passed", "exit_code": 0}), oenv)
         oledger = os.path.join(td, "ledger", "fires.jsonl")
         with open(os.path.join(td, "ledger", "conversions.jsonl"), encoding="utf-8") as f:
-            hows = [json.loads(l)["how"] for l in f if l.strip()]
+            crows = [json.loads(l) for l in f if l.strip()]
+        hows = [c["how"] for c in crows]
+        with open(oledger, encoding="utf-8") as f:
+            ofires = {json.loads(l)["fire_id"] for l in f if l.strip() and '"audit-before-push"' in l}
+        discharged = {c["fire_id"] for c in crows if c["how"] == "discharged"}
+        # three receipts landed; each answers EVERY fire the rule gave since
+        # the last one, not only the fire the engine marked last
         check("ordering: a discharge after a fire converts that fire (the conversion signal)",
-              hows.count("discharged") == 3, str(hows))
+              hows.count("discharged") >= 3 and ofires and ofires <= discharged,
+              f"{hows} fires={len(ofires)} discharged={len(ofires & discharged)}")
         statefiles = [n for n in os.listdir(os.path.join(td, "state")) if n.startswith("wt-") and n.endswith(".json")]
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
@@ -2853,94 +2860,102 @@ def min_hook_version_checks() -> None:
               decision(out) != "deny" and fire_id("o7c", "dup-a")["override_reason"] == "hotfix"
               and fire_id("o7c", "dup-b")["override_reason"] == "hotfix", out)
 
-        # 5d. the state file is delta-merged for the obligation keys: a Stop
-        #     lane that loaded before a tool hook opened/converted fires must
-        #     neither resurrect the converted one nor drop the new one
+        # 5d. per-fire records make the concurrent merge trivial: a Stop that
+        #     loaded before a tool hook opened/converted fires must neither
+        #     resurrect the converted one nor drop the new one
         sys.path.insert(0, os.path.dirname(HOOK))
         import rulebook_hook as H  # noqa: E402
+
+        def rec(rule, opened_at=0, kind="signal", closed=False, file=None):
+            return {"rule": rule, "kind": kind, "opened_at": opened_at, "file": file, "closed": closed}
+
         sp = os.path.join(td, "state", "merge-race.json")
         os.makedirs(os.path.dirname(sp), exist_ok=True)
         with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"open": {"a": "fa", "b": "fb"}, "closed": {}, "open_at": {"a": 0, "b": 0},
-                       "last_fire": {"n": "fn"}, "stops": 1}, f)
-        st = H.load_state(sp)                # the Stop lane's snapshot
+            json.dump({"obligations": {"fa": rec("a"), "fb": rec("b")}, "stops": 1}, f)
+        st = H.load_state(sp)                # the Stop lane's (unlocked-fallback) snapshot
         before = H.snapshot_arming(st)
-        with open(sp, "w", encoding="utf-8") as f:   # meanwhile a tool hook: converts b, opens c
-            json.dump({"open": {"a": "fa", "c": "fc"}, "closed": {}, "open_at": {"a": 0, "c": 1},
-                       "last_fire": {"n": "fn", "m": "fm"}, "stops": 1}, f)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile a tool hook: converts b, fires c
+            json.dump({"obligations": {"fa": rec("a"), "fc": rec("c", 1)}, "stops": 1}, f)
         st["stops"] = 2
-        st["closed"]["a"] = st["open"].pop("a")     # the Stop lane closes a
-        st["open_at"].pop("a", None)
+        st["obligations"]["fa"]["closed"] = True      # the Stop closes a
         H.save_state(sp, st, before=before)
         cur = H.load_state(sp)
         check("outcomes: delta merge — the close lands, the conversion is not resurrected, the new fire survives",
-              cur["open"] == {"c": "fc"} and cur["closed"] == {"a": "fa"} and cur["open_at"] == {"c": 1}
-              and cur["last_fire"] == {"n": "fn", "m": "fm"} and cur["stops"] == 2, str(cur))
-        # the SAME rule re-fired between the Stop's load and save: the Stop
-        # closes the fire it saw, and the replacement it never saw survives
+              cur["obligations"] == {"fa": rec("a", closed=True), "fc": rec("c", 1)} and cur["stops"] == 2,
+              str(cur))
+        # the SAME rule re-fired between the Stop's load and save: two fires
+        # of one rule are two keys — nothing to collide
         with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"open": {"a": "old"}, "closed": {}, "open_at": {"a": 0}, "stops": 1}, f)
+            json.dump({"obligations": {"old": rec("a")}, "stops": 1}, f)
         st = H.load_state(sp)
         before = H.snapshot_arming(st)
         with open(sp, "w", encoding="utf-8") as f:   # meanwhile: rule a fires again
-            json.dump({"open": {"a": "new"}, "closed": {}, "open_at": {"a": 1}, "stops": 1}, f)
+            json.dump({"obligations": {"old": rec("a"), "new": rec("a", 1)}, "stops": 1}, f)
         st["stops"] = 2
-        st["closed"]["a"] = st["open"].pop("a")
-        st["open_at"].pop("a", None)
+        st["obligations"]["old"]["closed"] = True
         H.save_state(sp, st, before=before)
         cur = H.load_state(sp)
-        # (the replaced fire is not re-added as closed either: the re-fire that
-        # displaced it already recorded its outcome — `refired` — so a closed
-        # entry for it would only make a resolved fire dismissable)
-        check("outcomes: delta merge — a fire that replaced the one the Stop saw is not dropped",
-              cur["open"] == {"a": "new"} and cur["closed"] == {} and cur["open_at"] == {"a": 1},
-              str(cur))
-        # the inverse: the fire the Stop is closing was CONVERTED meanwhile
-        # (a tool hook forgot it); the close must not resurrect it as closed
+        check("outcomes: delta merge — a second fire of the same rule written meanwhile is untouched",
+              cur["obligations"] == {"old": rec("a", closed=True), "new": rec("a", 1)}, str(cur))
+        # the inverse: the fire the Stop is closing was CONVERTED meanwhile;
+        # a resolution is a removal, and a removal always wins
         with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"open": {"a": "fa"}, "closed": {}, "open_at": {"a": 0}, "stops": 1}, f)
+            json.dump({"obligations": {"fa": rec("a")}, "stops": 1}, f)
         st = H.load_state(sp)
         before = H.snapshot_arming(st)
-        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: converted → forgotten
-            json.dump({"open": {}, "closed": {}, "open_at": {}, "stops": 1}, f)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: converted → record gone
+            json.dump({"obligations": {}, "stops": 1}, f)
         st["stops"] = 2
-        st["closed"]["a"] = st["open"].pop("a")
-        st["open_at"].pop("a", None)
+        st["obligations"]["fa"]["closed"] = True
         H.save_state(sp, st, before=before)
         cur = H.load_state(sp)
-        check("outcomes: delta merge — a close of a fire converted meanwhile lands nowhere",
-              cur["open"] == {} and cur["closed"] == {} and cur["open_at"] == {}, str(cur))
+        check("outcomes: delta merge — a close of a fire resolved meanwhile is not resurrected",
+              cur["obligations"] == {}, str(cur))
+        # and the other order: a tool hook resolves a fire a LOCKED Stop
+        # closed after the tool's snapshot — the removal still wins
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"obligations": {"fa": rec("a")}, "stops": 1}, f)
+        st = H.load_state(sp)                         # the tool hook's snapshot
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: a locked Stop flagged it
+            json.dump({"obligations": {"fa": rec("a", closed=True)}, "stops": 2}, f)
+        st["obligations"].pop("fa")                   # the tool hook converts it
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — a resolution beats a close flagged after the snapshot",
+              cur["obligations"] == {} and cur["stops"] == 2, str(cur))
+        # resolving one fire of a rule never touches another fire of the same
+        # rule that landed meanwhile
+        with open(sp, "w", encoding="utf-8") as f:
+            json.dump({"obligations": {"old": rec("e", 0, file="/f")}, "stops": 1}, f)
+        st = H.load_state(sp)
+        before = H.snapshot_arming(st)
+        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: e fired again on another file
+            json.dump({"obligations": {"old": rec("e", 0, file="/f"), "new": rec("e", 2, file="/g")},
+                       "stops": 2}, f)
+        st["obligations"].pop("old")                  # this process resolves `old`
+        H.save_state(sp, st, before=before)
+        cur = H.load_state(sp)
+        check("outcomes: delta merge — resolving one fire leaves the rule's other fire intact",
+              cur["obligations"] == {"new": rec("e", 2, file="/g")}, str(cur))
 
-        # 5g. a call-scoped NO-signal advisory firing twice: the earlier fire
-        #     is closed `refired`; a named dismissal answers only the latest
-        bash("o10", "curl https://x")
-        n1 = fire_id("o10", "nosig-call")
-        bash("o10", "curl https://y")
-        n2 = fire_id("o10", "nosig-call")
-        c = convs_for(n1["fire_id"])
-        check("outcomes: no-signal call-scoped — the displaced fire is closed refired",
-              n1["fire_id"] != n2["fire_id"] and len(c) == 1 and c[0]["how"] == "refired", str(c))
-        bash("o10", "RULEBOOK_OVERRIDE='[nosig-call] sdk lacks this endpoint' ls")
-        check("outcomes: …and a named dismissal lands on the latest fire only",
-              [x["how"] for x in convs_for(n2["fire_id"])] == ["dismissed"]
-              and len(convs_for(n1["fire_id"])) == 1)
-
-        # 5e. a call-scoped signal rule firing twice before its action: the
-        #     first fire is closed `refired`, the second converts
+        # 5e. a call-scoped signal rule firing twice before its action: two
+        #     records, both pending, both converted by the one action
         bash("o8", "make release")
         first = fire_id("o8", "lint-first")
         bash("o8", "make release")
         second = fire_id("o8", "lint-first")
-        check("outcomes: call-scoped — two fires, two ids", first["fire_id"] != second["fire_id"])
-        c = convs_for(first["fire_id"])
-        check("outcomes: the first fire is closed converted=false, how=refired, when the rule fires again",
-              len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "refired", str(c))
+        check("outcomes: call-scoped — two fires, two ids, neither closed by the other",
+              first["fire_id"] != second["fire_id"] and convs_for(first["fire_id"]) == [])
         bash("o8", "uv run ruff check .", mode="post", resp={"stdout": "ok", "exit_code": 0})
-        check("outcomes: …and the second converts",
-              [x["how"] for x in convs_for(second["fire_id"])] == ["converted_rx"])
+        check("outcomes: …and the action converts BOTH",
+              [x["how"] for x in convs_for(first["fire_id"])] == ["converted_rx"]
+              and [x["how"] for x in convs_for(second["fire_id"])] == ["converted_rx"])
 
-        # 5f. an ordering ADVISORY can be dismissed by name (its obligation is
-        #     in the engine, not `open`), and is not dismissable once discharged
+        # 5f. an ordering ADVISORY: dismissable by name, closeable by the Stop
+        #     lane, converted by a late receipt, and not dismissable once
+        #     discharged
         run("post", {"cwd": orepo, "session_id": "o9", "tool_name": "Edit",
                      "tool_input": {"file_path": os.path.join(orepo, "pkg", "x.py")}}, oenv)   # arm
         rc, out = bash("o9", "git push origin feat")
@@ -2958,11 +2973,9 @@ def min_hook_version_checks() -> None:
         bash("o9", "uv run pytest tests/architecture -q", mode="post",
              resp={"stdout": "3 passed", "exit_code": 0})                                     # discharge
         rc, out = bash("o9", "RULEBOOK_OVERRIDE='[ord-adv] too late' ls")
+        hows = {x["how"] for x in convs_for(o9b["fire_id"])}
         check("outcomes: a DISCHARGED ordering advisory is not dismissable",
-              out.strip() == "" and [x["how"] for x in convs_for(o9b["fire_id"])] == ["discharged"],
-              out + str(convs_for(o9b["fire_id"])))
-        # an ordering advisory neither discharged nor dismissed is closed by
-        # the Stop lane like any other obligation
+              out.strip() == "" and hows == {"discharged"}, out + str(hows))
         run("post", {"cwd": orepo, "session_id": "o9", "tool_name": "Edit",
                      "tool_input": {"file_path": os.path.join(orepo, "pkg", "z.py")}}, oenv)   # re-arm
         bash("o9", "git push origin feat")
@@ -2973,38 +2986,38 @@ def min_hook_version_checks() -> None:
               len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "open_after_turns", str(c))
         bash("o9", "uv run pytest tests/architecture -q", mode="post",
              resp={"stdout": "3 passed", "exit_code": 0})                                     # late receipt
+        hows = [x["how"] for x in convs_for(o9c["fire_id"])]
         check("outcomes: …and a late receipt still converts it",
-              [x["how"] for x in convs_for(o9c["fire_id"])] == ["open_after_turns", "discharged"])
+              hows[0] == "open_after_turns" and set(hows[1:]) == {"discharged"}, str(hows))
+
+        # 5g. a call-scoped NO-signal advisory firing twice: two pending
+        #     records, never closed by Stops, both answered by one dismissal
+        bash("o10", "curl https://x")
+        n1 = fire_id("o10", "nosig-call")
+        bash("o10", "curl https://y")
+        n2 = fire_id("o10", "nosig-call")
+        stop("o10"); stop("o10"); stop("o10")
+        check("outcomes: no-signal fires are never closed by the Stop lane",
+              n1["fire_id"] != n2["fire_id"] and convs_for(n1["fire_id"]) == [] and convs_for(n2["fire_id"]) == [])
+        bash("o10", "RULEBOOK_OVERRIDE='[nosig-call] sdk lacks this endpoint' ls")
+        check("outcomes: …and one named dismissal answers every pending fire of the rule",
+              [x["how"] for x in convs_for(n1["fire_id"])] == ["dismissed"]
+              and [x["how"] for x in convs_for(n2["fire_id"])] == ["dismissed"])
 
         # 5h. the wait is stamped against the file's counter at save time: a
         #     fire opened from a snapshot taken before a Stop advanced the
         #     counter is not closed a turn early
         with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"open": {}, "closed": {}, "open_at": {}, "stops": 3}, f)
+            json.dump({"obligations": {}, "stops": 3}, f)
         st = H.load_state(sp)
         before = H.snapshot_arming(st)
         with open(sp, "w", encoding="utf-8") as f:   # meanwhile: a Stop advanced the counter
-            json.dump({"open": {}, "closed": {}, "open_at": {}, "stops": 4}, f)
-        st["open"]["q"] = "fq"
-        st["open_at"]["q"] = st["stops"]              # 3, the stale snapshot
+            json.dump({"obligations": {}, "stops": 4}, f)
+        H.open_obligation(st, "fq", "q", "signal")     # opened_at 3, the stale snapshot
         H.save_state(sp, st, before=before)
         cur = H.load_state(sp)
-        check("outcomes: open_at is stamped with the counter as saved, never a stale snapshot",
-              cur["open"] == {"q": "fq"} and cur["open_at"] == {"q": 4} and cur["stops"] == 4, str(cur))
-
-        # 5j. a tool hook that resolved a fire AFTER a locked Stop closed it
-        #     consumes that close on save — the resolved fire leaves `closed`
-        with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"open": {"a": "fa"}, "closed": {}, "open_at": {"a": 0}, "stops": 1}, f)
-        st = H.load_state(sp)                         # the tool hook's snapshot
-        before = H.snapshot_arming(st)
-        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: a locked Stop closed it
-            json.dump({"open": {}, "closed": {"a": "fa"}, "open_at": {}, "stops": 2}, f)
-        H._forget_obligation(st, "a")                 # the tool hook converts it
-        H.save_state(sp, st, before=before)
-        cur = H.load_state(sp)
-        check("outcomes: delta merge — a close added after the tool's snapshot is consumed by its conversion",
-              cur["open"] == {} and cur["closed"] == {} and cur["stops"] == 2, str(cur))
+        check("outcomes: opened_at is stamped with the counter as saved, never a stale snapshot",
+              cur["obligations"] == {"fq": rec("q", 4)} and cur["stops"] == 4, str(cur))
 
         # 5k. a gate that also carries a conversion signal never becomes an
         #     obligation: blocked on its call, never closed or dismissed later
@@ -3018,31 +3031,14 @@ def min_hook_version_checks() -> None:
 
         # 5l. a subagent's Stop, or a re-entered one, advances nothing
         with open(os.path.join(td, "state", "o13.json"), "w", encoding="utf-8") as f:
-            json.dump({"open": {"x": "fx"}, "closed": {}, "open_at": {"x": 0}, "stops": 1}, f)
+            json.dump({"obligations": {"fx": rec("x")}, "stops": 1}, f)
         for extra in ({"agent_id": "sub-1"}, {"stop_hook_active": True}):
             subprocess.run([sys.executable, HOOK, "flush"],
                            input=json.dumps({"session_id": "o13", "hook_event_name": "Stop", **extra}),
                            capture_output=True, text=True, env=dict(os.environ, **oenv), timeout=30)
         cur = H.load_state(os.path.join(td, "state", "o13.json"))
-        check("outcomes: a subagent's or re-entered Stop leaves the counter and the obligations alone",
-              cur["stops"] == 1 and cur["open"] == {"x": "fx"} and cur["closed"] == {}, str(cur))
-
-        # 5m. the companion maps follow the fire `open` holds: resolving the
-        #     fire this process saw must not strip the replacement's wait/file
-        with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"open": {"e": "old"}, "closed": {}, "open_at": {"e": 0}, "open_file": {"e": "/f"},
-                       "stops": 1}, f)
-        st = H.load_state(sp)
-        before = H.snapshot_arming(st)
-        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: the same rule re-fired on another file
-            json.dump({"open": {"e": "new"}, "closed": {}, "open_at": {"e": 2}, "open_file": {"e": "/g"},
-                       "stops": 2}, f)
-        H._forget_obligation(st, "e")                 # this process resolves `old`
-        H.save_state(sp, st, before=before)
-        cur = H.load_state(sp)
-        check("outcomes: delta merge — resolving the fire seen leaves the replacement's open_at/open_file intact",
-              cur["open"] == {"e": "new"} and cur["open_at"] == {"e": 2} and cur["open_file"] == {"e": "/g"},
-              str(cur))
+        check("outcomes: a subagent's or re-entered Stop leaves the counter and the records alone",
+              cur["stops"] == 1 and cur["obligations"] == {"fx": rec("x")}, str(cur))
 
         # 5n. a rule id outranks another rule's label when resolving a dismissal
         bash("o14", "wget https://x")
@@ -3052,48 +3048,17 @@ def min_hook_version_checks() -> None:
               [x["how"] for x in convs_for(fa["fire_id"])] == ["dismissed"] and convs_for(fo["fire_id"]) == []
               and "set aside" in ctx(out), out + str(convs_for(fo["fire_id"])))
 
-        # 5i. the Stop lane never writes stale copies of the non-delta fields
+        # 5i. the Stop lane never writes stale copies of the non-delta fields,
+        #     and an old hook's rule-keyed maps are dropped on load
         with open(os.path.join(td, "state", "o11.json"), "w", encoding="utf-8") as f:
             json.dump({"fired": ["keep-me"], "counts": {"c": 2}, "raw": {"c": 1}, "bash_t0": 12.5,
-                       "open": {"x": "fx"}, "closed": {}, "open_at": {"x": 0}, "stops": 1}, f)
+                       "open": {"legacy": "f0"}, "open_file": {"legacy": "/p"},
+                       "obligations": {"fx": rec("x")}, "stops": 1}, f)
         stop("o11")
         cur = H.load_state(os.path.join(td, "state", "o11.json"))
-        check("outcomes: a Stop close keeps every field it did not touch",
+        check("outcomes: a Stop close keeps every field it did not touch, and drops the old maps",
               cur["fired"] == ["keep-me"] and cur["counts"] == {"c": 2} and cur["raw"] == {"c": 1}
-              and cur["bash_t0"] == 12.5 and cur["closed"] == {"x": "fx"} and cur["stops"] == 2, str(cur))
-
-        # 6. the flush merge: a close never downgrades a conversion, in either order
-        merge_script = (
-            "import json, os, sys\n"
-            "sys.path.insert(0, %r)\n"
-            "import rulebook_hook as H\n"
-            "b, s = H.pending_batches({})\n"
-            "rows = {r['fire_id']: r for batch, _ in b for r in batch}\n"
-            "print(json.dumps({k: [v.get('converted'), v.get('override_reason')] for k, v in rows.items()}))\n"
-        ) % os.path.dirname(os.path.abspath(HOOK))
-        mtd = os.path.join(td, "merge")
-        os.makedirs(os.path.join(mtd, "ledger"))
-        fire = {"fire_id": "F-%s", "rule_id": "r", "rule_version": 1, "session_id": "m", "agent_id": None,
-                "repo": "x", "branch": "b", "tool": "Bash", "hook_phase": "pre", "mode": "advise",
-                "dedup_key": None, "raw_matches_before_fire": None, "fired_at": "2026-09-14T00:00:00+00:00",
-                "converted": None, "converted_at": None, "override_reason": None, "excerpt": ""}
-        with open(os.path.join(mtd, "ledger", "fires.jsonl"), "w", encoding="utf-8") as f:
-            for k in ("ft", "tf", "f", "d"):
-                f.write(json.dumps(dict(fire, fire_id="F-" + k)) + "\n")
-        with open(os.path.join(mtd, "ledger", "conversions.jsonl"), "w", encoding="utf-8") as f:
-            f.write(json.dumps({"fire_id": "F-ft", "converted": False, "converted_at": "t", "how": "open_after_turns"}) + "\n")
-            f.write(json.dumps({"fire_id": "F-ft", "converted": True, "converted_at": "t", "how": "converted_rx"}) + "\n")
-            f.write(json.dumps({"fire_id": "F-tf", "converted": True, "converted_at": "t", "how": "converted_rx"}) + "\n")
-            f.write(json.dumps({"fire_id": "F-tf", "converted": False, "converted_at": "t", "how": "open_after_turns"}) + "\n")
-            f.write(json.dumps({"fire_id": "F-f", "converted": False, "converted_at": "t", "how": "open_after_turns"}) + "\n")
-            f.write(json.dumps({"fire_id": "F-d", "converted": False, "converted_at": "t", "how": "dismissed",
-                                "override_reason": "why"}) + "\n")
-        p = subprocess.run([sys.executable, "-c", merge_script], capture_output=True, text=True,
-                           env=dict(os.environ, MEMHUB_RULEBOOK_BASE=mtd, HOME=td, MEMHUB_TOKEN=""), timeout=30)
-        merged = json.loads(p.stdout or "{}")
-        check("outcomes: flush merge — false then true → true; true then false → true; false alone → false; "
-              "a dismissal carries its reason",
-              merged == {"F-ft": [True, None], "F-tf": [True, None], "F-f": [False, None], "F-d": [False, "why"]},
-              p.stdout + p.stderr)
+              and cur["bash_t0"] == 12.5 and cur["obligations"] == {"fx": rec("x", closed=True)}
+              and cur["stops"] == 2 and "open" not in cur, str(cur))
 if __name__ == "__main__":
     sys.exit(main())
