@@ -83,6 +83,10 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "loopback"):
             probe.probe("https://api.example.com", "org-fixture", CONTRACT)
 
+    def test_missing_release_checkout_never_falls_back_to_controller(self):
+        with self.assertRaises((FileNotFoundError, ModuleNotFoundError)):
+            probe.probe(self.base, "org-fixture", CONTRACT, Path(self.temp.name) / "missing")
+
 
 class PinTests(unittest.TestCase):
     def test_changed_contract_or_digest_cannot_pass(self):
