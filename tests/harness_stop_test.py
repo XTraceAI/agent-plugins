@@ -476,7 +476,7 @@ def test_the_nudge_line():
     # a draft may ask to BLOCK, but only when the person did and only on an
     # engine that can: the server refuses a gate on an anchor recall
     assert 'mode="gate" ONLY if' in line and "omit mode otherwise" in line
-    assert line.index("bash or edit") < line.index("Never put a person")
+    assert line.index("bash, edit or read matcher") < line.index("Never put a person")
     # The line grew when a draft became able to ASK to block: the agent needs
     # the condition (the user asked) and the shape (an engine that can block)
     # or it will guess at both. Still one line, still bounded.
