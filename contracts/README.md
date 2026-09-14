@@ -28,3 +28,10 @@ plugin binaries, production deployment, or host-to-agent upgrade messages.
 
 The backend contract commit must be published before merging this pin. Do not
 squash away the referenced commit without updating the pin to a reachable one.
+
+The controller can certify a separate immutable released plugin checkout with
+`--plugin-root`. Its actual hook, HTTP transport and manifest are loaded from
+that checkout; the controller and contract pin remain fixed. Backend CI uses
+this to exercise releases that predate the probe itself. Set
+`MEMHUB_CONTRACT_PLUGIN_SOURCE_ROOT` when running the backend tests to select
+that released source. Omitting it tests the controller checkout's own plugin.

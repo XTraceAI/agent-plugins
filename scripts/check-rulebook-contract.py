@@ -37,7 +37,7 @@ def read_contract(backend):
     return json.loads(pinned)
 
 
-def probe(base, org, contract):
+def probe(base, org, contract, plugin_root=ROOT):
     parts = urlsplit(base)
     require(parts.scheme == "http" and parts.hostname in {"127.0.0.1", "::1"}
             and parts.username is None and parts.password is None
@@ -47,7 +47,7 @@ def probe(base, org, contract):
     require(bool(token), "MEMHUB_CONTRACT_TOKEN is required")
     require("MEMHUB_RULEBOOK_HOOK_VERSION" not in os.environ,
             "candidate version override is forbidden")
-    scripts = ROOT / "plugins/memhub/scripts"
+    scripts = Path(plugin_root).resolve() / "plugins/memhub/scripts"
     sys.path.insert(0, str(scripts))
     import mcp_http
 
@@ -114,9 +114,11 @@ def main():
     parser.add_argument("--backend-root", required=True, type=Path)
     parser.add_argument("--base", required=True)
     parser.add_argument("--org", required=True)
+    parser.add_argument("--plugin-root", type=Path, default=ROOT,
+                        help="Plugin source checkout to certify (may be an older release without this probe)")
     args = parser.parse_args()
     try:
-        print(json.dumps(probe(args.base, args.org, read_contract(args.backend_root))))
+        print(json.dumps(probe(args.base, args.org, read_contract(args.backend_root), args.plugin_root)))
         return 0
     except Exception as exc:
         # Never echo HTTP bodies, credentials, or full transport exceptions.
