@@ -469,11 +469,36 @@ def test_the_nudge_line():
     assert "Never pass activate" in line and "/Users/" not in line and "@" not in line
     # the server refuses to guess a rulebook for someone bound to several
     assert line.index("list_rulebooks") < line.index("Then pass title") and "rulebook_id" in line
-    assert "ask the user which" in line
-    # the server does no title matching: a twin is found before filing, retired ones too
+    assert "ask which" in line          # several books: the agent asks, never guesses
+    # SKILL.md:107-112: include_retired matters because a DISMISSED rule is the
+    # twin you must not re-file and the default view hides it, and an unpaged
+    # scan silently misses whatever fell off page one (Codex, #222)
     assert line.index("list_rulebooks") < line.index("include_retired=true") < line.index("Then pass title")
-    assert "supersedes_rule_id" in line and "has_more" in line
-    assert len(line) < 1600
+    assert "has_more" in line and "dismissed rule" in line
+    assert "supersedes_rule_id" in line
+    # a draft may ask to BLOCK, but only when the person did and only on an
+    # engine that can: the server refuses a gate on an anchor recall
+    # This line files ADVICE. A gate has rules of its own — the disclosure, the
+    # shapes that can block before the call, the --fires/--silent proof — and
+    # they live in skills/create-rule/SKILL.md. Restating a subset here dropped
+    # whatever it missed and drifted from whatever it copied (Codex, #222), so
+    # a gate candidate is handed to the skill.
+    assert "Never pass activate or mode" in line and "create-rule skill" in line
+    assert "--fires/--silent" in line
+    # the skill knows nothing of session_draft or the stamp, and the server
+    # refuses a draft without it — so the handoff carries provenance (Codex, #222)
+    assert "hand it this turn's source, source_ref, scope_repos and state" in line
+    assert line.index("create-rule skill") < line.index("hand it this turn's")
+    assert line.index("asked for the action to be STOPPED") < line.index("Never put a person")
+    # 1800, set once and deliberately. This bound has moved four times in one
+    # PR — 1600, 1700, 1800, 1700 — which is the tell that it was being treated
+    # as an obstacle rather than a budget. The line legitimately carries more
+    # than it did at 1600: the engine contract, the twin rule, the gate handoff
+    # and the stamp that travels with it. Everything cheap has already been cut
+    # (the twin passage now says only what the server cannot do for itself);
+    # cutting further would drop instructions the agent needs. If this trips
+    # again, delete something on purpose and say which — do not raise it.
+    assert len(line) < 1800
     assert "may already be written down" in hs.nudge_line("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
     print("PASS test_the_nudge_line")
