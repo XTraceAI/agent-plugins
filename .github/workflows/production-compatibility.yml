@@ -1,0 +1,111 @@
+name: production-compatibility
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: production-plugin-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  probe-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tests/production_compatibility_test.py
+
+  production:
+    # Forks get offline tests, never production credentials. The aggregate fails
+    # on a skipped live job; a maintainer must promote reviewed code in this repo.
+    if: >-
+      (vars.MEMHUB_PLUGIN_PROD_CHECKS_ENABLED == 'true' || vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED == 'true') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    environment: production-plugin-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve the actual Claude marketplace release
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          catalog = json.loads(pathlib.Path('.claude-plugin/marketplace.json').read_text())
+          entries = [p for p in catalog['plugins'] if p['name'] == 'memhub']
+          assert len(entries) == 1, 'expected one MemHub marketplace entry'
+          source = entries[0]['source']
+          assert source['source'] == 'git-subdir'
+          assert source['url'] == 'https://github.com/XTraceAI/agent-plugins.git'
+          assert source['path'] == 'plugins/memhub'
+          sha, tag = source['sha'], source['ref']
+          assert re.fullmatch(r'[0-9a-f]{40}', sha), 'Claude SHA must be immutable'
+          assert re.fullmatch(r'memhub--v[0-9]+\.[0-9]+\.[0-9]+', tag), 'invalid Claude tag'
+          resolved = subprocess.check_output(['git', 'rev-parse', '--verify', f'refs/tags/{tag}^{{commit}}'], text=True).strip()
+          assert resolved == sha, 'Claude tag does not resolve to its pinned SHA'
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'claude-release'
+          subprocess.run(['git', 'worktree', 'add', '--detach', str(target), sha], check=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write(f'CLAUDE_RELEASE_SHA={sha}\n')
+          PY
+      - name: Check Codex and Cursor package against live production
+        env:
+          MEMHUB_PROD_READ_TOKEN: ${{ secrets.MEMHUB_PROD_READ_TOKEN }}
+          MEMHUB_PROD_FIXTURE_JSON: ${{ vars.MEMHUB_PROD_FIXTURE_JSON }}
+        run: >-
+          python3 scripts/check-production-compatibility.py
+          --plugin-root plugins/memhub --source-sha "$(git rev-parse HEAD)"
+          --report "$RUNNER_TEMP/prod-reports/main.json"
+      - name: Check the pinned Claude package against live production
+        env:
+          MEMHUB_PROD_READ_TOKEN: ${{ secrets.MEMHUB_PROD_READ_TOKEN }}
+          MEMHUB_PROD_FIXTURE_JSON: ${{ vars.MEMHUB_PROD_FIXTURE_JSON }}
+        run: >-
+          python3 scripts/check-production-compatibility.py
+          --plugin-root "$RUNNER_TEMP/claude-release/plugins/memhub"
+          --source-sha "$CLAUDE_RELEASE_SHA"
+          --report "$RUNNER_TEMP/prod-reports/claude.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prod-reports
+          if-no-files-found: ignore
+          retention-days: 30
+
+  readiness:
+    name: Production plugin readiness
+    if: always()
+    needs: [probe-tests, production]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every required job must have succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          ENFORCED: ${{ vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          passed = bool(results) and all(job['result'] == 'success' for job in results.values())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Production compatibility: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
+              out.write('Enforcement: ' + ('enabled' if os.environ['ENFORCED'] == 'true' else 'advisory') + '\n')
+          if not passed:
+              print('::warning::Production compatibility is NOT VERIFIED; checks failed or were not run.')
+              if os.environ['ENFORCED'] == 'true':
+                  raise SystemExit(1)
+          PY
