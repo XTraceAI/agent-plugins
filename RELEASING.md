@@ -40,9 +40,11 @@ guard also runs the manifest parity and test-registration suites.
 ## The procedure
 
 Backend-dependent releases must also satisfy the [compatibility contract](contracts/README.md).
-The local rulebook integration test is implemented; a required production check
-and branch/deployment protection remain follow-up work in ENG-1063. A passing
-local test is not evidence that backend support has reached production.
+The local integration test and [advisory production checks](contracts/PRODUCTION-RELEASE.md)
+are implemented. Production credentials, validation, and explicit enforcement
+activation are still required. A passing local test or advisory workflow is not
+evidence that backend support has reached production. The production checks cover
+both the main package and the separately pinned Claude package.
 
 1. **Verify BEFORE any bump merges.** The bump is the release on two
    channels. On the exact `origin/main` SHA:
