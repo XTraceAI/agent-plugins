@@ -2656,5 +2656,171 @@ def min_hook_version_checks() -> None:
         check("unknown key: an unrecognised arming event degrades",
               moonrise == "this hook does not understand "
                           "`ordering.armed_by_events:moonrise`", moonrise)
+
+    # --- advise outcomes: close on Stop, sweep at SessionEnd, named dismissal ---
+    # Every advise fire should leave with an outcome. Two writers: the Stop
+    # lane closes a fire still waiting on its conversion two Stops after it
+    # fired (`converted=false`), and a `RULEBOOK_OVERRIDE='[<label>] <why>'`
+    # on a later command records the agent setting that rule's advice aside.
+    with tempfile.TemporaryDirectory() as td:
+        # HOME=td → no token file, MEMHUB_TOKEN empty → the flush lane's POST
+        # has no credential and returns before touching any server.
+        oenv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0",
+                "HOME": td, "MEMHUB_TOKEN": ""}
+        orepo = os.path.join(td, "orepo")
+        os.makedirs(os.path.join(orepo, ".git"))
+        with open(os.path.join(orepo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "orepo", [
+            {"id": "tests-first", "title": "tests-first", "on": "bash", "rx": r"git\s+push\b",
+             "fire_scope": "session", "repo_scope": "any", "converted_rx": r"\bpytest\b",
+             "text": "Run the tests before you push", "why": "w"},
+            {"id": "no-sudo", "title": "no-sudo", "on": "bash", "rx": r"\bsudo\b",
+             "fire_scope": "session", "repo_scope": "any",
+             "text": "No sudo in this repo", "why": "w"},
+            {"id": "push-gate", "title": "push-gate", "on": "bash", "rx": r"git\s+push\s+--force",
+             "fire_scope": "session", "repo_scope": "any", "mode": "gate",
+             "text": "No force push", "why": "w"},
+        ])
+        fires_path = os.path.join(td, "ledger", "fires.jsonl")
+        convs_path = os.path.join(td, "ledger", "conversions.jsonl")
+
+        def fire_id(session, rid):
+            with open(fires_path, encoding="utf-8") as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+            hits = [r for r in rows if r["session_id"] == session and r["rule_id"] == rid]
+            return hits[-1] if hits else None
+
+        def convs_for(fid):
+            if not os.path.isfile(convs_path):
+                return []
+            with open(convs_path, encoding="utf-8") as f:
+                return [json.loads(l) for l in f if l.strip() and fid in l]
+
+        def bash(session, command, mode="pre", resp=None):
+            payload = {"cwd": orepo, "session_id": session, "tool_name": "Bash",
+                       "tool_input": {"command": command}}
+            if resp is not None:
+                payload["tool_response"] = resp
+            return run(mode, payload, oenv)
+
+        def stop(session, final=False):
+            args = [sys.executable, HOOK, "flush"] + (["final"] if final else [])
+            p = subprocess.run(args, input=json.dumps({"session_id": session, "hook_event_name": "Stop"}),
+                               capture_output=True, text=True, env=dict(os.environ, **oenv), timeout=30)
+            return p.returncode, p.stdout
+
+        def decision(out):
+            return json.loads(out)["hookSpecificOutput"].get("permissionDecision") if out.strip() else None
+
+        # 1. the Stop lane closes an open obligation at the SECOND Stop after the fire
+        rc, out = bash("o1", "git push origin main")
+        check("outcomes: the advisory names its feedback channel",
+              "RULEBOOK_OVERRIDE='[<label>] <why>'" in ctx(out), ctx(out))
+        f1 = fire_id("o1", "tests-first")
+        check("outcomes: the advise fire is in the ledger", f1 is not None and f1["converted"] is None)
+        rc, _ = stop("o1")
+        check("outcomes: one Stop after the fire — still open, nothing written",
+              rc == 0 and convs_for(f1["fire_id"]) == [], str(convs_for(f1["fire_id"])))
+        rc, _ = stop("o1")
+        c = convs_for(f1["fire_id"])
+        check("outcomes: the second Stop records converted=false, how=open_after_turns",
+              rc == 0 and len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "open_after_turns", str(c))
+        rc, _ = stop("o1")
+        check("outcomes: a closed fire is not closed again on later Stops",
+              len(convs_for(f1["fire_id"])) == 1)
+        bash("o1", "uv run pytest -q", mode="post", resp={"stdout": "ok", "exit_code": 0})
+        c = convs_for(f1["fire_id"])
+        check("outcomes: a conversion AFTER the close is still recorded as true (a closed fire is still watched)",
+              len(c) == 2 and c[-1]["converted"] is True and c[-1]["how"] == "converted_rx", str(c))
+        rc, _ = stop("o1")
+        check("outcomes: and a converted fire is forgotten — no further close",
+              len(convs_for(f1["fire_id"])) == 2)
+
+        # 2. `flush final` (SessionEnd) sweeps everything still open at once
+        bash("o2", "git push origin main")
+        f2 = fire_id("o2", "tests-first")
+        rc, _ = stop("o2", final=True)
+        c = convs_for(f2["fire_id"])
+        check("outcomes: flush final closes an open fire immediately, how=open_at_session_end",
+              rc == 0 and len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "open_at_session_end", str(c))
+
+        # 3. a named override on a LATER command dismisses an advisory by label —
+        #    even one with no conversion signal (it points at the rule's last fire)
+        bash("o3", "sudo ls /etc")
+        f3 = fire_id("o3", "no-sudo")
+        check("outcomes: the no-signal advisory fired", f3 is not None)
+        rc, out = bash("o3", "RULEBOOK_OVERRIDE='[no-sudo] the container has no sudo at all' ls /etc")
+        c = convs_for(f3["fire_id"])
+        check("outcomes: dismissal → converted=false, how=dismissed, with the reason",
+              len(c) == 1 and c[0]["converted"] is False and c[0]["how"] == "dismissed"
+              and c[0]["override_reason"] == "the container has no sudo at all", str(c))
+        check("outcomes: the dismissal is acknowledged on BOTH channels",
+              "set aside" in ctx(out) and "no-sudo" in ctx(out)
+              and "set aside" in (json.loads(out).get("systemMessage") or ""), out)
+        check("outcomes: a dismissal never blocks the call", decision(out) != "deny")
+        check("outcomes: a dismissal is not itself a fire", fire_id("o3", "no-sudo")["fire_id"] == f3["fire_id"])
+        rc, out = bash("o3", "RULEBOOK_OVERRIDE='[nothing-fired-here] why' ls")
+        check("outcomes: a label naming nothing that fired records nothing and says nothing",
+              out.strip() == "" and len(convs_for(f3["fire_id"])) == 1, out)
+
+        # 4. the same named form still excuses a gate it names on THIS call —
+        #    and records the bare reason, not the label
+        rc, out = bash("o4", "RULEBOOK_OVERRIDE='[push-gate] hotfix, CI is green' git push --force")
+        g4 = fire_id("o4", "push-gate")
+        check("outcomes: a named override excuses the gate it names",
+              decision(out) != "deny" and g4 is not None and g4["mode"] == "gate"
+              and g4["override_reason"] == "hotfix, CI is green", out)
+        check("outcomes: excusing a gate is not a dismissal", convs_for(g4["fire_id"]) == [])
+        rc, out = bash("o4b", "RULEBOOK_OVERRIDE='hotfix' git push --force")
+        check("outcomes: the unnamed form is unchanged — excuses the gate on this call",
+              decision(out) != "deny" and fire_id("o4b", "push-gate")["override_reason"] == "hotfix", out)
+
+        # 5. a named form that names ANOTHER rule does not excuse the gate;
+        #    the gate stands and the named advisory is still dismissed
+        bash("o5", "sudo ls")
+        f5 = fire_id("o5", "no-sudo")
+        rc, out = bash("o5", "RULEBOOK_OVERRIDE='[no-sudo] not this box' git push --force")
+        check("outcomes: naming a different rule leaves the gate standing",
+              decision(out) == "deny" and fire_id("o5", "push-gate")["override_reason"] is None, out)
+        c = convs_for(f5["fire_id"])
+        check("outcomes: …and the named advisory is dismissed on that same call",
+              len(c) == 1 and c[0]["how"] == "dismissed" and c[0]["override_reason"] == "not this box", str(c))
+        rc, out = bash("o6", "RULEBOOK_OVERRIDE='[push-gate]' git push --force")
+        check("outcomes: a label with no reason is no override — the gate stands", decision(out) == "deny", out)
+
+        # 6. the flush merge: a close never downgrades a conversion, in either order
+        merge_script = (
+            "import json, os, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import rulebook_hook as H\n"
+            "b, s = H.pending_batches({})\n"
+            "rows = {r['fire_id']: r for batch, _ in b for r in batch}\n"
+            "print(json.dumps({k: [v.get('converted'), v.get('override_reason')] for k, v in rows.items()}))\n"
+        ) % os.path.dirname(os.path.abspath(HOOK))
+        mtd = os.path.join(td, "merge")
+        os.makedirs(os.path.join(mtd, "ledger"))
+        fire = {"fire_id": "F-%s", "rule_id": "r", "rule_version": 1, "session_id": "m", "agent_id": None,
+                "repo": "x", "branch": "b", "tool": "Bash", "hook_phase": "pre", "mode": "advise",
+                "dedup_key": None, "raw_matches_before_fire": None, "fired_at": "2026-09-14T00:00:00+00:00",
+                "converted": None, "converted_at": None, "override_reason": None, "excerpt": ""}
+        with open(os.path.join(mtd, "ledger", "fires.jsonl"), "w", encoding="utf-8") as f:
+            for k in ("ft", "tf", "f", "d"):
+                f.write(json.dumps(dict(fire, fire_id="F-" + k)) + "\n")
+        with open(os.path.join(mtd, "ledger", "conversions.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"fire_id": "F-ft", "converted": False, "converted_at": "t", "how": "open_after_turns"}) + "\n")
+            f.write(json.dumps({"fire_id": "F-ft", "converted": True, "converted_at": "t", "how": "converted_rx"}) + "\n")
+            f.write(json.dumps({"fire_id": "F-tf", "converted": True, "converted_at": "t", "how": "converted_rx"}) + "\n")
+            f.write(json.dumps({"fire_id": "F-tf", "converted": False, "converted_at": "t", "how": "open_after_turns"}) + "\n")
+            f.write(json.dumps({"fire_id": "F-f", "converted": False, "converted_at": "t", "how": "open_after_turns"}) + "\n")
+            f.write(json.dumps({"fire_id": "F-d", "converted": False, "converted_at": "t", "how": "dismissed",
+                                "override_reason": "why"}) + "\n")
+        p = subprocess.run([sys.executable, "-c", merge_script], capture_output=True, text=True,
+                           env=dict(os.environ, MEMHUB_RULEBOOK_BASE=mtd, HOME=td, MEMHUB_TOKEN=""), timeout=30)
+        merged = json.loads(p.stdout or "{}")
+        check("outcomes: flush merge — false then true → true; true then false → true; false alone → false; "
+              "a dismissal carries its reason",
+              merged == {"F-ft": [True, None], "F-tf": [True, None], "F-f": [False, None], "F-d": [False, "why"]},
+              p.stdout + p.stderr)
 if __name__ == "__main__":
     sys.exit(main())

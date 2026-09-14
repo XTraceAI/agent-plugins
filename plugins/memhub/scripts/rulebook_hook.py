@@ -17,7 +17,13 @@ Lanes (the mode argument):
            it DETACHED so SessionStart never waits on the network.
   flush    Stop / SessionEnd: POST unsent ledger rows to /fires in batches,
            behind a sent-watermark (ledger/.sent). `flush final` ignores the
-           every-N-fires / every-M-minutes throttle.
+           every-N-fires / every-M-minutes throttle. First, the session's
+           open obligations are closed: a fire still waiting on its
+           conversion at the second Stop after it fired is recorded
+           `converted=false` (`flush final` closes them all), so a rule's
+           record says "not followed" instead of nothing. A conversion that
+           lands later still wins — the hook keeps watching a closed fire,
+           and the server keeps a true over a false.
 
 Book = the server book, cached with its ETag. SessionStart re-fetches a stale
 one BEFORE the digest renders (a fresh one just spawns the detached child), and
@@ -2493,9 +2499,19 @@ def pending_batches(sent):
     # Only conversions past THEIR watermark need merging: the two offsets
     # advance together, so an older conversion was shipped with its fire.
     for c in new_convs:
-        if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
-            by_id[c["fire_id"]]["converted"] = True
-            by_id[c["fire_id"]]["converted_at"] = c.get("converted_at")
+        if not (isinstance(c, dict) and c.get("fire_id") in by_id):
+            continue
+        row = by_id[c["fire_id"]]
+        if c.get("converted"):
+            row["converted"] = True
+            row["converted_at"] = c.get("converted_at")
+        elif c.get("converted") is False and row.get("converted") is None:
+            # a close never downgrades a conversion already on the row, in
+            # either order the two rows were written
+            row["converted"] = False
+            row["converted_at"] = c.get("converted_at")
+        if c.get("override_reason") and not row.get("override_reason"):
+            row["override_reason"] = c["override_reason"]
     # (row, fires_offset once this row is accepted); conversion re-sends carry
     # no fires progress of their own, so they inherit the last fire's offset.
     items, seen = [], set()
@@ -2782,7 +2798,8 @@ def state_path(session_id):
 
 def load_state(p):
     st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {},
-          "armed_once": [], "armed_fire": {}, "armed_version": {}}
+          "armed_once": [], "armed_fire": {}, "armed_version": {},
+          "closed": {}, "open_at": {}, "last_fire": {}, "stops": 0}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2790,6 +2807,11 @@ def load_state(p):
         pass
     if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
         st["armed"] = {}
+    for k in ("closed", "open_at", "last_fire", "open"):
+        if not isinstance(st.get(k), dict):
+            st[k] = {}
+    if not isinstance(st.get("stops"), int):
+        st["stops"] = 0
     if not isinstance(st.get("armed_once"), list):
         st["armed_once"] = []
     if not isinstance(st.get("armed_fire"), dict):
@@ -3304,6 +3326,14 @@ def find_edit_override(body):
 # was STOPPED — and every other fire, including a gate someone overrode, takes
 # `📏`. The sentence is identical either way, so the shape is one recognisable
 # thing and the symbol is what says whether work was actually halted.
+# Appended under the advisories of an emitting call (never under a gate alone):
+# the call has already run, so the reason for going on without the advice
+# travels on the NEXT shell command, naming the rule. One constant, so a test
+# can pin the block around it without re-typing it.
+ADVISE_FEEDBACK_HINT = (
+    "_If you go on without following one of these, say why on your next shell command — "
+    "`RULEBOOK_OVERRIDE='[<label>] <why>' <command>` — so the reason is recorded against "
+    "that rule instead of silence._")
 DISCLOSE_ADVISORY = "📏"
 DISCLOSE_BLOCKED = "⛔️"
 DISCLOSE_PREFIX = "Rule fired: "
@@ -3504,18 +3534,116 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     return ids
 
 
-def log_conversion(fire_id, how):
+def log_conversion(fire_id, how, converted=True, override_reason=None):
     """Append-only sidecar (the fires file is shared across sessions, so it
-    is never rewritten in place). A reader merges by fire_id."""
+    is never rewritten in place). A reader merges by fire_id.
+
+    `converted=False` records a NON-conversion: the fire's obligation was
+    still open past its turns (`open_after_turns`), still open at session end
+    (`open_at_session_end`), or the agent set the advice aside by name
+    (`dismissed`, carrying the reason it gave). Neither the reader below nor
+    the server lets a False downgrade a True."""
     if portable_lock is None:
         return
     try:
+        row = {"fire_id": fire_id, "converted": bool(converted),
+               "converted_at": _now(), "how": how}
+        if override_reason:
+            row["override_reason"] = override_reason
         with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
                   encoding="utf-8") as f:
-            f.write(json.dumps({"fire_id": fire_id, "converted": True,
-                                "converted_at": _now(), "how": how}) + "\n")
+            f.write(json.dumps(row) + "\n")
     except Exception:
         pass
+
+
+CLOSE_OPEN_AFTER_STOPS = 2   # a fire still open at the 2nd Stop after it is recorded not converted
+
+
+def _forget_obligation(st, rid):
+    """Drop every trace of a rule's obligation: open or closed, its wait, and
+    the file an edit rule was watching."""
+    st["open"].pop(rid, None)
+    st.setdefault("closed", {}).pop(rid, None)
+    st.setdefault("open_at", {}).pop(rid, None)
+    st.setdefault("open_file", {}).pop(rid, None)
+
+
+def close_open_obligations(session, *, final):
+    """Record `converted=false` for this session's fires still waiting on a
+    conversion — the Stop lane's job (one Stop = one assistant turn) and
+    `flush final`'s sweep.
+
+    Age is counted in Stops, not seconds: a fire from turn N closes at the
+    Stop that ends turn N+1, so the agent had the rest of the turn it fired in
+    and one whole turn after. `final` closes everything open at once — but
+    SessionEnd is not reliable (a closed window skips it), which is why the
+    per-turn close is the writer and the sweep is only a sweep.
+
+    A close is not a verdict. The fire moves from `open` to `closed` and the
+    conversion pass keeps watching both, so an action that lands later still
+    records `converted=true` (and the server keeps a true over a false). What
+    a close changes is the default: a fire nobody acted on now says so."""
+    sp = state_path(session)
+    st = load_state(sp)
+    before = snapshot_arming(st)
+    if not final:
+        st["stops"] = int(st.get("stops") or 0) + 1
+    for rid, fid in list(st["open"].items()):
+        # an obligation an older hook opened carries no wait; close it now
+        opened = int(st["open_at"].get(rid, 0) or 0)
+        if not final and st["stops"] - opened < CLOSE_OPEN_AFTER_STOPS:
+            continue
+        if fid:
+            log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
+                           converted=False)
+            st["closed"][rid] = fid
+        del st["open"][rid]
+        st["open_at"].pop(rid, None)
+    save_state(sp, st, before=before)
+
+
+# `RULEBOOK_OVERRIDE='[<label>] <why>'` — the label rides INSIDE the value.
+# `RULEBOOK_OVERRIDE[label]=…` reads as an array subscript to zsh and fails
+# the command before the hook ever sees it; a plain assignment is valid in
+# every shell the hook runs under.
+_NAMED_REASON_RX = re.compile(r"^\[([^\]\r\n]+)\]\s*(.*)$", re.S)
+
+
+def split_named_override(reason):
+    """`[<label>] <why>` → (label lowered, why); a bare reason → (None, reason)."""
+    m = _NAMED_REASON_RX.match(reason or "")
+    if not m:
+        return None, reason
+    return m.group(1).strip().lower(), m.group(2).strip()
+
+
+def apply_dismissals(st, rules, dismissals, *, allow_last_fire):
+    """Record each `{label: why}` as a dismissal of that rule's fire in this
+    session — `converted=false` with the reason — on the fire still waiting
+    on its conversion, or, when `allow_last_fire`, on the rule's most recent
+    fire (a rule with no conversion signal has no obligation to point at; the
+    one-shot shell form may still answer it, a durable edit marker may not).
+    Returns `[(label, why)]` for what was recorded, so the caller can say so.
+    A label naming nothing that fired this session records nothing."""
+    done = []
+    for label, why in dismissals.items():
+        if not label or not why:
+            continue
+        hit = next((r for r in rules
+                    if str(r.get("_label") or r["id"]).lower() == label
+                    or str(r["id"]).lower() == label), None)
+        if not hit:
+            continue
+        rid = hit["id"]
+        fid = st["open"].get(rid) or st["closed"].get(rid) \
+            or (st["last_fire"].get(rid) if allow_last_fire else None)
+        if not fid:
+            continue
+        log_conversion(fid, "dismissed", converted=False, override_reason=why)
+        _forget_obligation(st, rid)
+        done.append((hit.get("_label") or rid, why))
+    return done
 
 
 # §2. A CONSTANT, not a template: no rule counts, no repo name, nothing that
@@ -3688,12 +3816,21 @@ def main():
             return 2
         print(book_path(repo))
         return 0
-    if mode == "flush":                # needs nothing from the event payload
+    if mode == "flush":
+        final = "final" in sys.argv[2:]
+        # The payload's one useful field: which session's open obligations to
+        # close before the rows go out. Anything unreadable → just flush.
         try:
-            sys.stdin.read()
+            data = json.loads(sys.stdin.read() or "{}")
         except Exception:
-            pass
-        flush_fires(final="final" in sys.argv[2:])
+            data = {}
+        session = data.get("session_id") if isinstance(data, dict) else None
+        if session:
+            try:
+                close_open_obligations(session, final=final)
+            except Exception:
+                pass
+        flush_fires(final=final)
         return 0
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -3785,6 +3922,14 @@ def main():
         if found:
             override_reason = redact_secrets(found[0])[:2000]
             cmd = strip_override(cmd, found)   # rules match the command, not the assignment
+    # `RULEBOOK_OVERRIDE='[<label>] <why>'` names its rule: a gate on THIS
+    # call by that label is excused; otherwise it is the agent setting an
+    # earlier advisory aside, and the reason is recorded on that rule's fire.
+    override_label = None
+    if override_reason is not None:
+        override_label, override_reason = split_named_override(override_reason)
+        if override_label is not None and not override_reason:
+            override_label, override_reason = None, None   # `'[x]'` alone: no reason, no override
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
@@ -3856,8 +4001,10 @@ def main():
                            "via": "bash-read", "read": read_facts(path, pulled=pulled)})
 
     # Conversions: did this call perform the action an earlier fire asked for?
-    # Deterministic, under-counts, never over-counts (spec §5.1).
-    for rid, fid in list(st["open"].items()):
+    # Deterministic, under-counts, never over-counts (spec §5.1). A fire the
+    # Stop lane already closed is still watched: a late action is still the
+    # action, and its `true` outranks the close.
+    for rid, fid in list(st["open"].items()) + list(st["closed"].items()):
         r = by_id.get(rid)
         if not r:
             continue
@@ -3865,8 +4012,7 @@ def main():
         if mode == "post" and tool == "Bash" and crx and cmd \
                 and re.search(crx, strip_comments(shell_only(cmd)), re.I | re.M):
             log_conversion(fid, "converted_rx")
-            del st["open"][rid]
-            st.get("open_file", {}).pop(rid, None)
+            _forget_obligation(st, rid)
             continue
         if r.get("on") != "edit" or "content_rx" not in r:
             continue
@@ -3876,9 +4022,17 @@ def main():
                     and not evaluate(r, hook_phase="pre", tool=ev["tool"], file_path=ev["fp"],
                                      body=ev["body"]):
                 log_conversion(fid, "re-edit-clears")
-                del st["open"][rid]
-                st.get("open_file", {}).pop(rid, None)
+                _forget_obligation(st, rid)
                 break
+
+    # A named override, or an edit marker, that names no gate on this call is
+    # the agent setting an earlier advisory aside. Collected here, before the
+    # fire pass: the command carrying it usually fires nothing itself.
+    dismissals = {}
+    if mode == "pre" and override_label is not None:
+        dismissals[override_label] = override_reason
+    elif mode == "pre" and edit_markers:
+        dismissals = {k: v for k, v in edit_markers.items() if k}
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -3992,7 +4146,19 @@ def main():
             fired_on[rid] = ev
 
     if not fired_now:
+        set_aside = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
+            if dismissals else []
         save_state(sp, st, before=before)
+        if set_aside:
+            # Say so on both channels: a recorded reason nobody can see is
+            # the silence this exists to replace.
+            try:
+                emit("PreToolUse",
+                     "\n".join(f"_Recorded: [{label}] set aside — {why}_" for label, why in set_aside),
+                     user_line="\n".join(f"{BRAND} ▸ [{label}] set aside: {why}"
+                                         for label, why in set_aside))
+            except Exception:
+                pass
         return 0
 
     # §5.3: which of this call's fires are GATES. Only a call the hook sees
@@ -4030,13 +4196,24 @@ def main():
         return str(r.get("_label") or r["id"]).lower()
 
     overridden = {}
-    if override_reason is not None:
+    if override_reason is not None and override_label is None:
         overridden = {r["id"]: override_reason for r in fired_now if r["id"] in gate_ids}
+    elif override_reason is not None:
+        # the named shell form excuses exactly the gate it names, as an edit
+        # marker does; a label that names no gate here stays a dismissal
+        for r in (r for r in fired_now if r["id"] in gate_ids):
+            if override_label in (_label_of(r), str(r["id"]).lower()):
+                overridden[r["id"]] = override_reason
+                dismissals.pop(override_label, None)
     elif edit_markers:
         for r in (r for r in fired_now if r["id"] in gate_ids):
             named = edit_markers.get(_label_of(r)) or edit_markers.get(str(r["id"]).lower())
             if named:
                 overridden[r["id"]] = named
+                dismissals.pop(_label_of(r), None)
+                dismissals.pop(str(r["id"]).lower(), None)
+    set_aside = apply_dismissals(st, rules, dismissals, allow_last_fire=(tool == "Bash")) \
+        if dismissals else []
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4058,6 +4235,9 @@ def main():
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
     user_lines, deny_lines = [], []
+    for label, why in set_aside:
+        lines.append(f"_Recorded: [{label}] set aside — {why}_")
+        user_lines.append(f"{BRAND} ▸ [{label}] set aside: {why}")
 
     def _where(r):
         """A fire from a file the Bash call wrote names the file: the model
@@ -4111,6 +4291,11 @@ def main():
         disclosures.append(line)
         user_lines.append(line)
         user_lines.append("   " + detail_line)
+    # The advisory's feedback channel. The call has already run, so a reason
+    # travels on the NEXT shell command, naming the rule — what turns a silent
+    # non-conversion into a recorded one the rule's reviewer can read.
+    if any(r["id"] not in gate_ids for r in shown):
+        lines.append(ADVISE_FEEDBACK_HINT)
     deny = None
     if blocked:
         # Each lane names the override it actually accepts: an Edit tool call
@@ -4178,12 +4363,16 @@ def main():
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
+        if ids.get(r["id"]):
+            st["last_fire"][r["id"]] = ids[r["id"]]    # what a named dismissal points at
         if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
             st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
         elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):
             ordering.mark_fired(r["id"], ids[r["id"]])
         elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
             st["open"][r["id"]] = ids.get(r["id"])
+            st["open_at"][r["id"]] = int(st.get("stops") or 0)   # the wait starts now
+            st["closed"].pop(r["id"], None)                      # a fresh fire replaces a closed one
             if r.get("on") == "edit":
                 ev = fired_on.get(r["id"])
                 st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
