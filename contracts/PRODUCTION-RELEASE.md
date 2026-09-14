@@ -12,8 +12,9 @@ still applies; this change does not switch development or publish a plugin.
 
 ## What runs
 
-The public `production-compatibility.yml` runs offline probe failure tests on PRs
-to main. Once live checks are enabled, it tests both the PR's merged main package
+The public `production-compatibility.yml` runs all offline plugin suites, native
+install/upgrade checks, and synthetic upgrade-policy checks on PRs to main. Once
+live checks are enabled, it tests both the PR's merged main package
 (Codex/Cursor) and the exact commit/tag selected by the Claude marketplace. A
 missing tag, wrong SHA, or non-production source is a failure. Main changes and
 Claude pin changes use the same workflow, with no path filter or label exemption.
@@ -42,7 +43,10 @@ deployment SHA or every serving replica**. It does not yet test MCP sessions,
 capture, host hook delivery, or every plugin API. Those remain separate release
 checks. A later backend deployment can invalidate earlier compatibility evidence;
 rerun immediately before merging a release. Backend CI must still protect already
-supported plugin versions.
+supported plugin versions. The workflow now also includes the separate
+[full release checks](FULL-RELEASE-CHECKS.md), including real host sessions. Those
+checks need their own credentials and fixtures; their known coverage gaps prevent
+the aggregate from claiming the release is verified.
 
 ## Setup, then opt in
 
