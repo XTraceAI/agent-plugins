@@ -249,6 +249,11 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                     continue
                 txt = _SYS_BLOCK.sub("", _text_of(content)).strip()
                 if rec.get("isMeta") and txt.startswith(STOP_FEEDBACK_PREFIX):
+                    # The stopped turn ENDS here. What follows is the blocked
+                    # continuation (the create-rule flow, the verdict), not the
+                    # person's turn; left attached, a late extractor would hand
+                    # the classifier the harness's own output (Codex, #230).
+                    cur = None
                     continue
                 if is_harness_text(txt):
                     continue

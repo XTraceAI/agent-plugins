@@ -550,6 +550,12 @@ def test_a_recorded_block_is_not_a_turn():
                 {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
                 {"type": "user", "isMeta": True, "uuid": "m1",
                  "message": {"content": f"Stop hook feedback:\n{reason}"}},
+                # the blocked continuation: its actions and verdict are not turn 1's
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c1", "name": "Bash",
+                     "input": {"command": "python3 rulebook_verify.py --rule-file cand.json"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "E boom", "is_error": True}]}},
                 {"type": "assistant", "message": {"content": [
                     {"type": "text", "text": "No rule from turn 1: project state"}]}},
                 {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}},
@@ -561,6 +567,9 @@ def test_a_recorded_block_is_not_a_turn():
         assert [t["user"] for t in turns] == ["fix the deploy", "now the tests",
                                               "Stop hook feedback: why did it block me?"], turns
         assert [t["n"] for t in turns] == [1, 2, 3]
+        # the stopped turn ends at the feedback record: a late extractor must not
+        # hand the classifier the harness's own flow as turn 1 (Codex, #230)
+        assert turns[0]["asst"] == "done" and turns[0]["tools"] == [] and turns[0]["results"] == [], turns[0]
     print("PASS test_a_recorded_block_is_not_a_turn")
 
 
