@@ -2,9 +2,11 @@
 
 The production readiness check requires every deterministic job to succeed. Missing credentials,
 skipped jobs, unsupported host operations and failed assertions mean **NOT VERIFIED**.
-While `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` is unset, the aggregate reports that
-result without blocking merges. Do not enable enforcement until the gaps below
-are closed and all enabled hosts have a real successful run and a deliberate failure run.
+`MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED=true` makes the aggregate fail on NOT
+VERIFIED, and the active `main` ruleset requires it (see
+[.github/rulesets/README.md](../.github/rulesets/README.md)). The release
+owner approves the `production-plugin-release` environment per run; that
+approval is the human gate on every production release.
 
 ## Coverage and evidence
 
@@ -160,9 +162,9 @@ ingestion or a linked session UI record. The raw native rule-fire session ID
 differs from capture's `codex-`-prefixed source ID; that identity fix and a backend
 readback assertion are separate follow-up work.
 
-Keep `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` unset and the production ruleset disabled.
-Staging is not part of this setup, and its manifest is not advanced by a production
-release.
+Enforcement is on: `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED=true` and the `main`
+ruleset active, since 2026-09-15. Staging is not part of this setup, and its
+manifest is not advanced by a production release.
 
 ## Host references
 
