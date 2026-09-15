@@ -17,21 +17,26 @@ approval is the human gate on every production release.
 | Fresh install | Native host registers the selected version and installs identical package bytes | Codex and Claude native CLI, isolated home |
 | Upgrade | Older immutable release installs, native update selects candidate bytes; updated Codex setup installs the current bridge | Codex and Claude native CLI, isolated home |
 | Cursor marketplace lifecycle | Actual install/update through its supported distribution surface | **Not verified: desktop/account runner still needed** |
-| Agent advice | A real hook fire plus the final assistant answer contains a marker absent from the user prompt | Each actual host CLI against production |
+| Agent advice | A real hook fire plus a marker absent from the user prompt in the agent's structured final answer (its `advice` field, or anywhere in the final text) | Each actual host CLI against production |
 | Agent gating | A gate fire for that native session and absence of the forbidden marker file | Each actual host CLI against production |
 | Allowed operation | The same session creates an unrelated file with the run's unique contents | Each actual host CLI against production |
 | Automatic capture | Fresh successful capture acknowledgement for the exact native session ID; Claude requires both turn and session-end capture | Each actual host CLI against production |
 | Upgrade response contract | Existing gate works, synthetic 426 surfaces actionable notice, stale gate stops, rollback restores it | Actual package with loopback HTTP server |
 | Upgrade notice reaches the host | The pinned host CLI starts the package's SessionStart hook and takes the notice: Claude reports it in its own `hook_response` record; Codex leaves the hook's per-session marker after the version-carrying fetch | Each actual host CLI, no prompt, no model, no credentials (`check-host-session-start.py`) |
-| Upgrade notice reaches the model | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server, on demand |
+| Upgrade notice reaches the model | Real agent's structured final answer carries the error code, a per-run nonce minimum version that exists only in the 426 body, and a restart instruction | Each actual host CLI against loopback HTTP server, on demand |
 
 The four real-agent rows (advice, gating, allowed operation, capture) and the
 model-side upgrade-notice row run in `real-agent-evidence.yml`, which is
-`workflow_dispatch` only. They cost model turns, leave synthetic sessions in
-the fixture org, and assert on what a model chooses to say (the upgrade-notice
-check flipped between pass and fail on byte-identical packages, same pinned
-CLI and same model within one hour), so they run when a developer decides the
-PR is ready rather than on every push. Their aggregate check, `Real agent
+`workflow_dispatch` only. They cost model turns and leave synthetic sessions
+in the fixture org, so they run when a developer decides the PR is ready
+rather than on every push. Their assertions are built not to depend on prose
+style: each prompt names the facts to report and asks for one JSON object
+with fixed keys, the hosts are given that schema (`claude --json-schema`,
+`codex exec --output-schema`), the harness compares fields and falls back to
+the final text, and the minimum version is a per-run nonce so the answer can
+only contain it by reading the notice. The live prompt writes the allowed
+file before the command a hook denies and names the denial as expected, so a
+model that stops at a denial does not read as a plugin failure. Their aggregate check, `Real agent
 evidence`, is required on `main`: absent until the workflow has run on the
 PR's head commit, so the merge waits for it without a fake failure. See
 [.github/rulesets/README.md](../.github/rulesets/README.md) for the flow.

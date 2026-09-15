@@ -14,9 +14,13 @@ from release_check_lib import Report, isolated_env, require, run
 
 
 class PolicyServer:
-    def __init__(self):
+    def __init__(self, minimum_version="999.0.0"):
+        # The contract test keeps the constant; the real-agent session passes a
+        # per-run nonce so the only way an answer can contain the version is
+        # by having read the notice.
         self.reject = False
         self.requests = []
+        self.minimum_version = minimum_version
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -28,8 +32,8 @@ class PolicyServer:
                 status = 426 if owner.reject else 200
                 if owner.reject:
                     body = {"code": 426, "msg": "PLUGIN_UPGRADE_REQUIRED: Update MemHub and restart your agent session.",
-                            "data": {"error_code": "PLUGIN_UPGRADE_REQUIRED", "minimum_version": "999.0.0",
-                                     "current_version": "0.0.0", "policy_revision": "rulebook-v1:999.0.0",
+                            "data": {"error_code": "PLUGIN_UPGRADE_REQUIRED", "minimum_version": owner.minimum_version,
+                                     "current_version": "0.0.0", "policy_revision": "rulebook-v1:" + owner.minimum_version,
                                      "scope": "rulebook_fetch", "retryable": False}}
                 else:
                     body = {"code": 0, "data": {"rules": [{

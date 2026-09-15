@@ -21,9 +21,13 @@ developer runs the real-agent workflow on the branch:
 gh workflow run real-agent-evidence.yml --ref <branch>
 ```
 
-Until that run exists for the PR's head commit the third check is absent
-("expected") and the merge is blocked; when it passes, the developer merges.
-A further push makes a new head with no evidence, so the run is repeated. The
+The run publishes its verdict as a commit status named `Real agent evidence`
+on the head it tested (a pull request's rollup never sees the check run of a
+`workflow_dispatch` run, so the workflow's own check would not count). Until
+that status exists for the PR's head commit the third check is absent
+("expected") and the merge is blocked; when it is `success`, the developer
+merges. A further push makes a new head with no evidence, so the run is
+repeated. The
 `production-plugin-release` environment holds the production test credentials
 and has no required reviewers: CI, not a person, is the release gate. Merging
 to `main` is the production release on the unpinned channels
