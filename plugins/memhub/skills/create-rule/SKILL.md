@@ -22,6 +22,24 @@ Arguments: `$ARGUMENTS`
 - Remaining text = the rule in the user's words. If absent, ask for it — one
   sentence, ideally already conditional ("when X, do/never Y").
 
+## Handed a turn by the harness
+
+MemHub's harness can block a stop with `MemHub harness: before you stop: turn
+N of this session was flagged as …`. Then you are here because a turn was
+flagged, not because the user asked for a rule, and two things differ:
+
+- **First decide whether there is a lesson at all**, by the test the harness
+  line gives. If there is none — or the user, asked in step 1, declines — end
+  with the one line the harness asked for (`No rule from turn N: <why>`) and do
+  nothing else.
+- **If there is, run this whole flow** with the lesson as the user's words.
+  In step 5 pass the `source`, `source_ref`, `scope_repos` and `state` the
+  harness handed you, verbatim; they replace the `source_ref` step 5
+  describes (put the step-1b numbers in your report instead). MemHub refuses a
+  `session_draft` without its `state`, and nothing else in the session has it.
+
+`mode: "gate"` still needs the user's own words asking for a block (step 3).
+
 ## 0. Which rulebook — resolve it first
 
 A **rulebook** is a container with its own membership: whoever is a member has

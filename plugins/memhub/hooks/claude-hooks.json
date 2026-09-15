@@ -160,16 +160,6 @@
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" prompt; fi"
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 5,
-            "statusMessage": "MemHub: checking for a flagged moment",
-            "command": "IN=$(cat); case \"${MEMHUB_HARNESS_EXTRACT:-}\" in 1|[Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) ;; *) exit 0 ;; esac; if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py\" prompt; fi"
-          }
-        ]
       }
     ],
     "Stop": [

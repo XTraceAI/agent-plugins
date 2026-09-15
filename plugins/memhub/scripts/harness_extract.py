@@ -19,10 +19,11 @@ turn through this pipeline in a detached child:
                  `/v1/team/rulebook/harness/classify`: is this moment worth
                  handing to the agent, and of what kind.
     moment       on a signal, the turn, kind, router hint and state stamp,
-                 appended to a local file for the prompt lane to hand over.
+                 appended to a local file for a later Stop to hand over.
 
-The agent that lived the turn writes the lesson, if there is one, at the next
-prompt (`harness_stop.py prompt`), through the memhub `create_rule` tool.
+The agent that lived the turn writes the lesson, if there is one, when a later
+Stop blocks on the moment (`harness_stop.py stop`): it runs the memhub
+create-rule skill, or says in one line why there is no rule.
 
 Everything is bounded and fails open: one attempt at the server, no retry, and
 every failure is "no signal" with a reason. Stdlib only, like every other
@@ -153,6 +154,10 @@ _HARNESS_PREFIX = (
     "This session is being continued from a previous conversation",
     "[Request interrupted by user",
 )
+# A blocked Stop's reason, recorded as an `isMeta` user record (verified on
+# Claude Code 2.1.270). Matched on the flag AND the text, never the text alone:
+# a person can type a prompt that starts with these words (Codex, #230).
+STOP_FEEDBACK_PREFIX = "Stop hook feedback:"
 # Named wrappers only. A person's prompt can begin with pasted HTML or a
 # Markdown heading, and dropping it would attribute that turn's actions to the
 # turn before.
@@ -243,6 +248,13 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                         })
                     continue
                 txt = _SYS_BLOCK.sub("", _text_of(content)).strip()
+                if rec.get("isMeta") and txt.startswith(STOP_FEEDBACK_PREFIX):
+                    # The stopped turn ENDS here. What follows is the blocked
+                    # continuation (the create-rule flow, the verdict), not the
+                    # person's turn; left attached, a late extractor would hand
+                    # the classifier the harness's own output (Codex, #230).
+                    cur = None
+                    continue
                 if is_harness_text(txt):
                     continue
                 cur = {"n": before + len(turns) + 1, "user": txt, "tools": [], "results": [],

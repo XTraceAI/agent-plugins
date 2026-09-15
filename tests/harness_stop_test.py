@@ -5,10 +5,12 @@ What these protect: with the flag off nothing happens at all; with it on the
 Stop hook returns at once and takes the turn's error arcs at the boundary; a
 detached child classifies each turn exactly once; a failure and its fix are
 one moment; the child classifies the turn that stopped even when the next
-prompt has already landed; a flagged moment is handed to the main agent once,
-at the next prompt, with its stamp, and a moment the child appends meanwhile
-is never lost; the proposal is scoped to the repository the turn worked in;
-subagents never take a moment; nothing in the sensor sends `activate`. No test reaches a server: `server_classify` is substituted.
+prompt has already landed; a flagged moment BLOCKS a later Stop of the main
+agent once, with its stamp, the continuation's own Stop passes, and a moment
+the child appends meanwhile is never lost; the recorded block never becomes a
+turn; the proposal is scoped to the repository the turn worked in; subagents
+never take a moment; nothing in the sensor sends `activate`. No test reaches a
+server: `server_classify` is substituted.
 """
 from __future__ import annotations
 
@@ -109,7 +111,7 @@ def test_with_the_flag_off_nothing_happens():
         os.environ["MEMHUB_HARNESS_EXTRACT"] = "0"
         tp = env.base / "s.jsonl"
         _transcript(tp, [("i mean staging", "ok", [])])
-        for mode in ("stop", "prompt", "extract"):
+        for mode in ("stop", "extract"):
             proc = subprocess.run(
                 [sys.executable, str(SCRIPTS / "harness_stop.py"), mode,
                  "--session", "s", "--transcript", str(tp)],
@@ -195,6 +197,13 @@ def test_a_failure_and_its_fix_are_one_moment_taken_at_the_boundary():
         # the router sees the arc on a turn whose transcript shows no error
         hits = hx.route({"n": 1, "user": "ok", "asst": "done", "tools": [], "results": []}, None, arcs=arcs)
         assert dict(hits)["error_arc"] == "missing-module"
+        # a blocked continuation's arcs are drained at its own Stop, which spawns
+        # nothing: the next ordinary turn must not inherit them (Codex, #230)
+        _post(repo, "arc", "make y", {"stdout": "", "stderr": "E boom", "exit_code": 1})
+        _post(repo, "arc", "make y", {"stdout": "ok", "exit_code": 0})
+        assert _spawns(lambda: hs.cmd_stop({"session_id": "arc", "transcript_path": str(tp),
+                                            "stop_hook_active": True})) == []
+        assert rh.take_error_arcs("arc") == [], "the continuation's arcs were drained"
         # with the flag off the hook records nothing
         os.environ["MEMHUB_HARNESS_EXTRACT"] = "0"
         _post(repo, "off", "pytest", {"stdout": "", "stderr": "E", "exit_code": 1})
@@ -279,7 +288,7 @@ def test_extract_takes_the_turn_that_stopped_not_the_prompt_queued_after_it():
     print("PASS test_extract_takes_the_turn_that_stopped_not_the_prompt_queued_after_it")
 
 
-# ------------------------------------------------------------- prompt lane
+# ------------------------------------------------------------- the handoff
 def _moment(n, kind="correction", hint="wrong_target", session="sess"):
     return {"turn": n, "source_ref": f"{session}#{n}", "hint": hint, "kind": kind,
             "state": {"repo": "repo", "session_id": session, "turn": n, "hook_version": "0.54.0",
@@ -287,55 +296,97 @@ def _moment(n, kind="correction", hint="wrong_target", session="sess"):
                       "pr_number": None, "env": "staging"}}
 
 
-def _prompt(payload):
+def _stop(**payload):
+    """The Stop hook end to end through `main`, the child's spawn substituted."""
+    tp = hx.harness_dir().parent / "stop.jsonl"
+    if not tp.exists():
+        tp.write_text("", encoding="utf-8")
+    payload = dict({"session_id": "sess", "transcript_path": str(tp)}, **payload)
     out, real_stdout, real_stdin = io.StringIO(), sys.stdout, sys.stdin
     sys.stdout, sys.stdin = out, io.StringIO(json.dumps(payload))
+    real_popen = hx.subprocess.Popen
+    hx.subprocess.Popen = lambda args, **kw: None
     try:
-        rc = hs.main(["prompt"])
+        rc = hs.main(["stop"])
     finally:
         sys.stdout, sys.stdin = real_stdout, real_stdin
+        hx.subprocess.Popen = real_popen
     return rc, out.getvalue()
 
 
-def test_the_next_prompt_hands_the_moment_to_the_main_agent_once():
+def _reason(out: str) -> str:
+    doc = json.loads(out)
+    assert doc["decision"] == "block", doc     # top-level, verified live on Claude Code 2.1.270
+    return doc["reason"]
+
+
+def test_a_later_stop_blocks_on_the_moment_once():
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=2)
         hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        # a subagent's prompt, carrying the parent session id, takes nothing
-        assert _prompt({"session_id": "sess", "agent_id": "agent-7f", "prompt": "go"}) == (0, "")
-        assert len(hx.read_jsonl(hs.moments_path("sess"))) == 1, "a subagent hands nothing"
-        rc, out = _prompt({"session_id": "sess", "prompt": "ok now run the migration"})
-        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert "turn 2" in ctx and "correction" in ctx and "router: wrong_target" in ctx
-        assert '"session_id": "sess"' in ctx and 'source_ref="sess#2"' in ctx
-        assert 'scope_repos=["repo"]' in ctx and "create_rule" in ctx and "Never pass activate" in ctx
+        # a subagent's Stop, carrying the parent session id, takes nothing; nor
+        # does the continuation's own Stop, or every block would chain another
+        assert _stop(agent_id="agent-7f") == (0, "")
+        assert _stop(stop_hook_active=True) == (0, "")
+        assert len(hx.read_jsonl(hs.moments_path("sess"))) == 1, "nothing handed"
+        rc, out = _stop()
+        reason = _reason(out)
+        assert rc == 0 and reason.startswith(hs.BLOCK_PREFIX)
+        assert "turn 2" in reason and "correction" in reason and "router: wrong_target" in reason
+        assert '"session_id": "sess"' in reason and 'source_ref="sess#2"' in reason
+        assert 'scope_repos=["repo"]' in reason and "create-rule skill" in reason
+        assert "Never pass activate" in reason
         rows = hx.read_jsonl(hs.moments_path("sess"))
         assert [r.get("handed") for r in rows] == [None, "sess#2"], "handed by appending"
         assert "handed_at" not in rows[0], "the moment row is never rewritten"
-        assert _prompt({"session_id": "sess", "prompt": "and the tests"}) == (0, "")
-    print("PASS test_the_next_prompt_hands_the_moment_to_the_main_agent_once")
+        assert _stop() == (0, ""), "one block per moment"
+    print("PASS test_a_later_stop_blocks_on_the_moment_once")
 
 
-def test_stale_harness_capped_and_missing_moments_are_never_nudged():
+def test_a_fast_child_never_makes_the_block_hand_the_stopping_turn():
+    """The handoff is chosen before the child is spawned. A child that wins the
+    race and appends THIS turn's moment at once must not become the block
+    (Codex, #230)."""
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        tp = hx.harness_dir().parent / "race.jsonl"
+        tp.write_text("", encoding="utf-8")
+        out, real_stdout, real_popen = io.StringIO(), sys.stdout, hx.subprocess.Popen
+
+        def child_wins_the_race(args, **kw):
+            hx.append_jsonl(hs.moments_path("sess"), _moment(3))
+
+        hx.subprocess.Popen, sys.stdout = child_wins_the_race, out
+        try:
+            hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp)})
+        finally:
+            hx.subprocess.Popen, sys.stdout = real_popen, real_stdout
+        reason = _reason(out.getvalue())
+        assert "turn 2" in reason and "turn 3" not in reason, reason[:80]
+        assert [r.get("handed") for r in hx.read_jsonl(hs.moments_path("sess"))
+                if r.get("handed")] == ["sess#2"]
+    print("PASS test_a_fast_child_never_makes_the_block_hand_the_stopping_turn")
+
+
+def test_stale_capped_and_missing_moments_never_block():
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=9)
         hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        assert _prompt({"session_id": "sess", "prompt": "next"}) == (0, "")
-        hs.save_meta("sess", last_turn=3)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(3))
-        assert _prompt({"session_id": "sess", "prompt": "Skill /loop is running"}) == (0, "")
-        hx.append_jsonl(hs.moments_path("sess"), _moment(4, kind="error_arc", hint="error_arc"))
+        assert _stop() == (0, ""), "a stale moment"
         hs.save_meta("sess", last_turn=4)
-        ctx = json.loads(_prompt({"session_id": "sess", "prompt": "go on"})[1])["hookSpecificOutput"]["additionalContext"]
-        assert "turn 4" in ctx and "turn 3" not in ctx
-        for i in range(hs.NUDGE_CAP_PER_SESSION):
+        hx.append_jsonl(hs.moments_path("sess"), _moment(3))
+        hx.append_jsonl(hs.moments_path("sess"), _moment(4, kind="error_arc", hint="error_arc"))
+        reason = _reason(_stop()[1])
+        assert "turn 4" in reason and "turn 3" not in reason
+        for i in range(hs.HANDOFF_CAP_PER_SESSION):
             hx.append_jsonl(hs.moments_path("sess"), {"handed": f"sess#old{i}", "at": 0})
         hs.save_meta("sess", last_turn=5)
         hx.append_jsonl(hs.moments_path("sess"), _moment(5))
-        assert _prompt({"session_id": "sess", "prompt": "more"}) == (0, "")
-        assert _prompt({"prompt": "x"}) == (0, "")
-        assert _prompt({"session_id": "nobody", "prompt": "x"}) == (0, "")
-    print("PASS test_stale_harness_capped_and_missing_moments_are_never_nudged")
+        assert _stop() == (0, ""), "the session cap"
+        assert _stop(session_id="") == (0, "")
+        assert _stop(session_id="nobody") == (0, "")
+    print("PASS test_stale_capped_and_missing_moments_never_block")
 
 
 def test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept():
@@ -352,14 +403,13 @@ def test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept():
 
         hx.read_jsonl = read_then_the_child_appends
         try:
-            rc, out = _prompt({"session_id": "sess", "prompt": "go"})
+            rc, out = _stop()
         finally:
             hx.read_jsonl = real
-        assert rc == 0 and "turn 2" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert rc == 0 and "turn 2" in _reason(out)
         assert [r.get("turn") for r in hx.read_jsonl(path) if not r.get("handed")] == [2, 3]
         hs.save_meta("sess", last_turn=3)
-        ctx = json.loads(_prompt({"session_id": "sess", "prompt": "next"})[1])["hookSpecificOutput"]["additionalContext"]
-        assert "turn 3" in ctx
+        assert "turn 3" in _reason(_stop()[1])
     print("PASS test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept")
 
 
@@ -371,7 +421,7 @@ def test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in():
         only_beta = {"n": 1, "tools": [{"tool": "Bash", "target": f"cd {beta} && make test"}]}
         state = hx.stamp_state(turn=only_beta, **kw)
         assert state["repo"] == "beta" and "touched_repos" not in state, state
-        line = hs.nudge_line("s", {"turn": 1, "state": state}, "alpha")
+        line = hs.block_reason("s", {"turn": 1, "state": state}, "alpha")
         assert 'scope_repos=["beta"]' in line and "repositories" not in line
         # `git -C <path>` points a command at another repository as a leading `cd` does
         for target in (f"git -C {beta} status", f"cd {alpha} && git -C ../beta log -1",
@@ -383,12 +433,12 @@ def test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in():
                                   {"tool": "Edit", "target": str(alpha / "x.py")}]}
         state = hx.stamp_state(turn=both, **kw)
         assert state["repo"] == "alpha" and state["touched_repos"] == ["beta", "alpha"], state
-        line = hs.nudge_line("s", {"turn": 2, "state": state}, "alpha")
+        line = hs.block_reason("s", {"turn": 2, "state": state}, "alpha")
         assert 'scope_repos=["beta", "alpha"]' in line and "worked in 2 repositories" in line
         # an action that addresses nothing leaves the session's own repo
         idle = {"n": 3, "tools": [{"tool": "TodoWrite", "target": ""}]}
         assert hx.stamp_state(turn=idle, **kw)["repo"] == "alpha"
-        assert hs.nudge_line("s", {"turn": 3, "state": {}}, "alpha").count('scope_repos=["alpha"]') == 1
+        assert hs.block_reason("s", {"turn": 3, "state": {}}, "alpha").count('scope_repos=["alpha"]') == 1
     print("PASS test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in")
 
 
@@ -432,8 +482,8 @@ def test_the_newest_turn_is_handed_whatever_order_the_children_finished_in():
         hs.save_meta("sess", repo="repo", last_turn=5)
         hx.append_jsonl(hs.moments_path("sess"), _moment(5))      # turn 5's classifier answered first
         hx.append_jsonl(hs.moments_path("sess"), _moment(4))
-        ctx = json.loads(_prompt({"session_id": "sess", "prompt": "go"})[1])["hookSpecificOutput"]["additionalContext"]
-        assert "turn 5" in ctx and "turn 4" not in ctx, ctx[:80]
+        reason = _reason(_stop()[1])
+        assert "turn 5" in reason and "turn 4" not in reason, reason[:80]
     print("PASS test_the_newest_turn_is_handed_whatever_order_the_children_finished_in")
 
 
@@ -464,44 +514,63 @@ def test_an_older_turns_child_never_moves_the_meta_back():
     print("PASS test_an_older_turns_child_never_moves_the_meta_back")
 
 
-def test_the_nudge_line():
-    line = hs.nudge_line("sess", _moment(2), "repo")
+def test_the_block_reason():
+    line = hs.block_reason("sess", _moment(2), "repo")
+    assert line.startswith(hs.BLOCK_PREFIX)
     assert "Never pass activate" in line and "/Users/" not in line and "@" not in line
-    # the server refuses to guess a rulebook for someone bound to several
-    assert line.index("list_rulebooks") < line.index("Then pass title") and "rulebook_id" in line
-    assert "ask which" in line          # several books: the agent asks, never guesses
-    # SKILL.md:107-112: include_retired matters because a DISMISSED rule is the
-    # twin you must not re-file and the default view hides it, and an unpaged
-    # scan silently misses whatever fell off page one (Codex, #222)
-    assert line.index("list_rulebooks") < line.index("include_retired=true") < line.index("Then pass title")
-    assert "has_more" in line and "dismissed rule" in line
-    assert "supersedes_rule_id" in line
-    # a draft may ask to BLOCK, but only when the person did and only on an
-    # engine that can: the server refuses a gate on an anchor recall
-    # This line files ADVICE. A gate has rules of its own — the disclosure, the
-    # shapes that can block before the call, the --fires/--silent proof — and
-    # they live in skills/create-rule/SKILL.md. Restating a subset here dropped
-    # whatever it missed and drifted from whatever it copied (Codex, #222), so
-    # a gate candidate is handed to the skill.
-    assert "Never pass activate or mode" in line and "create-rule skill" in line
-    assert "--fires/--silent" in line
-    # the skill knows nothing of session_draft or the stamp, and the server
-    # refuses a draft without it — so the handoff carries provenance (Codex, #222)
-    assert "hand it this turn's source, source_ref, scope_repos and state" in line
-    assert line.index("create-rule skill") < line.index("hand it this turn's")
-    assert line.index("asked for the action to be STOPPED") < line.index("Never put a person")
-    # 1800, set once and deliberately. This bound has moved four times in one
-    # PR — 1600, 1700, 1800, 1700 — which is the tell that it was being treated
-    # as an obstacle rather than a budget. The line legitimately carries more
-    # than it did at 1600: the engine contract, the twin rule, the gate handoff
-    # and the stamp that travels with it. Everything cheap has already been cut
-    # (the twin passage now says only what the server cannot do for itself);
-    # cutting further would drop instructions the agent needs. If this trips
-    # again, delete something on purpose and say which — do not raise it.
-    assert len(line) < 1800
-    assert "may already be written down" in hs.nudge_line("sess", dict(_moment(2), derivable=True), "repo")
+    # HOW to file lives in skills/create-rule/SKILL.md. The prompt-lane line
+    # restated it and drew five of six Codex findings on #222 (dropped whatever
+    # it did not copy, drifted from whatever it did), so none of it is here.
+    assert "create-rule skill" in line
+    for restated in ("list_rulebooks", "include_retired", "supersedes_rule_id",
+                     "anchor_recall", "--fires", "mode"):
+        assert restated not in line, restated
+    # the provenance only this line has: the server refuses a draft without it
+    assert 'source="session_draft"' in line and 'source_ref="sess#2"' in line
+    assert '"hook_version": "0.54.0"' in line and line.index("create-rule skill") < line.index("state=")
+    # the verdict is owed either way: a silent "no lesson" looked exactly like
+    # an ignored handoff, 19 handoffs to 0 create_rule calls
+    assert '"No rule from turn 2: <why>"' in line
+    # a budget, not an obstacle: the line carries a verdict and a stamp, nothing else
+    assert len(line) < 1000, len(line)
+    assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
-    print("PASS test_the_nudge_line")
+    print("PASS test_the_block_reason")
+
+
+def test_a_recorded_block_is_not_a_turn():
+    """Claude Code records the block's reason as an isMeta `user` record
+    (`Stop hook feedback:\\n<reason>`, seen on 2.1.270). Read as a human
+    message it would renumber every later turn and hand the classifier the
+    harness talking to itself."""
+    with _Env() as env:
+        tp = env.base / "s.jsonl"
+        reason = hs.block_reason("sess", _moment(1), "repo")
+        recs = [{"type": "user", "uuid": "u1", "message": {"content": "fix the deploy"}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+                {"type": "user", "isMeta": True, "uuid": "m1",
+                 "message": {"content": f"Stop hook feedback:\n{reason}"}},
+                # the blocked continuation: its actions and verdict are not turn 1's
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c1", "name": "Bash",
+                     "input": {"command": "python3 rulebook_verify.py --rule-file cand.json"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "E boom", "is_error": True}]}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "No rule from turn 1: project state"}]}},
+                {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}},
+                # a person may TYPE those words; without isMeta it is their turn (Codex, #230)
+                {"type": "user", "uuid": "u3",
+                 "message": {"content": "Stop hook feedback: why did it block me?"}}]
+        tp.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        turns = hx.turns_from_transcript(tp)
+        assert [t["user"] for t in turns] == ["fix the deploy", "now the tests",
+                                              "Stop hook feedback: why did it block me?"], turns
+        assert [t["n"] for t in turns] == [1, 2, 3]
+        # the stopped turn ends at the feedback record: a late extractor must not
+        # hand the classifier the harness's own flow as turn 1 (Codex, #230)
+        assert turns[0]["asst"] == "done" and turns[0]["tools"] == [] and turns[0]["results"] == [], turns[0]
+    print("PASS test_a_recorded_block_is_not_a_turn")
 
 
 def test_the_hooks_are_wired_behind_the_guard():
@@ -512,12 +581,12 @@ def test_the_hooks_are_wired_behind_the_guard():
             for handler in group["hooks"]:
                 if "harness_stop.py" in handler["command"]:
                     wired[event] = handler
-    assert set(wired) == {"Stop", "UserPromptSubmit"}, set(wired)
-    # synchronous: the transcript size and the error arcs it takes ARE the boundary
+    # one lane: the prompt lane handed 19 moments for 0 proposals and is gone
+    assert set(wired) == {"Stop"}, set(wired)
+    # synchronous: the transcript size and the error arcs it takes ARE the
+    # boundary, and an async hook's stdout could not block the stop
     assert not wired["Stop"].get("async") and wired["Stop"]["timeout"] <= 10
     assert wired["Stop"]["command"].rstrip("; fi").endswith('harness_stop.py" stop')
-    assert wired["UserPromptSubmit"]["command"].rstrip("; fi").endswith('harness_stop.py" prompt')
-    assert wired["UserPromptSubmit"]["timeout"] <= 5
     for h in wired.values():
         assert 'claude_hook_guard.py" ignore' in h["command"]
     print("PASS test_the_hooks_are_wired_behind_the_guard")
@@ -530,7 +599,7 @@ def test_the_hook_commands_start_nothing_unless_the_flag_is_on():
     doc = json.loads((ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
     commands = [h["command"] for groups in doc["hooks"].values() for g in groups
                 for h in g["hooks"] if "harness_stop.py" in h["command"]]
-    assert len(commands) == 2
+    assert len(commands) == 1
     with tempfile.TemporaryDirectory() as td:
         root, ran = Path(td) / "plugin", Path(td) / "ran"
         (root / "scripts").mkdir(parents=True)
@@ -546,7 +615,7 @@ def test_the_hook_commands_start_nothing_unless_the_flag_is_on():
                                       capture_output=True, env=env, timeout=10)
                 assert proc.returncode == 0, proc.stderr
             got = sorted(ran.read_text().split()) if ran.exists() else []
-            assert got == (["prompt", "stop"] if runs else []), (value, got)
+            assert got == (["stop"] if runs else []), (value, got)
             if ran.exists():
                 ran.unlink()
     print("PASS test_the_hook_commands_start_nothing_unless_the_flag_is_on")
