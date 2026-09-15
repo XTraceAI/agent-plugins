@@ -1003,6 +1003,10 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
 
 
 # ── ordering engine: obligation state machine ───────────────────────────────
+OPEN_FIRES_KEPT = 32       # open advisory fires the engine remembers per rule, across sessions
+RESOLVED_FIRES_KEPT = 64   # answered fire ids kept per rule so other sessions can reconcile
+
+
 class OrderingEngine:
     """State file per worktree root; inside it {"*": {rule_id: {count, last_edit}}}.
     Keyed by WORKTREE, not branch: a working tree carries uncommitted edits
@@ -1051,18 +1055,34 @@ class OrderingEngine:
 
     def mark_fired(self, rule_id, fire_id):
         """Remember the open fire in WORKTREE state so a later discharge from
-        any session in this checkout converts it."""
+        any session in this checkout converts it — EVERY open fire of the
+        rule, not only the last: two sessions (or one session twice) firing
+        the same advisory before the receipt are both answered by it."""
         lock = self._locked()
         if lock is None:
             return
         try:
             st = self._read()
-            st.setdefault(self.branch, {}).setdefault(
-                rule_id, {"count": 0, "last_edit": None})["open_fire"] = fire_id
+            slot = st.setdefault(self.branch, {}).setdefault(
+                rule_id, {"count": 0, "last_edit": None})
+            slot["open_fire"] = fire_id
+            fires = [f for f in (slot.get("open_fires") or []) if f != fire_id] + [fire_id]
+            slot["open_fires"] = fires[-OPEN_FIRES_KEPT:]
             self._write(st)
         finally:
             portable_lock.unlock(lock.fileno())
             lock.close()
+
+    def resolved_fires(self):
+        """``{rule_id: {fire_id, …}}`` answered by a receipt in this checkout,
+        run by ANY session. A session still holding a record for one of these
+        drops it instead of closing or dismissing it: the session that ran
+        the receipt wrote the ``true`` for every fire the engine held."""
+        out = {}
+        for rid, slot in (self._read().get(self.branch) or {}).items():
+            if isinstance(slot, dict) and slot.get("resolved_fires"):
+                out[rid] = set(slot["resolved_fires"])
+        return out
 
     def forget_fire(self, rule_id, fire_id):
         """The inverse, for a fire resolved some other way — a named
@@ -1076,8 +1096,16 @@ class OrderingEngine:
         try:
             st = self._read()
             slot = (st.get(self.branch) or {}).get(rule_id)
-            if isinstance(slot, dict) and slot.get("open_fire") == fire_id:
-                slot.pop("open_fire", None)
+            changed = False
+            if isinstance(slot, dict):
+                if slot.get("open_fire") == fire_id:
+                    slot.pop("open_fire", None)
+                    changed = True
+                fires = slot.get("open_fires") or []
+                if fire_id in fires:
+                    slot["open_fires"] = [f for f in fires if f != fire_id]
+                    changed = True
+            if changed:
                 self._write(st)
         finally:
             portable_lock.unlock(lock.fileno())
@@ -1162,6 +1190,14 @@ class OrderingEngine:
                     # who complied.
                     if not by_call:
                         rule["_converted_fire"] = s.pop("open_fire", None)
+                        fires = list(s.pop("open_fires", None) or [])
+                        if rule["_converted_fire"] and rule["_converted_fire"] not in fires:
+                            fires.append(rule["_converted_fire"])
+                        rule["_converted_fires"] = fires
+                        # What every session sharing this checkout consults
+                        # (`resolved_fires`): these fires are answered,
+                        # whichever session still holds a record for one.
+                        s["resolved_fires"] = ((s.get("resolved_fires") or []) + fires)[-RESOLVED_FIRES_KEPT:]
                     self._write(st)
                     return "discharged"
                 return None
@@ -3662,7 +3698,19 @@ def resolve_fires(st, rid, how, *, kinds=None, converted=True, override_reason=N
     return done
 
 
-def close_open_obligations(session, *, final):
+def reconcile_shared_receipts(st, resolved):
+    """Drop the ordering records another session's receipt already answered
+    (``OrderingEngine.resolved_fires``). No outcome is written here: the
+    session that ran the receipt wrote the ``true`` for every fire the
+    engine held, this session's included — closing or dismissing it now
+    would put a ``false`` beside an honest ``true``."""
+    for fid, rec in list(st["obligations"].items()):
+        if isinstance(rec, dict) and rec.get("kind") == "ordering" \
+                and fid in resolved.get(rec.get("rule"), ()):
+            st["obligations"].pop(fid, None)
+
+
+def close_open_obligations(session, *, final, resolved=None):
     """Record `converted=false` for this session's fires still waiting on a
     conversion — the Stop lane's job (one Stop = one assistant turn) and
     `flush final`'s sweep.
@@ -3690,6 +3738,8 @@ def close_open_obligations(session, *, final):
     try:
         st = load_state(sp)
         before = None if lock is not None else snapshot_arming(st)
+        if resolved:
+            reconcile_shared_receipts(st, resolved)
         if not final:
             st["stops"] = int(st.get("stops") or 0) + 1
         for fid, rec in st["obligations"].items():
@@ -3977,7 +4027,16 @@ def main():
             and not str(data.get("agent_id") or "").strip()
         if session and own_turn:
             try:
-                close_open_obligations(session, final=final)
+                # a receipt run by a sibling session in this checkout may
+                # have answered ordering fires this session still holds
+                resolved = None
+                try:
+                    _repo, root, _gitdir, branch = repo_of_call(data)
+                    if root:
+                        resolved = OrderingEngine(root, branch).resolved_fires()
+                except Exception:
+                    resolved = None
+                close_open_obligations(session, final=final, resolved=resolved)
             except Exception:
                 pass
         flush_fires(final=final)
@@ -4196,6 +4255,13 @@ def main():
     dismissals = {}
     if mode == "pre" and override_label is not None:
         dismissals[override_label] = override_reason
+    # Before anything answers an ordering record, drop the ones a sibling
+    # session's receipt already answered in this checkout.
+    if any(isinstance(rec, dict) and rec.get("kind") == "ordering" for rec in st["obligations"].values()):
+        try:
+            reconcile_shared_receipts(st, OrderingEngine(root, branch).resolved_fires())
+        except Exception:
+            pass
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -4261,9 +4327,14 @@ def main():
                     if fid:
                         log_conversion(fid, "discharged")
                         logged.add(fid)
-                    if r.get("_converted_fire"):
-                        log_conversion(r["_converted_fire"], "discharged")
-                        logged.add(r["_converted_fire"])
+                    # every open fire the engine held for the rule — this
+                    # session's and any sibling's — is answered by the receipt
+                    engine_fires = r.get("_converted_fires") or (
+                        [r["_converted_fire"]] if r.get("_converted_fire") else [])
+                    for cf in engine_fires:
+                        if cf not in logged:
+                            log_conversion(cf, "discharged")
+                            logged.add(cf)
                     # The receipt answers EVERY fire of the rule this session
                     # is waiting on, not only the one the engine marked last:
                     # the earlier ones were the same advice, given earlier.
@@ -4412,12 +4483,18 @@ def main():
     # yet, so it is answered at registration — its ledger row carries the
     # reason and it is resolved as dismissed before it ever waits.
     same_call = {}
-    if override_label is not None and override_label not in {l for l, _ in set_aside}:
-        here = [r for r in fired_now if r["id"] not in gate_ids
-                and override_label in (str(r["id"]).lower(), _label_of(r))]
+    if override_label is not None:
+        # exact id first, then label — and regardless of whether earlier
+        # fires of the rule were just dismissed above: the fire THIS call
+        # produced is a new one and takes the reason too
+        advisories = [r for r in fired_now if r["id"] not in gate_ids]
+        here = [r for r in advisories if str(r["id"]).lower() == override_label] \
+            or [r for r in advisories if _label_of(r) == override_label]
         if len(here) == 1:
             same_call[here[0]["id"]] = override_reason
-            set_aside.append((here[0].get("_label") or here[0]["id"], override_reason))
+            ack = (here[0].get("_label") or here[0]["id"], override_reason)
+            if ack not in set_aside:
+                set_aside.append(ack)
         elif here:
             ambiguous.append((override_label, len(here)))
     gates = [r for r in fired_now if r["id"] in gate_ids]

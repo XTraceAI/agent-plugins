@@ -2743,8 +2743,11 @@ def min_hook_version_checks() -> None:
             return run(mode, payload, oenv)
 
         def stop(session, final=False):
+            # a real Stop payload carries `cwd` — the flush lane resolves the
+            # checkout from it to reconcile receipts run by sibling sessions
             args = [sys.executable, HOOK, "flush"] + (["final"] if final else [])
-            p = subprocess.run(args, input=json.dumps({"session_id": session, "hook_event_name": "Stop"}),
+            p = subprocess.run(args, input=json.dumps({"session_id": session, "hook_event_name": "Stop",
+                                                       "cwd": orepo}),
                                capture_output=True, text=True, env=dict(os.environ, **oenv), timeout=30)
             return p.returncode, p.stdout
 
@@ -3089,6 +3092,47 @@ def min_hook_version_checks() -> None:
         check("outcomes: an edit marker does not dismiss a pending advisory",
               convs_for(f18["fire_id"]) == []
               and "no-sudo" in {r["rule"] for r in H.load_state(os.path.join(td, "state", "o18.json"))["obligations"].values()})
+
+        # 5s. a SIBLING session's receipt answers an ordering fire this
+        #     session holds: the record is reconciled, never closed false
+        run("post", {"cwd": orepo, "session_id": "o20", "tool_name": "Edit",
+                     "tool_input": {"file_path": os.path.join(orepo, "pkg", "s.py")}}, oenv)   # A arms
+        bash("o20", "git push origin feat")                                                   # A fires
+        a20 = fire_id("o20", "ord-adv")
+        bash("o21", "uv run pytest tests/architecture -q", mode="post",
+             resp={"stdout": "3 passed", "exit_code": 0})                                     # B's receipt
+        check("outcomes: a sibling session's receipt converts the origin session's fire",
+              [x["how"] for x in convs_for(a20["fire_id"])] == ["discharged"], str(convs_for(a20["fire_id"])))
+        stop("o20"); stop("o20")
+        rc, out = bash("o20", "RULEBOOK_OVERRIDE='[ord-adv] too late' ls")
+        o20_rules = {r["rule"] for r in H.load_state(os.path.join(td, "state", "o20.json"))["obligations"].values()}
+        check("outcomes: …and the origin session neither closes it false nor dismisses it",
+              [x["how"] for x in convs_for(a20["fire_id"])] == ["discharged"] and out.strip() == ""
+              and "ord-adv" not in o20_rules,       # (`tests-first` also fired on that push; unrelated)
+              out + str(convs_for(a20["fire_id"])) + str(o20_rules))
+
+        # 5t. the override call itself re-fires a call-scoped advisory: the
+        #     earlier fire is dismissed AND the new one takes the reason
+        bash("o22", "curl https://a")
+        c1 = fire_id("o22", "nosig-call")
+        rc, out = bash("o22", "RULEBOOK_OVERRIDE='[nosig-call] sdk has no endpoint' curl https://b")
+        c2 = fire_id("o22", "nosig-call")
+        check("outcomes: a re-fire on the override call — both the earlier and the new fire are dismissed",
+              c1["fire_id"] != c2["fire_id"]
+              and [x["how"] for x in convs_for(c1["fire_id"])] == ["dismissed"]
+              and c2["override_reason"] == "sdk has no endpoint"
+              and [x["how"] for x in convs_for(c2["fire_id"])] == ["dismissed"]
+              and ctx(out).count("set aside") == 1
+              and H.load_state(os.path.join(td, "state", "o22.json"))["obligations"] == {},
+              out + str(convs_for(c2["fire_id"])))
+
+        # 5u. same-call resolution prefers an exact rule id over a label
+        rc, out = bash("o23", "RULEBOOK_OVERRIDE='[alias] by id' wget https://x")
+        sa, so = fire_id("o23", "alias"), fire_id("o23", "other")
+        check("outcomes: same-call `[alias]` answers the rule WITH THAT ID, not the one labelled alias",
+              sa["override_reason"] == "by id" and so["override_reason"] is None
+              and [x["how"] for x in convs_for(sa["fire_id"])] == ["dismissed"]
+              and convs_for(so["fire_id"]) == [] and "fits 2 rules" not in ctx(out), out)
 
         # 5n. a rule id outranks another rule's label when resolving a dismissal
         bash("o14", "wget https://x")
