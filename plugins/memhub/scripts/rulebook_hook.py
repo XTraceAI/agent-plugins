@@ -17,7 +17,13 @@ Lanes (the mode argument):
            it DETACHED so SessionStart never waits on the network.
   flush    Stop / SessionEnd: POST unsent ledger rows to /fires in batches,
            behind a sent-watermark (ledger/.sent). `flush final` ignores the
-           every-N-fires / every-M-minutes throttle.
+           every-N-fires / every-M-minutes throttle. First, the session's
+           open obligations are closed: a fire still waiting on its
+           conversion at the second Stop after it fired is recorded
+           `converted=false` (`flush final` closes them all), so a rule's
+           record says "not followed" instead of nothing. A conversion that
+           lands later still wins — the hook keeps watching a closed fire,
+           and the server keeps a true over a false.
 
 Book = the server book, cached with its ETag. SessionStart re-fetches a stale
 one BEFORE the digest renders (a fresh one just spawns the detached child), and
@@ -997,6 +1003,10 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
 
 
 # ── ordering engine: obligation state machine ───────────────────────────────
+OPEN_FIRES_KEPT = 32       # open advisory fires the engine remembers per rule, across sessions
+RESOLVED_FIRES_KEPT = 64   # answered fire ids kept per rule so other sessions can reconcile
+
+
 class OrderingEngine:
     """State file per worktree root; inside it {"*": {rule_id: {count, last_edit}}}.
     Keyed by WORKTREE, not branch: a working tree carries uncommitted edits
@@ -1045,15 +1055,69 @@ class OrderingEngine:
 
     def mark_fired(self, rule_id, fire_id):
         """Remember the open fire in WORKTREE state so a later discharge from
-        any session in this checkout converts it."""
+        any session in this checkout converts it — EVERY open fire of the
+        rule, not only the last: two sessions (or one session twice) firing
+        the same advisory before the receipt are both answered by it."""
         lock = self._locked()
         if lock is None:
             return
         try:
             st = self._read()
-            st.setdefault(self.branch, {}).setdefault(
-                rule_id, {"count": 0, "last_edit": None})["open_fire"] = fire_id
+            slot = st.setdefault(self.branch, {}).setdefault(
+                rule_id, {"count": 0, "last_edit": None})
+            slot["open_fire"] = fire_id
+            fires = [f for f in (slot.get("open_fires") or []) if f != fire_id] + [fire_id]
+            slot["open_fires"] = fires[-OPEN_FIRES_KEPT:]
             self._write(st)
+        finally:
+            portable_lock.unlock(lock.fileno())
+            lock.close()
+
+    def resolved_fires(self):
+        """``{rule_id: {fire_id, …}}`` answered by a receipt in this checkout,
+        run by ANY session. A session still holding a record for one of these
+        drops it instead of closing or dismissing it: the session that ran
+        the receipt wrote the ``true`` for every fire the engine held."""
+        out = {}
+        for rid, slot in (self._read().get(self.branch) or {}).items():
+            if isinstance(slot, dict) and slot.get("resolved_fires"):
+                out[rid] = set(slot["resolved_fires"])
+        return out
+
+    def forget_fire(self, rule_id, fire_id):
+        """The inverse, for a fire resolved some other way — a named
+        dismissal. A receipt that lands later must find nothing to convert:
+        the person's explicit non-conversion outranks it, and the server's
+        sticky-true merge would otherwise let the receipt overwrite it.
+        Only THAT fire is forgotten; a newer open fire of the rule stays.
+
+        Returns ``"consumed"`` (it was here and is gone), ``"resolved"`` (a
+        receipt already answered it — the caller must NOT write a dismissal
+        over that true), or ``"absent"`` (never here: a session-armed fire,
+        or an engine this hook could not lock). Decided under the engine's
+        lock, so a receipt cannot slip between the answer and the caller's
+        write — that is the whole reason this runs BEFORE the dismissal."""
+        lock = self._locked()
+        if lock is None:
+            return "absent"
+        try:
+            st = self._read()
+            slot = (st.get(self.branch) or {}).get(rule_id)
+            if not isinstance(slot, dict):
+                return "absent"
+            if fire_id in (slot.get("resolved_fires") or []):
+                return "resolved"
+            changed = False
+            if slot.get("open_fire") == fire_id:
+                slot.pop("open_fire", None)
+                changed = True
+            fires = slot.get("open_fires") or []
+            if fire_id in fires:
+                slot["open_fires"] = [f for f in fires if f != fire_id]
+                changed = True
+            if changed:
+                self._write(st)
+            return "consumed" if changed else "absent"
         finally:
             portable_lock.unlock(lock.fileno())
             lock.close()
@@ -1137,6 +1201,14 @@ class OrderingEngine:
                     # who complied.
                     if not by_call:
                         rule["_converted_fire"] = s.pop("open_fire", None)
+                        fires = list(s.pop("open_fires", None) or [])
+                        if rule["_converted_fire"] and rule["_converted_fire"] not in fires:
+                            fires.append(rule["_converted_fire"])
+                        rule["_converted_fires"] = fires
+                        # What every session sharing this checkout consults
+                        # (`resolved_fires`): these fires are answered,
+                        # whichever session still holds a record for one.
+                        s["resolved_fires"] = ((s.get("resolved_fires") or []) + fires)[-RESOLVED_FIRES_KEPT:]
                     self._write(st)
                     return "discharged"
                 return None
@@ -2553,9 +2625,19 @@ def pending_batches(sent):
     # Only conversions past THEIR watermark need merging: the two offsets
     # advance together, so an older conversion was shipped with its fire.
     for c in new_convs:
-        if isinstance(c, dict) and c.get("fire_id") in by_id and c.get("converted"):
-            by_id[c["fire_id"]]["converted"] = True
-            by_id[c["fire_id"]]["converted_at"] = c.get("converted_at")
+        if not (isinstance(c, dict) and c.get("fire_id") in by_id):
+            continue
+        row = by_id[c["fire_id"]]
+        if c.get("converted"):
+            row["converted"] = True
+            row["converted_at"] = c.get("converted_at")
+        elif c.get("converted") is False and row.get("converted") is None:
+            # a close never downgrades a conversion already on the row, in
+            # either order the two rows were written
+            row["converted"] = False
+            row["converted_at"] = c.get("converted_at")
+        if c.get("override_reason") and not row.get("override_reason"):
+            row["override_reason"] = c["override_reason"]
     # (row, fires_offset once this row is accepted); conversion re-sends carry
     # no fires progress of their own, so they inherit the last fire's offset.
     items, seen = [], set()
@@ -2841,8 +2923,9 @@ def state_path(session_id):
 
 
 def load_state(p):
-    st = {"fired": [], "counts": {}, "raw": {}, "open": {}, "armed": {},
-          "armed_once": [], "armed_fire": {}, "armed_version": {}}
+    st = {"fired": [], "counts": {}, "raw": {}, "armed": {},
+          "armed_once": [], "armed_fire": {}, "armed_version": {},
+          "obligations": {}, "stops": 0}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2850,6 +2933,15 @@ def load_state(p):
         pass
     if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
         st["armed"] = {}
+    if not isinstance(st.get("obligations"), dict):
+        st["obligations"] = {}
+    # The pre-outcome hook kept its conversion watch in `open`/`open_file`,
+    # keyed by RULE. Those entries are dropped, not migrated: that hook never
+    # wrote an outcome for them, so nothing is lost that was ever recorded.
+    for k in ("open", "open_file", "closed", "open_at", "last_fire"):
+        st.pop(k, None)
+    if not isinstance(st.get("stops"), int):
+        st["stops"] = 0
     if not isinstance(st.get("armed_once"), list):
         st["armed_once"] = []
     if not isinstance(st.get("armed_fire"), dict):
@@ -2889,12 +2981,23 @@ def drop_arming(st, rid):
 # is on disk now.
 _ARMING_KEYS = ("armed", "armed_fire", "armed_version")
 _APPEND_KEYS = ("armed_once",)      # only ever appended to
+# `obligations` — one record per advisory FIRE, keyed by fire id — rides the
+# same delta merge and needs none of the conditions a rule-keyed map would:
+# a fire id is minted by exactly one hook, so an id this process removed was
+# resolved HERE and an id it added was fired HERE, and neither can collide
+# with another hook's. The Stop lane only FLAGS records (`closed`), under
+# the lock; it never adds or removes one, so a resolution always beats a
+# close and two fires of one rule are two keys, not one slot.
+_DELTA_KEYS = _ARMING_KEYS + ("obligations",)
 
 
 def snapshot_arming(st):
-    """What the arming keys looked like when this process loaded the state —
-    the baseline `save_state` diffs against."""
-    return {k: dict(st.get(k) or {}) for k in _ARMING_KEYS}
+    """What the delta-merged keys looked like when this process loaded the
+    state — the baseline `save_state` diffs against. Records are copied, so
+    a flag set on one after the snapshot reads as a change."""
+    return {k: {kk: (dict(vv) if isinstance(vv, dict) else vv)
+                for kk, vv in (st.get(k) or {}).items()}
+            for k in _DELTA_KEYS}
 
 
 def _state_lock(p):
@@ -2918,6 +3021,24 @@ def _state_lock(p):
             time.sleep(0.005)
 
 
+def _write_json_atomic(p, st):
+    """Replace the file in one step. A reader that loads without the lock
+    (every tool hook does) must never see a truncated file: it would parse
+    nothing, default everything, and write those defaults back over the
+    session's dedup and counters."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix="." + os.path.basename(p) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
 def save_state(p, st, before=None):
     """Write the session state. With `before` (a `snapshot_arming` taken at
     load), the arming keys are merged by delta against the file as it is NOW,
@@ -2927,20 +3048,30 @@ def save_state(p, st, before=None):
     try:
         if lock is not None:
             cur = load_state(p)
-            for k in _ARMING_KEYS:
+            for k in _DELTA_KEYS:
+                if k not in before:                    # a snapshot an older caller took
+                    continue
                 merged = dict(cur.get(k) or {})
-                for rid in before[k]:
-                    if rid not in st[k]:
-                        merged.pop(rid, None)          # discharged by this process
-                for rid, v in st[k].items():
-                    if rid not in before[k] or before[k][rid] != v:
-                        merged[rid] = v                # armed or re-versioned here
+                for key in before[k]:
+                    if key not in st[k]:
+                        merged.pop(key, None)          # discharged / resolved by this process
+                for key, v in st[k].items():
+                    if key not in before[k]:
+                        merged[key] = v                # armed or fired here
+                    elif before[k][key] != v:
+                        # re-versioned, or a record flagged closed by the
+                        # unlocked Stop fallback — never resurrected if the
+                        # file no longer holds it (resolved meanwhile)
+                        if k == "obligations" and key not in merged:
+                            continue
+                        merged[key] = v
                 st[k] = merged
             for k in _APPEND_KEYS:
                 seen = list(cur.get(k) or [])
                 st[k] = seen + [x for x in st[k] if x not in seen]
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(st, f)
+            # a monotonic counter: only the Stop lane moves it, forward
+            st["stops"] = max(int(cur.get("stops") or 0), int(st.get("stops") or 0))
+        _write_json_atomic(p, st)
     except Exception:
         pass
     finally:
@@ -3364,6 +3495,14 @@ def find_edit_override(body):
 # was STOPPED — and every other fire, including a gate someone overrode, takes
 # `📏`. The sentence is identical either way, so the shape is one recognisable
 # thing and the symbol is what says whether work was actually halted.
+# Appended under the advisories of an emitting call (never under a gate alone):
+# the call has already run, so the reason for going on without the advice
+# travels on the NEXT shell command, naming the rule. One constant, so a test
+# can pin the block around it without re-typing it.
+ADVISE_FEEDBACK_HINT = (
+    "_If you go on without following one of these, say why on your next shell command — "
+    "`RULEBOOK_OVERRIDE='[<label>] <why>' <command>` — so the reason is recorded against "
+    "that rule instead of silence._")
 DISCLOSE_ADVISORY = "📏"
 DISCLOSE_BLOCKED = "⛔️"
 DISCLOSE_PREFIX = "Rule fired: "
@@ -3564,18 +3703,224 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     return ids
 
 
-def log_conversion(fire_id, how):
+def log_conversion(fire_id, how, converted=True, override_reason=None):
     """Append-only sidecar (the fires file is shared across sessions, so it
-    is never rewritten in place). A reader merges by fire_id."""
+    is never rewritten in place). A reader merges by fire_id.
+
+    `converted=False` records a NON-conversion: the fire's obligation was
+    still open past its turns (`open_after_turns`), still open at session end
+    (`open_at_session_end`), or the agent set the advice aside by name
+    (`dismissed`, carrying the reason it gave). Neither the reader below nor
+    the server lets a False downgrade a True."""
     if portable_lock is None:
         return
     try:
+        row = {"fire_id": fire_id, "converted": bool(converted),
+               "converted_at": _now(), "how": how}
+        if override_reason:
+            row["override_reason"] = override_reason
         with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
                   encoding="utf-8") as f:
-            f.write(json.dumps({"fire_id": fire_id, "converted": True,
-                                "converted_at": _now(), "how": how}) + "\n")
+            f.write(json.dumps(row) + "\n")
     except Exception:
         pass
+
+
+CLOSE_OPEN_AFTER_STOPS = 2   # a fire still pending at the 2nd Stop after it is recorded not converted
+
+# A record's `kind` says what can resolve it:
+#   signal    the rule carries converted_rx / content_rx — an action converts
+#             it, the Stop lane closes it
+#   ordering  an ordering advisory — the engine's receipt converts it, the
+#             Stop lane closes it
+#   plain     no conversion signal — no deterministic outcome exists, so it
+#             is never closed; it stays pending for a named dismissal only
+_STOP_CLOSES = ("signal", "ordering")
+
+
+def open_obligation(st, fid, rid, kind, file=None):
+    """One record per advisory fire. `opened_at` is None until the first Stop
+    that SEES the record stamps it: the wait is counted in Stops that
+    actually processed the fire, so a Stop that lands late (the hook is
+    asynchronous) or a counter this hook loaded stale can neither shorten
+    nor skip it."""
+    st["obligations"][fid] = {"rule": rid, "kind": kind, "opened_at": None,
+                              "file": file, "closed": False}
+
+
+def pending_fires(st, rid, kinds=None):
+    """`[(fire_id, record)]` of the rule's records, closed or not — a closed
+    fire is still pending until an action or a dismissal resolves it."""
+    return [(fid, rec) for fid, rec in st["obligations"].items()
+            if isinstance(rec, dict) and rec.get("rule") == rid
+            and (kinds is None or rec.get("kind") in kinds)]
+
+
+def resolve_fires(st, rid, how, *, kinds=None, converted=True, override_reason=None):
+    """Write the outcome for EVERY pending fire of the rule and drop the
+    records. Every fire, because the action (or the dismissal) answers all
+    the times the advice was given — and resolved is resolved, whatever a
+    concurrent Stop flagged meanwhile."""
+    done = []
+    for fid, _rec in pending_fires(st, rid, kinds):
+        log_conversion(fid, how, converted=converted, override_reason=override_reason)
+        st["obligations"].pop(fid, None)
+        done.append(fid)
+    return done
+
+
+def reconcile_shared_receipts(st, resolved):
+    """Drop the ordering records another session's receipt already answered
+    (``OrderingEngine.resolved_fires``). No outcome is written here: the
+    session that ran the receipt wrote the ``true`` for every fire the
+    engine held, this session's included — closing or dismissing it now
+    would put a ``false`` beside an honest ``true``."""
+    for fid, rec in list(st["obligations"].items()):
+        if isinstance(rec, dict) and rec.get("kind") == "ordering" \
+                and fid in resolved.get(rec.get("rule"), ()):
+            st["obligations"].pop(fid, None)
+
+
+def close_open_obligations(session, *, final, resolved=None):
+    """Record `converted=false` for this session's fires still waiting on a
+    conversion — the Stop lane's job (one Stop = one assistant turn) and
+    `flush final`'s sweep.
+
+    Age is counted in Stops, not seconds: a fire from turn N closes at the
+    Stop that ends turn N+1, so the agent had the rest of the turn it fired in
+    and one whole turn after. `final` closes everything open at once — but
+    SessionEnd is not reliable (a closed window skips it), which is why the
+    per-turn close is the writer and the sweep is only a sweep.
+
+    A close is not a verdict. The record is FLAGGED, never removed: the
+    conversion pass keeps watching a closed fire, so an action that lands
+    later still records `converted=true` (and the server keeps a true over a
+    false). What a close changes is the default: a fire nobody acted on now
+    says so. Only `signal` and `ordering` records close — a `plain` fire has
+    no deterministic outcome and stays null unless dismissed."""
+    sp = state_path(session)
+    # The Stop hook runs asynchronously beside the next turn's tool hooks, so
+    # the whole read-modify-write is done under the session lock: nothing
+    # loaded here can go stale before it is written back, and a tool hook
+    # that loaded earlier merges its own delta against this write. Only if
+    # the lock cannot be had (LOCK_WAIT_S) does it fall back to the delta
+    # save every hook uses.
+    lock = _state_lock(sp)
+    try:
+        st = load_state(sp)
+        before = None if lock is not None else snapshot_arming(st)
+        if resolved:
+            reconcile_shared_receipts(st, resolved)
+        if not final:
+            st["stops"] = int(st.get("stops") or 0) + 1
+        for fid, rec in st["obligations"].items():
+            if not isinstance(rec, dict) or rec.get("closed") or rec.get("kind") not in _STOP_CLOSES:
+                continue
+            if not final:
+                if rec.get("opened_at") is None:
+                    rec["opened_at"] = st["stops"]     # the first Stop to see it: the wait starts
+                    continue
+                if st["stops"] - int(rec["opened_at"]) < CLOSE_OPEN_AFTER_STOPS - 1:
+                    continue
+            log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
+                           converted=False)
+            rec["closed"] = True
+        if lock is not None:
+            _write_json_atomic(sp, st)
+        else:
+            save_state(sp, st, before=before)
+    finally:
+        if lock is not None:
+            try:
+                portable_lock.unlock(lock.fileno())
+            except Exception:
+                pass
+            lock.close()
+
+
+# `RULEBOOK_OVERRIDE='[<label>] <why>'` — the label rides INSIDE the value.
+# `RULEBOOK_OVERRIDE[label]=…` reads as an array subscript to zsh and fails
+# the command before the hook ever sees it; a plain assignment is valid in
+# every shell the hook runs under.
+_NAMED_REASON_RX = re.compile(r"^\[([^\]\r\n]+)\]\s*(.*)$", re.S)
+
+
+def split_named_override(reason):
+    """`[<label>] <why>` → (label lowered, why); a bare reason → (None, reason)."""
+    m = _NAMED_REASON_RX.match(reason or "")
+    if not m:
+        return None, reason
+    return m.group(1).strip().lower(), m.group(2).strip()
+
+
+def apply_dismissals(st, rules, dismissals, *, forget_ordering_fire=None):
+    """Record each `{label: why}` as a dismissal — `converted=false` with the
+    reason — of every pending fire of the rule it names, closed or not. A
+    resolved fire (converted, or dismissed once) has no record and cannot be
+    dismissed again.
+
+    An ordering fire is also held by the engine (`open_fire`, worktree
+    state) or by this session's arming (`armed_fire`), which is how a later
+    receipt finds it to convert. A dismissed fire is consumed from there too
+    — `forget_ordering_fire(rule_id, fire_id)` for the engine — or the
+    receipt would log `true` over the person's explicit `false` and the
+    server's sticky-true merge would keep the receipt.
+
+    Titles are not unique across the union of books, so a label is resolved
+    against the rules with a fire PENDING: exactly one → recorded; more than
+    one → nothing recorded and the label reported back as ambiguous, so the
+    agent can name the rule by its id — and an exact id outranks a displayed
+    label, as the gate resolver does, so that recovery works even when one
+    rule's id equals another's label.
+    Returns `(recorded, ambiguous)`: `[(label, why)]` and `[(label, n)]`."""
+    done, ambiguous = [], []
+    for label, why in dismissals.items():
+        if not label or not why:
+            continue
+        pending = [r for r in rules if str(r["id"]).lower() == label and pending_fires(st, r["id"])] \
+            or [r for r in rules
+                if str(r.get("_label") or r["id"]).lower() == label and pending_fires(st, r["id"])]
+        if len(pending) > 1:
+            ambiguous.append((label, len(pending)))
+            continue
+        if not pending:
+            continue
+        hit = pending[0]
+        rid = hit["id"]
+        # Ordering fires FIRST consume their engine / session reference —
+        # under the engine's lock — and only then is the dismissal written.
+        # The other order left a window: a sibling session's receipt could
+        # take the fire between the dismissal's false and the engine's
+        # forget, log its true, and the server's sticky-true would keep the
+        # receipt over the person's explicit no. A fire the engine reports
+        # as already resolved is dropped without a dismissal: the receipt
+        # won, honestly, and its true is already in the ledger.
+        for fid, _rec in pending_fires(st, rid, ("ordering",)):
+            if st.get("armed_fire", {}).get(rid) == fid:
+                st["armed_fire"].pop(rid, None)
+                continue
+            status = None
+            if forget_ordering_fire is not None:
+                try:
+                    status = forget_ordering_fire(rid, fid)
+                except Exception:
+                    status = None
+            if status == "resolved":
+                st["obligations"].pop(fid, None)
+        if resolve_fires(st, rid, "dismissed", converted=False, override_reason=why):
+            done.append((hit.get("_label") or rid, why))
+    return done, ambiguous
+
+
+def _dismissal_lines(set_aside, ambiguous):
+    """The acknowledgement, on both channels: (agent lines, user lines)."""
+    agent = [f"_Recorded: [{label}] set aside — {why}_" for label, why in set_aside]
+    user = [f"{BRAND} ▸ [{label}] set aside: {why}" for label, why in set_aside]
+    for label, n in ambiguous:
+        agent.append(f"_`[{label}]` fits {n} rules with a fire pending — nothing recorded; "
+                     "name one by its rule id instead_")
+        user.append(f"{BRAND} ▸ [{label}] fits {n} rules — name one by its rule id")
+    return agent, user
 
 
 # §2. A CONSTANT, not a template: no rule counts, no repo name, nothing that
@@ -3751,12 +4096,36 @@ def main():
             return 2
         print(book_path(repo))
         return 0
-    if mode == "flush":                # needs nothing from the event payload
+    if mode == "flush":
+        final = "final" in sys.argv[2:]
+        # The payload's one useful field: which session's open obligations to
+        # close before the rows go out. Anything unreadable → just flush.
         try:
-            sys.stdin.read()
+            data = json.loads(sys.stdin.read() or "{}")
         except Exception:
-            pass
-        flush_fires(final="final" in sys.argv[2:])
+            data = {}
+        session = data.get("session_id") if isinstance(data, dict) else None
+        # A turn is the PERSON's turn: a subagent's Stop (top-level agent_id,
+        # as harness_stop.py reads it) and a Stop re-entered while a stop hook
+        # is already running (`stop_hook_active`) advance nothing, or one
+        # parent turn would count as two and close its fires a turn early.
+        own_turn = isinstance(data, dict) and not data.get("stop_hook_active") \
+            and not str(data.get("agent_id") or "").strip()
+        if session and own_turn:
+            try:
+                # a receipt run by a sibling session in this checkout may
+                # have answered ordering fires this session still holds
+                resolved = None
+                try:
+                    _repo, root, _gitdir, branch = repo_of_call(data)
+                    if root:
+                        resolved = OrderingEngine(root, branch).resolved_fires()
+                except Exception:
+                    resolved = None
+                close_open_obligations(session, final=final, resolved=resolved)
+            except Exception:
+                pass
+        flush_fires(final=final)
         return 0
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -3861,6 +4230,22 @@ def main():
         if found:
             override_reason = redact_secrets(found[0])[:2000]
             cmd = strip_override(cmd, found)   # rules match the command, not the assignment
+    # `RULEBOOK_OVERRIDE='[<label>] <why>'` names its rule: a gate on THIS
+    # call by that label is excused; otherwise it is the agent setting an
+    # earlier advisory aside, and the reason is recorded on that rule's fire.
+    override_label = None
+    if override_reason is not None:
+        raw_reason = override_reason
+        override_label, override_reason = split_named_override(override_reason)
+        if override_label is not None and not override_reason:
+            override_label, override_reason = None, None   # `'[x]'` alone: no reason, no override
+        elif override_label is not None and not any(
+                override_label in (str(r["id"]).lower(), str(r.get("_label") or r["id"]).lower())
+                for r in rules):
+            # A bracket that names no rule in the book is part of the reason
+            # (`'[WIP] hotfix, CI green'`), not an address: the unnamed form,
+            # exactly as it read before labels existed.
+            override_label, override_reason = None, raw_reason
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
@@ -3932,29 +4317,50 @@ def main():
                            "via": "bash-read", "read": read_facts(path, pulled=pulled)})
 
     # Conversions: did this call perform the action an earlier fire asked for?
-    # Deterministic, under-counts, never over-counts (spec §5.1).
-    for rid, fid in list(st["open"].items()):
-        r = by_id.get(rid)
+    # Deterministic, under-counts, never over-counts (spec §5.1). A fire the
+    # Stop lane already closed is still watched: a late action is still the
+    # action, and its `true` outranks the close.
+    for fid, rec in list(st["obligations"].items()):
+        if not isinstance(rec, dict) or rec.get("kind") != "signal":
+            continue
+        r = by_id.get(rec.get("rule"))
         if not r:
             continue
         crx = r.get("converted_rx")
         if mode == "post" and tool == "Bash" and crx and cmd \
                 and re.search(crx, strip_comments(shell_only(cmd)), re.I | re.M):
             log_conversion(fid, "converted_rx")
-            del st["open"][rid]
-            st.get("open_file", {}).pop(rid, None)
+            st["obligations"].pop(fid, None)
             continue
         if r.get("on") != "edit" or "content_rx" not in r:
             continue
         for ev in events:
             if ev["phase"] == "pre" and ev["tool"] in EDIT_TOOLS \
-                    and ev["fp"] == st.get("open_file", {}).get(rid) \
+                    and ev["fp"] == rec.get("file") \
                     and not evaluate(r, hook_phase="pre", tool=ev["tool"], file_path=ev["fp"],
                                      body=ev["body"]):
                 log_conversion(fid, "re-edit-clears")
-                del st["open"][rid]
-                st.get("open_file", {}).pop(rid, None)
+                st["obligations"].pop(fid, None)
                 break
+
+    # A named override, or an edit marker, that names no gate on this call is
+    # the agent setting an earlier advisory aside. Collected here, before the
+    # fire pass: the command carrying it usually fires nothing itself.
+    # Only the SHELL form dismisses. An edit marker is a durable annotation
+    # that stays in the file: every later edit that carries the line would
+    # dismiss whatever fire of that rule is pending anywhere in the session —
+    # the "content copied from elsewhere" hazard the gate lane refuses the
+    # unnamed marker for. A marker still excuses the gate on its own call.
+    dismissals = {}
+    if mode == "pre" and override_label is not None:
+        dismissals[override_label] = override_reason
+    # Before anything answers an ordering record, drop the ones a sibling
+    # session's receipt already answered in this checkout.
+    if any(isinstance(rec, dict) and rec.get("kind") == "ordering" for rec in st["obligations"].values()):
+        try:
+            reconcile_shared_receipts(st, OrderingEngine(root, branch).resolved_fires())
+        except Exception:
+            pass
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -4015,11 +4421,26 @@ def main():
                     # worktree state: it was never written there. Its open
                     # fire lives beside it for the same reason — a sibling
                     # session sharing the checkout must not convert it.
+                    logged = set()
                     fid = drop_arming(st, rid)
                     if fid:
                         log_conversion(fid, "discharged")
-                if outcome == "discharged" and r.get("_converted_fire"):
-                    log_conversion(r["_converted_fire"], "discharged")
+                        logged.add(fid)
+                    # every open fire the engine held for the rule — this
+                    # session's and any sibling's — is answered by the receipt
+                    engine_fires = r.get("_converted_fires") or (
+                        [r["_converted_fire"]] if r.get("_converted_fire") else [])
+                    for cf in engine_fires:
+                        if cf not in logged:
+                            log_conversion(cf, "discharged")
+                            logged.add(cf)
+                    # The receipt answers EVERY fire of the rule this session
+                    # is waiting on, not only the one the engine marked last:
+                    # the earlier ones were the same advice, given earlier.
+                    for pf, _rec in pending_fires(st, rid, ("ordering",)):
+                        if pf not in logged:
+                            log_conversion(pf, "discharged")
+                        st["obligations"].pop(pf, None)
                 elif outcome == "fired":
                     dedup_keys[rid] = f"{rid}@{root}:{branch}"
                     fired_now.append(r)
@@ -4067,8 +4488,23 @@ def main():
             fired_now.append(r)
             fired_on[rid] = ev
 
+    def _forget_ordering_fire(rid, fid):
+        # the engine is built lazily on this path — the usual dismissal
+        # command fires nothing and never needed it
+        return OrderingEngine(root, branch).forget_fire(rid, fid)
+
     if not fired_now:
+        set_aside, ambiguous = apply_dismissals(
+            st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
         save_state(sp, st, before=before)
+        if set_aside or ambiguous:
+            # Say so on both channels: a recorded reason nobody can see is
+            # the silence this exists to replace.
+            agent_lines, user_lines = _dismissal_lines(set_aside, ambiguous)
+            try:
+                emit("PreToolUse", "\n".join(agent_lines), user_line="\n".join(user_lines))
+            except Exception:
+                pass
         return 0
 
     # §5.3: which of this call's fires are GATES. Only a call the hook sees
@@ -4106,13 +4542,41 @@ def main():
         return str(r.get("_label") or r["id"]).lower()
 
     overridden = {}
-    if override_reason is not None:
-        overridden = {r["id"]: override_reason for r in fired_now if r["id"] in gate_ids}
+    # Titles are not unique across the union of books (the server matches no
+    # titles at filing time), so a NAMED excuse that fits more than one gate
+    # on this call excuses none of them — fail closed — and the deny says to
+    # name the rule by its id, which the named form also takes.
+    gates_here = [r for r in fired_now if r["id"] in gate_ids]
+    label_count = {}
+    for r in gates_here:
+        label_count[_label_of(r)] = label_count.get(_label_of(r), 0) + 1
+    ambiguous_gate = None                # (label, n) when a named excuse fit n gates
+
+    def _named_gates(label):
+        by_id = [r for r in gates_here if str(r["id"]).lower() == label]
+        return by_id or [r for r in gates_here if _label_of(r) == label]
+
+    if override_reason is not None and override_label is None:
+        overridden = {r["id"]: override_reason for r in gates_here}
+    elif override_reason is not None:
+        # the named shell form excuses exactly the gate it names, as an edit
+        # marker does; a label that names no gate here stays a dismissal
+        named = _named_gates(override_label)
+        if len(named) == 1:
+            overridden[named[0]["id"]] = override_reason
+            dismissals.pop(override_label, None)
+        elif named:
+            ambiguous_gate = (override_label, len(named))
+            dismissals.pop(override_label, None)
     elif edit_markers:
-        for r in (r for r in fired_now if r["id"] in gate_ids):
-            named = edit_markers.get(_label_of(r)) or edit_markers.get(str(r["id"]).lower())
-            if named:
-                overridden[r["id"]] = named
+        for label, why in edit_markers.items():
+            named = _named_gates(label) if label else []
+            if len(named) == 1:
+                overridden[named[0]["id"]] = why
+            elif named:
+                ambiguous_gate = (label, len(named))
+    set_aside, ambiguous = apply_dismissals(
+        st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4130,10 +4594,35 @@ def main():
     # the advisory cap never cuts a gate — a silently un-gated push is the one
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]
+    # The named form on the very call that FIRES the advisory: the agent knew
+    # the command would trip it and said why up front. That fire has no record
+    # yet, so it is answered at registration — its ledger row carries the
+    # reason and it is resolved as dismissed before it ever waits. Resolved
+    # against the advisories SHOWN (a fire the cap cut is a suppressed row
+    # with no outcome to give), exact id first, and never when the same
+    # override already excused a gate: one named override answers one rule.
+    same_call = {}
+    gate_took_it = any(override_label in (str(r["id"]).lower(), _label_of(r))
+                       for r in gates if r["id"] in overridden) if override_label else False
+    if override_label is not None and not gate_took_it:
+        shown_advisories = [r for r in shown if r["id"] not in gate_ids]
+        here = [r for r in shown_advisories if str(r["id"]).lower() == override_label] \
+            or [r for r in shown_advisories if _label_of(r) == override_label]
+        if len(here) == 1:
+            same_call[here[0]["id"]] = override_reason
+            ack = (here[0].get("_label") or here[0]["id"], override_reason)
+            if ack not in set_aside:
+                set_aside.append(ack)
+        elif here:
+            ambiguous.append((override_label, len(here)))
     blocked = any(r["id"] not in overridden for r in gates)
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
     user_lines, deny_lines = [], []
+    if set_aside or ambiguous:
+        agent_ack, user_ack = _dismissal_lines(set_aside, ambiguous)
+        lines.extend(agent_ack)
+        user_lines.extend(user_ack)
 
     def _where(r):
         """A fire from a file the Bash call wrote names the file: the model
@@ -4180,13 +4669,20 @@ def main():
         else:
             lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
             detail_line = f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}"
-            deny_lines.append(f"[{label}] {r['text']}{detail}{_where(r)}")
+            # a label shared by two gates is no address; give the id alongside
+            ident = f" (rule id {r['id']})" if label_count.get(_label_of(r), 0) > 1 else ""
+            deny_lines.append(f"[{label}]{ident} {r['text']}{detail}{_where(r)}")
         # A gate that was overridden still FIRED and the call still ran, so it
         # takes 📏; ⛔️ is reserved for a call that was actually stopped.
         line = disclosure_line(r, blocked=blocked_here)
         disclosures.append(line)
         user_lines.append(line)
         user_lines.append("   " + detail_line)
+    # The advisory's feedback channel. The call has already run, so a reason
+    # travels on the NEXT shell command, naming the rule — what turns a silent
+    # non-conversion into a recorded one the rule's reviewer can read.
+    if any(r["id"] not in gate_ids for r in shown):
+        lines.append(ADVISE_FEEDBACK_HINT)
     deny = None
     if blocked:
         # Each lane names the override it actually accepts: an Edit tool call
@@ -4216,6 +4712,10 @@ def main():
                 how += (". A `rulebook-override:` with no rule in brackets excuses nothing — "
                         "it would mean something different as soon as a second edit gate "
                         "covers this line")
+        if ambiguous_gate:
+            how = (f"`[{ambiguous_gate[0]}]` fits {ambiguous_gate[1]} of this call's gates, so it "
+                   f"excused none — name the one you mean by its rule id, "
+                   f"`[<rule id>] <why>`, in the same override form; {how}")
         deny = (f"Blocked by the {BRAND} team rulebook:\n" + "\n".join(f"- {l}" for l in deny_lines)
                 + f"\nIf this is a legitimate exception, {how}.")
         lines.append(f"_This call was blocked. If it is a legitimate exception, {how}._")
@@ -4244,7 +4744,7 @@ def main():
     ids = {}
     for r in (r for r in shown if r["id"] not in gate_ids):
         ids.update(log_fires(ctx, [r], hook_phase=mode, mode="advise", excerpt=_excerpt(r),
-                             raw_counts=raw, dedup_keys=dedup_keys))
+                             raw_counts=raw, dedup_keys=dedup_keys, override_reasons=same_call))
     if gates:      # a blocked call and an overridden one are both delivered gate fires
         ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
@@ -4254,15 +4754,27 @@ def main():
                   raw_counts=raw, dedup_keys=dedup_keys)
     for r in shown:
         st["raw"][r["id"]] = 0
-        if r.get("on") == "ordering" and session_scoped(r) and ids.get(r["id"]):
-            st.setdefault("armed_fire", {})[r["id"]] = ids[r["id"]]
-        elif r.get("on") == "ordering" and ordering and ids.get(r["id"]):
-            ordering.mark_fired(r["id"], ids[r["id"]])
-        elif r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r):
-            st["open"][r["id"]] = ids.get(r["id"])
-            if r.get("on") == "edit":
-                ev = fired_on.get(r["id"])
-                st.setdefault("open_file", {})[r["id"]] = ev["fp"] if ev else fp
+        fid = ids.get(r["id"])
+        has_signal = r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r)
+        is_ordering = r.get("on") == "ordering"
+        if is_ordering and session_scoped(r) and fid:
+            st.setdefault("armed_fire", {})[r["id"]] = fid
+        elif is_ordering and ordering and fid:
+            ordering.mark_fired(r["id"], fid)
+        if fid and r["id"] in same_call:
+            # dismissed on the call that fired it: outcome written, no wait
+            log_conversion(fid, "dismissed", converted=False, override_reason=same_call[r["id"]])
+        elif fid and r["id"] not in gate_ids:
+            # Every advisory fire gets its own record — a call-scoped rule
+            # firing five times is five records, each closed at its own age
+            # and all converted by the action that answers them. A gate's
+            # fire is answered on its own call (blocked, or excused with a
+            # reason) and is never waited on, closed or dismissed later,
+            # whatever signal its matcher also carries.
+            kind = "ordering" if is_ordering else ("signal" if has_signal else "plain")
+            ev = fired_on.get(r["id"])
+            open_obligation(st, fid, r["id"], kind,
+                            file=((ev["fp"] if ev else fp) if r.get("on") == "edit" else None))
     save_state(sp, st, before=before)
     return 0
 

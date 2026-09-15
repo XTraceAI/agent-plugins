@@ -362,8 +362,12 @@ def test_delivery_lanes() -> None:
         pre_container = ("## XTrace Rulebook (team rules — advisory, not blocking)\n"
                          "- **[Pair advisory]** Pair advisory\n"
                          "- **[Team advisory]** Team advisory")
+        # The advise-feedback hint sits between the rules and the disclosure;
+        # like the disclosure it carries no book facts and comes from the
+        # hook's own constant.
         check("no book facts → byte-identical to the pre-container output, plus the disclosure",
-              ctx(out_old) == pre_container + "\n" + hook.disclosure_instruction(
+              ctx(out_old) == pre_container + "\n" + hook.ADVISE_FEEDBACK_HINT + "\n"
+              + hook.disclosure_instruction(
                   ["📏 Rule fired: Pair advisory", "📏 Rule fired: Team advisory"]),
               repr(ctx(out_old)))
 

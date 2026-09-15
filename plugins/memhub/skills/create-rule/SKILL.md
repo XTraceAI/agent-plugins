@@ -170,7 +170,13 @@ make the message say what is actually missing.
 shown and the call goes through. Pass `mode: "gate"` and the rule DENIES a
 matching command before it runs — the person can still run that exact command
 by prefixing `RULEBOOK_OVERRIDE='<why>'`, and their reason is recorded with the
-fire.
+fire. Advice has the same channel, one call later: an agent that reads an
+advisory and goes on without it says why on its next command as
+`RULEBOOK_OVERRIDE='[<label>] <why>'`, naming the rule, and the reason lands on
+that rule's fire. A rule with a `converted_rx` also records "not followed" on
+its own: a fire still waiting on its conversion two turns later is closed
+`converted=false`, so a rule nobody acts on shows it instead of showing
+nothing.
 
 Ask for it when the user's own words ask for it — "block", "stop me", "don't
 let me", "never let it happen again" — and never on your own initiative. Two
