@@ -82,6 +82,26 @@ class ReleaseChecksTests(unittest.TestCase):
         with self.assertRaises(lib.compat.GateError):
             agent.final_text(events, "codex")
 
+    def test_claude_final_answer_and_hook_health_are_independent(self):
+        events = [{"type": "system", "subtype": "hook_response", "outcome": "error", "exit_code": 1},
+                  {"type": "result", "result": "HIDDEN_MARKER"}]
+        self.assertEqual(agent.final_text(events, "claude"), "HIDDEN_MARKER")
+        with self.assertRaises(lib.compat.GateError):
+            agent.claude_hook_health(events)
+        with self.assertRaises(lib.compat.GateError):
+            agent.claude_hook_health(events[1:])
+
+    def test_diagnostics_never_include_host_controlled_strings(self):
+        secret = "private-model-or-memhub-key"
+        events = [{"type": "system", "subtype": "hook_response", "hook_event": secret,
+                   "outcome": secret, "exit_code": secret, "stderr": "uv: command not found " + secret},
+                  {"type": "item.completed", "item": {"type": "command_execution", "status": "failed",
+                   "exit_code": 1, "command": secret, "aggregated_output": "bwrap: Operation not permitted " + secret}}]
+        diagnostics = agent.event_diagnostics(events)
+        self.assertNotIn(secret, json.dumps(diagnostics))
+        self.assertIn("uv_missing", diagnostics["hooks"][0]["signals"])
+        self.assertIn("sandbox_error", diagnostics["commands"][0]["signals"])
+
     def test_capture_requires_this_session_and_fresh_success(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

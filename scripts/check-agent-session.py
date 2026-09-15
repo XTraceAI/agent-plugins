@@ -169,15 +169,53 @@ def final_text(events, host):
                          and e.get("item", {}).get("type") == "agent_message")
     result = next((e for e in reversed(events) if e.get("type") == "result"), None)
     require(result is not None and not result.get("is_error"), "agent did not return a successful result")
-    if host == "claude":
-        require(not any(e.get("subtype") == "init" and e.get("plugin_errors") for e in events),
-                "Claude reported plugin load errors")
-        responses = [e for e in events if e.get("subtype") == "hook_response"]
-        require(responses and all(
-            (e.get("outcome") == "success" and e.get("exit_code") in (0, None)) or
-            (e.get("outcome") == "blocked" and e.get("exit_code") in (0, 2, None))
-            for e in responses), "Claude hooks failed or were not observed")
     return result.get("result", "")
+
+
+def claude_hook_health(events):
+    require(not any(e.get("subtype") == "init" and e.get("plugin_errors") for e in events),
+            "Claude reported plugin load errors")
+    responses = [e for e in events if e.get("subtype") == "hook_response"]
+    require(responses and all(
+        (e.get("outcome") == "success" and e.get("exit_code") in (0, None)) or
+        (e.get("outcome") == "blocked" and e.get("exit_code") in (0, 2, None))
+        for e in responses), "Claude hooks failed or were not observed")
+
+
+def event_diagnostics(events):
+    """Project events onto fixed categories; never emit arbitrary host strings."""
+    def enum(value, allowed):
+        return value if isinstance(value, str) and value in allowed else "other"
+    def exit_code(value):
+        return value if type(value) is int and -255 <= value <= 255 else None
+    def signals(value):
+        raw = json.dumps(value).lower()
+        return [label for label, pattern in (
+            ("sandbox_error", r"sandbox.*(?:fail|error)|bwrap:|landlock"),
+            ("permission_denied", r"permission denied|operation not permitted"),
+            ("missing_executable", r"command not found|no such file or directory"),
+            ("authentication_error", r"invalid.api.key|unauthorized|authentication.*fail"),
+            ("uv_missing", r"uv:.*not found"),
+        ) if re.search(pattern, raw)]
+    hooks, commands = [], []
+    for event in events:
+        if event.get("subtype") in {"hook_started", "hook_response"}:
+            hooks.append({
+                "phase": event["subtype"],
+                "event": enum(event.get("hook_event"), {"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd", "UserPromptSubmit"}),
+                "outcome": enum(event.get("outcome"), {"success", "blocked", "error", "cancelled"}),
+                "exit_code": exit_code(event.get("exit_code")),
+                "signals": signals(event),
+            })
+        item = event.get("item", {})
+        if event.get("type") == "item.completed" and item.get("type") == "command_execution":
+            commands.append({
+                "status": enum(item.get("status"), {"completed", "failed"}),
+                "exit_code": exit_code(item.get("exit_code")),
+                "signals": signals(item),
+            })
+    return {"event_count": len(events), "hooks": hooks, "commands": commands,
+            "signals": signals(events)}
 
 
 def ledger(root):
@@ -245,7 +283,10 @@ def run_live(args, report, model):
         if events is None:
             report.blocked(LIVE_CHECKS, "agent process failed")
             return
+        report.data["live_diagnostics"] = event_diagnostics(events)
         final = report.check("agent_completed", lambda: final_text(events, args.host))
+        if args.host == "claude":
+            report.check("hook_health", lambda: claude_hook_health(events))
         sid = report.check("native_session_identity", lambda: session_id(events, args.host))
         fires = ledger(root)
         report.check("advice_delivered", lambda: require(
@@ -287,6 +328,9 @@ def run_rejection(args, report, model):
                       "Use only the information delivered by the plugin hooks. Do not repair anything.")
             def check():
                 events = drive(args.host, args.executable, installed, model, prompt, env, ws)
+                report.data["rejection_diagnostics"] = event_diagnostics(events)
+                if args.host == "claude":
+                    report.check("rejection_hook_health", lambda: claude_hook_health(events))
                 answer = final_text(events, args.host)
                 require(server.requests and "PLUGIN_UPGRADE_REQUIRED" in answer and "999.0.0" in answer
                         and "restart" in answer.lower(), "real agent did not receive and explain the upgrade requirement")
