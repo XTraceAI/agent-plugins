@@ -78,70 +78,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  agent-session:
-    name: Real agent session (${{ matrix.host }}${{ matrix.package == 'candidate' && ' candidate' || '' }})
-    if: >-
-      (vars.MEMHUB_PLUGIN_PROD_CHECKS_ENABLED == 'true' || vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED == 'true') &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    environment: production-plugin-release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host: codex
-            model_variable: MEMHUB_E2E_CODEX_MODEL
-          - host: claude
-            model_variable: MEMHUB_E2E_CLAUDE_MODEL
-          - host: claude
-            package: candidate
-            model_variable: MEMHUB_E2E_CLAUDE_MODEL
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages" ${{ matrix.package == 'candidate' && '--candidate-head' || '' }}
-      - run: bash scripts/install-release-host.sh '${{ matrix.host }}'
-      - uses: astral-sh/setup-uv@v6
-      - name: Prepare Codex Linux sandbox
-        if: matrix.host == 'codex'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y bubblewrap apparmor-profiles apparmor-utils
-          # Ubuntu 24.04 requires the distribution's bwrap user-namespace profile.
-          # https://learn.chatgpt.com/docs/sandboxing
-          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
-          bwrap --ro-bind / / --unshare-user -- /bin/true
-      - name: Rule delivery, gate enforcement, allowed operation, capture, and upgrade notice
-        env:
-          CODEX_API_KEY: ${{ matrix.host == 'codex' && secrets.MEMHUB_E2E_OPENAI_API_KEY || '' }}
-          ANTHROPIC_API_KEY: ${{ matrix.host == 'claude' && secrets.MEMHUB_E2E_ANTHROPIC_API_KEY || '' }}
-          CURSOR_API_KEY: ${{ matrix.host == 'cursor' && secrets.MEMHUB_E2E_CURSOR_API_KEY || '' }}
-          MEMHUB_E2E_MODEL: ${{ vars[matrix.model_variable] }}
-          MEMHUB_PROD_E2E_TOKEN: ${{ secrets.MEMHUB_PROD_E2E_TOKEN }}
-          MEMHUB_PROD_E2E_FIXTURE_JSON: ${{ vars.MEMHUB_PROD_E2E_FIXTURE_JSON }}
-        run: >-
-          python3 scripts/check-agent-session.py --host '${{ matrix.host }}'
-          --executable '${{ matrix.host == 'cursor' && 'cursor-agent' || matrix.host }}'
-          --plugin-root "$RELEASE_PACKAGE" --source-sha "$RELEASE_SHA"
-          --report "$RUNNER_TEMP/agent-reports/session.json"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: real-agent-${{ matrix.host }}-${{ matrix.package || 'selected' }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/agent-reports
-          if-no-files-found: warn
-          retention-days: 30
-
   production:
     # Forks get offline tests, never production credentials. The aggregate fails
     # on a skipped live job; a maintainer must promote reviewed code in this repo.
@@ -208,9 +144,8 @@ jobs:
   readiness:
     name: Production plugin readiness
     if: always()
-    # Real agent sessions are advisory: they sit behind the environment reviewer
-    # gate and assert on what an LLM chooses to echo, so they report on the PR
-    # but never feed this required check.
+    # Real agent sessions run on demand in real-agent-evidence.yml and gate the
+    # merge through their own required check, not through this one.
     needs: [probe-tests, host-install, production]
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -226,7 +161,7 @@ jobs:
           passed = bool(results) and all(job['result'] == 'success' for job in results.values())
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               out.write('Codex/Claude release evidence: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
-              out.write('Real agent sessions: advisory; see the "Real agent session" jobs. They never block this check.\n')
+              out.write('Real agent sessions: on demand; run the real-agent-evidence workflow on this branch before merging.\n')
               out.write('Cursor: deferred; native install and agent behavior are not verified.\n')
               out.write('Session cleanup: deferred pending backend PAK deletion support (ENG-1074).\n')
               out.write('Session UI rule-fire linkage: deferred (ENG-1075); local hook evidence does not verify backend/UI linkage.\n')

@@ -23,17 +23,18 @@ approval is the human gate on every production release.
 | Automatic capture | Fresh successful capture acknowledgement for the exact native session ID; Claude requires both turn and session-end capture | Each actual host CLI against production |
 | Upgrade response contract | Existing gate works, synthetic 426 surfaces actionable notice, stale gate stops, rollback restores it | Actual package with loopback HTTP server |
 | Upgrade notice reaches the host | The pinned host CLI starts the package's SessionStart hook and takes the notice: Claude reports it in its own `hook_response` record; Codex leaves the hook's per-session marker after the version-carrying fetch | Each actual host CLI, no prompt, no model, no credentials (`check-host-session-start.py`) |
-| Upgrade notice reaches the model (advisory) | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server |
+| Upgrade notice reaches the model | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server, on demand |
 
 The four real-agent rows (advice, gating, allowed operation, capture) and the
-model-side upgrade-notice row run in the `Real agent session` jobs, which are
-**advisory**: they report on the PR but are not inputs to `Production plugin
-readiness`. Two reasons. They assert on what an LLM chooses to echo (the
-upgrade-notice check flipped between pass and fail on byte-identical packages,
-same pinned CLI and same model within one hour), and they sit behind the
-`production-plugin-release` environment reviewer gate, which would otherwise put
-a human approval on every merge. Read their reports before promoting a release;
-do not treat a red job as a merge blocker.
+model-side upgrade-notice row run in `real-agent-evidence.yml`, which is
+`workflow_dispatch` only. They cost model turns, leave synthetic sessions in
+the fixture org, and assert on what a model chooses to say (the upgrade-notice
+check flipped between pass and fail on byte-identical packages, same pinned
+CLI and same model within one hour), so they run when a developer decides the
+PR is ready rather than on every push. Their aggregate check, `Real agent
+evidence`, is required on `main`: absent until the workflow has run on the
+PR's head commit, so the merge waits for it without a fake failure. See
+[.github/rulesets/README.md](../.github/rulesets/README.md) for the flow.
 
 The host-side row is the required form of that evidence. It runs in the
 key-free `Install and upgrade` jobs: an isolated home, the native install, the
@@ -70,8 +71,10 @@ marketplaces. Re-indexing is deliberately not reported as installing a plugin.
 
 ## CI provisioning
 
-Use the existing `production-plugin-release` environment, with required reviewers
-approving the exact candidate. Only reviewed same-repository code receives secrets.
+Use the existing `production-plugin-release` environment. It has no required
+reviewers: the read-only production probe runs on every same-repository PR
+push, and the real-agent workflow can only be dispatched by a collaborator on
+a branch of this repository, so only same-repository code receives secrets.
 Do not use `pull_request_target`, personal host login files, or developer home
 directories. Installation and dependency steps run before secret-bearing steps.
 All agent homes are disposable; only sanitized JSON reports are uploaded.
