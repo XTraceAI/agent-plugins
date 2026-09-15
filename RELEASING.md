@@ -57,7 +57,12 @@ both the main package and the separately pinned Claude package.
    cd /tmp/rel && uv run --with 'mcp<2' python tests/run_all.py
    ```
 
-2. **Merge the release PR bumping all production manifests in lockstep**
+2. **Run the real-agent evidence on the PR's final head.** `main` requires the
+   `Real agent evidence` check, which only exists once someone has run
+   `gh workflow run real-agent-evidence.yml --ref <branch>` on that exact
+   commit (see [.github/rulesets/README.md](.github/rulesets/README.md)).
+
+3. **Merge the release PR bumping all production manifests in lockstep**
    (`tests/version_parity_test.py` enforces):
    - `plugins/memhub/plugin.json` (Agent Plugins 1.0 root)
    - `plugins/memhub/.claude-plugin/plugin.json`
@@ -69,18 +74,18 @@ both the main package and the separately pinned Claude package.
    Claude AND Codex key install caches by version — no bump, no delivery.
    The moment this merges, Cursor and Codex are live.
 
-3. **Tag the release commit** — `memhub--v<version>`, on the verified SHA.
+4. **Tag the release commit** — `memhub--v<version>`, on the verified SHA.
    `claude plugin tag plugins/memhub` validates manifest/marketplace
    agreement; `git tag memhub--v<version> <sha>` works for non-HEAD commits.
-4. **Push the tag FIRST** (the Claude pin cannot resolve a missing ref).
-5. **Move `ref` + `sha`** in `.claude-plugin/marketplace.json` by PR.
-6. **Smoke-test each channel:** Claude reinstall + restart; `codex plugin
+5. **Push the tag FIRST** (the Claude pin cannot resolve a missing ref).
+6. **Move `ref` + `sha`** in `.claude-plugin/marketplace.json` by PR.
+7. **Smoke-test each channel:** Claude reinstall + restart; `codex plugin
    marketplace update && codex plugin add memhub`; Cursor marketplace
    refresh, hooks visible in Hooks settings.
    For Codex bridge changes, run the installed MemHub setup skill again,
    restart Codex, and review the three MemHub hooks. Updating the package
    alone does not replace the existing copy in the user's hooks configuration.
-7. **Submit the Cursor-official update** (when listed) — every update is
+8. **Submit the Cursor-official update** (when listed) — every update is
    manually reviewed; expect lag; keep the server compatible one plugin
    version back.
 

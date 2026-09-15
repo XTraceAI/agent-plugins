@@ -5,7 +5,7 @@ MemHub is a native Codex plugin. Installing it provides:
 - the `memhub` MCP server for interactive memory tools;
 - skills for login, onboarding, search, artifacts, imports, handoffs, specs,
   rules, and PR review;
-- automatic session capture and directive recall through a three-hook
+- automatic session capture and directive recall through a four-hook
   compatibility bridge.
 
 Do not configure MemHub as a separate global MCP server. The installed plugin
@@ -72,9 +72,11 @@ Set up MemHub
 ```
 
 Codex 0.148 and 0.149 support user-level hooks but do not mount hooks bundled
-inside an installed plugin. The `setup` skill therefore merges three MemHub
+inside an installed plugin. The `setup` skill therefore merges four MemHub
 handlers into `~/.codex/hooks.json` while preserving unrelated hooks:
 
+- `SessionStart`: rulebook posture rules and any plugin-upgrade notice, the
+  repo brain brief, and a capture-health warning;
 - `PreToolUse`: situated directive recall;
 - `PostToolUse`: reactive recall, artifact reminders, and milestone capture;
 - `Stop`: incremental session capture.
@@ -85,9 +87,10 @@ hooks** or open `/hooks`, and trust only handlers with both of these traits:
 - source: `User config - ~/.codex/hooks.json`;
 - command contains: `memhub_hook_bridge.py`.
 
-There should be one MemHub handler under each of `PreToolUse`, `PostToolUse`,
-and `Stop`. Review any other waiting hooks separately instead of choosing
-**Trust all**.
+There should be one MemHub handler under each of `SessionStart`, `PreToolUse`,
+`PostToolUse`, and `Stop`. Review any other waiting hooks separately instead of
+choosing **Trust all**. Upgrading from a release that installed three handlers
+asks for one more review: the `SessionStart` handler is new.
 
 ## 4. Connect the repository to its team brain
 

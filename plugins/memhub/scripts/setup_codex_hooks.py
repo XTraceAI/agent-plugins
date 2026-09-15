@@ -257,7 +257,7 @@ def main() -> int:
             print(f"review source: User config - {home / 'hooks.json'}")
             print(f"review command: {home / _RUNNER_NAME}")
             print(
-                "next: restart Codex, open /hooks, and trust only the 3 "
+                f"next: restart Codex, open /hooks, and trust only the {count} "
                 f"handlers whose command contains {_RUNNER_NAME}"
             )
             print("note: do not use 'Trust all' while unrelated hooks also need review")
@@ -268,7 +268,7 @@ def main() -> int:
         healthy, actual, expected = status(home)
         print(f"MemHub Codex hooks: {'OK' if healthy else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
         if healthy:
-            print("trust: Codex-controlled; verify the 3 MemHub handlers in /hooks")
+            print(f"trust: Codex-controlled; verify the {expected} MemHub handlers in /hooks")
         return 0 if healthy else 1
     except (SetupError, OSError) as exc:
         print(f"MemHub Codex hooks: ERROR: {exc}")

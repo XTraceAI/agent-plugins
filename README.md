@@ -87,8 +87,8 @@ server and can force an incompatible static OAuth client. See
 recovery steps.
 
 In a new Codex task, ask it to **Log in to MemHub**, then **Set up MemHub**.
-Restart, open `/hooks`, and trust only MemHub's `PreToolUse`, `PostToolUse`, and
-`Stop` handlers from `~/.codex/hooks.json`. Finally ask it to **Onboard MemHub
+Restart, open `/hooks`, and trust only MemHub's `SessionStart`, `PreToolUse`,
+`PostToolUse`, and `Stop` handlers from `~/.codex/hooks.json`. Finally ask it to **Onboard MemHub
 for this repo**.
 
 ### Cursor

@@ -406,6 +406,51 @@ def test_end_to_end() -> None:
           _run({"session_id": "e2e-off"}, {"MEMHUB_TURN_FLUSH": "0"}), "")
 
 
+def test_codex_host_reads_codex_flush_state() -> None:
+    """The Codex bridge runs this hook with `--host codex --plugin-root R`:
+    it must judge codex_flush's state directory, not Claude's, and find the
+    package's .mcp.json without CLAUDE_PLUGIN_ROOT (Codex never exports it)."""
+    print("\ncodex host")
+    _reset()
+    codex_state = ch.CACHE_DIR / "codexflush"
+    codex_state.mkdir(parents=True, exist_ok=True)
+    for f in codex_state.iterdir():
+        if f.is_file():
+            f.unlink()
+    now = time.time()
+    (codex_state / "c1.json").write_text(json.dumps(
+        {"last_error": "timeout", "last_error_at": now - 60}), encoding="utf-8")
+    _write_token(exp=now + 3600, refresh=True)
+
+    def run(args, env_extra=None):
+        env = dict(os.environ, HOME=_TMP_HOME, USERPROFILE=_TMP_HOME)
+        for k in ("MEMHUB_MCP_BASE_URL", "CLAUDE_PLUGIN_ROOT"):
+            env.pop(k, None)
+        env.update(env_extra or {})
+        out = subprocess.run(
+            [sys.executable, str(SCRIPTS / "capture_health.py"), *args],
+            input=json.dumps({"session_id": "codex-e2e"}), capture_output=True,
+            text=True, env=env)
+        check("exit code is 0", out.returncode, 0)
+        return out.stdout.strip()
+
+    # No host, no root: not an installed plugin as far as this hook knows.
+    check("no root and no host -> silent", run([]), "")
+    # Claude's state dir is empty, so the Claude view is healthy.
+    check("claude view is healthy",
+          run(["--host", "claude", "--plugin-root", str(_plugin_root())]), "")
+    out = run(["--host", "codex", "--plugin-root", str(_plugin_root())])
+    payload = json.loads(out) if out else {}
+    check("codex view reports codex_flush's failure",
+          ch._REASONS["timeout"] in
+          payload.get("hookSpecificOutput", {}).get("additionalContext", ""), True)
+    check("and tells the user", "systemMessage" in payload, True)
+    check("unknown host value is ignored, not fatal",
+          run(["--host", "gemini", "--plugin-root", str(_plugin_root())]), "")
+    check("state dir global restored for in-process tests",
+          ch.STATE_DIR, ch._STATE_DIRS["claude"])
+
+
 def test_never_raises() -> None:
     print("\nrobustness")
     _reset()
@@ -570,7 +615,7 @@ if __name__ == "__main__":
     for test in (test_token_states, test_stored_key_outranks_the_oauth_cache,
                  test_breadcrumbs, test_messages,
                  test_debounce, test_rulebook_health, test_end_to_end,
-                 test_never_raises):
+                 test_codex_host_reads_codex_flush_state, test_never_raises):
         test()
     if failures:
         print("\nFAILED:")

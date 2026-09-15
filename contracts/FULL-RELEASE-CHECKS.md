@@ -2,9 +2,11 @@
 
 The production readiness check requires every deterministic job to succeed. Missing credentials,
 skipped jobs, unsupported host operations and failed assertions mean **NOT VERIFIED**.
-While `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` is unset, the aggregate reports that
-result without blocking merges. Do not enable enforcement until the gaps below
-are closed and all enabled hosts have a real successful run and a deliberate failure run.
+`MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED=true` makes the aggregate fail on NOT
+VERIFIED, and the active `main` ruleset requires it (see
+[.github/rulesets/README.md](../.github/rulesets/README.md)). The release
+owner approves the `production-plugin-release` environment per run; that
+approval is the human gate on every production release.
 
 ## Coverage and evidence
 
@@ -20,17 +22,28 @@ are closed and all enabled hosts have a real successful run and a deliberate fai
 | Allowed operation | The same session creates an unrelated file with the run's unique contents | Each actual host CLI against production |
 | Automatic capture | Fresh successful capture acknowledgement for the exact native session ID; Claude requires both turn and session-end capture | Each actual host CLI against production |
 | Upgrade response contract | Existing gate works, synthetic 426 surfaces actionable notice, stale gate stops, rollback restores it | Actual package with loopback HTTP server |
-| Upgrade notice reaches agent | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server |
+| Upgrade notice reaches the host | The pinned host CLI starts the package's SessionStart hook and takes the notice: Claude reports it in its own `hook_response` record; Codex leaves the hook's per-session marker after the version-carrying fetch | Each actual host CLI, no prompt, no model, no credentials (`check-host-session-start.py`) |
+| Upgrade notice reaches the model | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server, on demand |
 
 The four real-agent rows (advice, gating, allowed operation, capture) and the
-upgrade-notice row run in the `Real agent session` jobs, which are **advisory**:
-they report on the PR but are not inputs to `Production plugin readiness`. Two
-reasons. They assert on what an LLM chooses to echo (the upgrade-notice check
-flipped between pass and fail on byte-identical packages, same pinned CLI and
-same model within one hour), and they sit behind the `production-plugin-release`
-environment reviewer gate, which would otherwise put a human approval on every
-merge. Read their reports before promoting a release; do not treat a red job as
-a merge blocker.
+model-side upgrade-notice row run in `real-agent-evidence.yml`, which is
+`workflow_dispatch` only. They cost model turns, leave synthetic sessions in
+the fixture org, and assert on what a model chooses to say (the upgrade-notice
+check flipped between pass and fail on byte-identical packages, same pinned
+CLI and same model within one hour), so they run when a developer decides the
+PR is ready rather than on every push. Their aggregate check, `Real agent
+evidence`, is required on `main`: absent until the workflow has run on the
+PR's head commit, so the merge waits for it without a fake failure. See
+[.github/rulesets/README.md](../.github/rulesets/README.md) for the flow.
+
+The host-side row is the required form of that evidence. It runs in the
+key-free `Install and upgrade` jobs: an isolated home, the native install, the
+loopback 426 server, and a session that never reaches a model. Claude runs
+SessionStart hooks before any prompt, so a stream-json session with nothing on
+stdin is enough; Codex has no prompt-less mode, so it gets a one-word prompt
+and a model endpoint that cannot answer. If this row fails, a host stopped
+starting the plugin's SessionStart hook or stopped taking its output — the
+regression a release gate exists to catch.
 
 The actual Claude package is the marketplace's immutable tag/SHA, which may differ
 from main. Codex and Cursor use the candidate main/merge commit. Previous versions
@@ -58,8 +71,10 @@ marketplaces. Re-indexing is deliberately not reported as installing a plugin.
 
 ## CI provisioning
 
-Use the existing `production-plugin-release` environment, with required reviewers
-approving the exact candidate. Only reviewed same-repository code receives secrets.
+Use the existing `production-plugin-release` environment. It has no required
+reviewers: the read-only production probe runs on every same-repository PR
+push, and the real-agent workflow can only be dispatched by a collaborator on
+a branch of this repository, so only same-repository code receives secrets.
 Do not use `pull_request_target`, personal host login files, or developer home
 directories. Installation and dependency steps run before secret-bearing steps.
 All agent homes are disposable; only sanitized JSON reports are uploaded.
@@ -150,9 +165,9 @@ ingestion or a linked session UI record. The raw native rule-fire session ID
 differs from capture's `codex-`-prefixed source ID; that identity fix and a backend
 readback assertion are separate follow-up work.
 
-Keep `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` unset and the production ruleset disabled.
-Staging is not part of this setup, and its manifest is not advanced by a production
-release.
+Enforcement is on: `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED=true` and the `main`
+ruleset active, since 2026-09-15. Staging is not part of this setup, and its
+manifest is not advanced by a production release.
 
 ## Host references
 

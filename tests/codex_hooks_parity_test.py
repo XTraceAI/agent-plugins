@@ -43,25 +43,40 @@ def test_no_claude_only_capture_leaked():
 
 def test_user_bridge_covers_live_codex_capabilities():
     bridge = json.loads(BRIDGE_HOOKS.read_text(encoding="utf-8"))["hooks"]
-    assert set(bridge) == {"PreToolUse", "PostToolUse", "Stop"}
+    assert set(bridge) == {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
     assert all(len(groups) == 1 for groups in bridge.values())
     text = json.dumps(bridge)
-    for action in ("dispatch PreToolUse", "dispatch PostToolUse",
-                   "dispatch Stop"):
+    for action in ("dispatch SessionStart", "dispatch PreToolUse",
+                   "dispatch PostToolUse", "dispatch Stop"):
         assert action in text, action
-    assert text.count("memhub_hook_bridge.py") == 6  # Unix + Windows, 3 handlers
+    assert text.count("memhub_hook_bridge.py") == 8  # Unix + Windows, 4 handlers
     print("PASS test_user_bridge_covers_live_codex_capabilities")
 
 
-def test_bundled_hooks_require_only_three_approvals():
+def test_bundled_hooks_require_only_four_approvals():
     hooks = json.loads(CODEX_HOOKS.read_text(encoding="utf-8"))["hooks"]
-    assert set(hooks) == {"PreToolUse", "PostToolUse", "Stop"}
+    assert set(hooks) == {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
     handlers = [handler for groups in hooks.values() for group in groups
                 for handler in group["hooks"]]
-    assert len(handlers) == 3
+    assert len(handlers) == 4
     assert all("codex_hook_bridge.py" in handler["command"]
                for handler in handlers)
-    print("PASS test_bundled_hooks_require_only_three_approvals")
+    print("PASS test_bundled_hooks_require_only_four_approvals")
+
+
+def test_session_start_is_wired_on_both_codex_manifests():
+    """Codex 0.153+ honours additionalContext/systemMessage on SessionStart.
+    Without this event a Codex session first hears about an unsupported
+    plugin at its first tool call, and only if the model makes one — the
+    upgrade notice, posture rules and brain brief all ride this hook."""
+    for path in (CODEX_HOOKS, BRIDGE_HOOKS):
+        groups = json.loads(path.read_text(encoding="utf-8"))["hooks"]["SessionStart"]
+        assert len(groups) == 1 and "matcher" not in groups[0], path
+        (handler,) = groups[0]["hooks"]
+        assert "dispatch SessionStart" in handler["command"], path
+        assert "dispatch SessionStart" in handler["commandWindows"], path
+        assert handler["timeout"] >= 8, path     # three children in parallel
+    print("PASS test_session_start_is_wired_on_both_codex_manifests")
 
 
 def test_the_pr_link_prefilter_spares_ordinary_shell_calls():

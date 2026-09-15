@@ -1,6 +1,19 @@
 {
   "description": "MemHub compatibility hooks for Codex releases without plugin-bundled hook loading.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch SessionStart",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch SessionStart",
+            "statusMessage": "MemHub: orienting this session"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command)$",

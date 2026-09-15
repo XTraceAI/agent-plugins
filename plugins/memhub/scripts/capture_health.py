@@ -42,7 +42,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
+# Claude's flush state. `--host codex` switches to codex_flush's directory:
+# the two writers keep the same last_error / last_error_at / last_ok_at shape,
+# so everything below reads either one unchanged.
 STATE_DIR = CACHE_DIR / "turnflush"
+_STATE_DIRS = {"claude": CACHE_DIR / "turnflush", "codex": CACHE_DIR / "codexflush"}
+_PLUGIN_ROOT_ARG: str | None = None     # `--plugin-root`, see _configure
 # The rulebook keeps its own tree, relocatable together for tests (the hook
 # reads the same variable).
 RULEBOOK_DIR = Path(os.environ.get("MEMHUB_RULEBOOK_BASE")
@@ -117,7 +122,10 @@ def _env_host() -> str | None:
     base = os.environ.get("MEMHUB_MCP_BASE_URL")
     if base:
         return urlparse(base).netloc or None
-    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    # The Codex bridge names the package on argv: Codex exports no
+    # CLAUDE_PLUGIN_ROOT, and the user-level bridge resolves the newest
+    # installed version itself.
+    root = _PLUGIN_ROOT_ARG or os.environ.get("CLAUDE_PLUGIN_ROOT")
     if not root:
         return None
     try:
@@ -546,11 +554,24 @@ def _already_warned(session_id: str, signature: str) -> bool:
     return False
 
 
+def _configure(argv: list[str]) -> None:
+    """`--host claude|codex` picks the flush state to judge; `--plugin-root`
+    names the package when the host exports no CLAUDE_PLUGIN_ROOT. Unknown
+    flags are ignored — a health check never fails a session over argv."""
+    global STATE_DIR, _PLUGIN_ROOT_ARG
+    for flag, value in zip(argv, argv[1:]):
+        if flag == "--host" and value in _STATE_DIRS:
+            STATE_DIR = _STATE_DIRS[value]
+        elif flag == "--plugin-root" and value:
+            _PLUGIN_ROOT_ARG = value
+
+
 def main() -> int:
     # Capture switched off on purpose is not a fault. Checked first so the
     # opt-out is genuinely free and genuinely silent.
     if os.environ.get("MEMHUB_TURN_FLUSH", "").strip().lower() in {"0", "off", "false"}:
         return 0
+    _configure(sys.argv[1:])
 
     raw = sys.stdin.read()
     try:
