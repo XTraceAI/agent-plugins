@@ -77,6 +77,9 @@ both the main package and the separately pinned Claude package.
 6. **Smoke-test each channel:** Claude reinstall + restart; `codex plugin
    marketplace update && codex plugin add memhub`; Cursor marketplace
    refresh, hooks visible in Hooks settings.
+   For Codex bridge changes, run the installed MemHub setup skill again,
+   restart Codex, and review the three MemHub hooks. Updating the package
+   alone does not replace the existing copy in the user's hooks configuration.
 7. **Submit the Cursor-official update** (when listed) — every update is
    manually reviewed; expect lag; keep the server compatible one plugin
    version back.

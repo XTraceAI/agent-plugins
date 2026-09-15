@@ -4,7 +4,7 @@ The production readiness check requires every job to succeed. Missing credential
 skipped jobs, unsupported host operations and failed assertions mean **NOT VERIFIED**.
 While `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` is unset, the aggregate reports that
 result without blocking merges. Do not enable enforcement until the gaps below
-are closed and all hosts have a real successful run and a deliberate failure run.
+are closed and all enabled hosts have a real successful run and a deliberate failure run.
 
 ## Coverage and evidence
 
@@ -13,7 +13,7 @@ are closed and all hosts have a real successful run and a deliberate failure run
 | Regression suites | Every registered suite and shell check passes, with and without MCP SDK | Every PR, no secrets |
 | Production API compatibility | Exact rule IDs/modes, cold 200, ETag and warm 304 through actual package code | Dedicated read key, live production |
 | Fresh install | Native host registers the selected version and installs identical package bytes | Codex and Claude native CLI, isolated home |
-| Upgrade | Older immutable release installs, native update selects candidate bytes; existing Codex bridge resolves new cache | Codex and Claude native CLI, isolated home |
+| Upgrade | Older immutable release installs, native update selects candidate bytes; updated Codex setup installs the current bridge | Codex and Claude native CLI, isolated home |
 | Cursor marketplace lifecycle | Actual install/update through its supported distribution surface | **Not verified: desktop/account runner still needed** |
 | Agent advice | A real hook fire plus the final assistant answer contains a marker absent from the user prompt | Each actual host CLI against production |
 | Agent gating | A gate fire for that native session and absence of the forbidden marker file | Each actual host CLI against production |
@@ -38,10 +38,9 @@ use the JWT-only conversation read/delete routes. Independent readback and full
 cleanup need a suitable backend API or a separate authenticated test runner;
 do not silently broaden the read-only production token. Synthetic sessions are
 retained in the dedicated test account for now, at most one production session
-per host per workflow attempt. No developer transcripts are imported.
+per enabled host/package job per workflow attempt. No developer transcripts are imported.
 
-The new session adapters cannot be called validated until they run with real CI
-credentials. CLI success alone is insufficient: the checks require observable
+The session adapters run with real CI credentials. CLI success alone is insufficient: the checks require observable
 rule fires, filesystem effects and capture state. Codex/Claude CLI installation
 has been exercised without account credentials; Cursor's CLI supports local
 `--plugin-dir` loading, but its marketplace commands only add/list/re-index
@@ -111,24 +110,39 @@ member. The exact two active rule IDs, modes, repo scope, marker and matching
 commands are checked before the real agent starts. This supplements account
 provisioning; it does not query the account's internal-privilege flag.
 
-## Initial known failures
+## Release candidates and deferred coverage
 
-These checks intentionally expose unfinished product support:
+Codex and Claude are the enabled hosts. Cursor execution and native marketplace
+lifecycle are explicitly deferred and do not contribute passing evidence.
+The workflow summary names that limitation even when the enabled checks pass.
 
-- Production main 0.55.1 and pinned Claude 0.54.3 predate the global upgrade-error
-  handler in PR #226. The rejection test fails those packages; it passes the
-  existing upgrade-handler branch.
-- The inspected Codex bridge does not dispatch rulebook gating and the inspected
-  Cursor capture hook always allows commands. The real host rule tests must not
-  pass until their actual hook integrations deliver and enforce the fixtures.
-- Cursor native marketplace install/update is not automated by this implementation.
-- Real-agent CI keys and the two active rules must be provisioned before live
-  behavior can be verified. An enabled workflow with missing setup stays unverified.
+Claude runs twice: the published marketplace tag/SHA and an explicitly labeled
+HEAD candidate (`--candidate-head`). A candidate pass does not imply that the
+published Claude package has changed. Promote only verified package bytes through
+the normal immutable tag and marketplace pin procedure.
 
-After provisioning, enable `MEMHUB_PLUGIN_PROD_CHECKS_ENABLED=true` and manually
-dispatch `production-compatibility`. Inspect every host report, including failures.
-Keep `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` unset and the production ruleset disabled
-until all required coverage is verified. Staging is not part of this setup.
+The 0.56.1 candidate incorporates the upgrade handler and Codex Rulebook dispatch.
+A cold Codex pre-call fetches the book within a bounded timeout. The bridge
+normalizes shell arguments, preserves gate denials and disclosure text while
+merging other context, and flushes rule-fire records at Stop. Codex users upgrading
+must rerun the installed setup skill, restart, and review the three MemHub hooks;
+the copied user bridge is not replaced by a marketplace refresh alone.
+
+Session cleanup remains deferred by request. Track backend personal-token deletion
+support and the subsequent CI cleanup change in
+[ENG-1074](https://linear.app/xtrace/issue/ENG-1074/accept-personal-access-tokens-for-owner-scoped-session-deletion-and).
+Until that ships, synthetic sessions remain in the dedicated test account.
+
+Codex rule-fire linkage in the session UI is also deferred under
+[ENG-1075](https://linear.app/xtrace/issue/ENG-1075/codex-rule-fires-are-not-linked-to-captured-sessions-because-session).
+The current checks prove local rule fires and agent behavior, not backend fire
+ingestion or a linked session UI record. The raw native rule-fire session ID
+differs from capture's `codex-`-prefixed source ID; that identity fix and a backend
+readback assertion are separate follow-up work.
+
+Keep `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` unset and the production ruleset disabled.
+Staging is not part of this setup, and its manifest is not advanced by a production
+release.
 
 ## Host references
 

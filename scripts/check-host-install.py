@@ -85,7 +85,12 @@ def lifecycle(host, candidate, previous, executable, report):
                 run([sys.executable, str(old / "scripts/setup_codex_hooks.py"), "install"], env=env, cwd=root)
             installed = native_install(root, env, candidate, host, executable, update=True)
             if host == "codex":
-                # The existing bridge must resolve the updated cache, without reinstalling it.
+                # Hook definitions live outside the plugin cache. Apply the
+                # documented setup step again when upgrading this bridge.
+                run([sys.executable, str(installed / "scripts/setup_codex_hooks.py"), "install"], env=env, cwd=root)
+                require((Path(env["CODEX_HOME"]) / "memhub_hook_bridge.py").read_bytes()
+                        == (installed / "scripts/codex_hook_bridge.py").read_bytes(),
+                        "Codex setup did not replace the previous bridge")
                 out = run([sys.executable, "-c", "import runpy; d=runpy.run_path(" +
                            repr(str(Path(env['CODEX_HOME']) / 'memhub_hook_bridge.py')) +
                            "); print(d['resolve_plugin_root']())"], env=env, cwd=root)

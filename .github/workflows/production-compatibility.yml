@@ -34,7 +34,6 @@ jobs:
         include:
           - host: codex
           - host: claude
-          - host: cursor
           - host: claude
             package: candidate
     steps:
@@ -88,8 +87,6 @@ jobs:
           - host: claude
             package: candidate
             model_variable: MEMHUB_E2E_CLAUDE_MODEL
-          - host: cursor
-            model_variable: MEMHUB_E2E_CURSOR_MODEL
     steps:
       - uses: actions/checkout@v4
         with:
@@ -215,7 +212,10 @@ jobs:
           results = json.loads(os.environ['RESULTS'])
           passed = bool(results) and all(job['result'] == 'success' for job in results.values())
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
-              out.write('Production plugin release: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
+              out.write('Codex/Claude release evidence: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
+              out.write('Cursor: deferred; native install and agent behavior are not verified.\n')
+              out.write('Session cleanup: deferred pending backend PAK deletion support (ENG-1074).\n')
+              out.write('Session UI rule-fire linkage: deferred (ENG-1075); local hook evidence does not verify backend/UI linkage.\n')
               out.write('Enforcement: ' + ('enabled' if os.environ['ENFORCED'] == 'true' else 'advisory') + '\n')
               out.write('\n| Check group | Result |\n| --- | --- |\n')
               for name, job in results.items():
