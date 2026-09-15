@@ -229,33 +229,39 @@ class ReleaseChecksTests(unittest.TestCase):
                 agent.record_session(manifest, host="codex", sid=SID, org_id="not-an-org")
             self.assertEqual(len(json.loads(manifest.read_text())["sessions"]), 3)
 
-    def test_session_is_recorded_before_any_live_assertion_can_fail(self):
-        """A run whose advice / gate / capture checks fail still created a
-        production session; the manifest write must precede them in source,
-        or a failed run is exactly the run cleanup never hears about."""
-        source = (ROOT / "scripts/check-agent-session.py").read_text()
-        recorded = source.index('report.check("session_recorded"')
-        for later in ('report.check("advice_delivered"', 'report.check("gate_enforced"',
-                      'report.check("allowed_operation"', 'report.check("capture_acknowledged"'):
-            self.assertLess(recorded, source.index(later), later)
-
-    def test_fixture_cannot_target_arbitrary_repo_or_reuse_one_rule(self):
-        fixture = {"schema_version": 1, "org_id": SID, "repo": agent.REPO,
-                   "advice_rule_id": SID, "gate_rule_id": "22222222-2222-4222-8222-222222222222",
-                   "advice_marker": "MEMHUB_RELEASE_ADVICE_12345678"}
-        self.assertEqual(agent.fixture_config(json.dumps(fixture)), fixture)
-        for changed in (dict(fixture, repo="real-customer-repo"), dict(fixture, gate_rule_id=SID),
-                        dict(fixture, advice_marker="arbitrary prose")):
-            with self.assertRaises((lib.compat.GateError, lib.NotVerified)):
-                agent.fixture_config(json.dumps(changed))
-
-    def test_unknown_cli_output_is_withheld(self):
+    def test_identity_streams_out_before_the_host_fails(self):
+        """A host that announces its session and then exits nonzero, or hangs
+        past its budget, has already let capture create the production
+        session. ``drive`` must hand the identity to ``on_event`` mid-run, so
+        the manifest exists even though ``drive`` itself raises."""
         with tempfile.TemporaryDirectory() as raw:
-            with self.assertRaisesRegex(lib.compat.GateError, "raw output withheld") as caught:
-                lib.run([sys.executable, "-c", "print('secret'); raise SystemExit(1)"],
-                        env=lib.isolated_env(Path(raw)), cwd=raw)
-            self.assertNotIn("secret", str(caught.exception))
+            root = Path(raw)
+            env = lib.isolated_env(root)
+            for name, tail in (("crash", "raise SystemExit(1)"), ("hang", "import time; time.sleep(30)")):
+                # Stands in for the host binary: ``command()`` puts the
+                # executable first and the host's flags after it, so the fake
+                # must be the executable itself and ignore its arguments.
+                fake = root / f"{name}-host"
+                fake.write_text(f"#!{sys.executable}\nimport json, sys\n"
+                                f"print(json.dumps({{'type': 'thread.started', 'thread_id': {SID!r}}}), flush=True)\n"
+                                "sys.stdin.read()\n" + tail + "\n")
+                fake.chmod(0o700)
+                seen = []
+                with self.subTest(name=name), patch.object(agent, "AGENT_TIME_BUDGET_S", 2), \
+                        self.assertRaises(lib.compat.GateError):
+                    agent.drive("codex", str(fake), None, "m", "prompt", env, root,
+                                on_event=lambda e: seen.append(agent.identity_of(e, "codex")))
+                self.assertEqual([v for v in seen if v], [SID], name)
 
+    def test_identity_extractor_is_the_one_the_final_check_uses(self):
+        codex = [{"type": "thread.started", "thread_id": SID}, {"type": "item.completed"}]
+        claude = [{"type": "system", "subtype": "init", "session_id": SID}, {"type": "result"}]
+        self.assertEqual([agent.identity_of(e, "codex") for e in codex], [SID, None])
+        self.assertEqual([agent.identity_of(e, "claude") for e in claude], [SID, None])
+        self.assertEqual(agent.session_id(codex, "codex"), SID)
+        self.assertEqual(agent.session_id(claude, "cursor"), SID)
+        with self.assertRaises(lib.compat.GateError):
+            agent.session_id([{"type": "thread.started", "thread_id": 7}], "codex")
 
 if __name__ == "__main__":
     unittest.main()

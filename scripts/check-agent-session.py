@@ -37,6 +37,7 @@ BLOCKED_FILE = ".memhub-release-blocked"
 # sends it bare (flush_turn / flush_session).
 HARNESS_SESSION_ID = {"codex": "codex-{}", "claude": "{}", "cursor": "cursor-{}"}
 MANIFEST_SCHEMA = 1
+AGENT_TIME_BUDGET_S = 360
 
 
 def fixture_config(raw):
@@ -121,27 +122,55 @@ def command(host, executable, installed, model):
             "--sandbox", "enabled", "--model", model, "--plugin-dir", str(installed)]
 
 
-def drive(host, executable, installed, model, prompt, env, workspace):
+def drive(host, executable, installed, model, prompt, env, workspace, on_event=None):
+    """Run the agent and return its JSON event stream.
+
+    Every host STREAMS: each event is parsed as it arrives and handed to
+    ``on_event`` while the host is still running. That is what lets the caller
+    persist the session identity before the outcome is known — a host that
+    then times out or exits nonzero has already let the capture hooks create
+    the production session, and only an identity recorded mid-run can name it
+    for cleanup. Buffering the output (``communicate``) would discard exactly
+    that on the failures that need it. Raw output is never retained beyond the
+    parsed events, and is never streamed into CI logs.
+    """
     cmd = command(host, executable, installed, model)
-    if host != "claude":
-        # Cursor takes the prompt as an argument; Codex supports stdin.
-        output = run(cmd + ([prompt] if host == "cursor" else []), env=env, cwd=workspace,
-                     stdin=prompt if host == "codex" else None, timeout=360)
-        return json_lines(output)
-    # Hold stream-json stdin open for Stop hooks. A plain -p process can exit
-    # before asynchronous capture hooks finish. No raw logs are retained.
     events = []
-    with subprocess.Popen(cmd, cwd=workspace, env=env, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                          start_new_session=True) as proc:
-        def read():
-            for line in proc.stdout:
-                events.extend(json_lines(line))
-        reader = threading.Thread(target=read, daemon=True)
+
+    def read(stream):
+        for line in stream:
+            for event in json_lines(line):
+                events.append(event)
+                if on_event is not None:
+                    on_event(event)
+
+    # Cursor takes the prompt as an argument; Codex reads it from stdin; Claude
+    # speaks stream-json on stdin, held open for its Stop hooks (a plain -p
+    # process can exit before asynchronous capture hooks finish).
+    with subprocess.Popen(cmd + ([prompt] if host == "cursor" else []), cwd=workspace, env=env,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True, start_new_session=True) as proc:
+        reader = threading.Thread(target=read, args=(proc.stdout,), daemon=True)
         reader.start()
-        proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
-        proc.stdin.flush()
-        deadline = time.monotonic() + 360
+        if host == "claude":
+            proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
+            proc.stdin.flush()
+        else:
+            if host == "codex":
+                proc.stdin.write(prompt)
+            proc.stdin.close()
+        deadline = time.monotonic() + AGENT_TIME_BUDGET_S
+        if host != "claude":
+            try:
+                proc.wait(timeout=AGENT_TIME_BUDGET_S)
+            except subprocess.TimeoutExpired:
+                import signal
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                raise compat.GateError("command exceeded its time budget") from None
+            reader.join(timeout=5)
+            require(proc.returncode == 0, "host command failed; raw output withheld")
+            return events
         while time.monotonic() < deadline and proc.poll() is None:
             if any(e.get("type") == "result" for e in list(events)):
                 break
@@ -229,12 +258,19 @@ def ledger(root):
     return json_lines(path.read_text()) if path.is_file() else []
 
 
-def session_id(events, host):
+def identity_of(event, host):
+    """The native session identity this one event announces, else ``None``.
+    Unvalidated on purpose: ``session_id`` and ``record_session`` each apply
+    the shape rule, so a hostile value is refused wherever it is used."""
     if host == "codex":
-        value = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
-    else:
-        value = next((e.get("session_id") for e in events if e.get("type") == "system"
-                      and e.get("subtype") == "init"), None)
+        return event.get("thread_id") if event.get("type") == "thread.started" else None
+    if event.get("type") == "system" and event.get("subtype") == "init":
+        return event.get("session_id")
+    return None
+
+
+def session_id(events, host):
+    value = next((v for v in (identity_of(e, host) for e in events) if v is not None), None)
     require(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", value),
             "host did not expose a usable native session identity")
     return value
@@ -323,7 +359,35 @@ def run_live(args, report, model):
                   f"Then attempt exactly `touch {BLOCKED_FILE}` once; if a hook denies it, respect the denial and do not retry or override it. "
                   f"Then write allowed.txt containing exactly {marker}. Finish with any advice the plugin delivered and the test result.")
         started = time.time()
-        events = report.check("agent_execution", lambda: drive(args.host, args.executable, installed, model, prompt, env, ws))
+        recorded = {}
+
+        def note(event):
+            # Persist the identity the moment the host announces it, while the
+            # host is still running. A host that then times out or exits
+            # nonzero has already let the capture hooks create the production
+            # session; a cleanup that never hears of it is a leak reported as a
+            # clean run. Errors are kept, not raised: this runs on the reader
+            # thread, and ``session_recorded`` below is where they surface.
+            if recorded or not args.session_manifest:
+                return
+            sid = identity_of(event, args.host)
+            if not isinstance(sid, str):
+                return
+            try:
+                record_session(args.session_manifest, host=args.host, sid=sid, org_id=fixture["org_id"])
+                recorded["sid"] = sid
+            except Exception as exc:
+                recorded["error"] = exc
+
+        events = report.check("agent_execution", lambda: drive(
+            args.host, args.executable, installed, model, prompt, env, ws, on_event=note))
+        if args.session_manifest:
+            def session_recorded():
+                if "error" in recorded:
+                    raise compat.GateError("the session manifest could not be written")
+                if "sid" not in recorded:
+                    raise NotVerified("the host announced no session identity; nothing to record")
+            report.check("session_recorded", session_recorded)
         if events is None:
             report.blocked(LIVE_CHECKS, "agent process failed")
             return
@@ -332,11 +396,6 @@ def run_live(args, report, model):
         if args.host == "claude":
             report.check("hook_health", lambda: claude_hook_health(events))
         sid = report.check("native_session_identity", lambda: session_id(events, args.host))
-        # Recorded FIRST — before any assertion below can fail this run — so
-        # cleanup knows about the session whether or not the checks pass.
-        if sid and args.session_manifest:
-            report.check("session_recorded", lambda: record_session(
-                args.session_manifest, host=args.host, sid=sid, org_id=fixture["org_id"]))
         fires = ledger(root)
         report.check("advice_delivered", lambda: require(
             isinstance(final, str) and fixture["advice_marker"] in final and any(

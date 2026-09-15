@@ -49,9 +49,15 @@ class FakeRest:
             raise step
         if step == 200:
             return mcp_http.RestReply(200, None, {"deleted": True})
-        raise mcp_http.McpError(
-            f"DELETE {url} failed ({step}): " + ('{"reason": "conversation_not_found"}' if step == 404 else "no"),
-            step)
+        if step == 404:
+            body = '{"code": 404, "msg": "conversation not found", "data": {"reason": "conversation_not_found"}}'
+        elif step == "404-bare":
+            step, body = 404, "<html>404 Not Found</html>"
+        elif step == "404-other":
+            step, body = 404, '{"code": 404, "msg": "no", "data": {"reason": "workspace_not_found"}}'
+        else:
+            body = "no"
+        raise mcp_http.McpError(f"DELETE {url} failed ({step}): {body}", step)
 
 
 class CleanupTests(unittest.TestCase):
@@ -75,6 +81,19 @@ class CleanupTests(unittest.TestCase):
         result = cleanup.cleanup_session(rest, TOKEN, session("abcdefgh-1111", host="claude"))
         self.assertEqual(result["outcome"], "recreated")
         self.assertNotIn("recreated", cleanup.OK)
+
+    def test_a_404_without_the_backends_reason_proves_nothing(self):
+        """A proxy page or a missing route is also a 404; only the backend's
+        own ``conversation_not_found`` says the id resolves to nothing."""
+        for hid, script, outcome in (
+            ("codex-bare404a", ["404-bare"], "failed"),
+            ("codex-bare404b", ["404-other"], "failed"),
+            ("codex-bare404c", [200, "404-bare"], "unverified"),
+            ("codex-bare404d", [200, "404-other"], "unverified"),
+        ):
+            with self.subTest(hid=hid):
+                rest = FakeRest({hid: script})
+                self.assertEqual(cleanup.cleanup_session(rest, TOKEN, session(hid))["outcome"], outcome)
 
     def test_refused_key_and_transport_failures_are_named(self):
         for hid, script, outcome in (

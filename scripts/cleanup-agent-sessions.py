@@ -35,6 +35,7 @@ from release_check_lib import compat, read_json
 
 ROOT = Path(__file__).resolve().parents[1]
 DELETE_PATH = "/v1/team/conversations"
+NOT_FOUND = "conversation_not_found"
 OK = frozenset({"deleted", "absent"})
 _TIMEOUT_S = 30
 
@@ -57,9 +58,28 @@ def load_manifest(path):
     return sessions
 
 
+def _reason(exc):
+    """The backend's ``data.reason`` out of a transport error, or ``None``.
+
+    ``mcp_http.rest`` folds the (truncated) error body into the message after
+    ``"failed (<status>): "``; the envelope this needs is ~90 bytes, so it is
+    always intact. Parsed, not pattern-matched, so a proxy page that happens
+    to contain the words cannot pass as the backend's answer.
+    """
+    _head, sep, body = str(exc).partition("): ")
+    if not sep:
+        return None
+    try:
+        data = json.loads(body).get("data")
+    except (ValueError, AttributeError):
+        return None
+    return data.get("reason") if isinstance(data, dict) else None
+
+
 def _delete(rest, token, session):
-    """One DELETE. Returns ``(status, reason)``; ``status`` is the HTTP code and
-    ``reason`` the backend's ``data.reason`` on a 404, else None."""
+    """One DELETE. Returns ``(status, reason)``: the HTTP code, and on a 404
+    the backend's ``data.reason`` — which is what distinguishes "this id
+    resolves to nothing" from a proxy or route 404 that proved nothing."""
     url = compat.PRODUCTION + DELETE_PATH + "?session_id=eq." + urllib.parse.quote(
         session["harness_session_id"], safe="")
     try:
@@ -68,28 +88,25 @@ def _delete(rest, token, session):
         return reply.status, None
     except Exception as exc:  # McpError and anything the transport raised
         status = getattr(exc, "status", None)
-        reason = None
-        if status == 404:
-            found = re.search(r"conversation_not_found", str(exc))
-            reason = "conversation_not_found" if found else "other"
-        return status, reason
+        return status, (_reason(exc) if status == 404 else None)
 
 
 def cleanup_session(rest, token, session):
     """Delete one session and verify it is gone. Never raises; the outcome is
     one of a fixed vocabulary so the report holds no server strings."""
     status, reason = _delete(rest, token, session)
-    if status == 404:
+    if status == 404 and reason == NOT_FOUND:
         # Already gone, never captured, or not this key's session — every one
         # of those means "nothing of ours remains", and a retried cleanup lands
-        # here by design.
+        # here by design. Only the backend's own reason counts: a bare 404 is
+        # a proxy or a missing route, and proves nothing about the session.
         return {"outcome": "absent"}
     if status in (401, 403):
         return {"outcome": "unauthorized", "http_status": status}
     if status != 200:
         return {"outcome": "failed", "http_status": status}
-    verify, _reason = _delete(rest, token, session)
-    if verify == 404:
+    verify, reason = _delete(rest, token, session)
+    if verify == 404 and reason == NOT_FOUND:
         return {"outcome": "deleted"}
     if verify == 200:
         # A capture flush landed between the two calls and re-created the

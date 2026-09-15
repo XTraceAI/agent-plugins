@@ -142,8 +142,11 @@ the copied user bridge is not replaced by a marketplace refresh alone.
 Each "Real agent session" job records the native session identity of the one
 production session it captures in a run-owned manifest
 (`check-agent-session.py --session-manifest`, under the job's report directory,
-outside the disposable agent home) the moment the identity is known — before the
-advice, gate and capture assertions, so a failed run is still listed. An
+outside the disposable agent home) the moment the host announces it, while the
+host is still running — every host's event stream is read live for this — so a
+host that then times out or exits nonzero, or a run whose advice, gate or capture
+assertions fail, is still listed. Only a 404 carrying the backend's own
+`conversation_not_found` counts as "gone"; a bare proxy or route 404 is a failure. An
 `always()` step then runs `cleanup-agent-sessions.py`, which issues one
 `DELETE /v1/team/conversations?session_id=eq.<id>` per listed session with the
 dedicated test key and the fixture organization, and verifies with a second
