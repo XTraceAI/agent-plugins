@@ -413,7 +413,11 @@ def run_live(args, report, model):
     if not ready:
         report.blocked(LIVE_CHECKS, "production fixture verification failed")
         return
-    with tempfile.TemporaryDirectory(prefix="memhub-agent-prod-") as raw:
+    # ignore_cleanup_errors: the host can still be writing into its disposable
+    # home after the checks are done (Codex's plugin clone under
+    # ~/.codex/.tmp, a detached capture flush). A cleanup race must not turn a
+    # fully passed run into a crash with no report (#235, run 35023881455).
+    with tempfile.TemporaryDirectory(prefix="memhub-agent-prod-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
         env = isolated_env(root)
         ws = prepare_workspace(root, env, REPO)
@@ -537,7 +541,7 @@ UPGRADE_REQUIRED_EVIDENCE = ("server_contacted", "error_code_reported", "minimum
 
 
 def run_rejection(args, report, model):
-    with tempfile.TemporaryDirectory(prefix="memhub-agent-rejection-") as raw:
+    with tempfile.TemporaryDirectory(prefix="memhub-agent-rejection-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
         env = isolated_env(root)
         ws = prepare_workspace(root, env, "memhub-release-upgrade")
@@ -594,7 +598,7 @@ def main():
     else:
         require(re.fullmatch(r"[A-Za-z0-9./:_-]{1,100}", model), "invalid host model configuration")
         report.data["model"] = model
-        with tempfile.TemporaryDirectory(prefix="memhub-host-version-") as raw:
+        with tempfile.TemporaryDirectory(prefix="memhub-host-version-", ignore_cleanup_errors=True) as raw:
             root = Path(raw)
             report.data["host_version"] = report.check("host_cli", lambda: host_version(
                 args.executable, isolated_env(root), root))

@@ -61,7 +61,7 @@ def native_install(root, env, package, host, executable, update=False):
 
 
 def lifecycle(host, candidate, previous, executable, report):
-    with tempfile.TemporaryDirectory(prefix="memhub-install-") as raw:
+    with tempfile.TemporaryDirectory(prefix="memhub-install-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
         env = isolated_env(root)
         report.data["host_version"] = report.check("host_cli", lambda: host_version(executable, env, root))
@@ -69,7 +69,7 @@ def lifecycle(host, candidate, previous, executable, report):
     if previous is None:
         report.blocked(["upgrade"], "no previous immutable release was selected")
         return
-    with tempfile.TemporaryDirectory(prefix="memhub-upgrade-") as raw:
+    with tempfile.TemporaryDirectory(prefix="memhub-upgrade-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
         env = isolated_env(root)
 

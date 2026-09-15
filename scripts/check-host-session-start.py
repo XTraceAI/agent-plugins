@@ -150,7 +150,7 @@ def codex_evidence(events, root, installed, env, server):
 
 
 def exercise(args, report):
-    with tempfile.TemporaryDirectory(prefix="memhub-session-start-") as raw:
+    with tempfile.TemporaryDirectory(prefix="memhub-session-start-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
         env = isolated_env(root)
         report.data["host_version"] = report.check("host_cli", lambda: host_version(args.executable, env, root))
