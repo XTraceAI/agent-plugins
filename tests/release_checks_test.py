@@ -30,20 +30,100 @@ SID = "11111111-1111-4111-8111-111111111111"
 
 class ReleaseChecksTests(unittest.TestCase):
     def test_upgrade_notice_diagnostics_identify_each_missing_requirement(self):
-        complete = "PLUGIN_UPGRADE_REQUIRED requires 999.0.0; upgrade and restart."
-        self.assertTrue(all(agent.upgrade_notice_evidence(complete, True).values()))
+        nonce = "999.4242.17"
+        fields = {"error_code": "PLUGIN_UPGRADE_REQUIRED", "minimum_version": nonce,
+                  "remediation": "Update MemHub to 999.4242.17 or newer, then restart this agent session."}
+        complete = agent.upgrade_notice_evidence("", fields, nonce, True)
+        self.assertTrue(all(complete.values()))
         for field, answer, contacted in (
-            ("server_contacted", complete, False),
-            ("error_code_reported", complete.replace("PLUGIN_UPGRADE_REQUIRED", "upgrade"), True),
-            ("minimum_version_reported", complete.replace("999.0.0", "latest"), True),
-            ("restart_reported", complete.replace("restart", "retry"), True),
+            ("server_contacted", fields, False),
+            ("error_code_reported", {**fields, "error_code": "UPGRADE"}, True),
+            ("minimum_version_reported", {**fields, "minimum_version": "999.0.0"}, True),
+            ("restart_reported", {**fields, "remediation": "retry later"}, True),
         ):
             with self.subTest(field=field):
-                evidence = agent.upgrade_notice_evidence(answer, contacted)
-                self.assertEqual([key for key, value in evidence.items() if not value], [field])
-        evidence = agent.upgrade_notice_evidence("secret-from-child-output", True)
+                evidence = agent.upgrade_notice_evidence("", answer, nonce, contacted)
+                self.assertEqual([key for key in agent.UPGRADE_REQUIRED_EVIDENCE if not evidence[key]], [field])
+        # A prose answer with the right facts still counts; it is recorded as unstructured.
+        prose = agent.upgrade_notice_evidence(
+            f"PLUGIN_UPGRADE_REQUIRED: update to {nonce} and restart.", {}, nonce, True)
+        self.assertTrue(all(prose[key] for key in agent.UPGRADE_REQUIRED_EVIDENCE))
+        self.assertFalse(prose["structured_answer"])
+        # The constant that used to be accepted is not the nonce.
+        stale = agent.upgrade_notice_evidence("PLUGIN_UPGRADE_REQUIRED 999.0.0 restart", {}, nonce, True)
+        self.assertFalse(stale["minimum_version_reported"])
+        evidence = agent.upgrade_notice_evidence("secret-from-child-output", {"remediation": "secret-two"}, nonce, True)
         self.assertTrue(all(type(value) is bool for value in evidence.values()))
-        self.assertNotIn("secret-from-child-output", json.dumps(evidence))
+        self.assertNotIn("secret", json.dumps(evidence))
+
+    def test_upgrade_nonce_is_fresh_and_acceptable_to_the_hook(self):
+        import re
+        seen = {agent.upgrade_nonce() for _ in range(20)}
+        self.assertGreater(len(seen), 1)
+        for nonce in seen:
+            self.assertRegex(nonce, r"^999\.[0-9]{1,6}\.[0-9]{1,6}$")
+            self.assertNotEqual(nonce, "999.0.0")
+
+    def test_policy_server_serves_the_configured_minimum_version(self):
+        import urllib.request
+        server = agent.policy.PolicyServer(minimum_version="999.77.88")
+        server.reject = True
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(server.url + "/v1/team/rulebook/rules?view=hook&repo=x")
+            body = json.loads(caught.exception.read())
+            self.assertEqual(caught.exception.code, 426)
+            self.assertEqual(body["data"]["minimum_version"], "999.77.88")
+            self.assertEqual(body["data"]["policy_revision"], "rulebook-v1:999.77.88")
+            self.assertEqual(body["data"]["error_code"], "PLUGIN_UPGRADE_REQUIRED")
+        finally:
+            server.close()
+        # The contract test's default is unchanged.
+        self.assertEqual(agent.policy.PolicyServer().minimum_version, "999.0.0")
+
+    def test_answer_fields_takes_the_last_object_and_survives_wrapping(self):
+        obj = {"error_code": "PLUGIN_UPGRADE_REQUIRED", "minimum_version": "999.1.2", "remediation": "restart"}
+        raw = json.dumps(obj)
+        self.assertEqual(agent.answer_fields(raw), obj)
+        self.assertEqual(agent.answer_fields("Here is the report:\n```json\n" + raw + "\n```\n"), obj)
+        self.assertEqual(agent.answer_fields("Ran the echo. " + raw + " Done."), obj)
+        # Two objects: the last one is the answer (an earlier one is a quoted hook payload).
+        self.assertEqual(agent.answer_fields('{"hookSpecificOutput": {"x": 1}}\n' + raw), obj)
+        # Nested braces inside strings do not break the scan.
+        nested = {"advice": "use {braces} carefully", "blocked_command_denied": True, "allowed_file_written": True}
+        self.assertEqual(agent.answer_fields("done " + json.dumps(nested)), nested)
+        for junk in ("no json here", "{not: json}", "[1, 2]", "", None, 42):
+            self.assertEqual(agent.answer_fields(junk), {}, junk)
+
+    def test_final_answer_prefers_claude_structured_output_and_parses_codex_text(self):
+        structured = {"error_code": "PLUGIN_UPGRADE_REQUIRED", "minimum_version": "999.5.6", "remediation": "restart"}
+        events = [{"type": "result", "result": "prose that disagrees {\"error_code\": \"X\"}", "structured_output": structured}]
+        self.assertEqual(agent.final_answer(events, "claude"), (events[0]["result"], structured))
+        # No structured_output: parse the text.
+        events = [{"type": "result", "result": json.dumps(structured)}]
+        self.assertEqual(agent.final_answer(events, "claude")[1], structured)
+        # Codex: the joined agent messages, last object wins.
+        events = [{"type": "item.completed", "item": {"type": "agent_message", "text": "working"}},
+                  {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(structured)}},
+                  {"type": "turn.completed"}]
+        self.assertEqual(agent.final_answer(events, "codex")[1], structured)
+        # A failed turn still cannot pass on an earlier message.
+        with self.assertRaises(lib.compat.GateError):
+            agent.final_answer(events + [{"type": "turn.failed"}], "codex")
+
+    def test_commands_carry_the_answer_schema_per_host(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = agent.answer_schema_path(raw, agent.UPGRADE_ANSWER)
+            self.assertEqual(json.loads(Path(path).read_text()), agent.UPGRADE_ANSWER)
+            codex = agent.command("codex", "codex", Path(raw), "m", schema=agent.UPGRADE_ANSWER, schema_path=path)
+            self.assertEqual(codex[codex.index("--output-schema") + 1], str(path))
+            self.assertEqual(codex[-1], "-")
+            claude = agent.command("claude", "claude", Path(raw), "m", schema=agent.UPGRADE_ANSWER, schema_path=path)
+            self.assertEqual(json.loads(claude[claude.index("--json-schema") + 1]), agent.UPGRADE_ANSWER)
+            self.assertNotIn("--output-schema", claude)
+            # Without a schema the commands are exactly as before.
+            self.assertNotIn("--json-schema", agent.command("claude", "claude", Path(raw), "m"))
+            self.assertNotIn("--output-schema", agent.command("codex", "codex", Path(raw), "m"))
 
     def test_empty_report_and_negative_return_cannot_pass(self):
         with tempfile.TemporaryDirectory() as raw:

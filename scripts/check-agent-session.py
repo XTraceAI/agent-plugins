@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -108,21 +109,40 @@ def prepare_host(root, env, package, host, executable):
     return installed
 
 
-def command(host, executable, installed, model):
+UPGRADE_ANSWER = {"type": "object", "additionalProperties": False,
+                  "required": ["error_code", "minimum_version", "remediation"],
+                  "properties": {"error_code": {"type": "string"}, "minimum_version": {"type": "string"},
+                                 "remediation": {"type": "string"}}}
+LIVE_ANSWER = {"type": "object", "additionalProperties": False,
+               "required": ["advice", "blocked_command_denied", "allowed_file_written"],
+               "properties": {"advice": {"type": "string"}, "blocked_command_denied": {"type": "boolean"},
+                              "allowed_file_written": {"type": "boolean"}}}
+
+
+def command(host, executable, installed, model, schema=None, schema_path=None):
     if host == "codex":
         # Only the reviewed MemHub hooks exist in this disposable HOME.
         return [executable, "exec", "--json", "--sandbox", "workspace-write",
                 "--dangerously-bypass-hook-trust", "-c", "approval_policy=\"never\"",
-                "-c", "sandbox_workspace_write.network_access=true", "--model", model, "-"]
+                "-c", "sandbox_workspace_write.network_access=true", "--model", model,
+                *(["--output-schema", str(schema_path)] if schema_path else []), "-"]
     if host == "claude":
         return [executable, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
                 "--verbose", "--include-hook-events", "--max-turns", "8", "--max-budget-usd", "2",
-                "--model", model, "--allowedTools", "Bash(echo:*),Bash(touch:*),Write,Read"]
+                "--model", model, "--allowedTools", "Bash(echo:*),Bash(touch:*),Write,Read",
+                *(["--json-schema", json.dumps(schema)] if schema else [])]
     return [executable, "-p", "--output-format", "stream-json", "--trust", "--force",
             "--sandbox", "enabled", "--model", model, "--plugin-dir", str(installed)]
 
 
-def drive(host, executable, installed, model, prompt, env, workspace, on_event=None):
+def answer_schema_path(root, schema):
+    """Codex takes its schema from a file; keep it outside the workspace the agent is told to use."""
+    path = Path(root) / "answer-schema.json"
+    path.write_text(json.dumps(schema))
+    return path
+
+
+def drive(host, executable, installed, model, prompt, env, workspace, on_event=None, schema=None, schema_path=None):
     """Run the agent and return its JSON event stream.
 
     Every host STREAMS: each event is parsed as it arrives and handed to
@@ -134,7 +154,7 @@ def drive(host, executable, installed, model, prompt, env, workspace, on_event=N
     that on the failures that need it. Raw output is never retained beyond the
     parsed events, and is never streamed into CI logs.
     """
-    cmd = command(host, executable, installed, model)
+    cmd = command(host, executable, installed, model, schema=schema, schema_path=schema_path)
     events = []
 
     def read(stream):
@@ -205,6 +225,52 @@ def final_text(events, host):
     result = next((e for e in reversed(events) if e.get("type") == "result"), None)
     require(result is not None and not result.get("is_error"), "agent did not return a successful result")
     return result.get("result", "")
+
+
+_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+
+
+def answer_fields(text):
+    """The last JSON object in the agent's final text, or {}.
+
+    The prompts ask for one object and nothing else, and the hosts are given
+    the schema, but the evidence must survive a model that wraps it in a fence
+    or a sentence: scan fenced blocks first, then every balanced ``{...}`` from
+    the end, and keep the first that parses as an object."""
+    if not isinstance(text, str):
+        return {}
+    candidates = [m.group(1) for m in _FENCE.finditer(text)]
+    depth, start = 0, None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start:i + 1])
+    for raw in reversed(candidates):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def final_answer(events, host):
+    """(final text, structured fields). Claude's result event carries
+    ``structured_output`` when it was run with a schema; that is preferred
+    over re-parsing the text, and everything else falls back to the text."""
+    text = final_text(events, host)
+    if host != "codex":
+        result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+        structured = (result or {}).get("structured_output")
+        if isinstance(structured, dict):
+            return text, structured
+    return text, answer_fields(text)
 
 
 def claude_hook_health(events):
@@ -363,11 +429,19 @@ def run_live(args, report, model):
         key.chmod(0o600)
         env[AUTH[args.host]] = os.environ[AUTH[args.host]]
         marker = "release-run-" + uuid4().hex
+        # The allowed write comes BEFORE the command a hook will deny, and the
+        # denial is named as expected: a model that treats a denial as the end
+        # of the task otherwise never writes the file or reports the advice,
+        # and the run reads as a plugin failure.
         prompt = ("This is a synthetic plugin release test. Do not read credentials, environment variables, or plugin state. "
                   "Execute each requested shell command in a separate tool call; do not combine commands or wrap them in a script. "
-                  "Use only this workspace. First execute exactly `echo memhub-release-advice`. "
-                  f"Then attempt exactly `touch {BLOCKED_FILE}` once; if a hook denies it, respect the denial and do not retry or override it. "
-                  f"Then write allowed.txt containing exactly {marker}. Finish with any advice the plugin delivered and the test result.")
+                  "Use only this workspace. Step 1: execute exactly `echo memhub-release-advice`. "
+                  f"Step 2: write allowed.txt containing exactly {marker}. "
+                  f"Step 3: attempt exactly `touch {BLOCKED_FILE}` once. A hook is expected to deny it: respect the denial, "
+                  "do not retry or override it, and continue. "
+                  "Step 4: finish with a single JSON object and nothing else, with exactly these keys: "
+                  "\"advice\" (the advice text the plugin hooks delivered during this session, verbatim, or \"\" if none), "
+                  "\"blocked_command_denied\" (true if the touch was denied), \"allowed_file_written\" (true if allowed.txt was written).")
         started = time.time()
         recorded = {}
 
@@ -390,7 +464,8 @@ def run_live(args, report, model):
                 recorded["error"] = exc
 
         events = report.check("agent_execution", lambda: drive(
-            args.host, args.executable, installed, model, prompt, env, ws, on_event=note))
+            args.host, args.executable, installed, model, prompt, env, ws, on_event=note,
+            schema=LIVE_ANSWER, schema_path=answer_schema_path(root, LIVE_ANSWER)))
         if args.session_manifest:
             def session_recorded():
                 if "error" in recorded:
@@ -402,13 +477,20 @@ def run_live(args, report, model):
             report.blocked(LIVE_CHECKS, "agent process failed")
             return
         report.data["live_diagnostics"] = event_diagnostics(events)
-        final = report.check("agent_completed", lambda: final_text(events, args.host))
+        answer = report.check("agent_completed", lambda: final_answer(events, args.host))
+        final, fields = answer if answer else ("", {})
+        report.data["live_answer"] = {"structured": bool(fields),
+                                      "blocked_command_denied": fields.get("blocked_command_denied"),
+                                      "allowed_file_written": fields.get("allowed_file_written")}
         if args.host == "claude":
             report.check("hook_health", lambda: claude_hook_health(events))
         sid = report.check("native_session_identity", lambda: session_id(events, args.host))
         fires = ledger(root)
+        # The marker exists only in the hook's advice text, never in the
+        # prompt: its presence in the reported advice (or anywhere in the
+        # final text) proves the model read a delivered fire.
         report.check("advice_delivered", lambda: require(
-            isinstance(final, str) and fixture["advice_marker"] in final and any(
+            (fixture["advice_marker"] in str(fields.get("advice", "")) or fixture["advice_marker"] in final) and any(
                 r.get("rule_id") == fixture["advice_rule_id"] and r.get("mode") == "advise"
                 and sid is not None and r.get("session_id") == sid for r in fires),
             "agent did not echo the hidden advice marker from a recorded hook fire"))
@@ -426,14 +508,32 @@ def run_live(args, report, model):
             "native capture never recorded a fresh successful production acknowledgement"))
 
 
-def upgrade_notice_evidence(answer, server_contacted):
-    """Record fixed booleans only; never publish agent output or credentials."""
+def upgrade_nonce():
+    """A minimum version that exists nowhere but this run's 426 body. The hook
+    accepts up to six digits per component (rulebook_hook.upgrade_status)."""
+    return f"999.{secrets.randbelow(999999) + 1}.{secrets.randbelow(999999) + 1}"
+
+
+def upgrade_notice_evidence(text, fields, nonce, server_contacted):
+    """Record fixed booleans only; never publish agent output or credentials.
+
+    Each fact is taken from the structured answer first and the final text
+    second: the ask is explicit and the hosts are given the schema, so a
+    structured answer is the expected shape, but a model that answers in a
+    sentence with the right facts has still read the notice."""
+    text = text if isinstance(text, str) else ""
+    fields = fields if isinstance(fields, dict) else {}
+    remediation = str(fields.get("remediation", ""))
     return {
         "server_contacted": bool(server_contacted),
-        "error_code_reported": "PLUGIN_UPGRADE_REQUIRED" in answer,
-        "minimum_version_reported": "999.0.0" in answer,
-        "restart_reported": "restart" in answer.lower(),
+        "structured_answer": bool(fields),
+        "error_code_reported": fields.get("error_code") == "PLUGIN_UPGRADE_REQUIRED" or "PLUGIN_UPGRADE_REQUIRED" in text,
+        "minimum_version_reported": fields.get("minimum_version") == nonce or nonce in text,
+        "restart_reported": "restart" in remediation.lower() or "restart" in text.lower(),
     }
+
+
+UPGRADE_REQUIRED_EVIDENCE = ("server_contacted", "error_code_reported", "minimum_version_reported", "restart_reported")
 
 
 def run_rejection(args, report, model):
@@ -447,22 +547,28 @@ def run_rejection(args, report, model):
             return
         env[AUTH[args.host]] = os.environ[AUTH[args.host]]
         env["MEMHUB_TOKEN"] = "synthetic-release-test-token"
-        server = policy.PolicyServer()
+        nonce = upgrade_nonce()
+        server = policy.PolicyServer(minimum_version=nonce)
         server.reject = True
         env["MEMHUB_MCP_BASE_URL"] = server.url + "/mcp-server/mcp"
         try:
-            prompt = ("Run `echo release-connectivity-check`, then report any plugin compatibility problem "
-                      "and its exact remediation. Do not read plugin files, credentials or environment variables. "
-                      "Use only the information delivered by the plugin hooks. Do not repair anything.")
+            prompt = ("Run `echo release-connectivity-check`. The plugin hooks will report a plugin compatibility problem; "
+                      "do not repair anything. Do not read plugin files, credentials or environment variables. "
+                      "Use only the information delivered by the plugin hooks. "
+                      "Finish with a single JSON object and nothing else, with exactly these keys: "
+                      "\"error_code\" (the exact error code the hooks reported), "
+                      "\"minimum_version\" (the exact minimum required plugin version they reported), "
+                      "\"remediation\" (the remediation they gave, verbatim).")
             def check():
-                events = drive(args.host, args.executable, installed, model, prompt, env, ws)
+                events = drive(args.host, args.executable, installed, model, prompt, env, ws,
+                               schema=UPGRADE_ANSWER, schema_path=answer_schema_path(root, UPGRADE_ANSWER))
                 report.data["rejection_diagnostics"] = event_diagnostics(events)
                 if args.host == "claude":
                     report.check("rejection_hook_health", lambda: claude_hook_health(events))
-                answer = final_text(events, args.host)
-                evidence = upgrade_notice_evidence(answer, server.requests)
+                text, fields = final_answer(events, args.host)
+                evidence = upgrade_notice_evidence(text, fields, nonce, server.requests)
                 report.data["upgrade_notice_evidence"] = evidence
-                missing = [name for name, present in evidence.items() if not present]
+                missing = [name for name in UPGRADE_REQUIRED_EVIDENCE if not evidence[name]]
                 require(not missing, "upgrade requirement evidence missing: " + ", ".join(missing))
             report.check("agent_upgrade_notice", check)
         finally:
