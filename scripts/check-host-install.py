@@ -87,7 +87,7 @@ def lifecycle(host, candidate, previous, executable, report):
             if host == "codex":
                 # The existing bridge must resolve the updated cache, without reinstalling it.
                 out = run([sys.executable, "-c", "import runpy; d=runpy.run_path(" +
-                           repr(str(root / 'codex/memhub_hook_bridge.py')) +
+                           repr(str(Path(env['CODEX_HOME']) / 'memhub_hook_bridge.py')) +
                            "); print(d['resolve_plugin_root']())"], env=env, cwd=root)
                 require(Path(out.strip()).resolve() == installed.resolve(), "Codex bridge still selects the previous plugin")
         report.check("upgrade", upgrade)

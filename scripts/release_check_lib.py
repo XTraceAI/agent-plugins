@@ -27,9 +27,11 @@ def require(value, message):
 def isolated_env(root):
     # No developer auth, saved sessions, GitHub token, or inherited plugin overrides.
     env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "WINDIR") if k in os.environ}
-    for name in ("home", "codex", "claude", "tmp"):
+    for name in ("home", "home/.codex", "claude", "tmp"):
         (root / name).mkdir(parents=True, exist_ok=True)
-    env.update(HOME=str(root / "home"), CODEX_HOME=str(root / "codex"),
+    # Match the normal host layout: MemHub's capture reader intentionally
+    # confines rollout reads to ~/.codex/sessions, independently of CODEX_HOME.
+    env.update(HOME=str(root / "home"), CODEX_HOME=str(root / "home/.codex"),
                CLAUDE_CONFIG_DIR=str(root / "claude"), TMPDIR=str(root / "tmp"),
                XDG_CONFIG_HOME=str(root / "home/.config"),
                PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", LANG="en_US.UTF-8")

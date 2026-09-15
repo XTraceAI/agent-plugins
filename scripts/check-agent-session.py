@@ -275,6 +275,7 @@ def run_live(args, report, model):
         env[AUTH[args.host]] = os.environ[AUTH[args.host]]
         marker = "release-run-" + uuid4().hex
         prompt = ("This is a synthetic plugin release test. Do not read credentials, environment variables, or plugin state. "
+                  "Execute each requested shell command in a separate tool call; do not combine commands or wrap them in a script. "
                   "Use only this workspace. First execute exactly `echo memhub-release-advice`. "
                   f"Then attempt exactly `touch {BLOCKED_FILE}` once; if a hook denies it, respect the denial and do not retry or override it. "
                   f"Then write allowed.txt containing exactly {marker}. Finish with any advice the plugin delivered and the test result.")

@@ -63,6 +63,22 @@ class ReleaseChecksTests(unittest.TestCase):
                 self.assertNotIn(name, env)
             self.assertTrue(Path(env["CODEX_HOME"]).is_dir())
 
+    def test_codex_rollout_is_inside_capture_reader_boundary(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            env = lib.isolated_env(root)
+            rollout = Path(env["CODEX_HOME"]) / "sessions" / f"rollout-{SID}.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{}\n")
+            outside = root / "outside.jsonl"
+            outside.write_text("{}\n")
+            code = ("import sys; from pathlib import Path; "
+                    f"sys.path.insert(0, {str(PACKAGE / 'scripts')!r}); "
+                    "import codex_flush; "
+                    f"assert codex_flush._contained(Path({str(rollout)!r})) is not None; "
+                    f"assert codex_flush._contained(Path({str(outside)!r})) is None")
+            lib.run([sys.executable, "-c", code], env=env, cwd=root)
+
     def test_cursor_marketplace_reindex_is_not_an_install(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
