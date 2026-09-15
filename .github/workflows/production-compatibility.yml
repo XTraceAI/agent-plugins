@@ -163,7 +163,7 @@ jobs:
               out.write('Codex/Claude release evidence: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
               out.write('Real agent sessions: on demand; run the real-agent-evidence workflow on this branch before merging.\n')
               out.write('Cursor: deferred; native install and agent behavior are not verified.\n')
-              out.write('Session cleanup: deferred pending backend PAK deletion support (ENG-1074).\n')
+              out.write('Session cleanup: each real-agent-evidence job deletes the sessions it captured in an always() step and reports the outcome in its own summary line and cleanup.json (ENG-1074; advisory until production accepts the test key).\n')
               out.write('Session UI rule-fire linkage: deferred (ENG-1075); local hook evidence does not verify backend/UI linkage.\n')
               out.write('Enforcement: ' + ('enabled' if os.environ['ENFORCED'] == 'true' else 'advisory') + '\n')
               out.write('\n| Check group | Result |\n| --- | --- |\n')

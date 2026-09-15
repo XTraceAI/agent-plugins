@@ -23,7 +23,11 @@ jobs:
     if: vars.MEMHUB_PLUGIN_PROD_CHECKS_ENABLED == 'true' || vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED == 'true'
     environment: production-plugin-release
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # The job cap is NOT the agent's budget. A job that hits its own cap is
+    # killed outright and its always() steps never run, so the agent check
+    # carries a step-level timeout below and the job cap leaves room after it
+    # for the cleanup step — the one step that must run however the run ends.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +64,10 @@ jobs:
           sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
           bwrap --ro-bind / / --unshare-user -- /bin/true
       - name: Rule delivery, gate enforcement, allowed operation, capture, and upgrade notice
+        # Two agent executions (360 s each plus Claude's 120 s hook grace and
+        # 60 s shutdown) and a 240 s capture wait can reach ~22 minutes; this
+        # cap ends the step, not the job, so cleanup below still runs.
+        timeout-minutes: 26
         env:
           CODEX_API_KEY: ${{ matrix.host == 'codex' && secrets.MEMHUB_E2E_OPENAI_API_KEY || '' }}
           ANTHROPIC_API_KEY: ${{ matrix.host == 'claude' && secrets.MEMHUB_E2E_ANTHROPIC_API_KEY || '' }}
@@ -72,6 +80,24 @@ jobs:
           --executable '${{ matrix.host == 'cursor' && 'cursor-agent' || matrix.host }}'
           --plugin-root "$RELEASE_PACKAGE" --source-sha "$RELEASE_SHA"
           --report "$RUNNER_TEMP/agent-reports/session.json"
+          --session-manifest "$RUNNER_TEMP/agent-reports/sessions.json"
+      # Deletes exactly the sessions the manifest names, on success, failure,
+      # timeout and cancellation alike. Reported separately from the release
+      # evidence: its report is cleanup.json in the same artifact, its outcome
+      # is one line in the job summary, and a failure is a warning annotation
+      # rather than a red job — until production has ENG-1074's backend, the
+      # test key is refused here on every run, and that is a known state, not
+      # release signal. Flip continue-on-error off once production accepts it.
+      - name: Delete this attempt's production sessions
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          MEMHUB_PROD_E2E_TOKEN: ${{ secrets.MEMHUB_PROD_E2E_TOKEN }}
+        run: >-
+          python3 scripts/cleanup-agent-sessions.py
+          --manifest "$RUNNER_TEMP/agent-reports/sessions.json"
+          --report "$RUNNER_TEMP/agent-reports/cleanup.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
