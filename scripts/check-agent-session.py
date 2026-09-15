@@ -309,6 +309,16 @@ def run_live(args, report, model):
             "native capture never recorded a fresh successful production acknowledgement"))
 
 
+def upgrade_notice_evidence(answer, server_contacted):
+    """Record fixed booleans only; never publish agent output or credentials."""
+    return {
+        "server_contacted": bool(server_contacted),
+        "error_code_reported": "PLUGIN_UPGRADE_REQUIRED" in answer,
+        "minimum_version_reported": "999.0.0" in answer,
+        "restart_reported": "restart" in answer.lower(),
+    }
+
+
 def run_rejection(args, report, model):
     with tempfile.TemporaryDirectory(prefix="memhub-agent-rejection-") as raw:
         root = Path(raw)
@@ -333,8 +343,10 @@ def run_rejection(args, report, model):
                 if args.host == "claude":
                     report.check("rejection_hook_health", lambda: claude_hook_health(events))
                 answer = final_text(events, args.host)
-                require(server.requests and "PLUGIN_UPGRADE_REQUIRED" in answer and "999.0.0" in answer
-                        and "restart" in answer.lower(), "real agent did not receive and explain the upgrade requirement")
+                evidence = upgrade_notice_evidence(answer, server.requests)
+                report.data["upgrade_notice_evidence"] = evidence
+                missing = [name for name, present in evidence.items() if not present]
+                require(not missing, "upgrade requirement evidence missing: " + ", ".join(missing))
             report.check("agent_upgrade_notice", check)
         finally:
             server.close()

@@ -28,6 +28,22 @@ SID = "11111111-1111-4111-8111-111111111111"
 
 
 class ReleaseChecksTests(unittest.TestCase):
+    def test_upgrade_notice_diagnostics_identify_each_missing_requirement(self):
+        complete = "PLUGIN_UPGRADE_REQUIRED requires 999.0.0; upgrade and restart."
+        self.assertTrue(all(agent.upgrade_notice_evidence(complete, True).values()))
+        for field, answer, contacted in (
+            ("server_contacted", complete, False),
+            ("error_code_reported", complete.replace("PLUGIN_UPGRADE_REQUIRED", "upgrade"), True),
+            ("minimum_version_reported", complete.replace("999.0.0", "latest"), True),
+            ("restart_reported", complete.replace("restart", "retry"), True),
+        ):
+            with self.subTest(field=field):
+                evidence = agent.upgrade_notice_evidence(answer, contacted)
+                self.assertEqual([key for key, value in evidence.items() if not value], [field])
+        evidence = agent.upgrade_notice_evidence("secret-from-child-output", True)
+        self.assertTrue(all(type(value) is bool for value in evidence.values()))
+        self.assertNotIn("secret-from-child-output", json.dumps(evidence))
+
     def test_empty_report_and_negative_return_cannot_pass(self):
         with tempfile.TemporaryDirectory() as raw:
             for negative in (False, True):
