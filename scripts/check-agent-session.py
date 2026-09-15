@@ -31,6 +31,12 @@ AUTH = {"codex": "CODEX_API_KEY", "claude": "ANTHROPIC_API_KEY", "cursor": "CURS
 LIVE_CHECKS = ("agent_completed", "advice_delivered", "gate_enforced", "allowed_operation", "capture_acknowledged")
 REPO = "memhub-production-release-e2e"
 BLOCKED_FILE = ".memhub-release-blocked"
+# The id each host's capture sends as ``conversation_id`` — what the backend's
+# ``DELETE /v1/team/conversations?session_id=eq.<id>`` resolves (ENG-1074).
+# Codex and Cursor prefix the native id (codex_flush / cursor_flush); Claude
+# sends it bare (flush_turn / flush_session).
+HARNESS_SESSION_ID = {"codex": "codex-{}", "claude": "{}", "cursor": "cursor-{}"}
+MANIFEST_SCHEMA = 1
 
 
 def fixture_config(raw):
@@ -234,6 +240,43 @@ def session_id(events, host):
     return value
 
 
+def harness_session_id(host, sid):
+    return HARNESS_SESSION_ID[host].format(sid)
+
+
+def record_session(path, *, host, sid, org_id):
+    """Append this run's production session to the run-owned manifest.
+
+    The manifest lives OUTSIDE the disposable agent home (the caller passes a
+    path under the job's report directory), and is written the moment the
+    native session identity is known — before the capture wait and the checks
+    that can raise — so a crash, a job timeout or a cancelled workflow still
+    leaves the ``always()`` cleanup step an exact list of what this attempt
+    created. Exact ids only: cleanup deletes what is listed here and nothing
+    else, so it can never reach the fixtures, the rules, or a session another
+    run or a developer captured into the same test account.
+    """
+    path = Path(path)
+    require(re.fullmatch(r"[A-Za-z0-9_-]{8,128}", sid), "refusing to record a malformed session identity")
+    UUID(org_id)
+    manifest = read_json(path) if path.is_file() else None
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != MANIFEST_SCHEMA:
+        manifest = {"schema_version": MANIFEST_SCHEMA, "sessions": []}
+    entry = {"host": host, "org_id": org_id, "repo": REPO,
+             "native_session_id": sid, "harness_session_id": harness_session_id(host, sid),
+             "recorded_at": int(time.time())}
+    sessions = [row for row in manifest.get("sessions", []) if isinstance(row, dict)]
+    if not any(row.get("harness_session_id") == entry["harness_session_id"]
+               and row.get("org_id") == org_id for row in sessions):
+        sessions.append(entry)
+    manifest["sessions"] = sessions
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+    os.replace(tmp, path)
+    return entry
+
+
 def capture_ok(root, host, since, sid):
     folder = {"codex": "codexflush", "claude": "turnflush", "cursor": "cursorflush"}[host]
     paths = [root / "home/.config/memhub-plugin" / folder / f"{sid}.json"]
@@ -289,6 +332,11 @@ def run_live(args, report, model):
         if args.host == "claude":
             report.check("hook_health", lambda: claude_hook_health(events))
         sid = report.check("native_session_identity", lambda: session_id(events, args.host))
+        # Recorded FIRST — before any assertion below can fail this run — so
+        # cleanup knows about the session whether or not the checks pass.
+        if sid and args.session_manifest:
+            report.check("session_recorded", lambda: record_session(
+                args.session_manifest, host=args.host, sid=sid, org_id=fixture["org_id"]))
         fires = ledger(root)
         report.check("advice_delivered", lambda: require(
             isinstance(final, str) and fixture["advice_marker"] in final and any(
@@ -359,6 +407,9 @@ def main():
     ap.add_argument("--source-sha", required=True)
     ap.add_argument("--executable", required=True)
     ap.add_argument("--report", type=Path, required=True)
+    ap.add_argument("--session-manifest", type=Path, default=None,
+                    help="run-owned list of the production sessions this run captured, for the "
+                         "always() cleanup step; keep it outside the disposable agent home")
     args = ap.parse_args()
     args.plugin_root = args.plugin_root.resolve()
     report = Report(args.host, args.plugin_root, args.source_sha)

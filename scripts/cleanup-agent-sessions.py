@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Delete the production sessions one workflow attempt captured — and only those.
+
+Reads the run-owned manifest ``check-agent-session.py --session-manifest``
+wrote and issues one ``DELETE /v1/team/conversations?session_id=eq.<id>`` per
+listed session with the dedicated test account's key (ENG-1074). Exact ids
+from the manifest, never a listing or a pattern, so fixtures, rules and every
+session this attempt did not create are untouchable from here.
+
+Runs from an ``always()`` step, so it must cope with every way the agent job
+can end: no manifest (the run never reached a session), a manifest with no
+sessions, a key that is not provisioned, and a backend that has not shipped
+key-authenticated deletion yet. Each session is attempted independently — one
+failure never skips the rest — and each outcome is reported by name in the
+cleanup report and the job summary, separately from the release evidence.
+
+Verification is a second DELETE: the backend answers ``404
+conversation_not_found`` for an id that resolves to nothing, so a 404 after a
+200 proves the session is gone, and a second 200 proves a capture flush
+re-created it after the harness exited — reported as ``recreated``, deleted
+once more, and counted as a failure so the race is visible rather than
+silently absorbed.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.parse
+
+from release_check_lib import compat, read_json
+
+ROOT = Path(__file__).resolve().parents[1]
+DELETE_PATH = "/v1/team/conversations"
+OK = frozenset({"deleted", "absent"})
+_TIMEOUT_S = 30
+
+
+def load_manifest(path):
+    """The manifest's sessions, or ``None`` when there is no manifest at all."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    manifest = read_json(path)
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        raise compat.GateError("session manifest is malformed")
+    sessions = []
+    for row in manifest.get("sessions", []):
+        hid, org = row.get("harness_session_id"), row.get("org_id")
+        if not (isinstance(hid, str) and re.fullmatch(r"(codex-|cursor-)?[A-Za-z0-9_-]{8,128}", hid)
+                and isinstance(org, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", org)):
+            raise compat.GateError("session manifest carries an unusable session entry")
+        sessions.append({"host": row.get("host"), "harness_session_id": hid, "org_id": org})
+    return sessions
+
+
+def _delete(rest, token, session):
+    """One DELETE. Returns ``(status, reason)``; ``status`` is the HTTP code and
+    ``reason`` the backend's ``data.reason`` on a 404, else None."""
+    url = compat.PRODUCTION + DELETE_PATH + "?session_id=eq." + urllib.parse.quote(
+        session["harness_session_id"], safe="")
+    try:
+        reply = rest(url, token, method="DELETE", headers={"X-Org-Id": session["org_id"]},
+                     timeout=_TIMEOUT_S)
+        return reply.status, None
+    except Exception as exc:  # McpError and anything the transport raised
+        status = getattr(exc, "status", None)
+        reason = None
+        if status == 404:
+            found = re.search(r"conversation_not_found", str(exc))
+            reason = "conversation_not_found" if found else "other"
+        return status, reason
+
+
+def cleanup_session(rest, token, session):
+    """Delete one session and verify it is gone. Never raises; the outcome is
+    one of a fixed vocabulary so the report holds no server strings."""
+    status, reason = _delete(rest, token, session)
+    if status == 404:
+        # Already gone, never captured, or not this key's session — every one
+        # of those means "nothing of ours remains", and a retried cleanup lands
+        # here by design.
+        return {"outcome": "absent"}
+    if status in (401, 403):
+        return {"outcome": "unauthorized", "http_status": status}
+    if status != 200:
+        return {"outcome": "failed", "http_status": status}
+    verify, _reason = _delete(rest, token, session)
+    if verify == 404:
+        return {"outcome": "deleted"}
+    if verify == 200:
+        # A capture flush landed between the two calls and re-created the
+        # session. It is deleted now, but the race is the finding.
+        return {"outcome": "recreated", "http_status": verify}
+    return {"outcome": "unverified", "http_status": verify}
+
+
+def summarize(results):
+    counts = {}
+    for row in results:
+        counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+    return counts
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--manifest", type=Path, required=True)
+    ap.add_argument("--report", type=Path, required=True)
+    args = ap.parse_args()
+
+    report = {"schema_version": 1, "sessions": [], "ok": True}
+    try:
+        sessions = load_manifest(args.manifest)
+    except compat.GateError as exc:
+        sessions = None
+        report.update(ok=False, error=str(exc))
+    if sessions is None and report["ok"]:
+        report["note"] = "no session manifest; the run never captured a production session"
+    elif not sessions and report["ok"]:
+        report["note"] = "session manifest lists no sessions"
+    elif sessions:
+        token = os.environ.get("MEMHUB_PROD_E2E_TOKEN", "")
+        if not token.startswith("mhk_") or any(c.isspace() for c in token):
+            report.update(ok=False, error="MEMHUB_PROD_E2E_TOKEN is not provisioned; sessions were NOT deleted")
+            report["sessions"] = [dict(s, outcome="skipped") for s in sessions]
+        else:
+            http = compat.load_module("cleanup_http", ROOT / "plugins/memhub/scripts/mcp_http.py")
+            for session in sessions:
+                result = cleanup_session(http.rest, token, session)
+                report["sessions"].append({**session, **result})
+                print(f"{session['host']} {session['harness_session_id']}: {result['outcome']}")
+            report["counts"] = summarize(report["sessions"])
+            report["ok"] = all(r["outcome"] in OK for r in report["sessions"])
+
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(json.dumps(report, indent=2) + "\n")
+
+    line = "Session cleanup: " + (
+        "ok" if report["ok"] else "FAILED") + (
+        f" — {report['note']}" if report.get("note") else "") + (
+        f" — {report['error']}" if report.get("error") else "") + (
+        " — " + ", ".join(f"{k}={v}" for k, v in sorted(report["counts"].items()))
+        if report.get("counts") else "")
+    print(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as out:
+            out.write(line + "\n")
+    if not report["ok"]:
+        print("::warning::" + line)
+    return 0 if report["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

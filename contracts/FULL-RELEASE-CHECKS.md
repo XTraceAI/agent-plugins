@@ -43,12 +43,11 @@ installation, or the Cursor official directory's review/publication process.
 
 Capture success means the plugin recorded the server's successful import
 acknowledgement. It is not an independent query of the stored transcript or proof
-that asynchronous extraction/search indexing completed. The current PAK cannot
-use the JWT-only conversation read/delete routes. Independent readback and full
-cleanup need a suitable backend API or a separate authenticated test runner;
-do not silently broaden the read-only production token. Synthetic sessions are
-retained in the dedicated test account for now, at most one production session
-per enabled host/package job per workflow attempt. No developer transcripts are imported.
+that asynchronous extraction/search indexing completed. Independent readback is
+not performed; do not silently broaden the read-only production token to get it.
+At most one production session is captured per enabled host/package job per
+workflow attempt, and each job deletes its own afterwards (see "Session cleanup"
+below). No developer transcripts are imported.
 
 The session adapters run with real CI credentials. CLI success alone is insufficient: the checks require observable
 rule fires, filesystem effects and capture state. Codex/Claude CLI installation
@@ -138,10 +137,30 @@ merging other context, and flushes rule-fire records at Stop. Codex users upgrad
 must rerun the installed setup skill, restart, and review the three MemHub hooks;
 the copied user bridge is not replaced by a marketplace refresh alone.
 
-Session cleanup remains deferred by request. Track backend personal-token deletion
-support and the subsequent CI cleanup change in
-[ENG-1074](https://linear.app/xtrace/issue/ENG-1074/accept-personal-access-tokens-for-owner-scoped-session-deletion-and).
-Until that ships, synthetic sessions remain in the dedicated test account.
+### Session cleanup
+
+Each "Real agent session" job records the native session identity of the one
+production session it captures in a run-owned manifest
+(`check-agent-session.py --session-manifest`, under the job's report directory,
+outside the disposable agent home) the moment the identity is known — before the
+advice, gate and capture assertions, so a failed run is still listed. An
+`always()` step then runs `cleanup-agent-sessions.py`, which issues one
+`DELETE /v1/team/conversations?session_id=eq.<id>` per listed session with the
+dedicated test key and the fixture organization, and verifies with a second
+DELETE (the backend answers `404 conversation_not_found` once the id resolves to
+nothing, so a retried cleanup is idempotent). Exact ids only — no listing, no
+pattern, no bulk form — so fixtures, rules and any session the attempt did not
+create are out of reach. Derived memory (facts, episodes, artifacts) is retained
+by the backend; only the transcript is deleted.
+
+Cleanup is reported separately from release evidence: `cleanup.json` in the job
+artifact, one line in the job summary, and a warning annotation on failure. It is
+`continue-on-error` while production has not yet deployed the backend half of
+[ENG-1074](https://linear.app/xtrace/issue/ENG-1074/accept-personal-access-tokens-for-owner-scoped-session-deletion-and)
+(MemHub-Backend #1310, on staging); until then every run reports `unauthorized`.
+A `recreated` outcome means a capture flush landed after the harness exited and
+re-created the session between the delete and its verification; it is deleted
+again and counted as a failure so the race is visible.
 
 Codex rule-fire linkage in the session UI is also deferred under
 [ENG-1075](https://linear.app/xtrace/issue/ENG-1075/codex-rule-fires-are-not-linked-to-captured-sessions-because-session).

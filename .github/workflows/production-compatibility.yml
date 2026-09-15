@@ -124,6 +124,23 @@ jobs:
           --executable '${{ matrix.host == 'cursor' && 'cursor-agent' || matrix.host }}'
           --plugin-root "$RELEASE_PACKAGE" --source-sha "$RELEASE_SHA"
           --report "$RUNNER_TEMP/agent-reports/session.json"
+          --session-manifest "$RUNNER_TEMP/agent-reports/sessions.json"
+      # Deletes exactly the sessions the manifest names, on success, failure,
+      # timeout and cancellation alike. Reported separately from the release
+      # evidence: its report is cleanup.json in the same artifact, its outcome
+      # is one line in the job summary, and a failure is a warning annotation
+      # rather than a red job — until production has ENG-1074's backend, the
+      # test key is refused here on every run, and that is a known state, not
+      # release signal. Flip continue-on-error off once production accepts it.
+      - name: Delete this attempt's production sessions
+        if: always()
+        continue-on-error: true
+        env:
+          MEMHUB_PROD_E2E_TOKEN: ${{ secrets.MEMHUB_PROD_E2E_TOKEN }}
+        run: >-
+          python3 scripts/cleanup-agent-sessions.py
+          --manifest "$RUNNER_TEMP/agent-reports/sessions.json"
+          --report "$RUNNER_TEMP/agent-reports/cleanup.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -218,7 +235,7 @@ jobs:
               out.write('Codex/Claude release evidence: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
               out.write('Real agent sessions: advisory; see the "Real agent session" jobs. They never block this check.\n')
               out.write('Cursor: deferred; native install and agent behavior are not verified.\n')
-              out.write('Session cleanup: deferred pending backend PAK deletion support (ENG-1074).\n')
+              out.write('Session cleanup: each "Real agent session" job deletes the sessions it captured in an always() step and reports the outcome in its own summary line and cleanup.json (ENG-1074; advisory until production accepts the test key).\n')
               out.write('Session UI rule-fire linkage: deferred (ENG-1075); local hook evidence does not verify backend/UI linkage.\n')
               out.write('Enforcement: ' + ('enabled' if os.environ['ENFORCED'] == 'true' else 'advisory') + '\n')
               out.write('\n| Check group | Result |\n| --- | --- |\n')

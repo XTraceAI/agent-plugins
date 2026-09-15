@@ -201,6 +201,44 @@ class ReleaseChecksTests(unittest.TestCase):
         with self.assertRaises(lib.compat.GateError):
             agent.session_id([{"type": "thread.started", "thread_id": "../../other-file"}], "codex")
 
+    def test_session_manifest_records_the_id_capture_sent_and_only_that(self):
+        """The manifest is what cleanup deletes from, so it must carry the
+        harness id exactly as the plugin's capture sent it (codex- / cursor-
+        prefixed, Claude bare), survive the disposable home, dedup a re-record,
+        and refuse an id that could not be a session."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest = root / "reports/sessions.json"
+            with tempfile.TemporaryDirectory() as home:
+                lib.isolated_env(Path(home))
+                agent.record_session(manifest, host="codex", sid=SID, org_id=SID)
+            # The agent home is gone; the manifest is not.
+            rows = json.loads(manifest.read_text())["sessions"]
+            self.assertEqual([r["harness_session_id"] for r in rows], [f"codex-{SID}"])
+            agent.record_session(manifest, host="claude", sid=SID, org_id=SID)
+            agent.record_session(manifest, host="cursor", sid=SID, org_id=SID)
+            agent.record_session(manifest, host="codex", sid=SID, org_id=SID)  # re-record: no duplicate
+            rows = json.loads(manifest.read_text())["sessions"]
+            self.assertEqual([r["harness_session_id"] for r in rows], [f"codex-{SID}", SID, f"cursor-{SID}"])
+            self.assertTrue(all(r["org_id"] == SID and r["repo"] == agent.REPO for r in rows))
+            self.assertFalse(manifest.with_name("sessions.json.tmp").exists())
+            for bad in ("../../other-file", "x" * 200, "short"):
+                with self.assertRaises(lib.compat.GateError):
+                    agent.record_session(manifest, host="codex", sid=bad, org_id=SID)
+            with self.assertRaises(ValueError):
+                agent.record_session(manifest, host="codex", sid=SID, org_id="not-an-org")
+            self.assertEqual(len(json.loads(manifest.read_text())["sessions"]), 3)
+
+    def test_session_is_recorded_before_any_live_assertion_can_fail(self):
+        """A run whose advice / gate / capture checks fail still created a
+        production session; the manifest write must precede them in source,
+        or a failed run is exactly the run cleanup never hears about."""
+        source = (ROOT / "scripts/check-agent-session.py").read_text()
+        recorded = source.index('report.check("session_recorded"')
+        for later in ('report.check("advice_delivered"', 'report.check("gate_enforced"',
+                      'report.check("allowed_operation"', 'report.check("capture_acknowledged"'):
+            self.assertLess(recorded, source.index(later), later)
+
     def test_fixture_cannot_target_arbitrary_repo_or_reuse_one_rule(self):
         fixture = {"schema_version": 1, "org_id": SID, "repo": agent.REPO,
                    "advice_rule_id": SID, "gate_rule_id": "22222222-2222-4222-8222-222222222222",
