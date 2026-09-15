@@ -106,12 +106,6 @@ class Report:
         print(f"{name}: {result['status']}")
         return value
 
-    def passed(self, name):
-        """Whether a recorded check passed. The value ``check`` returns is the
-        callable's own result — ``None`` for a ``require``-only check — so a
-        caller asking "did it pass" must ask the record, not the return."""
-        return self.data["checks"].get(name, {}).get("status") == "passed"
-
     def blocked(self, names, reason):
         for name in names:
             self.data["checks"][name] = {"status": "not_verified", "reason": reason}

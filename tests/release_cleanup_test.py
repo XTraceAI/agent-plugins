@@ -28,17 +28,14 @@ OTHER_ORG = "22222222-2222-4222-8222-222222222222"
 TOKEN = "mhk_synthetic_release_key"
 
 
-def session(hid, host="codex", org=ORG, captured=True):
-    return {"host": host, "harness_session_id": hid, "org_id": org, "captured": captured}
-
-
-def no_sleep(seconds):
-    raise AssertionError(f"an acknowledged session must not wait ({seconds}s)")
+def session(hid, host="codex", org=ORG):
+    return {"host": host, "harness_session_id": hid, "org_id": org}
 
 
 def cleanup_session(rest, session_row, waited=None):
-    return cleanup.cleanup_session(rest, TOKEN, session_row,
-                                   sleep=(waited.append if waited is not None else no_sleep))
+    """Runs cleanup with the late-capture wait recorded rather than slept."""
+    waited = [] if waited is None else waited
+    return cleanup.cleanup_session(rest, TOKEN, session_row, sleep=waited.append)
 
 
 class FakeRest:
@@ -70,10 +67,12 @@ class FakeRest:
 
 
 class CleanupTests(unittest.TestCase):
-    def test_delete_then_verify_is_the_happy_path(self):
-        rest = FakeRest({"codex-abcdefgh": [200, 404]})
-        self.assertEqual(cleanup_session(rest, session("codex-abcdefgh")), {"outcome": "deleted"})
-        self.assertEqual([c["method"] for c in rest.calls], ["DELETE", "DELETE"])
+    def test_delete_verify_wait_and_recheck_is_the_happy_path(self):
+        """Delete, prove it gone, give a late flush its window, prove it again."""
+        rest, waited = FakeRest({"codex-abcdefgh": [200, 404, 404]}), []
+        self.assertEqual(cleanup_session(rest, session("codex-abcdefgh"), waited), {"outcome": "deleted"})
+        self.assertEqual([c["method"] for c in rest.calls], ["DELETE"] * 3)
+        self.assertEqual(waited, [cleanup.LATE_CAPTURE_WINDOW_S])
         for call in rest.calls:
             self.assertTrue(call["url"].startswith(lib.compat.PRODUCTION + "/v1/team/conversations?session_id=eq."))
             self.assertEqual(call["headers"], {"X-Org-Id": ORG})
@@ -81,18 +80,20 @@ class CleanupTests(unittest.TestCase):
             self.assertIsNotNone(call["timeout"])
 
     def test_already_gone_is_absent_and_idempotent(self):
-        rest = FakeRest({"codex-abcdefgh": [404]})
-        self.assertEqual(cleanup_session(rest, session("codex-abcdefgh")), {"outcome": "absent"})
-        self.assertEqual(len(rest.calls), 1)
+        """The initial 404 is its own proof; only the late-flush recheck follows."""
+        rest, waited = FakeRest({"codex-abcdefgh": [404, 404]}), []
+        self.assertEqual(cleanup_session(rest, session("codex-abcdefgh"), waited), {"outcome": "absent"})
+        self.assertEqual(len(rest.calls), 2)
+        self.assertEqual(waited, [cleanup.LATE_CAPTURE_WINDOW_S])
 
     def test_a_session_recreated_under_the_delete_is_deleted_again_until_proved_gone(self):
         """Several asynchronous flushes can be in flight for one session: the
         DELETE that discovers a re-creation has just deleted it, so the proof
         goes around again — bounded, and the race is named in the result."""
-        rest = FakeRest({"abcdefgh-1111": [200, 200, 404]})
+        rest = FakeRest({"abcdefgh-1111": [200, 200, 404, 404]})
         self.assertEqual(cleanup_session(rest, session("abcdefgh-1111", host="claude")),
                          {"outcome": "deleted", "recreated": 1})
-        rest = FakeRest({"abcdefgh-2222": [200, 200, 200, 404]})
+        rest = FakeRest({"abcdefgh-2222": [200, 200, 200, 404, 404]})
         self.assertEqual(cleanup_session(rest, session("abcdefgh-2222", host="claude")),
                          {"outcome": "deleted", "recreated": 2})
         # Keeps coming back: give up, and say so.
@@ -103,10 +104,11 @@ class CleanupTests(unittest.TestCase):
         # The initial delete plus one per bounded reappearance, and no more.
         self.assertEqual(len(rest.calls), cleanup.MAX_SETTLE_ROUNDS + 1)
 
-    def test_unacknowledged_session_gets_a_late_capture_window(self):
-        """A run that died before its flushes were acknowledged may still have
-        one in flight: "gone" is re-checked after a bounded wait, and a session
-        that lands in between is deleted, verified and named as late."""
+    def test_every_session_gets_a_late_capture_window(self):
+        """A flush can still be in flight after the host is gone (Codex and
+        Cursor flush from detached processes): "gone" is re-checked after a
+        bounded wait, and a session that lands in between is deleted, verified
+        and named as late."""
         for hid, script, outcome, calls in (
             # gone, waited, still gone: absent is final
             ("codex-late0001", [404, 404], {"outcome": "absent"}, 2),
@@ -125,28 +127,14 @@ class CleanupTests(unittest.TestCase):
         ):
             with self.subTest(hid=hid):
                 rest, waited = FakeRest({hid: script}), []
-                self.assertEqual(cleanup_session(rest, session(hid, captured=False), waited), outcome)
+                self.assertEqual(cleanup_session(rest, session(hid), waited), outcome)
                 self.assertEqual(waited, [cleanup.LATE_CAPTURE_WINDOW_S])
                 self.assertEqual(len(rest.calls), calls)
         # Refused or failed outright: nothing to wait for.
         for hid, script in (("codex-late0006", [401]), ("codex-late0007", [500])):
-            rest = FakeRest({hid: script})
-            cleanup_session(rest, session(hid, captured=False), [])
-            self.assertEqual(len(rest.calls), 1)
-
-    def test_acknowledged_session_never_waits(self):
-        rest = FakeRest({"codex-acked001": [200, 404], "codex-acked002": [404]})
-        self.assertEqual(cleanup_session(rest, session("codex-acked001")), {"outcome": "deleted"})
-        self.assertEqual(cleanup_session(rest, session("codex-acked002")), {"outcome": "absent"})
-
-    def test_manifest_captured_flag_is_read_and_defaults_off(self):
-        with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "sessions.json"
-            path.write_text(json.dumps({"schema_version": 1, "sessions": [
-                {"host": "codex", "harness_session_id": "codex-abcdefgh", "org_id": ORG, "captured": True},
-                {"host": "claude", "harness_session_id": "abcdefgh-1111", "org_id": ORG},
-                {"host": "claude", "harness_session_id": "abcdefgh-2222", "org_id": ORG, "captured": "yes"}]}))
-            self.assertEqual([s["captured"] for s in cleanup.load_manifest(path)], [True, False, False])
+            rest, waited = FakeRest({hid: script}), []
+            cleanup_session(rest, session(hid), waited)
+            self.assertEqual((len(rest.calls), waited), (1, []))
 
     def test_a_404_without_the_backends_reason_proves_nothing(self):
         """A proxy page or a missing route is also a 404; only the backend's
@@ -174,7 +162,7 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(cleanup_session(rest, session(hid))["outcome"], outcome)
 
     def test_ids_are_url_encoded_and_org_bound(self):
-        rest = FakeRest({"codex-a%2Fb%3Fc%3Dd": [404]})
+        rest = FakeRest({"codex-a%2Fb%3Fc%3Dd": [404, 404]})
         cleanup_session(rest, session("codex-a/b?c=d", org=OTHER_ORG))
         self.assertIn("session_id=eq.codex-a%2Fb%3Fc%3Dd", rest.calls[0]["url"])
         self.assertEqual(rest.calls[0]["headers"]["X-Org-Id"], OTHER_ORG)
@@ -206,12 +194,13 @@ class CleanupTests(unittest.TestCase):
             fake_http = type("H", (), {"rest": staticmethod(rest)})
             with patch.dict(os.environ, {**env, "GITHUB_STEP_SUMMARY": str(summary)}, clear=False), \
                     patch.object(cleanup.compat, "load_module", lambda name, path: fake_http), \
+                    patch.object(cleanup.time, "sleep", lambda s: None), \
                     patch.object(sys, "argv", ["cleanup", "--manifest", str(manifest), "--report", str(report)]):
                 code = cleanup.main()
             return code, json.loads(report.read_text()), summary.read_text() if summary.exists() else ""
 
     def test_one_failure_never_skips_the_other_sessions(self):
-        rest = FakeRest({"codex-abcdefgh": [401], "abcdefgh-1111": [200, 404]})
+        rest = FakeRest({"codex-abcdefgh": [401], "abcdefgh-1111": [200, 404, 404]})
         code, report, summary = self._main([session("codex-abcdefgh"), session("abcdefgh-1111", host="claude")],
                                            rest, {"MEMHUB_PROD_E2E_TOKEN": TOKEN})
         self.assertEqual(code, 1)

@@ -23,11 +23,14 @@ an installed plugin. Install MemHub's compatibility bridge:
 python3 "$ROOT/scripts/setup_codex_hooks.py" install
 ```
 
-The installer is idempotent. It merges three MemHub handlers into
+The installer is idempotent. It merges four MemHub handlers into
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`), preserves unrelated
 events and handlers, backs up a changed existing file, and installs a stable
 trampoline that follows plugin version upgrades. It enables:
 
+- `SessionStart`: rulebook posture rules and any plugin-upgrade notice, the
+  repo brain brief, and a capture-health warning — the same three scripts
+  Claude Code runs at session start;
 - `PreToolUse`: situated directive recall before mutating shell and edit calls;
 - `PostToolUse`: reactive recall on failures and artifact-link reminders;
 - `PostToolUse` + `Stop`: incremental session capture.
@@ -40,13 +43,15 @@ recall is active until the user confirms the review is done.
 Give these precise review instructions:
 
 1. Restart Codex, then choose **Review hooks** at startup or open `/hooks`.
-2. Review the single MemHub handler under each of `PreToolUse`, `PostToolUse`,
-   and `Stop`.
+2. Review the single MemHub handler under each of `SessionStart`,
+   `PreToolUse`, `PostToolUse`, and `Stop`.
 3. Trust only handlers whose source is `User config - ~/.codex/hooks.json` and
    whose command contains `memhub_hook_bridge.py`.
 
-If Codex reports more than three handlers awaiting review, the extras are not
-from this installer. Warn the user not to choose **Trust all** in that case.
+If Codex reports more than four handlers awaiting review, the extras are not
+from this installer. A user who trusted the earlier three-handler bridge is
+asked once more after upgrading: the new `SessionStart` handler is the only
+addition. Warn the user not to choose **Trust all** in that case.
 Never describe this manual approval as automatable by MemHub.
 
 For `$ARGUMENTS == --status`, run this and make no changes:

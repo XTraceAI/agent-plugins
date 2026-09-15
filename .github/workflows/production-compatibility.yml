@@ -60,101 +60,21 @@ jobs:
         run: >-
           python3 scripts/check-upgrade-contract.py --plugin-root "$RELEASE_PACKAGE"
           --source-sha "$RELEASE_SHA" --report "$RUNNER_TEMP/host-reports/upgrade-policy.json"
+      # The pinned host CLI itself starts the package's SessionStart hook and
+      # takes the upgrade notice: no model, no credentials, so this is the
+      # required form of "upgrade notice reaches agent". The real-agent jobs
+      # answer the model-side question and stay advisory.
+      - name: Host runs SessionStart and receives the upgrade notice
+        if: always() && env.RELEASE_PACKAGE != ''
+        run: >-
+          python3 scripts/check-host-session-start.py --host '${{ matrix.host }}'
+          --executable '${{ matrix.host }}' --plugin-root "$RELEASE_PACKAGE"
+          --source-sha "$RELEASE_SHA" --report "$RUNNER_TEMP/host-reports/session-start.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: host-install-${{ matrix.host }}-${{ matrix.package || 'selected' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/host-reports
-          if-no-files-found: warn
-          retention-days: 30
-
-  agent-session:
-    name: Real agent session (${{ matrix.host }}${{ matrix.package == 'candidate' && ' candidate' || '' }})
-    if: >-
-      (vars.MEMHUB_PLUGIN_PROD_CHECKS_ENABLED == 'true' || vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED == 'true') &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    environment: production-plugin-release
-    runs-on: ubuntu-24.04
-    # The job cap is NOT the agent's budget. A job that hits its own cap is
-    # killed outright and its always() steps never run, so the agent check
-    # carries a step-level timeout below and the job cap leaves room after it
-    # for the cleanup step — the one step that must run however the run ends.
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host: codex
-            model_variable: MEMHUB_E2E_CODEX_MODEL
-          - host: claude
-            model_variable: MEMHUB_E2E_CLAUDE_MODEL
-          - host: claude
-            package: candidate
-            model_variable: MEMHUB_E2E_CLAUDE_MODEL
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages" ${{ matrix.package == 'candidate' && '--candidate-head' || '' }}
-      - run: bash scripts/install-release-host.sh '${{ matrix.host }}'
-      - uses: astral-sh/setup-uv@v6
-      - name: Prepare Codex Linux sandbox
-        if: matrix.host == 'codex'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y bubblewrap apparmor-profiles apparmor-utils
-          # Ubuntu 24.04 requires the distribution's bwrap user-namespace profile.
-          # https://learn.chatgpt.com/docs/sandboxing
-          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
-          bwrap --ro-bind / / --unshare-user -- /bin/true
-      - name: Rule delivery, gate enforcement, allowed operation, capture, and upgrade notice
-        # Two agent executions (360 s each plus Claude's 120 s hook grace and
-        # 60 s shutdown) and a 240 s capture wait can reach ~22 minutes; this
-        # cap ends the step, not the job, so cleanup below still runs.
-        timeout-minutes: 26
-        env:
-          CODEX_API_KEY: ${{ matrix.host == 'codex' && secrets.MEMHUB_E2E_OPENAI_API_KEY || '' }}
-          ANTHROPIC_API_KEY: ${{ matrix.host == 'claude' && secrets.MEMHUB_E2E_ANTHROPIC_API_KEY || '' }}
-          CURSOR_API_KEY: ${{ matrix.host == 'cursor' && secrets.MEMHUB_E2E_CURSOR_API_KEY || '' }}
-          MEMHUB_E2E_MODEL: ${{ vars[matrix.model_variable] }}
-          MEMHUB_PROD_E2E_TOKEN: ${{ secrets.MEMHUB_PROD_E2E_TOKEN }}
-          MEMHUB_PROD_E2E_FIXTURE_JSON: ${{ vars.MEMHUB_PROD_E2E_FIXTURE_JSON }}
-        run: >-
-          python3 scripts/check-agent-session.py --host '${{ matrix.host }}'
-          --executable '${{ matrix.host == 'cursor' && 'cursor-agent' || matrix.host }}'
-          --plugin-root "$RELEASE_PACKAGE" --source-sha "$RELEASE_SHA"
-          --report "$RUNNER_TEMP/agent-reports/session.json"
-          --session-manifest "$RUNNER_TEMP/agent-reports/sessions.json"
-      # Deletes exactly the sessions the manifest names, on success, failure,
-      # timeout and cancellation alike. Reported separately from the release
-      # evidence: its report is cleanup.json in the same artifact, its outcome
-      # is one line in the job summary, and a failure is a warning annotation
-      # rather than a red job — until production has ENG-1074's backend, the
-      # test key is refused here on every run, and that is a known state, not
-      # release signal. Flip continue-on-error off once production accepts it.
-      - name: Delete this attempt's production sessions
-        if: always()
-        continue-on-error: true
-        timeout-minutes: 6
-        env:
-          MEMHUB_PROD_E2E_TOKEN: ${{ secrets.MEMHUB_PROD_E2E_TOKEN }}
-        run: >-
-          python3 scripts/cleanup-agent-sessions.py
-          --manifest "$RUNNER_TEMP/agent-reports/sessions.json"
-          --report "$RUNNER_TEMP/agent-reports/cleanup.json"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: real-agent-${{ matrix.host }}-${{ matrix.package || 'selected' }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/agent-reports
           if-no-files-found: warn
           retention-days: 30
 
@@ -224,9 +144,8 @@ jobs:
   readiness:
     name: Production plugin readiness
     if: always()
-    # Real agent sessions are advisory: they sit behind the environment reviewer
-    # gate and assert on what an LLM chooses to echo, so they report on the PR
-    # but never feed this required check.
+    # Real agent sessions run on demand in real-agent-evidence.yml and gate the
+    # merge through their own required check, not through this one.
     needs: [probe-tests, host-install, production]
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -242,9 +161,9 @@ jobs:
           passed = bool(results) and all(job['result'] == 'success' for job in results.values())
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               out.write('Codex/Claude release evidence: ' + ('verified' if passed else 'NOT VERIFIED (failed or not run)') + '\n')
-              out.write('Real agent sessions: advisory; see the "Real agent session" jobs. They never block this check.\n')
+              out.write('Real agent sessions: on demand; run the real-agent-evidence workflow on this branch before merging.\n')
               out.write('Cursor: deferred; native install and agent behavior are not verified.\n')
-              out.write('Session cleanup: each "Real agent session" job deletes the sessions it captured in an always() step and reports the outcome in its own summary line and cleanup.json (ENG-1074; advisory until production accepts the test key).\n')
+              out.write('Session cleanup: each real-agent-evidence job deletes the sessions it captured in an always() step and reports the outcome in its own summary line and cleanup.json (ENG-1074; advisory until production accepts the test key).\n')
               out.write('Session UI rule-fire linkage: deferred (ENG-1075); local hook evidence does not verify backend/UI linkage.\n')
               out.write('Enforcement: ' + ('enabled' if os.environ['ENFORCED'] == 'true' else 'advisory') + '\n')
               out.write('\n| Check group | Result |\n| --- | --- |\n')

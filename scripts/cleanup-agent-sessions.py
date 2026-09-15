@@ -21,12 +21,12 @@ re-created it after the harness exited — reported as ``recreated``, deleted
 once more, and counted as a failure so the race is visible rather than
 silently absorbed.
 
-The capture hooks are asynchronous. A run that died after announcing its
-session may still have a flush in flight when this runs, and that flush can
-land AFTER a first "gone" answer — an initial 404 is then not the end of the
-story. The manifest says whether the run saw every flush acknowledged
-(``captured``); for a session it did not, "gone" is re-checked once after a
-bounded wait, and whatever landed in between is deleted and reported.
+The capture hooks are asynchronous — Codex and Cursor flush from detached
+processes — so a flush can still be in flight when this runs and land AFTER a
+first "gone" answer; an initial 404 is not the end of the story, and nothing
+the agent check can observe rules a late flush out. "Gone" is therefore
+always re-checked once after a bounded wait, and whatever landed in between
+is deleted and reported.
 """
 from __future__ import annotations
 
@@ -46,9 +46,9 @@ DELETE_PATH = "/v1/team/conversations"
 NOT_FOUND = "conversation_not_found"
 OK = frozenset({"deleted", "absent"})
 _TIMEOUT_S = 30
-#: How long an unacknowledged session's flush is given to land before "gone"
-#: is believed. The agent check itself waits 240 s for the acknowledgement; a
-#: flush that has not landed 90 s after the host and its hooks were killed is
+#: How long a still-in-flight flush is given to land before "gone" is
+#: believed. By the time this runs the live host exited minutes ago (the
+#: rejection session ran after it); a flush that has not landed 90 s later is
 #: not coming, and one session per job keeps the wait affordable.
 LATE_CAPTURE_WINDOW_S = 90
 #: How many re-creations one settle pass will delete before calling the
@@ -70,8 +70,7 @@ def load_manifest(path):
         if not (isinstance(hid, str) and re.fullmatch(r"(codex-|cursor-)?[A-Za-z0-9_-]{8,128}", hid)
                 and isinstance(org, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", org)):
             raise compat.GateError("session manifest carries an unusable session entry")
-        sessions.append({"host": row.get("host"), "harness_session_id": hid, "org_id": org,
-                         "captured": row.get("captured") is True})
+        sessions.append({"host": row.get("host"), "harness_session_id": hid, "org_id": org})
     return sessions
 
 
@@ -137,9 +136,11 @@ def _settle(rest, token, session):
     return "recreated", reappearances, 200
 
 
-def cleanup_session(rest, token, session, sleep=time.sleep):
+def cleanup_session(rest, token, session, sleep=None):
     """Delete one session and prove it is gone. Never raises; the outcome is
-    one of a fixed vocabulary so the report holds no server strings."""
+    one of a fixed vocabulary so the report holds no server strings.
+    ``sleep`` is looked up at call time so a test can stand in for it."""
+    sleep = time.sleep if sleep is None else sleep
     status, reason = _delete(rest, token, session)
     if status in (401, 403):
         return {"outcome": "unauthorized", "http_status": status}
@@ -157,15 +158,14 @@ def cleanup_session(rest, token, session, sleep=time.sleep):
         verdict, recreated, http = _settle(rest, token, session)
         if verdict != "gone":
             return {"outcome": verdict, "http_status": http}
-    if not session.get("captured"):
-        # The run never saw its flushes acknowledged, so one may still be in
-        # flight and land after every answer above. Wait it out, then settle
-        # again; whatever appears now is deleted and proved gone like any
-        # other, and named as late so the report shows the race happened.
-        sleep(LATE_CAPTURE_WINDOW_S)
-        verdict, late, http = _settle(rest, token, session)
-        if verdict != "gone":
-            return {"outcome": verdict, "http_status": http}
+    # A flush may still be in flight and land after every answer above. Wait
+    # it out, then settle again; whatever appears now is deleted and proved
+    # gone like any other, and named as late so the report shows the race
+    # happened.
+    sleep(LATE_CAPTURE_WINDOW_S)
+    verdict, late, http = _settle(rest, token, session)
+    if verdict != "gone":
+        return {"outcome": verdict, "http_status": http}
     result = {"outcome": "deleted" if (deleted or recreated or late) else "absent"}
     if recreated:
         result["recreated"] = recreated

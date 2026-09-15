@@ -94,6 +94,15 @@ def generate(claude_hooks: dict) -> dict:
         return value
 
     return {"hooks": {
+        # SessionStart carries what Claude's three SessionStart hooks carry
+        # (rulebook posture + upgrade notice, brain brief, capture health),
+        # folded into the one dispatcher. Codex 0.153+ honours
+        # additionalContext and systemMessage on this event. Before it existed
+        # here a Codex session first heard about an unsupported plugin at its
+        # first tool call, and only if the model made one.
+        "SessionStart": [{"hooks": [handler(
+            "SessionStart", 8, "MemHub: orienting this session"
+        )]}],
         "PreToolUse": [{
             "matcher": _ALL_TOOLS,
             "hooks": [handler(

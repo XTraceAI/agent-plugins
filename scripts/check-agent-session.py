@@ -280,7 +280,7 @@ def harness_session_id(host, sid):
     return HARNESS_SESSION_ID[host].format(sid)
 
 
-def record_session(path, *, host, sid, org_id, captured=False):
+def record_session(path, *, host, sid, org_id):
     """Upsert this run's production session into the run-owned manifest.
 
     The manifest lives OUTSIDE the disposable agent home (the caller passes a
@@ -292,11 +292,12 @@ def record_session(path, *, host, sid, org_id, captured=False):
     the fixtures, the rules, or a session another run or a developer captured
     into the same test account.
 
-    ``captured=True`` is recorded once the plugin's own state files show the
-    server acknowledged every flush for this session. The capture hooks are
-    asynchronous, so until then a flush can still be in flight after the host
-    is gone; cleanup reads this flag to decide whether an id that resolves to
-    nothing is final or needs a second look. It only ever turns on.
+    Deliberately no "capture finished" mark. Codex and Cursor flush from
+    DETACHED processes (``codex_hook_bridge._detach_flush``,
+    ``cursor_capture.spawn_cursor_flush``) and write the acknowledgement on
+    every flush, so a fresh ``last_ok_at`` proves an earlier flush landed, not
+    that the final one has; nothing this script can observe says a flush is
+    not still in flight. Cleanup therefore always allows for one.
     """
     path = Path(path)
     require(re.fullmatch(r"[A-Za-z0-9_-]{8,128}", sid), "refusing to record a malformed session identity")
@@ -306,14 +307,13 @@ def record_session(path, *, host, sid, org_id, captured=False):
         manifest = {"schema_version": MANIFEST_SCHEMA, "sessions": []}
     entry = {"host": host, "org_id": org_id, "repo": REPO,
              "native_session_id": sid, "harness_session_id": harness_session_id(host, sid),
-             "recorded_at": int(time.time()), "captured": bool(captured)}
+             "recorded_at": int(time.time())}
     sessions = [row for row in manifest.get("sessions", []) if isinstance(row, dict)]
     existing = next((row for row in sessions if row.get("harness_session_id") == entry["harness_session_id"]
                      and row.get("org_id") == org_id), None)
     if existing is None:
         sessions.append(entry)
     else:
-        existing["captured"] = bool(existing.get("captured")) or bool(captured)
         entry = existing
     manifest["sessions"] = sessions
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -424,14 +424,6 @@ def run_live(args, report, model):
             time.sleep(1)
         report.check("capture_acknowledged", lambda: require(sid and capture_ok(root, args.host, started, sid),
             "native capture never recorded a fresh successful production acknowledgement"))
-        if report.passed("capture_acknowledged") and args.session_manifest and "sid" in recorded:
-            # Every flush for this session is acknowledged and the host is
-            # gone, so nothing can land late: tell cleanup a "gone" answer is
-            # final. Best effort — a failed mark only costs cleanup a wait.
-            try:
-                record_session(args.session_manifest, host=args.host, sid=sid, org_id=fixture["org_id"], captured=True)
-            except Exception:
-                pass
 
 
 def upgrade_notice_evidence(answer, server_contacted):
