@@ -79,11 +79,12 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 22   # + UserPromptSubmit (brain_brief.py prompt,
+    assert len(commands) == 21   # + UserPromptSubmit (brain_brief.py prompt,
                                  # and rulebook_hook.py prompt — the lane that
                                  # arms a prompt-armed obligation),
-                                 # + Stop and UserPromptSubmit (harness_stop.py;
-                                 # both no-ops unless MEMHUB_HARNESS_EXTRACT),
+                                 # + Stop (harness_stop.py, a no-op unless
+                                 # MEMHUB_HARNESS_EXTRACT; it blocks the stop,
+                                 # so its prompt lane is gone),
                                  # + PostToolUse (pr_link_trigger.py); SessionEnd
                                  # carries capture AND the fire flush in ONE
                                  # handler, because they must run in that order.

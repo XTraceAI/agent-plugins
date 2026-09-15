@@ -9,7 +9,9 @@ It requires a PR and the GitHub Actions-published `guard` check on an up-to-date
 main base, with no bypass actors. It also blocks force pushes and deletion.
 No new human-approval count is introduced here.
 
-This is not yet the live-production compatibility gate. Add that distinct check
-only after its workflow, production test account and deployment evidence are
-configured and a real run passes. Do not label the existing guard as proof of
-production compatibility.
+The disabled template also includes `Production plugin readiness`. Its workflow
+is advisory until explicitly configured and enabled: see
+[production release checks](../../contracts/PRODUCTION-RELEASE.md). Keep both
+the ruleset disabled and `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` unset during setup.
+Enabling only one control does not establish enforcement. Do not label an advisory
+workflow completion or the existing guard as proof of production compatibility.
