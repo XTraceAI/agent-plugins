@@ -4,12 +4,17 @@ name: real-agent-evidence
 # This is deliberately NOT a pull_request workflow. The three sessions cost
 # model turns and leave synthetic sessions in the fixture org, and their
 # assertions include what a model chooses to say, so they run when a developer
-# decides the PR is ready, not on every push. The aggregate check below is
-# required on main: until someone runs this workflow on the PR's head commit
-# the check is simply absent ("expected"), which blocks the merge without a
-# fake failure. Push again and the new head needs a new run.
+# decides the PR is ready, not on every push.
 #
 #   gh workflow run real-agent-evidence.yml --ref <branch>
+#
+# The gate is a COMMIT STATUS, not this workflow's check run: a pull request's
+# status rollup only sees check suites from pull_request/push events, so the
+# check run a workflow_dispatch run produces never satisfies a required check
+# (observed on #235, run 35022940701). A status is attached to the SHA itself
+# and is visible everywhere. Until someone runs this on the PR's head commit
+# the status is absent ("expected"), which blocks the merge without a fake
+# failure; push again and the new head needs a new run.
 on:
   workflow_dispatch:
 permissions:
@@ -108,20 +113,31 @@ jobs:
 
 
   evidence:
-    # One context for the ruleset to require, covering the whole host matrix.
+    # One context for the ruleset to require, covering the whole host matrix,
+    # published as a commit status on the exact head this run tested.
     name: Real agent evidence
     if: always()
     needs: [agent-session]
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      contents: read
+      statuses: write
     steps:
-      - name: Every real agent session must have passed
+      - name: Publish the verdict as a commit status on this head
         env:
           RESULT: ${{ needs.agent-session.result }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          state=failure
+          [ "$RESULT" = "success" ] && state=success
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="Real agent evidence" \
+            -f description="Real agent sessions: $RESULT" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null
           echo "Real agent sessions: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo "Head: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$RESULT" != "success" ]; then
+          echo "Head: $GITHUB_SHA (status: $state)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$state" != "success" ]; then
             echo "::error::Real agent evidence is $RESULT for $GITHUB_SHA; see the Real agent session jobs"
             exit 1
           fi
