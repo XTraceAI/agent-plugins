@@ -51,6 +51,9 @@ _TIMEOUT_S = 30
 #: flush that has not landed 90 s after the host and its hooks were killed is
 #: not coming, and one session per job keeps the wait affordable.
 LATE_CAPTURE_WINDOW_S = 90
+#: How many re-creations one settle pass will delete before calling the
+#: session ``recreated`` and giving up on proving it gone.
+MAX_SETTLE_ROUNDS = 3
 
 
 def load_manifest(path):
@@ -111,16 +114,27 @@ def _gone(status, reason):
     return status == 404 and reason == NOT_FOUND
 
 
-def _verify(rest, token, session, result):
-    """Prove ``result`` with one more DELETE. A 200 here means a capture flush
-    re-created the session in between — the call just deleted it again, and
-    the race is the finding."""
-    status, reason = _delete(rest, token, session)
-    if _gone(status, reason):
-        return result
-    if status == 200:
-        return {"outcome": "recreated", "http_status": status}
-    return {"outcome": "unverified", "http_status": status}
+def _settle(rest, token, session):
+    """Keep deleting until a DELETE finds nothing. Returns ``(verdict,
+    reappearances, http_status)``.
+
+    One verification is not enough: the capture hooks are asynchronous and
+    several can be in flight for one session, so a flush can re-create the
+    session between any delete and the answer that was meant to prove it —
+    and the DELETE that discovers that has just deleted it again, which is
+    why the loop goes around rather than stopping there. Bounded, so a
+    session that keeps coming back is reported as ``recreated`` instead of
+    holding the job.
+    """
+    reappearances = 0
+    while reappearances < MAX_SETTLE_ROUNDS:
+        status, reason = _delete(rest, token, session)
+        if _gone(status, reason):
+            return "gone", reappearances, None
+        if status != 200:
+            return "unverified", reappearances, status
+        reappearances += 1
+    return "recreated", reappearances, 200
 
 
 def cleanup_session(rest, token, session, sleep=time.sleep):
@@ -130,25 +144,33 @@ def cleanup_session(rest, token, session, sleep=time.sleep):
     if status in (401, 403):
         return {"outcome": "unauthorized", "http_status": status}
     if status == 200:
-        result = _verify(rest, token, session, {"outcome": "deleted"})
+        deleted = True
     elif _gone(status, reason):
         # Already gone, never captured, or not this key's session — every one
         # of those means "nothing of ours remains", and a retried cleanup lands
-        # here by design.
-        result = {"outcome": "absent"}
+        # here by design. This answer is its own proof; nothing to settle yet.
+        deleted = False
     else:
         return {"outcome": "failed", "http_status": status}
-    if result["outcome"] in OK and not session.get("captured"):
+    recreated = late = 0
+    if deleted:
+        verdict, recreated, http = _settle(rest, token, session)
+        if verdict != "gone":
+            return {"outcome": verdict, "http_status": http}
+    if not session.get("captured"):
         # The run never saw its flushes acknowledged, so one may still be in
-        # flight and land after the answer above. Wait it out, then look
-        # again; a session that appears now is deleted and verified like any
+        # flight and land after every answer above. Wait it out, then settle
+        # again; whatever appears now is deleted and proved gone like any
         # other, and named as late so the report shows the race happened.
         sleep(LATE_CAPTURE_WINDOW_S)
-        status, reason = _delete(rest, token, session)
-        if status == 200:
-            return _verify(rest, token, session, {"outcome": "deleted", "late_capture": True})
-        if not _gone(status, reason):
-            return {"outcome": "unverified", "http_status": status}
+        verdict, late, http = _settle(rest, token, session)
+        if verdict != "gone":
+            return {"outcome": verdict, "http_status": http}
+    result = {"outcome": "deleted" if (deleted or recreated or late) else "absent"}
+    if recreated:
+        result["recreated"] = recreated
+    if late:
+        result["late_capture"] = True
     return result
 
 
@@ -187,6 +209,9 @@ def main():
                 report["sessions"].append({**session, **result})
                 print(f"{session['host']} {session['harness_session_id']}: {result['outcome']}")
             report["counts"] = summarize(report["sessions"])
+            races = {"late_capture": sum(1 for r in report["sessions"] if r.get("late_capture")),
+                     "recreated_then_deleted": sum(1 for r in report["sessions"] if r.get("recreated"))}
+            report["counts"].update({k: v for k, v in races.items() if v})
             report["ok"] = all(r["outcome"] in OK for r in report["sessions"])
 
     args.report.parent.mkdir(parents=True, exist_ok=True)

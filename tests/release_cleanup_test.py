@@ -85,11 +85,23 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(cleanup_session(rest, session("codex-abcdefgh")), {"outcome": "absent"})
         self.assertEqual(len(rest.calls), 1)
 
-    def test_recreated_after_delete_is_reported_not_absorbed(self):
-        rest = FakeRest({"abcdefgh-1111": [200, 200]})
-        result = cleanup_session(rest, session("abcdefgh-1111", host="claude"))
+    def test_a_session_recreated_under_the_delete_is_deleted_again_until_proved_gone(self):
+        """Several asynchronous flushes can be in flight for one session: the
+        DELETE that discovers a re-creation has just deleted it, so the proof
+        goes around again — bounded, and the race is named in the result."""
+        rest = FakeRest({"abcdefgh-1111": [200, 200, 404]})
+        self.assertEqual(cleanup_session(rest, session("abcdefgh-1111", host="claude")),
+                         {"outcome": "deleted", "recreated": 1})
+        rest = FakeRest({"abcdefgh-2222": [200, 200, 200, 404]})
+        self.assertEqual(cleanup_session(rest, session("abcdefgh-2222", host="claude")),
+                         {"outcome": "deleted", "recreated": 2})
+        # Keeps coming back: give up, and say so.
+        rest = FakeRest({"abcdefgh-3333": [200] * (cleanup.MAX_SETTLE_ROUNDS + 1)})
+        result = cleanup_session(rest, session("abcdefgh-3333", host="claude"))
         self.assertEqual(result["outcome"], "recreated")
         self.assertNotIn("recreated", cleanup.OK)
+        # The initial delete plus one per bounded reappearance, and no more.
+        self.assertEqual(len(rest.calls), cleanup.MAX_SETTLE_ROUNDS + 1)
 
     def test_unacknowledged_session_gets_a_late_capture_window(self):
         """A run that died before its flushes were acknowledged may still have
@@ -102,8 +114,12 @@ class CleanupTests(unittest.TestCase):
             ("codex-late0002", [404, 200, 404], {"outcome": "deleted", "late_capture": True}, 3),
             # deleted+verified, waited, landed late, verified again
             ("codex-late0003", [200, 404, 200, 404], {"outcome": "deleted", "late_capture": True}, 4),
-            # landed late and came back yet again
-            ("codex-late0004", [404, 200, 200], {"outcome": "recreated", "http_status": 200}, 3),
+            # recreated under the first delete, settled, then the window: the
+            # Codex round-3 case — a recreation must not skip the window
+            ("codex-late0003b", [200, 200, 404, 404], {"outcome": "deleted", "recreated": 1}, 4),
+            # landed late and kept coming back past the bound
+            ("codex-late0004", [404] + [200] * cleanup.MAX_SETTLE_ROUNDS,
+             {"outcome": "recreated", "http_status": 200}, cleanup.MAX_SETTLE_ROUNDS + 1),
             # the recheck itself could not prove anything
             ("codex-late0005", [404, "404-bare"], {"outcome": "unverified", "http_status": 404}, 2),
         ):
@@ -203,6 +219,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual({r["harness_session_id"]: r["outcome"] for r in report["sessions"]},
                          {"codex-abcdefgh": "unauthorized", "abcdefgh-1111": "deleted"})
         self.assertEqual(report["counts"], {"deleted": 1, "unauthorized": 1})
+        self.assertNotIn("late_capture", report["counts"])
         self.assertIn("Session cleanup: FAILED", summary)
         self.assertNotIn(TOKEN, json.dumps(report) + summary)
 

@@ -165,9 +165,11 @@ The capture hooks are asynchronous, so a run that died after announcing its
 session may still have a flush in flight when cleanup runs. The manifest records
 whether the run saw every flush acknowledged (`captured`); for a session it did
 not, cleanup re-checks "gone" once after a bounded wait and deletes whatever
-landed in between, reporting it as `deleted` with `late_capture`. A `recreated`
-outcome means the session came back after a verified delete; it is deleted again
-and counted as a failure so the race is visible. The agent check carries its own
+landed in between, reporting it as `deleted` with `late_capture`. Proof of
+absence is itself a bounded loop — the DELETE that finds a re-created session has
+just deleted it, so cleanup goes around until a DELETE finds nothing, and reports
+how many re-creations it removed (`recreated`); a session that keeps coming back
+past the bound is the `recreated` outcome, a failure. The agent check carries its own
 step timeout inside a larger job cap, so a run that exhausts its budget ends the
 step — not the job — and the cleanup step still runs.
 
