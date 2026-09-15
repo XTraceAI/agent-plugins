@@ -135,7 +135,7 @@ def probe(root, fixture, token):
             cold = hook.load_book(fixture["repo"])
             require(calls == [(200, None)] and cold and cold.get("etag"),
                     "production cold fetch failed (credentials, version policy, response, or ETag)")
-            actual = sorted((r["id"], r["mode"]) for r in cold["rules"])
+            actual = sorted((r.get("rule_id", r.get("id")), r["mode"]) for r in cold["rules"])
             expected = sorted((r["id"], r["mode"]) for r in fixture["rules"])
             require(actual == expected, "production fixture rules or modes do not match")
             cold["fetched_at"] = "2000-01-01T00:00:00+00:00"

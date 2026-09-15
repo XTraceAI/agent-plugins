@@ -72,6 +72,10 @@ class ProductionGateTests(unittest.TestCase):
             rules[0]["mode"] = "advise"
         if self.mode == "wrong_org":
             rules[0]["id"] = "33333333-3333-4333-8333-333333333333"
+        # Production caches the API's rule_id, before hook engine normalization.
+        if self.mode != "legacy_id":
+            for rule in rules:
+                rule["rule_id"] = rule.pop("id")
         payload = {"code": 0, "data": {"rules": rules}}
         if self.mode == "bad_envelope":
             payload["code"] = 1
@@ -99,6 +103,10 @@ class ProductionGateTests(unittest.TestCase):
                 self.mode = mode
                 with self.assertRaises(gate.GateError):
                     self.run_probe()
+
+    def test_legacy_id_field(self):
+        self.mode = "legacy_id"
+        self.assertTrue(self.run_probe()["ok"])
 
     def test_no_credentials_or_version_override(self):
         with self.assertRaises(gate.GateError):
