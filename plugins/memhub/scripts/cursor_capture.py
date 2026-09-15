@@ -116,17 +116,35 @@ def _normalize_payload(raw: bytes) -> bytes | None:
     return None
 
 
+def upgrade_context(payload: bytes) -> str | None:
+    data = json.loads(payload)
+    roots = data.get("workspace_roots") or []
+    hook = {"cwd": data.get("cwd") or (roots[0] if roots else os.getcwd()),
+            "session_id": data.get("conversation_id", ""), "tool_name": "Bash"}
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("rulebook_hook.py")), "upgrade"],
+        input=json.dumps(hook).encode(), capture_output=True, timeout=2, check=False)
+    if result.stdout:
+        return json.loads(result.stdout).get("hookSpecificOutput", {}).get("additionalContext")
+    return None
+
+
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+    output = {"permission": "allow"}
     try:
         raw = sys.stdin.buffer.read(_MAX_PAYLOAD_BYTES + 1)
         payload = _normalize_payload(raw)
         if payload is not None:
             spawn_cursor_flush(payload, event)
+            if event == "beforeShellExecution":
+                context = upgrade_context(payload)
+                if context:
+                    output.update(agent_message=context, user_message=context)
     except Exception as exc:
         # Capture observes; it must never gate the user's prompt or command.
         _log(f"could not launch hook capture ({exc!r})")
-    print(json.dumps({"permission": "allow"}), flush=True)
+    print(json.dumps(output), flush=True)
     return 0
 
 

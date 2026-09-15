@@ -57,13 +57,14 @@ both the main package and the separately pinned Claude package.
    cd /tmp/rel && uv run --with 'mcp<2' python tests/run_all.py
    ```
 
-2. **Merge the release PR bumping ALL manifests in lockstep**
+2. **Merge the release PR bumping all production manifests in lockstep**
    (`tests/version_parity_test.py` enforces):
    - `plugins/memhub/plugin.json` (Agent Plugins 1.0 root)
    - `plugins/memhub/.claude-plugin/plugin.json`
    - `plugins/memhub/.codex-plugin/plugin.json`
    - `plugins/memhub/.cursor-plugin/plugin.json`
-   - `plugins/memhub-staging/.claude-plugin/plugin.json`
+
+   Staging is released separately. Leave its manifest unchanged during a production-only release.
 
    Claude AND Codex key install caches by version — no bump, no delivery.
    The moment this merges, Cursor and Codex are live.
@@ -76,6 +77,9 @@ both the main package and the separately pinned Claude package.
 6. **Smoke-test each channel:** Claude reinstall + restart; `codex plugin
    marketplace update && codex plugin add memhub`; Cursor marketplace
    refresh, hooks visible in Hooks settings.
+   For Codex bridge changes, run the installed MemHub setup skill again,
+   restart Codex, and review the three MemHub hooks. Updating the package
+   alone does not replace the existing copy in the user's hooks configuration.
 7. **Submit the Cursor-official update** (when listed) — every update is
    manually reviewed; expect lag; keep the server compatible one plugin
    version back.

@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -427,6 +428,41 @@ def test_every_shell_alias_uses_the_directive_prefilter():
             )
             assert result.stdout == b"", tool_name
     print("PASS test_every_shell_alias_uses_the_directive_prefilter")
+
+
+def test_rulebook_normalizes_shell_calls_without_losing_identity():
+    for name, inp in (("shell", {"command": ["/bin/bash", "-lc", "touch blocked"]}),
+                      ("exec_command", {"cmd": "touch blocked", "workdir": "/repo"}),
+                      ("shell_command", {"command": "touch blocked"})):
+        result = json.loads(bridge._rulebook_payload(json.dumps({
+            "tool_name": name, "tool_input": inp, "session_id": "session", "cwd": "/repo"
+        }).encode()))
+        assert result["tool_name"] == "Bash"
+        assert result["tool_input"]["command"] == "touch blocked"
+        assert result["session_id"] == "session" and result["cwd"] == "/repo"
+
+
+def test_rulebook_denial_survives_context_merge_and_recall_failure():
+    denied = subprocess.CompletedProcess([], 0, json.dumps({
+        "systemMessage": "Rule fired", "hookSpecificOutput": {
+            "permissionDecision": "deny", "permissionDecisionReason": "blocked",
+            "additionalContext": "rule evidence"}}).encode(), b"")
+    out = io.StringIO()
+    with patch.object(bridge, "_rulebook_result", return_value=denied), \
+            patch.object(bridge, "_directive_result", side_effect=RuntimeError("recall failed")), \
+            contextlib.redirect_stdout(out):
+        bridge._dispatch(Path("/unused"), b'{}', "PreToolUse")
+    doc = json.loads(out.getvalue())
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert doc["hookSpecificOutput"]["permissionDecisionReason"] == "blocked"
+    assert doc["systemMessage"] == "Rule fired"
+
+
+def test_stop_flushes_rule_fires_and_capture():
+    with patch.object(bridge, "_detach_flush") as capture, patch.object(bridge, "_run") as fire_flush:
+        bridge._dispatch(Path("/plugin"), b"{}", "Stop")
+    capture.assert_called_once_with(Path("/plugin"), b"{}", "Stop")
+    fire_flush.assert_called_once_with(Path("/plugin"), "rulebook_hook.py", b"{}", "flush", "final", timeout=7)
 
 
 if __name__ == "__main__":
