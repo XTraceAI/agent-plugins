@@ -44,6 +44,19 @@ class ReleaseChecksTests(unittest.TestCase):
         self.assertTrue(all(type(value) is bool for value in evidence.values()))
         self.assertNotIn("secret-from-child-output", json.dumps(evidence))
 
+    def test_passed_reads_the_record_not_the_return(self):
+        """A require-only check returns None from ``check``; ``passed`` is the
+        question to ask. (The manifest's captured mark was keyed on the return
+        once, and never fired.)"""
+        report = lib.Report("codex", PACKAGE, SHA)
+        self.assertIsNone(report.check("acknowledged", lambda: lib.require(True, "unreachable")))
+        self.assertTrue(report.passed("acknowledged"))
+        report.check("refused", lambda: lib.require(False, "no"))
+        self.assertFalse(report.passed("refused"))
+        self.assertFalse(report.passed("never_ran"))
+        report.blocked(["blocked"], "not provisioned")
+        self.assertFalse(report.passed("blocked"))
+
     def test_empty_report_and_negative_return_cannot_pass(self):
         with tempfile.TemporaryDirectory() as raw:
             for negative in (False, True):

@@ -422,9 +422,9 @@ def run_live(args, report, model):
         deadline = time.monotonic() + (240 if sid else 0)
         while time.monotonic() < deadline and not capture_ok(root, args.host, started, sid):
             time.sleep(1)
-        captured = report.check("capture_acknowledged", lambda: require(sid and capture_ok(root, args.host, started, sid),
+        report.check("capture_acknowledged", lambda: require(sid and capture_ok(root, args.host, started, sid),
             "native capture never recorded a fresh successful production acknowledgement"))
-        if captured is not None and args.session_manifest and "sid" in recorded:
+        if report.passed("capture_acknowledged") and args.session_manifest and "sid" in recorded:
             # Every flush for this session is acknowledged and the host is
             # gone, so nothing can land late: tell cleanup a "gone" answer is
             # final. Best effort — a failed mark only costs cleanup a wait.
