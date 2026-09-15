@@ -70,7 +70,7 @@ jobs:
       (vars.MEMHUB_PLUGIN_PROD_CHECKS_ENABLED == 'true' || vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED == 'true') &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     environment: production-plugin-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -95,6 +95,17 @@ jobs:
           node-version: '22'
       - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages"
       - run: bash scripts/install-release-host.sh '${{ matrix.host }}'
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare Codex Linux sandbox
+        if: matrix.host == 'codex'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap apparmor-profiles apparmor-utils
+          # Ubuntu 24.04 requires the distribution's bwrap user-namespace profile.
+          # https://learn.chatgpt.com/docs/sandboxing
+          sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          bwrap --ro-bind / / --unshare-user -- /bin/true
       - name: Rule delivery, gate enforcement, allowed operation, capture, and upgrade notice
         env:
           CODEX_API_KEY: ${{ matrix.host == 'codex' && secrets.MEMHUB_E2E_OPENAI_API_KEY || '' }}
