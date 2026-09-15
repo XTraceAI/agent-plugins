@@ -79,6 +79,42 @@ class ReleaseChecksTests(unittest.TestCase):
                     f"assert codex_flush._contained(Path({str(outside)!r})) is None")
             lib.run([sys.executable, "-c", code], env=env, cwd=root)
 
+    def test_codex_bridge_cold_gate_upgrade_and_rollback(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            env = lib.isolated_env(root)
+            ws = agent.prepare_workspace(root, env, "memhub-release-upgrade")
+            server = agent.policy.PolicyServer()
+            env.update(MEMHUB_TOKEN="synthetic", MEMHUB_RULEBOOK_RECALL="0",
+                       MEMHUB_PLUGIN_ROOT=str(PACKAGE),
+                       MEMHUB_MCP_BASE_URL=server.url + "/mcp-server/mcp")
+            try:
+                def invoke(tool, inp, sid):
+                    payload = json.dumps({"cwd": str(ws), "session_id": sid,
+                                          "tool_name": tool, "tool_input": inp})
+                    return json.loads(lib.run([sys.executable, str(PACKAGE / "scripts/codex_hook_bridge.py"),
+                                               "dispatch", "PreToolUse"], env=env, cwd=ws, stdin=payload))
+                for i, (tool, inp) in enumerate((
+                        ("exec_command", {"cmd": "memhub-synthetic-command"}),
+                        ("shell", {"command": ["/bin/bash", "-lc", "memhub-synthetic-command"]}),
+                        ("shell_command", {"command": "memhub-synthetic-command"}))):
+                    result = invoke(tool, inp, f"cold-session-{i}")
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertTrue(server.requests)  # No pre-seeded book: bridge fetched it.
+                fetch = [sys.executable, str(PACKAGE / "scripts/rulebook_hook.py"),
+                         "fetch", "memhub-release-upgrade"]
+                server.reject = True
+                lib.run(fetch, env=env, cwd=ws)
+                result = invoke("exec_command", {"cmd": "memhub-synthetic-command"}, "upgrade-session")
+                self.assertIn("PLUGIN_UPGRADE_REQUIRED", result["hookSpecificOutput"]["additionalContext"])
+                self.assertNotEqual(result["hookSpecificOutput"].get("permissionDecision"), "deny")
+                server.reject = False
+                lib.run(fetch, env=env, cwd=ws)
+                result = invoke("exec_command", {"cmd": "memhub-synthetic-command"}, "rollback-session")
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+            finally:
+                server.close()
+
     def test_cursor_marketplace_reindex_is_not_an_install(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

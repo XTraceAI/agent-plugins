@@ -3733,6 +3733,9 @@ def refresh_if_stale(repo, rules, fetched_at, sources):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
+    codex_pre = mode == "codex-pre"
+    if codex_pre:
+        mode = "pre"
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
         fetch_book(sys.argv[2])
         return 0
@@ -3776,6 +3779,10 @@ def main():
         show_upgrade(repo, session, "PreToolUse")
         return 0
     rules, rule_version, fetched_at, sources = load_rules(repo)
+    # The three-handler Codex bridge has no SessionStart fetch. Refresh before
+    # its first/stale pre-call so a cold install cannot silently miss a gate.
+    if codex_pre and _age_s(fetched_at) >= REFRESH_AFTER_S:
+        rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,

@@ -14,9 +14,9 @@ def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
-def resolve(host, temp):
+def resolve(host, temp, candidate_head=False):
     sha = git("rev-parse", "HEAD")
-    if host == "claude":
+    if host == "claude" and not candidate_head:
         entries = [p for p in json.loads(Path(".claude-plugin/marketplace.json").read_text())["plugins"]
                    if p["name"] == "memhub"]
         require(len(entries) == 1, "expected exactly one Claude marketplace entry")
@@ -52,9 +52,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", choices=("codex", "claude", "cursor"), required=True)
     ap.add_argument("--temp", type=Path, required=True)
+    ap.add_argument("--candidate-head", action="store_true",
+                    help="Test HEAD before promotion, separately from the published Claude pin")
     args = ap.parse_args()
     args.temp.mkdir(parents=True, exist_ok=True)
-    result = resolve(args.host, args.temp.resolve())
+    require(not args.candidate_head or args.host == "claude", "candidate-head is only for the additional Claude candidate check")
+    result = resolve(args.host, args.temp.resolve(), args.candidate_head)
     with open(os.environ["GITHUB_ENV"], "a") as out:
         for key, value in result.items():
             require("\n" not in value and "\r" not in value, "unsafe workflow environment value")

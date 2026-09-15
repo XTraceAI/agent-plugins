@@ -25,13 +25,18 @@ jobs:
         run: bash scripts/check-plugin.sh
 
   host-install:
-    name: Install and upgrade (${{ matrix.host }})
+    name: Install and upgrade (${{ matrix.host }}${{ matrix.package == 'candidate' && ' candidate' || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        host: [codex, claude, cursor]
+        include:
+          - host: codex
+          - host: claude
+          - host: cursor
+          - host: claude
+            package: candidate
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +48,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages"
+      - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages" ${{ matrix.package == 'candidate' && '--candidate-head' || '' }}
       - run: bash scripts/install-release-host.sh '${{ matrix.host }}'
       - name: Fresh install and upgrade from the previous immutable release
         run: >-
@@ -59,13 +64,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: host-install-${{ matrix.host }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: host-install-${{ matrix.host }}-${{ matrix.package || 'selected' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/host-reports
           if-no-files-found: warn
           retention-days: 30
 
   agent-session:
-    name: Real agent session (${{ matrix.host }})
+    name: Real agent session (${{ matrix.host }}${{ matrix.package == 'candidate' && ' candidate' || '' }})
     if: >-
       (vars.MEMHUB_PLUGIN_PROD_CHECKS_ENABLED == 'true' || vars.MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED == 'true') &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
@@ -80,6 +85,9 @@ jobs:
             model_variable: MEMHUB_E2E_CODEX_MODEL
           - host: claude
             model_variable: MEMHUB_E2E_CLAUDE_MODEL
+          - host: claude
+            package: candidate
+            model_variable: MEMHUB_E2E_CLAUDE_MODEL
           - host: cursor
             model_variable: MEMHUB_E2E_CURSOR_MODEL
     steps:
@@ -93,7 +101,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages"
+      - run: python3 scripts/prepare-release-candidate.py --host '${{ matrix.host }}' --temp "$RUNNER_TEMP/packages" ${{ matrix.package == 'candidate' && '--candidate-head' || '' }}
       - run: bash scripts/install-release-host.sh '${{ matrix.host }}'
       - uses: astral-sh/setup-uv@v6
       - name: Prepare Codex Linux sandbox
@@ -122,7 +130,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: real-agent-${{ matrix.host }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: real-agent-${{ matrix.host }}-${{ matrix.package || 'selected' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/agent-reports
           if-no-files-found: warn
           retention-days: 30
