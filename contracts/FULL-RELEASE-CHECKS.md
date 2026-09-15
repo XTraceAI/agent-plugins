@@ -1,6 +1,6 @@
 # Production plugin release checks
 
-The production readiness check requires every job to succeed. Missing credentials,
+The production readiness check requires every deterministic job to succeed. Missing credentials,
 skipped jobs, unsupported host operations and failed assertions mean **NOT VERIFIED**.
 While `MEMHUB_PLUGIN_RELEASE_GATE_ENFORCED` is unset, the aggregate reports that
 result without blocking merges. Do not enable enforcement until the gaps below
@@ -21,6 +21,16 @@ are closed and all enabled hosts have a real successful run and a deliberate fai
 | Automatic capture | Fresh successful capture acknowledgement for the exact native session ID; Claude requires both turn and session-end capture | Each actual host CLI against production |
 | Upgrade response contract | Existing gate works, synthetic 426 surfaces actionable notice, stale gate stops, rollback restores it | Actual package with loopback HTTP server |
 | Upgrade notice reaches agent | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server |
+
+The four real-agent rows (advice, gating, allowed operation, capture) and the
+upgrade-notice row run in the `Real agent session` jobs, which are **advisory**:
+they report on the PR but are not inputs to `Production plugin readiness`. Two
+reasons. They assert on what an LLM chooses to echo (the upgrade-notice check
+flipped between pass and fail on byte-identical packages, same pinned CLI and
+same model within one hour), and they sit behind the `production-plugin-release`
+environment reviewer gate, which would otherwise put a human approval on every
+merge. Read their reports before promoting a release; do not treat a red job as
+a merge blocker.
 
 The actual Claude package is the marketplace's immutable tag/SHA, which may differ
 from main. Codex and Cursor use the candidate main/merge commit. Previous versions
