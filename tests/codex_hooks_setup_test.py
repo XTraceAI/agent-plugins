@@ -46,10 +46,12 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         }
         (home / "hooks.json").write_text(json.dumps(original), encoding="utf-8")
         changed, expected, backup = setup.install(home)
-        assert changed and expected == 3 and backup and backup.exists()
+        assert changed and expected == 4 and backup and backup.exists()
         installed = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
         assert installed["description"] == "mine"
-        assert installed["hooks"]["SessionStart"] == original["hooks"]["SessionStart"]
+        # The user's own SessionStart hook keeps its slot; ours is appended.
+        assert installed["hooks"]["SessionStart"][0] == original["hooks"]["SessionStart"][0]
+        assert len(installed["hooks"]["SessionStart"]) == 2
         assert installed["hooks"]["PreToolUse"][0] == original["hooks"]["PreToolUse"][0]
         assert (home / "memhub_hook_bridge.py").is_file()
         installed_text = json.dumps(installed)
@@ -63,10 +65,10 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         ]
         assert any(str(home) in command for command in commands)
         assert "${CODEX_HOME" not in installed_text
-        assert setup.status(home) == (True, 3, 3)
+        assert setup.status(home) == (True, 4, 4)
 
         again, count, second_backup = setup.install(home)
-        assert not again and count == 3 and second_backup is None
+        assert not again and count == 4 and second_backup is None
         assert json.loads((home / "hooks.json").read_text(encoding="utf-8")) == installed
     print("PASS test_install_preserves_other_hooks_and_is_idempotent")
 
@@ -119,7 +121,7 @@ def test_install_replaces_legacy_bridge_without_duplicates():
         assert "plugins/cache/xtrace-plugins" not in text
         assert "0.26/scripts/codex_flush.py" not in text
         assert "echo user" in text
-        assert setup.status(home) == (True, 3, 3)
+        assert setup.status(home) == (True, 4, 4)
     print("PASS test_install_replaces_legacy_bridge_without_duplicates")
 
 
@@ -361,8 +363,58 @@ def test_dispatch_keeps_artifact_context_when_recall_fails():
     print("PASS test_dispatch_keeps_artifact_context_when_recall_fails")
 
 
+def test_dispatch_session_start_merges_the_three_claude_scripts():
+    """SessionStart folds rulebook `session`, brain_brief `brief` and
+    capture_health (told the host) into one document — the same scripts
+    Claude's three SessionStart hooks run, unchanged."""
+    with tempfile.TemporaryDirectory() as raw:
+        plugin = Path(raw)
+        scripts = plugin / "scripts"
+        scripts.mkdir()
+        (scripts / "codex_flush.py").write_text("", encoding="utf-8")
+        (scripts / "rulebook_hook.py").write_text(
+            "import json,sys; assert sys.argv[1] == 'session', sys.argv; json.load(sys.stdin); "
+            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'SessionStart',"
+            "'additionalContext':'PLUGIN_UPGRADE_REQUIRED: update to 999.0.0 then restart'},"
+            "'systemMessage':'PLUGIN_UPGRADE_REQUIRED: update to 999.0.0 then restart'}))\n",
+            encoding="utf-8",
+        )
+        (scripts / "brain_brief.py").write_text(
+            "import json,sys; assert sys.argv[1] == 'brief', sys.argv; json.load(sys.stdin); "
+            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'SessionStart',"
+            "'additionalContext':'MemHub: this repo brain'}}))\n",
+            encoding="utf-8",
+        )
+        (scripts / "capture_health.py").write_text(
+            "import json,sys; a=sys.argv[1:]; "
+            "assert a[a.index('--host')+1] == 'codex', a; "
+            "assert a[a.index('--plugin-root')+1] == %r, a; json.load(sys.stdin); "
+            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'SessionStart',"
+            "'additionalContext':'MemHub capture health: token expired'},"
+            "'systemMessage':'capture: token expired'}))\n" % str(plugin),
+            encoding="utf-8",
+        )
+        env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
+        payload = json.dumps({"hook_event_name": "SessionStart", "source": "startup",
+                              "session_id": "s-1", "cwd": raw}).encode()
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"), "dispatch", "SessionStart"],
+            input=payload, capture_output=True, env=env, check=True,
+        )
+        doc = json.loads(result.stdout)
+        assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+        assert doc["hookSpecificOutput"]["additionalContext"] == (
+            "PLUGIN_UPGRADE_REQUIRED: update to 999.0.0 then restart\n\n"
+            "MemHub: this repo brain\n\nMemHub capture health: token expired")
+        assert doc["systemMessage"] == (
+            "PLUGIN_UPGRADE_REQUIRED: update to 999.0.0 then restart\n\ncapture: token expired")
+        assert "permissionDecision" not in doc["hookSpecificOutput"]
+    print("PASS test_dispatch_session_start_merges_the_three_claude_scripts")
+
+
 def test_dispatch_subprocess_budgets_fit_hook_timeouts():
     assert bridge._GATE_TIMEOUT_S + bridge._RECALL_TIMEOUT_S < 8
+    assert max(bridge._SESSION_TIMEOUT_S, bridge._HEALTH_TIMEOUT_S) < 8
     assert max(
         bridge._GATE_TIMEOUT_S + bridge._RECALL_TIMEOUT_S,
         bridge._ARTIFACT_TIMEOUT_S,
@@ -378,7 +430,7 @@ def test_status_checks_materialized_windows_commands():
         doc["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] = "py -3 broken.py"
         (home / "hooks.json").write_text(json.dumps(doc), encoding="utf-8")
         healthy, actual, expected = setup.status(home)
-        assert not healthy and actual == expected == 3
+        assert not healthy and actual == expected == 4
     print("PASS test_status_checks_materialized_windows_commands")
 
 
@@ -394,10 +446,10 @@ def test_cli_names_only_the_memhub_handlers_for_review():
             sys.argv = real_argv
 
         text = output.getvalue()
-        assert "installed (3 handlers)" in text
+        assert "installed (4 handlers)" in text
         assert f"User config - {Path(raw) / 'hooks.json'}" in text
         assert f"review command: {Path(raw) / 'memhub_hook_bridge.py'}" in text
-        assert "trust only the 3 handlers" in text
+        assert "trust only the 4 handlers" in text
         assert "do not use 'Trust all'" in text
     print("PASS test_cli_names_only_the_memhub_handlers_for_review")
 

@@ -22,6 +22,7 @@ def module(name, filename):
 
 agent = module("release_agent_test", "check-agent-session.py")
 install = module("release_install_test", "check-host-install.py")
+session_start = module("release_session_start_test", "check-host-session-start.py")
 PACKAGE = ROOT / "plugins/memhub"
 SHA = "a" * 40
 SID = "11111111-1111-4111-8111-111111111111"
@@ -210,6 +211,68 @@ class ReleaseChecksTests(unittest.TestCase):
                         dict(fixture, advice_marker="arbitrary prose")):
             with self.assertRaises((lib.compat.GateError, lib.NotVerified)):
                 agent.fixture_config(json.dumps(changed))
+
+    def test_claude_session_start_evidence_needs_the_notice_in_the_host_record(self):
+        notice = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
+                  "PLUGIN_UPGRADE_REQUIRED: MemHub plugin 0.0.0 is unsupported. Update MemHub to 999.0.0 "
+                  "or newer using your host's plugin manager, then restart this agent session."}}
+        def response(output, outcome="success"):
+            return {"type": "system", "subtype": "hook_response", "hook_event": "SessionStart",
+                    "outcome": outcome, "exit_code": 0, "output": output}
+        class Server:
+            requests = ["/v1/team/rulebook/rules?view=hook&repo=memhub-release-upgrade&hook_version=0.57.0"]
+        good = session_start.claude_evidence([response(""), response(json.dumps(notice))], Server())
+        self.assertEqual(good, {"hook_responses": 2, "all_succeeded": True,
+                                "notice_in_host_record": True, "server_fetched": True})
+        # A hook that ran but printed the notice somewhere the host does not
+        # forward (stderr, a bare line) is not delivery.
+        bare = session_start.claude_evidence([response("PLUGIN_UPGRADE_REQUIRED 999.0.0 restart")], Server())
+        self.assertFalse(bare["notice_in_host_record"])
+        # A cancelled hook is not success even if its output looks right.
+        cancelled = session_start.claude_evidence([response(json.dumps(notice), outcome="cancelled")], Server())
+        self.assertFalse(cancelled["all_succeeded"])
+        # No SessionStart hook at all: the host did not run the plugin.
+        none = session_start.claude_evidence([{"type": "system", "subtype": "init"}], Server())
+        self.assertEqual(none["hook_responses"], 0)
+        self.assertFalse(none["all_succeeded"])
+        # The version-carrying fetch is what produced the 426; without it the
+        # notice could be a stale marker from an earlier session.
+        class Quiet:
+            requests = ["/v1/team/rulebook/rules?view=hook&repo=memhub-release-upgrade"]
+        self.assertFalse(session_start.claude_evidence([response(json.dumps(notice))], Quiet())["server_fetched"])
+
+    def test_codex_session_start_evidence_is_the_hooks_own_per_session_record(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            book = root / "book" / "memhub-release-upgrade-deadbeef.json"
+            book.parent.mkdir()
+            thread = "019a0000-0000-7000-8000-000000000001"
+            marker = book.parent / (book.name + ".notice-" + hashlib.sha256(thread.encode()).hexdigest()[:16])
+            events = [{"type": "thread.started", "thread_id": thread}, {"type": "turn.failed"}]
+            class Server:
+                requests = ["/v1/team/rulebook/rules?view=hook&repo=memhub-release-upgrade&hook_version=0.57.0"]
+            with patch.object(session_start, "run", return_value=str(book) + "\n"):
+                before = session_start.codex_evidence(events, root, root, {}, Server())
+                self.assertEqual(before, {"session_started": True, "server_fetched": True, "notice_markers": 0,
+                                          "notice_emitted_for_session": False, "notice_in_host_stream": False})
+                marker.write_text("[]")
+                after = session_start.codex_evidence(events, root, root, {}, Server())
+                self.assertTrue(after["notice_emitted_for_session"])
+                self.assertEqual(after["notice_markers"], 1)
+                # A marker for some OTHER session is not evidence for this one.
+                other = session_start.codex_evidence([{"type": "thread.started", "thread_id": "other"}],
+                                                     root, root, {}, Server())
+                self.assertFalse(other["notice_emitted_for_session"])
+                # No thread: Codex never started a session; nothing else can compensate.
+                self.assertFalse(session_start.codex_evidence([], root, root, {}, Server())["session_started"])
+
+    def test_session_start_notice_needs_all_three_facts(self):
+        full = "PLUGIN_UPGRADE_REQUIRED: update to 999.0.0 then restart"
+        self.assertTrue(session_start.notice_delivered(full))
+        for broken in (full.replace("PLUGIN_UPGRADE_REQUIRED", "upgrade"), full.replace("999.0.0", "1.0.0"),
+                       full.replace("restart", "retry"), None, 42):
+            self.assertFalse(session_start.notice_delivered(broken), broken)
 
     def test_unknown_cli_output_is_withheld(self):
         with tempfile.TemporaryDirectory() as raw:

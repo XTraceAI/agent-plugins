@@ -60,6 +60,16 @@ jobs:
         run: >-
           python3 scripts/check-upgrade-contract.py --plugin-root "$RELEASE_PACKAGE"
           --source-sha "$RELEASE_SHA" --report "$RUNNER_TEMP/host-reports/upgrade-policy.json"
+      # The pinned host CLI itself starts the package's SessionStart hook and
+      # takes the upgrade notice: no model, no credentials, so this is the
+      # required form of "upgrade notice reaches agent". The real-agent jobs
+      # answer the model-side question and stay advisory.
+      - name: Host runs SessionStart and receives the upgrade notice
+        if: always() && env.RELEASE_PACKAGE != ''
+        run: >-
+          python3 scripts/check-host-session-start.py --host '${{ matrix.host }}'
+          --executable '${{ matrix.host }}' --plugin-root "$RELEASE_PACKAGE"
+          --source-sha "$RELEASE_SHA" --report "$RUNNER_TEMP/host-reports/session-start.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

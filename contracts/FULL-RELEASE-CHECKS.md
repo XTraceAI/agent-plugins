@@ -20,17 +20,27 @@ are closed and all enabled hosts have a real successful run and a deliberate fai
 | Allowed operation | The same session creates an unrelated file with the run's unique contents | Each actual host CLI against production |
 | Automatic capture | Fresh successful capture acknowledgement for the exact native session ID; Claude requires both turn and session-end capture | Each actual host CLI against production |
 | Upgrade response contract | Existing gate works, synthetic 426 surfaces actionable notice, stale gate stops, rollback restores it | Actual package with loopback HTTP server |
-| Upgrade notice reaches agent | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server |
+| Upgrade notice reaches the host | The pinned host CLI starts the package's SessionStart hook and takes the notice: Claude reports it in its own `hook_response` record; Codex leaves the hook's per-session marker after the version-carrying fetch | Each actual host CLI, no prompt, no model, no credentials (`check-host-session-start.py`) |
+| Upgrade notice reaches the model (advisory) | Real agent reports error code, required version, and restart instruction absent from its prompt | Each actual host CLI against loopback HTTP server |
 
 The four real-agent rows (advice, gating, allowed operation, capture) and the
-upgrade-notice row run in the `Real agent session` jobs, which are **advisory**:
-they report on the PR but are not inputs to `Production plugin readiness`. Two
-reasons. They assert on what an LLM chooses to echo (the upgrade-notice check
-flipped between pass and fail on byte-identical packages, same pinned CLI and
-same model within one hour), and they sit behind the `production-plugin-release`
-environment reviewer gate, which would otherwise put a human approval on every
-merge. Read their reports before promoting a release; do not treat a red job as
-a merge blocker.
+model-side upgrade-notice row run in the `Real agent session` jobs, which are
+**advisory**: they report on the PR but are not inputs to `Production plugin
+readiness`. Two reasons. They assert on what an LLM chooses to echo (the
+upgrade-notice check flipped between pass and fail on byte-identical packages,
+same pinned CLI and same model within one hour), and they sit behind the
+`production-plugin-release` environment reviewer gate, which would otherwise put
+a human approval on every merge. Read their reports before promoting a release;
+do not treat a red job as a merge blocker.
+
+The host-side row is the required form of that evidence. It runs in the
+key-free `Install and upgrade` jobs: an isolated home, the native install, the
+loopback 426 server, and a session that never reaches a model. Claude runs
+SessionStart hooks before any prompt, so a stream-json session with nothing on
+stdin is enough; Codex has no prompt-less mode, so it gets a one-word prompt
+and a model endpoint that cannot answer. If this row fails, a host stopped
+starting the plugin's SessionStart hook or stopped taking its output — the
+regression a release gate exists to catch.
 
 The actual Claude package is the marketplace's immutable tag/SHA, which may differ
 from main. Codex and Cursor use the candidate main/merge commit. Previous versions

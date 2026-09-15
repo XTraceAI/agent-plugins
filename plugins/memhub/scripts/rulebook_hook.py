@@ -4148,8 +4148,9 @@ def main():
         show_upgrade(repo, session, "PreToolUse")
         return 0
     rules, rule_version, fetched_at, sources = load_rules(repo)
-    # The three-handler Codex bridge has no SessionStart fetch. Refresh before
-    # its first/stale pre-call so a cold install cannot silently miss a gate.
+    # A Codex bridge trusted before SessionStart was wired (three handlers)
+    # never ran the session lane's fetch. Refresh before a first/stale
+    # pre-call so such an install cannot silently miss a gate.
     if codex_pre and _age_s(fetched_at) >= REFRESH_AFTER_S:
         rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
     tool = data.get("tool_name", "")
