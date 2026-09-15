@@ -1089,24 +1089,35 @@ class OrderingEngine:
         dismissal. A receipt that lands later must find nothing to convert:
         the person's explicit non-conversion outranks it, and the server's
         sticky-true merge would otherwise let the receipt overwrite it.
-        Only THAT fire is forgotten; a newer open fire of the rule stays."""
+        Only THAT fire is forgotten; a newer open fire of the rule stays.
+
+        Returns ``"consumed"`` (it was here and is gone), ``"resolved"`` (a
+        receipt already answered it — the caller must NOT write a dismissal
+        over that true), or ``"absent"`` (never here: a session-armed fire,
+        or an engine this hook could not lock). Decided under the engine's
+        lock, so a receipt cannot slip between the answer and the caller's
+        write — that is the whole reason this runs BEFORE the dismissal."""
         lock = self._locked()
         if lock is None:
-            return
+            return "absent"
         try:
             st = self._read()
             slot = (st.get(self.branch) or {}).get(rule_id)
+            if not isinstance(slot, dict):
+                return "absent"
+            if fire_id in (slot.get("resolved_fires") or []):
+                return "resolved"
             changed = False
-            if isinstance(slot, dict):
-                if slot.get("open_fire") == fire_id:
-                    slot.pop("open_fire", None)
-                    changed = True
-                fires = slot.get("open_fires") or []
-                if fire_id in fires:
-                    slot["open_fires"] = [f for f in fires if f != fire_id]
-                    changed = True
+            if slot.get("open_fire") == fire_id:
+                slot.pop("open_fire", None)
+                changed = True
+            fires = slot.get("open_fires") or []
+            if fire_id in fires:
+                slot["open_fires"] = [f for f in fires if f != fire_id]
+                changed = True
             if changed:
                 self._write(st)
+            return "consumed" if changed else "absent"
         finally:
             portable_lock.unlock(lock.fileno())
             lock.close()
@@ -3815,17 +3826,29 @@ def apply_dismissals(st, rules, dismissals, *, forget_ordering_fire=None):
         if not pending:
             continue
         hit = pending[0]
-        ordering_fids = [fid for fid, _rec in pending_fires(st, hit["id"], ("ordering",))]
-        resolve_fires(st, hit["id"], "dismissed", converted=False, override_reason=why)
-        for fid in ordering_fids:
-            if st.get("armed_fire", {}).get(hit["id"]) == fid:
-                st["armed_fire"].pop(hit["id"], None)
+        rid = hit["id"]
+        # Ordering fires FIRST consume their engine / session reference —
+        # under the engine's lock — and only then is the dismissal written.
+        # The other order left a window: a sibling session's receipt could
+        # take the fire between the dismissal's false and the engine's
+        # forget, log its true, and the server's sticky-true would keep the
+        # receipt over the person's explicit no. A fire the engine reports
+        # as already resolved is dropped without a dismissal: the receipt
+        # won, honestly, and its true is already in the ledger.
+        for fid, _rec in pending_fires(st, rid, ("ordering",)):
+            if st.get("armed_fire", {}).get(rid) == fid:
+                st["armed_fire"].pop(rid, None)
+                continue
+            status = None
             if forget_ordering_fire is not None:
                 try:
-                    forget_ordering_fire(hit["id"], fid)
+                    status = forget_ordering_fire(rid, fid)
                 except Exception:
-                    pass
-        done.append((hit.get("_label") or hit["id"], why))
+                    status = None
+            if status == "resolved":
+                st["obligations"].pop(fid, None)
+        if resolve_fires(st, rid, "dismissed", converted=False, override_reason=why):
+            done.append((hit.get("_label") or rid, why))
     return done, ambiguous
 
 
@@ -4392,7 +4415,7 @@ def main():
     def _forget_ordering_fire(rid, fid):
         # the engine is built lazily on this path — the usual dismissal
         # command fires nothing and never needed it
-        OrderingEngine(root, branch).forget_fire(rid, fid)
+        return OrderingEngine(root, branch).forget_fire(rid, fid)
 
     if not fired_now:
         set_aside, ambiguous = apply_dismissals(
@@ -4478,25 +4501,6 @@ def main():
                 ambiguous_gate = (label, len(named))
     set_aside, ambiguous = apply_dismissals(
         st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
-    # The named form on the very call that FIRES the advisory: the agent knew
-    # the command would trip it and said why up front. That fire has no record
-    # yet, so it is answered at registration — its ledger row carries the
-    # reason and it is resolved as dismissed before it ever waits.
-    same_call = {}
-    if override_label is not None:
-        # exact id first, then label — and regardless of whether earlier
-        # fires of the rule were just dismissed above: the fire THIS call
-        # produced is a new one and takes the reason too
-        advisories = [r for r in fired_now if r["id"] not in gate_ids]
-        here = [r for r in advisories if str(r["id"]).lower() == override_label] \
-            or [r for r in advisories if _label_of(r) == override_label]
-        if len(here) == 1:
-            same_call[here[0]["id"]] = override_reason
-            ack = (here[0].get("_label") or here[0]["id"], override_reason)
-            if ack not in set_aside:
-                set_aside.append(ack)
-        elif here:
-            ambiguous.append((override_label, len(here)))
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4514,6 +4518,27 @@ def main():
     # the advisory cap never cuts a gate — a silently un-gated push is the one
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]
+    # The named form on the very call that FIRES the advisory: the agent knew
+    # the command would trip it and said why up front. That fire has no record
+    # yet, so it is answered at registration — its ledger row carries the
+    # reason and it is resolved as dismissed before it ever waits. Resolved
+    # against the advisories SHOWN (a fire the cap cut is a suppressed row
+    # with no outcome to give), exact id first, and never when the same
+    # override already excused a gate: one named override answers one rule.
+    same_call = {}
+    gate_took_it = any(override_label in (str(r["id"]).lower(), _label_of(r))
+                       for r in gates if r["id"] in overridden) if override_label else False
+    if override_label is not None and not gate_took_it:
+        shown_advisories = [r for r in shown if r["id"] not in gate_ids]
+        here = [r for r in shown_advisories if str(r["id"]).lower() == override_label] \
+            or [r for r in shown_advisories if _label_of(r) == override_label]
+        if len(here) == 1:
+            same_call[here[0]["id"]] = override_reason
+            ack = (here[0].get("_label") or here[0]["id"], override_reason)
+            if ack not in set_aside:
+                set_aside.append(ack)
+        elif here:
+            ambiguous.append((override_label, len(here)))
     blocked = any(r["id"] not in overridden for r in gates)
     lines = [f"## {BRAND} Rulebook — BLOCKED" if blocked
              else f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]

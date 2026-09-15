@@ -2709,6 +2709,16 @@ def min_hook_version_checks() -> None:
              "fire_scope": "session", "repo_scope": "any", "text": "wget (rule id alias)", "why": "w"},
             {"id": "other", "_label": "alias", "on": "bash", "rx": r"\bwget\b",
              "fire_scope": "session", "repo_scope": "any", "text": "wget (label alias)", "why": "w"},
+            # an ADVISORY that shares its label with the push GATE
+            {"id": "push-adv", "_label": "push-gate", "on": "bash", "rx": r"git\s+push\s+--force",
+             "fire_scope": "session", "repo_scope": "any", "text": "Tell the team before a force push", "why": "w"},
+            # three advisories on one command: with MAX_ADVISE=2 the last is cut
+            {"id": "capx-0", "_label": "capx-0", "on": "bash", "rx": r"\bcapx-cmd\b",
+             "fire_scope": "session", "repo_scope": "any", "text": "capx 0", "why": "w"},
+            {"id": "capx-1", "_label": "capx-1", "on": "bash", "rx": r"\bcapx-cmd\b",
+             "fire_scope": "session", "repo_scope": "any", "text": "capx 1", "why": "w"},
+            {"id": "capx-2", "_label": "capx-2", "on": "bash", "rx": r"\bcapx-cmd\b",
+             "fire_scope": "session", "repo_scope": "any", "text": "capx 2", "why": "w"},
             # a call-scoped advisory with NO signal: only `last_fire` points at it
             {"id": "nosig-call", "title": "nosig-call", "on": "bash", "rx": r"\bcurl\b",
              "fire_scope": "call", "repo_scope": "any",
@@ -2837,8 +2847,12 @@ def min_hook_version_checks() -> None:
               out.strip() == "" and len(convs_for(f1["fire_id"])) == 2, out)
         g5 = fire_id("o5", "push-gate")
         rc, out = bash("o5", "RULEBOOK_OVERRIDE='[push-gate] later' ls")
+        # (`push-adv`, the advisory that shares the gate's label, fired on the
+        # same force-push and IS what this dismisses — the gate's fire is not)
         check("outcomes: a gate's fire is never a dismissal target",
-              out.strip() == "" and convs_for(g5["fire_id"]) == [], out)
+              convs_for(g5["fire_id"]) == []
+              and [x["how"] for x in convs_for(fire_id("o5", "push-adv")["fire_id"])] == ["dismissed"],
+              out + str(convs_for(g5["fire_id"])))
         rc, out = bash("o3", "RULEBOOK_OVERRIDE='[no-sudo] twice' ls")
         check("outcomes: a dismissed fire is consumed — a second dismissal records nothing",
               out.strip() == "" and len(convs_for(f3["fire_id"])) == 1, out)
@@ -3058,9 +3072,11 @@ def min_hook_version_checks() -> None:
         forgotten = []
         H.apply_dismissals(st, [{"id": "ord", "_label": "ord"}], {"ord": "why"},
                            forget_ordering_fire=lambda rid, fid: forgotten.append((rid, fid)))
-        check("outcomes: dismissing a session-armed ordering fire drops armed_fire and tells the engine",
+        # a session-armed fire was never in the engine (the caller holds it),
+        # so its reference is armed_fire and the engine is not asked
+        check("outcomes: dismissing a session-armed ordering fire drops armed_fire, keeps the arming",
               st["obligations"] == {} and st["armed_fire"] == {} and st["armed"] == {"ord": True}
-              and forgotten == [("ord", "fo")], str(st) + str(forgotten))
+              and forgotten == [], str(st) + str(forgotten))
 
         # 5p. a bracket that names no rule is part of the reason, not an
         #     address — the unnamed form keeps working as it always did
@@ -3133,6 +3149,42 @@ def min_hook_version_checks() -> None:
               sa["override_reason"] == "by id" and so["override_reason"] is None
               and [x["how"] for x in convs_for(sa["fire_id"])] == ["dismissed"]
               and convs_for(so["fire_id"]) == [] and "fits 2 rules" not in ctx(out), out)
+
+        # 5v. one named override answers ONE rule: consumed by the gate it
+        #     names, it does not also dismiss a same-labelled advisory
+        rc, out = bash("o24", "RULEBOOK_OVERRIDE='[push-gate] hotfix' git push --force")
+        g24, a24 = fire_id("o24", "push-gate"), fire_id("o24", "push-adv")
+        check("outcomes: an override the gate consumed leaves the same-labelled advisory pending",
+              decision(out) != "deny" and g24["override_reason"] == "hotfix"
+              and a24 is not None and a24["override_reason"] is None and convs_for(a24["fire_id"]) == []
+              and "set aside" not in ctx(out), out)
+
+        # 5w. a same-call target the advisory cap CUT is a suppressed row with
+        #     no outcome to give — no acknowledgement, no reason claimed
+        rc, out = bash("o25", "RULEBOOK_OVERRIDE='[capx-2] why' capx-cmd")
+        with open(fires_path, encoding="utf-8") as f:
+            o25 = [json.loads(l) for l in f if l.strip() and '"o25"' in l]
+        cut_row = next(r for r in o25 if r["rule_id"] == "capx-2")
+        check("outcomes: naming a cut advisory records nothing and says nothing about it",
+              cut_row["mode"] == "suppressed" and cut_row["override_reason"] is None
+              and convs_for(cut_row["fire_id"]) == [] and "set aside" not in ctx(out), out)
+
+        # 5x. a dismissal that races a sibling's receipt: the engine already
+        #     holds the fire as resolved → no dismissal is written over it
+        st = {"obligations": {"fr": rec("ord", kind="ordering")}, "armed_fire": {}, "armed": {}, "stops": 0}
+        done, amb = H.apply_dismissals(st, [{"id": "ord", "_label": "ord"}], {"ord": "why"},
+                                       forget_ordering_fire=lambda rid, fid: "resolved")
+        check("outcomes: a fire the engine reports resolved is dropped, not dismissed",
+              done == [] and amb == [] and st["obligations"] == {}, str((done, st)))
+        st = {"obligations": {"fr": rec("ord", kind="ordering")}, "armed_fire": {}, "armed": {}, "stops": 0}
+        done, amb = H.apply_dismissals(st, [{"id": "ord", "_label": "ord"}], {"ord": "why"},
+                                       forget_ordering_fire=lambda rid, fid: "consumed")
+        check("outcomes: …and one the engine hands over is dismissed",
+              done == [("ord", "why")] and st["obligations"] == {}, str((done, st)))
+        eng = H.OrderingEngine(orepo, "main")
+        eng.mark_fired("ord-x", "fx1")
+        check("outcomes: forget_fire — consumed, then absent",
+              eng.forget_fire("ord-x", "fx1") == "consumed" and eng.forget_fire("ord-x", "fx1") == "absent")
 
         # 5n. a rule id outranks another rule's label when resolving a dismissal
         bash("o14", "wget https://x")
