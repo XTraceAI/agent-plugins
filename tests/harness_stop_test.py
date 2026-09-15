@@ -343,6 +343,32 @@ def test_a_later_stop_blocks_on_the_moment_once():
     print("PASS test_a_later_stop_blocks_on_the_moment_once")
 
 
+def test_a_fast_child_never_makes_the_block_hand_the_stopping_turn():
+    """The handoff is chosen before the child is spawned. A child that wins the
+    race and appends THIS turn's moment at once must not become the block
+    (Codex, #230)."""
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        tp = hx.harness_dir().parent / "race.jsonl"
+        tp.write_text("", encoding="utf-8")
+        out, real_stdout, real_popen = io.StringIO(), sys.stdout, hx.subprocess.Popen
+
+        def child_wins_the_race(args, **kw):
+            hx.append_jsonl(hs.moments_path("sess"), _moment(3))
+
+        hx.subprocess.Popen, sys.stdout = child_wins_the_race, out
+        try:
+            hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp)})
+        finally:
+            hx.subprocess.Popen, sys.stdout = real_popen, real_stdout
+        reason = _reason(out.getvalue())
+        assert "turn 2" in reason and "turn 3" not in reason, reason[:80]
+        assert [r.get("handed") for r in hx.read_jsonl(hs.moments_path("sess"))
+                if r.get("handed")] == ["sess#2"]
+    print("PASS test_a_fast_child_never_makes_the_block_hand_the_stopping_turn")
+
+
 def test_stale_capped_and_missing_moments_never_block():
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=9)

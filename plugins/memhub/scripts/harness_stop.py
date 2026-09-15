@@ -192,8 +192,9 @@ def cmd_stop(payload: dict) -> int:
     hook until it returns. (The shell gate in claude-hooks.json keeps it free
     with the flag off.)
 
-    The spawn comes first: the child is bounded by the transcript's size NOW,
-    so whatever the blocked continuation appends is not this turn's."""
+    The child is bounded by the transcript's size taken here, so whatever the
+    blocked continuation appends is not this turn's. The handoff is chosen
+    BEFORE the child exists, so it can only ever hand an earlier turn."""
     session = str(payload.get("session_id") or "").strip()
     transcript = str(payload.get("transcript_path") or "").strip()
     cwd = str(payload.get("cwd") or "").strip()
@@ -238,8 +239,13 @@ def cmd_stop(payload: dict) -> int:
                 args += ["--arcs", str(arcs_path)]
             except Exception:
                 pass
+    # Choose the handoff before spawning: a child that wins the race could
+    # otherwise append THIS turn's moment first, and the block would hand the
+    # turn that is stopping (Codex, #230). Selection only reads the moments file
+    # and appends a `handed` row; the boundary above is already taken.
+    rc = hand_off(session)
     hx.spawn_detached(args, script=Path(__file__).resolve(), log_name="stop.log")
-    return hand_off(session)
+    return rc
 
 
 def _claim_turn(session: str, marker: str) -> bool:
