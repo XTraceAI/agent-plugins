@@ -3013,20 +3013,19 @@ def min_hook_version_checks() -> None:
               [x["how"] for x in convs_for(n1["fire_id"])] == ["dismissed"]
               and [x["how"] for x in convs_for(n2["fire_id"])] == ["dismissed"])
 
-        # 5h. the wait is stamped against the file's counter at save time: a
-        #     fire opened from a snapshot taken before a Stop advanced the
-        #     counter is not closed a turn early
-        with open(sp, "w", encoding="utf-8") as f:
-            json.dump({"obligations": {}, "stops": 3}, f)
-        st = H.load_state(sp)
-        before = H.snapshot_arming(st)
-        with open(sp, "w", encoding="utf-8") as f:   # meanwhile: a Stop advanced the counter
-            json.dump({"obligations": {}, "stops": 4}, f)
-        H.open_obligation(st, "fq", "q", "signal")     # opened_at 3, the stale snapshot
-        H.save_state(sp, st, before=before)
-        cur = H.load_state(sp)
-        check("outcomes: opened_at is stamped with the counter as saved, never a stale snapshot",
-              cur["obligations"] == {"fq": rec("q", 4)} and cur["stops"] == 4, str(cur))
+        # 5h. the wait is counted in Stops that actually SAW the record: a
+        #     fresh record carries no opened_at; the first Stop stamps it, the
+        #     second closes it — whatever the counter said when the hook fired
+        with open(os.path.join(td, "state", "o15.json"), "w", encoding="utf-8") as f:
+            json.dump({"obligations": {"fq": rec("q", None)}, "stops": 7}, f)   # hook loaded a stale 7
+        stop("o15")
+        cur = H.load_state(os.path.join(td, "state", "o15.json"))
+        check("outcomes: the first Stop to see a record stamps it and does not close it",
+              cur["obligations"] == {"fq": rec("q", 8)} and cur["stops"] == 8, str(cur))
+        stop("o15")
+        cur = H.load_state(os.path.join(td, "state", "o15.json"))
+        check("outcomes: …the second closes it",
+              cur["obligations"] == {"fq": rec("q", 8, closed=True)} and cur["stops"] == 9, str(cur))
 
         # 5k. a gate that also carries a conversion signal never becomes an
         #     obligation: blocked on its call, never closed or dismissed later
@@ -3059,6 +3058,37 @@ def min_hook_version_checks() -> None:
         check("outcomes: dismissing a session-armed ordering fire drops armed_fire and tells the engine",
               st["obligations"] == {} and st["armed_fire"] == {} and st["armed"] == {"ord": True}
               and forgotten == [("ord", "fo")], str(st) + str(forgotten))
+
+        # 5p. a bracket that names no rule is part of the reason, not an
+        #     address — the unnamed form keeps working as it always did
+        rc, out = bash("o16", "RULEBOOK_OVERRIDE='[WIP] hotfix, CI green' git push --force")
+        check("outcomes: `[WIP] …` names no rule → the unnamed override, reason kept whole",
+              decision(out) != "deny"
+              and fire_id("o16", "push-gate")["override_reason"] == "[WIP] hotfix, CI green", out)
+
+        # 5q. the named form on the very call that FIRES the advisory: the
+        #     reason lands on that fire, it is dismissed at once, no wait
+        rc, out = bash("o17", "RULEBOOK_OVERRIDE='[no-sudo] container has no sudo' sudo ls")
+        f17 = fire_id("o17", "no-sudo")
+        check("outcomes: a same-call named override records the reason on the fire itself",
+              f17 is not None and f17["override_reason"] == "container has no sudo"
+              and [x["how"] for x in convs_for(f17["fire_id"])] == ["dismissed"]
+              and "set aside" in ctx(out) and decision(out) != "deny", out + str(f17))
+        stop("o17"); stop("o17")
+        check("outcomes: …and it never waits — no close, nothing pending",
+              len(convs_for(f17["fire_id"])) == 1
+              and H.load_state(os.path.join(td, "state", "o17.json"))["obligations"] == {})
+
+        # 5r. an edit marker naming an advisory excuses nothing and dismisses
+        #     nothing — it is a durable annotation, not the dismissal channel
+        bash("o18", "sudo ls")
+        f18 = fire_id("o18", "no-sudo")
+        run("pre", {"cwd": orepo, "session_id": "o18", "tool_name": "Write",
+                    "tool_input": {"file_path": os.path.join(orepo, "notes.md"),
+                                   "content": "# rulebook-override[no-sudo]: copied from elsewhere\n"}}, oenv)
+        check("outcomes: an edit marker does not dismiss a pending advisory",
+              convs_for(f18["fire_id"]) == []
+              and "no-sudo" in {r["rule"] for r in H.load_state(os.path.join(td, "state", "o18.json"))["obligations"].values()})
 
         # 5n. a rule id outranks another rule's label when resolving a dismissal
         bash("o14", "wget https://x")

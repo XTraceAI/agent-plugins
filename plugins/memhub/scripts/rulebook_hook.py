@@ -2914,6 +2914,24 @@ def _state_lock(p):
             time.sleep(0.005)
 
 
+def _write_json_atomic(p, st):
+    """Replace the file in one step. A reader that loads without the lock
+    (every tool hook does) must never see a truncated file: it would parse
+    nothing, default everything, and write those defaults back over the
+    session's dedup and counters."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix="." + os.path.basename(p) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
 def save_state(p, st, before=None):
     """Write the session state. With `before` (a `snapshot_arming` taken at
     load), the arming keys are merged by delta against the file as it is NOW,
@@ -2932,13 +2950,6 @@ def save_state(p, st, before=None):
                         merged.pop(key, None)          # discharged / resolved by this process
                 for key, v in st[k].items():
                     if key not in before[k]:
-                        if k == "obligations" and isinstance(v, dict):
-                            # A wait starts at the counter as it is WHEN THE
-                            # FIRE LANDS: a Stop that advanced it after this
-                            # process loaded would otherwise close the fire a
-                            # turn early.
-                            v = dict(v, opened_at=max(int(v.get("opened_at") or 0),
-                                                      int(cur.get("stops") or 0)))
                         merged[key] = v                # armed or fired here
                     elif before[k][key] != v:
                         # re-versioned, or a record flagged closed by the
@@ -2953,8 +2964,7 @@ def save_state(p, st, before=None):
                 st[k] = seen + [x for x in st[k] if x not in seen]
             # a monotonic counter: only the Stop lane moves it, forward
             st["stops"] = max(int(cur.get("stops") or 0), int(st.get("stops") or 0))
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(st, f)
+        _write_json_atomic(p, st)
     except Exception:
         pass
     finally:
@@ -3622,10 +3632,12 @@ _STOP_CLOSES = ("signal", "ordering")
 
 
 def open_obligation(st, fid, rid, kind, file=None):
-    """One record per advisory fire. `opened_at` is re-stamped at save time
-    against the file's counter (`save_state`), so a Stop racing this hook
-    cannot shorten the wait."""
-    st["obligations"][fid] = {"rule": rid, "kind": kind, "opened_at": int(st.get("stops") or 0),
+    """One record per advisory fire. `opened_at` is None until the first Stop
+    that SEES the record stamps it: the wait is counted in Stops that
+    actually processed the fire, so a Stop that lands late (the hook is
+    asynchronous) or a counter this hook loaded stale can neither shorten
+    nor skip it."""
+    st["obligations"][fid] = {"rule": rid, "kind": kind, "opened_at": None,
                               "file": file, "closed": False}
 
 
@@ -3683,14 +3695,17 @@ def close_open_obligations(session, *, final):
         for fid, rec in st["obligations"].items():
             if not isinstance(rec, dict) or rec.get("closed") or rec.get("kind") not in _STOP_CLOSES:
                 continue
-            if not final and st["stops"] - int(rec.get("opened_at") or 0) < CLOSE_OPEN_AFTER_STOPS:
-                continue
+            if not final:
+                if rec.get("opened_at") is None:
+                    rec["opened_at"] = st["stops"]     # the first Stop to see it: the wait starts
+                    continue
+                if st["stops"] - int(rec["opened_at"]) < CLOSE_OPEN_AFTER_STOPS - 1:
+                    continue
             log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
                            converted=False)
             rec["closed"] = True
         if lock is not None:
-            with open(sp, "w", encoding="utf-8") as f:
-                json.dump(st, f)
+            _write_json_atomic(sp, st)
         else:
             save_state(sp, st, before=before)
     finally:
@@ -4062,9 +4077,17 @@ def main():
     # earlier advisory aside, and the reason is recorded on that rule's fire.
     override_label = None
     if override_reason is not None:
+        raw_reason = override_reason
         override_label, override_reason = split_named_override(override_reason)
         if override_label is not None and not override_reason:
             override_label, override_reason = None, None   # `'[x]'` alone: no reason, no override
+        elif override_label is not None and not any(
+                override_label in (str(r["id"]).lower(), str(r.get("_label") or r["id"]).lower())
+                for r in rules):
+            # A bracket that names no rule in the book is part of the reason
+            # (`'[WIP] hotfix, CI green'`), not an address: the unnamed form,
+            # exactly as it read before labels existed.
+            override_label, override_reason = None, raw_reason
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
@@ -4165,11 +4188,14 @@ def main():
     # A named override, or an edit marker, that names no gate on this call is
     # the agent setting an earlier advisory aside. Collected here, before the
     # fire pass: the command carrying it usually fires nothing itself.
+    # Only the SHELL form dismisses. An edit marker is a durable annotation
+    # that stays in the file: every later edit that carries the line would
+    # dismiss whatever fire of that rule is pending anywhere in the session —
+    # the "content copied from elsewhere" hazard the gate lane refuses the
+    # unnamed marker for. A marker still excuses the gate on its own call.
     dismissals = {}
     if mode == "pre" and override_label is not None:
         dismissals[override_label] = override_reason
-    elif mode == "pre" and edit_markers:
-        dismissals = {k: v for k, v in edit_markers.items() if k}
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -4377,12 +4403,23 @@ def main():
             named = _named_gates(label) if label else []
             if len(named) == 1:
                 overridden[named[0]["id"]] = why
-                dismissals.pop(label, None)
             elif named:
                 ambiguous_gate = (label, len(named))
-                dismissals.pop(label, None)
     set_aside, ambiguous = apply_dismissals(
         st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
+    # The named form on the very call that FIRES the advisory: the agent knew
+    # the command would trip it and said why up front. That fire has no record
+    # yet, so it is answered at registration — its ledger row carries the
+    # reason and it is resolved as dismissed before it ever waits.
+    same_call = {}
+    if override_label is not None and override_label not in {l for l, _ in set_aside}:
+        here = [r for r in fired_now if r["id"] not in gate_ids
+                and override_label in (str(r["id"]).lower(), _label_of(r))]
+        if len(here) == 1:
+            same_call[here[0]["id"]] = override_reason
+            set_aside.append((here[0].get("_label") or here[0]["id"], override_reason))
+        elif here:
+            ambiguous.append((override_label, len(here)))
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4529,7 +4566,7 @@ def main():
     ids = {}
     for r in (r for r in shown if r["id"] not in gate_ids):
         ids.update(log_fires(ctx, [r], hook_phase=mode, mode="advise", excerpt=_excerpt(r),
-                             raw_counts=raw, dedup_keys=dedup_keys))
+                             raw_counts=raw, dedup_keys=dedup_keys, override_reasons=same_call))
     if gates:      # a blocked call and an overridden one are both delivered gate fires
         ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
@@ -4546,7 +4583,10 @@ def main():
             st.setdefault("armed_fire", {})[r["id"]] = fid
         elif is_ordering and ordering and fid:
             ordering.mark_fired(r["id"], fid)
-        if fid and r["id"] not in gate_ids:
+        if fid and r["id"] in same_call:
+            # dismissed on the call that fired it: outcome written, no wait
+            log_conversion(fid, "dismissed", converted=False, override_reason=same_call[r["id"]])
+        elif fid and r["id"] not in gate_ids:
             # Every advisory fire gets its own record — a call-scoped rule
             # firing five times is five records, each closed at its own age
             # and all converted by the action that answers them. A gate's
