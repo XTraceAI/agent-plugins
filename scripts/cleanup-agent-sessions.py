@@ -20,6 +20,13 @@ conversation_not_found`` for an id that resolves to nothing, so a 404 after a
 re-created it after the harness exited — reported as ``recreated``, deleted
 once more, and counted as a failure so the race is visible rather than
 silently absorbed.
+
+The capture hooks are asynchronous. A run that died after announcing its
+session may still have a flush in flight when this runs, and that flush can
+land AFTER a first "gone" answer — an initial 404 is then not the end of the
+story. The manifest says whether the run saw every flush acknowledged
+(``captured``); for a session it did not, "gone" is re-checked once after a
+bounded wait, and whatever landed in between is deleted and reported.
 """
 from __future__ import annotations
 
@@ -29,6 +36,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 import urllib.parse
 
 from release_check_lib import compat, read_json
@@ -38,6 +46,11 @@ DELETE_PATH = "/v1/team/conversations"
 NOT_FOUND = "conversation_not_found"
 OK = frozenset({"deleted", "absent"})
 _TIMEOUT_S = 30
+#: How long an unacknowledged session's flush is given to land before "gone"
+#: is believed. The agent check itself waits 240 s for the acknowledgement; a
+#: flush that has not landed 90 s after the host and its hooks were killed is
+#: not coming, and one session per job keeps the wait affordable.
+LATE_CAPTURE_WINDOW_S = 90
 
 
 def load_manifest(path):
@@ -54,7 +67,8 @@ def load_manifest(path):
         if not (isinstance(hid, str) and re.fullmatch(r"(codex-|cursor-)?[A-Za-z0-9_-]{8,128}", hid)
                 and isinstance(org, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", org)):
             raise compat.GateError("session manifest carries an unusable session entry")
-        sessions.append({"host": row.get("host"), "harness_session_id": hid, "org_id": org})
+        sessions.append({"host": row.get("host"), "harness_session_id": hid, "org_id": org,
+                         "captured": row.get("captured") is True})
     return sessions
 
 
@@ -91,28 +105,51 @@ def _delete(rest, token, session):
         return status, (_reason(exc) if status == 404 else None)
 
 
-def cleanup_session(rest, token, session):
-    """Delete one session and verify it is gone. Never raises; the outcome is
+def _gone(status, reason):
+    """Only the backend's own reason counts: a bare 404 is a proxy or a
+    missing route, and proves nothing about the session."""
+    return status == 404 and reason == NOT_FOUND
+
+
+def _verify(rest, token, session, result):
+    """Prove ``result`` with one more DELETE. A 200 here means a capture flush
+    re-created the session in between — the call just deleted it again, and
+    the race is the finding."""
+    status, reason = _delete(rest, token, session)
+    if _gone(status, reason):
+        return result
+    if status == 200:
+        return {"outcome": "recreated", "http_status": status}
+    return {"outcome": "unverified", "http_status": status}
+
+
+def cleanup_session(rest, token, session, sleep=time.sleep):
+    """Delete one session and prove it is gone. Never raises; the outcome is
     one of a fixed vocabulary so the report holds no server strings."""
     status, reason = _delete(rest, token, session)
-    if status == 404 and reason == NOT_FOUND:
-        # Already gone, never captured, or not this key's session — every one
-        # of those means "nothing of ours remains", and a retried cleanup lands
-        # here by design. Only the backend's own reason counts: a bare 404 is
-        # a proxy or a missing route, and proves nothing about the session.
-        return {"outcome": "absent"}
     if status in (401, 403):
         return {"outcome": "unauthorized", "http_status": status}
-    if status != 200:
+    if status == 200:
+        result = _verify(rest, token, session, {"outcome": "deleted"})
+    elif _gone(status, reason):
+        # Already gone, never captured, or not this key's session — every one
+        # of those means "nothing of ours remains", and a retried cleanup lands
+        # here by design.
+        result = {"outcome": "absent"}
+    else:
         return {"outcome": "failed", "http_status": status}
-    verify, reason = _delete(rest, token, session)
-    if verify == 404 and reason == NOT_FOUND:
-        return {"outcome": "deleted"}
-    if verify == 200:
-        # A capture flush landed between the two calls and re-created the
-        # session. It is deleted now, but the race is the finding.
-        return {"outcome": "recreated", "http_status": verify}
-    return {"outcome": "unverified", "http_status": verify}
+    if result["outcome"] in OK and not session.get("captured"):
+        # The run never saw its flushes acknowledged, so one may still be in
+        # flight and land after the answer above. Wait it out, then look
+        # again; a session that appears now is deleted and verified like any
+        # other, and named as late so the report shows the race happened.
+        sleep(LATE_CAPTURE_WINDOW_S)
+        status, reason = _delete(rest, token, session)
+        if status == 200:
+            return _verify(rest, token, session, {"outcome": "deleted", "late_capture": True})
+        if not _gone(status, reason):
+            return {"outcome": "unverified", "http_status": status}
+    return result
 
 
 def summarize(results):

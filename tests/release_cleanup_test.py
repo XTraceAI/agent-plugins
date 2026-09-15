@@ -28,8 +28,17 @@ OTHER_ORG = "22222222-2222-4222-8222-222222222222"
 TOKEN = "mhk_synthetic_release_key"
 
 
-def session(hid, host="codex", org=ORG):
-    return {"host": host, "harness_session_id": hid, "org_id": org}
+def session(hid, host="codex", org=ORG, captured=True):
+    return {"host": host, "harness_session_id": hid, "org_id": org, "captured": captured}
+
+
+def no_sleep(seconds):
+    raise AssertionError(f"an acknowledged session must not wait ({seconds}s)")
+
+
+def cleanup_session(rest, session_row, waited=None):
+    return cleanup.cleanup_session(rest, TOKEN, session_row,
+                                   sleep=(waited.append if waited is not None else no_sleep))
 
 
 class FakeRest:
@@ -63,7 +72,7 @@ class FakeRest:
 class CleanupTests(unittest.TestCase):
     def test_delete_then_verify_is_the_happy_path(self):
         rest = FakeRest({"codex-abcdefgh": [200, 404]})
-        self.assertEqual(cleanup.cleanup_session(rest, TOKEN, session("codex-abcdefgh")), {"outcome": "deleted"})
+        self.assertEqual(cleanup_session(rest, session("codex-abcdefgh")), {"outcome": "deleted"})
         self.assertEqual([c["method"] for c in rest.calls], ["DELETE", "DELETE"])
         for call in rest.calls:
             self.assertTrue(call["url"].startswith(lib.compat.PRODUCTION + "/v1/team/conversations?session_id=eq."))
@@ -73,14 +82,55 @@ class CleanupTests(unittest.TestCase):
 
     def test_already_gone_is_absent_and_idempotent(self):
         rest = FakeRest({"codex-abcdefgh": [404]})
-        self.assertEqual(cleanup.cleanup_session(rest, TOKEN, session("codex-abcdefgh")), {"outcome": "absent"})
+        self.assertEqual(cleanup_session(rest, session("codex-abcdefgh")), {"outcome": "absent"})
         self.assertEqual(len(rest.calls), 1)
 
     def test_recreated_after_delete_is_reported_not_absorbed(self):
         rest = FakeRest({"abcdefgh-1111": [200, 200]})
-        result = cleanup.cleanup_session(rest, TOKEN, session("abcdefgh-1111", host="claude"))
+        result = cleanup_session(rest, session("abcdefgh-1111", host="claude"))
         self.assertEqual(result["outcome"], "recreated")
         self.assertNotIn("recreated", cleanup.OK)
+
+    def test_unacknowledged_session_gets_a_late_capture_window(self):
+        """A run that died before its flushes were acknowledged may still have
+        one in flight: "gone" is re-checked after a bounded wait, and a session
+        that lands in between is deleted, verified and named as late."""
+        for hid, script, outcome, calls in (
+            # gone, waited, still gone: absent is final
+            ("codex-late0001", [404, 404], {"outcome": "absent"}, 2),
+            # gone, waited, landed late: delete (the recheck IS a delete), verify
+            ("codex-late0002", [404, 200, 404], {"outcome": "deleted", "late_capture": True}, 3),
+            # deleted+verified, waited, landed late, verified again
+            ("codex-late0003", [200, 404, 200, 404], {"outcome": "deleted", "late_capture": True}, 4),
+            # landed late and came back yet again
+            ("codex-late0004", [404, 200, 200], {"outcome": "recreated", "http_status": 200}, 3),
+            # the recheck itself could not prove anything
+            ("codex-late0005", [404, "404-bare"], {"outcome": "unverified", "http_status": 404}, 2),
+        ):
+            with self.subTest(hid=hid):
+                rest, waited = FakeRest({hid: script}), []
+                self.assertEqual(cleanup_session(rest, session(hid, captured=False), waited), outcome)
+                self.assertEqual(waited, [cleanup.LATE_CAPTURE_WINDOW_S])
+                self.assertEqual(len(rest.calls), calls)
+        # Refused or failed outright: nothing to wait for.
+        for hid, script in (("codex-late0006", [401]), ("codex-late0007", [500])):
+            rest = FakeRest({hid: script})
+            cleanup_session(rest, session(hid, captured=False), [])
+            self.assertEqual(len(rest.calls), 1)
+
+    def test_acknowledged_session_never_waits(self):
+        rest = FakeRest({"codex-acked001": [200, 404], "codex-acked002": [404]})
+        self.assertEqual(cleanup_session(rest, session("codex-acked001")), {"outcome": "deleted"})
+        self.assertEqual(cleanup_session(rest, session("codex-acked002")), {"outcome": "absent"})
+
+    def test_manifest_captured_flag_is_read_and_defaults_off(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "sessions.json"
+            path.write_text(json.dumps({"schema_version": 1, "sessions": [
+                {"host": "codex", "harness_session_id": "codex-abcdefgh", "org_id": ORG, "captured": True},
+                {"host": "claude", "harness_session_id": "abcdefgh-1111", "org_id": ORG},
+                {"host": "claude", "harness_session_id": "abcdefgh-2222", "org_id": ORG, "captured": "yes"}]}))
+            self.assertEqual([s["captured"] for s in cleanup.load_manifest(path)], [True, False, False])
 
     def test_a_404_without_the_backends_reason_proves_nothing(self):
         """A proxy page or a missing route is also a 404; only the backend's
@@ -93,7 +143,7 @@ class CleanupTests(unittest.TestCase):
         ):
             with self.subTest(hid=hid):
                 rest = FakeRest({hid: script})
-                self.assertEqual(cleanup.cleanup_session(rest, TOKEN, session(hid))["outcome"], outcome)
+                self.assertEqual(cleanup_session(rest, session(hid))["outcome"], outcome)
 
     def test_refused_key_and_transport_failures_are_named(self):
         for hid, script, outcome in (
@@ -105,11 +155,11 @@ class CleanupTests(unittest.TestCase):
         ):
             with self.subTest(hid=hid):
                 rest = FakeRest({hid: script})
-                self.assertEqual(cleanup.cleanup_session(rest, TOKEN, session(hid))["outcome"], outcome)
+                self.assertEqual(cleanup_session(rest, session(hid))["outcome"], outcome)
 
     def test_ids_are_url_encoded_and_org_bound(self):
         rest = FakeRest({"codex-a%2Fb%3Fc%3Dd": [404]})
-        cleanup.cleanup_session(rest, TOKEN, session("codex-a/b?c=d", org=OTHER_ORG))
+        cleanup_session(rest, session("codex-a/b?c=d", org=OTHER_ORG))
         self.assertIn("session_id=eq.codex-a%2Fb%3Fc%3Dd", rest.calls[0]["url"])
         self.assertEqual(rest.calls[0]["headers"]["X-Org-Id"], OTHER_ORG)
 

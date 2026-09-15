@@ -280,17 +280,23 @@ def harness_session_id(host, sid):
     return HARNESS_SESSION_ID[host].format(sid)
 
 
-def record_session(path, *, host, sid, org_id):
-    """Append this run's production session to the run-owned manifest.
+def record_session(path, *, host, sid, org_id, captured=False):
+    """Upsert this run's production session into the run-owned manifest.
 
     The manifest lives OUTSIDE the disposable agent home (the caller passes a
-    path under the job's report directory), and is written the moment the
-    native session identity is known — before the capture wait and the checks
-    that can raise — so a crash, a job timeout or a cancelled workflow still
-    leaves the ``always()`` cleanup step an exact list of what this attempt
-    created. Exact ids only: cleanup deletes what is listed here and nothing
-    else, so it can never reach the fixtures, the rules, or a session another
-    run or a developer captured into the same test account.
+    path under the job's report directory), and is written the moment the host
+    announces the native session identity — while the host is still running —
+    so a crash, a timeout or a cancelled workflow still leaves the ``always()``
+    cleanup step an exact list of what this attempt created. Exact ids only:
+    cleanup deletes what is listed here and nothing else, so it can never reach
+    the fixtures, the rules, or a session another run or a developer captured
+    into the same test account.
+
+    ``captured=True`` is recorded once the plugin's own state files show the
+    server acknowledged every flush for this session. The capture hooks are
+    asynchronous, so until then a flush can still be in flight after the host
+    is gone; cleanup reads this flag to decide whether an id that resolves to
+    nothing is final or needs a second look. It only ever turns on.
     """
     path = Path(path)
     require(re.fullmatch(r"[A-Za-z0-9_-]{8,128}", sid), "refusing to record a malformed session identity")
@@ -300,11 +306,15 @@ def record_session(path, *, host, sid, org_id):
         manifest = {"schema_version": MANIFEST_SCHEMA, "sessions": []}
     entry = {"host": host, "org_id": org_id, "repo": REPO,
              "native_session_id": sid, "harness_session_id": harness_session_id(host, sid),
-             "recorded_at": int(time.time())}
+             "recorded_at": int(time.time()), "captured": bool(captured)}
     sessions = [row for row in manifest.get("sessions", []) if isinstance(row, dict)]
-    if not any(row.get("harness_session_id") == entry["harness_session_id"]
-               and row.get("org_id") == org_id for row in sessions):
+    existing = next((row for row in sessions if row.get("harness_session_id") == entry["harness_session_id"]
+                     and row.get("org_id") == org_id), None)
+    if existing is None:
         sessions.append(entry)
+    else:
+        existing["captured"] = bool(existing.get("captured")) or bool(captured)
+        entry = existing
     manifest["sessions"] = sessions
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -412,8 +422,16 @@ def run_live(args, report, model):
         deadline = time.monotonic() + (240 if sid else 0)
         while time.monotonic() < deadline and not capture_ok(root, args.host, started, sid):
             time.sleep(1)
-        report.check("capture_acknowledged", lambda: require(sid and capture_ok(root, args.host, started, sid),
+        captured = report.check("capture_acknowledged", lambda: require(sid and capture_ok(root, args.host, started, sid),
             "native capture never recorded a fresh successful production acknowledgement"))
+        if captured is not None and args.session_manifest and "sid" in recorded:
+            # Every flush for this session is acknowledged and the host is
+            # gone, so nothing can land late: tell cleanup a "gone" answer is
+            # final. Best effort — a failed mark only costs cleanup a wait.
+            try:
+                record_session(args.session_manifest, host=args.host, sid=sid, org_id=fixture["org_id"], captured=True)
+            except Exception:
+                pass
 
 
 def upgrade_notice_evidence(answer, server_contacted):

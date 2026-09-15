@@ -161,9 +161,15 @@ artifact, one line in the job summary, and a warning annotation on failure. It i
 `continue-on-error` while production has not yet deployed the backend half of
 [ENG-1074](https://linear.app/xtrace/issue/ENG-1074/accept-personal-access-tokens-for-owner-scoped-session-deletion-and)
 (MemHub-Backend #1310, on staging); until then every run reports `unauthorized`.
-A `recreated` outcome means a capture flush landed after the harness exited and
-re-created the session between the delete and its verification; it is deleted
-again and counted as a failure so the race is visible.
+The capture hooks are asynchronous, so a run that died after announcing its
+session may still have a flush in flight when cleanup runs. The manifest records
+whether the run saw every flush acknowledged (`captured`); for a session it did
+not, cleanup re-checks "gone" once after a bounded wait and deletes whatever
+landed in between, reporting it as `deleted` with `late_capture`. A `recreated`
+outcome means the session came back after a verified delete; it is deleted again
+and counted as a failure so the race is visible. The agent check carries its own
+step timeout inside a larger job cap, so a run that exhausts its budget ends the
+step — not the job — and the cleanup step still runs.
 
 Codex rule-fire linkage in the session UI is also deferred under
 [ENG-1075](https://linear.app/xtrace/issue/ENG-1075/codex-rule-fires-are-not-linked-to-captured-sessions-because-session).

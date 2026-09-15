@@ -228,6 +228,14 @@ class ReleaseChecksTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 agent.record_session(manifest, host="codex", sid=SID, org_id="not-an-org")
             self.assertEqual(len(json.loads(manifest.read_text())["sessions"]), 3)
+            # `captured` starts off, turns on when the acknowledgement is seen,
+            # and never turns back off — a later plain re-record keeps it.
+            self.assertEqual([r["captured"] for r in rows], [False, False, False])
+            agent.record_session(manifest, host="codex", sid=SID, org_id=SID, captured=True)
+            agent.record_session(manifest, host="codex", sid=SID, org_id=SID)
+            rows = json.loads(manifest.read_text())["sessions"]
+            self.assertEqual([r["captured"] for r in rows], [True, False, False])
+            self.assertEqual(len(rows), 3)
 
     def test_identity_streams_out_before_the_host_fails(self):
         """A host that announces its session and then exits nonzero, or hangs
