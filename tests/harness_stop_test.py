@@ -197,6 +197,13 @@ def test_a_failure_and_its_fix_are_one_moment_taken_at_the_boundary():
         # the router sees the arc on a turn whose transcript shows no error
         hits = hx.route({"n": 1, "user": "ok", "asst": "done", "tools": [], "results": []}, None, arcs=arcs)
         assert dict(hits)["error_arc"] == "missing-module"
+        # a blocked continuation's arcs are drained at its own Stop, which spawns
+        # nothing: the next ordinary turn must not inherit them (Codex, #230)
+        _post(repo, "arc", "make y", {"stdout": "", "stderr": "E boom", "exit_code": 1})
+        _post(repo, "arc", "make y", {"stdout": "ok", "exit_code": 0})
+        assert _spawns(lambda: hs.cmd_stop({"session_id": "arc", "transcript_path": str(tp),
+                                            "stop_hook_active": True})) == []
+        assert rh.take_error_arcs("arc") == [], "the continuation's arcs were drained"
         # with the flag off the hook records nothing
         os.environ["MEMHUB_HARNESS_EXTRACT"] = "0"
         _post(repo, "off", "pytest", {"stdout": "", "stderr": "E", "exit_code": 1})
@@ -519,11 +526,15 @@ def test_a_recorded_block_is_not_a_turn():
                  "message": {"content": f"Stop hook feedback:\n{reason}"}},
                 {"type": "assistant", "message": {"content": [
                     {"type": "text", "text": "No rule from turn 1: project state"}]}},
-                {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}}]
+                {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}},
+                # a person may TYPE those words; without isMeta it is their turn (Codex, #230)
+                {"type": "user", "uuid": "u3",
+                 "message": {"content": "Stop hook feedback: why did it block me?"}}]
         tp.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
         turns = hx.turns_from_transcript(tp)
-        assert [t["user"] for t in turns] == ["fix the deploy", "now the tests"], turns
-        assert [t["n"] for t in turns] == [1, 2]
+        assert [t["user"] for t in turns] == ["fix the deploy", "now the tests",
+                                              "Stop hook feedback: why did it block me?"], turns
+        assert [t["n"] for t in turns] == [1, 2, 3]
     print("PASS test_a_recorded_block_is_not_a_turn")
 
 

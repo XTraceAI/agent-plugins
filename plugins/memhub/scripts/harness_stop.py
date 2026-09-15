@@ -199,7 +199,19 @@ def cmd_stop(payload: dict) -> int:
     cwd = str(payload.get("cwd") or "").strip()
     if not session or not transcript or not os.path.isfile(transcript):
         return 0
-    if payload.get("stop_hook_active") or _is_subagent(payload):
+    if _is_subagent(payload):
+        return 0
+    if payload.get("stop_hook_active"):
+        # The blocked continuation's own Stop: no extraction and no second
+        # block, but its error arcs (the create-rule flow runs commands) are
+        # drained here, or the next ordinary turn would inherit them and be
+        # classified on failures it never had (Codex, #230).
+        rh = hx._hook()
+        if rh is not None and hasattr(rh, "take_error_arcs"):
+            try:
+                rh.take_error_arcs(session)
+            except Exception:
+                pass
         return 0
     args = ["extract", "--session", session, "--transcript", transcript, "--cwd", cwd]
     # The transcript's size NOW is the turn boundary, taken inside the

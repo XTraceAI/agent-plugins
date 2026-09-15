@@ -153,10 +153,11 @@ _HARNESS_PREFIX = (
     "Skill /",
     "This session is being continued from a previous conversation",
     "[Request interrupted by user",
-    # a blocked Stop's reason, recorded as an isMeta `user` record (verified on
-    # Claude Code 2.1.270): the harness's own handoff, never the person
-    "Stop hook feedback:",
 )
+# A blocked Stop's reason, recorded as an `isMeta` user record (verified on
+# Claude Code 2.1.270). Matched on the flag AND the text, never the text alone:
+# a person can type a prompt that starts with these words (Codex, #230).
+STOP_FEEDBACK_PREFIX = "Stop hook feedback:"
 # Named wrappers only. A person's prompt can begin with pasted HTML or a
 # Markdown heading, and dropping it would attribute that turn's actions to the
 # turn before.
@@ -247,6 +248,8 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                         })
                     continue
                 txt = _SYS_BLOCK.sub("", _text_of(content)).strip()
+                if rec.get("isMeta") and txt.startswith(STOP_FEEDBACK_PREFIX):
+                    continue
                 if is_harness_text(txt):
                     continue
                 cur = {"n": before + len(turns) + 1, "user": txt, "tools": [], "results": [],
