@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell)$",
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command)$",
         "hooks": [
           {
             "type": "command",
@@ -16,7 +16,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$",
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command|mcp__.*[Gg]it[Hh]ub.*__.*)$",
         "hooks": [
           {
             "type": "command",

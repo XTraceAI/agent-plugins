@@ -1,22 +1,7 @@
-"""Every memhub manifest must declare the SAME version — across every host.
+"""Production MemHub manifests must declare the same version across hosts.
 
-`memhub-staging` shares its scripts, hooks and skills with `memhub` by symlink,
-so the code genuinely never drifts. The VERSION does — and that is what gates
-delivery: the plugin cache is keyed by version on Claude
-(`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`) AND on Codex
-(`~/.codex/plugins/cache/...`), so a manifest that still reads an old number is
-never re-fetched. `/plugin update` reports success and installs nothing.
-
-That happened: prod was bumped for a release and staging was not, so everyone on
-the staging build silently stayed on code from several releases earlier while
-believing they were current. Shared code, unshared version number, no error
-anywhere.
-
-Multi-host raises the stakes: `memhub` now carries FIVE version-bearing
-manifests (the Agent Plugins 1.0 root manifest, the Claude/Codex/Cursor native
-manifests, and staging's Claude manifest). On the unpinned channels (Codex,
-Cursor) a version bump reaching `main` IS the release, so a straggler manifest
-is a straggler *channel*.
+Staging has a separate release cadence; its manifest is validated independently
+so a production release cannot implicitly publish a staging version.
 
 The MCP endpoint must agree too: `mcp.json` (Agent Plugins — read by Codex,
 Cursor, and every other AP client) and `.mcp.json` (Claude) both name the
@@ -45,7 +30,6 @@ MANIFESTS = {
     "memhub (claude)": MEMHUB / ".claude-plugin" / "plugin.json",
     "memhub (codex)": MEMHUB / ".codex-plugin" / "plugin.json",
     "memhub (cursor)": MEMHUB / ".cursor-plugin" / "plugin.json",
-    "memhub-staging (claude)": ROOT / "plugins" / "memhub-staging" / ".claude-plugin" / "plugin.json",
 }
 AP_SCHEMA_PREFIX = "https://agent-plugins.org/schemas/"
 MCP_AP = MEMHUB / "mcp.json"          # Agent Plugins format (Codex, Cursor, …)
@@ -90,7 +74,12 @@ def main() -> int:
               "     unpinned channels the bump itself is the release.\n"
               "     Bump ALL manifests together.")
         return 1
-    print("\nok  all manifests declare the same version")
+    print("\nok  all production manifests declare the same version")
+    # Staging is released separately. Do not advance its version as a side
+    # effect of a production release, but still validate its manifest JSON.
+    staging_manifest = _load(ROOT / "plugins/memhub-staging/.claude-plugin/plugin.json")
+    if staging_manifest is None or not staging_manifest.get("version"):
+        return 1
 
     ap_root = _load(MEMHUB / "plugin.json")
     ap_mcp = _load(MCP_AP)

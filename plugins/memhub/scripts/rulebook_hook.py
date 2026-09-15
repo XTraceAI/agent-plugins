@@ -2075,7 +2075,7 @@ def to_hook_rule(row):
 def load_rules(repo):
     """The cached server book as hook rules. Returns (rules, "", fetched_at,
     sources) — sources maps rule id → "server" (kept for the audit file)."""
-    book = load_book(repo)
+    book = None if upgrade_status(repo) else load_book(repo)
     rules, sources = [], {}
     for row in (book or {}).get("rules", []):
         r = to_hook_rule(row)
@@ -2178,6 +2178,59 @@ def _api():
     return pak.api_base(url), bearer, mcp_http
 
 
+def _upgrade_scope(api):
+    base, bearer, _ = api
+    return hashlib.sha256((base + "\0" + bearer).encode()).hexdigest()
+
+
+def upgrade_status(repo):
+    try:
+        with open(book_path(repo) + ".upgrade", encoding="utf-8") as f:
+            notice = json.load(f)
+        api = _api()
+        if (api and notice.get("scope") == _upgrade_scope(api)
+                and re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}",
+                                 notice.get("minimum_version", ""))):
+            return notice
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _clear_upgrade(repo):
+    try:
+        os.unlink(book_path(repo) + ".upgrade")
+    except FileNotFoundError:
+        pass
+
+
+def show_upgrade(repo, session, event):
+    notice = upgrade_status(repo)
+    if not notice:
+        return False
+    # A known rejection suspends cached rules; it never denies unrelated tools.
+    # Bound repeated context to once per session/policy/installed version.
+    version = hook_version()
+    key = [notice["scope"], notice["minimum_version"], list(version or ())]
+    seen_path = book_path(repo) + ".notice-" + hashlib.sha256(str(session).encode()).hexdigest()[:16]
+    seen = None
+    try:
+        with open(seen_path, encoding="utf-8") as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if event == "SessionStart" or seen != key:
+        current = ".".join(map(str, version)) if version else "unknown"
+        text = (f"PLUGIN_UPGRADE_REQUIRED: MemHub plugin {current} is unsupported. "
+                f"Update MemHub to {notice['minimum_version']} or newer using your host's "
+                "plugin manager, then restart this agent session. Rulebook synchronization "
+                "is unavailable and cached rules are suspended until a successful refresh. "
+                "Tell the user this upgrade is required; do not report the cached rules as current.")
+        emit(event, text, user_line=text)
+        _atomic_json(seen_path, key)
+    return True
+
+
 def fetch_book(repo, timeout=None):
     """GET /rules?repo=<repo>&view=hook with If-None-Match.
 
@@ -2199,8 +2252,9 @@ def fetch_book(repo, timeout=None):
     installed has to be the server serving them an advice-only representation,
     and it cannot do that without being told who is asking. An older hook
     sends no version, which is itself the signal that it predates the field.
-    Unknown query parameters are ignored by every backend this has run
-    against, so sending it costs nothing while the server side is unbuilt."""
+    The shared backend contract verifies support for this query field.
+    A structured 426 suspends cached rules and records an agent-visible upgrade
+    notice. Only a subsequent valid 200/304 response clears that notice."""
     api = _api()
     if not api:
         return
@@ -2214,15 +2268,21 @@ def fetch_book(repo, timeout=None):
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", headers=hdrs,
                           timeout=timeout or FETCH_TIMEOUT_S)
-    except Exception as exc:          # keep the cache; say so where an operator can look
+    except Exception as exc:          # keep cache bytes, but never hide a policy rejection
+        if isinstance(exc, getattr(http, "PluginUpgradeRequired", ())):
+            _atomic_json(book_path(repo) + ".upgrade", {
+                "scope": _upgrade_scope(api), "minimum_version": exc.minimum_version,
+            })
         _breadcrumb("fetch", exc)
         return
     if reply.status == 304 and old:
+        _clear_upgrade(repo)
         _atomic_json(book_path(repo), dict(old, fetched_at=_now()))
     elif reply.status == 200 and isinstance(reply.data, dict) \
             and isinstance(reply.data.get("rules"), list):
         _atomic_json(book_path(repo), {"etag": reply.etag, "fetched_at": _now(),
                                        "rules": reply.data["rules"]})
+        _clear_upgrade(repo)
     else:                             # a 2xx with the wrong shape is a failure too — say so
         _breadcrumb("fetch", f"HTTP {reply.status}: unexpected reply shape")
 
@@ -3673,6 +3733,9 @@ def refresh_if_stale(repo, rules, fetched_at, sources):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
+    codex_pre = mode == "codex-pre"
+    if codex_pre:
+        mode = "pre"
     if mode == "fetch" and len(sys.argv) > 2:      # detached child: repo on argv
         fetch_book(sys.argv[2])
         return 0
@@ -3710,7 +3773,16 @@ def main():
     if mode == "fetch":
         fetch_book(repo)
         return 0
+    if mode == "upgrade":
+        book = load_book(repo) or {}
+        maybe_refresh(repo, None if upgrade_status(repo) else book.get("fetched_at"))
+        show_upgrade(repo, session, "PreToolUse")
+        return 0
     rules, rule_version, fetched_at, sources = load_rules(repo)
+    # The three-handler Codex bridge has no SessionStart fetch. Refresh before
+    # its first/stale pre-call so a cold install cannot silently miss a gate.
+    if codex_pre and _age_s(fetched_at) >= REFRESH_AFTER_S:
+        rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
@@ -3766,11 +3838,15 @@ def main():
             _atomic_json(book_path(repo) + ".sources", {"at": _now(), "sources": sources})
         except Exception:
             pass
+        if show_upgrade(repo, session, "SessionStart"):
+            return 0
         session_digest(rules, repo, gitdir, ctx)
         arm_obligations(rules, repo, gitdir, session, "session")
         return 0
     if mode == "pre":
         maybe_refresh(repo, fetched_at)
+    if show_upgrade(repo, session, "PreToolUse" if mode == "pre" else "PostToolUse"):
+        return 0
 
     inp = data.get("tool_input") or {}
     sp = state_path(session)

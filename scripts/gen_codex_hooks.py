@@ -46,7 +46,7 @@ _WINDOWS_DISPATCH = (
     'else if defined CLAUDE_PLUGIN_ROOT '
     '(py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py" dispatch {event})'
 )
-_ALL_TOOLS = "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell)$"
+_ALL_TOOLS = "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command)$"
 # PostToolUse also carries the PR-link check, which fires on GitHub MCP tool
 # calls as well as shell ones. The SERVER segment must name GitHub — the same
 # anchor pr_link.py uses — so a tool called `mcp__notes__github_summary` never
@@ -57,7 +57,7 @@ _ALL_TOOLS = "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_s
 # already trusted in ~/.codex/hooks.json, and widening it would cost a
 # re-trust for a detection they can do with /memhub:link-pr.
 _POST_TOOLS = ("^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|"
-               "local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$")
+               "local_shell|exec_command|shell_command|mcp__.*[Gg]it[Hh]ub.*__.*)$")
 
 
 # Claude-only capture scripts: they read Claude's transcript store and must

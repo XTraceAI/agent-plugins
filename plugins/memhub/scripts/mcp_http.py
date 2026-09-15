@@ -38,6 +38,7 @@ Run the self-test:  python3 tests/mcp_http_test.py
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,6 +60,16 @@ class McpError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+class PluginUpgradeRequired(McpError):
+    """Structured rulebook policy rejection; safe fields only, no raw body."""
+
+    def __init__(self, minimum_version: str):
+        self.minimum_version = minimum_version
+        super().__init__(
+            f"PLUGIN_UPGRADE_REQUIRED: Update the MemHub plugin to {minimum_version} "
+            "or newer and restart your agent session.", 426)
 
 
 class McpNoResponse(McpError):
@@ -333,7 +344,19 @@ def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
     except urllib.error.HTTPError as exc:
         if exc.code == 304:
             return RestReply(304, exc.headers.get("ETag"), None)
-        detail = (exc.read() or b"").decode("utf-8", errors="replace")[:200]
+        raw_error = exc.read(16384)
+        exc.close()
+        if exc.code == 426:
+            try:
+                policy = json.loads(raw_error).get("data", {})
+                minimum = policy.get("minimum_version")
+                if (policy.get("error_code") == "PLUGIN_UPGRADE_REQUIRED"
+                        and isinstance(minimum, str)
+                        and re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", minimum)):
+                    raise PluginUpgradeRequired(minimum) from exc
+            except (ValueError, AttributeError, TypeError):
+                pass
+        detail = raw_error.decode("utf-8", errors="replace")[:200]
         if exc.code == 429:
             raw_ra = exc.headers.get("Retry-After")
             try:
