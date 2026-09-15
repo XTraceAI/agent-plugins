@@ -65,17 +65,17 @@ class ProductionGateTests(unittest.TestCase):
             raise urllib.error.URLError("private detail")
         if conditional and self.mode != "always_200":
             raise urllib.error.HTTPError(request.full_url, 304, "fixture", {"ETag": '"fixture"'}, io.BytesIO())
-        rules = [dict(r) for r in FIXTURE["rules"]]
+        # Shaped like the real hook view: the server names a rule `rule_id`. A fake
+        # that echoed the fixture's `id` key hid a KeyError that failed every live run.
+        rules = [{"rule_id": r["id"], "mode": r["mode"]} for r in FIXTURE["rules"]]
         if self.mode == "empty":
             rules = []
         if self.mode == "wrong_mode":
             rules[0]["mode"] = "advise"
         if self.mode == "wrong_org":
-            rules[0]["id"] = "33333333-3333-4333-8333-333333333333"
-        # Production caches the API's rule_id, before hook engine normalization.
-        if self.mode != "legacy_id":
-            for rule in rules:
-                rule["rule_id"] = rule.pop("id")
+            rules[0]["rule_id"] = "33333333-3333-4333-8333-333333333333"
+        if self.mode == "id_keyed_rows":
+            rules = [{"id": r["id"], "mode": r["mode"]} for r in FIXTURE["rules"]]
         payload = {"code": 0, "data": {"rules": rules}}
         if self.mode == "bad_envelope":
             payload["code"] = 1
@@ -97,16 +97,12 @@ class ProductionGateTests(unittest.TestCase):
         self.assertNotIn(FIXTURE["org_id"], json.dumps(result))
 
     def test_http_success_alone_cannot_pass(self):
-        for mode in ("empty", "wrong_mode", "wrong_org", "bad_envelope", "bad_shape", "no_etag", "always_200",
-                     "401", "400", "426", "500", "302", "offline"):
+        for mode in ("empty", "wrong_mode", "wrong_org", "id_keyed_rows", "bad_envelope", "bad_shape", "no_etag",
+                     "always_200", "401", "400", "426", "500", "302", "offline"):
             with self.subTest(mode=mode):
                 self.mode = mode
                 with self.assertRaises(gate.GateError):
                     self.run_probe()
-
-    def test_legacy_id_field(self):
-        self.mode = "legacy_id"
-        self.assertTrue(self.run_probe()["ok"])
 
     def test_no_credentials_or_version_override(self):
         with self.assertRaises(gate.GateError):
