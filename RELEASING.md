@@ -57,13 +57,14 @@ both the main package and the separately pinned Claude package.
    cd /tmp/rel && uv run --with 'mcp<2' python tests/run_all.py
    ```
 
-2. **Merge the release PR bumping ALL manifests in lockstep**
+2. **Merge the release PR bumping all production manifests in lockstep**
    (`tests/version_parity_test.py` enforces):
    - `plugins/memhub/plugin.json` (Agent Plugins 1.0 root)
    - `plugins/memhub/.claude-plugin/plugin.json`
    - `plugins/memhub/.codex-plugin/plugin.json`
    - `plugins/memhub/.cursor-plugin/plugin.json`
-   - `plugins/memhub-staging/.claude-plugin/plugin.json`
+
+   Staging is released separately. Leave its manifest unchanged during a production-only release.
 
    Claude AND Codex key install caches by version — no bump, no delivery.
    The moment this merges, Cursor and Codex are live.
