@@ -2530,6 +2530,80 @@ def pending_batches(sent, ledger=LEDGERS[0]):
     return batches, new_sent
 
 
+# What a hook before v0.59 left behind: `conversions.jsonl`, one verdict per
+# line ({fire_id, converted, converted_at, how, override_reason?}), shipped by
+# re-sending the fire row with the verdict merged. Rows past the old
+# `conversions_offset` were recorded — offline, or held by the throttle — and
+# never posted; abandoning them would leave their fires unresolved on the
+# server for good (Codex, #240). They are drained once, the old way: the
+# server still takes a verdict on POST /fires (as a lowest-precedence
+# `client_verdict`, rule-fire-events-spec §5). Nothing writes this file any
+# more, so the drain ends when the offset reaches its end.
+LEGACY_CONVERSIONS = ("conversions.jsonl", "conversions_offset", "/fires", "fires", "fire_id", None)
+
+
+def legacy_verdict_batches(sent):
+    """Unsent pre-v0.59 verdicts as fire rows with `converted` /
+    `converted_at` / `override_reason` merged — `(batches, new_sent)` in the
+    shape of :func:`pending_batches`. A verdict whose fire is not in the
+    fires ledger cannot be posted and is passed by; the fires ledger is
+    scanned once for the ids named, bounded by the number of unsent rows."""
+    ldir = _ledger_dir()
+    cpath = os.path.join(ldir, "conversions.jsonl")
+    if not os.path.isfile(cpath):
+        return [], sent
+    offsets = []
+    convs, end = _read_rows(cpath, sent.get("conversions_offset", 0), offsets)
+    new_sent = dict(sent, conversions_offset=end)
+    wanted = {c.get("fire_id") for c in convs if isinstance(c, dict) and c.get("fire_id")}
+    by_id = {}
+    if wanted:
+        try:
+            with open(os.path.join(ldir, "fires.jsonl"), "rb") as f:
+                for line in f:
+                    if not line.endswith(b"\n"):
+                        break
+                    try:
+                        r = json.loads(line.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(r, dict) and r.get("fire_id") in wanted:
+                        by_id[r["fire_id"]] = r
+                        wanted.discard(r["fire_id"])
+                        if not wanted:
+                            break
+        except FileNotFoundError:
+            pass
+    items, seen = [], {}
+    for c, off in zip(convs, offsets):
+        fid = c.get("fire_id") if isinstance(c, dict) else None
+        if fid not in by_id:
+            continue
+        row = seen.get(fid)
+        if row is None:
+            row = dict(wire_row(by_id[fid]), converted=None, converted_at=None)
+            seen[fid] = row
+            items.append((row, off))
+        # the old sidecar's own merge: a true is never downgraded by a false
+        if c.get("converted"):
+            row["converted"], row["converted_at"] = True, c.get("converted_at")
+        elif c.get("converted") is False and row.get("converted") is None:
+            row["converted"], row["converted_at"] = False, c.get("converted_at")
+        if c.get("override_reason") and not row.get("override_reason"):
+            row["override_reason"] = c["override_reason"]
+    batches = []
+    for i in range(0, len(items), FLUSH_BATCH):
+        chunk = items[i:i + FLUSH_BATCH]
+        last = i + FLUSH_BATCH >= len(items)
+        batches.append(([r for r, _ in chunk],
+                        dict(sent, conversions_offset=end if last else chunk[-1][1])))
+    if not items:
+        # nothing postable past the watermark: advance it, or an orphan row
+        # would be re-read on every flush forever
+        return [([], new_sent)] if convs else [], new_sent
+    return batches, new_sent
+
+
 def _log_rejected(rejected, batch, idkey="fire_id"):
     """Per-row rejections are logged as given; a bare count (the §4.3 example
     shape) is logged with the batch's ids so the loss is visible even
@@ -2569,6 +2643,15 @@ def flush_fires(final=False):
     try:
         sent = load_sent()
         plan = [(ledger, pending_batches(sent, ledger)[0]) for ledger in LEDGERS]
+        legacy, legacy_sent = legacy_verdict_batches(sent)
+        if legacy and not any(b for b, _ in legacy):
+            # only orphans past the old watermark: retire them without a POST
+            _atomic_json(_sent_path(), dict(load_sent(), conversions_offset=legacy_sent["conversions_offset"]))
+            legacy = []
+        if legacy:
+            # after the fires (their rows must be there for the verdict to
+            # land on), before the events
+            plan.insert(1, (LEGACY_CONVERSIONS, legacy))
         n = sum(len(b) for _, batches in plan for b, _ in batches)
         if not n:
             return
@@ -3598,6 +3681,22 @@ def split_named_override(reason):
     return m.group(1).strip().lower(), m.group(2).strip()
 
 
+def named_rules(label, rules, pool=None):
+    """The rules `label` addresses among `pool` (default: the whole book).
+
+    An exact rule id anywhere in the book wins outright: when `label` IS a
+    rule's id, only that rule is meant — even on a call where some OTHER
+    rule's displayed title happens to be the same word, and even when that
+    rule is the one firing right now. Only a label that is nobody's id is
+    matched by title. One statement of it, used by the gate excuse, the
+    same-call dismissal and the later dismissal alike, so `[<rule id>]`
+    always means the same rule (Codex, #240)."""
+    pool = rules if pool is None else pool
+    if any(str(r["id"]).lower() == label for r in rules):
+        return [r for r in pool if str(r["id"]).lower() == label]
+    return [r for r in pool if str(r.get("_label") or r["id"]).lower() == label]
+
+
 def resolve_dismissals(rules, dismissals):
     """Each `{label: why}` → the ONE rule it names, for a `dismissed` event.
     Returns `(resolved, ambiguous)`: `[(rule, why)]` and `[(label, n)]`.
@@ -3614,8 +3713,7 @@ def resolve_dismissals(rules, dismissals):
     for label, why in dismissals.items():
         if not label or not why:
             continue
-        hits = [r for r in rules if str(r["id"]).lower() == label] \
-            or [r for r in rules if str(r.get("_label") or r["id"]).lower() == label]
+        hits = named_rules(label, rules)
         if len(hits) > 1:
             ambiguous.append((label, len(hits)))
         elif hits:
@@ -4243,8 +4341,7 @@ def main():
     ambiguous_gate = None                # (label, n) when a named excuse fit n gates
 
     def _named_gates(label):
-        by_id = [r for r in gates_here if str(r["id"]).lower() == label]
-        return by_id or [r for r in gates_here if _label_of(r) == label]
+        return named_rules(label, rules, gates_here)
 
     if override_reason is not None and override_label is None:
         overridden = {r["id"]: override_reason for r in gates_here}
@@ -4294,17 +4391,14 @@ def main():
     # below, a cut one with no outcome to give — never also as a dismissal
     # of the rule's earlier fires, which the event at the fire's instant
     # already answers server-side.
-    if override_label is not None and any(
-            override_label in (str(r["id"]).lower(), _label_of(r)) for r in fired_now):
+    if override_label is not None and named_rules(override_label, rules, fired_now):
         dismissals.pop(override_label, None)
     set_aside, ambiguous = _dismiss(dismissals)
     same_call = {}
-    gate_took_it = any(override_label in (str(r["id"]).lower(), _label_of(r))
-                       for r in gates if r["id"] in overridden) if override_label else False
+    gate_took_it = any(r["id"] in overridden
+                       for r in named_rules(override_label, rules, gates)) if override_label else False
     if override_label is not None and not gate_took_it:
-        shown_advisories = [r for r in shown if r["id"] not in gate_ids]
-        here = [r for r in shown_advisories if str(r["id"]).lower() == override_label] \
-            or [r for r in shown_advisories if _label_of(r) == override_label]
+        here = named_rules(override_label, rules, [r for r in shown if r["id"] not in gate_ids])
         if len(here) == 1:
             same_call[here[0]["id"]] = override_reason
             ack = (here[0].get("_label") or here[0]["id"], override_reason)

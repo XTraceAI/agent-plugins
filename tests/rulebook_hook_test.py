@@ -2715,6 +2715,9 @@ def min_hook_version_checks() -> None:
              "fire_scope": "session", "repo_scope": "any", "text": "wget (rule id alias)", "why": "w"},
             {"id": "other", "_label": "alias", "on": "bash", "rx": r"\bwget\b",
              "fire_scope": "session", "repo_scope": "any", "text": "wget (label alias)", "why": "w"},
+            # …and a THIRD rule whose displayed label is that same id, firing elsewhere
+            {"id": "other2", "_label": "alias", "on": "bash", "rx": r"\bfetch-x\b",
+             "fire_scope": "session", "repo_scope": "any", "text": "fetch-x (label alias)", "why": "w"},
             # an ADVISORY that shares its label with the push GATE
             {"id": "push-adv", "_label": "push-gate", "on": "bash", "rx": r"git\s+push\s+--force",
              "fire_scope": "session", "repo_scope": "any", "text": "Tell the team before a force push", "why": "w"},
@@ -2932,6 +2935,11 @@ def min_hook_version_checks() -> None:
         d = events("o22", "dismissed", "nosig-call")
         check("outcomes: a re-fire on the override call: one dismissed event at the new fire's instant answers both fires server-side",
               len(d) == 1 and d[0]["at"] == c2["fired_at"] and ctx(out).count("set aside") == 1, out + str(d))
+        bash("o26", "wget https://x")                       # rule `alias` (id) fired earlier
+        rc, out = bash("o26", "RULEBOOK_OVERRIDE='[alias] by id' fetch-x")   # a rule LABELLED alias fires now
+        check("outcomes: an exact rule id names that rule even when another rule with that TITLE fires on this call",
+              len(events("o26", "dismissed", "alias")) == 1 and not events("o26", "dismissed", "other2")
+              and fire_id("o26", "other2") is not None and "[alias-x] set aside" in ctx(out), out)
         bash("o18", "sudo ls")
         run("pre", {"cwd": orepo, "session_id": "o18", "tool_name": "Write",
                     "tool_input": {"file_path": os.path.join(orepo, "notes.md"),
@@ -3009,6 +3017,30 @@ def min_hook_version_checks() -> None:
                   and es["events_offset"] > 0 and es["fires_offset"] == 0, str((fs, es)))
             check("outcomes: the fires ledger ships first, then events",
                   H.LEDGERS[0][2] == "/fires" and H.LEDGERS[1][2] == "/fire-events")
+            # 10. upgrade: verdicts a pre-v0.59 hook recorded but never flushed
+            #     are drained once, the old way — fire row + verdict to /fires
+            cpath = os.path.join(td, "ledger", "conversions.jsonl")
+            with open(cpath, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"fire_id": f1["fire_id"], "converted": False, "converted_at": "2026-09-16T10:00:00+00:00",
+                                    "how": "dismissed", "override_reason": "old hook said so"}) + "\n")
+                f.write(json.dumps({"fire_id": f1["fire_id"], "converted": True, "converted_at": "2026-09-16T10:01:00+00:00",
+                                    "how": "converted_rx"}) + "\n")
+                f.write(json.dumps({"fire_id": "never-in-the-ledger", "converted": True,
+                                    "converted_at": "2026-09-16T10:02:00+00:00", "how": "x"}) + "\n")
+            lb, ls = H.legacy_verdict_batches({"fires_offset": 0, "events_offset": 0})
+            rows = [r for b, _ in lb for r in b]
+            check("outcomes: legacy verdicts re-send their fire with the old sidecar's merge (true never downgraded)",
+                  len(rows) == 1 and rows[0]["fire_id"] == f1["fire_id"] and rows[0]["converted"] is True
+                  and rows[0]["converted_at"] == "2026-09-16T10:01:00+00:00"
+                  and rows[0]["override_reason"] == "old hook said so" and rows[0]["worktree"] == WT, str(rows))
+            check("outcomes: …behind the old conversions watermark, which reaches the file's end",
+                  ls["conversions_offset"] == os.path.getsize(cpath) and lb[-1][1]["conversions_offset"] == ls["conversions_offset"])
+            drained, _ = H.legacy_verdict_batches(ls)
+            check("outcomes: a drained legacy ledger yields nothing", drained == [])
+            orphan_only, os_ = H.legacy_verdict_batches({"conversions_offset": lb[-1][1]["conversions_offset"] - 1 - len(
+                json.dumps({"fire_id": "never-in-the-ledger", "converted": True, "converted_at": "2026-09-16T10:02:00+00:00", "how": "x"}))})
+            check("outcomes: orphans past the watermark are retired, not re-read forever",
+                  orphan_only == [([], os_)] and os_["conversions_offset"] == os.path.getsize(cpath), str(orphan_only))
         finally:
             H.BASE = old_base
 
