@@ -74,11 +74,39 @@ def plan(items, headers):
     return segments[root][0], revision, header, [(rid, *segments[rid]) for rid in ordered]
 
 
+def context_boundary(rows):
+    boundary = rows[0]['payload'].get('subagent_history_start_ordinal')
+    if boundary is not None and (type(boundary) is not int or boundary < 0
+                                 or boundary > rows[-1]['ordinal'] + 1):
+        raise ValueError('invalid or incomplete subagent context boundary')
+    return boundary
+
+
+def project_context(rows, records, sources, convert):
+    """Retain legacy IDs while projecting inherited context out of child work."""
+    boundary = context_boundary(rows)
+    if boundary is None or boundary <= rows[0]['ordinal'] + 1:
+        return rows, records, None, []
+    projected = [rows[0], *[{'type': 'inherited_context'} if row['ordinal'] < boundary else row
+                           for row in rows[1:]]]
+    identities = {sources[id(record)]: record['uuid'] for record in records}
+    context = [record for record in records if rows[sources[id(record)]]['ordinal'] < boundary]
+    own, meta = convert(projected)
+    for record in own:
+        if sources[id(record)] in identities:
+            record['uuid'] = identities[sources[id(record)]]
+    for record in context:
+        record['isMeta'] = True
+        record['message'].pop('usage', None)
+    return projected, own, meta, context
+
+
 def prefix_usage(path, cutoff, ordinal, inherited):
     """Read the referenced prefix's cumulative counters, proving its boundary."""
     previous = inherited
     offset = 0
     next_ordinal = None
+    owned_from = 0
     with path.open('rb') as source:
         while offset < cutoff:
             raw = source.readline()
@@ -89,9 +117,11 @@ def prefix_usage(path, cutoff, ordinal, inherited):
             current = row.get('ordinal') if isinstance(row, dict) else None
             if type(current) is not int or (next_ordinal is not None and current != next_ordinal):
                 raise ValueError('history ordinal gap')
+            if next_ordinal is None:
+                owned_from = row.get('payload', {}).get('subagent_history_start_ordinal') or 0
             next_ordinal = current + 1
             payload = row.get('payload')
-            if row.get('type') == 'event_msg' and isinstance(payload, dict) and payload.get('type') == 'token_count':
+            if current >= owned_from and row.get('type') == 'event_msg' and isinstance(payload, dict) and payload.get('type') == 'token_count':
                 info = payload.get('info')
                 total = codex._usage_total(info.get('total_token_usage') if isinstance(info, dict) else None)
                 if total is not None and (previous is None or all(total[k] >= previous[k] for k in total)):
@@ -126,18 +156,27 @@ def read(group, snapshot, *, title_index=None):
                 raise ValueError('history header changed since discovery')
             start = 0 if base is None else base['end_ordinal_exclusive']
             for i, row in enumerate(rows):
-                if (i and row.get('type') == 'session_meta') or type(row.get('ordinal')) is not int or row['ordinal'] != start + i:
+                if type(row.get('ordinal')) is not int or row['ordinal'] != start + i:
                     raise ValueError('rollout has missing or inconsistent ordinals')
+            boundary = context_boundary(rows)
+            if any(row.get('type') == 'session_meta' and
+                   (boundary is None or row['ordinal'] >= boundary) for row in rows[1:]):
+                raise ValueError('session metadata outside inherited context')
             record_sources, usage_targets = {}, {}
             namespace = rid if base is None else f"{session_id}:rollout:{rid}"
-            converted, meta = codex.rollout_to_claude_records(
-                rows, strict=True, title_index={},
-                identity_namespace=namespace,
-                initial_usage_total=seed,
-                usage_baseline_unknown=base is not None and seed is None,
-                record_sources=record_sources, usage_targets=usage_targets)
+            def convert(items):
+                usage_targets.clear()
+                return codex.rollout_to_claude_records(
+                    items, strict=True, title_index={}, identity_namespace=namespace,
+                    initial_usage_total=seed,
+                    usage_baseline_unknown=base is not None and seed is None,
+                    record_sources=record_sources, usage_targets=usage_targets)
+            converted, meta = convert(rows)
+            rows, converted, own_meta, context = project_context(rows, converted, record_sources, convert)
+            meta = own_meta or meta
             converted = codex_usage.apply(rows, converted, record_sources, usage_targets,
                 session_id=session_id, namespace=namespace, seen=seen_responses)
+            records.extend(context)
             records.extend(converted)
             native_title = codex._rollout_thread_name(rows, strict=True) or native_title
             if first_meta is None:

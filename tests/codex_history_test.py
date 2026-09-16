@@ -288,6 +288,68 @@ def test_first_ledger_without_output_does_not_charge_an_older_thinking_block():
         assert sum(sum(r['message'].get('usage', {}).values()) for r in records[1:]) == 15
 
 
+def test_subagent_context_is_metadata_and_own_ids_and_usage_stay_stable():
+    for native_ledger in [False, True]:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            parent, child, original, _ = fixture(home)
+            child.unlink()
+            meta = original[0]['payload']
+            meta['subagent_history_start_ordinal'] = 6
+            meta['parent_thread_id'] = RID
+            inherited_meta = {**meta, 'id': RID}
+            inherited_meta.pop('subagent_history_start_ordinal')
+            rows = [row(0, 'session_meta', meta), row(1, 'session_meta', inherited_meta),
+                    message(2, 'user', 'parent ask'), message(3, 'assistant', 'parent reply'),
+                    row(4, 'event_msg', {'type':'thread_name_updated','thread_name':'Parent title'}),
+                    tokens(5, 100, 20), message(6, 'user', 'child ask'),
+                    message(7, 'assistant', 'child reply')]
+            if native_ledger:
+                rows.extend([ledger(8, 'child-response', 7, 2), tokens(9, 7, 2)])
+            else:
+                rows.append(tokens(8, 7, 2))
+            cli.write_jsonl(parent, rows)
+            before, _ = codex.to_canonical(parent, strict=True, title_index={})
+            result, emitted = cli.run(home, 'codex')
+            assert result.returncode == 0, result.stderr
+            assert [r['uuid'] for r in emitted[1:]] == [r['uuid'] for r in before]
+            assert [r.get('isMeta', False) for r in emitted[1:]] == [True, True, False, False]
+            assert emitted[0]['title'] == 'child ask'
+            assert all('usage' not in r['message'] for r in emitted[1:] if r.get('isMeta'))
+            assert sum(sum(r['message'].get('usage', {}).values()) for r in emitted[1:] if not r.get('isMeta')) == 9
+            again, replay = cli.run(home, 'codex')
+            assert again.returncode == 0 and emitted == replay
+            # Continuations retain the child's boundary but begin after it.
+            # Their legacy baseline must exclude counters in copied context.
+            start = len(rows)
+            continuation_meta = {**meta, 'timestamp':'2026-01-03T00:00:00Z',
+                'history_base':{'thread_id':SID,'end_ordinal_exclusive':start,'end_byte_offset':parent.stat().st_size}}
+            tail = [row(start,'session_meta',continuation_meta), message(start+1,'user','next ask'),
+                    message(start+2,'assistant','next reply')]
+            if native_ledger:
+                tail.extend([ledger(start+3,'next-response',3,1),tokens(start+4,10,3)])
+            else:
+                tail.append(tokens(start+3,10,3))
+            cli.write_jsonl(child,tail)
+            result, continued = cli.run(home,'codex')
+            assert result.returncode == 0, result.stderr
+            assert [r['uuid'] for r in continued[1:len(emitted)]] == [r['uuid'] for r in emitted[1:]]
+            assert sum(sum(r['message'].get('usage',{}).values()) for r in continued[1:] if not r.get('isMeta')) == 13
+
+
+def test_subagent_boundary_and_own_metadata_are_validated():
+    for boundary in [-1, True, '4', 100, None, 1]:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            parent, child, original, _ = fixture(home)
+            child.unlink()
+            meta = original[0]['payload'];meta['subagent_history_start_ordinal'] = boundary
+            rows = [row(0,'session_meta',meta), row(1,'session_meta',{'id':RID}), message(2,'user','child')]
+            cli.write_jsonl(parent, rows)
+            result, emitted = cli.run(home,'codex')
+            assert result.returncode == 2 and not emitted, boundary
+
+
 if __name__ == '__main__':
     for name, fn in sorted(globals().items()):
         if name.startswith('test_'):
