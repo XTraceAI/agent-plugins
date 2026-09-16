@@ -130,6 +130,93 @@ def test_parent_changes_after_snapshot_invalidate_the_entire_group():
         assert 'source_changed' in errors.getvalue(), errors.getvalue()
 
 
+def ledger(ordinal, response, input_count, output_count):
+    return row(ordinal, 'token_usage_record', {'thread_id': SID, 'response_id': response,
+               'usage': {'input_tokens': input_count, 'output_tokens': output_count}})
+
+
+def test_native_ledger_counts_meter_resets_and_deduplicates_responses():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        parent, child, original, continuation = fixture(home)
+        original = [original[0], row(1, 'turn_context', {'model': 'fixture-one'}),
+                    message(2, 'user', 'shared ask'), message(3, 'assistant', 'shared reply'),
+                    ledger(4, 'response-original', 10, 2), tokens(5, 10, 2),
+                    message(6, 'user', 'abandoned ask'), message(7, 'assistant', 'abandoned reply'),
+                    ledger(8, 'response-abandoned', 5, 1), tokens(9, 5, 1)]
+        cli.write_jsonl(parent, original)
+        cutoff = sum(map(len, parent.read_bytes().splitlines(keepends=True)[:6]))
+        meta = continuation[0]['payload']
+        meta['history_base'] = {'thread_id': SID, 'end_ordinal_exclusive': 6, 'end_byte_offset': cutoff}
+        continuation = [row(6, 'session_meta', meta), row(7, 'turn_context', {'model': 'fixture-two'}),
+                        message(8, 'user', 'retry ask'), message(9, 'assistant', 'retry reply'),
+                        ledger(10, 'response-retry', 7, 2), tokens(11, 7, 2),
+                        ledger(12, 'response-original', 10, 2)]
+        cli.write_jsonl(child, continuation)
+        result, records = cli.run(home, 'codex')
+        assert result.returncode == 0, result.stderr
+        assert len(records) == 7
+        assert sum(sum(r['message'].get('usage', {}).values()) for r in records[1:]) == 27
+        legacy, _ = codex.to_canonical(parent, strict=True)
+        assert [r['uuid'] for r in records[1:5]] == [r['uuid'] for r in legacy]
+        assert {r['api_message_id'] for r in records[1:] if 'api_message_id' in r} == {
+            'response-original', 'response-abandoned', 'response-retry'}
+        assert records[-1]['message']['model'] == 'fixture-two'
+        replay, again = cli.run(home, 'codex')
+        assert replay.returncode == 0 and records == again
+
+
+def test_ledger_preserves_legacy_prefix_and_usage_only_identities():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        parent, child, original, _ = fixture(home)
+        child.unlink()
+        # A legacy-only request precedes the introduction of response ledgers.
+        original = [original[0], message(1, 'assistant', 'legacy answer'), tokens(2, 2, 1),
+                    message(3, 'assistant', 'modern answer'), ledger(4, 'modern-response', 10, 2),
+                    tokens(5, 12, 3), ledger(6, 'empty-response', 4, 1), tokens(7, 16, 4)]
+        cli.write_jsonl(parent, original)
+        legacy, _ = codex.to_canonical(parent, strict=True)
+        result, records = cli.run(home, 'codex')
+        assert result.returncode == 0, result.stderr
+        assert [r['uuid'] for r in records[1:]] == [r['uuid'] for r in legacy]
+        assert sum(sum(r['message'].get('usage', {}).values()) for r in records[1:]) == 20
+        assert records[-1]['api_message_id'] == 'empty-response'
+
+
+def test_conflicting_or_invalid_native_ledgers_refuse_the_group():
+    for invalid in ('identity', 'conflicting-response', 'negative'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            parent, child, original, _ = fixture(home)
+            child.unlink()
+            original = [original[0], message(1, 'assistant', 'answer'), ledger(2, 'r', 4, 1), tokens(3, 4, 1)]
+            if invalid == 'identity': original[2]['payload']['thread_id'] = RID
+            elif invalid == 'negative': original[2]['payload']['usage']['input_tokens'] = -1
+            else: original.append(ledger(4, 'r', 5, 1))
+            cli.write_jsonl(parent, original)
+            result, records = cli.run(home, 'codex')
+            assert result.returncode == 2 and not records
+
+
+def test_first_ledger_without_output_does_not_charge_an_older_thinking_block():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        parent, child, original, _ = fixture(home)
+        child.unlink()
+        original = [original[0], row(1, 'response_item', {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'legacy thought'}]}),
+                    message(2, 'assistant', 'legacy answer'), tokens(3, 2, 1),
+                    ledger(4, 'new-empty-response', 10, 2), tokens(5, 12, 3)]
+        cli.write_jsonl(parent, original)
+        legacy, _ = codex.to_canonical(parent, strict=True)
+        result, records = cli.run(home, 'codex')
+        assert result.returncode == 0, result.stderr
+        assert [r['uuid'] for r in records[1:]] == [r['uuid'] for r in legacy]
+        assert 'usage' not in records[1]['message']
+        assert records[-1]['api_message_id'] == 'new-empty-response'
+        assert sum(sum(r['message'].get('usage', {}).values()) for r in records[1:]) == 15
+
+
 if __name__ == '__main__':
     for name, fn in sorted(globals().items()):
         if name.startswith('test_'):

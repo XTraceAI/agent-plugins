@@ -494,7 +494,7 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict=False, 
 
 def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=None,
                              identity_namespace=None, initial_usage_total=None,
-                             usage_baseline_unknown=False) -> tuple[list[dict], dict]:
+                             usage_baseline_unknown=False, record_sources=None, usage_targets=None) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
     ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
@@ -555,6 +555,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
 
     def rec(record: dict) -> dict:
         nonlocal identity_index
+        if record_sources is not None:
+            record_sources[id(record)] = idx
         if cwd:
             record["cwd"] = cwd
         # The server's agentic parser SKIPS records without a ``uuid`` (it is
@@ -594,6 +596,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
         ))
         if ts_holder["ts"]:
             record["timestamp"] = ts_holder["ts"]
+        if record_sources is not None:
+            record_sources[id(record)] = source_index
         return record
 
     def assistant(block) -> dict:
@@ -625,6 +629,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
             f"memhub:codex:{sid_key}:usage-only:{event_idx}",
         ))
         _merge_usage(record, usage)
+        if usage_targets is not None:
+            usage_targets[event_idx] = record
         out.append(record)
 
     for idx, r in enumerate(rollout):
@@ -653,6 +659,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
                 if usage:
                     if last_assistant is not None:
                         _merge_usage(last_assistant, usage)
+                        if usage_targets is not None:
+                            usage_targets[idx] = last_assistant
                         # One cumulative delta belongs to one model request.
                         # Until another response item is emitted, a later
                         # advancing snapshot has no assistant output to own it

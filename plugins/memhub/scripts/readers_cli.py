@@ -698,7 +698,8 @@ def main(argv=None) -> int:
         for conversation, items in grouped.items():
             referenced = any(codex_headers[item[0]]["payload"].get("history_base") is not None
                              for item in items)
-            if counts[conversation] == 1 and not referenced:
+            paginated = any(codex_headers[item[0]]["payload"].get("history_mode") == "paginated" for item in items)
+            if counts[conversation] == 1 and not referenced and not paginated:
                 selected.extend(items)
                 continue
             try:

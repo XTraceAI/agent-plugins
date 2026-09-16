@@ -1,14 +1,15 @@
 """Physical Codex rollouts belonging to one paginated session.
 
-History references supply usage baselines, not an instruction to discard work
-past a rewind cutoff. Each immutable rollout has its own record identities.
+History references supply legacy usage baselines, not an instruction to discard
+work past a rewind cutoff. Native response ledgers supersede UI token meters.
+Each immutable rollout has its own record identities.
 """
 from __future__ import annotations
 
 from contextlib import ExitStack
 import re
 
-from . import codex
+from . import codex, codex_usage
 from .strict_json import loads
 
 _UUID = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
@@ -103,6 +104,7 @@ def read(group, snapshot, *, title_index=None):
                   for rid, path, revision, _, _ in group}
         seeds = {}
         records = []
+        seen_responses = {}
         first_meta = None
         for rid, _, _, _, base in group:
             seed = None if base is None else prefix_usage(
@@ -119,11 +121,16 @@ def read(group, snapshot, *, title_index=None):
             for i, row in enumerate(rows):
                 if (i and row.get('type') == 'session_meta') or type(row.get('ordinal')) is not int or row['ordinal'] != start + i:
                     raise ValueError('rollout has missing or inconsistent ordinals')
+            record_sources, usage_targets = {}, {}
+            namespace = rid if base is None else f"{session_id}:rollout:{rid}"
             converted, meta = codex.rollout_to_claude_records(
                 rows, strict=True, title_index=title_index,
-                identity_namespace=(rid if base is None else f"{session_id}:rollout:{rid}"),
+                identity_namespace=namespace,
                 initial_usage_total=seed,
-                usage_baseline_unknown=base is not None and seed is None)
+                usage_baseline_unknown=base is not None and seed is None,
+                record_sources=record_sources, usage_targets=usage_targets)
+            converted = codex_usage.apply(rows, converted, record_sources, usage_targets,
+                session_id=session_id, namespace=namespace, seen=seen_responses)
             records.extend(converted)
             if first_meta is None:
                 first_meta = meta

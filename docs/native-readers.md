@@ -76,13 +76,18 @@ they are not claims that real user session files were found corrupted.
 
 The read-only CLI groups validated paginated rollout files that share one native
 session ID. It emits each physical rollout's work once, including attempts beyond
-a later rewind cutoff. `history_base` is used to recover the inherited cumulative
-token baseline, so copied counters do not become new usage. If that baseline is
-unavailable, the first delta stays unknown rather than being guessed.
+a later rewind cutoff. Persisted `token_usage_record` entries provide per-response
+accounting even when UI token meters reset. Response IDs deduplicate repeated
+ledger entries. From the first ledger entry onward, ledger usage replaces the
+parallel UI counters; any older legacy-only prefix keeps its existing handling.
+Without a ledger, `history_base` supplies the legacy cumulative baseline when
+available; an unavailable baseline leaves the first delta unknown.
 
 Original rollout record IDs retain their existing namespace. Continuations use
-the immutable rollout ID within the session namespace; appending a continuation
-or replaying the group does not renumber already indexed work. The output has one
+the immutable rollout ID within the session namespace. A separate usage overlay
+preserves real-record IDs and order, reuses existing usage-only identities where
+possible, and adds stable per-response identities for otherwise unrepresented
+inferences. Appending a continuation or replaying does not renumber real work. The output has one
 session header with the original start time. File snapshots and final revision
 checks cover every group member.
 
@@ -94,4 +99,5 @@ select the native session ID or use unfiltered discovery. This does not add a
 native database dependency or change the separate cloud-capture transport.
 
 Regression: `python3 tests/codex_history_test.py` covers abandoned work, inherited
-usage, replay/legacy IDs, source changes, and invalid/incomplete lineage.
+usage, meter resets, response-ledger deduplication, replay/legacy IDs, source
+changes, and invalid/incomplete lineage.
