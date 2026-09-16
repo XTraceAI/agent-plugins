@@ -136,15 +136,18 @@ use equivalent host-specific readers and flushers under
 
 Two Codex-specific rules fall out of that:
 
-- **Only threads you started are captured.** Codex runs its own threads
-  alongside yours — guardian action-reviews and spawned subagents — and each
-  one copies the conversation it is reviewing, so it looks like a real
+- **Codex's own threads are not captured.** Codex runs threads alongside
+  yours — spawned subagents, guardian action-reviews, memory consolidation —
+  and each copies the conversation it is working on, so it looks like a real
   transcript and takes its title from the reviewer's prompt. Capture reads
-  `thread_source` from the rollout header and ships a session only when Codex
-  says it is yours. A rollout old enough to predate that field still counts as
-  yours; an unfamiliar value is held back *and* logged, so a new Codex thread
-  kind shows up as a reported skip rather than a session that quietly stops
-  being captured.
+  `thread_source` from the rollout header and skips those three kinds by name.
+  Everything else is yours and is captured: a rollout old enough to predate the
+  field, and — deliberately — a kind we have never seen. Codex's own
+  `ThreadSource` type is open-ended (`Feature(String)`), so new product
+  surfaces appear as new values; refusing them by default would silently drop
+  real sessions, and because the skip advances the capture cursor that loss
+  would be unrecoverable. An unfamiliar value is captured and noted in the
+  Codex capture log instead.
 - **A broken install says so.** The bridge in `~/.codex` finds the plugin at
   hook time. If the plugin's files are missing — the usual cause is an install
   that copied the manifest but not the scripts — it used to exit quietly and

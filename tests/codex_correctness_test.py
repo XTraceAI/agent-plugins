@@ -208,14 +208,22 @@ def test_a_rollout_predating_thread_source_is_still_captured():
 
 
 def test_codex_talking_to_itself_is_not_captured():
-    for source in ("subagent", "guardian", "collab", "automation"):
+    # The literals are upstream's: `enum ThreadSource` in
+    # codex-rs/protocol/src/protocol.rs — User | Subagent | GuardianReview |
+    # Feature(String) | MemoryConsolidation. Note `guardian_review`, not
+    # `guardian`: an invented literal would match nothing.
+    for source in ("subagent", "guardian_review", "memory_consolidation"):
         assert not codex_reader.is_own_thread(_rollout(thread_source=source)), source
 
 
-def test_an_unknown_thread_source_is_excluded_by_the_allowlist():
-    # The point of an allowlist: a value Codex has not shipped yet is held
-    # out by default rather than captured because it wasn't on a denylist.
-    assert not codex_reader.is_own_thread(_rollout(thread_source="something-new"))
+def test_an_unfamiliar_feature_surface_is_captured_not_dropped():
+    # `Feature(String)` is an OPEN variant — any string Codex has not named
+    # parses into it, and a Feature thread is the PERSON's. Codex's own review
+    # of this PR reported a user-started web thread with
+    # thread_source="codex_web_code_review"; an allowlist would have dropped it,
+    # and the watermark advance would have made that unrecoverable.
+    for source in ("codex_web_code_review", "something-shipped-tomorrow"):
+        assert codex_reader.is_own_thread(_rollout(thread_source=source)), source
     # Non-string junk must not crash the header read. Treating it as the
     # person's is a DELIBERATE hole in the allowlist: fail open, because
     # dropping real work costs more than importing one stray review.
@@ -263,34 +271,36 @@ def test_an_unreadable_header_still_captures():
         assert reached.get("yes"), "an unreadable header must not block capture"
 
 
-def test_an_unrecognised_thread_kind_is_reported_not_skipped_in_silence():
-    # The allowlist's one real risk: if Codex renames the marker for ordinary
-    # sessions, EVERY session falls outside it. A quiet skip would rebuild the
-    # silent-capture-death bug on a new axis, so this one reaches health.
+def test_an_unfamiliar_kind_reaches_the_parse_instead_of_being_skipped():
+    # Regression for the P1 Codex raised on this PR: an unfamiliar Feature
+    # surface must be CAPTURED, not skipped. If it were skipped the watermark
+    # would advance and the session could never be recovered.
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "rollout-n.jsonl"
-        path.write_text(json.dumps(_rollout(thread_source="brand-new-kind")[0]) + "\n",
+        path.write_text(json.dumps(_rollout(thread_source="codex_web_code_review")[0]) + "\n",
                         encoding="utf-8")
-        saved = {}
+        reached = {}
+        def _mark(*a, **k):
+            reached["yes"] = True
+            raise RuntimeError("stop after the gate")
         with patch.object(codex_flush, "STATE_DIR", Path(td)), \
-                patch.object(codex_flush, "_save_state",
-                             lambda sid, **f: saved.update(f)):
-            asyncio.run(codex_flush._flush("n", path, 10))
-    assert saved["last_error"] == "unknown_thread_source", saved
-    assert saved["last_error_at"] > 0, saved
-    # capture_health must have real words for it, not the generic
-    # "run /memhub:login --status" advice — this is not a credential problem.
+                patch.object(codex_flush.codex_reader, "to_canonical", _mark), \
+                patch.object(codex_flush, "_save_state", lambda sid, **f: None):
+            with contextlib.suppress(RuntimeError):
+                asyncio.run(codex_flush._flush("n", path, 10))
+    assert reached.get("yes"), "an unfamiliar Feature thread must still be captured"
+    # capture_health keeps a real remedy for the one failure we DO record.
     health = _load("capture_health")
-    assert "unknown_thread_source" in health._REASONS
     assert "plugin_root_unresolved" in health._REASONS
 
 
-def test_a_known_bot_thread_is_skipped_quietly_and_clears_a_stale_failure():
+def test_a_named_bot_thread_is_skipped_quietly_and_clears_a_stale_failure():
     # Routine. And a session that failed an upload before being reclassified
     # must not keep warning forever about a retry that will never come.
+    # Note the literal: upstream spells it `guardian_review`.
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "rollout-g2.jsonl"
-        path.write_text(json.dumps(_rollout(thread_source="guardian")[0]) + "\n",
+        path.write_text(json.dumps(_rollout(thread_source="guardian_review")[0]) + "\n",
                         encoding="utf-8")
         saved = {}
         with patch.object(codex_flush, "STATE_DIR", Path(td)), \
@@ -300,10 +310,13 @@ def test_a_known_bot_thread_is_skipped_quietly_and_clears_a_stale_failure():
     assert saved["last_error"] is None and saved["fail_streak"] == 0, saved
 
 
-def test_the_report_only_set_never_widens_the_gate():
-    # Naming a kind silences an alarm; it must never admit a thread.
-    for source in codex_reader.KNOWN_BOT_THREAD_SOURCES:
+def test_only_the_named_bot_kinds_are_refused():
+    # Everything outside the denylist is captured — that is the whole point of
+    # denying by name against an open type.
+    for source in codex_reader.BOT_THREAD_SOURCES:
         assert not codex_reader.is_own_thread(_rollout(thread_source=source)), source
+    for source in codex_reader.KNOWN_OWN_THREAD_SOURCES:
+        assert codex_reader.is_own_thread(_rollout(thread_source=source)), source
 
 
 def test_discovery_does_not_offer_codex_threads_the_person_never_started():

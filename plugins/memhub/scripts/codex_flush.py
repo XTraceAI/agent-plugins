@@ -450,25 +450,22 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     except (OSError, ValueError) as exc:
         source = None                       # unreadable header: capture as usual
         _log(f"could not read thread_source ({exc!r}) — treating as own thread")
-    if source not in codex_reader.OWN_THREAD_SOURCES:
-        known = source in codex_reader.KNOWN_BOT_THREAD_SOURCES
-        _log(f"not this person's thread (thread_source={source!r}) — not "
-             f"captured{'' if known else '; UNRECOGNISED kind, reporting it'}")
-        # A kind we already know is Codex's own is routine: skip quietly, and
-        # clear any earlier failure the way the other never-contacted-the-
-        # server no-ops do, so a stale last_error cannot outlive a session
-        # nothing will retry for.
-        #
-        # A kind we have NEVER seen is the allowlist's one real risk — if
-        # Codex renamed the marker for ordinary sessions, this path is every
-        # session, and a silent skip would rebuild the exact silent-capture-
-        # death bug on a new axis. Record it where capture_health will say so.
-        note = ({"last_error": None, "last_error_at": 0, "fail_streak": 0}
-                if known else
-                {"last_error": "unknown_thread_source",
-                 "last_error_at": time.time()})
-        _save_state(sid, skipped_thread_source=source, rollout_size=size, **note)
+    if source in codex_reader.BOT_THREAD_SOURCES:
+        _log(f"not this person's thread (thread_source={source!r}) — not captured")
+        # Clear any earlier failure the way the other never-contacted-the-
+        # server no-ops do: nothing will ever retry this session, so a stale
+        # last_error would warn about a recovery that cannot come.
+        _save_state(sid, skipped_thread_source=source, rollout_size=size,
+                    last_error=None, last_error_at=0, fail_streak=0)
         return
+    if source not in codex_reader.KNOWN_OWN_THREAD_SOURCES:
+        # A Feature surface we have not seen before. It IS captured — the
+        # variant means a product surface the person is using — but say so, so
+        # a new kind gets classified deliberately rather than by silence. Not
+        # a failure, so deliberately NOT a last_error: a health banner reading
+        # "capture failed" over a session that captured fine is its own bug.
+        _log(f"unfamiliar thread_source={source!r} — capturing it as the "
+             f"person's work; classify it upstream if that is wrong")
     records, meta = codex_reader.to_canonical(rollout)
     state = _read_state(sid)
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (

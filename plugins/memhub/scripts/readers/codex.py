@@ -267,16 +267,28 @@ def _session_meta(rollout: list[dict]) -> dict:
 # thread is captured only when Codex says it belongs to the person. The bot
 # literals ("subagent", "guardian", …) are Codex's to rename and extend, and a
 # denylist would silently admit every future one.
-OWN_THREAD_SOURCES = (None, "", "user")
+# Upstream's own type, from `enum ThreadSource` in
+# codex-rs/protocol/src/protocol.rs:
+#
+#     User | Subagent | GuardianReview | Feature(String) | MemoryConsolidation
+#
+# `Feature(String)` is an OPEN variant: any string Codex has not named parses
+# into it, which is why the generated TypeScript type is a bare `string` rather
+# than a union. A product surface that ships tomorrow arrives as a Feature, and
+# Feature threads are the PERSON's — that is what the variant means.
+#
+# So the gate is a DENYLIST of the kinds that are definitionally not the
+# person's, not an allowlist of the ones we happen to have seen. An allowlist
+# against an open type drops real work the first time Codex names a new
+# surface, and because the skip advances the capture watermark, a session that
+# has since stopped growing never re-flushes — the loss is unrecoverable.
+# Importing one stray bot thread is not. Asymmetric risk, asymmetric default.
+BOT_THREAD_SOURCES = ("subagent", "guardian_review", "memory_consolidation")
 
-# Report-only, and deliberately NOT part of the gate: these are the kinds we
-# already know are Codex's own, so skipping one is routine and silent. Any
-# OTHER non-user value is a kind we have never seen, which is the allowlist's
-# one real risk — if Codex renames the marker for ordinary sessions, capture
-# would stop for everyone. Callers say so out loud in that case instead of
-# skipping quietly. Adding a name here suppresses an alarm; it never admits a
-# thread that `is_own_thread` rejects.
-KNOWN_BOT_THREAD_SOURCES = ("subagent", "guardian", "review", "collab")
+# The values we have positively seen belong to the person. Anything in neither
+# set is still CAPTURED — it is a Feature surface — but callers note it, so a
+# new one gets classified deliberately instead of silently.
+KNOWN_OWN_THREAD_SOURCES = (None, "", "user")
 
 
 def thread_source_of(rollout: list[dict]) -> str | None:
@@ -286,14 +298,14 @@ def thread_source_of(rollout: list[dict]) -> str | None:
 
 
 def is_own_thread(rollout: list[dict]) -> bool:
-    """True when this rollout is a thread the person started.
+    """True unless this rollout is one of Codex's own thread kinds.
 
     Absent counts as the person's: rollouts written before Codex added the
-    field carry no `thread_source` at all and are ordinary user sessions.
-    Anything else is Codex talking to itself — including a value we do not
-    recognise, which callers should report rather than drop in silence.
+    field carry no `thread_source` at all and are ordinary user sessions. An
+    unfamiliar value counts as the person's too — see BOT_THREAD_SOURCES for
+    why the default has to fall this way.
     """
-    return thread_source_of(rollout) in OWN_THREAD_SOURCES
+    return thread_source_of(rollout) not in BOT_THREAD_SOURCES
 
 
 _USAGE_KEYS = (

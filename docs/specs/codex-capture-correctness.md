@@ -204,26 +204,44 @@ review:
 
 New helper in `plugins/memhub/scripts/readers/codex.py`:
 
+**The gate is a denylist, and the reason is upstream's own type.** From
+`enum ThreadSource` in `codex-rs/protocol/src/protocol.rs`:
+
+```rust
+pub enum ThreadSource {
+    User,                 // "user"
+    Subagent,             // "subagent"
+    GuardianReview,       // "guardian_review"
+    Feature(String),      // ← OPEN: any unnamed string parses here
+    MemoryConsolidation,  // "memory_consolidation"
+}
+```
+
+`Feature(String)` is why the generated TypeScript is
+`export type ThreadSource = string;` rather than a union. A product surface
+that ships tomorrow arrives as a `Feature`, and **a Feature thread is the
+person's** — that is what the variant means.
+
 ```python
-OWN_THREAD_SOURCES = (None, "", "user")
-KNOWN_BOT_THREAD_SOURCES = ("subagent", "guardian", "review", "collab")
+BOT_THREAD_SOURCES = ("subagent", "guardian_review", "memory_consolidation")
+KNOWN_OWN_THREAD_SOURCES = (None, "", "user")
 
 def thread_source_of(rows) -> str | None: ...
-def is_own_thread(rows) -> bool: ...          # thread_source in OWN_THREAD_SOURCES
+def is_own_thread(rows) -> bool: ...            # thread_source NOT in BOT_…
 def thread_source_of_path(path) -> str | None:  # bounded header read
 def is_own_thread_path(path) -> bool: ...       # same predicate, from disk
 ```
 
-`KNOWN_BOT_THREAD_SOURCES` is **report-only and never part of the gate**:
-naming a kind there suppresses an alarm, it can never admit a thread
-`is_own_thread` rejects.
-
-- **Allowlist, not denylist.** Import only `thread_source ∈ {absent, "user"}`.
-  This is correct regardless of the exact bot literal (`subagent`, `guardian`,
-  or anything Codex adds later), which we could not confirm — no guardian
-  rollout exists on this machine.
+- **Deny by name; capture everything else.** An allowlist against an open type
+  drops real work the first time Codex names a surface — and because the skip
+  advances the watermark, a session that has since stopped growing never
+  re-flushes. That loss is unrecoverable; importing one stray bot thread is
+  not. Asymmetric risk, asymmetric default.
 - **Absent ⇒ own.** Rollouts predating the field (cli < ~0.142) have no
   `thread_source`; they must keep being captured.
+- **An unfamiliar value is captured and noted** (log line only — *not* a
+  `last_error`, which would print "capture failed" over a session that
+  captured fine), so a new Feature surface gets classified deliberately.
 - **An unrecognised value is skipped *and recorded*.** A kind in
   `KNOWN_BOT_THREAD_SOURCES` is routine: skipped quietly, and it clears any
   earlier `last_error`/`fail_streak` the way the other never-contacted-the-
@@ -291,15 +309,16 @@ session id. Only the bytes that cross the wire change.
 | # | Decision | Why |
 |---|---|---|
 | D1 | Client-side namespacing here; backend backfill handled separately | Keeps this PR inside `plugins/memhub/`; the backend fix lives in another repo |
-| D2 | Allowlist `{absent, "user"}`, not a denylist | Correct without knowing the bot literals; new variants excluded by default |
+| D2 | ~~Allowlist `{absent, "user"}`~~ → **denylist of the named bot kinds** | **Reversed in review.** Codex's review of this PR reported a user-started web thread with `thread_source="codex_web_code_review"`, and upstream's `enum ThreadSource` confirms why: `Feature(String)` is an open variant, so the value space is unbounded and the *non-bot* side is the open one. An allowlist silently dropped real sessions, unrecoverably (the skip advances the watermark). See D11. |
 | D3 | Namespace at the wire, not in `ctx` | Preserves local state keys; no in-flight session breakage |
 | D4 | Add the Cursor guard, don't build the lane | One-line correctness for free; the lane is a separate ticket |
 | D5 | Bump **only** the four production manifests `0.58.3 → 0.58.4`; leave `memhub-staging` at `0.57.0` | The decoupling is deliberate: `16798a9` ("Keep staging version independent of the production release", PR #229) removed staging from `version_parity_test.py` and set `RELEASING.md:72` to "Leave its manifest unchanged during a production-only release". `CONTRIBUTING.md:104-106` still says lockstep and is **stale**. |
 | D6 | Fail open everywhere | A memory hook must never block the host agent |
 | D7 | `wire_session_id` delegates to `pr_link.conversation_id_for` rather than owning a namespace map | Found in review: the helper already existed. A parallel mechanism is the default wrong answer, and the local copy was already wrong on surrounding whitespace and on a host spelled `Codex` — both of which silently ship an *unnamespaced* id, i.e. the very bug this fixes |
-| D8 | The guardian gate reports an unrecognised kind; it is quiet only for known ones | Found in review: the first cut skipped every non-user value in silence. If Codex renames the marker for ordinary sessions that is *every* session, invisibly — ENG-1070 #1 rebuilt on a new axis |
+| D8 | ~~Report an unrecognised kind as a capture failure~~ → **capture it and log it** | Superseded by D11: an unfamiliar kind is now captured, so it is not a failure. A `last_error` there would print "capture failed" over a session that captured fine |
 | D9 | `_plugin_root` resolves under the HOOK's environment, not the caller's | Found in review: the setup skill always runs with `PLUGIN_ROOT` set, so the check reported a healthy plugin for a dead install — it could not detect the failure it was written for |
 | D10 | Discovery gates candidate *selection*, not read-only *enumeration* | `readers_cli` has a published wire contract and golden files; `capture.py list` is an explicit "show me what is on disk" |
+| D11 | The bot literals are taken from upstream source, not inferred | `guardian_review`, not `guardian` — the invented literal matched nothing, so every real guardian skip would have raised a false "unknown kind" alarm. `memory_consolidation` was missing entirely. Read from `codex-rs/protocol/src/protocol.rs`, not guessed |
 
 ---
 
@@ -337,10 +356,12 @@ session id. Only the bytes that cross the wire change.
 
 ## Open questions
 
-1. **The exact non-user `thread_source` literal is unconfirmed.** D2 makes the
-   fix correct without it, but confirming it (from the machine holding the 105
-   guardian sessions) would let us log a precise reason rather than
-   "unrecognised".
+1. ~~The exact non-user `thread_source` literal is unconfirmed.~~
+   **Resolved.** Read from upstream: `enum ThreadSource` in
+   `codex-rs/protocol/src/protocol.rs` gives `user`, `subagent`,
+   `guardian_review`, `memory_consolidation`, and the open `Feature(String)`.
+   What remains open is which *Feature* surfaces exist; the denylist makes that
+   safe — a new one is captured, not dropped.
 2. **Backend backfill** — the 103 guardian conversations and the orphaned
    production fires both need a data decision. Out of scope here.
 3. **`CONTRIBUTING.md:104-106` is stale** (contradicts `RELEASING.md:72` and
