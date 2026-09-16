@@ -124,7 +124,6 @@ the event's read facts, which is how the verifier feeds it fixtures.
 """
 import fnmatch
 import hashlib
-import datetime as _dt
 import importlib.util
 import json
 import os
@@ -1003,8 +1002,6 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
 
 
 # ── ordering engine: obligation state machine ───────────────────────────────
-OPEN_FIRES_KEPT = 32       # open advisory fires the engine remembers per rule, across sessions
-RESOLVED_FIRES_KEPT = 64   # answered fire ids kept per rule so other sessions can reconcile
 
 
 class OrderingEngine:
@@ -1016,12 +1013,16 @@ class OrderingEngine:
     Every read-modify-write holds an exclusive flock on a sidecar lock (bounded
     LOCK_WAIT_S; past that the hook fails open) and replaces the file atomically.
     An arm and a discharge from two sessions must never overwrite each other —
-    those are the two outcomes a gate exists to prevent."""
+    those are the two outcomes a gate exists to prevent.
+
+    Arming counters ONLY. Which fires a receipt answers is not this file's
+    business any more (rule-fire-events-spec §4): the receipt is posted as an
+    event carrying this checkout's key, and the server matches it to every
+    fire of the rule in the checkout, whichever session fired it."""
 
     def __init__(self, worktree_root, branch):
         os.makedirs(os.path.join(BASE, "state"), exist_ok=True)
-        key = hashlib.sha1(worktree_root.encode("utf-8")).hexdigest()[:16]
-        self.path = os.path.join(BASE, "state", f"wt-{key}.json")
+        self.path = os.path.join(BASE, "state", f"wt-{worktree_key(worktree_root)}.json")
         self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
@@ -1052,75 +1053,6 @@ class OrderingEngine:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(st, f)
         os.replace(tmp, self.path)
-
-    def mark_fired(self, rule_id, fire_id):
-        """Remember the open fire in WORKTREE state so a later discharge from
-        any session in this checkout converts it — EVERY open fire of the
-        rule, not only the last: two sessions (or one session twice) firing
-        the same advisory before the receipt are both answered by it."""
-        lock = self._locked()
-        if lock is None:
-            return
-        try:
-            st = self._read()
-            slot = st.setdefault(self.branch, {}).setdefault(
-                rule_id, {"count": 0, "last_edit": None})
-            slot["open_fire"] = fire_id
-            fires = [f for f in (slot.get("open_fires") or []) if f != fire_id] + [fire_id]
-            slot["open_fires"] = fires[-OPEN_FIRES_KEPT:]
-            self._write(st)
-        finally:
-            portable_lock.unlock(lock.fileno())
-            lock.close()
-
-    def resolved_fires(self):
-        """``{rule_id: {fire_id, …}}`` answered by a receipt in this checkout,
-        run by ANY session. A session still holding a record for one of these
-        drops it instead of closing or dismissing it: the session that ran
-        the receipt wrote the ``true`` for every fire the engine held."""
-        out = {}
-        for rid, slot in (self._read().get(self.branch) or {}).items():
-            if isinstance(slot, dict) and slot.get("resolved_fires"):
-                out[rid] = set(slot["resolved_fires"])
-        return out
-
-    def forget_fire(self, rule_id, fire_id):
-        """The inverse, for a fire resolved some other way — a named
-        dismissal. A receipt that lands later must find nothing to convert:
-        the person's explicit non-conversion outranks it, and the server's
-        sticky-true merge would otherwise let the receipt overwrite it.
-        Only THAT fire is forgotten; a newer open fire of the rule stays.
-
-        Returns ``"consumed"`` (it was here and is gone), ``"resolved"`` (a
-        receipt already answered it — the caller must NOT write a dismissal
-        over that true), or ``"absent"`` (never here: a session-armed fire,
-        or an engine this hook could not lock). Decided under the engine's
-        lock, so a receipt cannot slip between the answer and the caller's
-        write — that is the whole reason this runs BEFORE the dismissal."""
-        lock = self._locked()
-        if lock is None:
-            return "absent"
-        try:
-            st = self._read()
-            slot = (st.get(self.branch) or {}).get(rule_id)
-            if not isinstance(slot, dict):
-                return "absent"
-            if fire_id in (slot.get("resolved_fires") or []):
-                return "resolved"
-            changed = False
-            if slot.get("open_fire") == fire_id:
-                slot.pop("open_fire", None)
-                changed = True
-            fires = slot.get("open_fires") or []
-            if fire_id in fires:
-                slot["open_fires"] = [f for f in fires if f != fire_id]
-                changed = True
-            if changed:
-                self._write(st)
-            return "consumed" if changed else "absent"
-        finally:
-            portable_lock.unlock(lock.fileno())
-            lock.close()
 
     def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None, armed=None):
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
@@ -1187,28 +1119,13 @@ class OrderingEngine:
             if is_receipt:                                # handler 2: green receipt
                 if ok is True:                            # a red run never discharges
                     s["count"] = 0
-                    # For an EDIT-armed rule, conversion is (worktree,
-                    # branch)-scoped: a subagent's or sibling session's
-                    # receipt converts whichever fire is open, because the
-                    # obligation belongs to the checkout.
-                    #
-                    # A session- or prompt-armed one belongs to the SESSION,
-                    # so its open fire is not here to convert — the caller
-                    # holds it in session state. Popping the shared slot let
-                    # one session's compliance mark ANOTHER session's fire
-                    # converted, and two concurrent fires overwrote the single
-                    # slot so attribution followed execution order rather than
-                    # who complied.
-                    if not by_call:
-                        rule["_converted_fire"] = s.pop("open_fire", None)
-                        fires = list(s.pop("open_fires", None) or [])
-                        if rule["_converted_fire"] and rule["_converted_fire"] not in fires:
-                            fires.append(rule["_converted_fire"])
-                        rule["_converted_fires"] = fires
-                        # What every session sharing this checkout consults
-                        # (`resolved_fires`): these fires are answered,
-                        # whichever session still holds a record for one.
-                        s["resolved_fires"] = ((s.get("resolved_fires") or []) + fires)[-RESOLVED_FIRES_KEPT:]
+                    # Older builds also kept the rule's open fire ids here so
+                    # the receipt could convert them; those keys are dropped
+                    # on the way through. Which fires this receipt answers is
+                    # the server's fold, from the `receipt` event the caller
+                    # posts (rule-fire-events-spec §3).
+                    for k in ("open_fire", "open_fires", "resolved_fires"):
+                        s.pop(k, None)
                     self._write(st)
                     return "discharged"
                 return None
@@ -2467,16 +2384,41 @@ def spawn_fetch(repo):
                      stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
 
 
-WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "repo",
-             "branch", "tool", "hook_phase", "mode", "dedup_key",
-             "raw_matches_before_fire", "fired_at", "converted", "converted_at",
-             "source_message_id", "override_reason")
+# The fire row on the wire (rulebook-fire-ledger-spec §3, contract C3, plus
+# the additive `worktree` of rule-fire-events-spec §2). No `converted` /
+# `converted_at`: an advise fire's outcome is the SERVER's to compute from the
+# events this hook posts, and a hook that sent one would only be honoured at
+# the lowest precedence as a legacy verdict. `override_reason` stays — on a
+# GATE row it is the excuse given on the blocked call, the row's own record.
+WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "worktree",
+             "repo", "branch", "tool", "hook_phase", "mode", "dedup_key",
+             "raw_matches_before_fire", "fired_at", "source_message_id", "override_reason")
+
+# What the hook observed AFTER a fire (rule-fire-events-spec §2). Facts, never
+# verdicts: `receipt` (an ordering rule's green run in this checkout),
+# `converted` (a rule's converted_rx matched a command in this session),
+# `dismissed` (the person set a rule aside, with the reason), `turn_end` (the
+# session finished a turn), `session_end`. The server folds these into each
+# fire's outcome; nothing here decides one.
+EVENT_WIRE_KEYS = ("event_id", "kind", "rule_id", "session_id", "agent_id", "worktree",
+                   "repo", "branch", "reason", "at")
 
 
 def wire_row(row):
     """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
     opt-in for excerpts is a server setting the hook does not consult)."""
     return {k: row.get(k) for k in WIRE_KEYS}
+
+
+def event_wire_row(row):
+    return {k: row.get(k) for k in EVENT_WIRE_KEYS}
+
+
+def worktree_key(root):
+    """The 16-hex checkout id every fire and receipt carries — the same key
+    the ordering engine files its state under, so a receipt run by another
+    session of this checkout can answer this session's fire on the server."""
+    return hashlib.sha1(root.encode("utf-8")).hexdigest()[:16] if root else None
 
 
 def _read_rows(path, start=0, offsets=None):
@@ -2548,137 +2490,56 @@ def load_sent():
             raise ValueError("not a dict")
         return d
     except Exception:
-        return {"fires_offset": 0, "conversions_offset": 0, "last_flush_at": None}
+        return {"fires_offset": 0, "events_offset": 0, "last_flush_at": None}
 
 
-try:
-    CONVERSION_HOLD_S = int(os.environ.get("MEMHUB_RULEBOOK_CONVERSION_HOLD_S", 6 * 3600))
-except ValueError:
-    CONVERSION_HOLD_S = 6 * 3600
+# The two ledgers the flush lane ships, each behind its own byte watermark in
+# `.sent`: (file, offset key, endpoint, body key, id key, wire shape). Fires
+# go first so the events that answer them usually find them landed; the
+# server serialises the two ingests either way (rule-fire-events-spec §6).
+LEDGERS = (
+    ("fires.jsonl", "fires_offset", "/fires", "fires", "fire_id", wire_row),
+    ("events.jsonl", "events_offset", "/fire-events", "events", "event_id", event_wire_row),
+)
 
 
-def _older_than(iso, seconds):
-    """True when `iso` (ledger timestamp) is more than `seconds` in the past;
-    an unparseable stamp counts as old so it can never hold the watermark."""
-    try:
-        ts = _dt.datetime.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=_dt.timezone.utc)
-    except Exception:
-        return True
-    return (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() > seconds
-
-
-def pending_batches(sent):
-    """Rows to POST = fires past the watermark ∪ fires named by conversions past
-    THEIR watermark (each re-sent with converted/converted_at merged — the
-    ingest is an upsert on fire_id, so a re-send is an update, never a dup).
-    Returns (batches, new_sent): each batch is (rows, sent_after_it) so a
-    multi-batch flush advances the watermark per accepted batch and a poison
-    batch never makes earlier ones re-send forever. The same fire_id is
-    reused on every retry: rows come from the ledger, nothing is minted here.
-    Reads past the watermark first (a seek, cheap on every Stop) and only
-    indexes the whole ledger when there is something to send."""
-    ldir = _ledger_dir()
-    fpath, cpath = os.path.join(ldir, "fires.jsonl"), os.path.join(ldir, "conversions.jsonl")
-    f_offsets = []
-    new_fires, f_end = _read_rows(fpath, sent.get("fires_offset", 0), f_offsets)
-    c_offsets = []
-    new_convs, c_end = _read_rows(cpath, sent.get("conversions_offset", 0), c_offsets)
-    if not new_fires and not new_convs:
-        return [], dict(sent, fires_offset=f_end, conversions_offset=c_end)
-    # New fires carry their own rows. A NEW conversion may name a fire behind
-    # the watermark; only THOSE ids are looked up, streaming the ledger without
-    # holding it (bounded by the number of new conversions, not by history).
-    by_id = {r["fire_id"]: r for r in new_fires if isinstance(r, dict) and r.get("fire_id")}
-    wanted = {c.get("fire_id") for c in new_convs if isinstance(c, dict)} - set(by_id)
-    if wanted:
-        try:
-            with open(fpath, "rb") as f:
-                for line in f:
-                    if not line.endswith(b"\n"):
-                        break
-                    try:
-                        r = json.loads(line.decode("utf-8"))
-                    except Exception:
-                        continue
-                    if isinstance(r, dict) and r.get("fire_id") in wanted:
-                        by_id[r["fire_id"]] = r
-                        wanted.discard(r["fire_id"])
-                        if not wanted:
-                            break
-        except FileNotFoundError:
-            pass
-    # A conversion whose fire is not in the ledger yet (the fire line is still
-    # being written, or a rotated ledger) must NOT be passed by the watermark:
-    # stop the conversions offset just before the first unresolved one so the
-    # next flush sees it again once the fire has landed.
-    # The hold is bounded: a conversion older than CONVERSION_HOLD_S whose
-    # fire never landed (corrupt or rotated fire line) is dropped so it can
-    # never stall the conversions behind it.
-    c_start = sent.get("conversions_offset", 0)
-    for i, c in enumerate(new_convs):
-        if isinstance(c, dict) and c.get("fire_id") and c["fire_id"] not in by_id \
-                and not _older_than(c.get("converted_at"), CONVERSION_HOLD_S):
-            c_end = c_offsets[i - 1] if i else c_start
-            new_convs = new_convs[:i]
-            break
-    new_sent = dict(sent, fires_offset=f_end, conversions_offset=c_end)
-    # Only conversions past THEIR watermark need merging: the two offsets
-    # advance together, so an older conversion was shipped with its fire.
-    for c in new_convs:
-        if not (isinstance(c, dict) and c.get("fire_id") in by_id):
-            continue
-        row = by_id[c["fire_id"]]
-        if c.get("converted"):
-            row["converted"] = True
-            row["converted_at"] = c.get("converted_at")
-        elif c.get("converted") is False and row.get("converted") is None:
-            # a close never downgrades a conversion already on the row, in
-            # either order the two rows were written
-            row["converted"] = False
-            row["converted_at"] = c.get("converted_at")
-        if c.get("override_reason") and not row.get("override_reason"):
-            row["override_reason"] = c["override_reason"]
-    # (row, fires_offset once this row is accepted); conversion re-sends carry
-    # no fires progress of their own, so they inherit the last fire's offset.
+def pending_batches(sent, ledger=LEDGERS[0]):
+    """Rows of one ledger past its watermark, as `(batches, new_sent)`: each
+    batch is `(rows, sent_after_it)` so a multi-batch flush advances the
+    watermark per accepted batch and a poison batch never makes earlier ones
+    re-send forever. The same ids are reused on every retry: rows come from
+    the ledger, nothing is minted here. Reads past the watermark only (a
+    seek, cheap on every Stop). Nothing is merged: a fire row is what the
+    hook wrote when it fired, and what happened after it is its own rows in
+    the events ledger."""
+    fname, okey, _path, _body, idkey, wire = ledger
+    offsets = []
+    rows, end = _read_rows(os.path.join(_ledger_dir(), fname), sent.get(okey, 0), offsets)
+    new_sent = dict(sent, **{okey: end})
     items, seen = [], set()
-    for r, off in zip(new_fires, f_offsets):
-        if isinstance(r, dict) and r.get("fire_id") and r["fire_id"] not in seen:
-            items.append((wire_row(by_id.get(r["fire_id"], r)), off))
-            seen.add(r["fire_id"])
-    for c in new_convs:
-        fid = c.get("fire_id") if isinstance(c, dict) else None
-        if fid in by_id and fid not in seen:
-            items.append((wire_row(by_id[fid]), None))
-            seen.add(fid)
+    for r, off in zip(rows, offsets):
+        if isinstance(r, dict) and r.get(idkey) and r[idkey] not in seen:
+            items.append((wire(r), off))
+            seen.add(r[idkey])
     batches = []
-    fo = sent.get("fires_offset", 0) if f_offsets or new_fires else f_end
-    # conversions are credited once the last batch that carries ANY converted
-    # row (a re-send, or a new fire whose conversion was merged in) is
-    # accepted — a later failed batch must still re-merge its conversions
-    conv_ids = {c.get("fire_id") for c in new_convs if isinstance(c, dict)}
-    last_conv = max([-1] + [i for i, (r, o) in enumerate(items)
-                            if o is None or r.get("fire_id") in conv_ids])
     for i in range(0, len(items), FLUSH_BATCH):
         chunk = items[i:i + FLUSH_BATCH]
-        fo = max([fo] + [o for _, o in chunk if o is not None])
         last = i + FLUSH_BATCH >= len(items)
-        convs_done = last or i + FLUSH_BATCH > last_conv
         batches.append(([r for r, _ in chunk],
-                        dict(sent, fires_offset=f_end if last else fo,
-                             conversions_offset=c_end if convs_done else c_start)))
+                        dict(sent, **{okey: end if last else chunk[-1][1]})))
     return batches, new_sent
 
 
-def _log_rejected(rejected, batch):
+def _log_rejected(rejected, batch, idkey="fire_id"):
     """Per-row rejections are logged as given; a bare count (the §4.3 example
-    shape) is logged with the batch's fire_ids so the loss is visible even
+    shape) is logged with the batch's ids so the loss is visible even
     though the server did not say which rows."""
     try:
         if isinstance(rejected, list):
             items = [{"rejected": it} for it in rejected]
         elif isinstance(rejected, int) and rejected > 0:
             items = [{"rejected_count": rejected,
-                      "batch_fire_ids": [r.get("fire_id") for r in batch]}]
+                      "batch_ids": [r.get(idkey) for r in batch]}]
         else:
             items = []
         if items:
@@ -2690,10 +2551,11 @@ def _log_rejected(rejected, batch):
 
 
 def flush_fires(final=False):
-    """POST unsent rows in batches. The watermark advances ONLY on a 2xx, so
-    a failed batch is retried, verbatim, on the next flush; `rejected` rows
-    are logged locally and never retried (they sit behind the watermark).
-    One flusher at a time via flock; a second caller simply leaves."""
+    """POST unsent rows of both ledgers in batches. Each watermark advances
+    ONLY on a 2xx, so a failed batch is retried, verbatim, on the next flush;
+    `rejected` rows are logged locally and never retried (they sit behind
+    the watermark). One flusher at a time via flock; a second caller simply
+    leaves. `final` (SessionEnd) ignores the throttle."""
     if portable_lock is None:
         # Retain the ledger rather than advancing it without process exclusivity.
         return
@@ -2706,8 +2568,8 @@ def flush_fires(final=False):
         return
     try:
         sent = load_sent()
-        batches, new_sent = pending_batches(sent)
-        n = sum(len(b) for b, _ in batches)
+        plan = [(ledger, pending_batches(sent, ledger)[0]) for ledger in LEDGERS]
+        n = sum(len(b) for _, batches in plan for b, _ in batches)
         if not n:
             return
         if not final:
@@ -2722,52 +2584,61 @@ def flush_fires(final=False):
         if not api:
             return
         base, bearer, http = api
-        accepted = 0
-        for batch, after in batches:
-            try:
-                reply = http.rest(f"{base}{API_PATH}/fires", bearer, "POST",
-                                  body={"fires": batch}, timeout=FLUSH_TIMEOUT_S)
-            except Exception as exc:      # transport/envelope error: retry next flush,
-                _breadcrumb("flush", exc)  # but say so where an operator can look
-                return
-            if reply.status not in (200, 201, 202):
-                return                    # watermark stays at the last accepted batch
-            data = reply.data if isinstance(reply.data, dict) else {}
-            if not isinstance(data.get("accepted"), int):
-                return                    # not the §4.3 reply → do not trust it as a receipt
-            rej = data.get("rejected")
-            n_rej = len(rej) if isinstance(rej, list) else (rej if isinstance(rej, int) else 0)
-            if data["accepted"] + n_rej < len(batch):
-                # Short-counted: retry — but not forever. The same batch (same
-                # first fire_id) short-counting STALL_QUARANTINE_AFTER times in
-                # a row is a poison batch: log it as rejected and move past it,
-                # so one bad row can never strand every fire behind it.
-                key = batch[0].get("fire_id")
-                cur = load_sent()             # the on-disk state, including any
-                stall = cur.get("stall") or {}  # progress written by earlier batches
-                n = (stall.get("n", 0) + 1) if stall.get("key") == key else 1
-                if n < STALL_QUARANTINE_AFTER:
-                    cur["stall"] = {"key": key, "n": n}
-                    _atomic_json(_sent_path(), cur)
-                    return
-                _log_rejected([{"fire_id": r.get("fire_id"), "reason": "quarantined: short-counted "
-                                f"{n}x (accepted {data['accepted']}, rejected {n_rej} of {len(batch)})"}
-                               for r in batch], batch)
-            else:
-                _log_rejected(rej, batch)
-            accepted += data["accepted"]
-            if (sent.get("stall") or {}).get("key") != batch[0].get("fire_id"):
-                after["stall"] = sent.get("stall")   # an accepted batch clears only ITS OWN marker
-            else:
-                after.pop("stall", None)
-            if after.get("stall") is None:
-                after.pop("stall", None)
-            after["last_flush_at"] = _now()
-            after["last_accepted"] = accepted
-            _atomic_json(_sent_path(), after)   # per batch: a later failure keeps this progress
+        for ledger, batches in plan:
+            if not _post_batches(ledger, batches, base, bearer, http):
+                return       # this ledger's watermark stays; the other waits for the next flush
     finally:
         portable_lock.unlock(lock.fileno())
         lock.close()
+
+
+def _post_batches(ledger, batches, base, bearer, http):
+    """Ship one ledger's batches; True when every batch was accepted. The
+    per-batch `.sent` write is re-read from disk first so progress another
+    ledger's batches wrote in this same flush is never rolled back."""
+    _fname, okey, path, body_key, idkey, _wire = ledger
+    accepted = 0
+    for batch, after in batches:
+        try:
+            reply = http.rest(f"{base}{API_PATH}{path}", bearer, "POST",
+                              body={body_key: batch}, timeout=FLUSH_TIMEOUT_S)
+        except Exception as exc:      # transport/envelope error: retry next flush,
+            _breadcrumb("flush", exc)  # but say so where an operator can look
+            return False
+        if reply.status not in (200, 201, 202):
+            return False              # watermark stays at the last accepted batch
+        data = reply.data if isinstance(reply.data, dict) else {}
+        if not isinstance(data.get("accepted"), int):
+            return False              # not the §4.3 reply → do not trust it as a receipt
+        rej = data.get("rejected")
+        n_rej = len(rej) if isinstance(rej, list) else (rej if isinstance(rej, int) else 0)
+        cur = load_sent()             # the on-disk state, including any
+        stall = cur.get("stall") or {}  # progress written by earlier batches
+        key = batch[0].get(idkey)
+        if data["accepted"] + n_rej < len(batch):
+            # Short-counted: retry — but not forever. The same batch (same
+            # first id) short-counting STALL_QUARANTINE_AFTER times in a row
+            # is a poison batch: log it as rejected and move past it, so one
+            # bad row can never strand every row behind it.
+            n = (stall.get("n", 0) + 1) if stall.get("key") == key else 1
+            if n < STALL_QUARANTINE_AFTER:
+                cur["stall"] = {"key": key, "n": n}
+                _atomic_json(_sent_path(), cur)
+                return False
+            _log_rejected([{idkey: r.get(idkey), "reason": "quarantined: short-counted "
+                            f"{n}x (accepted {data['accepted']}, rejected {n_rej} of {len(batch)})"}
+                           for r in batch], batch, idkey)
+        else:
+            _log_rejected(rej, batch, idkey)
+        accepted += data["accepted"]
+        # only THIS ledger's watermark moves; the other's is whatever is on disk
+        cur[okey] = after[okey]
+        if stall.get("key") == key:
+            cur.pop("stall", None)    # an accepted batch clears only ITS OWN marker
+        cur["last_flush_at"] = _now()
+        cur["last_accepted"] = accepted
+        _atomic_json(_sent_path(), cur)   # per batch: a later failure keeps this progress
+    return True
 
 
 def repo_info(cwd):
@@ -2924,8 +2795,7 @@ def state_path(session_id):
 
 def load_state(p):
     st = {"fired": [], "counts": {}, "raw": {}, "armed": {},
-          "armed_once": [], "armed_fire": {}, "armed_version": {},
-          "obligations": {}, "stops": 0}
+          "armed_once": [], "armed_version": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -2933,19 +2803,17 @@ def load_state(p):
         pass
     if not isinstance(st.get("armed"), dict):   # a file an older hook wrote
         st["armed"] = {}
-    if not isinstance(st.get("obligations"), dict):
-        st["obligations"] = {}
-    # The pre-outcome hook kept its conversion watch in `open`/`open_file`,
-    # keyed by RULE. Those entries are dropped, not migrated: that hook never
-    # wrote an outcome for them, so nothing is lost that was ever recorded.
-    for k in ("open", "open_file", "closed", "open_at", "last_fire"):
+    # Older hooks kept outcome bookkeeping here — first a conversion watch
+    # keyed by RULE (`open`/`open_file`), then one record per FIRE
+    # (`obligations`, with the `stops` counter and `armed_fire` beside it).
+    # All of it is dropped, not migrated: the server folds outcomes from the
+    # events ledger now (rule-fire-events-spec §4), and a verdict an old
+    # hook had not yet written is nothing the server was ever told.
+    for k in ("open", "open_file", "closed", "open_at", "last_fire",
+              "obligations", "stops", "armed_fire"):
         st.pop(k, None)
-    if not isinstance(st.get("stops"), int):
-        st["stops"] = 0
     if not isinstance(st.get("armed_once"), list):
         st["armed_once"] = []
-    if not isinstance(st.get("armed_fire"), dict):
-        st["armed_fire"] = {}
     if not isinstance(st.get("armed_version"), dict):
         st["armed_version"] = {}
     return st
@@ -2964,11 +2832,10 @@ def stale_arming(st, rule):
 
 
 def drop_arming(st, rid):
-    """Forget a session arming and the open fire it carries; returns that
-    fire's id, if any, so the caller can close it in the ledger."""
+    """Forget a session arming. Which fire the discharge answers is not kept
+    here: the receipt is posted as an event and the server matches it."""
     st["armed"].pop(rid, None)
     st["armed_version"].pop(rid, None)
-    return st.setdefault("armed_fire", {}).pop(rid, None)
 
 
 # The session's obligation keys. A hook process reads the whole state file,
@@ -2979,16 +2846,9 @@ def drop_arming(st, rid):
 # keys are therefore merged by DELTA under a lock: what this process armed
 # is added, what it discharged is removed, and everything else is whatever
 # is on disk now.
-_ARMING_KEYS = ("armed", "armed_fire", "armed_version")
+_ARMING_KEYS = ("armed", "armed_version")
 _APPEND_KEYS = ("armed_once",)      # only ever appended to
-# `obligations` — one record per advisory FIRE, keyed by fire id — rides the
-# same delta merge and needs none of the conditions a rule-keyed map would:
-# a fire id is minted by exactly one hook, so an id this process removed was
-# resolved HERE and an id it added was fired HERE, and neither can collide
-# with another hook's. The Stop lane only FLAGS records (`closed`), under
-# the lock; it never adds or removes one, so a resolution always beats a
-# close and two fires of one rule are two keys, not one slot.
-_DELTA_KEYS = _ARMING_KEYS + ("obligations",)
+_DELTA_KEYS = _ARMING_KEYS
 
 
 def snapshot_arming(st):
@@ -3059,18 +2919,11 @@ def save_state(p, st, before=None):
                     if key not in before[k]:
                         merged[key] = v                # armed or fired here
                     elif before[k][key] != v:
-                        # re-versioned, or a record flagged closed by the
-                        # unlocked Stop fallback — never resurrected if the
-                        # file no longer holds it (resolved meanwhile)
-                        if k == "obligations" and key not in merged:
-                            continue
-                        merged[key] = v
+                        merged[key] = v                # re-versioned here
                 st[k] = merged
             for k in _APPEND_KEYS:
                 seen = list(cur.get(k) or [])
                 st[k] = seen + [x for x in st[k] if x not in seen]
-            # a monotonic counter: only the Stop lane moves it, forward
-            st["stops"] = max(int(cur.get("stops") or 0), int(st.get("stops") or 0))
         _write_json_atomic(p, st)
     except Exception:
         pass
@@ -3664,15 +3517,17 @@ def agent_id_of(data):
 
 
 def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None,
-              override_reasons=None):
+              override_reasons=None, fired_at=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
-    org opt-in. `override_reasons` is {rule_id: why} for the gates this call
+    org opt-in. `override_reasons` is {rule_id: why} for the GATES this call
     excused, so a row records the reason for ITS rule — one call can excuse one
     gate and be blocked by another (§5.3). `rulebook_id` is local too — POST /fires carries no book
     dimension (container spec §6.4), so it is absent from WIRE_KEYS on purpose;
     it is here so a local reader can tell which book a fire came from.
-    Returns {rule_id: fire_id} so conversions can point back."""
+    `fired_at` lets a caller stamp a fire and the event that answers it on
+    the same call (a same-call dismissal) with one instant.
+    Returns {rule_id: fire_id} so events can point back."""
     if portable_lock is None:
         # Enforcement still runs, but do not create telemetry that cannot drain.
         return {}
@@ -3688,13 +3543,13 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "rulebook_id": r.get("_rulebook_id"),
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
+                    "worktree": ctx.get("worktree"),
                     "source_message_id": ctx.get("source_message_id"),
                     "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
                     "dedup_key": (dedup_keys or {}).get(r["id"]),
                     "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
-                    "fired_at": _now(),
-                    "converted": None, "converted_at": None,
+                    "fired_at": fired_at or _now(),
                     "override_reason": (override_reasons or {}).get(r["id"]),
                     "excerpt": excerpt[:160],
                 }) + "\n")
@@ -3703,139 +3558,29 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     return ids
 
 
-def log_conversion(fire_id, how, converted=True, override_reason=None):
-    """Append-only sidecar (the fires file is shared across sessions, so it
-    is never rewritten in place). A reader merges by fire_id.
-
-    `converted=False` records a NON-conversion: the fire's obligation was
-    still open past its turns (`open_after_turns`), still open at session end
-    (`open_at_session_end`), or the agent set the advice aside by name
-    (`dismissed`, carrying the reason it gave). Neither the reader below nor
-    the server lets a False downgrade a True."""
+def log_event(ctx, kind, *, rule_id=None, reason=None, worktree=None, at=None):
+    """Append one observation to `events.jsonl` (rule-fire-events-spec §2).
+    `worktree` defaults to the call's checkout; pass `None` explicitly for a
+    receipt that must answer THIS session's fires only (a session- or
+    prompt-armed ordering rule — the sibling session down the hall fetching
+    does not answer for this one; the server matches a receipt with no
+    checkout by session). Never a verdict: which fire this answers, and
+    whether it does, is the server's fold. Fails silent like every ledger
+    write — an event that could not be appended is an outcome that stays
+    null, never a blocked call."""
     if portable_lock is None:
-        return
+        return None
     try:
-        row = {"fire_id": fire_id, "converted": bool(converted),
-               "converted_at": _now(), "how": how}
-        if override_reason:
-            row["override_reason"] = override_reason
-        with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a",
-                  encoding="utf-8") as f:
+        row = {"event_id": str(uuid.uuid4()), "kind": kind, "rule_id": rule_id,
+               "session_id": ctx["session"], "agent_id": ctx.get("agent_id"),
+               "worktree": worktree if worktree is not None or kind == "receipt" else ctx.get("worktree"),
+               "repo": ctx.get("repo"), "branch": ctx.get("branch"),
+               "reason": reason, "at": at or _now()}
+        with open(os.path.join(_ledger_dir(), "events.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
+        return row["event_id"]
     except Exception:
-        pass
-
-
-CLOSE_OPEN_AFTER_STOPS = 2   # a fire still pending at the 2nd Stop after it is recorded not converted
-
-# A record's `kind` says what can resolve it:
-#   signal    the rule carries converted_rx / content_rx — an action converts
-#             it, the Stop lane closes it
-#   ordering  an ordering advisory — the engine's receipt converts it, the
-#             Stop lane closes it
-#   plain     no conversion signal — no deterministic outcome exists, so it
-#             is never closed; it stays pending for a named dismissal only
-_STOP_CLOSES = ("signal", "ordering")
-
-
-def open_obligation(st, fid, rid, kind, file=None):
-    """One record per advisory fire. `opened_at` is None until the first Stop
-    that SEES the record stamps it: the wait is counted in Stops that
-    actually processed the fire, so a Stop that lands late (the hook is
-    asynchronous) or a counter this hook loaded stale can neither shorten
-    nor skip it."""
-    st["obligations"][fid] = {"rule": rid, "kind": kind, "opened_at": None,
-                              "file": file, "closed": False}
-
-
-def pending_fires(st, rid, kinds=None):
-    """`[(fire_id, record)]` of the rule's records, closed or not — a closed
-    fire is still pending until an action or a dismissal resolves it."""
-    return [(fid, rec) for fid, rec in st["obligations"].items()
-            if isinstance(rec, dict) and rec.get("rule") == rid
-            and (kinds is None or rec.get("kind") in kinds)]
-
-
-def resolve_fires(st, rid, how, *, kinds=None, converted=True, override_reason=None):
-    """Write the outcome for EVERY pending fire of the rule and drop the
-    records. Every fire, because the action (or the dismissal) answers all
-    the times the advice was given — and resolved is resolved, whatever a
-    concurrent Stop flagged meanwhile."""
-    done = []
-    for fid, _rec in pending_fires(st, rid, kinds):
-        log_conversion(fid, how, converted=converted, override_reason=override_reason)
-        st["obligations"].pop(fid, None)
-        done.append(fid)
-    return done
-
-
-def reconcile_shared_receipts(st, resolved):
-    """Drop the ordering records another session's receipt already answered
-    (``OrderingEngine.resolved_fires``). No outcome is written here: the
-    session that ran the receipt wrote the ``true`` for every fire the
-    engine held, this session's included — closing or dismissing it now
-    would put a ``false`` beside an honest ``true``."""
-    for fid, rec in list(st["obligations"].items()):
-        if isinstance(rec, dict) and rec.get("kind") == "ordering" \
-                and fid in resolved.get(rec.get("rule"), ()):
-            st["obligations"].pop(fid, None)
-
-
-def close_open_obligations(session, *, final, resolved=None):
-    """Record `converted=false` for this session's fires still waiting on a
-    conversion — the Stop lane's job (one Stop = one assistant turn) and
-    `flush final`'s sweep.
-
-    Age is counted in Stops, not seconds: a fire from turn N closes at the
-    Stop that ends turn N+1, so the agent had the rest of the turn it fired in
-    and one whole turn after. `final` closes everything open at once — but
-    SessionEnd is not reliable (a closed window skips it), which is why the
-    per-turn close is the writer and the sweep is only a sweep.
-
-    A close is not a verdict. The record is FLAGGED, never removed: the
-    conversion pass keeps watching a closed fire, so an action that lands
-    later still records `converted=true` (and the server keeps a true over a
-    false). What a close changes is the default: a fire nobody acted on now
-    says so. Only `signal` and `ordering` records close — a `plain` fire has
-    no deterministic outcome and stays null unless dismissed."""
-    sp = state_path(session)
-    # The Stop hook runs asynchronously beside the next turn's tool hooks, so
-    # the whole read-modify-write is done under the session lock: nothing
-    # loaded here can go stale before it is written back, and a tool hook
-    # that loaded earlier merges its own delta against this write. Only if
-    # the lock cannot be had (LOCK_WAIT_S) does it fall back to the delta
-    # save every hook uses.
-    lock = _state_lock(sp)
-    try:
-        st = load_state(sp)
-        before = None if lock is not None else snapshot_arming(st)
-        if resolved:
-            reconcile_shared_receipts(st, resolved)
-        if not final:
-            st["stops"] = int(st.get("stops") or 0) + 1
-        for fid, rec in st["obligations"].items():
-            if not isinstance(rec, dict) or rec.get("closed") or rec.get("kind") not in _STOP_CLOSES:
-                continue
-            if not final:
-                if rec.get("opened_at") is None:
-                    rec["opened_at"] = st["stops"]     # the first Stop to see it: the wait starts
-                    continue
-                if st["stops"] - int(rec["opened_at"]) < CLOSE_OPEN_AFTER_STOPS - 1:
-                    continue
-            log_conversion(fid, "open_at_session_end" if final else "open_after_turns",
-                           converted=False)
-            rec["closed"] = True
-        if lock is not None:
-            _write_json_atomic(sp, st)
-        else:
-            save_state(sp, st, before=before)
-    finally:
-        if lock is not None:
-            try:
-                portable_lock.unlock(lock.fileno())
-            except Exception:
-                pass
-            lock.close()
+        return None
 
 
 # `RULEBOOK_OVERRIDE='[<label>] <why>'` — the label rides INSIDE the value.
@@ -3853,62 +3598,28 @@ def split_named_override(reason):
     return m.group(1).strip().lower(), m.group(2).strip()
 
 
-def apply_dismissals(st, rules, dismissals, *, forget_ordering_fire=None):
-    """Record each `{label: why}` as a dismissal — `converted=false` with the
-    reason — of every pending fire of the rule it names, closed or not. A
-    resolved fire (converted, or dismissed once) has no record and cannot be
-    dismissed again.
+def resolve_dismissals(rules, dismissals):
+    """Each `{label: why}` → the ONE rule it names, for a `dismissed` event.
+    Returns `(resolved, ambiguous)`: `[(rule, why)]` and `[(label, n)]`.
 
-    An ordering fire is also held by the engine (`open_fire`, worktree
-    state) or by this session's arming (`armed_fire`), which is how a later
-    receipt finds it to convert. A dismissed fire is consumed from there too
-    — `forget_ordering_fire(rule_id, fire_id)` for the engine — or the
-    receipt would log `true` over the person's explicit `false` and the
-    server's sticky-true merge would keep the receipt.
-
-    Titles are not unique across the union of books, so a label is resolved
-    against the rules with a fire PENDING: exactly one → recorded; more than
-    one → nothing recorded and the label reported back as ambiguous, so the
-    agent can name the rule by its id — and an exact id outranks a displayed
-    label, as the gate resolver does, so that recovery works even when one
-    rule's id equals another's label.
-    Returns `(recorded, ambiguous)`: `[(label, why)]` and `[(label, n)]`."""
+    Resolved against the whole book: this hook no longer knows which fires
+    are pending (the server does), and a dismissal of a rule with no fire to
+    answer is simply an event nothing folds. Titles are not unique across
+    the union of books, so a label that fits more than one rule records
+    nothing and is reported back as ambiguous, so the agent can name the
+    rule by its id — and an exact id outranks a displayed label, as the gate
+    resolver does, so that recovery works even when one rule's id equals
+    another's label."""
     done, ambiguous = [], []
     for label, why in dismissals.items():
         if not label or not why:
             continue
-        pending = [r for r in rules if str(r["id"]).lower() == label and pending_fires(st, r["id"])] \
-            or [r for r in rules
-                if str(r.get("_label") or r["id"]).lower() == label and pending_fires(st, r["id"])]
-        if len(pending) > 1:
-            ambiguous.append((label, len(pending)))
-            continue
-        if not pending:
-            continue
-        hit = pending[0]
-        rid = hit["id"]
-        # Ordering fires FIRST consume their engine / session reference —
-        # under the engine's lock — and only then is the dismissal written.
-        # The other order left a window: a sibling session's receipt could
-        # take the fire between the dismissal's false and the engine's
-        # forget, log its true, and the server's sticky-true would keep the
-        # receipt over the person's explicit no. A fire the engine reports
-        # as already resolved is dropped without a dismissal: the receipt
-        # won, honestly, and its true is already in the ledger.
-        for fid, _rec in pending_fires(st, rid, ("ordering",)):
-            if st.get("armed_fire", {}).get(rid) == fid:
-                st["armed_fire"].pop(rid, None)
-                continue
-            status = None
-            if forget_ordering_fire is not None:
-                try:
-                    status = forget_ordering_fire(rid, fid)
-                except Exception:
-                    status = None
-            if status == "resolved":
-                st["obligations"].pop(fid, None)
-        if resolve_fires(st, rid, "dismissed", converted=False, override_reason=why):
-            done.append((hit.get("_label") or rid, why))
+        hits = [r for r in rules if str(r["id"]).lower() == label] \
+            or [r for r in rules if str(r.get("_label") or r["id"]).lower() == label]
+        if len(hits) > 1:
+            ambiguous.append((label, len(hits)))
+        elif hits:
+            done.append((hits[0], why))
     return done, ambiguous
 
 
@@ -4107,24 +3818,21 @@ def main():
         session = data.get("session_id") if isinstance(data, dict) else None
         # A turn is the PERSON's turn: a subagent's Stop (top-level agent_id,
         # as harness_stop.py reads it) and a Stop re-entered while a stop hook
-        # is already running (`stop_hook_active`) advance nothing, or one
-        # parent turn would count as two and close its fires a turn early.
+        # is already running (`stop_hook_active`) are not turns, or one parent
+        # turn would count as two and the server would close its fires a
+        # turn early. The event says only that a turn ended; the server
+        # counts them (rule-fire-events-spec §3: the second one after a fire
+        # closes it), so a Stop that lands late still lands after the fire.
         own_turn = isinstance(data, dict) and not data.get("stop_hook_active") \
             and not str(data.get("agent_id") or "").strip()
         if session and own_turn:
             try:
-                # a receipt run by a sibling session in this checkout may
-                # have answered ordering fires this session still holds
-                resolved = None
-                try:
-                    _repo, root, _gitdir, branch = repo_of_call(data)
-                    if root:
-                        resolved = OrderingEngine(root, branch).resolved_fires()
-                except Exception:
-                    resolved = None
-                close_open_obligations(session, final=final, resolved=resolved)
+                repo, root, _gitdir, branch = repo_of_call(data)
             except Exception:
-                pass
+                repo, root, branch = "", "", ""
+            log_event({"session": session, "agent_id": None, "repo": repo or None,
+                       "branch": branch or None, "worktree": worktree_key(root)},
+                      "session_end" if final else "turn_end")
         flush_fires(final=final)
         return 0
     try:
@@ -4156,7 +3864,7 @@ def main():
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
-           "source_message_id": message_id_of(data)}
+           "source_message_id": message_id_of(data), "worktree": worktree_key(root)}
     if mode == "prompt":
         # UserPromptSubmit. It arms and says nothing: anything printed here is
         # injected above the person's own words, and an arming is not news —
@@ -4266,7 +3974,6 @@ def main():
             pass
     ordering = None
     dedup_keys = {}
-    by_id = {r["id"]: r for r in rules}
 
     # The events this call is. The tool call itself, always; and for a Bash
     # call that wrote files, one synthetic Write per file, so an edit rule sees
@@ -4317,32 +4024,26 @@ def main():
                            "fp": path, "body": "", "rtext": "", "resp": None,
                            "via": "bash-read", "read": read_facts(path, pulled=pulled)})
 
-    # Conversions: did this call perform the action an earlier fire asked for?
-    # Deterministic, under-counts, never over-counts (spec §5.1). A fire the
-    # Stop lane already closed is still watched: a late action is still the
-    # action, and its `true` outranks the close.
-    for fid, rec in list(st["obligations"].items()):
-        if not isinstance(rec, dict) or rec.get("kind") != "signal":
-            continue
-        r = by_id.get(rec.get("rule"))
-        if not r:
-            continue
-        crx = r.get("converted_rx")
-        if mode == "post" and tool == "Bash" and crx and cmd \
-                and re.search(crx, strip_comments(shell_only(cmd)), re.I | re.M):
-            log_conversion(fid, "converted_rx")
-            st["obligations"].pop(fid, None)
-            continue
-        if r.get("on") != "edit" or "content_rx" not in r:
-            continue
-        for ev in events:
-            if ev["phase"] == "pre" and ev["tool"] in EDIT_TOOLS \
-                    and ev["fp"] == rec.get("file") \
-                    and not evaluate(r, hook_phase="pre", tool=ev["tool"], file_path=ev["fp"],
-                                     body=ev["body"]):
-                log_conversion(fid, "re-edit-clears")
-                st["obligations"].pop(fid, None)
-                break
+    # Conversions (rule-fire-events-spec §2): did this call run the action a
+    # rule's `converted_rx` names? Posted as a `converted` event for EVERY
+    # such rule, whether or not it fired — this hook no longer knows what is
+    # pending, and does not need to: the server ignores a conversion with no
+    # earlier fire of the rule in this session, and a fire the Stop lane
+    # already closed is still answered by an action timestamped before the
+    # close. Deterministic, under-counts, never over-counts (spec §5.1).
+    if mode == "post" and tool == "Bash" and cmd:
+        stripped = strip_comments(shell_only(cmd))
+        for r in rules:
+            crx = r.get("converted_rx")
+            if crx and r.get("status", "active") == "active" and scope_ok(r, repo, gitdir):
+                try:
+                    hit = re.search(crx, stripped, re.I | re.M)
+                except re.error:
+                    hit = None
+                if hit:
+                    log_event(ctx, "converted", rule_id=r["id"])
+    # (A `content_rx` rule's re-edit conversion is deferred — spec §4: the
+    # fire would need to know its file, and the wire row does not carry it.)
 
     # A named override, or an edit marker, that names no gate on this call is
     # the agent setting an earlier advisory aside. Collected here, before the
@@ -4355,13 +4056,6 @@ def main():
     dismissals = {}
     if mode == "pre" and override_label is not None:
         dismissals[override_label] = override_reason
-    # Before anything answers an ordering record, drop the ones a sibling
-    # session's receipt already answered in this checkout.
-    if any(isinstance(rec, dict) and rec.get("kind") == "ordering" for rec in st["obligations"].values()):
-        try:
-            reconcile_shared_receipts(st, OrderingEngine(root, branch).resolved_fires())
-        except Exception:
-            pass
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -4419,29 +4113,18 @@ def main():
                     outcome = None
                 if outcome == "discharged":
                     # The session's own arming is discharged here, not in the
-                    # worktree state: it was never written there. Its open
-                    # fire lives beside it for the same reason — a sibling
-                    # session sharing the checkout must not convert it.
-                    logged = set()
-                    fid = drop_arming(st, rid)
-                    if fid:
-                        log_conversion(fid, "discharged")
-                        logged.add(fid)
-                    # every open fire the engine held for the rule — this
-                    # session's and any sibling's — is answered by the receipt
-                    engine_fires = r.get("_converted_fires") or (
-                        [r["_converted_fire"]] if r.get("_converted_fire") else [])
-                    for cf in engine_fires:
-                        if cf not in logged:
-                            log_conversion(cf, "discharged")
-                            logged.add(cf)
-                    # The receipt answers EVERY fire of the rule this session
-                    # is waiting on, not only the one the engine marked last:
-                    # the earlier ones were the same advice, given earlier.
-                    for pf, _rec in pending_fires(st, rid, ("ordering",)):
-                        if pf not in logged:
-                            log_conversion(pf, "discharged")
-                        st["obligations"].pop(pf, None)
+                    # worktree state: it was never written there.
+                    drop_arming(st, rid)
+                    # The green receipt, as a fact for the server to fold. A
+                    # checkout-armed rule's receipt carries the checkout key,
+                    # so it answers every fire of the rule in this checkout —
+                    # this session's and any sibling's. A session- or
+                    # prompt-armed rule's obligation belongs to THIS session
+                    # (the sibling down the hall fetching does not answer for
+                    # this one), so its receipt carries no checkout and the
+                    # server matches it by session.
+                    log_event(ctx, "receipt", rule_id=rid,
+                              worktree=None if session_scoped(r) else ctx["worktree"])
                 elif outcome == "fired":
                     dedup_keys[rid] = f"{rid}@{root}:{branch}"
                     fired_now.append(r)
@@ -4489,14 +4172,20 @@ def main():
             fired_now.append(r)
             fired_on[rid] = ev
 
-    def _forget_ordering_fire(rid, fid):
-        # the engine is built lazily on this path — the usual dismissal
-        # command fires nothing and never needed it
-        return OrderingEngine(root, branch).forget_fire(rid, fid)
+    def _dismiss(dismissals):
+        """Post a `dismissed` event per rule the override names; returns the
+        acknowledgement lines' inputs. Which fires it answers — every fire of
+        the rule in this session before it, closed or not — is the server's
+        fold (rule-fire-events-spec §3)."""
+        resolved, ambiguous = resolve_dismissals(rules, dismissals) if dismissals else ([], [])
+        recorded = []
+        for r, why in resolved:
+            log_event(ctx, "dismissed", rule_id=r["id"], reason=why)
+            recorded.append((r.get("_label") or r["id"], why))
+        return recorded, ambiguous
 
     if not fired_now:
-        set_aside, ambiguous = apply_dismissals(
-            st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
+        set_aside, ambiguous = _dismiss(dismissals)
         save_state(sp, st, before=before)
         if set_aside or ambiguous:
             # Say so on both channels: a recorded reason nobody can see is
@@ -4576,8 +4265,6 @@ def main():
                 overridden[named[0]["id"]] = why
             elif named:
                 ambiguous_gate = (label, len(named))
-    set_aside, ambiguous = apply_dismissals(
-        st, rules, dismissals, forget_ordering_fire=_forget_ordering_fire) if dismissals else ([], [])
     gates = [r for r in fired_now if r["id"] in gate_ids]
     # §11: precedence between books is the hook's, and it is an ORDERING —
     # the wider book's rule is what MAX_ADVISE keeps when two books both fire
@@ -4596,12 +4283,21 @@ def main():
     # failure a gate exists to prevent
     shown, cut = gates + advisories[:MAX_ADVISE], advisories[MAX_ADVISE:]
     # The named form on the very call that FIRES the advisory: the agent knew
-    # the command would trip it and said why up front. That fire has no record
-    # yet, so it is answered at registration — its ledger row carries the
-    # reason and it is resolved as dismissed before it ever waits. Resolved
-    # against the advisories SHOWN (a fire the cap cut is a suppressed row
-    # with no outcome to give), exact id first, and never when the same
-    # override already excused a gate: one named override answers one rule.
+    # the command would trip it and said why up front. The fire and its
+    # `dismissed` event are stamped with one instant, so the event is never
+    # earlier than the fire it answers. Resolved against the advisories SHOWN
+    # (a fire the cap cut is a suppressed row with no outcome to give), exact
+    # id first, and never when the same override already excused a gate: one
+    # named override answers one rule.
+    # A label that names a rule firing on THIS call is answered here and only
+    # here — a gate excused above, an advisory dismissed at its own fire
+    # below, a cut one with no outcome to give — never also as a dismissal
+    # of the rule's earlier fires, which the event at the fire's instant
+    # already answers server-side.
+    if override_label is not None and any(
+            override_label in (str(r["id"]).lower(), _label_of(r)) for r in fired_now):
+        dismissals.pop(override_label, None)
+    set_aside, ambiguous = _dismiss(dismissals)
     same_call = {}
     gate_took_it = any(override_label in (str(r["id"]).lower(), _label_of(r))
                        for r in gates if r["id"] in overridden) if override_label else False
@@ -4742,40 +4438,26 @@ def main():
             return f"bash-read {ev['fp']}"
         return cmd or fp or ""
 
+    fired_at = _now()
     ids = {}
     for r in (r for r in shown if r["id"] not in gate_ids):
+        # An advise row carries no reason: a same-call dismissal is the event
+        # below, and the row's outcome columns are the server's to write.
         ids.update(log_fires(ctx, [r], hook_phase=mode, mode="advise", excerpt=_excerpt(r),
-                             raw_counts=raw, dedup_keys=dedup_keys, override_reasons=same_call))
+                             raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at))
     if gates:      # a blocked call and an overridden one are both delivered gate fires
         ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
-                             override_reasons=overridden))
+                             override_reasons=overridden, fired_at=fired_at))
     for r in cut:   # the per-call cap has a cost; make it visible, never silent
         log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
-                  raw_counts=raw, dedup_keys=dedup_keys)
+                  raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at)
     for r in shown:
         st["raw"][r["id"]] = 0
-        fid = ids.get(r["id"])
-        has_signal = r.get("converted_rx") or (r.get("on") == "edit" and "content_rx" in r)
-        is_ordering = r.get("on") == "ordering"
-        if is_ordering and session_scoped(r) and fid:
-            st.setdefault("armed_fire", {})[r["id"]] = fid
-        elif is_ordering and ordering and fid:
-            ordering.mark_fired(r["id"], fid)
-        if fid and r["id"] in same_call:
-            # dismissed on the call that fired it: outcome written, no wait
-            log_conversion(fid, "dismissed", converted=False, override_reason=same_call[r["id"]])
-        elif fid and r["id"] not in gate_ids:
-            # Every advisory fire gets its own record — a call-scoped rule
-            # firing five times is five records, each closed at its own age
-            # and all converted by the action that answers them. A gate's
-            # fire is answered on its own call (blocked, or excused with a
-            # reason) and is never waited on, closed or dismissed later,
-            # whatever signal its matcher also carries.
-            kind = "ordering" if is_ordering else ("signal" if has_signal else "plain")
-            ev = fired_on.get(r["id"])
-            open_obligation(st, fid, r["id"], kind,
-                            file=((ev["fp"] if ev else fp) if r.get("on") == "edit" else None))
+        if ids.get(r["id"]) and r["id"] in same_call:
+            # dismissed on the call that fired it — an event at the fire's
+            # own instant, which the server folds before anything later
+            log_event(ctx, "dismissed", rule_id=r["id"], reason=same_call[r["id"]], at=fired_at)
     save_state(sp, st, before=before)
     return 0
 
