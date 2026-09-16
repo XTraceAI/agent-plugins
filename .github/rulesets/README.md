@@ -46,3 +46,14 @@ gh api repos/XTraceAI/agent-plugins/rules/branches/main   # verify the effective
 Bootstrapping note: a `workflow_dispatch` workflow can only be run once it
 exists on the default branch, so `Real agent evidence` is added to the live
 ruleset after the PR that introduces real-agent-evidence.yml has merged.
+
+### Upgrade-notice evidence
+
+The Claude live check requires a successful native hook response carrying the
+error code, fresh minimum version and restart instruction in both agent context
+and the user-facing message. The model must report that unpredictable version;
+paraphrasing other fields does not replace or invalidate the host-delivery proof.
+Missing notice fields, failed hook execution or a stale model answer still fail.
+Codex and Cursor retain their model-answer checks because this harness does not
+receive equivalent structured native hook-response events from those hosts.
+Response evidence retains fixed fields, never raw model replies or credentials.
