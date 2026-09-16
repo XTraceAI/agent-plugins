@@ -70,3 +70,38 @@ The standalone command and snapshots are in #198; Desktop indexing is separate.
 Run `python3 tests/readers_validation_test.py` and the existing plugin test
 contract. Corruption fixtures demonstrate behavior under synthetic failures;
 they are not claims that real user session files were found corrupted.
+
+
+### Paginated Codex history
+
+The read-only CLI groups validated paginated rollout files that share one native
+session ID. It emits each physical rollout's work once, including attempts beyond
+a later rewind cutoff. Persisted `token_usage_record` entries provide per-response
+accounting even when UI token meters reset. Response IDs deduplicate repeated
+ledger entries. From the first ledger entry onward, ledger usage replaces the
+parallel UI counters; any older legacy-only prefix keeps its existing handling.
+Without a ledger, `history_base` supplies the legacy cumulative baseline when
+available; an unavailable baseline leaves the first delta unknown.
+
+Original rollout record IDs retain their existing namespace. Continuations use
+the immutable rollout ID within the session namespace. A separate usage overlay
+preserves real-record IDs and order, reuses existing usage-only identities where
+possible, and adds stable per-response identities for otherwise unrepresented
+inferences. Appending a continuation or replaying does not renumber real work. The output has one
+session header with the original start time. File snapshots and final revision
+checks cover every group member. Ancestors precede their continuations; sibling
+rollouts use native start-time order with immutable IDs breaking ties. Paginated
+members without a native start time are rejected rather than given an invented
+chronology. The last native title update across that order wins; the sidecar is
+consulted only when no member contains a native title.
+
+A group must have one original and valid, acyclic references to discovered
+rollouts. Missing references, duplicate immutable IDs, inconsistent byte/ordinal
+bounds or malformed records remain explicit failures. An explicit path to a
+continuation cannot independently supply its undiscovered parent and is refused;
+select the native session ID or use unfiltered discovery. This does not add a
+native database dependency or change the separate cloud-capture transport.
+
+Regression: `python3 tests/codex_history_test.py` covers abandoned work, inherited
+usage, meter resets, response-ledger deduplication, replay/legacy IDs, source
+changes, and invalid/incomplete lineage.

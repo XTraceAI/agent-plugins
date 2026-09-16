@@ -537,6 +537,31 @@ def upgrade_notice_evidence(text, fields, nonce, server_contacted):
     }
 
 
+def upgrade_response_diagnostics(events, text, fields):
+    """Distinguish answer extraction from model omission without retaining text."""
+    result = next((e for e in reversed(events) if e.get("type") == "result"), {})
+    assistant_text = "\n".join(
+        block.get("text", "") for event in events if event.get("type") == "assistant"
+        for block in event.get("message", {}).get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str))
+    hook_text = "\n".join(
+        str(event.get(key, "")) for event in events if event.get("subtype") == "hook_response"
+        for key in ("stdout", "output"))
+    subtype = result.get("subtype")
+    return {
+        "result_kind": subtype if subtype in ("success", "error_max_turns", "error_max_budget_usd",
+                                               "error_during_execution", "error_max_structured_output_retries") else "other",
+        "result_has_structured_output": isinstance(result.get("structured_output"), dict),
+        "final_text_has_restart": "restart" in str(text).lower(),
+        "assistant_text_has_restart": "restart" in assistant_text.lower(),
+        "hook_output_has_restart": "restart" in hook_text.lower(),
+        "final_text_has_relaunch": "relaunch" in str(text).lower(),
+        "final_text_has_new_session": "new session" in str(text).lower(),
+        "remediation_has_relaunch": "relaunch" in str(fields.get("remediation", "")).lower(),
+        "remediation_has_new_session": "new session" in str(fields.get("remediation", "")).lower(),
+    }
+
+
 UPGRADE_REQUIRED_EVIDENCE = ("server_contacted", "error_code_reported", "minimum_version_reported", "restart_reported")
 
 
@@ -570,6 +595,7 @@ def run_rejection(args, report, model):
                 if args.host == "claude":
                     report.check("rejection_hook_health", lambda: claude_hook_health(events))
                 text, fields = final_answer(events, args.host)
+                report.data["upgrade_response_diagnostics"] = upgrade_response_diagnostics(events, text, fields)
                 evidence = upgrade_notice_evidence(text, fields, nonce, server.requests)
                 report.data["upgrade_notice_evidence"] = evidence
                 missing = [name for name in UPGRADE_REQUIRED_EVIDENCE if not evidence[name]]

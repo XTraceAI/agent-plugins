@@ -56,6 +56,23 @@ class ReleaseChecksTests(unittest.TestCase):
         self.assertTrue(all(type(value) is bool for value in evidence.values()))
         self.assertNotIn("secret", json.dumps(evidence))
 
+    def test_upgrade_response_diagnostics_separate_sources_without_exposing_text(self):
+        events = [
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "restart secret-output"}]}},
+            {"subtype": "hook_response", "stdout": "restart secret-hook"},
+            {"type": "result", "subtype": "success", "result": "secret-result"},
+        ]
+        details = agent.upgrade_response_diagnostics(events, "open a new session secret-result", {})
+        self.assertTrue(details["assistant_text_has_restart"])
+        self.assertTrue(details["hook_output_has_restart"])
+        self.assertFalse(details["final_text_has_restart"])
+        self.assertTrue(details["final_text_has_new_session"])
+        self.assertEqual(details["result_kind"], "success")
+        self.assertNotIn("secret", json.dumps(details))
+        events[-1]["subtype"] = "secret-subtype"
+        self.assertEqual(agent.upgrade_response_diagnostics(events, "", {})["result_kind"], "other")
+        self.assertFalse(agent.upgrade_notice_evidence("open a new session", {}, "999.1.2", True)["restart_reported"])
+
     def test_upgrade_nonce_is_fresh_and_acceptable_to_the_hook(self):
         import re
         seen = {agent.upgrade_nonce() for _ in range(20)}
