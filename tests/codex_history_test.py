@@ -105,6 +105,41 @@ def test_group_title_uses_sidecar_only_without_native_updates():
         assert result.returncode == 0 and rows[0]['title'] == 'Sidecar title', (result.stderr, rows)
 
 
+def test_explicit_paths_read_the_whole_group_inside_and_outside_native_root():
+    for exported in [False, True]:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            parent, child, _, _ = fixture(home)
+            if exported:
+                folder = home/'export'
+                folder.mkdir()
+                parent = parent.rename(folder/parent.name)
+                child = child.rename(folder/child.name)
+            else:
+                folder = child.parent/'another-date'
+                folder.mkdir()
+                child = child.rename(folder/child.name)
+            outputs = []
+            for path in [parent, child]:
+                result, records = cli.run(home, 'codex', '--session', str(path))
+                assert result.returncode == 0 and len(records) == 7, (result.stderr, len(records))
+                outputs.append(records)
+            assert outputs[0] == outputs[1]
+            parent.unlink()
+            result, records = cli.run(home, 'codex', '--session', str(child))
+            assert result.returncode == 2 and not records
+
+
+def test_explicit_group_rejects_symlinked_continuations():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        parent, child, _, _ = fixture(home)
+        hidden = child.rename(home/'hidden.jsonl')
+        child.symlink_to(hidden)
+        result, records = cli.run(home, 'codex', '--session', str(parent))
+        assert result.returncode == 2 and not records, result.stderr
+
+
 def test_missing_or_invalid_references_never_emit_a_partial_group():
     for scenario in ('missing', 'byte-boundary', 'ordinal-boundary', 'duplicate', 'cycle'):
         with tempfile.TemporaryDirectory() as td:
