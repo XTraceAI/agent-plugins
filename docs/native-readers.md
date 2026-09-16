@@ -108,3 +108,18 @@ This does not add a native database dependency or change cloud capture.
 Regression: `python3 tests/codex_history_test.py` covers abandoned work, inherited
 usage, meter resets, response-ledger deduplication, replay/legacy IDs, source
 changes, and invalid/incomplete lineage.
+
+### Codex subagent context
+
+Paginated subagent histories can copy another session's metadata and messages
+before `subagent_history_start_ordinal`. The first metadata record remains the
+child's identity. Upstream defines the earlier ordinals as inherited model
+context, excluded from the child's own turn/item projection
+([Codex protocol](https://github.com/openai/codex/blob/3c6f32ca8293e24879859501793f31422d2012be/codex-rs/protocol/src/protocol.rs)).
+
+The read-only stream retains those legacy record IDs with `isMeta: true`, so
+consumers can correct existing index classifications without deleting history.
+They carry no measured usage and must be excluded from work totals. Child work
+retains its previous IDs, while usage and titles are derived from the child's
+own projection. Ordinals must still be consecutive; an incomplete/invalid
+boundary or metadata outside the declared inherited prefix is rejected.
