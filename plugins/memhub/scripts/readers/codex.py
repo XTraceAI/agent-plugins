@@ -255,6 +255,47 @@ def _session_meta(rollout: list[dict]) -> dict:
     return {}
 
 
+# Codex runs its own threads alongside the person's: action-review "guardian"
+# reviews, spawned subagents, and whatever it adds next. Each copies the
+# conversation it is reviewing, so its first user message — and therefore its
+# title — reads "The following is the Codex agent history whose request action
+# you are…". They look like real work. In MemHub staging they were 103 of 298
+# captured Codex sessions (35%), and none of them are anything a person began.
+#
+# The rollout header says which it is: `session_meta.payload.thread_source`,
+# present since roughly cli 0.142. This is an ALLOWLIST, deliberately: a
+# thread is captured only when Codex says it belongs to the person. The bot
+# literals ("subagent", "guardian", …) are Codex's to rename and extend, and a
+# denylist would silently admit every future one.
+OWN_THREAD_SOURCES = (None, "", "user")
+
+# Report-only, and deliberately NOT part of the gate: these are the kinds we
+# already know are Codex's own, so skipping one is routine and silent. Any
+# OTHER non-user value is a kind we have never seen, which is the allowlist's
+# one real risk — if Codex renames the marker for ordinary sessions, capture
+# would stop for everyone. Callers say so out loud in that case instead of
+# skipping quietly. Adding a name here suppresses an alarm; it never admits a
+# thread that `is_own_thread` rejects.
+KNOWN_BOT_THREAD_SOURCES = ("subagent", "guardian", "review", "collab")
+
+
+def thread_source_of(rollout: list[dict]) -> str | None:
+    """`thread_source` off the rollout header; None when absent or not a str."""
+    value = _session_meta(rollout).get("thread_source")
+    return value if isinstance(value, str) else None
+
+
+def is_own_thread(rollout: list[dict]) -> bool:
+    """True when this rollout is a thread the person started.
+
+    Absent counts as the person's: rollouts written before Codex added the
+    field carry no `thread_source` at all and are ordinary user sessions.
+    Anything else is Codex talking to itself — including a value we do not
+    recognise, which callers should report rather than drop in silence.
+    """
+    return thread_source_of(rollout) in OWN_THREAD_SOURCES
+
+
 _USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -843,6 +884,26 @@ def _metadata_from_header(header: dict, *, strict: bool = True) -> dict:
 def session_metadata(path, *, strict: bool = True) -> dict:
     """Read typed native metadata; missing optional facts remain unknown."""
     return _metadata_from_header(_session_header(path, strict=strict), strict=strict)
+
+
+def thread_source_of_path(path, *, strict: bool = False) -> str | None:
+    """`thread_source` for a rollout on disk, via the bounded header read.
+
+    Capture gates on this per event, so it must not cost a full parse of an
+    ever-growing rollout.
+    """
+    return thread_source_of([_session_header(path, strict=strict)])
+
+
+def is_own_thread_path(path, *, strict: bool = False) -> bool:
+    """`is_own_thread` for a rollout on disk — the same predicate, one header.
+
+    Discovery uses this to keep Codex's own threads out of the candidates it
+    offers: a guardian review *contains a copy* of the conversation it is
+    reviewing, so it looks like an unusually strong match to anything scoring
+    sessions by content.
+    """
+    return is_own_thread([_session_header(path, strict=strict)])
 
 
 def session_cwd(path) -> str | None:

@@ -122,7 +122,18 @@ def upgrade_context(payload: bytes) -> str | None:
     hook = {"cwd": data.get("cwd") or (roots[0] if roots else os.getcwd()),
             "session_id": data.get("conversation_id", ""), "tool_name": "Bash"}
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("rulebook_hook.py")), "upgrade"],
+        # `conversation_id` is passed through bare above, while cursor_flush
+        # uploads the session as `cursor-<uuid>` — the mismatch that leaves
+        # every Codex fire unlinked (ENG-1075) would be Cursor's too.
+        #
+        # Inert today, and deliberately so: the `upgrade` lane returns before
+        # rulebook_hook builds its ctx, so --host is not read here and Cursor
+        # has no rule-evaluation lane to log a fire from. It is passed because
+        # this is the one place Cursor names itself to the hook; the namespace
+        # itself is enforced in rulebook_hook.wire_session_id, which already
+        # handles `cursor`.
+        [sys.executable, str(Path(__file__).with_name("rulebook_hook.py")),
+         "upgrade", "--host", "cursor"],
         input=json.dumps(hook).encode(), capture_output=True, timeout=2, check=False)
     if result.stdout:
         return json.loads(result.stdout).get("hookSpecificOutput", {}).get("additionalContext")

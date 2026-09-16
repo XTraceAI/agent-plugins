@@ -106,6 +106,21 @@ _REASONS = {
     # dealt with.
     "budget_exhausted": "capture ran out of time before it finished sending",
     "error": "the capture hook hit an unexpected error",
+    # Neither of the next two is a credential problem, so the default
+    # "/memhub:login --status" advice would send someone to inspect the one
+    # thing that is definitely fine. Both get their own remedy in `_message`.
+    #
+    # The Codex bridge could not find the plugin's scripts at all — usually an
+    # install that copied the manifest but not the linked directories.
+    "plugin_root_unresolved": ("this Codex install is missing the plugin's "
+                               "script files, so nothing was captured"),
+    # The allowlist in readers/codex.py did not recognise this rollout's
+    # `thread_source`. If Codex has renamed the marker for real user threads,
+    # capture stops for every session until the allowlist learns the new value
+    # — so this must be loud, not a silent skip.
+    "unknown_thread_source": ("Codex labelled this session with a thread kind "
+                              "the plugin does not recognise, so it was not "
+                              "captured"),
 }
 
 
@@ -483,6 +498,16 @@ def _message(host: str, token_problem: str | None,
                     "/memhub:import-session to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
+        elif reason == "plugin_root_unresolved":
+            # Nothing about the credential is wrong, and nothing retries on its
+            # own — the files have to come back first.
+            tail = ("Reinstall the MemHub plugin, then run the memhub:setup "
+                    "skill to confirm the bridge can find it.")
+        elif reason == "unknown_thread_source":
+            # The person cannot fix this one; reporting it is how the plugin
+            # finds out Codex changed the label before capture silently rots.
+            tail = ("That session was skipped. If it was ordinary work, please "
+                    "report it — the plugin needs to learn this thread kind.")
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

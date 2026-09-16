@@ -441,6 +441,34 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # send simply retries; the retry is bounded by the 60s cooldown (non-Stop)
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
+    # Codex's own threads (guardian action-reviews, spawned subagents) are not
+    # the person's work and must never be captured as sessions: they copy the
+    # conversation under review, so they arrive looking like real transcripts.
+    # Checked from the bounded header, before the parse — this runs per event.
+    try:
+        source = codex_reader.thread_source_of_path(rollout)
+    except (OSError, ValueError) as exc:
+        source = None                       # unreadable header: capture as usual
+        _log(f"could not read thread_source ({exc!r}) — treating as own thread")
+    if source not in codex_reader.OWN_THREAD_SOURCES:
+        known = source in codex_reader.KNOWN_BOT_THREAD_SOURCES
+        _log(f"not this person's thread (thread_source={source!r}) — not "
+             f"captured{'' if known else '; UNRECOGNISED kind, reporting it'}")
+        # A kind we already know is Codex's own is routine: skip quietly, and
+        # clear any earlier failure the way the other never-contacted-the-
+        # server no-ops do, so a stale last_error cannot outlive a session
+        # nothing will retry for.
+        #
+        # A kind we have NEVER seen is the allowlist's one real risk — if
+        # Codex renamed the marker for ordinary sessions, this path is every
+        # session, and a silent skip would rebuild the exact silent-capture-
+        # death bug on a new axis. Record it where capture_health will say so.
+        note = ({"last_error": None, "last_error_at": 0, "fail_streak": 0}
+                if known else
+                {"last_error": "unknown_thread_source",
+                 "last_error_at": time.time()})
+        _save_state(sid, skipped_thread_source=source, rollout_size=size, **note)
+        return
     records, meta = codex_reader.to_canonical(rollout)
     state = _read_state(sid)
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (

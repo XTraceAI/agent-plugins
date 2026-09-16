@@ -134,6 +134,24 @@ The detailed lifecycle below describes the Claude Code path. Codex and Cursor
 use equivalent host-specific readers and flushers under
 `plugins/memhub/scripts/`.
 
+Two Codex-specific rules fall out of that:
+
+- **Only threads you started are captured.** Codex runs its own threads
+  alongside yours — guardian action-reviews and spawned subagents — and each
+  one copies the conversation it is reviewing, so it looks like a real
+  transcript and takes its title from the reviewer's prompt. Capture reads
+  `thread_source` from the rollout header and ships a session only when Codex
+  says it is yours. A rollout old enough to predate that field still counts as
+  yours; an unfamiliar value is held back *and* logged, so a new Codex thread
+  kind shows up as a reported skip rather than a session that quietly stops
+  being captured.
+- **A broken install says so.** The bridge in `~/.codex` finds the plugin at
+  hook time. If the plugin's files are missing — the usual cause is an install
+  that copied the manifest but not the scripts — it used to exit quietly and
+  capture simply never happened. It now leaves a capture-health breadcrumb and
+  says once, at session start, that capture is off. `memhub:setup` reports the
+  same thing: wired handlers alone are no longer "OK".
+
 Capture runs on independent paths that all feed one server-side watermark
 (keyed on `conversation_id` = `session_id`), so re-sending never double-saves:
 
@@ -286,6 +304,17 @@ start names the books in play when there is more than one; in-flight advisories
 stay as short as they were. The server takes no position on any of this: it
 puts each rule's book, scope and member count on the wire and the client
 decides.
+
+A fire is reported under the same session identity capture used, so the fire
+history can show *which session* a rule fired in. That identity is namespaced
+per host — Claude sends the session id bare, Codex and Cursor send
+`codex-`/`cursor-`-prefixed, matching what their capture uploads. Before this,
+a Codex fire named the bare id while its session was stored prefixed, so every
+Codex fire showed as `Not linked yet`. The namespace is applied only on the
+wire: local ordering state, obligations and dedup keys still key off the raw
+id, so an in-flight session keeps its own state. Fires recorded by an older
+plugin keep the id they were written with and stay unlinked — linking those
+retroactively is a server-side change, not a client one.
 
 Authoring (`/memhub:create-rule`, `/memhub:rules-from-sessions`) resolves which
 book a rule lands in before drafting anything — one visible book is the answer,

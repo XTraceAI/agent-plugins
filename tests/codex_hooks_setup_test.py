@@ -65,7 +65,7 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         ]
         assert any(str(home) in command for command in commands)
         assert "${CODEX_HOME" not in installed_text
-        assert setup.status(home) == (True, 4, 4)
+        assert setup.status(home)[:3] == (True, 4, 4)
 
         again, count, second_backup = setup.install(home)
         assert not again and count == 4 and second_backup is None
@@ -121,7 +121,7 @@ def test_install_replaces_legacy_bridge_without_duplicates():
         assert "plugins/cache/xtrace-plugins" not in text
         assert "0.26/scripts/codex_flush.py" not in text
         assert "echo user" in text
-        assert setup.status(home) == (True, 4, 4)
+        assert setup.status(home)[:3] == (True, 4, 4)
     print("PASS test_install_replaces_legacy_bridge_without_duplicates")
 
 
@@ -429,7 +429,7 @@ def test_status_checks_materialized_windows_commands():
         doc = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
         doc["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] = "py -3 broken.py"
         (home / "hooks.json").write_text(json.dumps(doc), encoding="utf-8")
-        healthy, actual, expected = setup.status(home)
+        healthy, actual, expected, _root = setup.status(home)
         assert not healthy and actual == expected == 4
     print("PASS test_status_checks_materialized_windows_commands")
 

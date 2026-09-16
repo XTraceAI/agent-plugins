@@ -2473,10 +2473,45 @@ WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "re
              "source_message_id", "override_reason")
 
 
+# Capture namespaces a conversation id per host: Claude sends the session uuid
+# bare (flush_turn.py), Codex sends `codex-<uuid>` (codex_flush.py) and Cursor
+# `cursor-<uuid>` (cursor_flush.py). A fire carries the raw hook-payload
+# session id, so on Claude it matches the captured conversation by accident and
+# on the others it cannot match at all — every Codex fire shows "Not linked
+# yet" (ENG-1075). Namespace it HERE, at the wire, and nowhere else: ordering
+# state, obligations, dedup keys and state_path all key off the raw id, and
+# renaming that mid-session would strand an in-flight session's own state.
+def wire_session_id(session_id, host):
+    """The session id as CAPTURE wrote it, so the server can join the two.
+
+    Delegates to `pr_link.conversation_id_for`, which already owns this exact
+    projection for the PR-link lane — a second copy is how the two lanes come
+    to disagree about what a Codex session is called, and it already handles
+    the cases a fresh one forgets (surrounding whitespace, a host spelled
+    `Codex`, an id that already carries its prefix).
+
+    Imported lazily and on a fail-open path: only the flush lane projects rows,
+    so the per-call pre/post lanes never pay for the import, and a fire that
+    cannot be namespaced still ships (unlinked) rather than taking the hook
+    down.
+    """
+    try:
+        import pr_link
+        return pr_link.conversation_id_for(host, session_id) or session_id
+    except Exception:
+        return session_id
+
+
 def wire_row(row):
     """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
-    opt-in for excerpts is a server setting the hook does not consult)."""
-    return {k: row.get(k) for k in WIRE_KEYS}
+    opt-in for excerpts is a server setting the hook does not consult).
+
+    `host` is local-only, like `rulebook_id`: it is not a wire field, it is
+    how this projection knows which namespace the session id belongs in.
+    """
+    out = {k: row.get(k) for k in WIRE_KEYS}
+    out["session_id"] = wire_session_id(out.get("session_id"), row.get("host"))
+    return out
 
 
 def _read_rows(path, start=0, offsets=None):
@@ -3688,6 +3723,10 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "rulebook_id": r.get("_rulebook_id"),
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
+                    # Local-only (see wire_row): which host's namespace this
+                    # session id belongs to, recorded at fire time because the
+                    # flush that ships it may be a different invocation.
+                    "host": ctx.get("host"),
                     "source_message_id": ctx.get("source_message_id"),
                     "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
@@ -4076,6 +4115,26 @@ def refresh_if_stale(repo, rules, fetched_at, sources):
     return rules, fetched_at, sources
 
 
+def _host_arg(argv=None):
+    """`--host claude|codex|cursor` — which agent host this call came from.
+
+    Same flag the other hook scripts already take (`capture_health.py --host`,
+    `pr_link_trigger.py --host codex`). Defaults to claude, whose manifest
+    passes nothing, so existing behaviour is byte-for-byte unchanged.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    for i, arg in enumerate(args):
+        if arg == "--host" and i + 1 < len(args):
+            value = args[i + 1]
+            if value in ("claude", "codex", "cursor"):
+                return value
+        elif arg.startswith("--host="):
+            value = arg.split("=", 1)[1]
+            if value in ("claude", "codex", "cursor"):
+                return value
+    return "claude"
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     codex_pre = mode == "codex-pre"
@@ -4156,7 +4215,7 @@ def main():
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
-           "source_message_id": message_id_of(data)}
+           "source_message_id": message_id_of(data), "host": _host_arg()}
     if mode == "prompt":
         # UserPromptSubmit. It arms and says nothing: anything printed here is
         # injected above the person's own words, and an arming is not news —

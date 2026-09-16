@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -44,6 +45,75 @@ _HEALTH_TIMEOUT_S = 3
 # shell and edit tools only, because widening it costs the user a re-trust of
 # a file already in ~/.codex/hooks.json.
 _GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
+
+
+# A partial install — the staging build's `scripts/` is a relative symlink
+# escaping the plugin root, so any installer that copies only the plugin's own
+# subdirectory leaves it dangling (RELEASING.md) — used to end here in silence:
+# resolve_plugin_root() returned None and main() exited 0 with no output, no
+# record, and capture simply never happened. Leave a breadcrumb in the shape
+# capture_health already reads, and say so once per session. The breadcrumb
+# alone is not enough: capture_health.py lives in the very root we could not
+# find, so with no root there is nothing to read it back out.
+_STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
+_BRIDGE_STATE = _STATE_DIR / "_bridge.json"
+_UNRESOLVED = "plugin_root_unresolved"
+_UNRESOLVED_MESSAGE = (
+    "MemHub: this Codex install is missing the plugin's script files, so "
+    "session capture and Rulebook telemetry are OFF. Reinstall the MemHub "
+    "plugin, then run the memhub:setup skill to confirm it is healthy."
+)
+
+
+def _record_unresolved() -> None:
+    """Record the failure where capture_health looks for one.
+
+    Same ``last_error``/``last_error_at`` shape codex_flush writes, so the
+    next healthy session surfaces it through the ordinary health path rather
+    than needing a second reporting channel.
+    """
+    name = None
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="._bridge.", dir=_STATE_DIR)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"last_error": _UNRESOLVED,
+                       "last_error_at": time.time()}, handle)
+        os.replace(name, _BRIDGE_STATE)
+        name = None
+    except OSError:
+        pass          # a breadcrumb is never worth failing a hook over
+    finally:
+        # A failed flush-on-close or a replace that loses a Windows sharing
+        # race would otherwise strand the temp file — once per hook event,
+        # forever, in the one directory we ask users to keep.
+        if name is not None:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def _clear_unresolved() -> None:
+    """Retract the breadcrumb once a root resolves again.
+
+    A stale ``last_error`` outliving the failure it recorded is its own bug —
+    this hook has been bitten by exactly that on the recall lane.
+    """
+    try:
+        _BRIDGE_STATE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _report_unresolved(action: str, event: str) -> None:
+    """One visible line, on SessionStart only — it is once per session."""
+    _record_unresolved()
+    if action == "dispatch" and event == "SessionStart":
+        print(json.dumps({
+            "hookSpecificOutput": {"hookEventName": "SessionStart"},
+            "systemMessage": _UNRESOLVED_MESSAGE,
+        }))
 
 
 def _version_key(path: Path) -> tuple:
@@ -261,8 +331,10 @@ def _rulebook_payload(payload: bytes) -> bytes:
 
 
 def _rulebook_result(root: Path, payload: bytes, mode: str) -> subprocess.CompletedProcess:
+    # --host codex: capture uploads this session as `codex-<uuid>`, so a fire
+    # reported under the bare uuid can never be joined to it (ENG-1075).
     return _run(root, "rulebook_hook.py", _rulebook_payload(payload),
-                "codex-pre" if mode == "pre" else mode,
+                "codex-pre" if mode == "pre" else mode, "--host", "codex",
                 timeout=_SESSION_TIMEOUT_S if mode == "session" else 7)
 
 
@@ -378,7 +450,9 @@ def main() -> int:
         payload = sys.stdin.buffer.read()
         root = resolve_plugin_root()
         if root is None:
+            _report_unresolved(action, sys.argv[2] if len(sys.argv) > 2 else "")
             return 0
+        _clear_unresolved()
         if action == "dispatch" and len(sys.argv) > 2:
             _dispatch(root, payload, sys.argv[2])
         elif action == "directive-pre":
