@@ -4129,6 +4129,13 @@ def main():
     # earlier fire of the rule in this session, and a fire the Stop lane
     # already closed is still answered by an action timestamped before the
     # close. Deterministic, under-counts, never over-counts (spec §5.1).
+    # Collected here, POSTED after the fire pass below: a call that both fires
+    # a rule and matches its converted_rx (a failing-tests output rule whose
+    # signal is the same `pytest`) must not convert the fire it just caused —
+    # the two would share one second-precision instant, and an event at the
+    # fire's instant answers it. The old obligation logic converted only fires
+    # already open; skipping the rules THIS call fires is the same statement.
+    converted_hits = []
     if mode == "post" and tool == "Bash" and cmd:
         stripped = strip_comments(shell_only(cmd))
         for r in rules:
@@ -4139,7 +4146,7 @@ def main():
                 except re.error:
                     hit = None
                 if hit:
-                    log_event(ctx, "converted", rule_id=r["id"])
+                    converted_hits.append(r["id"])
     # (A `content_rx` rule's re-edit conversion is deferred — spec §4: the
     # fire would need to know its file, and the wire row does not carry it.)
 
@@ -4269,6 +4276,11 @@ def main():
             dedup_keys[rid] = key
             fired_now.append(r)
             fired_on[rid] = ev
+
+    fired_ids = {r["id"] for r in fired_now}
+    for rid in converted_hits:
+        if rid not in fired_ids:
+            log_event(ctx, "converted", rule_id=rid)
 
     def _dismiss(dismissals):
         """Post a `dismissed` event per rule the override names; returns the

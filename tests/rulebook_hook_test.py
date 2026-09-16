@@ -2732,6 +2732,10 @@ def min_hook_version_checks() -> None:
             {"id": "nosig-call", "title": "nosig-call", "on": "bash", "rx": r"\bcurl\b",
              "fire_scope": "call", "repo_scope": "any",
              "text": "Prefer the SDK over raw curl", "why": "w"},
+            # an OUTPUT rule whose conversion signal is the very command that fires it
+            {"id": "red-tests", "title": "red-tests", "on": "result", "cmd_rx": r"\bpytest\b",
+             "rx": r"\bfailed\b", "fire_scope": "call", "repo_scope": "any",
+             "converted_rx": r"\bpytest\b", "text": "Fix the red tests before moving on", "why": "w"},
             # an ordering ADVISORY armed by edits: its receipt answers the CHECKOUT
             {"id": "ord-adv", "title": "ord-adv", "on": "ordering", "repo_scope": "any",
              "ordering": {"required_command_rx": r"pytest\s+\S*tests/architecture",
@@ -2825,7 +2829,21 @@ def min_hook_version_checks() -> None:
               len([r for r in [fire_id("o2", "lint-first")] if r]) == 1
               and len(events("o2", "converted", "lint-first")) == 1)
         bash("o2", "git status", mode="post", resp=ok)
-        check("outcomes: a command that converts nothing posts nothing", len(events("o2", "converted")) == 2)
+        check("outcomes: a command that converts nothing posts nothing",
+              len(events("o2", "converted")) == 3)      # tests-first + red-tests on the pytest, lint-first on the ruff
+        # a call that FIRES a rule and matches its converted_rx must not
+        # convert the fire it just caused: the failing run fires red-tests
+        # and posts no conversion for it; the green run that follows does
+        rc, out = bash("o31", "uv run pytest -q", mode="post", resp={"stdout": "1 failed, 2 passed", "exit_code": 1})
+        red = fire_id("o31", "red-tests")
+        check("outcomes: the failing run fires the output rule",
+              red is not None and "[red-tests]" in ctx(out), ctx(out))
+        check("outcomes: …and posts no conversion for the rule it fired (tests-first, not fired here, still converts)",
+              not events("o31", "converted", "red-tests") and len(events("o31", "converted", "tests-first")) == 1,
+              str(events("o31", "converted")))
+        bash("o31", "uv run pytest -q", mode="post", resp={"stdout": "3 passed", "exit_code": 0})
+        check("outcomes: the green run that fires nothing converts it",
+              len(events("o31", "converted", "red-tests")) == 1 and fire_id("o31", "red-tests")["fire_id"] == red["fire_id"])
 
         # 4. a named override on a LATER command dismisses a rule by label
         bash("o3", "sudo ls /etc")
