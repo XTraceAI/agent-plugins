@@ -596,7 +596,19 @@ def main(argv=None) -> int:
         cursor_counts = Counter()
     elif args.host != "cursor":
         cursor_counts = None
+    latest_native_id = None
+    if args.host == "codex" and args.session == "latest":
+        try:
+            with regular_source(latest, entry_identity(latest_basis[1])) as (handle, observed):
+                if file_observation(latest, observed)[1:] != latest_basis[1][1:]:
+                    raise SourceChanged("latest source changed")
+                latest_native_id = native_text(reader._session_header(handle).get("payload", {}).get("id"), required=True)
+        except (OSError, ValueError, TypeError, AttributeError):
+            diagnostic("source_changed", latest)
+            return 2
     prepared = []
+    codex_headers = {}
+    history_groups = {}
     counts = Counter()
     for session in sessions:
         path = Path(session["path"])
@@ -644,6 +656,7 @@ def main(argv=None) -> int:
                 with regular_source(path, revision_identity(revision, path)) as (handle, _):
                     source_header = reader._session_header(handle)
                 sid = native_text(source_header.get("payload", {}).get("id"), required=True)
+                codex_headers[path] = source_header
                 native = None
             else:
                 meta_text = None
@@ -663,7 +676,7 @@ def main(argv=None) -> int:
                 # Identity must participate in ambiguity checks, but an unrelated
                 # header must not make an otherwise healthy selection incomplete.
                 if args.session == "latest":
-                    if path != latest:
+                    if sid != latest_native_id:
                         continue
                 elif sid != args.session.removesuffix(".jsonl"):
                     continue
@@ -676,6 +689,38 @@ def main(argv=None) -> int:
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
                 OverflowError, RuntimeError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
+    if args.host == "codex":
+        from readers import codex_history
+        grouped = {}
+        for item in prepared:
+            grouped.setdefault(item[2]["conversation_id"], []).append(item)
+        selected = []
+        for conversation, items in grouped.items():
+            referenced = any(codex_headers[item[0]]["payload"].get("history_base") is not None
+                             for item in items)
+            if counts[conversation] == 1 and not referenced:
+                selected.extend(items)
+                continue
+            try:
+                if len(items) != counts[conversation]:
+                    raise ValueError("a group member was unreadable")
+                path, revision, header, group = codex_history.plan(items, codex_headers)
+                history_groups[path] = group
+                if latest in {item[0] for item in items}:
+                    latest = path
+                selected.append((path, revision, header))
+                counts[conversation] = 1
+            except (ValueError, KeyError, TypeError, RecursionError):
+                for item in items:
+                    diagnostic("discovery_incomplete", item[0])
+        prepared = selected
+
+    def current_revision(path):
+        if path in history_groups:
+            return tuple(entry for _, segment, _, _, _ in history_groups[path]
+                         for entry in source_revision(segment, args.host))
+        return source_revision(path, args.host)
+
     # Reject every candidate sharing an actual native identity before emitting
     # any of them. File names alone do not establish Codex session identity.
     if cursor_counts is not None:
@@ -705,23 +750,23 @@ def main(argv=None) -> int:
             continue
         try:
             if titles is None and args.since is not None and header["mtime"] < args.since:
-                if source_revision(path, args.host) != revision:
+                if current_revision(path) != revision:
                     diagnostic("source_changed", path)
                 continue
             records = []
             used_title = []
             if not args.metadata_only:
-                with source_snapshot(path, args.host, revision) as snapshot:
-                    def fallback_title(sid):
-                        observation = titles.get(sid)
-                        # Remember the index stamp too: an undated row keeps
-                        # its tuple across unrelated index changes, but its
-                        # effective mtime came from that stamp.
-                        used_title.append((observation, titles.stamp))
-                        header["mtime"] = max(header["mtime"], titles.mtime(observation))
-                        return observation[0]
-                    options = {"title_index": fallback_title} if titles is not None else {}
-                    records, native = reader.to_canonical(snapshot, strict=True, **options)
+                def fallback_title(sid):
+                    observation = titles.get(sid)
+                    used_title.append((observation, titles.stamp))
+                    header["mtime"] = max(header["mtime"], titles.mtime(observation))
+                    return observation[0]
+                options = {"title_index": fallback_title} if titles is not None else {}
+                if path in history_groups:
+                    records, native = codex_history.read(history_groups[path], source_snapshot, **options)
+                else:
+                    with source_snapshot(path, args.host, revision) as snapshot:
+                        records, native = reader.to_canonical(snapshot, strict=True, **options)
                 if native.get("session_id") != header["native_session_id"]:
                     raise ValueError("native identity changed during read")
                 if args.host == "cursor":
@@ -745,7 +790,7 @@ def main(argv=None) -> int:
                         titles.stamp_bound(observation) and titles.stamp != stamp_used):
                     diagnostic("source_changed", path)
                     continue
-            if source_revision(path, args.host) != revision or (
+            if current_revision(path) != revision or (
                     latest_basis is not None and not basis_unchanged(latest_basis)):
                 diagnostic("source_changed", path)
                 continue

@@ -70,3 +70,28 @@ The standalone command and snapshots are in #198; Desktop indexing is separate.
 Run `python3 tests/readers_validation_test.py` and the existing plugin test
 contract. Corruption fixtures demonstrate behavior under synthetic failures;
 they are not claims that real user session files were found corrupted.
+
+
+### Paginated Codex history
+
+The read-only CLI groups validated paginated rollout files that share one native
+session ID. It emits each physical rollout's work once, including attempts beyond
+a later rewind cutoff. `history_base` is used to recover the inherited cumulative
+token baseline, so copied counters do not become new usage. If that baseline is
+unavailable, the first delta stays unknown rather than being guessed.
+
+Original rollout record IDs retain their existing namespace. Continuations use
+the immutable rollout ID within the session namespace; appending a continuation
+or replaying the group does not renumber already indexed work. The output has one
+session header with the original start time. File snapshots and final revision
+checks cover every group member.
+
+A group must have one original and valid, acyclic references to discovered
+rollouts. Missing references, duplicate immutable IDs, inconsistent byte/ordinal
+bounds or malformed records remain explicit failures. An explicit path to a
+continuation cannot independently supply its undiscovered parent and is refused;
+select the native session ID or use unfiltered discovery. This does not add a
+native database dependency or change the separate cloud-capture transport.
+
+Regression: `python3 tests/codex_history_test.py` covers abandoned work, inherited
+usage, replay/legacy IDs, source changes, and invalid/incomplete lineage.
