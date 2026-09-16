@@ -16,6 +16,7 @@ import stat
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from readers import reader_for, validate_canonical
 from readers.strict_json import loads as load_json
@@ -468,6 +469,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     reader = reader_for(args.host)
     explicit_path = False
+    explicit_basis = None
+    path_reader = reader
     latest = None
     latest_seen = None
     latest_basis = None
@@ -494,6 +497,31 @@ def main(argv=None) -> int:
                 diagnostic("session_unavailable")
                 return 2
             sessions = [{"path": str(path)}]
+            if args.host == "codex":
+                selected_path = Path(path).resolve(strict=True)
+                revision = source_revision(selected_path, "codex")
+                with regular_source(selected_path, revision_identity(revision, selected_path)) as (handle, _):
+                    selected_header = reader._session_header(handle)
+                payload = selected_header.get("payload", {})
+                if payload.get("history_mode") == "paginated" or payload.get("history_base") is not None:
+                    from readers.discovery import paths
+                    from readers.codex_history import _NAME
+                    sid = native_text(payload.get("id"), required=True)
+                    configured = reader._SESSIONS.resolve()
+                    scope = configured if selected_path.is_relative_to(configured) else selected_path.parent
+                    path_reader = SimpleNamespace(HOST="codex", _SESSIONS=scope)
+                    anchors = root_anchors(path_reader, lambda error: diagnostic("discovery_incomplete"))
+                    pattern = ("**", "rollout-*.jsonl") if scope == configured else ("rollout-*.jsonl",)
+                    candidates = paths(scope, pattern, lambda error: diagnostic("discovery_incomplete"))
+                    if incomplete:
+                        return 2
+                    sessions = [{"path": str(candidate)} for candidate in candidates
+                                if (match := _NAME.fullmatch(candidate.name)) and match[1] == sid]
+                    if selected_path not in [Path(item["path"]) for item in sessions]:
+                        raise ValueError("explicit rollout was excluded by discovery")
+                    explicit_basis = (selected_path, revision)
+                    explicit_path = False
+                    args.session = sid
         else:
             options = {"include_representations": True} if args.host == "cursor" else {}
             sessions = reader.list_sessions(None, on_error=lambda error: diagnostic("discovery_incomplete"), **options)
@@ -619,7 +647,7 @@ def main(argv=None) -> int:
             if explicit_path:
                 path, anchor = path.resolve(strict=True), None
             else:
-                path, anchor = discovered_path(reader, path, anchors)
+                path, anchor = discovered_path(path_reader, path, anchors)
             if args.host == "cursor":
                 from cursor_flush import _UUID_RE
                 select_saved = not args.session or args.session == "latest" or bool(_UUID_RE.fullmatch(args.session))
@@ -656,6 +684,8 @@ def main(argv=None) -> int:
                 with regular_source(path, revision_identity(revision, path)) as (handle, _):
                     source_header = reader._session_header(handle)
                 sid = native_text(source_header.get("payload", {}).get("id"), required=True)
+                if explicit_basis is not None and sid != args.session:
+                    raise ValueError("paginated filename and native identity disagree")
                 codex_headers[path] = source_header
                 native = None
             else:
@@ -689,6 +719,8 @@ def main(argv=None) -> int:
         except (OSError, ValueError, TypeError, KeyError, AttributeError,
                 OverflowError, RuntimeError, argparse.ArgumentTypeError):
             diagnostic("session_unreadable", path)
+    if explicit_basis is not None and incomplete:
+        return 2
     if args.host == "codex":
         from readers import codex_history
         grouped = {}
@@ -791,7 +823,7 @@ def main(argv=None) -> int:
                         titles.stamp_bound(observation) and titles.stamp != stamp_used):
                     diagnostic("source_changed", path)
                     continue
-            if current_revision(path) != revision or (
+            if (explicit_basis is not None and source_revision(explicit_basis[0], args.host) != explicit_basis[1]) or current_revision(path) != revision or (
                     latest_basis is not None and not basis_unchanged(latest_basis)):
                 diagnostic("source_changed", path)
                 continue

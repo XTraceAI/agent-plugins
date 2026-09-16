@@ -73,6 +73,36 @@ class ReleaseChecksTests(unittest.TestCase):
         self.assertEqual(agent.upgrade_response_diagnostics(events, "", {})["result_kind"], "other")
         self.assertFalse(agent.upgrade_notice_evidence("open a new session", {}, "999.1.2", True)["restart_reported"])
 
+    def test_claude_upgrade_requires_complete_native_delivery_and_fresh_model_version(self):
+        import copy
+        nonce = "999.4242.17"
+        notice = f"PLUGIN_UPGRADE_REQUIRED: Update to {nonce}, then restart this agent session."
+        output = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": notice},
+                  "systemMessage": notice}
+        event = {"subtype": "hook_response", "hook_event": "PreToolUse", "outcome": "success",
+                 "exit_code": 0, "stdout": json.dumps(output)}
+        def passes(events, answer):
+            evidence = agent.upgrade_notice_evidence("", answer, nonce, True)
+            evidence["native_notice_delivered"] = agent.claude_upgrade_delivery(events, nonce)
+            return all(evidence[k] for k in agent.required_upgrade_evidence("claude"))
+        self.assertTrue(passes([event], {"minimum_version": nonce}))
+        self.assertTrue(passes([{**event, "output": event["stdout"], "stdout": ""}], {"minimum_version": nonce}))
+        self.assertTrue(passes([{**event, "output": ""}], {"minimum_version": nonce}))
+        self.assertFalse(passes([{**event, "output": "not json"}], {"minimum_version": nonce}))
+        self.assertFalse(passes([event], {"minimum_version": "999.0.0"}))
+        self.assertFalse(passes([], {"minimum_version": nonce, "error_code": "PLUGIN_UPGRADE_REQUIRED", "remediation": "restart"}))
+        for field in ("additionalContext", "systemMessage"):
+            for missing in ("PLUGIN_UPGRADE_REQUIRED", nonce, "restart this agent session"):
+                changed = copy.deepcopy(output)
+                target = changed["hookSpecificOutput"] if field == "additionalContext" else changed
+                target[field] = target[field].replace(missing, "")
+                self.assertFalse(passes([{**event, "stdout": json.dumps(changed)}], {"minimum_version": nonce}))
+        for changed in ({"exit_code": 1}, {"outcome": "error"}, {"hook_event": "Stop"},
+                        {"subtype": "assistant"}, {"stdout": "not json"}, {"stdout": "[]"}):
+            self.assertFalse(passes([{**event, **changed}], {"minimum_version": nonce}))
+        self.assertEqual(agent.required_upgrade_evidence("codex"), agent.UPGRADE_REQUIRED_EVIDENCE)
+        self.assertEqual(agent.required_upgrade_evidence("cursor"), agent.UPGRADE_REQUIRED_EVIDENCE)
+
     def test_upgrade_nonce_is_fresh_and_acceptable_to_the_hook(self):
         import re
         seen = {agent.upgrade_nonce() for _ in range(20)}

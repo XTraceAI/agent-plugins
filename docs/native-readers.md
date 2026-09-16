@@ -97,10 +97,13 @@ consulted only when no member contains a native title.
 
 A group must have one original and valid, acyclic references to discovered
 rollouts. Missing references, duplicate immutable IDs, inconsistent byte/ordinal
-bounds or malformed records remain explicit failures. An explicit path to a
-continuation cannot independently supply its undiscovered parent and is refused;
-select the native session ID or use unfiltered discovery. This does not add a
-native database dependency or change the separate cloud-capture transport.
+bounds or malformed records remain explicit failures. An explicit paginated path
+selects its whole same-session group: the configured native sessions root is
+searched for native files, or only the containing directory for exported files.
+Keep original rollout filenames in exports. Selecting either the root or a
+continuation returns the same group. Missing
+parents or unsafe discovery prevent that explicit group from being emitted.
+This does not add a native database dependency or change cloud capture.
 
 Regression: `python3 tests/codex_history_test.py` covers abandoned work, inherited
 usage, meter resets, response-ledger deduplication, replay/legacy IDs, source

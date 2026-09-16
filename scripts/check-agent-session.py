@@ -565,6 +565,39 @@ def upgrade_response_diagnostics(events, text, fields):
 UPGRADE_REQUIRED_EVIDENCE = ("server_contacted", "error_code_reported", "minimum_version_reported", "restart_reported")
 
 
+def claude_upgrade_delivery(events, nonce):
+    """A real successful host hook must carry the complete actionable notice.
+
+    Agent paraphrases are not the delivery channel. Its unpredictable version
+    answer separately proves it consumed this run's notice rather than a hint.
+    """
+    for event in events:
+        if (event.get("subtype") != "hook_response" or event.get("outcome") != "success"
+                or event.get("exit_code") != 0
+                or event.get("hook_event") not in ("SessionStart", "PreToolUse", "PostToolUse")):
+            continue
+        try:
+            output = json.loads(event.get("output") or event.get("stdout") or "")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(output, dict):
+            continue
+        hook = output.get("hookSpecificOutput")
+        if not isinstance(hook, dict) or hook.get("hookEventName") != event["hook_event"]:
+            continue
+        texts = (hook.get("additionalContext"), output.get("systemMessage"))
+        if all(isinstance(text, str) and "PLUGIN_UPGRADE_REQUIRED" in text
+               and nonce in text and "restart this agent session" in text.lower() for text in texts):
+            return True
+    return False
+
+
+def required_upgrade_evidence(host):
+    if host == "claude":
+        return ("server_contacted", "native_notice_delivered", "minimum_version_reported")
+    return UPGRADE_REQUIRED_EVIDENCE
+
+
 def run_rejection(args, report, model):
     with tempfile.TemporaryDirectory(prefix="memhub-agent-rejection-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
@@ -597,8 +630,10 @@ def run_rejection(args, report, model):
                 text, fields = final_answer(events, args.host)
                 report.data["upgrade_response_diagnostics"] = upgrade_response_diagnostics(events, text, fields)
                 evidence = upgrade_notice_evidence(text, fields, nonce, server.requests)
+                if args.host == "claude":
+                    evidence["native_notice_delivered"] = claude_upgrade_delivery(events, nonce)
                 report.data["upgrade_notice_evidence"] = evidence
-                missing = [name for name in UPGRADE_REQUIRED_EVIDENCE if not evidence[name]]
+                missing = [name for name in required_upgrade_evidence(args.host) if not evidence[name]]
                 require(not missing, "upgrade requirement evidence missing: " + ", ".join(missing))
             report.check("agent_upgrade_notice", check)
         finally:
