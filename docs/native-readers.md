@@ -89,7 +89,11 @@ preserves real-record IDs and order, reuses existing usage-only identities where
 possible, and adds stable per-response identities for otherwise unrepresented
 inferences. Appending a continuation or replaying does not renumber real work. The output has one
 session header with the original start time. File snapshots and final revision
-checks cover every group member.
+checks cover every group member. Ancestors precede their continuations; sibling
+rollouts use native start-time order with immutable IDs breaking ties. Paginated
+members without a native start time are rejected rather than given an invented
+chronology. The last native title update across that order wins; the sidecar is
+consulted only when no member contains a native title.
 
 A group must have one original and valid, acyclic references to discovered
 rollouts. Missing references, duplicate immutable IDs, inconsistent byte/ordinal

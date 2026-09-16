@@ -7,6 +7,7 @@ Each immutable rollout has its own record identities.
 from __future__ import annotations
 
 from contextlib import ExitStack
+from datetime import datetime
 import re
 
 from . import codex, codex_usage
@@ -19,6 +20,7 @@ _NAME = re.compile(rf'rollout-.+-({_UUID})(?:_({_UUID}))?\.jsonl$')
 def plan(items, headers):
     """Validate one discovered same-session group; never choose a newest file."""
     segments = {}
+    started = {}
     for path, revision, header in items:
         raw = headers[path]
         meta = raw['payload']
@@ -38,6 +40,10 @@ def plan(items, headers):
         start = 0 if base is None else base['end_ordinal_exclusive']
         if type(raw.get('ordinal')) is not int or raw['ordinal'] != start:
             raise ValueError('rollout header ordinal disagrees with history reference')
+        timestamp = codex._metadata_from_header(raw, strict=True)['started_at']
+        if timestamp is None:
+            raise ValueError('paginated rollout requires a native start time')
+        started[rid] = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
         segments[rid] = (path, revision, header, base)
     roots = [rid for rid, (_, _, _, base) in segments.items() if base is None]
     if len(roots) != 1:
@@ -60,7 +66,7 @@ def plan(items, headers):
         done.add(rid)
         ordered.append(rid)
 
-    for rid in sorted(segments):
+    for rid in sorted(segments, key=lambda rid: (started[rid], rid)):
         visit(rid)
     header = dict(segments[root][2])
     header['mtime'] = max(item[2]['mtime'] for item in segments.values())
@@ -106,6 +112,7 @@ def read(group, snapshot, *, title_index=None):
         records = []
         seen_responses = {}
         first_meta = None
+        native_title = None
         for rid, _, _, _, base in group:
             seed = None if base is None else prefix_usage(
                 copies[base['thread_id']], base['end_byte_offset'],
@@ -124,7 +131,7 @@ def read(group, snapshot, *, title_index=None):
             record_sources, usage_targets = {}, {}
             namespace = rid if base is None else f"{session_id}:rollout:{rid}"
             converted, meta = codex.rollout_to_claude_records(
-                rows, strict=True, title_index=title_index,
+                rows, strict=True, title_index={},
                 identity_namespace=namespace,
                 initial_usage_total=seed,
                 usage_baseline_unknown=base is not None and seed is None,
@@ -132,6 +139,11 @@ def read(group, snapshot, *, title_index=None):
             converted = codex_usage.apply(rows, converted, record_sources, usage_targets,
                 session_id=session_id, namespace=namespace, seen=seen_responses)
             records.extend(converted)
+            native_title = codex._rollout_thread_name(rows, strict=True) or native_title
             if first_meta is None:
                 first_meta = meta
+        # Resolve the fallback once, after seeing every native rename. An early
+        # root fallback must not hide a continuation's title or require its index.
+        first_meta['title'] = (native_title or codex._title(
+            [], session_id, strict=True, title_index=title_index) or first_meta['title'])
         return records, first_meta

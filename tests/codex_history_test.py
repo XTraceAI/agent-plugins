@@ -69,6 +69,42 @@ def test_counts_abandoned_work_once_and_preserves_replay_and_legacy_ids():
         assert before == (parent.read_bytes(), child.read_bytes())
 
 
+def test_siblings_follow_native_time_and_latest_continuation_title():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        parent, child, original, continuation = fixture(home)
+        # The later sibling sorts before the older one by UUID and filename.
+        sibling = json.loads(json.dumps(continuation))
+        sibling[0]['payload']['timestamp'] = '2026-01-02T02:00:00+01:00'
+        sibling[1] = message(5, 'user', 'later ask')
+        sibling[2] = message(6, 'assistant', 'later reply')
+        continuation.append(row(8, 'event_msg', {'type':'thread_name_updated', 'thread_name':'Earlier title'}))
+        sibling.append(row(8, 'event_msg', {'type':'thread_name_updated', 'thread_name':'Latest title'}))
+        cli.write_jsonl(child, continuation)
+        cli.write_jsonl(parent.parent/f'rollout-2026-01-01T00-00-00-{SID}_00000000-0000-4000-8000-000000000001.jsonl', sibling)
+        result, rows = cli.run(home, 'codex')
+        assert result.returncode == 0, result.stderr
+        assert rows[0]['title'] == 'Latest title', rows[0]
+        contents = [(r['message']['content'] if isinstance(r['message']['content'], str) else r['message']['content'][0]['text']) for r in rows[1:] if r['message']['content']]
+        assert contents == ['shared ask', 'shared reply', 'abandoned ask', 'abandoned reply',
+                            'retry ask', 'retry reply', 'later ask', 'later reply'], contents
+        replay, again = cli.run(home, 'codex')
+        assert replay.returncode == 0 and rows == again
+        # A native title wins even over a malformed fallback index.
+        (home/'.codex/session_index.jsonl').write_text('not json\n')
+        result, again = cli.run(home, 'codex')
+        assert result.returncode == 0 and rows == again, result.stderr
+
+
+def test_group_title_uses_sidecar_only_without_native_updates():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        fixture(home)
+        cli.write_jsonl(home/'.codex/session_index.jsonl', [{'id':SID, 'thread_name':'Sidecar title'}])
+        result, rows = cli.run(home, 'codex')
+        assert result.returncode == 0 and rows[0]['title'] == 'Sidecar title', (result.stderr, rows)
+
+
 def test_missing_or_invalid_references_never_emit_a_partial_group():
     for scenario in ('missing', 'byte-boundary', 'ordinal-boundary', 'duplicate', 'cycle'):
         with tempfile.TemporaryDirectory() as td:
