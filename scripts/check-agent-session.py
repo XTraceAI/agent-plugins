@@ -577,7 +577,7 @@ def claude_upgrade_delivery(events, nonce):
                 or event.get("hook_event") not in ("SessionStart", "PreToolUse", "PostToolUse")):
             continue
         try:
-            output = json.loads(event.get("stdout", ""))
+            output = json.loads(event.get("output") or event.get("stdout") or "")
         except (TypeError, ValueError):
             continue
         if not isinstance(output, dict):

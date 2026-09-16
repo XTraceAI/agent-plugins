@@ -86,6 +86,9 @@ class ReleaseChecksTests(unittest.TestCase):
             evidence["native_notice_delivered"] = agent.claude_upgrade_delivery(events, nonce)
             return all(evidence[k] for k in agent.required_upgrade_evidence("claude"))
         self.assertTrue(passes([event], {"minimum_version": nonce}))
+        self.assertTrue(passes([{**event, "output": event["stdout"], "stdout": ""}], {"minimum_version": nonce}))
+        self.assertTrue(passes([{**event, "output": ""}], {"minimum_version": nonce}))
+        self.assertFalse(passes([{**event, "output": "not json"}], {"minimum_version": nonce}))
         self.assertFalse(passes([event], {"minimum_version": "999.0.0"}))
         self.assertFalse(passes([], {"minimum_version": nonce, "error_code": "PLUGIN_UPGRADE_REQUIRED", "remediation": "restart"}))
         for field in ("additionalContext", "systemMessage"):
