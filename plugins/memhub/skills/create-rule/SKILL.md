@@ -55,7 +55,13 @@ lives here.
     precondition was missing, file with the pattern proven only against the
     verifier's synthetic cases, and note that in the report.
   - **Step 5** does not ask. File, then tell the person one line naming the
-    rule. A `cross_book` conflict is still reported.
+    rule.
+  - **A `cross_book` conflict does not file and does not ask.** The mandatory
+    policy is that the person chooses, and this path may not interrupt them —
+    so record a verdict naming the other book and the rule id, and stop. The
+    moment is then judged-and-declined with a reason, not an unexplained
+    silence, and nothing is filed that would double-fire alongside a rule in a
+    book `supersedes_rule_id` cannot reach.
   - **Never pass `activate`.** Never put a person's name, home directory or
     e-mail in a rule.
 - **`scope_repos` is the harness line's, verbatim** — it is already narrowed by
@@ -63,6 +69,12 @@ lives here.
   cut it further to the ones the lesson is about. Do NOT rebuild it from
   `state.touched_repos`: that re-broadens it to repos the lesson has nothing to
   do with, which then fire on unrelated work.
+- **`source_ref` is passed EXACTLY as the harness line gives it.** The generic
+  steps append `|applies N/M|precision P` to a `source_ref`; on this path they
+  do not. That value is half of the server's `(rulebook, source_ref, title)`
+  re-import identity, so a retry carrying different evidence counts files a
+  second row instead of matching the first. Put those numbers in the report to
+  the person instead.
 - **The stamp** comes from the moments file
   (`$MEMHUB_HARNESS_DIR`, else `~/.config/memhub-plugin/harness`),
   `<session_id>.moments.jsonl`: the last JSON object whose `source_ref` matches

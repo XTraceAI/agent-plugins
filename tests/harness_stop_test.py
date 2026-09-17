@@ -558,7 +558,11 @@ def test_the_block_reason():
     for owed in ("not already a RULE", "does NOT disqualify it",
                  "restating the docs", "ask the person nothing at all",
                  "Never pass activate", "Step 4b.6", "Step 0 (which rulebook)",
-                 "Do NOT rebuild it from", 'source="session_draft"'):
+                 "Do NOT rebuild it from", 'source="session_draft"',
+                 # each exception the harness path takes must be stated, or the
+                 # agent hits a mandatory step it cannot satisfy (Codex, #244)
+                 "cross_book conflict does not file and does not ask",
+                 "source_ref is passed EXACTLY as the harness line gives it"):
         assert owed in skill, owed
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
