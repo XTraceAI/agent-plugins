@@ -5,7 +5,7 @@
 in the *urgent plugin fix (claude code)* brain, which holds the live evidence this was
 diagnosed from. This file is the standing description of the mechanism.
 
-**Status:** implemented in v0.59.1. Covered by `tests/turn_flush_bound_test.py`.
+**Status:** implemented in v0.59.2. Covered by `tests/turn_flush_bound_test.py`.
 
 ---
 
@@ -92,7 +92,7 @@ many records went. The ladder, in order:
 | >1 record, cap at the floor (`_MIN_SLICE_BYTES = 256_000`) | **one record per turn** from here on, cursor unmoved |
 | exactly 1 record, **larger** than the floor | **step over it**, breadcrumb the loss |
 | exactly 1 record, **at or below** the floor | keep it, cursor unmoved — the server is refusing, not the record |
-| already one record per turn, still refused | **dormant** — no legal batch exists; SessionEnd covers it |
+| already one record per turn, still refused | **dormant** — no legal batch exists; stop burning a round trip per turn |
 
 Each rung exists because the one above it has run out, and the last two are what keep this
 from being the original bug at a lower threshold:
