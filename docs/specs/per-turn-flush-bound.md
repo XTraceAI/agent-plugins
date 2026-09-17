@@ -126,9 +126,19 @@ from being the original bug at a lower threshold:
   the cursor is a single byte offset only a **prefix** can be sent — so if the shortest
   message-bearing prefix is over the limit, **no legal batch exists**. Re-sending it every
   turn is the stall this change removes. Setting `unsupported` stops the prefilter spawning
-  doomed flushes and loses nothing: `flush_session` sends the whole transcript and is
-  deliberately independent of this cursor. The `payload_too_large` breadcrumb stands, so the
-  banner still explains it.
+  doomed flushes, and the `payload_too_large` breadcrumb stands so the banner still explains
+  it.
+
+  Dormancy is the **least-bad** answer here, not a rescue. `flush_session` usually does
+  recover the session — it re-sends the whole transcript against its own cursor — but it is
+  **not a guarantee in this state**: it slices at a fixed `DEFAULT_CHUNK_BYTES`, has no 413
+  handling of its own, and stops on the first rejected slice, so a prefix unsendable here
+  can be unsendable there too. Nothing this hook can do changes that. Stepping over the
+  prefix *would* rescue the rest of the session, at the cost of deleting an `attachment` —
+  real user content this module deliberately keeps outside `_INERT_RECORD_TYPES` so it is
+  never dropped. Widening the single-record step-over that far is a policy call and is
+  deliberately not made here; `flush_session`'s missing adaptive handling is tracked
+  separately.
 
 When a record is stepped over, the cursor advance and the breadcrumb go out in **one**
 atomic publish, so a crash between them cannot leave a cursor that skipped a record nobody

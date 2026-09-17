@@ -518,10 +518,24 @@ def _shrink_slice(session_id: str, state: dict, batch: list,
     #
     # Retrying it re-sends the identical payload every turn forever, which is
     # the stall this module exists to remove. Go dormant instead: the prefilter
-    # reads this flag and stops spawning doomed flushes, and NOTHING IS LOST —
-    # SessionEnd sends the whole transcript and is deliberately independent of
-    # this cursor. The `payload_too_large` breadcrumb already written stands,
-    # so the health banner still says what happened.
+    # reads this flag and stops spawning doomed flushes. The
+    # `payload_too_large` breadcrumb already written stands, so the health
+    # banner still says what happened.
+    #
+    # Dormancy is the least-bad answer here, NOT a rescue, and the difference
+    # matters to whoever reads this next. SessionEnd usually does recover the
+    # session — it re-sends the whole transcript against its own cursor — but
+    # it is not a guarantee in this particular state: `flush_session` slices at
+    # a fixed `DEFAULT_CHUNK_BYTES`, has no 413 handling of its own, and stops
+    # on the first rejected slice, so a prefix that is unsendable here can be
+    # unsendable there too. Nothing this hook can do changes that: the cursor
+    # is one byte offset, so only a PREFIX can be sent, and a prefix that must
+    # carry a message record yet cannot fit the limit has no legal form.
+    # Retrying would not capture it either — it would only burn a round trip
+    # per turn. Stepping over the prefix WOULD rescue the rest of the session,
+    # at the cost of deleting an `attachment`, which this module deliberately
+    # keeps outside `_INERT_RECORD_TYPES` so it is never dropped; widening the
+    # step-over that far is a policy call and is deliberately not made here.
     _log("the smallest legal batch is still refused — per-turn capture is "
          "dormant for this session; session-end capture still applies")
     _save_state(session_id, unsupported=True)
