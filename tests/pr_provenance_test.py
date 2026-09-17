@@ -98,9 +98,9 @@ def test_direct_command_variants_and_shell_wrappers():
         r'"C:\bin\gh.exe" pr create --fill',
         "env -u GH_TOKEN gh pr create --fill",
         "gh pr create --title 'fix; still one command'",
+        "echo x; gh pr create --fill",          # one of two segments is direct
     )
     rejected = (
-        "echo x; gh pr create --fill",
         "bash -lc 'gh pr create --fill'",
         "printf 'gh pr create'",
         "gh pr view 6",
@@ -161,14 +161,67 @@ def test_current_codex_exec_envelope_is_narrowly_supported():
         'notify("extra"); text(r.output);',
         'const r = await tools.exec_command({cmd:"gh pr create --fill"}); '
         'const x = tools.read(); text(r.output);',
-        'const r = await tools.exec_command({cmd:"git status; gh pr create"}); '
-        'text(r.output);',
         'Here is an example: const r = await tools.exec_command('
         '{cmd:"gh pr create --fill"}); text(r.output);',
     )
     assert all(p.urls_from_tool_results(records(source)) == []
                for source in rejected)
     assert p.urls_from_tool_results(records(accepted[0], name="other")) == []
+    # A compound command is judged segment by segment, in the Codex envelope
+    # as anywhere else: `git status; gh pr create` IS a direct creation.
+    compound = ('const r = await tools.exec_command({cmd:"git status; gh pr create --fill"}); '
+                'text(r.output);')
+    assert p.urls_from_tool_results(records(compound)) == [url]
+
+
+def test_compound_commands_are_judged_segment_by_segment():
+    """0 of 179 real `gh pr create` calls in 14 days of local sessions were the
+    bare command; every one was `cd <dir> && … && gh pr create …`. The
+    matcher reads the command the way the shell runs it."""
+    body = ("cd /Users/dev/xtrace/wt && git rebase -q origin/staging && "
+            "git push -q -u origin fm-feat/x 2>&1 | tail -1; "
+            "gh pr create --base staging --title \"t\" --body-file - <<'EOF'\n"
+            "## What\n| a | b |\n> quoted $(not shell)\nEOF")
+    for command in (
+        "cd /x && gh pr create --fill",
+        "set +e; cd /x && gh pr create --fill",
+        "FOO=1 gh pr create --fill && echo done",
+        "gh pr create --title 'a; b' --body 'x && y'",
+        body,
+    ):
+        assert p.is_pr_creation_command(command), command
+    for command in (
+        "gh pr create --fill | tee out",           # the URL went elsewhere
+        "gh pr create --fill > out.txt",
+        "cd /x && gh pr create --fill 2>&1",       # stderr merged in: not exact
+        "grep 'gh pr create' notes.md",            # a mention, not a creation
+        "echo 'cd x && gh pr create'",
+        'gh pr create --title "$(date)"',           # substitution, as before
+        "gh repo view && foo pr create",
+        "sh -c 'gh pr create --fill'",
+    ):
+        assert not p.is_pr_creation_command(command), command
+
+
+def test_claude_post_tool_use_payload_is_read_like_cursors_hook():
+    """At PostToolUse the transcript does not yet hold the tool result
+    (verified live 2026-09-07), so the payload's ``tool_response`` is the
+    only place the URL exists when the flush fires."""
+    url = "https://github.com/x/r/pull/23"
+    post = {"hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "cd /x && gh pr create --fill"},
+            "tool_response": {"stdout": url + "\n", "stderr": "", "interrupted": False}}
+    assert p.scan_shell_event("PostToolUse", post) == ([url], 0)
+    assert p.scan_shell_event("PostToolUse", {**post, "tool_response": url + "\n"}) == ([url], 0)
+    assert p.scan_shell_event("PostToolUse", {**post, "tool_response": {
+        "stdout": url, "interrupted": True}}) == ([], 1)
+    # a pre-existing PR's URL is echoed on stderr, and is evidence of nothing
+    assert p.scan_shell_event("PostToolUse", {**post, "tool_response": {
+        "stdout": "", "stderr": f"a pull request already exists:\n{url}"}}) == ([], 1)
+    assert p.scan_shell_event("PostToolUse", {**post, "tool_name": "Read"}) == ([], 0)
+    assert p.scan_shell_event("PostToolUse", {**post, "tool_input": {
+        "command": "grep 'gh pr create' x"}}) == ([], 0)
+    assert p.scan_shell_event("PreToolUse", post) == ([], 0)
 
 
 def test_only_known_shell_tools_and_the_newest_reused_id_can_match():

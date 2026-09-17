@@ -104,28 +104,87 @@ def _has_command_substitution(value: str) -> bool:
     return False
 
 
+# A heredoc opener: the body that follows, up to the terminator line, is data
+# (a PR description carries `|` in tables and `>` in quotes) and never shell.
+_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+# Tokens that end one command and start the next. `|` is NOT one: a pipe
+# hands the URL to another process, and the segment that contains it is
+# judged (and refused) as a whole.
+_SEGMENT_SEPARATORS = {";", "&&", "||", ";;", "&"}
+# Stdin redirection does not touch what `gh` prints; every other pure
+# punctuation token (a pipe, an stdout redirect, a subshell, a backtick)
+# can hide or replace it.
+_HARMLESS_PUNCTUATION = {"<", "<<", "<<-", "<<<"}
+
+
+def _shell_only(value: str) -> str:
+    """``value`` with heredoc BODY lines removed. Openers and terminators stay."""
+    out: list[str] = []
+    terminator: str | None = None
+    for line in value.split("\n"):
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        out.append(line)
+        match = _HEREDOC_OPEN_RE.search(line)
+        if match is not None:
+            terminator = match.group(2)
+    return "\n".join(out)
+
+
+def command_segments(value: object) -> list[list[str]]:
+    """The command's simple commands, each as its shell tokens.
+
+    Measured on 14 days of local sessions (2026-09-07): 0 of 179 real
+    ``gh pr create`` calls were the bare command; every one was
+    ``cd <dir> && … && gh pr create …``, and a whole-command matcher saw
+    none of them. So the command is read the way the shell runs it — one
+    segment at a time, split at ``&&`` / ``;`` / ``||`` / newline with
+    quoting respected — and each segment is judged on its own. A line that
+    does not tokenize (unbalanced quotes) contributes nothing, and a line
+    carrying a command substitution is skipped whole: the conservative
+    direction, as before.
+    """
+    if not isinstance(value, str) or not value or len(value) > MAX_COMMAND_CHARS:
+        return []
+    segments: list[list[str]] = []
+    for line in _shell_only(value).split("\n"):
+        if not line.strip() or _has_command_substitution(line):
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            continue
+        current: list[str] = []
+        for token in tokens:
+            if token in _SEGMENT_SEPARATORS:
+                if current:
+                    segments.append(current)
+                current = []
+            else:
+                current.append(token)
+        if current:
+            segments.append(current)
+    return segments
+
+
 def is_pr_creation_command(value: object) -> bool:
-    """Return whether a bounded command directly invokes ``gh pr create``."""
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > MAX_COMMAND_CHARS
-        or _has_command_substitution(value)
-    ):
-        return False
-    try:
-        lexer = shlex.shlex(
-            value,
-            posix=True,
-            punctuation_chars=_SHELL_PUNCTUATION,
-        )
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        return False
+    """Return whether a bounded command directly invokes ``gh pr create``
+    in at least one of its segments (``cd x && gh pr create …`` counts;
+    ``gh pr create … | tee`` and ``gh pr create … > out`` do not, because
+    the URL is no longer what the tool result shows)."""
+    return any(_segment_is_pr_creation(tokens) for tokens in command_segments(value))
+
+
+def _segment_is_pr_creation(tokens: list[str]) -> bool:
     if not tokens or any(
-        token and all(ch in _SHELL_PUNCTUATION for ch in token)
+        token
+        and all(ch in _SHELL_PUNCTUATION for ch in token)
+        and token not in _HARMLESS_PUNCTUATION
         for token in tokens
     ):
         return False
@@ -388,16 +447,56 @@ def urls_from_tool_results(records: Iterable[object]) -> list[str]:
     return scan_tool_results(records)[0]
 
 
+def _post_tool_shell(payload: dict) -> dict | None:
+    """Claude Code's ``PostToolUse`` for a shell tool, normalised to the
+    ``{command, output, …status}`` shape Cursor's hook already sends.
+
+    Verified live 2026-09-07: when ``PostToolUse`` fires the transcript holds
+    the ``tool_use`` but NOT yet its ``tool_result`` — so a flush triggered by
+    that hook cannot find the URL by rescanning the transcript, and the
+    payload's ``tool_response`` is the only place it exists at that moment.
+    ``stdout`` alone is read from a dict response: ``stderr`` is where ``gh``
+    echoes a PRE-EXISTING pull request's URL ("already exists"), which is
+    evidence of nothing. An interrupted call is a failure.
+    """
+    name = payload.get("tool_name")
+    if not isinstance(name, str) or name.casefold() not in _DIRECT_COMMAND_TOOLS:
+        return None
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    response = payload.get("tool_response")
+    shell: dict = {"command": command}
+    if isinstance(response, dict):
+        shell["output"] = response.get("stdout")
+        for key in ("exit_code", "exitCode", "is_error", "success"):
+            if key in response:
+                shell[key] = response[key]
+        if response.get("interrupted") is True:
+            shell["is_error"] = True
+    elif isinstance(response, str):
+        shell["output"] = response
+    return shell
+
+
 def scan_shell_event(event: str, payload: object) -> tuple[list[str], int]:
-    """Return URLs and a missing count from Cursor's post-shell hook."""
-    if event != "afterShellExecution" or not isinstance(payload, dict):
+    """Return URLs and a missing count from a host's post-shell hook —
+    Cursor's ``afterShellExecution`` or Claude Code's ``PostToolUse``."""
+    if not isinstance(payload, dict):
         return [], 0
-    if not is_pr_creation_command(payload.get("command")):
+    if event == "afterShellExecution":
+        shell = payload
+    elif event == "PostToolUse":
+        shell = _post_tool_shell(payload)
+        if shell is None:
+            return [], 0
+    else:
         return [], 0
-    status = _execution_status(payload)
-    urls = urls_from_output_text(payload.get("output"))
+    if not is_pr_creation_command(shell.get("command")):
+        return [], 0
+    status = _execution_status(shell)
+    urls = urls_from_output_text(shell.get("output"))
     if status == "unknown":
-        urls = _exact_url_text(payload.get("output"))
+        urls = _exact_url_text(shell.get("output"))
     if status == "failure" or len(urls) != 1:
         return [], 1
     return urls, 0
