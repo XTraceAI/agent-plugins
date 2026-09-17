@@ -4152,8 +4152,15 @@ def main():
             # turn ended before this process started, so it ended before any
             # fire this session recorded after `started`; stamp it one tick
             # before the earliest of those.
+            # `host` too: this lane builds its ctx inline rather than reusing
+            # the one `main` assembles, and without it `event_wire_row` has no
+            # namespace to apply. Observed live — a Codex session's FIRES said
+            # `codex-<uuid>` while its own turn_end event said `<uuid>`, and the
+            # server folds events into fires by (org, session_id), so every
+            # turn_end folded into nothing.
             log_event({"session": session, "agent_id": None, "repo": repo or None,
-                       "branch": branch or None, "worktree": worktree_key(root)}, kind,
+                       "branch": branch or None, "worktree": worktree_key(root),
+                       "host": _host_arg()}, kind,
                       at=turn_end_at(session, started, data.get("transcript_path")))
         flush_fires(final=final)
         return 0

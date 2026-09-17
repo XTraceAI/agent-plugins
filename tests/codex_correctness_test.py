@@ -326,6 +326,32 @@ def test_a_stale_bridge_does_not_report_as_not_installed():
     assert "NOT INSTALLED" not in text, text
 
 
+def test_every_event_call_site_passes_a_host():
+    # `event_wire_row` can only namespace what the ledger row carries. The
+    # Stop/SessionEnd lane builds its ctx INLINE rather than reusing main's, so
+    # it silently wrote host=None and every turn_end folded into nothing —
+    # observed live: one session whose FIRES said `codex-<uuid>` while its own
+    # turn_end event said `<uuid>`, and the server folds by (org, session_id).
+    # Assert the shape rather than the one instance, so the next inline ctx
+    # cannot reintroduce it.
+    import ast
+    src = (SCRIPTS / "rulebook_hook.py").read_text(encoding="utf-8")
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "log_event"
+                and node.args):
+            continue
+        ctx = node.args[0]
+        if isinstance(ctx, ast.Dict):          # an inline ctx must name host
+            keys = [k.value for k in ctx.keys if isinstance(k, ast.Constant)]
+            if "host" not in keys:
+                bad.append((node.lineno, sorted(keys)))
+    assert not bad, (
+        "log_event called with an inline ctx that omits 'host'; the event it "
+        f"writes cannot be namespaced and folds into nothing: {bad}")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
