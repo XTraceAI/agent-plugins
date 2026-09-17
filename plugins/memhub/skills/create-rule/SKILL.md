@@ -174,9 +174,11 @@ fire. Advice has the same channel, one call later: an agent that reads an
 advisory and goes on without it says why on its next command as
 `RULEBOOK_OVERRIDE='[<label>] <why>'`, naming the rule, and the reason lands on
 that rule's fire. A rule with a `converted_rx` also records "not followed" on
-its own: a fire still waiting on its conversion two turns later is closed
+its own: a fire whose conversion has not been seen two turns later is closed
 `converted=false`, so a rule nobody acts on shows it instead of showing
-nothing.
+nothing. The hook only reports what it saw — the command that converted, the
+override that set a rule aside, each turn ending — and the server decides the
+outcome from those facts (the earliest one after the fire wins).
 
 Ask for it when the user's own words ask for it — "block", "stop me", "don't
 let me", "never let it happen again" — and never on your own initiative. Two
