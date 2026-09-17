@@ -212,8 +212,49 @@ Two smaller defects observed during the same live run:
 
 ## Investigated and not fixed
 
-**ENG-1070 #1 — "capture is dead and nothing says so."** A fix was written and
-**reverted before merge**:
+**ENG-1070 #1 — "capture is dead and nothing says so." NOW FIXED — the
+precondition was observed.**
+
+An earlier fix was written and reverted on the grounds that its precondition was
+never demonstrated. **That reasoning was wrong, and an observational study
+settled it.** A blind Codex session — an ordinary "fix the failing test" task,
+with no mention of MemHub — was run against a real install:
+
+```
+$ codex plugin add memhub-staging@memhub-internal     # reports success, prints 0.59.1
+$ ls -a <cache>/memhub-internal/memhub-staging/0.59.1/
+.claude-plugin   .mcp.json   mcp.json
+```
+
+**Three files.** All six symlinked entries (`scripts`, `hooks`, `skills`,
+`references`, `LICENSE`, `NOTICE`) were not copied — not dangling, absent.
+**Codex's installer copies regular files and skips symlinks.** A control
+install of the prod `memhub` plugin (real files, no symlinks) from the same
+marketplace landed complete, 49 entries under `scripts/`.
+
+The A/B, same blind prompt, only the install differing:
+
+| | broken install | repaired install |
+|---|---|---|
+| rulebook ledger rows | **0** | 6 |
+| `codexflush/<sid>` state | **none** | written |
+| anything naming MemHub | **nothing** | health sidecar |
+
+The hooks were firing the whole time; they were landing in silence.
+
+**Scope, honestly:** the install that breaks is `memhub-staging`, the internal
+build, which is not in the Codex public catalog — so the people at risk today
+are XTrace developers running the internal build on Codex. That is exactly who
+filed ENG-1070, against staging 0.54.0 and 0.55.1.
+
+This also falsifies `RELEASING.md`, which said a path source "dereferences the
+symlinks". True on Claude Code; false on Codex. Both that file and
+`CONTRIBUTING.md` are corrected here.
+
+**What was restored, and what was not.** The breadcrumb, the SessionStart
+notice and the `capture_health` reason are back — they address the observed
+defect, which is *silence*. Still **not** restored, because nothing observed
+justifies them:
 
 - The failure mode was reproduced: a version directory holding only
   `codex_flush.py` is selected over a complete one, and the flush child dies on
