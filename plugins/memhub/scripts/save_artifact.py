@@ -7,8 +7,10 @@ token — it just runs this with a path, the same way it would `cat` a file.
 
 `--attach` is the same bargain for BYTES: a rendered deliverable is read,
 base64-encoded and sent as the artifact's file bundle, so an HTML page or a PNG
-never passes through the model's context either. `--file`/`--stdin` stays the
-searchable text (give one so the deliverable is findable).
+never passes through the model's context either. Attach a whole tree and the
+paths below their common parent are preserved, so a page keeps resolving its
+own `assets/…`. `--file`/`--stdin` stays the searchable text (give one so the
+deliverable is findable).
 
 Auth = the PLUGIN's own credential (shared `_memhub_auth`), never the /mcp
 connector's: $MEMHUB_TOKEN if set (CI escape hatch), else the personal access
@@ -54,21 +56,38 @@ from room_map import env_for_url, read_room, repo_root  # noqa: E402
 def _bundle(paths, entrypoint):
     """`(files payload, error)` for `--attach` — base64 bytes for `save_artifact`.
 
-    The bundle path is the basename, so `--attach build/index.html` is stored
-    as `index.html` and `--entrypoint index.html` names it. Two attachments
-    with the same basename are refused rather than silently collapsed: the
-    server rejects a duplicate path, and guessing which one the user meant
-    would store the wrong bytes under the right name.
+    A deliverable is often a TREE: `report.html` next to `assets/chart.png`,
+    which the page references by that relative path. So the bundle path is each
+    file's path relative to the common parent of everything attached —
+    `--attach build/index.html --attach build/assets/chart.png` stores
+    `index.html` and `assets/chart.png`, and the page still resolves its own
+    asset. A single file keeps its basename. Flattening every attachment to its
+    basename would upload a page whose scripts, styles and images all 404.
     """
     import base64
     import mimetypes
+    import os
+
+    paths = list(paths or [])
+    if not paths:
+        return [], None
+    resolved = []
+    for path in paths:
+        if not path.is_file():
+            return [], f"attachment not found: {path}"
+        resolved.append(path.resolve())
+    parents = [str(p.parent) for p in resolved]
+    root = os.path.commonpath(parents) if len(parents) > 1 else parents[0]
 
     payload: list[dict] = []
     seen: set[str] = set()
-    for path in paths or []:
-        if not path.is_file():
-            return [], f"attachment not found: {path}"
-        name = path.name
+    for path in resolved:
+        name = os.path.relpath(str(path), root).replace(os.sep, "/")
+        # commonpath over the parents cannot produce "..", but an unrelated
+        # mount or a drive letter mismatch can: fall back rather than send a
+        # path the server will reject.
+        if name.startswith("../") or name.startswith("/") or name == "..":
+            name = path.name
         if name in seen:
             return [], (f"two attachments share the bundle path {name!r}; "
                         "rename one, they cannot both be stored")
@@ -110,7 +129,9 @@ async def main() -> int:
                     metavar="PATH",
                     help="a deliverable file to store as the artifact's payload "
                          "(repeatable). Its bytes are base64-encoded here, never "
-                         "re-emitted by the model. Bundle path = the basename")
+                         "re-emitted by the model. Bundle paths keep the structure "
+                         "below the attachments' common parent, so a page's nested "
+                         "assets still resolve")
     ap.add_argument("--entrypoint", default=None,
                     help="the attached file to render first, e.g. index.html")
     ap.add_argument("--name", required=True, help="artifact title (re-using a name versions it)")

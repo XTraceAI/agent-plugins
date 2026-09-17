@@ -79,11 +79,17 @@ Do exactly this:
      [--file "<a short text summary>"] --name "<name>" --type document
    ```
 
-   `--attach` is repeatable and the bundle path is each file's basename
-   (so `--entrypoint index.html` names an `--attach build/index.html`). Give a
-   text body too whenever you have one: the bytes are stored as the payload and
-   the text is what makes the deliverable findable by search. Keep the bundle
-   to a few MB — a large file belongs in `ingest_document_from_url` instead.
+   `--attach` is repeatable, and the bundle keeps the structure **below the
+   attachments' common parent** — `--attach build/index.html --attach
+   build/assets/chart.png` stores `index.html` and `assets/chart.png`, so a
+   page that references `assets/chart.png` still resolves it. Attach every file
+   the page needs, not just the page: a deliverable uploaded without its
+   stylesheet or images renders broken and looks like a server fault.
+   `--entrypoint` takes the bundle path (`index.html` here), and a lone
+   attachment keeps its basename. Give a text body too whenever you have one:
+   the bytes are the payload, the text is what makes the deliverable findable
+   by search. Keep the bundle to a few MB — a large file belongs in
+   `ingest_document_from_url` instead.
 5. Report the returned `{id, action}` to the user, **and which brain it landed
    in, by name** — automatic routing that happens silently reads as losing
    things. On first ever run the script may open the browser once for approval

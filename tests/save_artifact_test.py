@@ -156,12 +156,29 @@ with tempfile.TemporaryDirectory() as td:
     check(rc == 0 and calls[-1]["content"] == "" and len(calls[-1]["files"]) == 1,
           "empty content is allowed when a bundle carries the artifact")
 
+    print("a tree keeps the paths the page references")
+    assets = out / "assets"; assets.mkdir()
+    chart = assets / "chart.png"; chart.write_bytes(b"\x89PNG\r\n\x1a\n")
+    rc = run("--attach", str(page), "--attach", str(chart),
+             "--entrypoint", "report.html", "--name", "Report")
+    paths = sorted(f["path"] for f in calls[-1]["files"])
+    check(rc == 0 and paths == ["assets/chart.png", "report.html"],
+          f"nested asset keeps its relative path: {paths}")
+    check(calls[-1].get("entrypoint") == "report.html",
+          "the entrypoint still names the page at the bundle root")
+    deep = out / "build" / "static" / "js"; deep.mkdir(parents=True)
+    app_js = deep / "app.js"; app_js.write_text("console.log(1)\n", encoding="utf-8")
+    idx = out / "build" / "index.html"; idx.write_bytes(b"<html>x</html>")
+    rc = run("--attach", str(idx), "--attach", str(app_js), "--name", "Build")
+    paths = sorted(f["path"] for f in calls[-1]["files"])
+    check(rc == 0 and paths == ["index.html", "static/js/app.js"],
+          f"common parent is the bundle root, not the filesystem root: {paths}")
+
     print("refusals")
     rc = run("--attach", str(out / "nope.png"), "--name", "Report")
     check(rc == 2 and not calls, "a missing attachment is an error, nothing is sent")
-    nested = out / "sub"; nested.mkdir(); (nested / "report.html").write_bytes(b"other")
-    rc = run("--attach", str(page), "--attach", str(nested / "report.html"), "--name", "R")
-    check(rc == 2 and not calls, "two attachments with one basename are refused")
+    rc = run("--attach", str(page), "--attach", str(page), "--name", "R")
+    check(rc == 2 and not calls, "the same file attached twice is refused")
     rc = run("--attach", str(page), "--entrypoint", "index.html", "--name", "R")
     check(rc == 2 and not calls, "--entrypoint must name an attached file")
     rc = run("--entrypoint", "report.html", "--name", "R")
