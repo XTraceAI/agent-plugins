@@ -44,6 +44,20 @@ When the delta fits one payload, the offset is the **full consumed span**, not t
 record's end, so records the filters dropped are consumed too rather than re-read on every
 later turn. That keeps the common case byte-identical to the old behaviour.
 
+**Every batch must carry a message-bearing record.** The server reads a batch with no
+`message` among its records as plain chat and fails role validation — the contract
+`_INERT_RECORD_TYPES` is written around, and the reason `attachment` sits *outside* that
+set ("the next turn re-sends it alongside the message records that make the batch valid").
+That reasoning assumed the whole delta always ships. Bounding broke it: a first slice of
+nothing but attachments or sidecars is refused as `server_rejected` — **not** a 413 — so it
+neither advances the cursor nor reaches the shrink ladder, and the next turn slices the
+identical delta identically. A permanent stall through a different door than the one this
+change closes. `_with_a_message` widens the batch until it reaches the first message-bearing
+record, overshooting the byte cap if it must: a payload the server *might* refuse beats one
+it *must* refuse, and it is no larger than the single request the unbounded code sent every
+turn anyway. A delta with no message-bearing record at all is left alone — there is nothing
+to widen to, and being refused while keeping the cursor is already the documented answer.
+
 **One slice per turn, not all of them.** This hook is one call per turn, on a 60 s budget,
 holding the session's flock while `turn_flush_prefilter.py` skips behind it. A backlog
 still drains, because steady-state per-turn deltas are kilobytes: 3.5 MB a turn catches up

@@ -91,6 +91,54 @@ def test_an_oversized_delta_is_cut_to_one_slice():
     check("and advances to its end", consumed, 2_000)
 
 
+def test_a_bounded_batch_always_carries_a_message_bearing_record():
+    """REGRESSION LOCK. The server reads a batch with no `message` among its
+    records as plain chat and fails role validation — the contract
+    `_INERT_RECORD_TYPES` is written around, and the reason `attachment` sits
+    OUTSIDE that set ("the next turn re-sends it alongside the message records
+    that make the batch valid").
+
+    Bounding broke that reasoning: a first slice of nothing but attachments is
+    refused as `server_rejected` — NOT a 413 — so it neither advances the
+    cursor nor reaches the shrink ladder, and the next turn slices the
+    identical delta identically. A permanent stall, reintroduced through a
+    different door than the one this module closed."""
+    print("_bounded — every batch carries a message")
+    att = lambda i: {"type": "attachment", "uuid": f"att{i}",
+                     "attachment": {"pasted": "x" * 200_000}}
+    usr = _rec("u1", "here is the file")
+    sendable = [att(0), att(1), usr]
+    ends = [100, 200, 300]
+
+    batch, consumed = ft._bounded(sendable, ends, 300, ft._MIN_SLICE_BYTES)
+    check("the batch is widened to reach the message record",
+          [r["uuid"] for r in batch], ["att0", "att1", "u1"])
+    check("any batch sent carries a message",
+          any(ft._carries_message(r) for r in batch), True)
+    check("and the cursor covers exactly what was sent", consumed, 300)
+
+    # The same rule must hold on the one-record rung, or that rung walks
+    # straight back into the stall it exists to escape.
+    batch, _ = ft._bounded(sendable, ends, ft._MIN_SLICE_BYTES, True)
+    check("one_record still cannot emit a message-less batch",
+          any(ft._carries_message(r) for r in batch), True)
+
+    # A slice that already has one is left exactly as it was — the common case
+    # must not be widened.
+    plain = [_rec("a"), _rec("b"), _rec("c")]
+    batch, consumed = ft._bounded(plain, [10, 20, 30], 30, 10_000_000)
+    check("a healthy batch is untouched", [r["uuid"] for r in batch],
+          ["a", "b", "c"])
+
+    # Nothing to widen to: return as-is rather than inventing a record. The
+    # pre-existing answer (be refused, keep the cursor, carry it next turn)
+    # still applies.
+    only_atts = [att(0), att(1)]
+    batch, _ = ft._bounded(only_atts, [100, 200], 200, ft._MIN_SLICE_BYTES)
+    check("an all-attachment delta is returned unchanged",
+          [r["uuid"] for r in batch], ["att0"])
+
+
 def test_a_single_record_still_rides_alone():
     """``slices`` never splits inside a record, so a lone oversized record is
     still handed over as its own payload. That is what makes the 413 below a

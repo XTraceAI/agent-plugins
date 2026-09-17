@@ -387,9 +387,50 @@ def _bounded(sendable: list, ends: list[int], consumed: int,
         # Only the first slice is ever sent, so only the first is built.
         payloads = transcript_chunks.slices(sendable, chunk_bytes, max_slices=1)
         first = payloads[0] if payloads else []
+    first = _with_a_message(first, sendable)
     if len(first) >= len(sendable):
         return sendable, consumed
     return first, ends[len(first) - 1]
+
+
+def _carries_message(record) -> bool:
+    return isinstance(record, dict) and isinstance(record.get("message"), dict)
+
+
+def _with_a_message(batch: list, sendable: list) -> list:
+    """``batch``, widened until it carries at least one message-bearing record.
+
+    The server reads a batch with no ``message`` among its records as plain
+    chat and fails role validation — the same contract ``_INERT_RECORD_TYPES``
+    is written around. Before the delta was bounded that could not bite: the
+    whole delta went in one request, so the records that make it valid were
+    always in it, and ``attachment`` is deliberately OUTSIDE the inert set on
+    exactly that reasoning ("the next turn re-sends it alongside the message
+    records that make the batch valid").
+
+    Bounding broke that assumption. A first slice of nothing but attachments or
+    sidecars is rejected, and the rejection is ``server_rejected``, not a 413 —
+    so it neither advances the cursor nor reaches the shrink ladder. The next
+    turn slices the identical delta identically and is refused again, forever:
+    the permanent stall this module was changed to remove, reintroduced through
+    a different door.
+
+    Widening can overshoot the byte cap. That is the right trade and the one
+    ``transcript_chunks.slices`` already makes for an oversized record: a
+    payload the server MIGHT refuse beats one it MUST refuse, and this is no
+    bigger than the single request the unbounded code sent every turn anyway.
+
+    When the delta carries no message-bearing record at all, the batch is
+    returned untouched — there is nothing to widen to, and the pre-existing
+    behaviour (send it, be refused, keep the cursor, carry it again next turn
+    once a real record has arrived) is already the documented answer.
+    """
+    if any(_carries_message(r) for r in batch):
+        return batch
+    for i in range(len(batch), len(sendable)):
+        if _carries_message(sendable[i]):
+            return sendable[:i + 1]
+    return batch
 
 
 def _shrink_slice(session_id: str, state: dict, batch: list,
