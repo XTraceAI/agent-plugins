@@ -381,6 +381,31 @@ def _bounded(sendable: list, ends: list[int], consumed: int,
     it the cap bottoms out and the delta is re-sliced identically every turn —
     the same permanent stall, moved from the server's limit down to our floor.
     """
+    # A leading run of INERT sidecars is consumed rather than carried. They are
+    # UI bookkeeping the server never wants — a batch of nothing else is
+    # rejected outright, which is why `_INERT_RECORD_TYPES` exists — so keeping
+    # them costs payload and buys nothing.
+    #
+    # It matters because of what they do to `_with_a_message`. A
+    # `file-history-snapshot` runs to megabytes, and one sitting in front of a
+    # small user message got WIDENED INTO the batch to reach that message:
+    # measured, a 4,042,959-byte snapshot ahead of a 68-byte message produced a
+    # 4 MB payload where dropping the snapshot leaves a legal 68-byte one. A
+    # 413 on that sent the session dormant with a trivially sendable batch
+    # right there. Unlike the attachment case this needs no unusual server —
+    # one snapshot can clear the real 4 MiB limit by itself.
+    #
+    # Dropping them is not a new liberty: the all-inert branch above already
+    # consumes exactly these records without sending them, and the cursor
+    # advance below still covers them, because `ends` is sliced in step.
+    # `attachment` is deliberately NOT in that set and so is never dropped here.
+    start = 0
+    while start < len(sendable) and _is_inert(sendable[start]):
+        start += 1
+    if start and start < len(sendable):
+        sendable = sendable[start:]
+        ends = ends[start:]
+
     if one_record:
         first = sendable[:1]
     else:
@@ -395,6 +420,17 @@ def _bounded(sendable: list, ends: list[int], consumed: int,
 
 def _carries_message(record) -> bool:
     return isinstance(record, dict) and isinstance(record.get("message"), dict)
+
+
+def _is_inert(record) -> bool:
+    """A UI-bookkeeping sidecar the server has no use for.
+
+    The same set the all-inert branch consumes without sending. Read through a
+    helper rather than inline so both callers agree on what "inert" means —
+    `attachment` is deliberately outside it and must never be dropped.
+    """
+    return (isinstance(record, dict)
+            and record.get("type") in _INERT_RECORD_TYPES)
 
 
 def _with_a_message(batch: list, sendable: list) -> list:

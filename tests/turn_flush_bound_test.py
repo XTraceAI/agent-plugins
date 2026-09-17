@@ -140,6 +140,47 @@ def test_a_bounded_batch_always_carries_a_message_bearing_record():
           [r["uuid"] for r in batch], ["att0"])
 
 
+def test_an_inert_prefix_is_consumed_not_widened_into_the_batch():
+    """REGRESSION LOCK. `_INERT_RECORD_TYPES` records are UI bookkeeping the
+    server has no use for — the all-inert branch already consumes them without
+    sending. But a leading run of them used to be WIDENED INTO the batch by
+    `_with_a_message` reaching for the message behind them, and a
+    `file-history-snapshot` runs to megabytes: measured, a 4 MB snapshot ahead
+    of a 68-byte message produced a 4 MB payload where dropping the snapshot
+    leaves a legal 68-byte one. A 413 on that sent the session dormant with a
+    trivially sendable batch sitting right there — and unlike the attachment
+    case this needs no unusual server, since one snapshot can clear the real
+    4 MiB limit by itself."""
+    print("_bounded — an inert prefix is consumed, not carried")
+    snap = {"type": "file-history-snapshot", "uuid": "snap",
+            "snapshot": {"files": {f"f{i}": "x" * 1000 for i in range(4000)}}}
+    usr = _rec("u1", "hi")
+    check("the snapshot really is inert", ft._is_inert(snap), True)
+    check("and really is huge", ft._record_bytes(snap) > 4_000_000, True)
+
+    batch, consumed = ft._bounded([snap, usr], [100, 200], 200,
+                                  ft._MIN_SLICE_BYTES)
+    check("the inert prefix is dropped", [r["uuid"] for r in batch], ["u1"])
+    check("leaving a payload the server can actually take",
+          ft._record_bytes(batch[0]) < 1_000, True)
+    check("and the cursor still covers the dropped prefix", consumed, 200)
+
+    # An attachment is NOT inert — it is real user content and must survive.
+    att = {"type": "attachment", "uuid": "att", "attachment": {"pasted": "x" * 100}}
+    check("an attachment is not inert", ft._is_inert(att), False)
+    batch, _ = ft._bounded([att, usr], [100, 200], 200, ft._MIN_SLICE_BYTES)
+    check("so an attachment prefix is still carried",
+          [r["uuid"] for r in batch], ["att", "u1"])
+
+    # Interleaved: only the LEADING run goes; nothing after the first real
+    # record is touched, so this cannot quietly change the common case.
+    mid = {"type": "ai-title", "uuid": "t", "aiTitle": "x"}
+    batch, _ = ft._bounded([snap, usr, mid, _rec("u2")], [10, 20, 30, 40], 40,
+                           10_000_000)
+    check("only the leading run is dropped",
+          [r["uuid"] for r in batch], ["u1", "t", "u2"])
+
+
 def test_a_single_record_still_rides_alone():
     """``slices`` never splits inside a record, so a lone oversized record is
     still handed over as its own payload. That is what makes the 413 below a

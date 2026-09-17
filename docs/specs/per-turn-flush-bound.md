@@ -44,6 +44,18 @@ When the delta fits one payload, the offset is the **full consumed span**, not t
 record's end, so records the filters dropped are consumed too rather than re-read on every
 later turn. That keeps the common case byte-identical to the old behaviour.
 
+**A leading run of inert sidecars is consumed, not carried.** `_INERT_RECORD_TYPES`
+records are UI bookkeeping the server has no use for — the all-inert branch already
+consumes them without sending. But a leading run of them was *widened into* the batch by
+the rule below, reaching for the message behind them, and a `file-history-snapshot` runs to
+megabytes: measured, a 4,042,959-byte snapshot ahead of a 68-byte message produced a 4 MB
+payload where dropping the snapshot leaves a legal 68-byte one. A 413 on that sent the
+session dormant with a trivially sendable batch right there — and unlike the attachment
+case this needs no unusual server, since one snapshot can clear the real 4 MiB limit by
+itself. They are dropped before slicing; the cursor still advances past them, because
+`ends` is sliced in step. `attachment` is deliberately outside that set and is never
+dropped.
+
 **Every batch must carry a message-bearing record.** The server reads a batch with no
 `message` among its records as plain chat and fails role validation — the contract
 `_INERT_RECORD_TYPES` is written around, and the reason `attachment` sits *outside* that
