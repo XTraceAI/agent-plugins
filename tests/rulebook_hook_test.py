@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import json
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import shutil
@@ -2823,6 +2824,30 @@ def min_hook_version_checks() -> None:
         check("outcomes: a subagent's or re-entered Stop posts nothing", len(events("o1", "turn_end")) == 2)
         stop("o1", final=True)
         check("outcomes: SessionEnd posts one session_end", len(events("o1", "session_end")) == 1)
+        # the Stop hook is async: a fire of the NEXT turn may reach the ledger
+        # before the Stop process stamps this turn's end. The end is stamped
+        # one tick before the earliest fire recorded after the process began.
+        # (In-process: a subprocess cannot be handed a fire that lands between
+        # its start and its stamp; H reads the temp ledger through BASE.)
+        old_base = H.BASE
+        H.BASE = td
+        try:
+            started = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=5)).isoformat(timespec="microseconds")
+            raced = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=2)).isoformat(timespec="microseconds")
+            later = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=1)).isoformat(timespec="microseconds")
+            before = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=9)).isoformat(timespec="microseconds")
+            with open(fires_path, "a", encoding="utf-8") as f:
+                for fid, sess, at in (("raced-2", "o1", later), ("raced-1", "o1", raced),
+                                      ("mine-before", "o1", before), ("other-sess", "o99", raced)):
+                    f.write(json.dumps({"fire_id": fid, "rule_id": "tests-first", "session_id": sess,
+                                        "mode": "advise", "fired_at": at}) + "\n")
+            check("outcomes: a turn_end is stamped one tick before the EARLIEST fire of its session that raced it",
+                  H.turn_end_at("o1", started) == H._just_before(raced)
+                  and H._earliest_fire_after("o1", started) == raced, str(H.turn_end_at("o1", started)))
+            check("outcomes: …and a Stop nothing raced is stamped now",
+                  H.turn_end_at("o1", H._now()) >= H._now()[:19] and H._earliest_fire_after("o1", H._now()) is None)
+        finally:
+            H.BASE = old_base
         stop("o1", final=True, event="Stop")                    # the Codex bridge's shape
         check("outcomes: a `flush final` on a Stop (the Codex bridge) is a turn_end, not a session end",
               len(events("o1", "session_end")) == 1 and len(events("o1", "turn_end")) == 3,

@@ -3530,6 +3530,48 @@ def _ledger_dir():
     return d
 
 
+_LEDGER_TAIL_BYTES = 256 << 10   # the fires of the last few minutes, whatever the session count
+
+
+def _earliest_fire_after(session, since):
+    """The earliest `fired_at` of `session` in the fires ledger's tail that
+    is later than `since` (ISO instants compare as text within one offset;
+    the ledger is one machine's, so they share it), or None."""
+    try:
+        path = os.path.join(_ledger_dir(), "fires.jsonl")
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - _LEDGER_TAIL_BYTES))
+            chunk = f.read()
+        best = None
+        for line in chunk.split(b"\n")[1 if size > _LEDGER_TAIL_BYTES else 0:]:
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line.decode("utf-8"))
+            except Exception:
+                continue
+            at = r.get("fired_at") if isinstance(r, dict) else None
+            if r.get("session_id") == session and isinstance(at, str) and at > since \
+                    and (best is None or at < best):
+                best = at
+        return best
+    except Exception:
+        return None
+
+
+def turn_end_at(session, started):
+    """When the turn whose Stop spawned this process ended: now, unless a
+    fire of the session was recorded after `started` and before now — then
+    one tick before the earliest of those, because the turn had ended
+    before this process began and so before that fire."""
+    at = _now()
+    early = _earliest_fire_after(session, started)
+    if early and early < at:
+        at = _just_before(early)
+    return at
+
+
 def _just_before(iso):
     """The instant one microsecond before `iso` — the earliest tick the
     server can tell apart from it."""
@@ -3940,6 +3982,7 @@ def main():
         print(book_path(repo))
         return 0
     if mode == "flush":
+        started = _now()          # before anything else: the Stop happened no later than this
         final = "final" in sys.argv[2:]
         # The payload's one useful field: which session's open obligations to
         # close before the rows go out. Anything unreadable → just flush.
@@ -3974,8 +4017,16 @@ def main():
                 kind = "session_end"
             else:
                 kind = "turn_end"
+            # The Stop hook runs ASYNC beside the next turn: a fire of turn
+            # N+1 can land in the ledger before this process stamps turn N's
+            # end, and the server would then count this end as the first one
+            # after that fire and close it a turn early (Codex, #240). The
+            # turn ended before this process started, so it ended before any
+            # fire this session recorded after `started`; stamp it one tick
+            # before the earliest of those.
             log_event({"session": session, "agent_id": None, "repo": repo or None,
-                       "branch": branch or None, "worktree": worktree_key(root)}, kind)
+                       "branch": branch or None, "worktree": worktree_key(root)}, kind,
+                      at=turn_end_at(session, started))
         flush_fires(final=final)
         return 0
     try:
