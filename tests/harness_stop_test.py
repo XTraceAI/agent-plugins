@@ -541,6 +541,9 @@ def test_the_block_reason():
     # e2e caught the earlier `harness_stop.py verdict`: unresolvable, and the
     # agent narrated its reasoning to the person instead of staying quiet.
     assert "memhub-verdict --session sess --ref sess#2" in line
+    # the reason is free prose; `--why '<why>'` dies on an apostrophe, and the
+    # silence instruction above would then hide the failure (Codex, #244)
+    assert "--why" not in line and "<<'WHY'" in line
     assert "harness_stop.py verdict" not in line
     # silence is unconditional — it must not depend on the recording succeeding
     assert "say nothing to the person about this turn" in line
@@ -559,10 +562,29 @@ def test_the_block_reason():
     # a budget, not an obstacle. Raised 900 -> 1100 deliberately: the clause
     # above is the fix for a measured miss, and trimming instructions to hold a
     # round number is how the prompt lane lost its load-bearing text before.
-    assert len(line) < 1100, len(line)
+    assert len(line) < 1200, len(line)
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
     print("PASS test_the_block_reason")
+
+
+def test_a_reason_with_an_apostrophe_survives(monkeypatch=None):
+    """`--why '<why>'` breaks on prose like "it's already covered": the command
+    dies, no row lands, and the block reason says to stay silent regardless —
+    the invisible skip this lane exists to remove (Codex, #244)."""
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        awkward = "it's already covered by the repo's own docs — \"see CONTRIBUTING\""
+        real_stdin = sys.stdin
+        sys.stdin = io.StringIO(awkward)
+        try:
+            assert hs.cmd_verdict("sess", "sess#2", "") == 0
+        finally:
+            sys.stdin = real_stdin
+        rows = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]
+        assert len(rows) == 1 and rows[0]["why"] == awkward, rows
+    print("PASS test_a_reason_with_an_apostrophe_survives")
 
 
 def test_the_verdict_command_the_reason_names_is_on_the_agents_path():

@@ -406,8 +406,10 @@ def block_reason(session: str, moment: dict, repo: str = "") -> str:
         f"session's moments file.{narrow} File it without asking — a draft lands "
         f"proposed for a person either way — then tell the person one line naming the "
         f"rule you filed. If it does not, say nothing to the person about this turn — "
-        f"nothing at all, even if the next step fails — and record why with "
-        f"`memhub-verdict --session {session} --ref {ref} --why '<why>'`. "
+        f"nothing at all, even if the next step fails — and record why by piping "
+        f"the reason in on stdin, which an apostrophe cannot break: "
+        f"`memhub-verdict --session {session} --ref {ref} <<'WHY'`, the reason, "
+        f"then `WHY`. "
         f"Never pass activate. Never put a person's name, home directory or e-mail "
         f"in a rule."
     )
@@ -468,6 +470,17 @@ def cmd_verdict(session: str, ref: str, why: str) -> int:
     """
     if not session or not ref:
         return 0
+    if not why and not sys.stdin.isatty():
+        # The reason is free prose the agent writes, and an apostrophe in it
+        # ("it's already covered") closes the quoting of a `--why '<why>'`
+        # argument early: the command dies, no row is written, and the block
+        # reason tells the agent to stay silent anyway — precisely the
+        # indistinguishable ignored-handoff this lane exists to remove
+        # (Codex, #244). Heredoc-fed stdin cannot be broken by the prose.
+        try:
+            why = sys.stdin.read()
+        except Exception:
+            why = ""
     path = moments_path(session)
     if not path.is_file():
         return 0

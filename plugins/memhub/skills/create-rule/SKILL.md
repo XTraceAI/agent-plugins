@@ -617,7 +617,16 @@ rule's `scope_repos` / `scope_paths`, or file anyway and accept the double
 fire).
 
 Show the user: the rule sentence, the delivery + engine block, the sample
-commands it does and doesn't match, and the conflict verdict. On approval call the memhub
+commands it does and doesn't match, and the conflict verdict.
+
+**A `session_draft` handed over by the harness skips that approval** — it files
+straight away and tells the person afterwards in one line. The draft lands
+`proposed` and fires for nobody until a reviewer activates it, so the approval
+asked for here is already held by whoever reviews the book; asking again
+mid-turn is the interruption the Stop block exists to avoid. A `cross_book`
+conflict is still reported to the person either way.
+
+On approval — or immediately, for a harness draft — call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
 `user correction, session <id>`, with the step-1b numbers appended:
