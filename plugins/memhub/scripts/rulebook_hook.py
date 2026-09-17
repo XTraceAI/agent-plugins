@@ -3560,16 +3560,76 @@ def _earliest_fire_after(session, since):
         return None
 
 
-def turn_end_at(session, started):
-    """When the turn whose Stop spawned this process ended: now, unless a
-    fire of the session was recorded after `started` and before now — then
-    one tick before the earliest of those, because the turn had ended
-    before this process began and so before that fire."""
+def turn_end_at(session, started, transcript_path=None):
+    """When the turn whose Stop spawned this process ended.
+
+    The Stop hook is asynchronous, so this process may start after the next
+    turn has begun and even fired. The one record of when the turn REALLY
+    ended is the transcript: a turn ends with an assistant message whose
+    `stop_reason` is `end_turn` (a tool call mid-turn is `tool_use`), and
+    the harness writes it before the Stop. The latest such record no later
+    than `started` is this turn's end — a fire of the next turn, however
+    early it landed, comes after it (Codex, #240).
+
+    Without a transcript (the Codex bridge, an operator's manual flush):
+    now, unless a fire of the session was recorded after `started` — then
+    one tick before the earliest of those, which bounds the race to the
+    hook's own startup window."""
+    ended = _turn_end_from_transcript(transcript_path, started)
+    if ended:
+        return ended
     at = _now()
     early = _earliest_fire_after(session, started)
     if early and early < at:
         at = _just_before(early)
     return at
+
+
+def _turn_end_from_transcript(tp, before):
+    """The timestamp (local ISO, microseconds) of the latest assistant
+    `end_turn` record in the transcript's tail written no later than
+    `before`, or None. Reads the tail the way `message_id_of` does."""
+    if not tp:
+        return None
+    try:
+        limit = datetime.fromisoformat(before)
+    except Exception:
+        return None
+    try:
+        with open(tp, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            window = _TAIL_START
+            while True:
+                start = max(0, end - window)
+                f.seek(start)
+                lines = f.read(end - start).splitlines()
+                if start:
+                    lines = lines[1:]
+                for raw in reversed(lines):
+                    if not raw.strip():
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    if rec.get("type") != "assistant":
+                        continue
+                    msg = rec.get("message")
+                    if not isinstance(msg, dict) or msg.get("stop_reason") != "end_turn":
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(str(rec.get("timestamp")).replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    if ts.tzinfo is None or ts > limit:
+                        continue
+                    return ts.astimezone().isoformat(timespec="microseconds")
+                if start == 0 or window >= _TAIL_MAX:
+                    return None
+                window *= 4
+    except Exception:
+        return None
 
 
 def _just_before(iso):
@@ -4026,7 +4086,7 @@ def main():
             # before the earliest of those.
             log_event({"session": session, "agent_id": None, "repo": repo or None,
                        "branch": branch or None, "worktree": worktree_key(root)}, kind,
-                      at=turn_end_at(session, started))
+                      at=turn_end_at(session, started, data.get("transcript_path")))
         flush_fires(final=final)
         return 0
     try:

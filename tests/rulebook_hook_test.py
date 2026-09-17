@@ -2825,27 +2825,51 @@ def min_hook_version_checks() -> None:
         stop("o1", final=True)
         check("outcomes: SessionEnd posts one session_end", len(events("o1", "session_end")) == 1)
         # the Stop hook is async: a fire of the NEXT turn may reach the ledger
-        # before the Stop process stamps this turn's end. The end is stamped
-        # one tick before the earliest fire recorded after the process began.
-        # (In-process: a subprocess cannot be handed a fire that lands between
-        # its start and its stamp; H reads the temp ledger through BASE.)
+        # before the Stop process stamps this turn's end — even before the
+        # process STARTS. (In-process: a subprocess cannot be handed such a
+        # fire; H reads the temp ledger through BASE. A fresh session, so no
+        # earlier fire of the test's own sits after the boundary.)
         old_base = H.BASE
         H.BASE = td
         try:
-            started = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=5)).isoformat(timespec="microseconds")
-            raced = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=2)).isoformat(timespec="microseconds")
-            later = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=1)).isoformat(timespec="microseconds")
-            before = (datetime.now(timezone.utc).astimezone() - timedelta(seconds=9)).isoformat(timespec="microseconds")
+            now = datetime.now(timezone.utc).astimezone()
+            iso = lambda secs: (now - timedelta(seconds=secs)).isoformat(timespec="microseconds")
+            started, raced, later, before = iso(5), iso(2), iso(1), iso(9)
             with open(fires_path, "a", encoding="utf-8") as f:
-                for fid, sess, at in (("raced-2", "o1", later), ("raced-1", "o1", raced),
-                                      ("mine-before", "o1", before), ("other-sess", "o99", raced)):
+                for fid, sess, at in (("raced-2", "o-race", later), ("raced-1", "o-race", raced),
+                                      ("mine-before", "o-race", before), ("other-sess", "o99", raced)):
                     f.write(json.dumps({"fire_id": fid, "rule_id": "tests-first", "session_id": sess,
                                         "mode": "advise", "fired_at": at}) + "\n")
-            check("outcomes: a turn_end is stamped one tick before the EARLIEST fire of its session that raced it",
-                  H.turn_end_at("o1", started) == H._just_before(raced)
-                  and H._earliest_fire_after("o1", started) == raced, str(H.turn_end_at("o1", started)))
+            check("outcomes: without a transcript, a turn_end is stamped one tick before the EARLIEST fire that raced it",
+                  H.turn_end_at("o-race", started) == H._just_before(raced)
+                  and H._earliest_fire_after("o-race", started) == raced, str(H.turn_end_at("o-race", started)))
             check("outcomes: …and a Stop nothing raced is stamped now",
-                  H.turn_end_at("o1", H._now()) >= H._now()[:19] and H._earliest_fire_after("o1", H._now()) is None)
+                  H.turn_end_at("o-race", H._now()) >= H._now()[:19] and H._earliest_fire_after("o-race", H._now()) is None)
+            # WITH the transcript the turn's real end is known: the latest
+            # assistant `end_turn` record no later than the process start —
+            # so a next-turn fire that landed BEFORE the process started
+            # (during the hook's own launch) is still ordered after it
+            tpath = os.path.join(td, "race.jsonl")
+            z = lambda secs: (now - timedelta(seconds=secs)).astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            with open(tpath, "w", encoding="utf-8") as f:
+                for rec in (
+                    {"type": "assistant", "timestamp": z(8), "uuid": "a0", "message": {"role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use"}]}},
+                    {"type": "assistant", "timestamp": z(7), "uuid": "a1", "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}},
+                    {"type": "user", "timestamp": z(6.5), "uuid": "u2", "message": {"role": "user", "content": "next"}},
+                    {"type": "assistant", "timestamp": z(6), "uuid": "a2", "message": {"role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use"}]}},
+                    {"type": "attachment", "timestamp": z(5.9)},
+                ):
+                    f.write(json.dumps(rec) + "\n")
+            with open(fires_path, "a", encoding="utf-8") as f:       # the next turn's fire, before `started`
+                f.write(json.dumps({"fire_id": "raced-0", "rule_id": "tests-first", "session_id": "o-race",
+                                    "mode": "advise", "fired_at": iso(5.5)}) + "\n")
+            ended = H.turn_end_at("o-race", started, tpath)
+            want = (now - timedelta(seconds=7)).astimezone(timezone.utc).isoformat(timespec="milliseconds")
+            check("outcomes: with the transcript, the turn_end is the last end_turn record before the process started",
+                  datetime.fromisoformat(ended) == datetime.fromisoformat(want.replace("Z", "+00:00"))
+                  and ended < iso(5.5), str((ended, want)))
+            check("outcomes: a transcript with no end_turn before the start falls back to the fire bound",
+                  H.turn_end_at("o-race", iso(7.5), tpath) == H._just_before(iso(5.5)))
         finally:
             H.BASE = old_base
         stop("o1", final=True, event="Stop")                    # the Codex bridge's shape
