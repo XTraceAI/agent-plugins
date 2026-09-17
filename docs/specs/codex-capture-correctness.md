@@ -318,6 +318,7 @@ Also investigated, also not fixed:
 | D7 | Bot literals read from upstream source, not inferred | `guardian_review`, not `guardian` — an invented literal matched nothing |
 | D8 | Discovery gates candidate *selection*, not read-only *enumeration* | `readers_cli` has a published wire contract and golden files |
 | D9 | **Ship nothing whose precondition is unproven** | The reverted resolver fix: reproduced failure mode, unproven cause, and it introduced a wrong-environment routing bug |
+| D11 | Keep the ENG-1070 #1 fix even though the staging migration removes its trigger | All six symlinks live in `memhub-staging` and go with it when staging moves to its own repo; `memhub` has none. But the fix addresses the SILENCE, not the symlink — `resolve_plugin_root() -> None -> exit 0` swallows any cause, and removing today's cause does not make the next one visible. ~110 self-contained lines that fire on any unresolvable root. **Condition on the migration:** it only holds if the new repo ships staging with real files; a repo that vendors shared code by symlink reproduces this exactly. |
 | D10 | Touch no hook manifest | Editing one un-trusts every existing Codex user |
 
 ---
