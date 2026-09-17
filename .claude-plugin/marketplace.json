@@ -1,6 +1,6 @@
 {
   "name": "memhub",
-  "description": "MemHub plugins for Claude Code \u2014 auto-capture coding sessions into team memory.",
+  "description": "MemHub plugins for Claude Code — auto-capture coding sessions into team memory.",
   "owner": {
     "name": "XTrace",
     "email": "felixmeng@xtrace.ai"
@@ -12,8 +12,8 @@
         "source": "git-subdir",
         "url": "https://github.com/XTraceAI/agent-plugins.git",
         "path": "plugins/memhub",
-        "ref": "memhub--v0.56.1",
-        "sha": "917d729ce0745bd6c1c7ef9629fc852108418c15"
+        "ref": "memhub--v0.59.0",
+        "sha": "04bb90c6c317ebfb65e0bff946f4cf5034e3c2be"
       },
       "description": "Team memory for coding agents: sessions capture into a shared agent brain, your team's rules and past lessons surface in the agent as it works and every rule that fires is disclosed on its own line, and the sessions behind a pull request are linked to it once a human confirms them."
     }
