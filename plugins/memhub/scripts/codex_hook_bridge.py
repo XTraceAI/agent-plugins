@@ -124,24 +124,65 @@ def _version_key(path: Path) -> tuple:
     )
 
 
+# Everything `codex_flush.py` imports at module load, plus itself. Checking for
+# `codex_flush.py` ALONE was the bug: an upgrade that half-populates the new
+# version directory still satisfies a one-file test, so the newest (broken)
+# version outranks a complete older one sitting right beside it. The flush child
+# then dies on `ModuleNotFoundError` — and since it is detached with stdout and
+# stderr to DEVNULL, that death is completely invisible. Reproduced: a full
+# 0.58.3 next to a 0.58.4 holding only codex_flush.py resolves to 0.58.4, every
+# hook event exits 0 with empty output, and nothing is ever captured.
+_REQUIRED = (
+    "codex_flush.py", "atomic_write.py", "portable_lock.py", "mcp_http.py",
+    "pr_provenance.py", "_memhub_auth.py", "brain_resolve.py", "redact.py",
+    "transcript_filter.py", "room_map.py", "rulebook_hook.py",
+    "readers/__init__.py", "readers/codex.py",
+)
+
+
+def _is_complete(root: Path) -> bool:
+    """Does this directory hold a plugin that can actually run?
+
+    Cheap (a dozen stats) and worth it: the alternative is discovering the
+    answer inside a detached child whose failure nobody ever sees.
+    """
+    scripts = root / "scripts"
+    return all((scripts / name).is_file() for name in _REQUIRED)
+
+
 def resolve_plugin_root() -> Path | None:
     for variable in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
         override = os.environ.get(variable)
         if override:
             root = Path(override).expanduser()
-            if (root / "scripts" / "codex_flush.py").is_file():
+            if _is_complete(root):
                 return root
 
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     cache = codex_home / "plugins" / "cache"
-    for marketplace, plugin in _KNOWN_INSTALLS:
-        versions = [
-            path for path in (cache / marketplace / plugin).glob("*")
-            if (path / "scripts" / "codex_flush.py").is_file()
-        ]
-        if versions:
-            return max(versions, key=_version_key)
-    return None
+    # Any marketplace name, not a two-entry allowlist: a user who registers the
+    # marketplace under a name of their own choosing had capture silently die
+    # at a cache path we never looked in. The completeness test above is what
+    # makes a wide search safe — we are identifying OUR plugin by its contents.
+    candidates = []
+    try:
+        candidates = [path for path in cache.glob("*/*/*") if _is_complete(path)]
+    except OSError:
+        candidates = []
+    if not candidates:
+        return None
+    # Prefer a known marketplace, then the newest version. Falling back through
+    # the sorted list rather than returning the first hit means one broken
+    # version cannot mask a working one.
+    known = [(m, p) for m, p in _KNOWN_INSTALLS]
+
+    def rank(path: Path) -> tuple:
+        pair = (path.parent.parent.name, path.parent.name)
+        return (0 if pair in known else 1, _version_key(path))
+
+    preferred = min(candidates, key=lambda p: rank(p)[0])
+    tier = rank(preferred)[0]
+    return max((p for p in candidates if rank(p)[0] == tier), key=_version_key)
 
 
 def _run(
@@ -452,7 +493,11 @@ def main() -> int:
         if root is None:
             _report_unresolved(action, sys.argv[2] if len(sys.argv) > 2 else "")
             return 0
-        _clear_unresolved()
+        # Retract AFTER dispatching, never before: capture_health runs INSIDE
+        # _dispatch, so clearing first meant it could never see the breadcrumb a
+        # previous broken session left — and when the root is missing entirely,
+        # capture_health cannot run at all (it lives in that same root). Cleared
+        # up front, `_bridge.json` was readable by nothing.
         if action == "dispatch" and len(sys.argv) > 2:
             _dispatch(root, payload, sys.argv[2])
         elif action == "directive-pre":
@@ -463,6 +508,7 @@ def main() -> int:
             _artifact_sync(root, payload)
         elif action == "flush" and len(sys.argv) > 2:
             _detach_flush(root, payload, sys.argv[2])
+        _clear_unresolved()
     except BaseException as exc:  # A memory hook must always fail open.
         print(f"[memhub-codex-bridge] {type(exc).__name__}: {exc}", file=sys.stderr)
     return 0

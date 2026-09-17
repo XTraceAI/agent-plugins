@@ -144,6 +144,88 @@ def test_status_refuses_to_say_ok_while_capture_is_dead():
     assert "plugin: NOT FOUND" in out.getvalue()
 
 
+def _fake_install(root: Path, *, complete: bool) -> Path:
+    """A plugin version directory — fully populated, or the shape a partial
+    extraction leaves behind (codex_flush.py present, its imports missing)."""
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    names = bridge._REQUIRED if complete else ("codex_flush.py",)
+    for name in names:
+        path = scripts / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    return root
+
+
+def test_a_half_installed_newer_version_never_beats_a_working_one():
+    # THE upgrade bug. codex_flush.py imports ten siblings at module load, so a
+    # directory holding only that one file passes a one-file check and then dies
+    # on ModuleNotFoundError — inside a child detached to DEVNULL, where nobody
+    # sees it. Reproduced before the fix: a complete 0.58.3 beside a partial
+    # 0.58.4 resolved to 0.58.4, every hook event exited 0 with empty output,
+    # and capture was dead and silent.
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "plugins" / "cache" / "xtrace-plugins" / "memhub"
+        _fake_install(cache / "0.58.3", complete=True)
+        _fake_install(cache / "0.58.4", complete=False)
+        with patch.dict(os.environ, {"CODEX_HOME": td}, clear=False):
+            for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+                os.environ.pop(var, None)
+            picked = bridge.resolve_plugin_root()
+        assert picked is not None, "fell back to nothing instead of the good install"
+        assert picked.name == "0.58.3", f"picked the half-installed version: {picked}"
+
+
+def test_a_complete_newer_version_is_still_preferred():
+    # The fallback must not turn into "always use the oldest".
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "plugins" / "cache" / "xtrace-plugins" / "memhub"
+        _fake_install(cache / "0.58.3", complete=True)
+        _fake_install(cache / "0.58.4", complete=True)
+        with patch.dict(os.environ, {"CODEX_HOME": td}, clear=False):
+            for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+                os.environ.pop(var, None)
+            assert bridge.resolve_plugin_root().name == "0.58.4"
+
+
+def test_a_marketplace_we_did_not_hardcode_is_still_found():
+    # _KNOWN_INSTALLS listed two names. A user who registers the marketplace
+    # under any other name had capture die silently at a cache path nothing
+    # looked in. The completeness check is what makes a wide search safe.
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "plugins" / "cache" / "someones-own-name" / "memhub"
+        _fake_install(cache / "1.0.0", complete=True)
+        with patch.dict(os.environ, {"CODEX_HOME": td}, clear=False):
+            for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+                os.environ.pop(var, None)
+            assert bridge.resolve_plugin_root() is not None
+
+
+def test_an_env_override_pointing_at_a_partial_install_is_refused():
+    # PLUGIN_ROOT is injected by Codex itself; if it names a broken tree we must
+    # fall through to the cache rather than trust it and die in the child.
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        broken = _fake_install(Path(td) / "broken", complete=False)
+        with patch.dict(os.environ, {"MEMHUB_PLUGIN_ROOT": str(broken),
+                                     "CODEX_HOME": str(Path(td) / "empty")}):
+            assert bridge.resolve_plugin_root() is None
+
+
+def test_the_breadcrumb_survives_long_enough_for_health_to_read_it():
+    # capture_health runs INSIDE _dispatch. Clearing before dispatch meant the
+    # breadcrumb a previous broken session left could never be reported, and
+    # with no root capture_health cannot run at all — so it was readable by
+    # nothing. Retraction must happen after the dispatch, not before.
+    src = (SCRIPTS / "codex_hook_bridge.py").read_text(encoding="utf-8")
+    body = src.split("def main()", 1)[1]
+    assert body.index("_dispatch(root, payload") < body.index("_clear_unresolved()"), \
+        "main() still retracts the breadcrumb before capture_health can read it"
+
+
 def test_status_asks_with_the_hooks_environment_not_the_callers():
     # The setup skill always runs with PLUGIN_ROOT / CLAUDE_PLUGIN_ROOT set
     # (skills/setup/SKILL.md), while the user-level bridge is invoked with

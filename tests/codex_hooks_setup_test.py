@@ -29,6 +29,24 @@ setup = _load("setup_codex_hooks")
 bridge = _load("codex_hook_bridge")
 
 
+
+def _plausible_plugin(scripts: Path) -> None:
+    """Fill in the files `resolve_plugin_root` requires but this test never drives.
+
+    The bridge refuses a half-populated plugin directory on purpose: an upgrade
+    that leaves the newest version incomplete used to be selected over a working
+    older install and killed capture in silence. A stub standing in for a plugin
+    therefore has to look like one — the behaviour each test actually exercises
+    is still written by that test, this only fills the gaps.
+    """
+    scripts.mkdir(parents=True, exist_ok=True)
+    for name in bridge._REQUIRED:
+        path = scripts / name
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+
+
 def test_install_preserves_other_hooks_and_is_idempotent():
     with tempfile.TemporaryDirectory() as raw:
         home = Path(raw)
@@ -229,9 +247,10 @@ def test_runner_selects_latest_known_install():
         home = Path(raw)
         base = home / "plugins" / "cache" / "xtrace-plugins" / "memhub"
         for version in ("0.9.0", "0.10.0", "0.10.0+codex.local-2"):
-            scripts = base / version / "scripts"
-            scripts.mkdir(parents=True)
-            (scripts / "codex_flush.py").write_text("", encoding="utf-8")
+            # A COMPLETE install at each version: the resolver now
+            # skips half-populated ones, so an empty codex_flush.py
+            # alone no longer stands for a plugin.
+            _plausible_plugin(base / version / "scripts")
         old = os.environ.get("CODEX_HOME")
         try:
             os.environ["CODEX_HOME"] = str(home)
@@ -265,6 +284,7 @@ def test_runner_relays_directive_and_artifact_context():
             "'additionalContext':'version the linked artifact'}}))\n",
             encoding="utf-8",
         )
+        _plausible_plugin(scripts)
         env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
         payload = json.dumps({
             "tool_name": "Bash", "tool_input": {"command": "touch x"}
@@ -307,6 +327,7 @@ def test_dispatch_combines_post_tool_contexts():
             "'additionalContext':'version the artifact'}}))\n",
             encoding="utf-8",
         )
+        _plausible_plugin(scripts)
         env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
         payload = json.dumps({
             "hook_event_name": "PostToolUse",
@@ -394,6 +415,7 @@ def test_dispatch_session_start_merges_the_three_claude_scripts():
             "'systemMessage':'capture: token expired'}))\n" % str(plugin),
             encoding="utf-8",
         )
+        _plausible_plugin(scripts)
         env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
         payload = json.dumps({"hook_event_name": "SessionStart", "source": "startup",
                               "session_id": "s-1", "cwd": raw}).encode()
@@ -468,6 +490,7 @@ def test_every_shell_alias_uses_the_directive_prefilter():
         (scripts / "directive_recall.py").write_text(
             "print('SHOULD_NOT_RUN')\n", encoding="utf-8"
         )
+        _plausible_plugin(scripts)
         env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
         for tool_name in ("Bash", "shell", "local_shell"):
             payload = json.dumps({

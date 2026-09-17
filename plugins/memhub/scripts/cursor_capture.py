@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -140,6 +141,46 @@ def upgrade_context(payload: bytes) -> str | None:
     return None
 
 
+def health_context(payload: bytes) -> str | None:
+    """Capture-health for the Cursor lane, at most once per session.
+
+    Cursor wires no session-start event, so there is nowhere to run the health
+    check the way Claude and Codex do — which is why a Cursor capture failure
+    previously reached the user through no channel at all. This rides the
+    message `beforeShellExecution` already injects rather than adding a hook
+    event (a manifest change costs every user a re-trust).
+
+    Once per session: the marker bounds it to one subprocess per session
+    instead of one per shell call, and capture_health's own staleness window
+    and retraction rules still decide whether there is anything to say.
+    """
+    data = json.loads(payload)
+    session = str(data.get("conversation_id") or "").strip()
+    if not session:
+        return None
+    state_dir = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session)[:80]
+    marker = state_dir / f"{safe}.health"
+    try:
+        if marker.exists():
+            return None
+        state_dir.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")
+    except OSError:
+        return None          # never let a marker failure cost the health line
+    roots = data.get("workspace_roots") or []
+    hook = {"cwd": data.get("cwd") or (roots[0] if roots else os.getcwd()),
+            "session_id": session}
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("capture_health.py")),
+         "--host", "cursor"],
+        input=json.dumps(hook).encode(), capture_output=True, timeout=3, check=False)
+    if not result.stdout:
+        return None
+    return json.loads(result.stdout).get(
+        "hookSpecificOutput", {}).get("additionalContext")
+
+
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     output = {"permission": "allow"}
@@ -149,7 +190,16 @@ def main() -> int:
         if payload is not None:
             spawn_cursor_flush(payload, event)
             if event == "beforeShellExecution":
-                context = upgrade_context(payload)
+                parts = []
+                for lane in (upgrade_context, health_context):
+                    try:
+                        text = lane(payload)
+                    except Exception as exc:   # one lane must not cost the other
+                        _log(f"{lane.__name__} failed ({exc!r})")
+                        text = None
+                    if text:
+                        parts.append(text)
+                context = "\n\n".join(parts)
                 if context:
                     output.update(agent_message=context, user_message=context)
     except Exception as exc:

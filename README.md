@@ -148,12 +148,19 @@ Two Codex-specific rules fall out of that:
   real sessions, and because the skip advances the capture cursor that loss
   would be unrecoverable. An unfamiliar value is captured and noted in the
   Codex capture log instead.
-- **A broken install says so.** The bridge in `~/.codex` finds the plugin at
-  hook time. If the plugin's files are missing — the usual cause is an install
-  that copied the manifest but not the scripts — it used to exit quietly and
-  capture simply never happened. It now leaves a capture-health breadcrumb and
-  says once, at session start, that capture is off. `memhub:setup` reports the
-  same thing: wired handlers alone are no longer "OK".
+- **An upgrade no longer breaks capture.** The bridge in `~/.codex` finds the
+  plugin at hook time, preferring the newest installed version. It used to
+  accept a version directory on the strength of a single file, so an upgrade
+  that left the new version half-populated was chosen over the complete older
+  one — and capture then died silently, because the flusher runs detached with
+  its output discarded. It now checks that a version actually holds every file
+  it needs and falls back to the newest complete one, so a partial upgrade
+  costs you nothing. It also finds the plugin whatever name you registered the
+  marketplace under, rather than only two hard-coded ones.
+- **A genuinely broken install says so.** When no complete install exists at
+  all, the bridge used to exit quietly. It now leaves a capture-health
+  breadcrumb and says once, at session start, that capture is off.
+  `memhub:setup` reports the same: wired handlers alone are no longer "OK".
 
 Capture runs on independent paths that all feed one server-side watermark
 (keyed on `conversation_id` = `session_id`), so re-sending never double-saves:

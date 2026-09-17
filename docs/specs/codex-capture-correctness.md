@@ -16,9 +16,12 @@ Base: `origin/main` @ `2538729`. Branch: `fix/codex-capture-correctness`.
 
 ## Goal
 
-1. **A Codex install that cannot capture must say so.** Today the hook bridge
-   exits 0 in silence when it cannot find the plugin, and the installer's own
-   `status` reports OK while capture is dead.
+1. **Codex capture must survive an upgrade — and say so when it cannot.**
+   Two distinct defects. The bridge picks the NEWEST plugin version on the
+   strength of one file existing, so a half-populated new version outranks a
+   complete old one and capture dies in total silence. And when no plugin can
+   be found at all, the bridge exits 0 without a word while the installer's own
+   `status` reports OK.
 2. **Stop importing Codex's internal guardian/subagent review sessions.** They
    are 35% of all captured Codex sessions in staging.
 3. **Make Codex rule fires linkable to the session that produced them.** The
@@ -76,6 +79,47 @@ one more reason it never enters the Codex/Cursor catalogs".
 Aggravator: `setup_codex_hooks.status()` (`:233-240`) checks only `hooks.json`
 handler equality and the runner's bytes. It never checks that a plugin root
 resolves, so it prints `OK` while capture is dead.
+
+**The upgrade case — the one that actually breaks capture in the field.**
+`resolve_plugin_root()` accepted a version directory if `scripts/codex_flush.py`
+existed. But `codex_flush.py` imports ten siblings plus `readers/` at module
+load, so a partially extracted install satisfies that one-file test and then
+dies on `ModuleNotFoundError` — inside a child detached with stdout and stderr
+to `DEVNULL`, where nothing observes it. Reproduced directly:
+
+```
+complete install : …/memhub/0.58.3        (full scripts/)
+partial install  : …/memhub/0.58.4        (only scripts/codex_flush.py)
+resolve_plugin_root() -> …/0.58.4         ← picks the BROKEN one
+
+direct run of the partial codex_flush.py: rc=1
+  ModuleNotFoundError: No module named 'atomic_write'
+bridge dispatch Stop   rc=0  stdout=b''  stderr=b''
+breadcrumb written? False
+```
+
+A working 0.58.3 sits unused beside it. This matches the field report that
+"every plugin update breaks Codex capture", and ENG-1070's own note that the
+failure recurred "again during the update to 0.55.1".
+
+`_KNOWN_INSTALLS` compounded it: only `xtrace-plugins/memhub` and
+`memhub-internal/memhub-staging` were searched, so a marketplace registered
+under any other name put the plugin at a path nothing looked in.
+
+**Refuted while investigating, recorded so nobody re-derives it:**
+
+- *"Codex does not export `PLUGIN_ROOT`, so the bundled manifest's
+  `[ -n "$R" ]` guard silently no-ops."* **False.** Codex 0.146 exports
+  `PLUGIN_ROOT`, `CLAUDE_PLUGIN_ROOT` and `PLUGIN_DATA` into plugin hook
+  commands — `codex-rs/hooks/src/engine/discovery.rs:262-270`, applied at
+  `command_runner.rs:427-431` — confirmed empirically with a probe plugin.
+- *"Changing `codex_hook_bridge.py` un-trusts the hooks on upgrade."*
+  **False.** `hook_hash()` (`discovery.rs:775-791`) hashes the event name,
+  matcher and normalized handler — never the referenced script's bytes.
+  **But the manifests are a different matter:** the hash DOES cover `command`,
+  `matcher`, `timeout` and `statusMessage`, so editing
+  `hooks/codex-hooks.json` or `references/codex-hooks-bridge.json` silently
+  un-trusts every existing user. Commit `fe5e745` did exactly that.
 
 ### ② Guardian sessions imported as real sessions
 
@@ -156,11 +200,29 @@ schema, **not** from the production rows.
 
 ## Design
 
-### Fix ① — the bridge speaks for itself
+### Fix ① — capture survives a partial upgrade, and speaks when it cannot
 
 `plugins/memhub/scripts/codex_hook_bridge.py`
 
-When `resolve_plugin_root()` returns `None`:
+**The repair.** `resolve_plugin_root()` now proves an install before trusting
+it: `_REQUIRED` lists `codex_flush.py` plus everything it imports at module
+load (`atomic_write`, `portable_lock`, `mcp_http`, `pr_provenance`,
+`_memhub_auth`, `brain_resolve`, `redact`, `transcript_filter`, `room_map`,
+`rulebook_hook`, `readers/codex.py`). A dozen `is_file()` calls, weighed
+against discovering the answer inside a child whose failure nobody sees.
+
+Three consequences, all deliberate:
+
+- **Fall back, don't fail.** Candidates are ranked and the newest *complete*
+  one wins, so one broken version can never mask a working one.
+- **Any marketplace name.** The two-entry allowlist becomes a `cache/*/*/*`
+  search; known names still rank first. The completeness test is what makes a
+  wide search safe — we identify our plugin by its contents, not its path.
+- **An env override is checked too.** `PLUGIN_ROOT` is injected by Codex
+  itself; if it names a broken tree we fall through to the cache rather than
+  trust it and die in the child.
+
+**The observability, still needed** — when *no* complete install exists:
 
 1. **Write a breadcrumb** to
    `~/.config/memhub-plugin/codexflush/_bridge.json` in the shape
@@ -318,6 +380,10 @@ session id. Only the bytes that cross the wire change.
 | D8 | ~~Report an unrecognised kind as a capture failure~~ → **capture it and log it** | Superseded by D11: an unfamiliar kind is now captured, so it is not a failure. A `last_error` there would print "capture failed" over a session that captured fine |
 | D9 | `_plugin_root` resolves under the HOOK's environment, not the caller's | Found in review: the setup skill always runs with `PLUGIN_ROOT` set, so the check reported a healthy plugin for a dead install — it could not detect the failure it was written for |
 | D10 | Discovery gates candidate *selection*, not read-only *enumeration* | `readers_cli` has a published wire contract and golden files; `capture.py list` is an explicit "show me what is on disk" |
+| D12 | Prove the install; fall back to the newest COMPLETE version | A one-file check let a half-populated upgrade outrank a working install and kill capture silently. Reproduced. This is the repair ENG-1070 #1 actually needed |
+| D13 | Search any marketplace name, not a two-entry allowlist | A user who registered the marketplace under their own name had capture die at a path nothing looked in. Safe only because D12 identifies the plugin by contents |
+| D14 | Cursor gets a health lane, riding `beforeShellExecution` | `capture_health._STATE_DIRS` had no cursor entry, so `cursorflush/*.json` was read by nothing. Reusing the message that hook already injects avoids a manifest change — which would un-trust every user (see Evidence) |
+| D15 | `readers/codex.py` still ignores `$CODEX_HOME` | Deliberate deferral, not an oversight: the code says `sessions_root()` is a containment boundary for payload-supplied paths and widening it "is a separate change with its own review". Not smuggled into a correctness PR |
 | D11 | The bot literals are taken from upstream source, not inferred | `guardian_review`, not `guardian` — the invented literal matched nothing, so every real guardian skip would have raised a false "unknown kind" alarm. `memory_consolidation` was missing entirely. Read from `codex-rs/protocol/src/protocol.rs`, not guessed |
 
 ---
