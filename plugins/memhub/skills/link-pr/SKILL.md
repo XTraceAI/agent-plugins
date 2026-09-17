@@ -24,7 +24,7 @@ one command away from the link they would have made.
 
 Arguments: `$ARGUMENTS`
 - First token = a PR number or full URL (optional).
-- `--session <id>` (repeatable) = the session(s) to link. Omit and step 3
+- `--session <id>` (repeatable) = the session(s) to link. Omit and step 2
   resolves the running one.
 - `--unlink` = remove the link instead of creating it.
 
@@ -47,8 +47,10 @@ the only path — with no way to link at all.
 
 ## 2. Resolve the sessions
 
-`--session <id>` wins, and is used verbatim. Otherwise ask the plugin which
-session is running:
+`--session <id>` wins. Strip leading and trailing whitespace off each one —
+the server strips them inside `session_ids` but not in the classification
+argument step 4 sends, so a padded id links fine and then fails to classify.
+Otherwise ask the plugin which session is running:
 
 ```bash
 python3 "<plugin-root>/scripts/capture.py" current --json
@@ -81,7 +83,72 @@ Use `link_source="manual"` here — this skill is a person saying so, which is
 what that value means. (`session_self` is the hook's, `session_found` is
 `/memhub:find-contributing-sessions`'s.)
 
-## 4. Report the reply honestly
+## 4. Record the work type
+
+Skip this entire step when `--unlink` was used: unlinking does not clear a
+type, and implying otherwise would be a lie.
+
+Read `pr.pr_type` on the reply you just got from step 3. **If it is not null,
+this pull request already has a type** — say which one, and go straight to
+step 5. The first decision is permanent (MemHub has no edit path), so a second
+one is refused and there is nothing to add.
+
+If it is null, ask the user which of these the pull request primarily is:
+
+```
+feat — a new capability or behavior
+fix — corrects existing faulty behavior
+chore — maintenance, tooling, dependencies, tests, build/CI, style
+docs — documentation changes
+perf — performance improvements
+refactor — structural change that preserves intended behavior
+other — a deliberate choice when none of the above fit
+```
+
+This skill is a **human** saying so, so the type is theirs — do not pick one on
+their behalf. If they have no strong view, `other` is the honest answer rather
+than a guess; it cannot be corrected later. A PR that does several things gets
+its primary purpose; never more than one.
+
+Then send a SECOND call naming **one** session. The id you name is recorded
+permanently as the classification's author, so choose it deliberately: use the
+session step 2 resolved as the running one, and when several `--session` ids
+were linked and the running one is not among them, **ask** which session the
+type belongs to rather than picking the first.
+
+```
+link_pr(pr_url="…", session_ids=["<that one id>"], link_source="session_self",
+        pr_type="<the chosen type>", classification_session_id="<that same id>")
+```
+
+Three things about this call that will otherwise look like bugs:
+
+- **`link_source="session_self"`, not `"manual"`.** The server refuses
+  classification from any other value. This does not relabel anything: the row
+  written in step 3 keeps its `manual` source (a confirmed link is never
+  rewritten), and the classification table has no `link_source` column at all.
+- **`classification_session_id` must equal its `session_ids` entry and carry
+  no leading or trailing whitespace.** The server strips each `session_ids`
+  entry but compares `classification_session_id` raw, so sending `"  abc  "` in
+  both places still fails with `classification_session_id must name one of
+  session_ids`. Strip any id a user passed via `--session` before using it
+  here.
+- **`skipped: already_linked` with `linked: []` is SUCCESS here**, not a
+  failure. The session was linked in step 3; this call exists only to carry the
+  type. Confirm it by reading `pr.pr_type` on the reply.
+
+If it fails saying the session **"was not found among your sessions"**, capture
+has not caught up: wait 10s and retry the identical call once. If that fails
+too, say the link from step 3 stands but the type was not recorded. Never drop
+the type to force it through — an unarrived session links nothing either way,
+so that retry buys nothing.
+
+If it fails saying the PR **"already has a different classification"**, someone
+classified it between step 3 and now. The server refuses the **whole write** on
+that error, so nothing was lost here only because step 3 already made the link —
+report the type that is there and do not try another one.
+
+## 5. Report the reply honestly
 
 Relay what the server actually said; do not re-word a partial result into a
 success it does not claim.

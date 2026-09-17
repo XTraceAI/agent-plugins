@@ -285,6 +285,45 @@ def test_the_host_flag_namespaces_the_session_id():
           rc == 0 and '["s1"]' in context(out), out)
 
 
+def test_a_pr_with_no_type_yet_is_asked_for_one():
+    """End to end, the work-type block rides B1's existing link instruction.
+
+    `CONNECTED`'s `pr` carries no `pr_type` key at all, which is the same
+    answer an OLD backend gives — so this case also pins what the hook does
+    against a deployment that has never heard of classification. It asks. That
+    is why the pull request carrying this must not merge before the backend
+    ships: prod would be told to send arguments its `link_pr` rejects, and a
+    refused classification refuses the whole write.
+    """
+    FAKE.reply = dict(CONNECTED)
+    rc, out = run(payload("gh pr create"), home=_home())
+    ctx = context(out)
+    check("asks for a type alongside the link",
+          rc == 0 and 'pr_type="' in ctx and 'classification_session_id="s1"' in ctx,
+          out)
+    check("the classification session matches the linked one",
+          'session_ids=["s1"]' in ctx and 'classification_session_id="s1"' in ctx)
+
+
+def test_a_pr_that_already_has_a_type_is_left_alone():
+    """The 409 we can see coming is the one we never provoke.
+
+    A classification is permanent — no UPDATE, no DELETE, no correction
+    endpoint anywhere in the backend — so a second session opening or
+    reopening this pull request must not spend a call being refused.
+    """
+    reply = dict(CONNECTED)
+    reply["pr"] = {**CONNECTED["pr"], "pr_type": "fix",
+                   "pr_type_source": "agent_session"}
+    FAKE.reply = reply
+    rc, out = run(payload("gh pr create"), home=_home())
+    ctx = context(out)
+    check("still tells the session to link itself",
+          rc == 0 and 'link_source="session_self"' in ctx, out)
+    check("but asks for no type", "pr_type=" not in ctx
+          and "classification_session_id" not in ctx, ctx[-160:])
+
+
 def test_the_hook_is_stateless():
     FAKE.reply = dict(CONNECTED)
     home = _home()

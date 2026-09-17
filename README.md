@@ -389,11 +389,13 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 - `/memhub:link-pr [pr] [--session <id>] [--unlink]` — links a coding session
   to a pull request in MemHub, so the PR's session context is published from a
   confirmed fact rather than a branch-name guess. This is also how a PR opened
-  by something the hook cannot see — a script, a CI helper — gets linked.
+  by something the hook cannot see — a script, a CI helper — gets linked, and
+  on Cursor it is the only way to record a PR's work type.
 - `/memhub:find-contributing-sessions [pr]` — scans this machine's session
   history (Claude Code, Codex, Cursor) for the sessions that wrote a PR's code,
   ranks the candidates by the evidence that matched, and links the ones you
-  approve. It never links anything without an explicit yes.
+  approve. It never links anything without an explicit yes, and it records the
+  PR's work type only when the PR has none yet.
 
 ## PR babysitting
 
@@ -441,6 +443,18 @@ question and injects one instruction. There are three answers:
 - **any other GitHub call naming one PR** → the agent decides. It links only if
   it wrote that code in this session, and otherwise offers
   `/memhub:find-contributing-sessions`.
+
+**The agent also says what kind of work the PR is.** Whenever it links a pull
+request that has no type yet, the same call carries one of `feat`, `fix`,
+`chore`, `docs`, `perf`, `refactor` or `other` — chosen from the diff the
+session actually produced, never parsed out of the title. MemHub deleted its
+own title-and-branch inference, so a pull request nobody labels simply has no
+type; there is no hidden backfill. **The first label is permanent** — there is
+no correction endpoint — so a PR that already carries one is never re-asked,
+and a genuine collision is reported rather than overwritten. A multi-purpose PR
+gets its primary purpose; `other` is a legitimate answer and a better one than
+a guess. `/memhub:link-pr` asks *you* for the type instead of deciding, since
+that path is a person speaking.
 
 Unconditional self-linking is deliberately the **narrow** lane. A hand-rolled
 `curl -X POST …/pulls` is not treated as a creation: recognising a write meant
