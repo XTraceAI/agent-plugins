@@ -558,6 +558,7 @@ def test_the_block_reason():
     # markdown wraps; the check is about content, not where the lines break,
     # and reflowing prose to satisfy a substring test is the wrong direction
     skill = " ".join(skill.replace("*", "").replace("`", "").split())
+    assert "conflict is still reported to the person" not in skill
     for owed in ("not already a RULE", "does NOT disqualify it",
                  "restating the docs", "ask the person nothing at all",
                  "Never pass activate", "Step 4b.6", "Step 0 (which rulebook)",
@@ -566,6 +567,8 @@ def test_the_block_reason():
                  # agent hits a mandatory step it cannot satisfy (Codex, #244)
                  "Every terminal path that does not file records a verdict",
                  "not_filed", "no_lesson",
+                 # nothing on a non-filing path reaches the person (Codex, #244)
+                 "hears about the turn only when a rule was filed",
                  "same_matcher", "ambiguity verdict",
                  "source_ref is passed EXACTLY as the harness line gives it"):
         assert owed in skill, owed

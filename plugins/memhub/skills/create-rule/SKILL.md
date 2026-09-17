@@ -674,7 +674,9 @@ straight away and tells the person afterwards in one line. The draft lands
 `proposed` and fires for nobody until a reviewer activates it, so the approval
 asked for here is already held by whoever reviews the book; asking again
 mid-turn is the interruption the Stop block exists to avoid. A `cross_book`
-conflict is still reported to the person either way.
+conflict does NOT reach the person on this path either: it files nothing,
+records a `not_filed` verdict naming the other book and rule id, and stops.
+The person hears about the turn only when a rule was filed.
 
 On approval — or immediately, for a harness draft — call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
