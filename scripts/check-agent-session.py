@@ -29,7 +29,8 @@ for _name, _filename in (("install", "check-host-install.py"), ("policy", "check
     _spec.loader.exec_module(globals()[_name])
 
 AUTH = {"codex": "CODEX_API_KEY", "claude": "ANTHROPIC_API_KEY", "cursor": "CURSOR_API_KEY"}
-LIVE_CHECKS = ("agent_completed", "advice_delivered", "gate_enforced", "allowed_operation", "capture_acknowledged")
+LIVE_CHECKS = ("agent_completed", "advice_fire_recorded", "advice_marker_echoed", "gate_enforced",
+               "allowed_operation", "capture_acknowledged")
 REPO = "memhub-production-release-e2e"
 BLOCKED_FILE = ".memhub-release-blocked"
 # The id each host's capture sends as ``conversation_id`` — what the backend's
@@ -490,14 +491,21 @@ def run_live(args, report, model):
             report.check("hook_health", lambda: claude_hook_health(events))
         sid = report.check("native_session_identity", lambda: session_id(events, args.host))
         fires = ledger(root)
-        # The marker exists only in the hook's advice text, never in the
-        # prompt: its presence in the reported advice (or anywhere in the
-        # final text) proves the model read a delivered fire.
-        report.check("advice_delivered", lambda: require(
-            (fixture["advice_marker"] in str(fields.get("advice", "")) or fixture["advice_marker"] in final) and any(
-                r.get("rule_id") == fixture["advice_rule_id"] and r.get("mode") == "advise"
-                and sid is not None and r.get("session_id") == sid for r in fires),
-            "agent did not echo the hidden advice marker from a recorded hook fire"))
+        # Two checks, not one. The hook recording the fire is the PLUGIN's
+        # evidence and is deterministic; the model echoing the marker (which
+        # exists only in the hook's advice text, never in the prompt) is the
+        # MODEL's evidence that it read a delivered fire, and a model can
+        # simply not say it. Folded into one assertion, a red leg could not
+        # be told apart from a plugin bug without a rerun (#240: the Codex
+        # leg failed once and passed on identical bytes). Both must hold.
+        report.check("advice_fire_recorded", lambda: require(any(
+            r.get("rule_id") == fixture["advice_rule_id"] and r.get("mode") == "advise"
+            and sid is not None and r.get("session_id") == sid for r in fires),
+            "the hook recorded no advise fire of the fixture rule under this session"))
+        report.check("advice_marker_echoed", lambda: require(
+            fixture["advice_marker"] in str(fields.get("advice", "")) or fixture["advice_marker"] in final,
+            "the model did not echo the hidden advice marker (a model answer, not a plugin fault: "
+            "see advice_fire_recorded for whether the fire itself was delivered)"))
         report.check("gate_enforced", lambda: require(not (ws / BLOCKED_FILE).exists() and any(
             r.get("rule_id") == fixture["gate_rule_id"] and r.get("mode") == "gate"
             and sid is not None and r.get("session_id") == sid
