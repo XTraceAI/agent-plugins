@@ -1120,10 +1120,14 @@ class OrderingEngine:
                 if ok is True:                            # a red run never discharges
                     s["count"] = 0
                     # Older builds also kept the rule's open fire ids here so
-                    # the receipt could convert them; those keys are dropped
-                    # on the way through. Which fires this receipt answers is
-                    # the server's fold, from the `receipt` event the caller
-                    # posts (rule-fire-events-spec §3).
+                    # the receipt could convert them. Those fires were posted
+                    # WITHOUT a checkout key, so a `receipt` event cannot
+                    # reach them on the server (a sibling's session id is not
+                    # theirs); they are handed to the caller, which answers
+                    # them the old way — a legacy conversion the drain
+                    # re-posts (Codex, #240). Then the keys are gone for good.
+                    legacy = [f for f in [s.get("open_fire")] + list(s.get("open_fires") or []) if f]
+                    rule["_legacy_fires"] = list(dict.fromkeys(legacy))
                     for k in ("open_fire", "open_fires", "resolved_fires"):
                         s.pop(k, None)
                     self._write(st)
@@ -3527,7 +3531,13 @@ def _ledger_dir():
 
 
 def _now():
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    """Microseconds, not seconds: the server orders a fire and the events
+    that may answer it by these instants, and an equal instant counts (a
+    same-call dismissal is stamped with its fire's). At second precision an
+    event from one hook invocation and a fire of the same rule from the
+    NEXT invocation in that second would tie, and an earlier conversion
+    could answer a later fire (Codex, #240)."""
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
 
 
 # Records that ARE messages. A transcript interleaves many other kinds —
@@ -3664,6 +3674,21 @@ def log_event(ctx, kind, *, rule_id=None, reason=None, worktree=None, at=None):
         return row["event_id"]
     except Exception:
         return None
+
+
+def log_legacy_conversion(fire_id, how):
+    """A verdict for a fire a PRE-v0.59 hook posted (no checkout key on the
+    server, so no event can answer it): one line in the old sidecar, which
+    `legacy_verdict_batches` re-posts with the fire the old way. The only
+    writer of that file this hook has, and only for those fires."""
+    if portable_lock is None:
+        return
+    try:
+        with open(os.path.join(_ledger_dir(), "conversions.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"fire_id": fire_id, "converted": True,
+                                "converted_at": _now(), "how": how}) + "\n")
+    except Exception:
+        pass
 
 
 # `RULEBOOK_OVERRIDE='[<label>] <why>'` — the label rides INSIDE the value.
@@ -4241,6 +4266,8 @@ def main():
                     # server matches it by session.
                     log_event(ctx, "receipt", rule_id=rid,
                               worktree=None if session_scoped(r) else ctx["worktree"])
+                    for legacy_fid in r.pop("_legacy_fires", None) or []:
+                        log_legacy_conversion(legacy_fid, "discharged")
                 elif outcome == "fired":
                     dedup_keys[rid] = f"{rid}@{root}:{branch}"
                     fired_now.append(r)

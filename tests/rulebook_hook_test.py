@@ -2793,6 +2793,12 @@ def min_hook_version_checks() -> None:
 
         ok = {"stdout": "ok", "exit_code": 0}
 
+        # 0. instants carry microseconds, so two invocations in one second
+        #    cannot tie on the server (an earlier event must never answer a
+        #    later fire); a same-call event still shares its fire's instant
+        check("outcomes: instants are microsecond ISO with an offset",
+              re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}[+-]\d\d:\d\d$", H._now()) is not None, H._now())
+
         # 1. a fire is a row with the checkout key and NO outcome columns
         rc, out = bash("o1", "git push origin main")
         check("outcomes: the advisory names its feedback channel",
@@ -2993,6 +2999,30 @@ def min_hook_version_checks() -> None:
         rc, out = bash("o9", "RULEBOOK_OVERRIDE='[ord-adv] CI runs it' ls")
         check("outcomes: an ordering advisory is dismissable by name — the server orders it against the receipt",
               len(events("o9", "dismissed", "ord-adv")) == 1 and "set aside" in ctx(out), out)
+        # UPGRADE: an open ordering fire a pre-v0.59 hook left in the worktree
+        # state (posted without a checkout key) is answered the old way on
+        # the first green receipt — a legacy conversion the drain re-posts
+        wt_path = os.path.join(td, "state", f"wt-{WT}.json")
+        with open(wt_path, encoding="utf-8") as f:
+            wt_state = json.load(f)
+        with open(fires_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"fire_id": "legacy-ord-1", "rule_id": "ord-adv", "session_id": "old-sess",
+                                "mode": "advise", "fired_at": "2026-09-16T09:00:00+00:00"}) + "\n")
+        slot = wt_state.setdefault("*", {}).setdefault("ord-adv", {"count": 0, "last_edit": None})
+        slot.update({"count": 1, "open_fire": "legacy-ord-1", "open_fires": ["legacy-ord-1"], "resolved_fires": ["x"]})
+        with open(wt_path, "w", encoding="utf-8") as f:
+            json.dump(wt_state, f)
+        bash("o27", "uv run pytest tests/architecture -q", mode="post", resp={"stdout": "3 passed", "exit_code": 0})
+        legacy = [json.loads(l) for l in open(os.path.join(td, "ledger", "conversions.jsonl"), encoding="utf-8") if l.strip()] \
+            if os.path.isfile(os.path.join(td, "ledger", "conversions.jsonl")) else []
+        with open(wt_path, encoding="utf-8") as f:
+            slot_after = json.load(f)["*"]["ord-adv"]
+        check("outcomes: a legacy open fire is converted the old way on the receipt, and the old keys are gone",
+              [x["fire_id"] for x in legacy] == ["legacy-ord-1"] and legacy[0]["converted"] is True
+              and legacy[0]["how"] == "discharged" and len(events("o27", "receipt", "ord-adv")) == 1
+              and not any(k in slot_after for k in ("open_fire", "open_fires", "resolved_fires")),
+              str(legacy) + str(slot_after))
+        os.unlink(os.path.join(td, "ledger", "conversions.jsonl"))   # the drain is exercised in §10 below
         # a SESSION-armed ordering rule: its receipt carries no checkout, so
         # the server answers this session's fires only
         run("session", {"cwd": orepo, "session_id": "o30", "hook_event_name": "SessionStart"}, oenv)
