@@ -244,6 +244,45 @@ def test_the_floor_falls_through_to_one_record_per_turn():
             ft.STATE_DIR = original
 
 
+def test_the_ladder_ends_in_dormancy_not_an_endless_retry():
+    """REGRESSION LOCK. `one_record` shrinks the payload; `_with_a_message`
+    widens it to stay legal. When an attachment prefix plus the first message
+    exceeds the limit those two pull against each other, and the ladder ran out
+    of state to change — cursor pinned, identical payload re-sent every turn
+    forever, which is the stall this module exists to remove.
+
+    They are not actually in conflict: a batch must carry a message to be
+    parsed AND be under the limit to be accepted, and since the cursor is a
+    single byte offset only a PREFIX can be sent. If the shortest
+    message-bearing prefix is over the limit, no legal batch exists. So stop
+    trying — dormancy costs nothing, because SessionEnd sends the whole
+    transcript independently of this cursor."""
+    print("_shrink_slice — the ladder terminates")
+    original = ft.STATE_DIR
+    att = lambda i: {"type": "attachment", "uuid": f"att{i}",
+                     "attachment": {"pasted": "x" * 200_000}}
+    sendable = [att(0), att(1), att(2), _rec("u1")]
+    batch, _ = ft._bounded(sendable, [100, 200, 300, 400], 400,
+                           ft._MIN_SLICE_BYTES, True)
+    check("staying legal does widen past one record",
+          len(batch) > 1, True)
+    with tempfile.TemporaryDirectory() as tmp:
+        ft.STATE_DIR = Path(tmp)
+        try:
+            sid = "terminal"
+            ft._save_state(sid, slice_bytes=ft._MIN_SLICE_BYTES,
+                           one_record=True, last_error="payload_too_large")
+            ft._shrink_slice(sid, ft._read_state(sid), batch, 400)
+            state = ft._read_state(sid)
+            check("the ladder ends in dormancy", state.get("unsupported"), True)
+            check("the cursor is still not moved", state.get("offset"), None)
+            check("and the breadcrumb survives, so the banner still explains it",
+                  state.get("last_error"), "payload_too_large")
+            check("no false success is recorded", state.get("last_ok_at"), None)
+        finally:
+            ft.STATE_DIR = original
+
+
 def test_one_unsendable_record_is_stepped_over():
     """A record above the floor cannot ride in any payload we can build, so
     pinning the cursor on it means the session never captures another turn. It

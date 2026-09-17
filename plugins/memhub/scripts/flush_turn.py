@@ -507,6 +507,24 @@ def _shrink_slice(session_id: str, state: dict, batch: list,
         _log("still refused at the smallest slice — sending one record per "
              "turn for the rest of this session")
         _save_state(session_id, one_record=True)
+        return
+    # The last rung is spent, and the two requirements are now jointly
+    # unsatisfiable: a batch must carry a message-bearing record for the server
+    # to parse it at all, and must be under the limit for the server to accept
+    # it — and because the cursor is a single byte offset, only a PREFIX can
+    # ever be sent. When the shortest message-bearing prefix is over the limit,
+    # no valid batch exists, so `_with_a_message` widening past `one_record` is
+    # not a bug to route around: there is nothing smaller that would be legal.
+    #
+    # Retrying it re-sends the identical payload every turn forever, which is
+    # the stall this module exists to remove. Go dormant instead: the prefilter
+    # reads this flag and stops spawning doomed flushes, and NOTHING IS LOST —
+    # SessionEnd sends the whole transcript and is deliberately independent of
+    # this cursor. The `payload_too_large` breadcrumb already written stands,
+    # so the health banner still says what happened.
+    _log("the smallest legal batch is still refused — per-turn capture is "
+         "dormant for this session; session-end capture still applies")
+    _save_state(session_id, unsupported=True)
 
 
 def _titles(records: list[dict], state: dict) -> tuple[str | None, str | None]:

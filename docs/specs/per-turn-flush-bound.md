@@ -5,7 +5,7 @@
 in the *urgent plugin fix (claude code)* brain, which holds the live evidence this was
 diagnosed from. This file is the standing description of the mechanism.
 
-**Status:** implemented in v0.58.4. Covered by `tests/turn_flush_bound_test.py`.
+**Status:** implemented in v0.59.1. Covered by `tests/turn_flush_bound_test.py`.
 
 ---
 
@@ -92,6 +92,7 @@ many records went. The ladder, in order:
 | >1 record, cap at the floor (`_MIN_SLICE_BYTES = 256_000`) | **one record per turn** from here on, cursor unmoved |
 | exactly 1 record, **larger** than the floor | **step over it**, breadcrumb the loss |
 | exactly 1 record, **at or below** the floor | keep it, cursor unmoved — the server is refusing, not the record |
+| already one record per turn, still refused | **dormant** — no legal batch exists; SessionEnd covers it |
 
 Each rung exists because the one above it has run out, and the last two are what keep this
 from being the original bug at a lower threshold:
@@ -117,6 +118,17 @@ from being the original bug at a lower threshold:
   practice: a record `_elide_record` leaves untouched because it carries no `message`
   dict); below it, the server is refusing something minimal, which says nothing about the
   record. So drop the first, keep the second, and let the SessionEnd backstop have it.
+
+- **The ladder terminates in dormancy, not an endless retry.** `one_record` shrinks the
+  payload and `_with_a_message` widens it to stay legal, so an attachment prefix whose first
+  message pushes it over the limit pulls both ways. They are not really in conflict: a batch
+  must carry a message to be *parsed* and be under the limit to be *accepted*, and because
+  the cursor is a single byte offset only a **prefix** can be sent — so if the shortest
+  message-bearing prefix is over the limit, **no legal batch exists**. Re-sending it every
+  turn is the stall this change removes. Setting `unsupported` stops the prefilter spawning
+  doomed flushes and loses nothing: `flush_session` sends the whole transcript and is
+  deliberately independent of this cursor. The `payload_too_large` breadcrumb stands, so the
+  banner still explains it.
 
 When a record is stepped over, the cursor advance and the breadcrumb go out in **one**
 atomic publish, so a crash between them cannot leave a cursor that skipped a record nobody
