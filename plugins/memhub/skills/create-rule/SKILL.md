@@ -33,6 +33,15 @@ rendered to the person as `Stop hook feedback:` — there is no Stop channel tha
 reaches only the model — so it stays a pointer and everything it used to carry
 lives here.
 
+**The invariant, before the details: nothing on this path reaches the person
+except one line naming a rule that was filed.** Every step of this skill that
+shows, asks, offers or reports — §4b.1's prompt preview, §4b's cleanup report,
+the revision offer when a forward test finds nothing, the conflict choices,
+the step-5 confirmation — is suppressed here, including ones added after this
+was written. Where a step says to stop and ask, stop silently instead. The
+enumerations below say what to DO at each such point; this says what the
+person sees, which is nothing until there is a rule.
+
 - **The test.** A lesson is one that would change what an agent DOES next time,
   is not already a RULE, is not project state, and will still be true next
   month. Already written in CLAUDE.md or the docs does NOT disqualify it: if
@@ -65,6 +74,11 @@ lives here.
     and on this path it is not reported either: `cross_book` (a rule in a book
     `supersedes_rule_id` cannot reach), or `same_matcher` on an active rule
     that is not this one. File nothing, say nothing, stop.
+  - **A live verification that runs and fails is terminal.** The forward test
+    firing on zero candidate rows is not a conflict and not a missing
+    precondition: the pattern is unproven, so file nothing, say nothing, and
+    stop. Do not offer to revise it — that offer is the interruption this path
+    exists to avoid, and an unproven matcher is worse than no rule.
   - **Never pass `activate`.** Never put a person's name, home directory or
     e-mail in a rule.
   - **`unchanged: true` is a filing, not a blocker.** That reply means the rule

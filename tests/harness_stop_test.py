@@ -568,6 +568,11 @@ def test_the_block_reason():
                  # nothing on a non-filing path reaches the person (Codex, #244)
                  "hears about the turn only when a rule was filed",
                  "File nothing, say nothing, stop", "same_matcher",
+                 # one invariant beats enumerating every step that talks: five
+                 # rounds of this PR were the next unexempted one (Codex, #244)
+                 "nothing on this path reaches the person",
+                 "including ones added after this was written",
+                 "A live verification that runs and fails is terminal",
                  # an idempotent re-import ended WITH a rule (Codex, #244)
                  "unchanged: true is a filing, not a blocker",
                  "source_ref is passed EXACTLY as the harness line gives it"):
