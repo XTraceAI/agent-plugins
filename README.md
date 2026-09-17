@@ -145,7 +145,18 @@ Capture runs on independent paths that all feed one server-side watermark
    boundaries). A cheap prefilter (`turn_flush_prefilter.py`, plain `python3`,
    no `uv`) skips the expensive spawn when there's nothing new to send, a
    flush is already in flight, or capture is switched off
-   (`MEMHUB_TURN_FLUSH=0`).
+   (`MEMHUB_TURN_FLUSH=0`). The delta is **bounded** before it is sent — it
+   goes through `transcript_chunks.slices()`, the same splitter the
+   whole-transcript paths use, and only the first payload ships, with the
+   cursor landing on the last record in it. Without that bound, a session whose
+   pending delta outgrew the server's request limit got a `413` on every turn,
+   could not advance a cursor past bytes that were never sent, and re-sent the
+   same ever-growing delta forever — per-turn capture dead for the rest of that
+   session's life, on exactly the long sessions worth keeping. A backlog now
+   drains over the next few turns, because steady-state deltas are kilobytes;
+   if the server's limit turns out to be lower still the cap halves for that
+   session, and a single record no payload can carry is stepped over rather
+   than pinning every turn behind it.
 2. **`SessionEnd` (backstop).** Deliberately independent of the per-turn
    cursor — it re-sends the whole transcript-so-far and lets the server's
    watermark dedup, so it still captures a session whose per-turn path was

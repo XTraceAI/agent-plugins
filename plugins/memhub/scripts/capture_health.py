@@ -105,6 +105,15 @@ _REASONS = {
     # attempt BEFORE it produced, which pointed at a cause that had already been
     # dealt with.
     "budget_exhausted": "capture ran out of time before it finished sending",
+    # The server refused a payload for its SIZE. Reported as the generic
+    # `error` until ENG-1085, which rendered as "the capture hook hit an
+    # unexpected error … run /memhub:login --status" — pointing at the
+    # credential, which was fine — above a session whose per-turn capture had
+    # been dead for hours. The flush bounds its batch now, so this is the rare
+    # tail (a request limit lower than the slice cap, or one record that cannot
+    # be split at all) and it corrects itself, which the advice has to say.
+    "payload_too_large": ("one turn was too large for the server to accept in "
+                          "one piece"),
     "error": "the capture hook hit an unexpected error",
 }
 
@@ -483,6 +492,13 @@ def _message(host: str, token_problem: str | None,
                     "/memhub:import-session to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
+        elif reason == "payload_too_large":
+            # Same reasoning as `budget_exhausted`: not a credential question,
+            # so `--status` would send them to inspect the one thing that was
+            # definitely fine. The flush sends less on each following turn and
+            # steps over anything it can never send, so this resolves itself.
+            tail = ("Capture splits it over the next few turns on its own, "
+                    "and the session-end backstop covers the rest.")
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

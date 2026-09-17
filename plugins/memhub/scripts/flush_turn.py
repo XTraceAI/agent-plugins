@@ -21,6 +21,18 @@ The server dedups incoming records against (extracted ∪ buffered), so
 over-sending costs bandwidth while under-sending leaves a gap nothing will ever
 notice. That asymmetry is the whole reason this file is written the way it is.
 
+**The delta is BOUNDED, and the cursor tracks what was sent, not what was
+read.** Individual records have long been capped; the aggregate was not. So a
+session whose pending delta outgrew the server's request limit got a 413 on
+every turn, could not advance a cursor past bytes that were never sent, and
+re-sent the same ever-growing delta forever — per-turn capture dead for the
+rest of that session's life, on exactly the long sessions worth keeping. The
+delta now goes through the same splitter the whole-transcript paths use and
+only the first slice ships, with the cursor landing on the last record in it.
+A backlog drains over the next few turns because steady-state deltas are
+kilobytes; ``flush_session`` remains the backstop for whatever a session ends
+before reaching.
+
 **One flush per session at a time.** The server expects a session's turns to
 arrive in order, so an advisory ``flock`` keeps two hooks from overlapping when
 one turn finishes before the previous flush has returned. Losing that race is
@@ -56,9 +68,10 @@ from session_title import (  # noqa: E402
     prompt_title,
 )
 from redact import redact_records, redact_text  # noqa: E402
+import transcript_chunks  # noqa: E402
 from transcript_filter import (  # noqa: E402
-    drop_command_wrappers,
     elide_oversized_tool_results,
+    is_command_wrapper,
 )
 
 # All at module scope now. These used to be deferred into :func:`_flush`
@@ -79,6 +92,32 @@ STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "turnflush"
 # the prefilter skips while held, so this is also the longest a hung server
 # can stall capture for the session.
 _DEFAULT_FLUSH_TIMEOUT_S = 60.0
+
+# Floor for the per-turn payload cap (see ``_shrink_slice``). Below this a 413
+# has stopped meaning "the batch is too big" and started meaning "this ONE
+# record is", and halving further only delays the step-over that actually
+# unsticks the session. Well under any plausible request limit, and still
+# roomy enough to carry an ordinary turn whole.
+_MIN_SLICE_BYTES = 256_000
+
+# A refusal for SIZE that did not arrive as an HTTP 413. Today's server answers
+# with the status — verified live — and that is the path worth trusting. But a
+# proxy in front of it, or a server that reports the refusal inside a 200
+# JSON-RPC envelope or as an `isError` tool result, delivers the same thing
+# with no status to branch on; treated as a generic fault, the cap never comes
+# down and the session stalls exactly as it did before the batch was bounded.
+# Phrases only, and no bare "413": a status code is a plausible substring of an
+# unrelated message, and mistaking some other failure for this one puts the
+# session on the shrink ladder for no reason.
+_SIZE_REFUSAL_PHRASES = ("too large", "too big", "entity too large",
+                         "payload_too_large", "body exceeded",
+                         "request body limit")
+
+
+def _is_size_refusal(detail: str) -> bool:
+    """Whether an error the transport could not classify is a size refusal."""
+    text = (detail or "").lower()
+    return any(phrase in text for phrase in _SIZE_REFUSAL_PHRASES)
 
 
 def _flush_timeout_s() -> float:
@@ -239,19 +278,26 @@ def _acquire(session_id: str) -> int | None:
 
 # ── flush ─────────────────────────────────────────────────────────────
 
-def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
-    """Records appended since ``offset``, plus the offset actually consumed.
+def _read_tail(transcript: str, offset: int) -> tuple[list[dict], list[int], int]:
+    """Records appended since ``offset``, the byte offset each one ENDS at, and
+    the offset actually consumed.
 
-    Opened in binary and decoded per line so the returned offset is a true BYTE
-    count — a character count would drift on any non-ASCII turn and silently
+    Opened in binary and decoded per line so the returned offsets are true BYTE
+    counts — a character count would drift on any non-ASCII turn and silently
     mis-seek the next flush.
 
     The final line is routinely a PARTIAL write, because Claude Code is still
     appending while this runs. That is the expected case, not corruption: stop
     at the last complete line and leave the cursor before the partial one, so
     the next flush picks the record up whole.
+
+    ``ends`` is what lets a flush that ships only PART of the delta still move
+    the cursor — to the last record it actually sent. Without it the cursor can
+    only move by the whole delta, which is the all-or-nothing that made an
+    oversized delta unsendable for the rest of a session's life.
     """
     records: list[dict] = []
+    ends: list[int] = []
     consumed = offset
     with open(transcript, "rb") as fh:
         fh.seek(offset)
@@ -263,10 +309,163 @@ def _read_tail(transcript: str, offset: int) -> tuple[list[dict], int]:
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue  # unparseable but complete: skip, keep the offset
-    return records, consumed
+            records.append(record)
+            # Appended together, never independently: an ``ends`` that drifted
+            # out of step with ``records`` would move the cursor past a record
+            # that was never sent — the one failure this whole module is
+            # written to make impossible.
+            ends.append(consumed)
+    return records, ends, consumed
+
+
+def _slice_bytes(state: dict) -> int:
+    """Bytes one per-turn payload may carry.
+
+    ``transcript_chunks.DEFAULT_CHUNK_BYTES`` — the same figure the whole-
+    transcript paths use — unless a 413 already taught THIS session that this
+    server's limit is lower. Clamped on the way out so a hand-edited or
+    corrupt state file cannot widen the cap past the default or narrow it below
+    the floor.
+    """
+    try:
+        value = int(state.get("slice_bytes") or 0)
+    except (TypeError, ValueError):
+        return transcript_chunks.DEFAULT_CHUNK_BYTES
+    if value <= 0:
+        return transcript_chunks.DEFAULT_CHUNK_BYTES
+    return max(_MIN_SLICE_BYTES,
+               min(value, transcript_chunks.DEFAULT_CHUNK_BYTES))
+
+
+def _record_bytes(record) -> int:
+    """Serialized size of one record — the same measure ``transcript_chunks``
+    slices by, so the two agree about what "too big" means.
+
+    Never raises, and an unmeasurable record reports 0: every use of this is a
+    decision about whether to DROP a record, and an unknown size must resolve
+    toward keeping it.
+    """
+    try:
+        return len(json.dumps(record, separators=(",", ":"), default=str))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bounded(sendable: list, ends: list[int], consumed: int,
+             chunk_bytes: int, one_record: bool = False) -> tuple[list, int]:
+    """``(what to send now, the byte offset it ends at)``.
+
+    Individually-oversized records were already handled upstream by
+    ``elide_oversized_tool_results``. What was never bounded is the AGGREGATE:
+    once a session's pending delta crossed the server's request limit, every
+    flush returned 413, the cursor could not advance past what was never sent,
+    and the same ever-growing delta was re-sent every turn — per-turn capture
+    dead for the rest of that session. Six sessions on one machine at once.
+
+    The same splitter ``flush_session`` and ``import_session`` use, so there is
+    exactly one definition of "a payload one call can carry". Only the FIRST
+    slice goes: this hook is one call per turn, on a 60s budget, holding the
+    session's flock while the prefilter skips behind it. A backlog still
+    drains, because steady-state per-turn deltas are kilobytes — 3.5 MB a turn
+    catches up far faster than a session produces.
+
+    When the delta fits one payload the offset is the FULL consumed span, not
+    the last record's end, so records the filters dropped are consumed too
+    rather than re-read on every later turn.
+
+    ``one_record`` is the last rung: a server that refused even a floor-sized
+    slice gets one record at a time, the smallest payload that exists. Without
+    it the cap bottoms out and the delta is re-sliced identically every turn —
+    the same permanent stall, moved from the server's limit down to our floor.
+    """
+    if one_record:
+        first = sendable[:1]
+    else:
+        # Only the first slice is ever sent, so only the first is built.
+        payloads = transcript_chunks.slices(sendable, chunk_bytes, max_slices=1)
+        first = payloads[0] if payloads else []
+    if len(first) >= len(sendable):
+        return sendable, consumed
+    return first, ends[len(first) - 1]
+
+
+def _shrink_slice(session_id: str, state: dict, batch: list,
+                  batch_consumed: int) -> None:
+    """React to a refusal for SIZE: send less next turn, or step over a record
+    that can never be sent.
+
+    The ladder is: halve the cap → one record per turn → step over that record
+    if it is the thing that is too big. Each rung exists because the one above
+    it has run out, and the last two are what keep this from being the original
+    bug at a lower threshold.
+
+    **Halving is sticky**, because a request limit is a property of the server:
+    re-probing the full cap after every success buys one guaranteed-wasted
+    round trip per turn and learns nothing new.
+
+    **A single-record batch skips the ladder entirely.**
+    ``transcript_chunks.slices`` never splits inside a record, so
+    ``slices([R], n) == [[R]]`` for every ``n`` — lowering the cap cannot
+    change what the next turn sends. Walking the ladder anyway cost four
+    full-size uploads, each one refused, with the whole delta frozen behind
+    them.
+
+    **Stepping over a record is gated on the RECORD's own size**, not on the
+    cap having bottomed out. Inferring "unsendable" from the cap alone deleted
+    a 67-byte record on one spurious 413 — and because the cap is sticky, a
+    session that had ever been driven to the floor stayed in delete-on-413 mode
+    for the rest of its life, which is precisely the silent permanent loss the
+    cursor rule exists to prevent. A record above the floor is one no payload
+    we can build will carry; below it, the server is refusing something
+    minimal, which says nothing about the record. So: drop the first, keep the
+    second, and let the SessionEnd backstop have it.
+
+    Never raises: it is reached from a failure path that must still exit 0.
+    """
+    if len(batch) <= 1:
+        record = batch[0] if batch else None
+        if record is not None and _record_bytes(record) > _MIN_SLICE_BYTES:
+            _log("one record is larger than this server will accept at any "
+                 "size — skipping it so the rest of the session keeps "
+                 "capturing")
+            # One write, not two. The failure is already breadcrumbed by the
+            # caller; this replaces the detail with what actually happened and
+            # advances the cursor in the same atomic publish, so a crash
+            # between them cannot leave a cursor that skipped a record nobody
+            # knows about.
+            _save_state(session_id, offset=batch_consumed,
+                        last_error="payload_too_large",
+                        last_error_detail="skipped one record the server "
+                                          "would not accept at any size",
+                        last_error_at=time.time())
+            return
+        # Small, and still refused. Nothing smaller can be built, so per-turn
+        # capture cannot proceed — but the record is NOT the problem, and
+        # deleting an ordinary turn on one bad answer is the loss this rule
+        # exists to prevent. Keep it. The breadcrumb stands and SessionEnd
+        # still captures the session whole.
+        _log("the server refused a payload this small — keeping the record; "
+             "session-end capture still applies")
+        return
+    current = _slice_bytes(state)
+    if current > _MIN_SLICE_BYTES:
+        shrunk = max(_MIN_SLICE_BYTES, current // 2)
+        _log(f"payload cap {current:,}B was still too large — halving to "
+             f"{shrunk:,}B for the rest of this session")
+        _save_state(session_id, slice_bytes=shrunk)
+        return
+    # At the floor and still refused as a BATCH. Halving is spent, but one
+    # payload smaller than a floor-sized slice does exist: a single record.
+    # Without this rung the delta is re-sliced identically every turn and the
+    # session stalls for good — the same defect this module was changed to
+    # remove, relocated from the server's 4 MiB limit down to our own floor.
+    if not state.get("one_record"):
+        _log("still refused at the smallest slice — sending one record per "
+             "turn for the rest of this session")
+        _save_state(session_id, one_record=True)
 
 
 def _titles(records: list[dict], state: dict) -> tuple[str | None, str | None]:
@@ -335,7 +534,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     size = os.path.getsize(transcript_path)
     state = _read_state(session_id)
     offset = _read_cursor(state, size)
-    records, consumed = _read_tail(transcript_path, offset)
+    records, ends, consumed = _read_tail(transcript_path, offset)
     if not records:
         return
 
@@ -375,9 +574,21 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # runs over what will actually be sent, and before slicing would matter:
     # a single record the server can never accept would otherwise pin the
     # cursor and stall this session's capture for good.
+    # INDEX-PRESERVING, so every sendable record still knows the transcript
+    # byte offset it ends at. Dropping the wrappers through the predicate
+    # ``drop_command_wrappers`` is built from — rather than calling the dropper
+    # and losing which record came from where — is what lets a bounded batch
+    # advance the cursor to the last record it actually shipped.
+    # ``session_title`` already reads the filter this way, so this is the
+    # module's own idiom rather than a second mechanism.
+    # ``elide_oversized_tool_results`` and ``redact_records`` are both 1:1,
+    # including on their never-raise fallbacks (each returns the list it was
+    # handed), so the correspondence survives them.
+    keep = [i for i, r in enumerate(records) if not is_command_wrapper(r)]
     sendable = redact_records(
-        elide_oversized_tool_results(drop_command_wrappers(records))
+        elide_oversized_tool_results([records[i] for i in keep])
     )
+    sendable_ends = [ends[i] for i in keep]
 
     if not sendable or all(
         isinstance(r, dict) and r.get("type") in _INERT_RECORD_TYPES
@@ -402,6 +613,14 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # one call site clears the error.
         _save_state(session_id, **fields)
         return
+
+    # Bounded AFTER the inert check, so a delta made only of sidecars is
+    # consumed whole rather than sliced — and before anything costs a round
+    # trip, because the size of what we are about to send is the reason this
+    # hook stopped working on long sessions.
+    batch, batch_consumed = _bounded(sendable, sendable_ends, consumed,
+                                     _slice_bytes(state),
+                                     bool(state.get("one_record")))
 
     # Each falls back INDEPENDENTLY. Tying the namespace's fallback to the cwd's
     # left a real gap: a delta can carry a cwd while git resolution fails on it
@@ -452,7 +671,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # caches the answer, so this is not a per-turn round-trip.
     room = await resolve_repo_brain(session, cwd, env) if cwd else None
     arguments = {
-        "messages": sendable,
+        "messages": batch,
         "conversation_id": session_id,
         "source_platform": "claude",
         # The whole point: durable on arrival, extracted in batches.
@@ -489,6 +708,12 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # reported to the user as "the capture hook hit an unexpected error".
     #
     # The cursor is unmoved in every branch, so all of them retry next turn.
+    # Set by ``_import`` when the server refused the payload for its SIZE. The
+    # reaction lives at the call site because it needs to know how many records
+    # went — a slice of one cannot be made smaller, and that is the difference
+    # between "send less next turn" and "step over this record".
+    too_large = False
+
     async def _import(args: dict):
         """Send one import, classifying transport failures. None = already
         reported, and the caller must return without touching the cursor.
@@ -499,6 +724,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         must be classified identically on both, and keeping one copy is what
         guarantees that; a second inline ladder is exactly how the two drift.
         """
+        nonlocal too_large
         try:
             return await session.call_tool("import_conversation", arguments=args)
         except mcp_http.McpRateLimited as e:
@@ -528,6 +754,25 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 _log("credential lacks permission (403) — check the key's "
                      "scopes and that it can reach this brain's org; skipping")
                 _mark_failure(session_id, "forbidden", str(e))
+            elif e.status == 413:
+                # The server refused the payload for its SIZE. The batch is
+                # bounded now, so reaching here means either this server's
+                # limit is lower than the cap we guessed, or the slice is ONE
+                # record and cannot be split at all. Reported under its own
+                # slug because the generic `error` advice — "run
+                # /memhub:login --status" — sent the last person who hit this
+                # to inspect the one thing that was definitely fine, and they
+                # read past the banner for hours.
+                _log(f"payload refused as too large "
+                     f"({len(args.get('messages') or [])} rec)")
+                _mark_failure(session_id, "payload_too_large", str(e))
+                too_large = True
+            elif _is_size_refusal(str(e)):
+                # Same refusal, no status to read it from — see
+                # ``_SIZE_REFUSAL_PHRASES``.
+                _log(f"payload refused as too large (no status): {e}")
+                _mark_failure(session_id, "payload_too_large", str(e))
+                too_large = True
             else:
                 _log(f"transport error: {e}")
                 _mark_failure(session_id, "error", str(e))
@@ -539,6 +784,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
 
     res = await _import(arguments)
     if res is None:
+        if too_large:
+            _shrink_slice(session_id, state, batch, batch_consumed)
         return
 
     # MCP signals tool failure via isError + a message, NOT an
@@ -565,11 +812,21 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         arguments.pop("org_id", None)
         res = await _import(arguments)
         if res is None:
+            if too_large:
+                _shrink_slice(session_id, state, batch, batch_consumed)
             return
         texts = _texts(res)
 
     if getattr(res, "isError", False):
         detail = (texts[0] if texts else "no detail")[:200]
+        if _is_size_refusal(detail):
+            # A size refusal delivered as a tool error rather than a transport
+            # status. Reported and reacted to identically, or the cap never
+            # comes down on a server that answers this way.
+            _log(f"payload refused as too large (tool error): {detail}")
+            _mark_failure(session_id, "payload_too_large", detail)
+            _shrink_slice(session_id, state, batch, batch_consumed)
+            return
         _log(f"flush FAILED: {detail}")
         _mark_failure(session_id, "server_rejected", detail)
         return
@@ -667,19 +924,22 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "backend did not acknowledge the captured PR URL",
         )
         return
-    _mark_success(session_id, offset=consumed,
+    _mark_success(session_id, offset=batch_consumed,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,
                   pending_pr_urls=pending_pr_urls,
                   accepted_pr_urls=accepted_pr_urls,
                   **({"custom_title": custom} if custom else {}))
-    # Sent count, not read count — and the byte span stays the READ
-    # span, because that is what the cursor just advanced past. The
-    # filtered records are the difference between the two, so showing
-    # it makes an under-sent delta diagnosable from the log alone.
+    # Sent count, not read count — and the byte span is the span the cursor
+    # just advanced past, which is now the SENT span rather than the whole
+    # delta. The filtered records are the difference between read and sendable,
+    # and ``held`` is the rest of the delta this turn deliberately left for the
+    # next one, so an under-sent delta stays diagnosable from the log alone.
     filtered = len(records) - len(sendable)
-    _log(f"+{len(sendable)} rec ({consumed - offset}B) "
+    held = len(sendable) - len(batch)
+    _log(f"+{len(batch)} rec ({batch_consumed - offset}B) "
          + (f"filtered={filtered} " if filtered else "")
+         + (f"held={held} " if held else "")
          + f"new={out.get('records_new')} pending={out.get('pending')} "
          f"draining={out.get('draining')}")
 
