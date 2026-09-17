@@ -60,12 +60,18 @@ lives here.
     verifier's synthetic cases, and note that in the report.
   - **Step 5** does not ask. File, then tell the person one line naming the
     rule.
-  - **Every terminal path that does not file records a verdict.** This is the
+  - **Every terminal path that does not file records a verdict**, with the
+    `--outcome` that says which kind it was: `no_lesson` when you judged the
+    moment and there is no rule in it, `not_filed` when there IS a lesson but
+    something blocked the filing. Collapsing the two would inflate the
+    rejection rate with filing blockers, which is the one number this lane
+    exists to produce. This is the
     general rule, and it exists because the alternative is the failure the
     verdict lane was built to remove: a completed rejection and an ignored
     handoff look identical from outside. So whenever the mandatory policy says
     do not file — and this path may not ask the person instead — write a
     `memhub-verdict` row naming the reason and stop. Known cases:
+    All four below are `not_filed`; only your own judgement is `no_lesson`.
     - `cross_book`: name the other book and rule id. Nothing is filed that
       would double-fire beside a rule `supersedes_rule_id` cannot reach.
     - `same_matcher` on an active rule that is not this one: name that rule id.

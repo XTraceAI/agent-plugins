@@ -540,14 +540,17 @@ def test_the_block_reason():
     assert "memhub-verdict --session sess --ref sess#2" in line
     # the reason is free prose; `--why '<why>'` dies on an apostrophe, and the
     # silence instruction would then hide the failure (Codex, #244)
-    assert "--why" not in line and "<<'WHY'" in line
+    # no heredoc: a reason containing a line equal to the delimiter truncates
+    # the record and feeds the rest to the shell (Codex, #244). A path never
+    # touches shell syntax.
+    assert "<<" not in line and "--why-file" in line and "--outcome" in line
     assert "say nothing to the person about this turn" in line
     # the manual moved out and must NOT be restated here
     for moved in ("not already a RULE", "restating the docs", "without asking",
                   "activate", "state=", '"hook_version"'):
         assert moved not in line, moved
     # 1130 -> 411. A pointer, not a manual.
-    assert len(line) < 500, len(line)
+    assert len(line) < 600, len(line)
     # ...and the skill must actually carry what the line dropped, or the two
     # halves diverge silently and the agent gets neither.
     skill = (pathlib.Path(__file__).resolve().parent.parent / "plugins" / "memhub"
@@ -562,6 +565,7 @@ def test_the_block_reason():
                  # each exception the harness path takes must be stated, or the
                  # agent hits a mandatory step it cannot satisfy (Codex, #244)
                  "Every terminal path that does not file records a verdict",
+                 "not_filed", "no_lesson",
                  "same_matcher", "ambiguity verdict",
                  "source_ref is passed EXACTLY as the harness line gives it"):
         assert owed in skill, owed
@@ -587,6 +591,28 @@ def test_a_reason_with_an_apostrophe_survives(monkeypatch=None):
         rows = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]
         assert len(rows) == 1 and rows[0]["why"] == awkward, rows
     print("PASS test_a_reason_with_an_apostrophe_survives")
+
+
+def test_a_filing_blocker_is_not_recorded_as_a_rejection():
+    """`no_lesson` is a judgement; `not_filed` is a blocker. Collapsing them
+    inflates the rejection rate with conflicts (Codex, #244)."""
+    with _Env() as env:
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        f = pathlib.Path(env.base)/"why.txt"
+        # prose that breaks BOTH a quoted arg and a heredoc
+        awkward = "it's blocked\nWHY\nrm -rf /\n\"quoted\""
+        f.write_text(awkward, encoding="utf-8")
+        assert hs.cmd_verdict("sess", "sess#2", "", "not_filed", str(f)) == 0
+        row = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")][0]
+        assert row["verdict"] == "not_filed", row
+        assert row["why"] == awkward, row
+        # an unknown outcome degrades to the safe default, never a crash
+        hx.append_jsonl(hs.moments_path("sess"), _moment(3))
+        assert hs.cmd_verdict("sess", "sess#3", "x", "nonsense") == 0
+        rows = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]
+        assert rows[-1]["verdict"] == "no_lesson", rows[-1]
+    print("PASS test_a_filing_blocker_is_not_recorded_as_a_rejection")
 
 
 def test_the_verdict_command_the_reason_names_is_on_the_agents_path():

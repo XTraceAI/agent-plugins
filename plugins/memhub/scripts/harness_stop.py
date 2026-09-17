@@ -51,6 +51,7 @@ import json
 import os
 import sys
 import time
+import pathlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -398,9 +399,10 @@ def block_reason(session: str, moment: dict, repo: str = "") -> str:
         f"memhub create-rule skill on source_ref=\"{ref}\", scope_repos="
         f"{json.dumps(scope)} — its Harness-draft section holds the test for whether "
         f"this is a lesson, where the stamp comes from, and how to file it.{narrow} "
-        f"If it is NOT a lesson, say nothing to the person about this turn and record "
-        f"why: `memhub-verdict --session {session} --ref {ref} <<'WHY'`, the reason, "
-        f"then `WHY`."
+        f"If it does NOT end in a filed rule, say nothing to the person about this "
+        f"turn and record why: write the reason to a file with your file tool — never "
+        f"shell-quote it — then `memhub-verdict --session {session} --ref {ref} "
+        f"--outcome <no_lesson|not_filed> --why-file <that file>`."
     )
 
 
@@ -446,7 +448,11 @@ def hand_off(session: str) -> int:
 
 
 # ------------------------------------------------------------- verdict lane
-def cmd_verdict(session: str, ref: str, why: str) -> int:
+VERDICT_OUTCOMES = ("no_lesson", "not_filed")
+
+
+def cmd_verdict(session: str, ref: str, why: str,
+                outcome: str = "no_lesson", why_file: str = "") -> int:
     """The agent judged a handed moment and filed nothing. Record why.
 
     This is the half of the outcome the hook cannot see: `hand_off` knows a
@@ -459,6 +465,17 @@ def cmd_verdict(session: str, ref: str, why: str) -> int:
     """
     if not session or not ref:
         return 0
+    if outcome not in VERDICT_OUTCOMES:
+        outcome = "no_lesson"
+    if why_file:
+        # The prose never touches shell syntax. A heredoc reserves a content
+        # line — a reason containing a line equal to the delimiter truncates
+        # the record and feeds the remainder to the shell (Codex, #244) — and
+        # a quoted argument dies on an apostrophe. A path is neither.
+        try:
+            why = pathlib.Path(why_file).read_text(encoding="utf-8")
+        except Exception:
+            why = why or ""
     if not why and not sys.stdin.isatty():
         # The reason is free prose the agent writes, and an apostrophe in it
         # ("it's already covered") closes the quoting of a `--why '<why>'`
@@ -479,9 +496,13 @@ def cmd_verdict(session: str, ref: str, why: str) -> int:
         return 0
     if any(str(r.get("verdict_for") or "") == ref for r in rows):
         return 0                          # already recorded; never double-write
-    hx.append_jsonl(path, {"verdict_for": ref, "verdict": "no_lesson",
+    # `no_lesson` is a judgement about the moment; `not_filed` is a filing
+    # blocker (ambiguous rulebook, cross-book or same-matcher conflict). Both
+    # end without a rule, but recording a blocker as a rejection would inflate
+    # exactly the number this lane exists to measure (Codex, #244).
+    hx.append_jsonl(path, {"verdict_for": ref, "verdict": outcome,
                            "why": (why or "")[:400], "at": time.time()})
-    _log(f"verdict {session[:8]}: no_lesson on {ref}")
+    _log(f"verdict {session[:8]}: {outcome} on {ref}")
     return 0
 
 
@@ -496,6 +517,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--upto", type=int, default=-1)
     p.add_argument("--ref", default="")
     p.add_argument("--why", default="")
+    p.add_argument("--why-file", default="", dest="why_file")
+    p.add_argument("--outcome", default="no_lesson")
     return p
 
 
@@ -511,7 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "stop":
         return cmd_stop(_read_payload())
     if args.mode == "verdict":
-        return cmd_verdict(args.session, args.ref, args.why)
+        return cmd_verdict(args.session, args.ref, args.why,
+                           args.outcome, args.why_file)
     if args.mode == "extract" and args.session:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     return 0
