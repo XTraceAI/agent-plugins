@@ -42,6 +42,7 @@ def _load(name: str):
 
 
 bridge = _load("codex_hook_bridge")
+setup = _load("setup_codex_hooks")
 
 
 def _rollout(**payload) -> list[dict]:
@@ -254,6 +255,75 @@ def test_the_codex_bridge_tells_the_hook_which_host_it_is():
     args = run.call_args[0]
     # Adjacency, not membership: ("--host", "codex") must arrive as a pair.
     assert args[-2:] == ("--host", "codex"), args
+
+
+def test_the_event_lane_is_namespaced_too():
+    # main's #240 added a second fire path (events.jsonl -> /fire-events) that
+    # the server folds into each fire's outcome BY SESSION. It carried the bare
+    # id, exactly as the fire lane did — the same defect in a second place. An
+    # event naming the session differently from the fire it answers folds into
+    # nothing.
+    row = {"event_id": "e1", "kind": "receipt", "rule_id": "r1",
+           "session_id": "abc", "host": "codex"}
+    wire = rulebook_hook.event_wire_row(row)
+    assert wire["session_id"] == "codex-abc", wire
+    assert "host" not in wire                      # local-only, as on a fire
+    assert "host" not in rulebook_hook.EVENT_WIRE_KEYS
+
+
+def test_both_lanes_name_a_session_identically():
+    # The fold is by session id, so the two lanes disagreeing IS the bug.
+    for host in ("claude", "codex", "cursor", None):
+        fire = rulebook_hook.wire_row({"session_id": "s1", "host": host})
+        event = rulebook_hook.event_wire_row({"session_id": "s1", "host": host})
+        assert fire["session_id"] == event["session_id"], host
+
+
+def test_remove_is_a_true_inverse_of_install():
+    # Observed live: on a machine with no hooks.json, `remove` left a
+    # {"hooks": {}} stub behind — a file the user never had.
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        hooks = home / "hooks.json"
+        assert not hooks.exists()
+        setup.install(home)
+        assert hooks.exists(), "install should create it"
+        setup.uninstall(home)
+        assert not hooks.exists(), "remove left a stub behind"
+        assert not (home / "memhub_hook_bridge.py").exists()
+
+
+def test_remove_keeps_a_hooks_file_holding_someone_elses_hooks():
+    # The inverse must not become "delete the user's hooks.json".
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        hooks = home / "hooks.json"
+        hooks.write_text(json.dumps({"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "echo not-ours"}]}]}}),
+            encoding="utf-8")
+        setup.install(home)
+        setup.uninstall(home)
+        assert hooks.exists(), "removed a file holding someone else's hooks"
+        assert "not-ours" in hooks.read_text(encoding="utf-8")
+
+
+def test_a_stale_bridge_does_not_report_as_not_installed():
+    # Observed live right after a plugin upgrade: "NOT INSTALLED (4/4
+    # handlers)" while capture was demonstrably working. Only the copied runner
+    # was stale, and that wording reads as "nothing is set up".
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        setup.install(home)
+        (home / "memhub_hook_bridge.py").write_text("# stale\n", encoding="utf-8")
+        healthy, actual, expected, hooks_ok, runner_ok = setup.status(home)
+        assert not healthy and hooks_ok and not runner_ok and actual == expected
+        with patch.object(sys, "argv", ["s", "status", "--codex-home", str(home)]):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                setup.main()
+    text = out.getvalue()
+    assert "STALE BRIDGE" in text, text
+    assert "NOT INSTALLED" not in text, text
 
 
 if __name__ == "__main__":

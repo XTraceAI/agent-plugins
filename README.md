@@ -91,6 +91,15 @@ Restart, open `/hooks`, and trust only MemHub's `SessionStart`, `PreToolUse`,
 `PostToolUse`, and `Stop` handlers from `~/.codex/hooks.json`. Finally ask it to **Onboard MemHub
 for this repo**.
 
+> **Both of those steps are required, not optional.** Codex reports
+> `plugin_hooks` as `removed` (`codex features list`, verified on 0.146 and
+> 0.154), so the `hooks` key in the plugin's own manifest is never dispatched —
+> **Set up MemHub** installs the user-level bridge that is the only path by
+> which MemHub hooks run. And an untrusted handler is never dispatched either,
+> so a session started before the `/hooks` approval captures nothing. Skip
+> either step and capture is silently off, with the plugin otherwise appearing
+> installed and healthy.
+
 ### Cursor
 
 ```bash

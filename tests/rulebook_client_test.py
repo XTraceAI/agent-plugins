@@ -103,6 +103,12 @@ class Fake:
                     fake.recalls.append(req)
                     kept = [r for r in fake.recall_reply if r["rule_id"] not in (req.get("already_fired") or [])]
                     return self._send(200, {"code": 0, "msg": "ok", "data": {"rules": kept, "judge": "gate"}})
+                if self.path.endswith("/fire-events"):
+                    # the events ledger's endpoint: always accepts what it is
+                    # sent, so the canned `post_reply` shapes below exercise
+                    # the FIRES batch alone, as they did before events existed
+                    n = len(json.loads(body or "{}").get("events", []))
+                    return self._send(202, {"accepted": n, "rejected": 0})
                 n = len(json.loads(body or "{}").get("fires", []))
                 rep = dict(fake.post_reply)
                 if "accepted" in rep and rep["accepted"] is None:
@@ -119,6 +125,12 @@ class Fake:
     def posts(self):
         return [json.loads(r["body"]) for r in self.requests if r["method"] == "POST"]
 
+    def fire_posts(self):
+        return [p["fires"] for p in self.posts() if "fires" in p]
+
+    def event_posts(self):
+        return [p["events"] for p in self.posts() if "events" in p]
+
 
 def run(mode, payload, env, extra_args=()):
     p = subprocess.run([sys.executable, HOOK, mode, *extra_args], input=json.dumps(payload),
@@ -130,6 +142,10 @@ def run(mode, payload, env, extra_args=()):
 
 def ctx(out):
     return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else ""
+
+
+H_EVENT_KEYS = ("event_id", "kind", "rule_id", "session_id", "agent_id", "worktree",
+                "repo", "branch", "reason", "at")
 
 
 def jl(path):
@@ -330,77 +346,71 @@ def main():
         n_rows = len(jl(ledger))
         rc, out = run("flush", {"session_id": "f1"}, env, ("final",))
         posts = fake.posts()
-        check("flush: silent exit-0, one POST /v1/team/rulebook/fires",
-              rc == 0 and out == "" and len(posts) == 1
-              and fake.requests[-1]["path"] == "/v1/team/rulebook/fires")
+        paths = [r["path"] for r in fake.requests if r["method"] == "POST"]
+        check("flush: silent exit-0, POST /fires then POST /fire-events (the SessionEnd's session_end)",
+              rc == 0 and out == "" and len(posts) == 2
+              and paths == ["/v1/team/rulebook/fires", "/v1/team/rulebook/fire-events"]
+              and [e["kind"] for e in posts[1]["events"]] == ["session_end"], str(paths))
         wire = posts[0]["fires"]
         check("flush: every unsent ledger row shipped", len(wire) == n_rows, f"{len(wire)} vs {n_rows}")
         check("flush: wire rows contain no excerpt (identifiers cross the wire, payloads stay local)",
               all("excerpt" not in r for r in wire) and "secret payload" not in json.dumps(posts))
-        check("flush: wire row shape (§4.3)",
+        check("flush: wire row shape (§4.3 + worktree; no verdict columns)",
               all({"fire_id", "rule_id", "rule_version", "session_id", "repo", "branch", "tool",
-                   "hook_phase", "mode", "fired_at", "converted"} <= set(r) for r in wire))
+                   "hook_phase", "mode", "fired_at", "worktree"} <= set(r)
+                  and "converted" not in r and "converted_at" not in r for r in wire))
         s1 = json.load(open(sent_p, encoding="utf-8"))
-        check("flush: watermark advanced to the ledger's end",
-              s1["fires_offset"] == os.path.getsize(ledger) and s1["last_flush_at"])
+        events_ledger = os.path.join(td, "ledger", "events.jsonl")
+        check("flush: both watermarks advanced to their ledger's end",
+              s1["fires_offset"] == os.path.getsize(ledger)
+              and s1["events_offset"] == os.path.getsize(events_ledger) and s1["last_flush_at"])
         run("flush", {"session_id": "f1"}, env, ("final",))
-        check("flush: nothing pending → no POST", len(fake.posts()) == 1)
+        check("flush: no fires pending → no POST /fires (only the new session_end ships)",
+              len(fake.fire_posts()) == 1 and len(fake.event_posts()) == 2)
 
         # failure leaves rows; retry reuses fire_id
         run("pre", dict(base, session_id="f2", tool_input={"command": "server-only-cmd"}), env)
         new_ids = {r["fire_id"] for r in jl(ledger)[n_rows:]}
         fake.mode = "500"
         run("flush", {"session_id": "f2"}, env, ("final",))
-        failed = fake.posts()[-1]["fires"]
+        failed = fake.fire_posts()[-1]
         check("flush: 500 → watermark untouched (rows wait for the next flush)",
               json.load(open(sent_p, encoding="utf-8"))["fires_offset"] == s1["fires_offset"])
         fake.mode = "ok"
         run("flush", {"session_id": "f2"}, env, ("final",))
-        retry = fake.posts()[-1]["fires"]
+        retry = fake.fire_posts()[-1]
         check("flush: retried batch resends the SAME fire_ids",
               {r["fire_id"] for r in failed} == {r["fire_id"] for r in retry} == new_ids)
         fake.mode = "slow"
         run("pre", dict(base, session_id="f3", tool_input={"command": "server-only-cmd"}), env)
-        n_posts = len(fake.posts())
+        n_posts = len(fake.fire_posts())
         run("flush", {"session_id": "f3"}, env, ("final",))
         fake.mode = "ok"
         check("flush: timeout → watermark untouched",
               json.load(open(sent_p, encoding="utf-8"))["fires_offset"] < os.path.getsize(ledger))
         run("flush", {"session_id": "f3"}, env, ("final",))
-        check("flush: rows flushed after the timeout cleared", len(fake.posts()) == n_posts + 2)
+        check("flush: rows flushed after the timeout cleared", len(fake.fire_posts()) == n_posts + 2)
 
-        # conversion after the fire was sent → the fire is re-sent as an update
+        # a conversion after the fire was sent is an EVENT on the events
+        # ledger — the fire row is never re-sent, and nothing here merges
         fid_local = next(r["fire_id"] for r in jl(ledger) if r["rule_id"] == "local-rule")
+        n_fire_posts = len(fake.fire_posts())
         run("post", dict(base, session_id="f1", tool_input={"command": "now do-it"},
                          tool_response={"stdout": "ok"}), env)
         run("flush", {"session_id": "f1"}, env, ("final",))
-        upd = fake.posts()[-1]["fires"]
-        check("flush: a conversion re-sends that fire_id with converted=true (upsert, not a new row)",
-              len(upd) == 1 and upd[0]["fire_id"] == fid_local and upd[0]["converted"] is True
-              and upd[0]["converted_at"], str(upd))
-
-        # a conversion naming a fire the ledger does not hold yet must not be
-        # passed by the conversions watermark (it waits for its fire)
-        conv_p = os.path.join(os.path.dirname(ledger), "conversions.jsonl")
-        with open(conv_p, "a", encoding="utf-8") as f:
-            import datetime as _dt
-            fresh = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            f.write(json.dumps({"fire_id": "not-yet-in-ledger", "converted": True,
-                                "converted_at": fresh}) + "\n")
-        before = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
-        run("flush", {"session_id": "f1"}, env, ("final",))
-        after = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
-        check("flush: a conversion whose fire is not in the ledger is NOT passed by the watermark",
-              after == before and after < os.path.getsize(conv_p), f"{before} -> {after}")
-        # ...but the hold is bounded: an old orphan conversion is dropped so it
-        # never stalls newer ones (stamp above is 2026-08-26, older than the hold)
-        with open(conv_p, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"fire_id": fid_local, "converted": True,
-                                "converted_at": "2026-08-26T00:00:01Z"}) + "\n")
-        run("flush", {"session_id": "f1"}, dict(env, MEMHUB_RULEBOOK_CONVERSION_HOLD_S="0"), ("final",))
-        after2 = json.load(open(sent_p, encoding="utf-8"))["conversions_offset"]
-        check("flush: an old orphan conversion is dropped, the watermark moves past it",
-              after2 == os.path.getsize(conv_p), f"{after2} vs {os.path.getsize(conv_p)}")
+        evs = fake.event_posts()[-1]
+        check("flush: a conversion ships as a converted event naming the rule, not a re-sent fire",
+              len(fake.fire_posts()) == n_fire_posts
+              and [e["kind"] for e in evs] == ["converted", "session_end"]
+              and evs[0]["rule_id"] == "local-rule" and evs[0]["session_id"] == "f1"
+              and "fire_id" not in evs[0] and set(evs[0]) == set(H_EVENT_KEYS), str(evs))
+        check("flush: the fire it answers is not named client-side (the server folds it)",
+              fid_local and all(fid_local not in json.dumps(e) for e in evs))
+        # the events watermark moves independently of the fires watermark
+        s2 = json.load(open(sent_p, encoding="utf-8"))
+        check("flush: the events watermark is at its ledger's end, the fires one unchanged",
+              s2["events_offset"] == os.path.getsize(events_ledger)
+              and s2["fires_offset"] == os.path.getsize(ledger), str(s2))
 
         # rejected rows: logged locally, never retried
         run("pre", dict(base, session_id="f4", tool_input={"command": "server-only-cmd"}), env)
@@ -408,11 +418,11 @@ def main():
         fake.post_reply = {"accepted": 0, "rejected": [{"fire_id": rej_id, "reason": "unknown rule"}]}
         run("flush", {"session_id": "f4"}, env, ("final",))
         fake.post_reply = {"accepted": None, "rejected": 0}
-        n_posts = len(fake.posts())
+        n_posts = len(fake.fire_posts())
         run("flush", {"session_id": "f4"}, env, ("final",))
         rej = jl(os.path.join(td, "ledger", "rejected.jsonl"))
         check("flush: rejected rows logged locally and not retried",
-              len(rej) == 1 and rej[0]["rejected"]["fire_id"] == rej_id and len(fake.posts()) == n_posts)
+              len(rej) == 1 and rej[0]["rejected"]["fire_id"] == rej_id and len(fake.fire_posts()) == n_posts)
 
         # a 2xx that is not the §4.3 receipt (error envelope, no accepted) is not a success
         run("pre", dict(base, session_id="f6", tool_input={"command": "server-only-cmd"}), env)
@@ -437,7 +447,9 @@ def main():
         with open(sent_p, "w", encoding="utf-8") as f:
             json.dump(st, f)
         run("flush", {"session_id": "f5"}, env)
-        check("flush: throttle releases after FLUSH_EVERY_S", len(fake.posts()) == n_posts + 1)
+        check("flush: throttle releases after FLUSH_EVERY_S — fires, then the turn_end events",
+              len(fake.posts()) == n_posts + 2
+              and [e["kind"] for e in fake.event_posts()[-1]] == ["turn_end", "turn_end"], str(fake.event_posts()[-1]))
 
         # ── gate freshness (§5.3) ───────────────────────────────────────
         os.environ.update(env)          # BEFORE import: BASE is read at module load —
@@ -489,8 +501,8 @@ def main():
         run("flush", {"session_id": "f7"}, env, ("final",))
         fake.post_reply = {"accepted": None, "rejected": 0}
         rej = jl(os.path.join(td, "ledger", "rejected.jsonl"))
-        check("flush: a bare rejected COUNT is logged with the batch's fire_ids",
-              rej[-1].get("rejected_count") == 1 and len(rej[-1].get("batch_fire_ids", [])) >= 2, str(rej[-1:]))
+        check("flush: a bare rejected COUNT is logged with the batch's ids",
+              rej[-1].get("rejected_count") == 1 and len(rej[-1].get("batch_ids", [])) >= 2, str(rej[-1:]))
         check("to_hook_rule: server version must be an int or short string",
               H._version_of(3) == 3 and H._version_of("pilot-5") == "pilot-5"
               and H._version_of({"a": 1}) is None and H._version_of("x" * 41) is None and H._version_of(True) is None)

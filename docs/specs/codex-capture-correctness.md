@@ -5,364 +5,262 @@ type: spec
 
 # Spec: Codex capture correctness
 
-Three independent correctness defects in the Codex lane, from ENG-1070 (two)
-and ENG-1075 (one). Each was reproduced against the MemHub **staging**
-database or proven from code before this spec was written; the evidence is
-recorded inline so an implementer can re-run it rather than trust it.
+Defects in the Codex lane from ENG-1070 and ENG-1075. Every fix here is backed
+by something **observed** — in the staging database, in a live Codex session, or
+in upstream source. A third defect was investigated at length and deliberately
+**not** fixed; *Investigated and not fixed* is the most useful section of this
+document, because it records what the evidence would not support.
 
-Base: `origin/main` @ `2538729`. Branch: `fix/codex-capture-correctness`.
+Base: `origin/main` @ `04bb90c` (v0.59.0). Branch: `fix/codex-capture-correctness`.
 
 ---
 
 ## Goal
 
-1. **Codex capture must survive an upgrade — and say so when it cannot.**
-   Two distinct defects. The bridge picks the NEWEST plugin version on the
-   strength of one file existing, so a half-populated new version outranks a
-   complete old one and capture dies in total silence. And when no plugin can
-   be found at all, the bridge exits 0 without a word while the installer's own
-   `status` reports OK.
-2. **Stop importing Codex's internal guardian/subagent review sessions.** They
-   are 35% of all captured Codex sessions in staging.
-3. **Make Codex rule fires linkable to the session that produced them.** The
-   fire's `session_id` and the captured conversation's `source_id` are in
-   different namespaces, so they can never match.
+1. **Stop capturing Codex's own threads as the person's sessions.**
+2. **Make a Codex rule fire joinable to the session that produced it** — on both
+   fire lanes.
+3. **Stop telling users the Codex hooks bridge is optional.** It is the only
+   path by which MemHub hooks run on Codex.
 
 ## Non-goals
 
-- **Backfilling already-orphaned fires.** Existing rows keep their un-namespaced
-  `session_id`. Linking them is a backend concern (see *Handoff to backend*).
-- **Deleting the 103 guardian sessions already in staging.** This spec stops
-  new ones; cleanup is a separate data task.
-- **Building a Cursor rule-evaluation lane.** Cursor has none today
-  (`cursor-hooks.json` routes only to `cursor_capture.cmd`). We add a guard so
-  a future lane is correct on day one, and nothing more.
-- **Changing how the staging plugin is packaged.** The dangling-symlink root
-  cause of defect ①  is a release/packaging matter that
-  `RELEASING.md` already documents. We make the failure *loud*, not impossible.
-- **Bumping `memhub-staging`'s manifest.** Deliberately decoupled — see
-  *Decisions*.
+- **Backfilling.** Orphaned fires keep their ids; captured bot threads are not
+  deleted. Backend data decisions.
+- **Repairing a broken install.** See *Investigated and not fixed*.
+- **A Cursor rule lane.** Cursor has no rule evaluation today.
 
 ---
 
 ## Evidence
 
-All queries were run **read-only against MemHub staging**
-(`db.uyctquxfccwjdbobjnoz.supabase.co`, the commented-out `DATABASE_URL` in
-`MemHub-Backend/.env.local`). Production was never touched.
+Staging reads were read-only via the commented-out `DATABASE_URL` in
+`MemHub-Backend/.env.local`. Live Codex work ran against the real `~/.codex`
+with `MEMHUB_MCP_BASE_URL` pinned to staging.
 
-### ① Silent capture death
+### ① Codex's own threads captured as sessions — REPRODUCED LIVE
 
-`plugins/memhub/scripts/codex_hook_bridge.py:57-74` gates on one file:
+Staging, `team_conversations`:
 
-```python
-versions = [path for path in (cache / marketplace / plugin).glob("*")
-            if (path / "scripts" / "codex_flush.py").is_file()]
-```
-
-and `main()` (`:379-381`) does:
-
-```python
-root = resolve_plugin_root()
-if root is None:
-    return 0          # no output, no breadcrumb, no trace
-```
-
-Root cause of the missing file: `plugins/memhub-staging/{scripts,hooks,skills,
-references}` are **relative symlinks escaping the plugin root** into
-`../memhub/`. Any installer that copies only the plugin subdirectory leaves
-them dangling. `RELEASING.md:113-121` documents this ("observed live on PR #56:
-the install came up with no `scripts/` directory at all and still reported
-success") and notes it makes staging "nonconforming under Agent Plugins 1.0 …
-one more reason it never enters the Codex/Cursor catalogs".
-
-Aggravator: `setup_codex_hooks.status()` (`:233-240`) checks only `hooks.json`
-handler equality and the runner's bytes. It never checks that a plugin root
-resolves, so it prints `OK` while capture is dead.
-
-**The upgrade case — the one that actually breaks capture in the field.**
-`resolve_plugin_root()` accepted a version directory if `scripts/codex_flush.py`
-existed. But `codex_flush.py` imports ten siblings plus `readers/` at module
-load, so a partially extracted install satisfies that one-file test and then
-dies on `ModuleNotFoundError` — inside a child detached with stdout and stderr
-to `DEVNULL`, where nothing observes it. Reproduced directly:
-
-```
-complete install : …/memhub/0.58.3        (full scripts/)
-partial install  : …/memhub/0.58.4        (only scripts/codex_flush.py)
-resolve_plugin_root() -> …/0.58.4         ← picks the BROKEN one
-
-direct run of the partial codex_flush.py: rc=1
-  ModuleNotFoundError: No module named 'atomic_write'
-bridge dispatch Stop   rc=0  stdout=b''  stderr=b''
-breadcrumb written? False
-```
-
-A working 0.58.3 sits unused beside it. This matches the field report that
-"every plugin update breaks Codex capture", and ENG-1070's own note that the
-failure recurred "again during the update to 0.55.1".
-
-`_KNOWN_INSTALLS` compounded it: only `xtrace-plugins/memhub` and
-`memhub-internal/memhub-staging` were searched, so a marketplace registered
-under any other name put the plugin at a path nothing looked in.
-
-**Refuted while investigating, recorded so nobody re-derives it:**
-
-- *"Codex does not export `PLUGIN_ROOT`, so the bundled manifest's
-  `[ -n "$R" ]` guard silently no-ops."* **False.** Codex 0.146 exports
-  `PLUGIN_ROOT`, `CLAUDE_PLUGIN_ROOT` and `PLUGIN_DATA` into plugin hook
-  commands — `codex-rs/hooks/src/engine/discovery.rs:262-270`, applied at
-  `command_runner.rs:427-431` — confirmed empirically with a probe plugin.
-- *"Changing `codex_hook_bridge.py` un-trusts the hooks on upgrade."*
-  **False.** `hook_hash()` (`discovery.rs:775-791`) hashes the event name,
-  matcher and normalized handler — never the referenced script's bytes.
-  **But the manifests are a different matter:** the hash DOES cover `command`,
-  `matcher`, `timeout` and `statusMessage`, so editing
-  `hooks/codex-hooks.json` or `references/codex-hooks-bridge.json` silently
-  un-trusts every existing user. Commit `fe5e745` did exactly that.
-
-### ② Guardian sessions imported as real sessions
-
-```sql
-select conversation_source_platform, count(*),
-       count(*) filter (where name ilike 'The following is the Codex agent history%')
-from team_conversations group by 1;
-```
-
-| platform | total | guardian-titled |
+| platform | total | titled `'The following is the Codex agent history%'` |
 |---|---|---|
 | claude | 1751 | **0** |
 | memhub | 889 | **0** |
 | **codex** | **298** | **103** |
 | cursor | 10 | **0** |
 
-**103 of 298 (35%)**, of which **94 arrived in the last 3 days** — active, not
-historical. Contamination is exclusive to the codex platform. `source_config`
-is `{}` for every Codex row, so nothing server-side distinguishes them: the
-filter must be client-side.
+**Attribution matters and was initially got wrong:** all 103 belong to one
+teammate's machine, not to the machine this work was done on. The defect is
+real; it is not "your session list".
 
-No guardian/subagent filter exists in the Codex reader. The only `subagent`
-handling is `subagent_history_start_ordinal` (`readers/codex_history.py:78`,
-added by #238), which concerns inherited context *within* one rollout — a
-different problem. By contrast Claude's path *does* exclude subagent
-transcripts (`readers/claude.py:11`, `import_session.py:116`). This is a host
-asymmetry, not a missing feature.
-
-**The discriminator is in the rollout**, so no sqlite dependency is needed.
-`session_meta.payload` of a real session (cli 0.146.0) carries:
+**Then reproduced live.** `codex review --uncommitted` on real Codex produced
+two threads:
 
 ```
-source           'cli'
-thread_source    'user'        ← discriminator
+id                                    thread_source  source                  title
+01a0ad2c-9184-7e50-b6cf-e573ee393214  subagent       {"subagent":"review"}   Review the current code changes…
+01a0ad2c-90e8-7fe1-ba82-c1f74c76d905  user           exec                    Review the current code changes…
 ```
 
-Codex's own `~/.codex/state_5.sqlite` `threads` table corroborates the shape
-with `thread_source`, `agent_role`, `has_user_event` and a
-`thread_spawn_edges(parent_thread_id, child_thread_id, status)` lineage table —
-matching ENG-1070's "marked `subagent → guardian`". We do **not** read that DB.
+Fed to the **unfixed** bridge, the bot thread landed in staging:
 
-### ③ Fires can never link
+```
+flushed 16 records → codex-01a0ad2c-9184-7e50-b6cf-e573ee393214
+row: ('codex-01a0ad2c-9184-…', 5be4db26-…, 'Review the current code changes…')
+```
 
-| host | capture writes `conversation_id` | fire posts `session_id` | match |
+**16 records for the bot thread against 2 for the real one** — the pollutant is
+the larger of the two. With the branch installed, the same payload:
+
+```
+not this person's thread (thread_source='subagent') — not captured
+```
+
+`subagent` is the literal observed live. `guardian_review` and
+`memory_consolidation` come from upstream's enum and the 0.154 binary — **read,
+not observed**. The distinction is why the gate denies by name rather than
+allowing by name.
+
+### ② Fires cannot be joined to their session — two lanes
+
+| host | capture writes `conversation_id` | fire posted `session_id` | match |
 |---|---|---|---|
-| Claude — `flush_turn.py:456` | `session_id` (**bare**) | bare | ✅ |
-| Codex — `codex_flush.py:526` | `f"codex-{sid}"` | bare | ❌ |
-| Cursor — `cursor_flush.py:1045` | `f"cursor-{uuid}"` | bare | ❌ (latent) |
+| Claude — `flush_turn.py` | `session_id` (**bare**) | bare | ✅ |
+| Codex — `codex_flush.py` | `f"codex-{sid}"` | bare | ❌ |
+| Cursor — `cursor_flush.py` | `f"cursor-{uuid}"` | bare | ❌ (latent) |
 
-`rulebook_hook.log_fires` (`:3690`) writes `"session_id": ctx["session"]`, and
-`ctx["session"]` is `data.get("session_id", "")` (`:4134`) — the raw hook
-payload value, never namespaced, on every host. Claude matches only because it
-happens to have no prefix.
+`codex-X` ≠ `X`. This is arithmetic, not inference. Claude matches only because
+it happens to carry no prefix.
 
-Staging corroboration:
+**And main's #240 duplicated it.** That PR added a second path — `events.jsonl`
+→ `/fire-events`, which "the server folds into each fire's outcome" — whose row
+builder also wrote `"session_id": ctx["session"]` bare. An event naming the
+session differently from the fire it answers folds into nothing. Both lanes are
+fixed here.
+
+**Not reproduced:** ENG-1075's `Not linked yet` was seen in **production**,
+which this work did not query. The live test could not reach it either — firing
+a rule needs a trusted hook dispatch, and trust could not be granted
+non-interactively. The mismatch is certain; that it causes the production
+symptom is strongly supported, not demonstrated.
+
+### ③ The Codex hooks bridge is mandatory, and the docs said otherwise
 
 ```
-platform | conversations | source_id prefixed
-claude   |          1751 | 0      (bare uuid)
-codex    |           298 | 275    (codex-…)
-cursor   |            10 | 5      (cursor-…)
+$ codex features list
+plugin_hooks    removed    false
 ```
 
-Fires linked to a Codex conversation: **0**. Fires whose `session_id` matches a
-Codex `source_id` in either form: **0**.
+Verified on **0.146 and 0.154**. Enabling it is a no-op — a `removed` stage
+stays `false`. Proven end-to-end rather than inferred: a throwaway plugin whose
+only hook appended to a file never created it; moving the same handlers into
+`~/.codex/hooks.json` put them in the trust queue immediately.
 
-**Caveat, stated plainly.** Staging contains *zero* Codex fires at all (every
-one of its 5,668 fires carries a UUIDv4 / Claude-shaped id; Codex ids are
-UUIDv7). So staging cannot demonstrate the orphaning directly — it has no rows
-to orphan. ENG-1075 was observed in **production**
-(repo `memhub-production-release-e2e`, absent from staging), which this work
-deliberately did not query. The production screenshot shows `Not linked yet`,
-i.e. the row **exists** with `conv_id` NULL — consistent with the namespace
-mismatch above. The mechanism is therefore proven from code plus the staging
-schema, **not** from the production rows.
+So the plugin's own `.codex-plugin/plugin.json` `"hooks"` key is **inert**, and
+`setup_codex_hooks.py` is not a "0.148–0.149 compatibility shim" — it is the
+only path by which MemHub hooks run on Codex. The docs named a version window
+that does not match reality, and a user who installs the plugin and never runs
+`memhub:setup` gets **zero capture, silently**.
+
+Trust compounds it: every handler arrives `"trustStatus": "untrusted"` and is
+never dispatched until approved in `/hooks`.
+
+### A note on log evidence — do not repeat this mistake
+
+`~/.config/memhub-plugin/codexflush/log` shows hundreds of `no session identity
+in payload` lines. **They are test output.** `codex_flush` fixes `STATE_DIR`
+from `Path.home()` at import and the suites did not redirect `$HOME`. Measured:
+237 such lines over **33 distinct seconds**, 209 of them inside one 13-second
+window at 16–29 per second, and the rotated backup holds the identical burst so
+a naive cross-file count double-counts. `~/.codex/hooks.json` did not even exist
+during that period, so none of them can be a hook fire.
+
+PR #217 (ENG-1034a) established this first and builds the fix. **Until it lands,
+this log is not admissible evidence.**
 
 ---
 
 ## Design
 
-### Fix ① — capture survives a partial upgrade, and speaks when it cannot
+### Fix ① — deny Codex's own thread kinds by name
 
-`plugins/memhub/scripts/codex_hook_bridge.py`
-
-**The repair.** `resolve_plugin_root()` now proves an install before trusting
-it: `_REQUIRED` lists `codex_flush.py` plus everything it imports at module
-load (`atomic_write`, `portable_lock`, `mcp_http`, `pr_provenance`,
-`_memhub_auth`, `brain_resolve`, `redact`, `transcript_filter`, `room_map`,
-`rulebook_hook`, `readers/codex.py`). A dozen `is_file()` calls, weighed
-against discovering the answer inside a child whose failure nobody sees.
-
-Three consequences, all deliberate:
-
-- **Fall back, don't fail.** Candidates are ranked and the newest *complete*
-  one wins, so one broken version can never mask a working one.
-- **Any marketplace name.** The two-entry allowlist becomes a `cache/*/*/*`
-  search; known names still rank first. The completeness test is what makes a
-  wide search safe — we identify our plugin by its contents, not its path.
-- **An env override is checked too.** `PLUGIN_ROOT` is injected by Codex
-  itself; if it names a broken tree we fall through to the cache rather than
-  trust it and die in the child.
-
-**The observability, still needed** — when *no* complete install exists:
-
-1. **Write a breadcrumb** to
-   `~/.config/memhub-plugin/codexflush/_bridge.json` in the shape
-   `capture_health` already reads (`capture_health.py:46,300`):
-   `{"last_error": "plugin_root_unresolved", "last_error_at": <epoch float>}`.
-   Stdlib-only, no import from the (missing) plugin root.
-2. **On `SessionStart` only**, print one `systemMessage` telling the user
-   capture is off and how to repair it. This is essential: with no plugin root,
-   `capture_health.py` *cannot run* (it lives in that same missing root), so a
-   breadcrumb alone would never surface. SessionStart is naturally once-per-
-   session, so no extra rate limiting is required.
-3. **Still `return 0`.** A memory hook must never block the host.
-
-When the root *does* resolve, **clear** `_bridge.json` — a stale breadcrumb
-must not outlive the failure it recorded (this repo has been bitten by exactly
-that on the recall lane).
-
-`plugins/memhub/scripts/setup_codex_hooks.py`
-
-`status()` returns `(hooks_ok, actual, expected, root)` and additionally reports
-whether a plugin root resolves, reusing the bridge's own `resolve_plugin_root`
-rather than reimplementing the search. Two rules, both learned the hard way in
-review:
-
-- **It must ask with the HOOK's environment, not the caller's.**
-  `resolve_plugin_root` honours `PLUGIN_ROOT` / `CLAUDE_PLUGIN_ROOT` first, and
-  the setup skill always runs with one set (`skills/setup/SKILL.md`: "Codex sets
-  `PLUGIN_ROOT`; Claude Code sets `CLAUDE_PLUGIN_ROOT`") while the user-level
-  bridge is invoked with neither. Resolving under the caller's environment
-  reported a healthy plugin for an install where every real hook event finds
-  nothing — the check defeated the very failure it was written for. So
-  `_plugin_root(home)` clears those three variables and pins `CODEX_HOME` to
-  the `home` under test, restoring the caller's environment afterwards. Pinning
-  `home` also makes `status --codex-home X` judge X rather than `~/.codex`.
-- **The headline still describes the HOOKS.** `hooks_ok` drives the
-  `OK / NOT INSTALLED` line and a missing plugin gets its own line; only the
-  exit code folds the two. Printing `NOT INSTALLED (4/4 handlers)` invited the
-  setup skill to reinstall and re-trust handlers that were already correct.
-
-### Fix ② — allowlist the thread source
-
-New helper in `plugins/memhub/scripts/readers/codex.py`:
-
-**The gate is a denylist, and the reason is upstream's own type.** From
-`enum ThreadSource` in `codex-rs/protocol/src/protocol.rs`:
+From `enum ThreadSource` in `codex-rs/protocol/src/protocol.rs`:
 
 ```rust
 pub enum ThreadSource {
-    User,                 // "user"
-    Subagent,             // "subagent"
-    GuardianReview,       // "guardian_review"
-    Feature(String),      // ← OPEN: any unnamed string parses here
-    MemoryConsolidation,  // "memory_consolidation"
+    User, Subagent, GuardianReview, Feature(String), MemoryConsolidation,
 }
 ```
 
-`Feature(String)` is why the generated TypeScript is
-`export type ThreadSource = string;` rather than a union. A product surface
-that ships tomorrow arrives as a `Feature`, and **a Feature thread is the
-person's** — that is what the variant means.
+`Feature(String)` is an open variant — which is why the generated TypeScript is
+`export type ThreadSource = string;`. A product surface shipped tomorrow arrives
+as a `Feature`, and **a Feature thread is the person's**.
 
 ```python
 BOT_THREAD_SOURCES = ("subagent", "guardian_review", "memory_consolidation")
 KNOWN_OWN_THREAD_SOURCES = (None, "", "user")
-
-def thread_source_of(rows) -> str | None: ...
-def is_own_thread(rows) -> bool: ...            # thread_source NOT in BOT_…
-def thread_source_of_path(path) -> str | None:  # bounded header read
-def is_own_thread_path(path) -> bool: ...       # same predicate, from disk
 ```
 
 - **Deny by name; capture everything else.** An allowlist against an open type
-  drops real work the first time Codex names a surface — and because the skip
-  advances the watermark, a session that has since stopped growing never
-  re-flushes. That loss is unrecoverable; importing one stray bot thread is
-  not. Asymmetric risk, asymmetric default.
-- **Absent ⇒ own.** Rollouts predating the field (cli < ~0.142) have no
-  `thread_source`; they must keep being captured.
-- **An unfamiliar value is captured and noted** (log line only — *not* a
-  `last_error`, which would print "capture failed" over a session that
-  captured fine), so a new Feature surface gets classified deliberately.
-- **An unrecognised value is skipped *and recorded*.** A kind in
-  `KNOWN_BOT_THREAD_SOURCES` is routine: skipped quietly, and it clears any
-  earlier `last_error`/`fail_streak` the way the other never-contacted-the-
-  server no-ops do, so a stale failure cannot outlive a session nothing will
-  retry for. Any **other** non-user value writes
-  `last_error="unknown_thread_source"` with a timestamp. This matters: if Codex
-  renames the marker for ordinary sessions, that path is *every* session, and a
-  silent skip would rebuild the silent-capture-death bug on a new axis. The
-  watermark advance makes it unrecoverable after the fact — a session that has
-  stopped growing never re-flushes — so the alarm is the containment.
+  drops real work the first time Codex names a surface, and because the skip
+  advances the capture watermark a session that has stopped growing never
+  re-flushes. Unrecoverable on one side, one stray bot thread on the other.
+- **Absent ⇒ own**, so rollouts predating the field keep being captured.
+- **An unfamiliar value is captured and noted** — a log line, deliberately not a
+  `last_error`, since a health banner reading "capture failed" over a session
+  that captured fine is its own bug.
 
-`capture_health.py` gains `_REASONS` entries and remedies for both
-`plugin_root_unresolved` and `unknown_thread_source`; without them the generic
-"run `/memhub:login --status`" advice points at a credential that is fine.
+Gated: `codex_flush._flush` (before `to_canonical`), `capture.py`'s candidate
+scan, and `find_sessions.py`. **Not** gated: `readers_cli.py` and `capture.py
+list` — a documented read-only stream with a wire contract and golden files.
 
-Call sites, all through the one predicate:
+### Fix ② — namespace the session id at the wire boundary, on both lanes
 
-| path | gated | why |
-|---|---|---|
-| `codex_flush._flush` | yes, before `to_canonical` | never capture a bot thread |
-| `capture.py` candidate scan | yes | do not offer candidates capture will refuse |
-| `find_sessions.py` | yes | a guardian review *contains* the reviewed conversation, so it scores like a strong authorship match on the very evidence the ranking uses |
-| `readers_cli.py` / `capture.py list` | **no** | a documented read-only stream with a wire contract and golden files; filtering inside `list_sessions` would break it, and an explicit enumeration should show what is on disk |
+1. `log_fires` and the event-row builder each record a **local-only** `host`
+   field (precedent: `rulebook_id`). Neither `WIRE_KEYS` nor `EVENT_WIRE_KEYS`
+   carries it.
+2. `wire_row` **and** `event_wire_row` render `session_id` through
+   `pr_link.conversation_id_for` — the helper that already owns this projection
+   for the PR-link lane. Not reimplemented: a second copy is how two lanes come
+   to disagree, and the existing one already handles whitespace, a host spelled
+   `Codex`, and an already-prefixed id.
+3. The host arrives via `--host claude|codex|cursor`, matching the existing
+   convention. Default `claude`, so existing behaviour is byte-identical.
 
-### Fix ③ — namespace at the wire boundary only
+Local state, ordering, dedup and obligations keep the **raw** id. Only the bytes
+crossing the wire change.
 
-The naive fix — prefixing `ctx["session"]` — would change the key used for
-local ordering state, obligations, dedup and `state_path()`, breaking
-in-flight sessions. Instead:
+### Fix ③ — say that the bridge is required
 
-1. `log_fires` records a **local-only** `host` field on each ledger row
-   (precedent: `rulebook_id` is local-only on purpose, `rulebook_hook.py:2470`).
-   `host` is **not** in `WIRE_KEYS`.
-2. At the wire projection (`wire_row`), `session_id` is rendered through
-   **`pr_link.conversation_id_for`** — the helper that already owns this
-   projection for the PR-link lane. It is not reimplemented: a second copy is
-   how the two lanes come to disagree about what a Codex session is called, and
-   the existing one already handles what a fresh one forgets (surrounding
-   whitespace, a host spelled `Codex`, an id that already carries its prefix).
-   Imported lazily inside the function — only the flush lane projects rows, so
-   the per-call pre/post lanes never pay the ~17 ms import — and on a fail-open
-   path, so a fire that cannot be namespaced still ships rather than taking the
-   hook down.
-3. The host reaches the hook via a `--host <claude|codex|cursor>` flag,
-   matching the existing convention (`capture_health.py --host`,
-   `pr_link_trigger.py --host codex`). Default `claude` preserves today's
-   behaviour exactly.
-4. `codex_hook_bridge._rulebook_result` passes `--host codex`.
-5. `cursor_capture.upgrade_context` passes `--host cursor`. This is **inert
-   today and deliberately so**: the `upgrade` lane returns before
-   `rulebook_hook` builds its ctx, so the flag is not read, and Cursor has no
-   rule-evaluation lane to log a fire from at all
-   (`cursor-hooks.json` routes every event to `cursor_capture.cmd`). It is
-   passed because this is the one place Cursor names itself to the hook; the
-   guard that actually matters is `wire_session_id` already handling `cursor`,
-   so a future Cursor fire lane is correct on its first day.
+`.codex-plugin/plugin.json`, `skills/setup/SKILL.md`, `codex/README.md` and
+`README.md` now state that `plugin_hooks` is `removed`, that the manifest's
+`hooks` key is never dispatched, and that skipping `memhub:setup` or the
+`/hooks` trust step leaves capture silently off. Descriptions are documentation,
+not metadata.
 
-Local state, ordering, dedup and obligations continue to key off the **raw**
-session id. Only the bytes that cross the wire change.
+Two smaller defects observed during the same live run:
+
+- **`remove` was not the inverse of `install`.** On a machine with no
+  `hooks.json` it left a `{"hooks": {}}` stub. It now removes the file when
+  nothing but our own entries were ever in it — and keeps it when it holds
+  someone else's hooks.
+- **`status` said `NOT INSTALLED (4/4 handlers)`** after a plugin upgrade, while
+  capture was demonstrably working and only the copied runner was stale. It now
+  distinguishes `STALE BRIDGE — re-run setup` from a missing install.
+
+---
+
+## Investigated and not fixed
+
+**ENG-1070 #1 — "capture is dead and nothing says so."** A fix was written and
+**reverted before merge**:
+
+- The failure mode was reproduced: a version directory holding only
+  `codex_flush.py` is selected over a complete one, and the flush child dies on
+  `ModuleNotFoundError` with its output discarded.
+- **The precondition was never demonstrated.** Nothing shows Codex produces a
+  half-populated version directory; a live install found `codex plugin add`
+  lands a full copy. The broken folder was built by hand.
+- **The live upgrade test contradicted the premise.** Capture *survived*
+  0.58.3 → 0.58.4 with a deliberately stale bridge, and the ENG-1070 #2 fix took
+  effect through it, because the bridge resolves the plugin root per event.
+- **The fix had introduced a worse bug than it cured**, caught in review:
+  ranking pooled the production and staging marketplaces into one tier, so a
+  production user with a newer staging install would have resolved to the
+  staging root — and `_memhub_auth` derives the backend and token cache from
+  that root, sending captures to the wrong environment.
+
+Also investigated, also not fixed:
+
+- **Hook trust** stops capture on 100% of fresh installs and is **already known
+  to the team** — PR #233 flags the re-trust cost explicitly; PR #80 separated
+  installation reporting from trust reporting. Documented here, not re-solved.
+- **Editing a hook manifest silently un-trusts every user.** `hook_hash`
+  (`discovery.rs:775-791`) covers `command`, `matcher`, `timeout` and
+  `statusMessage`, but *not* the referenced script's bytes. `fe5e745` rewrote
+  every command. This is why **no manifest is touched here**, and it deserves a
+  `RELEASING.md` warning of its own.
+- **`readers/codex.py` ignores `$CODEX_HOME`.** The code states this is a
+  containment boundary for payload-supplied paths and that widening it needs its
+  own review.
+- **`mcp.json` vs `.mcp.json`.** Codex reads the undotted file, Claude Code the
+  dotted one. Two files, two endpoints — a live test pointed only `.mcp.json` at
+  staging and Codex's MCP client then handshook against production (401, no data
+  written). Worth a guard; not a product defect.
+- **A Claude-lane 413 stall.** `flush_turn` caps individual records but not the
+  aggregate delta, so a long session 413s forever and its cursor never advances.
+  Six sessions on one machine, three of which never captured a turn. Written up
+  in the `urgent plugin fix (claude code)` brain.
+
+**Refuted, recorded so nobody re-derives them:**
+
+- *"Codex does not export `PLUGIN_ROOT`."* **False** —
+  `discovery.rs:262-270`, confirmed with a probe plugin.
+- *"Changing `codex_hook_bridge.py` un-trusts the hooks."* **False** — the hash
+  covers the config, never the script's bytes.
+- *"A subagent rollout's parent-uuid `payload.session_id` mis-identifies it."*
+  **False** — `_sid_of()` derives identity from the resolved rollout filename,
+  "never from the payload field that happened to locate it."
 
 ---
 
@@ -370,78 +268,38 @@ session id. Only the bytes that cross the wire change.
 
 | # | Decision | Why |
 |---|---|---|
-| D1 | Client-side namespacing here; backend backfill handled separately | Keeps this PR inside `plugins/memhub/`; the backend fix lives in another repo |
-| D2 | ~~Allowlist `{absent, "user"}`~~ → **denylist of the named bot kinds** | **Reversed in review.** Codex's review of this PR reported a user-started web thread with `thread_source="codex_web_code_review"`, and upstream's `enum ThreadSource` confirms why: `Feature(String)` is an open variant, so the value space is unbounded and the *non-bot* side is the open one. An allowlist silently dropped real sessions, unrecoverably (the skip advances the watermark). See D11. |
+| D1 | Client-side namespacing here; backend backfill separately | Keeps this inside `plugins/memhub/` |
+| D2 | Deny the named bot kinds; capture everything else | `Feature(String)` is open, so the non-bot side is the open one |
 | D3 | Namespace at the wire, not in `ctx` | Preserves local state keys; no in-flight session breakage |
-| D4 | Add the Cursor guard, don't build the lane | One-line correctness for free; the lane is a separate ticket |
-| D5 | Bump **only** the four production manifests `0.58.3 → 0.58.4`; leave `memhub-staging` at `0.57.0` | The decoupling is deliberate: `16798a9` ("Keep staging version independent of the production release", PR #229) removed staging from `version_parity_test.py` and set `RELEASING.md:72` to "Leave its manifest unchanged during a production-only release". `CONTRIBUTING.md:104-106` still says lockstep and is **stale**. |
-| D6 | Fail open everywhere | A memory hook must never block the host agent |
-| D7 | `wire_session_id` delegates to `pr_link.conversation_id_for` rather than owning a namespace map | Found in review: the helper already existed. A parallel mechanism is the default wrong answer, and the local copy was already wrong on surrounding whitespace and on a host spelled `Codex` — both of which silently ship an *unnamespaced* id, i.e. the very bug this fixes |
-| D8 | ~~Report an unrecognised kind as a capture failure~~ → **capture it and log it** | Superseded by D11: an unfamiliar kind is now captured, so it is not a failure. A `last_error` there would print "capture failed" over a session that captured fine |
-| D9 | `_plugin_root` resolves under the HOOK's environment, not the caller's | Found in review: the setup skill always runs with `PLUGIN_ROOT` set, so the check reported a healthy plugin for a dead install — it could not detect the failure it was written for |
-| D10 | Discovery gates candidate *selection*, not read-only *enumeration* | `readers_cli` has a published wire contract and golden files; `capture.py list` is an explicit "show me what is on disk" |
-| D12 | Prove the install; fall back to the newest COMPLETE version | A one-file check let a half-populated upgrade outrank a working install and kill capture silently. Reproduced. This is the repair ENG-1070 #1 actually needed |
-| D13 | Search any marketplace name, not a two-entry allowlist | A user who registered the marketplace under their own name had capture die at a path nothing looked in. Safe only because D12 identifies the plugin by contents |
-| D14 | Cursor gets a health lane, riding `beforeShellExecution` | `capture_health._STATE_DIRS` had no cursor entry, so `cursorflush/*.json` was read by nothing. Reusing the message that hook already injects avoids a manifest change — which would un-trust every user (see Evidence) |
-| D15 | `readers/codex.py` still ignores `$CODEX_HOME` | Deliberate deferral, not an oversight: the code says `sessions_root()` is a containment boundary for payload-supplied paths and widening it "is a separate change with its own review". Not smuggled into a correctness PR |
-| D11 | The bot literals are taken from upstream source, not inferred | `guardian_review`, not `guardian` — the invented literal matched nothing, so every real guardian skip would have raised a false "unknown kind" alarm. `memory_consolidation` was missing entirely. Read from `codex-rs/protocol/src/protocol.rs`, not guessed |
+| D4 | Delegate to `pr_link.conversation_id_for` | The helper already existed; a parallel mechanism is the default wrong answer |
+| D5 | Bump **all five** manifests to 0.59.1 | #229 decoupled staging, but #240 — the most recent release — bumped it in lockstep again. Follow what main does, not what an older PR decided |
+| D6 | Fail open everywhere | A memory hook must never block the host |
+| D7 | Bot literals read from upstream source, not inferred | `guardian_review`, not `guardian` — an invented literal matched nothing |
+| D8 | Discovery gates candidate *selection*, not read-only *enumeration* | `readers_cli` has a published wire contract and golden files |
+| D9 | **Ship nothing whose precondition is unproven** | The reverted resolver fix: reproduced failure mode, unproven cause, and it introduced a wrong-environment routing bug |
+| D10 | Touch no hook manifest | Editing one un-trusts every existing Codex user |
 
 ---
 
-## Milestones
+## Verification
 
-1. **M1 — bridge + installer honesty** (`codex_hook_bridge.py`,
-   `setup_codex_hooks.py`, `capture_health.py`)
-2. **M2 — guardian allowlist** (`readers/codex.py`, `codex_flush.py`,
-   `capture.py`, `find-contributing-sessions/scripts/find_sessions.py`,
-   `capture_health.py`)
-3. **M3 — wire namespacing** (`rulebook_hook.py`, `codex_hook_bridge.py`,
-   `cursor_capture.py`)
-4. **M4 — tests** — new `tests/codex_correctness_test.py`, house style: no
-   pytest, no new dependencies, isolated via tmpdir + `MEMHUB_*` env
-   overrides, never reaching a live backend. `run_all.py` auto-discovers
-   `*_test.py`, so it needs no edit — which also keeps this work clear of the
-   "Codex / Cursor reliability matrix" spec's globs.
-5. **M5 — version bump** per D5, plus README / `plugin.json` /
-   `marketplace.json` description updates where user-facing behaviour changed.
-
-### Verification
-
-- `python3 tests/run_all.py` green **and**
-  `uv run --with 'mcp<2' python tests/run_all.py` green (the second covers the
-  mcp-importing suites).
-- Every changed hook script smoke-tested by piping realistic event JSON in:
-  exits 0, prints nothing on the unhappy path, finishes inside its
-  `hooks.json` timeout.
-- Manual runs go to staging with `MEMHUB_MCP_BASE_URL` set **explicitly** —
-  the staging plugin's symlinked `scripts/` otherwise auto-resolves to prod.
-  Clean up with `scripts/purge_today.py`.
+- `python3 tests/run_all.py` and `uv run --with 'mcp<2' python tests/run_all.py`
+  both green, exit 0.
+- `tests/codex_correctness_test.py` — stdlib-only, tmpdir-isolated, never
+  reaches a backend.
+- Every changed hook smoked with realistic event JSON: exits 0, silent on the
+  unhappy path, inside its `hooks.json` timeout.
+- Manual runs go to staging with `MEMHUB_MCP_BASE_URL` set **explicitly** — and
+  note that Codex reads `mcp.json`, not `.mcp.json`.
 - **Never** exercise `api.memhub.xtrace.ai`.
-
----
 
 ## Open questions
 
-1. ~~The exact non-user `thread_source` literal is unconfirmed.~~
-   **Resolved.** Read from upstream: `enum ThreadSource` in
-   `codex-rs/protocol/src/protocol.rs` gives `user`, `subagent`,
-   `guardian_review`, `memory_consolidation`, and the open `Feature(String)`.
-   What remains open is which *Feature* surfaces exist; the denylist makes that
-   safe — a new one is captured, not dropped.
-2. **Backend backfill** — the 103 guardian conversations and the orphaned
-   production fires both need a data decision. Out of scope here.
-3. **`CONTRIBUTING.md:104-106` is stale** (contradicts `RELEASING.md:72` and
-   the parity test). Left untouched deliberately; worth its own PR.
-4. **`version_parity_test.py` cannot catch staging drift by design** (D5). If
-   the team ever wants staging drift detected without re-coupling the bump, it
-   needs a different check.
-
-## Handoff to backend
-
-For the MemHub backend, separately from this PR:
-
-- Resolve a fire to a conversation by matching `session_id` against
-  `source_id` **and** `'<platform>-' || session_id`, so historical orphaned
-  Codex fires link retroactively.
-- Decide the fate of the 103 guardian conversations already in staging (and
-  the production equivalent).
+1. **What breaks Codex capture on upgrade?** The field report is credible and
+   ENG-1070 saw it recur at 0.55.1, but the live upgrade test did **not**
+   reproduce it. Hook trust remains the strongest untested candidate.
+2. **ENG-1075 end to end.** Needs a trusted hook dispatch on a real Codex
+   install — one `/hooks` approval away, and untested until then.
+3. **Backend backfill** for orphaned fires and stored bot-thread conversations.
+4. **PR #217** should land first; until it does the Codex capture log cannot be
+   used as evidence.
