@@ -5,15 +5,27 @@ The point: the artifact body is read off disk / the pipe and shipped straight
 to the `save_artifact` MCP tool. The model never re-emits the content token by
 token — it just runs this with a path, the same way it would `cat` a file.
 
-Auth = the SAME OAuth the /mcp connector uses (shared `_memhub_auth`):
-$MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
-else a one-time browser approval. No memhub-cli required.
+`--attach` is the same bargain for BYTES: a rendered deliverable is read,
+base64-encoded and sent as the artifact's file bundle, so an HTML page or a PNG
+never passes through the model's context either. `--file`/`--stdin` stays the
+searchable text (give one so the deliverable is findable).
+
+Auth = the PLUGIN's own credential (shared `_memhub_auth`), never the /mcp
+connector's: $MEMHUB_TOKEN if set (CI escape hatch), else the personal access
+key `login.py` mints (`~/.config/memhub-plugin/pak-<host>.json`), else the
+cached plugin OAuth token, else a one-time browser approval. Being connected
+in /mcp does not satisfy it. No memhub-cli required.
 
 Run (mcp SDK pulled ephemerally by uv):
     uv run --with 'mcp<2' python scripts/save_artifact.py \
         --file spec.md --name "Retry Policy Spec" --type spec \
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
         [--tags a,b]
+
+    # a rendered DELIVERABLE (HTML page, chart PNG, PDF) — bytes, not text:
+    uv run --with 'mcp<2' python scripts/save_artifact.py \
+        --attach report.html --attach chart.png --entrypoint report.html \
+        --file summary.md --name "Q3 retry report" --type document
 
     # or pipe terminal output straight in:
     pytest -q | uv run --with 'mcp<2' python scripts/save_artifact.py \
@@ -39,6 +51,43 @@ from brain_resolve import resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, read_room, repo_root  # noqa: E402
 
 
+def _bundle(paths, entrypoint):
+    """`(files payload, error)` for `--attach` — base64 bytes for `save_artifact`.
+
+    The bundle path is the basename, so `--attach build/index.html` is stored
+    as `index.html` and `--entrypoint index.html` names it. Two attachments
+    with the same basename are refused rather than silently collapsed: the
+    server rejects a duplicate path, and guessing which one the user meant
+    would store the wrong bytes under the right name.
+    """
+    import base64
+    import mimetypes
+
+    payload: list[dict] = []
+    seen: set[str] = set()
+    for path in paths or []:
+        if not path.is_file():
+            return [], f"attachment not found: {path}"
+        name = path.name
+        if name in seen:
+            return [], (f"two attachments share the bundle path {name!r}; "
+                        "rename one, they cannot both be stored")
+        seen.add(name)
+        data = path.read_bytes()
+        if not data:
+            return [], f"attachment is empty: {path}"
+        entry = {"path": name,
+                 "content_base64": base64.b64encode(data).decode("ascii")}
+        guessed = mimetypes.guess_type(name)[0]
+        if guessed:
+            entry["content_type"] = guessed
+        payload.append(entry)
+    if entrypoint and entrypoint not in seen:
+        return [], (f"--entrypoint {entrypoint!r} is not one of the attached "
+                    f"files ({', '.join(sorted(seen)) or 'none'})")
+    return payload, None
+
+
 def unwrap(result) -> dict:
     if getattr(result, "structuredContent", None):
         return result.structuredContent
@@ -54,9 +103,16 @@ def unwrap(result) -> dict:
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Store a file/stdin as a MemHub artifact.")
-    src = ap.add_mutually_exclusive_group(required=True)
+    src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--file", type=Path, help="path to the artifact body")
     src.add_argument("--stdin", action="store_true", help="read body from stdin")
+    ap.add_argument("--attach", type=Path, action="append", default=[],
+                    metavar="PATH",
+                    help="a deliverable file to store as the artifact's payload "
+                         "(repeatable). Its bytes are base64-encoded here, never "
+                         "re-emitted by the model. Bundle path = the basename")
+    ap.add_argument("--entrypoint", default=None,
+                    help="the attached file to render first, e.g. index.html")
     ap.add_argument("--name", required=True, help="artifact title (re-using a name versions it)")
     ap.add_argument("--type", default="document", help="artifact_type (spec/design_doc/runbook/...)")
     ap.add_argument("--agent-brain-id", default=None,
@@ -77,8 +133,20 @@ async def main() -> int:
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    if not args.stdin and not args.file.is_file():
+    if not args.stdin and args.file is None and not args.attach:
+        print("ERROR: give --file, --stdin, or at least one --attach", file=sys.stderr)
+        return 2
+    if args.file is not None and not args.file.is_file():
         print(f"ERROR: file not found: {args.file}", file=sys.stderr)
+        return 2
+    if args.entrypoint and not args.attach:
+        print("ERROR: --entrypoint names an attached file; pass --attach too",
+              file=sys.stderr)
+        return 2
+
+    files_payload, err = _bundle(args.attach, args.entrypoint)
+    if err:
+        print(f"ERROR: {err}", file=sys.stderr)
         return 2
     # Explicit utf-8 on BOTH inputs: the default codec is the OS locale, so on a
     # non-UTF-8 box (cp950, cp1252, …) a piped or on-disk artifact carrying an
@@ -90,17 +158,26 @@ async def main() -> int:
     except (AttributeError, ValueError):  # already-wrapped or non-reconfigurable stream
         pass
     try:
-        content = sys.stdin.read() if args.stdin else args.file.read_text(encoding="utf-8")
+        if args.stdin:
+            content = sys.stdin.read()
+        elif args.file is not None:
+            content = args.file.read_text(encoding="utf-8")
+        else:
+            content = ""          # an attachment-only save: the bundle IS the body
     except UnicodeDecodeError as exc:
         src = "stdin" if args.stdin else str(args.file)
         print(f"ERROR: {src} is not valid UTF-8 ({exc.reason}); convert it first",
               file=sys.stderr)
         return 2
-    if not content.strip():
+    if not content.strip() and not files_payload:
         print("ERROR: artifact body is empty", file=sys.stderr)
         return 2
 
     call_args: dict = {"name": args.name, "content": content, "artifact_type": args.type}
+    if files_payload:
+        call_args["files"] = files_payload
+        if args.entrypoint:
+            call_args["entrypoint"] = args.entrypoint
     if args.agent_brain_id:
         call_args["agent_brain_id"] = args.agent_brain_id
     if args.parent_id:
@@ -134,7 +211,11 @@ async def main() -> int:
     want_room = not args.agent_brain_id and not args.no_room
     env = env_for_url(url)
     if want_room:
-        file_dir = None if args.stdin else args.file.resolve().parent
+        # The body's repo decides the room; with attachments only, the first
+        # attached file stands in for it.
+        body_path = args.file if args.file is not None else (
+            args.attach[0] if args.attach else None)
+        file_dir = None if (args.stdin or body_path is None) else body_path.resolve().parent
         if file_dir is not None and repo_root(file_dir) is not None:
             # The file lives in a repo — that repo is authoritative, and if it
             # has no cached room the artifact stays personal. Falling back to
@@ -143,8 +224,12 @@ async def main() -> int:
             room_cwd = file_dir
         room = read_room(room_cwd, env)
 
-    src_desc = "stdin" if args.stdin else str(args.file)
+    src_desc = "stdin" if args.stdin else (str(args.file) if args.file else "(no text body)")
     print(f"source   : {src_desc}  ({len(content):,} chars)")
+    if files_payload:
+        names = ", ".join(f["path"] for f in files_payload)
+        entry = f"  entrypoint={args.entrypoint}" if args.entrypoint else ""
+        print(f"files    : {names}{entry}")
     print(f"name     : {args.name}   type={args.type}")
     print(f"endpoint : {url}")
 

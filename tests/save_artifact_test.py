@@ -5,12 +5,16 @@
   already-open session (`brain_resolve.resolve_repo_brain`), so a hand-saved
   artifact lands in the repo room whenever one exists.
 - `--no-room` / `--agent-brain-id` still bypass resolution entirely.
+- `--attach` ships a deliverable's BYTES as the artifact's file bundle, and
+  refuses the shapes the server would reject anyway (missing file, colliding
+  bundle path, an `--entrypoint` naming nothing attached).
 
 Run: python3 tests/save_artifact_test.py  (stdlib only; the SDK is faked).
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import subprocess
 import sys
 import tempfile
@@ -121,6 +125,49 @@ with tempfile.TemporaryDirectory() as td:
     sa.resolve_repo_brain = none_resolve
     rc = run("--file", str(doc), "--name", "Spec: X")
     check(rc == 0 and len(resolved) == 1 and "agent_brain_id" not in calls[-1], "no room anywhere → saved without a brain")
+
+with tempfile.TemporaryDirectory() as td:
+    out = Path(td)
+    sa.repo_root = lambda d: None          # outside any repo: personal memory
+    sa.read_room = lambda cwd, env: None
+    sa.resolve_repo_brain = fake_resolve
+
+    page = out / "report.html"
+    page.write_bytes(b"<html>hi</html>")
+    summary = out / "summary.md"
+    summary.write_text("what the report says\n", encoding="utf-8")
+
+    print("--attach ships bytes as the file bundle")
+    rc = run("--attach", str(page), "--entrypoint", "report.html",
+             "--file", str(summary), "--name", "Report")
+    files = calls[-1].get("files") if calls else None
+    check(rc == 0, "exit 0")
+    check(isinstance(files, list) and len(files) == 1, f"one file sent: {files!r}")
+    check(files[0]["path"] == "report.html", "bundle path is the basename")
+    check(base64.b64decode(files[0]["content_base64"]) == b"<html>hi</html>",
+          "the file's real bytes round-trip through base64")
+    check(files[0].get("content_type") == "text/html", "content_type guessed from the name")
+    check(calls[-1].get("entrypoint") == "report.html", "entrypoint passed through")
+    check(calls[-1]["content"] == "what the report says\n",
+          "--file stays the searchable text body")
+
+    print("attachment-only save (no text body)")
+    rc = run("--attach", str(page), "--name", "Report")
+    check(rc == 0 and calls[-1]["content"] == "" and len(calls[-1]["files"]) == 1,
+          "empty content is allowed when a bundle carries the artifact")
+
+    print("refusals")
+    rc = run("--attach", str(out / "nope.png"), "--name", "Report")
+    check(rc == 2 and not calls, "a missing attachment is an error, nothing is sent")
+    nested = out / "sub"; nested.mkdir(); (nested / "report.html").write_bytes(b"other")
+    rc = run("--attach", str(page), "--attach", str(nested / "report.html"), "--name", "R")
+    check(rc == 2 and not calls, "two attachments with one basename are refused")
+    rc = run("--attach", str(page), "--entrypoint", "index.html", "--name", "R")
+    check(rc == 2 and not calls, "--entrypoint must name an attached file")
+    rc = run("--entrypoint", "report.html", "--name", "R")
+    check(rc == 2 and not calls, "--entrypoint without --attach is an error")
+    rc = run("--name", "R")
+    check(rc == 2 and not calls, "no --file, --stdin or --attach is an error")
 
 print()
 print("FAILED" if FAILS else "ALL PASSED", f"({FAILS} failures)")

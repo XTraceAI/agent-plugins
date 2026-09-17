@@ -109,8 +109,9 @@ labelled with who it binds) rather than guess. No books at all → offer
 the user, and create it only on a yes; never pass `scope: "all_org"` or name
 another member — both are org-admin acts. Every proposal you show the user
 names the book it would land in, because that is who the rule would reach.
-If the server has no `list_rulebooks`, it predates rulebook containers: fall
-back to `agent_brain_id` and carry on.
+If the server has no `list_rulebooks`, it predates rulebook containers: file
+with no `rulebook_id` and carry on. Never pass `agent_brain_id` to
+`create_rule` — the parameter no longer exists and the call fails outright.
 
 **When the create is refused.** `create_rulebook` validates the creator as an
 active org member, so it can answer `rulebook_member_not_in_org` naming *the
@@ -267,9 +268,12 @@ The report, in order:
   `evidence:` line with the machine tokens. A "do X before Y" matcher whose
   fires were mostly in sessions that had already done X is moved to session
   start with its numbers. A session-armed ordering (`armed_by_events:
-  ["session"]`, e.g. fetch before reading `origin/*`) is replayed but the
-  shipped engine is edit-armed only — its decision says so; the
-  fires-at-the-command form (once per session) is the alternative to offer.
+  ["session"]`, e.g. fetch before reading `origin/*`) is replayed AND armed by
+  the shipped engine: `armed_by_events` takes `session` and `prompt` (the
+  latter needs `armed_by_rx`) as well as the edit family. Propose it in that
+  shape rather than demoting it to a note, and let `/memhub:create-rule`
+  step 3 set `min_hook_version`, so a teammate on an older hook gets it as
+  advice naming the version it wanted instead of silence.
 - **DECLARED IN CLAUDE.MD, NOT BROKEN HERE** — the 0–2-fire declared checks,
   with their sentences. Offer them in bulk ("also file these as declared
   rules?"), default no.
@@ -370,7 +374,8 @@ Report per row: filed (with its trigger, and into which rulebook — name who
 that book binds) / replaces which rule / unchanged / skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
 already on with zero historical fires (retire candidates); skills with
 intent ≫ invoked; block candidates with a high bad-outcome rate;
-session-armed orderings waiting on the engine mode. Note the activation
+session- and prompt-armed orderings and the `min_hook_version` each carries.
+Note the activation
 date — the next run with `--baseline-date <that date>` over fresh sessions
 (with a new facet pass) measures whether the friction shrank. Identical
 re-files are no-ops on the server, so re-running is safe.
