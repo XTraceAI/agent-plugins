@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import pathlib
 import json
 import os
 import subprocess
@@ -335,7 +336,9 @@ def test_a_later_stop_blocks_on_the_moment_once():
         assert "turn 2" in reason and "correction" in reason and "router: wrong_target" in reason
         assert '"session_id"' not in reason and 'source_ref="sess#2"' in reason
         assert 'scope_repos=["repo"]' in reason and "create-rule skill" in reason
-        assert "Never pass activate" in reason
+        # "Never pass activate" moved into the skill with the rest of the
+        # manual; this line is a pointer (Codex, #244)
+        assert "activate" not in reason
         rows = hx.read_jsonl(hs.moments_path("sess"))
         assert [r.get("handed") for r in rows] == [None, "sess#2"], "handed by appending"
         assert "handed_at" not in rows[0], "the moment row is never rewritten"
@@ -517,7 +520,9 @@ def test_an_older_turns_child_never_moves_the_meta_back():
 def test_the_block_reason():
     line = hs.block_reason("sess", _moment(2), "repo")
     assert line.startswith(hs.BLOCK_PREFIX)
-    assert "Never pass activate" in line and "/Users/" not in line and "@" not in line
+    # the privacy guards stay on the line itself: it reaches both the model and
+    # the person. "Never pass activate" moved into the skill (Codex, #244).
+    assert "/Users/" not in line and "@" not in line
     # HOW to file lives in skills/create-rule/SKILL.md. The prompt-lane line
     # restated it and drew five of six Codex findings on #222 (dropped whatever
     # it did not copy, drifted from whatever it did), so none of it is here.
@@ -525,44 +530,36 @@ def test_the_block_reason():
     for restated in ("list_rulebooks", "include_retired", "supersedes_rule_id",
                      "anchor_recall", "--fires", "mode"):
         assert restated not in line, restated
-    # the provenance only this line has: the server refuses a draft without it
-    assert 'source="session_draft"' in line and 'source_ref="sess#2"' in line
-    # the STAMP is not quoted any more. The host renders this line to the
-    # person behind "Stop hook feedback:", and ~400 chars of state={...} JSON
-    # was the bulk of what they read. The skill takes it from the moments file.
-    assert "state=" not in line and '"hook_version"' not in line
-    assert "moments file" in line
-    # the verdict is still owed either way — a silent "no lesson" looked exactly
-    # like an ignored handoff, 19 handoffs to 0 create_rule calls — but it is
-    # recorded, not printed: the person asked for a quiet terminal.
-    # the command must RESOLVE, not merely look right: CLAUDE_PLUGIN_ROOT is
-    # unset in the agent's shell and `<plugin>/bin` is on its PATH, so the only
-    # runnable form free of a home directory is the wrapper's bare name. A live
-    # e2e caught the earlier `harness_stop.py verdict`: unresolvable, and the
-    # agent narrated its reasoning to the person instead of staying quiet.
+    # The line is a POINTER now. Claude Code renders a blocking Stop reason to
+    # the person as "Stop hook feedback:" and there is no Stop channel that
+    # reaches only the model (Codex, #244), so every instruction that does not
+    # have to be here lives in skills/create-rule/SKILL.md instead. What stays
+    # is what only this line knows: which turn, and where to record a decline.
+    assert "create-rule skill" in line
+    assert 'source_ref="sess#2"' in line and "scope_repos=" in line
     assert "memhub-verdict --session sess --ref sess#2" in line
     # the reason is free prose; `--why '<why>'` dies on an apostrophe, and the
-    # silence instruction above would then hide the failure (Codex, #244)
+    # silence instruction would then hide the failure (Codex, #244)
     assert "--why" not in line and "<<'WHY'" in line
-    assert "harness_stop.py verdict" not in line
-    # silence is unconditional — it must not depend on the recording succeeding
     assert "say nothing to the person about this turn" in line
-    assert line.index("say nothing") < line.index("memhub-verdict")
-    # it files without asking: a draft lands `proposed` for a human either way,
-    # so the confirmation was belt-and-braces over a server invariant
-    assert "without asking" in line
-    # the TEST is "not already a RULE", not "not already written down". A live
-    # e2e declined a trap documented at CONTRIBUTING.md:123 — but the docs are
-    # what had just failed to stop it, and 18 of the book's rules are hand-done
-    # `claude_md_import` of exactly that kind. Narration nobody tripped over is
-    # still out (the TEAM_DIRECTIVE_CAPTURE failure of 2026-09-14).
-    assert "not already a RULE" in line
-    assert "does NOT disqualify it" in line and "cite where it is written" in line
-    assert "merely be restating the docs" in line
-    # a budget, not an obstacle. Raised 900 -> 1100 deliberately: the clause
-    # above is the fix for a measured miss, and trimming instructions to hold a
-    # round number is how the prompt lane lost its load-bearing text before.
-    assert len(line) < 1200, len(line)
+    # the manual moved out and must NOT be restated here
+    for moved in ("not already a RULE", "restating the docs", "without asking",
+                  "activate", "state=", '"hook_version"'):
+        assert moved not in line, moved
+    # 1130 -> 411. A pointer, not a manual.
+    assert len(line) < 500, len(line)
+    # ...and the skill must actually carry what the line dropped, or the two
+    # halves diverge silently and the agent gets neither.
+    skill = (pathlib.Path(__file__).resolve().parent.parent / "plugins" / "memhub"
+             / "skills" / "create-rule" / "SKILL.md").read_text(encoding="utf-8")
+    # markdown wraps; the check is about content, not where the lines break,
+    # and reflowing prose to satisfy a substring test is the wrong direction
+    skill = " ".join(skill.replace("*", "").replace("`", "").split())
+    for owed in ("not already a RULE", "does NOT disqualify it",
+                 "restating the docs", "ask the person nothing at all",
+                 "Never pass activate", "Step 4b.6", "Step 0 (which rulebook)",
+                 "Do NOT rebuild it from", 'source="session_draft"'):
+        assert owed in skill, owed
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
     print("PASS test_the_block_reason")

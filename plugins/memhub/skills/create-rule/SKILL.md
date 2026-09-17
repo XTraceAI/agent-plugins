@@ -28,25 +28,47 @@ MemHub's harness can block a stop with `MemHub harness: before you stop: turn
 N of this session was flagged as …`. Then you are here because a turn was
 flagged, not because the user asked for a rule, and two things differ:
 
-- **First decide whether there is a lesson at all**, by the test the harness
-  line gives. If there is none, record why with the `verdict` command the
-  harness line names and say nothing to the person about it — the row is how a
-  judged-and-declined moment stays distinguishable from an ignored one.
-- **If there is, run this whole flow** with the lesson as the user's words, and
-  file it without asking: a `session_draft` always lands `proposed` for a
-  person to review, so the confirmation the rest of this skill asks for is
-  already covered by where the rule lands.
-- **The stamp comes from the moments file**, which the harness line names
-  (`~/.config/memhub-plugin/harness/<session_id>.moments.jsonl`, or under
-  `$MEMHUB_HARNESS_DIR`). Read the last JSON object whose `source_ref` matches
-  the one in the harness line, and pass its `state` verbatim in step 5, with
-  `source="session_draft"`, that `source_ref`, and `scope_repos` from the
-  moment's `state.touched_repos` (else `state.repo`). MemHub refuses a
-  `session_draft` without its `state`. The harness line no longer quotes the
-  stamp: the host renders that line to the person, and the JSON was the bulk
-  of what they were reading.
-- **Then tell the person one line** naming the rule filed and that it is
-  proposed pending review. That line, not the harness's, is what they see.
+**This section, not the harness line, is the harness path.** The line is
+rendered to the person as `Stop hook feedback:` — there is no Stop channel that
+reaches only the model — so it stays a pointer and everything it used to carry
+lives here.
+
+- **The test.** A lesson is one that would change what an agent DOES next time,
+  is not already a RULE, is not project state, and will still be true next
+  month. Already written in CLAUDE.md or the docs does NOT disqualify it: if
+  this turn tripped over it anyway, the prose was not enough — file it and cite
+  where it is written. Skip only when nothing went wrong and you would merely
+  be restating the docs.
+- **No lesson** → record why with the `memhub-verdict` command the harness line
+  names, and say nothing to the person. That row is how a judged-and-declined
+  moment stays distinguishable from an ignored one.
+- **A lesson** → run this flow with it as the user's words, and **ask the
+  person nothing at all**. A `session_draft` lands `proposed` and fires for
+  nobody until a reviewer activates it, so every confirmation this skill asks
+  for elsewhere is already held by whoever reviews the book. Concretely, on
+  this path:
+  - **Step 0 (which rulebook)** does not ask. Take the one `bound` rulebook
+    whose scope admits the repo; with several, the `all_org` one; with several
+    of those or none at all, do not guess and do not create one — record a
+    verdict naming the ambiguity and stop.
+  - **Step 4b.6** (no git checkout, no Agent tool) does not ask. Say the
+    precondition was missing, file with the pattern proven only against the
+    verifier's synthetic cases, and note that in the report.
+  - **Step 5** does not ask. File, then tell the person one line naming the
+    rule. A `cross_book` conflict is still reported.
+  - **Never pass `activate`.** Never put a person's name, home directory or
+    e-mail in a rule.
+- **`scope_repos` is the harness line's, verbatim** — it is already narrowed by
+  `proposal_scope`. When the line says the turn worked in several repositories,
+  cut it further to the ones the lesson is about. Do NOT rebuild it from
+  `state.touched_repos`: that re-broadens it to repos the lesson has nothing to
+  do with, which then fire on unrelated work.
+- **The stamp** comes from the moments file
+  (`$MEMHUB_HARNESS_DIR`, else `~/.config/memhub-plugin/harness`),
+  `<session_id>.moments.jsonl`: the last JSON object whose `source_ref` matches
+  the harness line's. Pass its `state` verbatim in step 5 with
+  `source="session_draft"` and that `source_ref` — MemHub refuses a
+  `session_draft` without its `state`.
 
 `mode: "gate"` still needs the user's own words asking for a block (step 3).
 

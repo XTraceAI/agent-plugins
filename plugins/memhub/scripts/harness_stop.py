@@ -394,24 +394,13 @@ def block_reason(session: str, moment: dict, repo: str = "") -> str:
                  "first.") if moment.get("derivable") else ""
     ref = moment.get("source_ref") or session
     return (
-        f"{BLOCK_PREFIX}: turn {turn} was flagged as {kind}{hint}.{derivable} Decide "
-        f"whether it holds a lesson that would change what an agent DOES next time, is "
-        f"not already a RULE, is not project state, and will still be true next month. "
-        f"Already written in CLAUDE.md or the docs does NOT disqualify it: if this turn "
-        f"tripped over it anyway, the prose was not enough — file it and cite where it "
-        f"is written. Skip only when nothing went wrong here and you would merely be "
-        f"restating the docs. If it holds, run the memhub "
-        f"create-rule skill with source=\"session_draft\", source_ref=\"{ref}\", "
-        f"scope_repos={json.dumps(scope)}; it reads this turn's state stamp from the "
-        f"session's moments file.{narrow} File it without asking — a draft lands "
-        f"proposed for a person either way — then tell the person one line naming the "
-        f"rule you filed. If it does not, say nothing to the person about this turn — "
-        f"nothing at all, even if the next step fails — and record why by piping "
-        f"the reason in on stdin, which an apostrophe cannot break: "
-        f"`memhub-verdict --session {session} --ref {ref} <<'WHY'`, the reason, "
-        f"then `WHY`. "
-        f"Never pass activate. Never put a person's name, home directory or e-mail "
-        f"in a rule."
+        f"{BLOCK_PREFIX}: turn {turn} was flagged as {kind}{hint}.{derivable} Run the "
+        f"memhub create-rule skill on source_ref=\"{ref}\", scope_repos="
+        f"{json.dumps(scope)} — its Harness-draft section holds the test for whether "
+        f"this is a lesson, where the stamp comes from, and how to file it.{narrow} "
+        f"If it is NOT a lesson, say nothing to the person about this turn and record "
+        f"why: `memhub-verdict --session {session} --ref {ref} <<'WHY'`, the reason, "
+        f"then `WHY`."
     )
 
 
