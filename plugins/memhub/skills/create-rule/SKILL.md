@@ -72,6 +72,11 @@ lives here.
     do not file — and this path may not ask the person instead — write a
     `memhub-verdict` row naming the reason and stop. Known cases:
     All four below are `not_filed`; only your own judgement is `no_lesson`.
+    **`unchanged: true` is not one of them.** That reply means the rule is
+    already in the book — a retry after a lost response, or a re-file of
+    identical content. The moment ended WITH a rule, so record no verdict and
+    tell the person as you would for any filing; a `not_filed` row there would
+    mark the same moment both imported and not filed.
     - `cross_book`: name the other book and rule id. Nothing is filed that
       would double-fire beside a rule `supersedes_rule_id` cannot reach.
     - `same_matcher` on an active rule that is not this one: name that rule id.

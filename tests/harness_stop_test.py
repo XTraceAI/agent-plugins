@@ -569,6 +569,8 @@ def test_the_block_reason():
                  "not_filed", "no_lesson",
                  # nothing on a non-filing path reaches the person (Codex, #244)
                  "hears about the turn only when a rule was filed",
+                 # an idempotent re-import ended WITH a rule (Codex, #244)
+                 "unchanged: true is not one of them",
                  "same_matcher", "ambiguity verdict",
                  "source_ref is passed EXACTLY as the harness line gives it"):
         assert owed in skill, owed
