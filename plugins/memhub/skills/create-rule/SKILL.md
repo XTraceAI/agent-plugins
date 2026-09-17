@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
 argument-hint: [--rulebook "<name or id>"] [the rule, in your own words]
-allowed-tools: Bash, Read, Write, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
+allowed-tools: Bash, Bash(memhub-verdict:*), Read, Write, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
 ---
 
 You are creating a **Rulebook rule**: a human-authored, team-owned rule stored
@@ -29,14 +29,24 @@ N of this session was flagged as …`. Then you are here because a turn was
 flagged, not because the user asked for a rule, and two things differ:
 
 - **First decide whether there is a lesson at all**, by the test the harness
-  line gives. If there is none — or the user, asked in step 1, declines — end
-  with the one line the harness asked for (`No rule from turn N: <why>`) and do
-  nothing else.
-- **If there is, run this whole flow** with the lesson as the user's words.
-  In step 5 pass the `source`, `source_ref`, `scope_repos` and `state` the
-  harness handed you, verbatim; they replace the `source_ref` step 5
-  describes (put the step-1b numbers in your report instead). MemHub refuses a
-  `session_draft` without its `state`, and nothing else in the session has it.
+  line gives. If there is none, record why with the `verdict` command the
+  harness line names and say nothing to the person about it — the row is how a
+  judged-and-declined moment stays distinguishable from an ignored one.
+- **If there is, run this whole flow** with the lesson as the user's words, and
+  file it without asking: a `session_draft` always lands `proposed` for a
+  person to review, so the confirmation the rest of this skill asks for is
+  already covered by where the rule lands.
+- **The stamp comes from the moments file**, which the harness line names
+  (`~/.config/memhub-plugin/harness/<session_id>.moments.jsonl`, or under
+  `$MEMHUB_HARNESS_DIR`). Read the last JSON object whose `source_ref` matches
+  the one in the harness line, and pass its `state` verbatim in step 5, with
+  `source="session_draft"`, that `source_ref`, and `scope_repos` from the
+  moment's `state.touched_repos` (else `state.repo`). MemHub refuses a
+  `session_draft` without its `state`. The harness line no longer quotes the
+  stamp: the host renders that line to the person, and the JSON was the bulk
+  of what they were reading.
+- **Then tell the person one line** naming the rule filed and that it is
+  proposed pending review. That line, not the harness's, is what they see.
 
 `mode: "gate"` still needs the user's own words asking for a block (step 3).
 

@@ -1,0 +1,14 @@
+#!/bin/sh
+# The agent's handle on the verdict lane.
+#
+# `<plugin>/bin` is on the agent's PATH; CLAUDE_PLUGIN_ROOT is NOT — it is set
+# for hook processes only. The block reason therefore cannot name the script by
+# path: an absolute one leaks the operator's home directory into text that
+# reaches the model and the terminal (tests/harness_stop_test.py guards it), and
+# a bare `harness_stop.py` does not resolve. A wrapper on PATH is the only form
+# that is both runnable and free of a home directory.
+#
+# Found by a live e2e: the agent, told to run an unresolvable command, narrated
+# its reasoning to the person instead — the loudest possible outcome from the
+# change meant to quieten it.
+exec python3 "$(dirname "$(dirname "$0")")/scripts/harness_stop.py" verdict "$@"

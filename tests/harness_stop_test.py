@@ -333,7 +333,7 @@ def test_a_later_stop_blocks_on_the_moment_once():
         reason = _reason(out)
         assert rc == 0 and reason.startswith(hs.BLOCK_PREFIX)
         assert "turn 2" in reason and "correction" in reason and "router: wrong_target" in reason
-        assert '"session_id": "sess"' in reason and 'source_ref="sess#2"' in reason
+        assert '"session_id"' not in reason and 'source_ref="sess#2"' in reason
         assert 'scope_repos=["repo"]' in reason and "create-rule skill" in reason
         assert "Never pass activate" in reason
         rows = hx.read_jsonl(hs.moments_path("sess"))
@@ -527,15 +527,89 @@ def test_the_block_reason():
         assert restated not in line, restated
     # the provenance only this line has: the server refuses a draft without it
     assert 'source="session_draft"' in line and 'source_ref="sess#2"' in line
-    assert '"hook_version": "0.54.0"' in line and line.index("create-rule skill") < line.index("state=")
-    # the verdict is owed either way: a silent "no lesson" looked exactly like
-    # an ignored handoff, 19 handoffs to 0 create_rule calls
-    assert '"No rule from turn 2: <why>"' in line
-    # a budget, not an obstacle: the line carries a verdict and a stamp, nothing else
-    assert len(line) < 1000, len(line)
+    # the STAMP is not quoted any more. The host renders this line to the
+    # person behind "Stop hook feedback:", and ~400 chars of state={...} JSON
+    # was the bulk of what they read. The skill takes it from the moments file.
+    assert "state=" not in line and '"hook_version"' not in line
+    assert "moments file" in line
+    # the verdict is still owed either way — a silent "no lesson" looked exactly
+    # like an ignored handoff, 19 handoffs to 0 create_rule calls — but it is
+    # recorded, not printed: the person asked for a quiet terminal.
+    # the command must RESOLVE, not merely look right: CLAUDE_PLUGIN_ROOT is
+    # unset in the agent's shell and `<plugin>/bin` is on its PATH, so the only
+    # runnable form free of a home directory is the wrapper's bare name. A live
+    # e2e caught the earlier `harness_stop.py verdict`: unresolvable, and the
+    # agent narrated its reasoning to the person instead of staying quiet.
+    assert "memhub-verdict --session sess --ref sess#2" in line
+    assert "harness_stop.py verdict" not in line
+    # silence is unconditional — it must not depend on the recording succeeding
+    assert "say nothing to the person about this turn" in line
+    assert line.index("say nothing") < line.index("memhub-verdict")
+    # it files without asking: a draft lands `proposed` for a human either way,
+    # so the confirmation was belt-and-braces over a server invariant
+    assert "without asking" in line
+    # the TEST is "not already a RULE", not "not already written down". A live
+    # e2e declined a trap documented at CONTRIBUTING.md:123 — but the docs are
+    # what had just failed to stop it, and 18 of the book's rules are hand-done
+    # `claude_md_import` of exactly that kind. Narration nobody tripped over is
+    # still out (the TEAM_DIRECTIVE_CAPTURE failure of 2026-09-14).
+    assert "not already a RULE" in line
+    assert "does NOT disqualify it" in line and "cite where it is written" in line
+    assert "merely be restating the docs" in line
+    # a budget, not an obstacle. Raised 900 -> 1100 deliberately: the clause
+    # above is the fix for a measured miss, and trimming instructions to hold a
+    # round number is how the prompt lane lost its load-bearing text before.
+    assert len(line) < 1100, len(line)
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
     print("PASS test_the_block_reason")
+
+
+def test_the_verdict_command_the_reason_names_is_on_the_agents_path():
+    """The reason names `memhub-verdict`; the wrapper must exist, be executable,
+    and sit in the `bin/` directory Claude Code puts on the agent's PATH."""
+    root = Path(__file__).resolve().parent.parent / "plugins" / "memhub"
+    wrapper = root / "bin" / "memhub-verdict"
+    assert wrapper.is_file(), wrapper
+    assert os.access(wrapper, os.X_OK), "wrapper must be executable"
+    assert "harness_stop.py" in wrapper.read_text(encoding="utf-8")
+    assert "/Users/" not in wrapper.read_text(encoding="utf-8")
+    print("PASS test_the_verdict_command_the_reason_names_is_on_the_agents_path")
+
+
+def test_the_block_shows_the_person_a_status_line_not_the_instructions():
+    """`reason` is the model's channel and the host also renders it; the
+    person's channel is `systemMessage`. The hook blocks BEFORE the agent has
+    decided, so it can only name what is being looked at — the outcome line is
+    the agent's own reply."""
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        rc, out = _stop()
+        payload = json.loads(out)
+        assert rc == 0 and payload["decision"] == "block"
+        assert payload["systemMessage"] == "MemHub: reviewing turn 2 for a team rule"
+        assert "create-rule skill" not in payload["systemMessage"]
+    print("PASS test_the_block_shows_the_person_a_status_line_not_the_instructions")
+
+
+def test_a_declined_moment_records_why_instead_of_printing_it():
+    """The half the hook cannot see. Without this row an ignored moment and a
+    judged-and-declined one are the same absence."""
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        assert hs.cmd_verdict("sess", "sess#2", "twin of an active rule") == 0
+        rows = hx.read_jsonl(hs.moments_path("sess"))
+        v = [r for r in rows if r.get("verdict_for")]
+        assert len(v) == 1 and v[0]["verdict"] == "no_lesson"
+        assert v[0]["why"] == "twin of an active rule"
+        # idempotent: a retry never double-writes
+        hs.cmd_verdict("sess", "sess#2", "again")
+        assert len([r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]) == 1
+        # an unknown session or ref is a no-op, never a crash
+        assert hs.cmd_verdict("", "sess#2", "x") == 0 and hs.cmd_verdict("nope", "r", "x") == 0
+    print("PASS test_a_declined_moment_records_why_instead_of_printing_it")
 
 
 def test_a_recorded_block_is_not_a_turn():
