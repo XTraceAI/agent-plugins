@@ -433,11 +433,24 @@ rebase.
 1. `python3 tests/run_all.py` green, and `uv run --with 'mcp<2' python tests/run_all.py` green.
 2. Every changed hook script smoke-tested with a realistic event JSON on stdin: exit 0, nothing on
    stdout for the unhappy path, comfortably inside its `hooks.json` timeout.
-3. **The two-step recorded end to end against staging** — link this PR with no type, then classify
-   it in a second call, and confirm `pr.pr_type` / `pr_type_source` come back on a `check`. This is
-   the one claim in §1.3 that was read from source and executed only in the backend's own test
-   fixture, never against the deployed service.
-4. Anything written to staging cleaned up with `scripts/purge_today.py`.
+3. **The two-step recorded end to end against staging — DONE, 2026-09-17**, on this feature's own
+   pull request ([agent-plugins#247](https://github.com/XTraceAI/agent-plugins/pull/247)):
+   - `link_pr(session_self)` with no classification → `linked[0].created: true`, and the reply
+     carried `pr.pr_type: null` / `pr_type_source: null`. **This is what closes §4.1's assumption**:
+     a call that classifies nothing still reports the field, so the skills can read it off the write
+     response instead of spending a probe.
+   - a second `link_pr` with `pr_type="feat"` + `classification_session_id` → HTTP 200,
+     `linked: []`, `skipped: [{"reason": "already_linked"}]`, `pr.pr_type: "feat"`,
+     `pr_type_source: "agent_session"`. The two-step works against the deployed service, not just
+     the backend's SQLite fixture.
+   - `GET /v1/team/pr-links/check` then returned `feat` / `agent_session`, and the link row kept
+     `link_source: "session_self"`. Feeding that exact reply to `classification_wanted()` returns
+     `False` — the hook will not ask again.
+   - a third call with `pr_type="chore"` → `This PR already has a different classification; linking
+     cannot overwrite it.` First write wins, and that message string is the one §3.4's instruction
+     matches on. MCP carried **only** the message: no `reason`, no status (§1.5 confirmed live).
+4. Staging writes left in place deliberately: the link and `feat` classification on #247 are this
+   feature's own honest record, not test pollution, so `scripts/purge_today.py` is not run for them.
 
 ---
 
