@@ -136,7 +136,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 def _load_portable_lock():
     """Load only the packaged lock shim without broadening module search."""
@@ -3530,6 +3530,15 @@ def _ledger_dir():
     return d
 
 
+def _just_before(iso):
+    """The instant one microsecond before `iso` — the earliest tick the
+    server can tell apart from it."""
+    try:
+        return (datetime.fromisoformat(iso) - timedelta(microseconds=1)).isoformat(timespec="microseconds")
+    except Exception:
+        return iso
+
+
 def _now():
     """Microseconds, not seconds: the server orders a fire and the events
     that may answer it by these instants, and an equal instant counts (a
@@ -4315,10 +4324,17 @@ def main():
             fired_now.append(r)
             fired_on[rid] = ev
 
+    # One instant for everything this call records: its fires, and the
+    # conversions it observed. A conversion for a rule this call ALSO fires
+    # (a second failing pytest for a rule whose signal is `pytest`) is stamped
+    # one microsecond earlier: it answers the rule's earlier fires — the old
+    # obligation logic converted what was already open — and not the fire
+    # this call is about to cause. Everything else shares the instant.
+    fired_at = _now()
     fired_ids = {r["id"] for r in fired_now}
     for rid in converted_hits:
-        if rid not in fired_ids:
-            log_event(ctx, "converted", rule_id=rid)
+        log_event(ctx, "converted", rule_id=rid,
+                  at=_just_before(fired_at) if rid in fired_ids else fired_at)
 
     def _dismiss(dismissals):
         """Post a `dismissed` event per rule the override names; returns the
@@ -4582,7 +4598,6 @@ def main():
             return f"bash-read {ev['fp']}"
         return cmd or fp or ""
 
-    fired_at = _now()
     ids = {}
     for r in (r for r in shown if r["id"] not in gate_ids):
         # An advise row carries no reason: a same-call dismissal is the event

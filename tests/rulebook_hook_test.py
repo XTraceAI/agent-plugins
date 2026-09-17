@@ -2853,12 +2853,24 @@ def min_hook_version_checks() -> None:
         red = fire_id("o31", "red-tests")
         check("outcomes: the failing run fires the output rule",
               red is not None and "[red-tests]" in ctx(out), ctx(out))
-        check("outcomes: …and posts no conversion for the rule it fired (tests-first, not fired here, still converts)",
-              not events("o31", "converted", "red-tests") and len(events("o31", "converted", "tests-first")) == 1,
-              str(events("o31", "converted")))
+        c = events("o31", "converted", "red-tests")
+        check("outcomes: …and its conversion is stamped one tick BEFORE the fire it caused (tests-first, not fired here, shares the instant)",
+              len(c) == 1 and c[0]["at"] < red["fired_at"]
+              and events("o31", "converted", "tests-first")[0]["at"] == red["fired_at"],
+              str((c, red["fired_at"])))
+        # a SECOND failing run: fires the rule again, and its `pytest` is the
+        # conversion of the EARLIER fire — stamped just before the new one,
+        # so the server answers the first fire and not the one this call caused
+        bash("o31", "uv run pytest -q", mode="post", resp={"stdout": "1 failed, 2 passed", "exit_code": 1})
+        red2 = fire_id("o31", "red-tests")
+        c = events("o31", "converted", "red-tests")
+        check("outcomes: a re-fire on the converting call posts the conversion one tick before the new fire",
+              red2["fire_id"] != red["fire_id"] and len(c) == 2
+              and red["fired_at"] < c[1]["at"] < red2["fired_at"], str((red["fired_at"], c, red2["fired_at"])))
         bash("o31", "uv run pytest -q", mode="post", resp={"stdout": "3 passed", "exit_code": 0})
-        check("outcomes: the green run that fires nothing converts it",
-              len(events("o31", "converted", "red-tests")) == 1 and fire_id("o31", "red-tests")["fire_id"] == red["fire_id"])
+        c = events("o31", "converted", "red-tests")
+        check("outcomes: the green run that fires nothing converts the rest",
+              len(c) == 3 and c[2]["at"] > red2["fired_at"] and fire_id("o31", "red-tests")["fire_id"] == red2["fire_id"])
 
         # 4. a named override on a LATER command dismisses a rule by label
         bash("o3", "sudo ls /etc")
