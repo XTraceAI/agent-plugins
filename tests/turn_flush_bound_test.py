@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -615,6 +616,36 @@ def test_the_health_banner_names_the_real_cause():
     check("it names the size, not the credential", "too large" in detail, True)
     check("it does not say 'unexpected error'",
           "unexpected error" in detail, False)
+
+    # REGRESSION LOCK. The recoverable case and the terminal one must not read
+    # the same. Once the flush has gone dormant, telling the user that capture
+    # "splits it over the next few turns on its own, and the session-end
+    # backstop covers the rest" is a promise nothing will keep — per-turn
+    # capture has stopped trying, and the session-end path slices at a fixed
+    # size with no adaptive handling, so it can refuse the same content. This
+    # module's own `no_refresh` comment states the principle: advice that
+    # cannot work is worse than no advice, because it spends the user's trust
+    # proving it. And a reassuring banner over silently-absent capture is the
+    # exact failure ENG-1085 began with.
+    now = time.time()
+    recovering = ch._message(None, None, ("payload_too_large", now, False), None)
+    terminal = ch._message(None, None, ("payload_too_large", now, True), None)
+    check("the recoverable case still reassures",
+          "splits it over the next few turns" in recovering, True)
+    check("the terminal case does NOT promise the backstop covers it",
+          "backstop covers the rest" in terminal, False)
+    check("the terminal case says capture has stopped",
+          "dormant" in terminal, True)
+    check("and gives the one lever that is actually the user's",
+          "/memhub:import-session" in terminal, True)
+    check("both still name the size rather than the credential",
+          "too large" in recovering and "too large" in terminal, True)
+    check("neither sends them to check the credential",
+          "--status" in recovering or "--status" in terminal, False)
+
+    # A 2-tuple from an older caller must not raise on SessionStart.
+    legacy = ch._message(None, None, ("payload_too_large", now), None)
+    check("a legacy 2-tuple still renders", "too large" in legacy, True)
 
 
 if __name__ == "__main__":

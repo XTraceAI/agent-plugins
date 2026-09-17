@@ -286,7 +286,7 @@ def _token_problem(host: str) -> str | None:
     return None
 
 
-def _recent_failure() -> tuple[str, float] | None:
+def _recent_failure() -> tuple[str, float, bool] | None:
     """The newest still-relevant ``(reason, when)`` recorded by a flush.
 
     Newest-first and returns on the first hit: an older breadcrumb cannot say
@@ -319,7 +319,12 @@ def _recent_failure() -> tuple[str, float] | None:
         # working?", not "did this particular path once stumble?".
         if _succeeded_since(path, when):
             continue
-        return str(reason), float(when)
+        # Whether per-turn capture went DORMANT for this session, not just
+        # whether it stumbled. The two need different advice: a transient
+        # failure retries on its own and the banner should say so, while a
+        # dormant session has stopped trying, so telling the user to wait is
+        # telling them to wait for something that will not happen.
+        return str(reason), float(when), bool(state.get("unsupported"))
     return None
 
 
@@ -475,7 +480,10 @@ def _message(host: str, token_problem: str | None,
                 f"$MEMHUB_TOKEN to a personal access key (mhk_…), which the "
                 f"hooks use directly and which does not expire.")
     if failure:
-        reason, when = failure
+        # Tolerant unpack: older callers (and tests) hand this a 2-tuple, and a
+        # banner is not worth a TypeError on SessionStart.
+        reason, when, *_rest = failure
+        dormant = bool(_rest[0]) if _rest else False
         detail = _REASONS.get(reason, "the capture hook failed")
         ago = max(0, int((time.time() - when) / 60))
         when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
@@ -492,6 +500,18 @@ def _message(host: str, token_problem: str | None,
                     "/memhub:import-session to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
+        elif reason == "payload_too_large" and dormant:
+            # The terminal case, and the ONE payload_too_large state where the
+            # reassuring wording below would be a lie: per-turn capture has
+            # stopped trying for this session, and the session-end path slices
+            # at a fixed size with no adaptive handling, so it can refuse the
+            # same content. Promising it lands would be the same mistake this
+            # whole reason slug exists to correct — a banner that tells the
+            # user nothing is wrong while capture is silently not happening.
+            # Name the state and give the one lever that is actually theirs.
+            tail = ("Per-turn capture is now dormant for this session and the "
+                    "session-end backstop may not recover it either — run "
+                    "/memhub:import-session to capture it directly.")
         elif reason == "payload_too_large":
             # Same reasoning as `budget_exhausted`: not a credential question,
             # so `--status` would send them to inspect the one thing that was

@@ -165,6 +165,19 @@ an action item.
 > one piece. Capture splits it over the next few turns on its own, and the session-end
 > backstop covers the rest.
 
+The **terminal** case gets different wording, because there the sentence above would be a
+promise nothing keeps — per-turn capture has stopped trying, and the session-end path
+slices at a fixed size with no adaptive handling, so it can refuse the same content. The
+banner names the state and gives the one lever that is actually the user's:
+
+> MemHub capture last failed 12m ago — one turn was too large for the server to accept in
+> one piece. Per-turn capture is now dormant for this session and the session-end backstop
+> may not recover it either — run `/memhub:import-session` to capture it directly.
+
+A reassuring banner over silently-absent capture is the exact failure ENG-1085 began with,
+and this module already states the principle for it (see the `no_refresh` comment): advice
+that cannot work is worse than no advice, because it spends the user's trust proving it.
+
 ## 4. Recovery of already-stalled sessions
 
 None needed, and none is shipped. A stalled session self-heals: the first turn it takes on
