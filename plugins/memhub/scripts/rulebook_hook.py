@@ -3928,9 +3928,20 @@ def main():
                 repo, root, _gitdir, branch = repo_of_call(data)
             except Exception:
                 repo, root, branch = "", "", ""
+            # Which lifecycle event this is comes from the PAYLOAD, not from
+            # `final`: `final` only lifts the flush throttle, and the Codex
+            # bridge passes it on every Stop (Codex has no SessionEnd hook to
+            # flush from), so reading it as "the session ended" would close
+            # every Codex advisory at the end of the turn it fired in. A
+            # payload that names no event (an operator's manual `flush
+            # final`) is taken at its word.
+            hook_event = str(data.get("hook_event_name") or "")
+            if hook_event == "SessionEnd" or (final and not hook_event):
+                kind = "session_end"
+            else:
+                kind = "turn_end"
             log_event({"session": session, "agent_id": None, "repo": repo or None,
-                       "branch": branch or None, "worktree": worktree_key(root)},
-                      "session_end" if final else "turn_end")
+                       "branch": branch or None, "worktree": worktree_key(root)}, kind)
         flush_fires(final=final)
         return 0
     try:

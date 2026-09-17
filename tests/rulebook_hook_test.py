@@ -2776,10 +2776,15 @@ def min_hook_version_checks() -> None:
                 payload["tool_response"] = resp
             return run(mode, payload, oenv)
 
-        def stop(session, final=False, **extra):
+        def stop(session, final=False, event=None, **extra):
+            # Claude's Stop hook runs `flush`; its SessionEnd hook runs `flush
+            # final`. The Codex bridge runs `flush final` on every STOP (no
+            # SessionEnd hook there), so the payload's event name, not the
+            # `final` flag, is what says which lifecycle event this is.
             args = [sys.executable, HOOK, "flush"] + (["final"] if final else [])
-            p = subprocess.run(args, input=json.dumps({"session_id": session, "hook_event_name": "Stop",
-                                                       "cwd": orepo, **extra}),
+            payload = {"session_id": session, "cwd": orepo, **extra}
+            payload["hook_event_name"] = event or ("SessionEnd" if final else "Stop")
+            p = subprocess.run(args, input=json.dumps(payload),
                                capture_output=True, text=True, env=dict(os.environ, **oenv), timeout=30)
             return p.returncode, p.stdout
 
@@ -2812,6 +2817,10 @@ def min_hook_version_checks() -> None:
         check("outcomes: a subagent's or re-entered Stop posts nothing", len(events("o1", "turn_end")) == 2)
         stop("o1", final=True)
         check("outcomes: SessionEnd posts one session_end", len(events("o1", "session_end")) == 1)
+        stop("o1", final=True, event="Stop")                    # the Codex bridge's shape
+        check("outcomes: a `flush final` on a Stop (the Codex bridge) is a turn_end, not a session end",
+              len(events("o1", "session_end")) == 1 and len(events("o1", "turn_end")) == 3,
+              str([e["kind"] for e in events("o1")]))
         check("outcomes: no Stop ever wrote a verdict",
               not events(kind="client_verdict") and all("converted" not in e for e in events()))
 
