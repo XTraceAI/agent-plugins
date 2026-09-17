@@ -46,13 +46,7 @@ CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 # the two writers keep the same last_error / last_error_at / last_ok_at shape,
 # so everything below reads either one unchanged.
 STATE_DIR = CACHE_DIR / "turnflush"
-# Cursor writes the same last_error / last_error_at / last_ok_at shape into its
-# own directory, but had no entry here — so `cursorflush/*.json` was read by
-# NOTHING and a Cursor capture failure could never reach the user. `--host
-# cursor` was also rejected by _configure, which silently fell back to Claude's
-# directory and reported on the wrong host.
-_STATE_DIRS = {"claude": CACHE_DIR / "turnflush", "codex": CACHE_DIR / "codexflush",
-               "cursor": CACHE_DIR / "cursorflush"}
+_STATE_DIRS = {"claude": CACHE_DIR / "turnflush", "codex": CACHE_DIR / "codexflush"}
 _PLUGIN_ROOT_ARG: str | None = None     # `--plugin-root`, see _configure
 # The rulebook keeps its own tree, relocatable together for tests (the hook
 # reads the same variable).
@@ -112,37 +106,7 @@ _REASONS = {
     # dealt with.
     "budget_exhausted": "capture ran out of time before it finished sending",
     "error": "the capture hook hit an unexpected error",
-    # Not a credential problem, so the default "/memhub:login --status" advice
-    # would send someone to inspect the one thing that is definitely fine.
-    # Gets its own remedy in `_message`. The Codex bridge could not find the
-    # plugin's scripts at all — usually an install that copied the manifest but
-    # not the linked directories.
-    "plugin_root_unresolved": ("this Codex install is missing the plugin's "
-                               "script files, so nothing was captured"),
-    # Slugs the Codex and Cursor flushers already write. Without an entry each
-    # rendered the generic "the capture hook failed … run /memhub:login
-    # --status", which points at a credential that is usually fine — and for
-    # `no_credential` says the one useful thing by accident while saying it for
-    # the wrong reason.
-    "no_credential": "the plugin has no saved login, so nothing could be sent",
-    "resolve_error": ("the repo's agent brain could not be resolved, so the "
-                      "session had nowhere to go"),
-    "unconfirmed_import": ("the server accepted the session but did not confirm "
-                           "what it stored"),
 }
-
-
-def _reason_text(reason: str) -> str:
-    """`flush_error:<detail>` / `mcp_error:<detail>` carry their cause inline.
-
-    They are generated per failure, so they cannot be enumerated above; read the
-    family and keep the detail rather than falling through to "unexpected".
-    """
-    if isinstance(reason, str) and ":" in reason:
-        family, _, detail = reason.partition(":")
-        if family in ("flush_error", "mcp_error"):
-            return f"the upload failed ({detail.strip()[:60]})"
-    return _REASONS.get(reason, "the capture hook failed")
 
 
 def _env_host() -> str | None:
@@ -503,7 +467,7 @@ def _message(host: str, token_problem: str | None,
                 f"hooks use directly and which does not expire.")
     if failure:
         reason, when = failure
-        detail = _reason_text(reason)
+        detail = _REASONS.get(reason, "the capture hook failed")
         ago = max(0, int((time.time() - when) / 60))
         when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
         # NOT "check /mcp" — the connector is a separate token store, so its
@@ -519,11 +483,6 @@ def _message(host: str, token_problem: str | None,
                     "/memhub:import-session to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
-        elif reason == "plugin_root_unresolved":
-            # Nothing about the credential is wrong, and nothing retries on its
-            # own — the files have to come back first.
-            tail = ("Reinstall the MemHub plugin, then run the memhub:setup "
-                    "skill to confirm the bridge can find it.")
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

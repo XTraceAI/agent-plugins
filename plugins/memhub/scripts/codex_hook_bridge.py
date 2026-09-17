@@ -14,7 +14,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -47,75 +46,6 @@ _HEALTH_TIMEOUT_S = 3
 _GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
 
 
-# A partial install — the staging build's `scripts/` is a relative symlink
-# escaping the plugin root, so any installer that copies only the plugin's own
-# subdirectory leaves it dangling (RELEASING.md) — used to end here in silence:
-# resolve_plugin_root() returned None and main() exited 0 with no output, no
-# record, and capture simply never happened. Leave a breadcrumb in the shape
-# capture_health already reads, and say so once per session. The breadcrumb
-# alone is not enough: capture_health.py lives in the very root we could not
-# find, so with no root there is nothing to read it back out.
-_STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
-_BRIDGE_STATE = _STATE_DIR / "_bridge.json"
-_UNRESOLVED = "plugin_root_unresolved"
-_UNRESOLVED_MESSAGE = (
-    "MemHub: this Codex install is missing the plugin's script files, so "
-    "session capture and Rulebook telemetry are OFF. Reinstall the MemHub "
-    "plugin, then run the memhub:setup skill to confirm it is healthy."
-)
-
-
-def _record_unresolved() -> None:
-    """Record the failure where capture_health looks for one.
-
-    Same ``last_error``/``last_error_at`` shape codex_flush writes, so the
-    next healthy session surfaces it through the ordinary health path rather
-    than needing a second reporting channel.
-    """
-    name = None
-    try:
-        _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix="._bridge.", dir=_STATE_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"last_error": _UNRESOLVED,
-                       "last_error_at": time.time()}, handle)
-        os.replace(name, _BRIDGE_STATE)
-        name = None
-    except OSError:
-        pass          # a breadcrumb is never worth failing a hook over
-    finally:
-        # A failed flush-on-close or a replace that loses a Windows sharing
-        # race would otherwise strand the temp file — once per hook event,
-        # forever, in the one directory we ask users to keep.
-        if name is not None:
-            try:
-                os.unlink(name)
-            except OSError:
-                pass
-
-
-def _clear_unresolved() -> None:
-    """Retract the breadcrumb once a root resolves again.
-
-    A stale ``last_error`` outliving the failure it recorded is its own bug —
-    this hook has been bitten by exactly that on the recall lane.
-    """
-    try:
-        _BRIDGE_STATE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _report_unresolved(action: str, event: str) -> None:
-    """One visible line, on SessionStart only — it is once per session."""
-    _record_unresolved()
-    if action == "dispatch" and event == "SessionStart":
-        print(json.dumps({
-            "hookSpecificOutput": {"hookEventName": "SessionStart"},
-            "systemMessage": _UNRESOLVED_MESSAGE,
-        }))
-
-
 def _version_key(path: Path) -> tuple:
     """Natural ordering for semver and Codex cachebuster directory names."""
     return tuple(
@@ -124,78 +54,24 @@ def _version_key(path: Path) -> tuple:
     )
 
 
-# Everything `codex_flush.py` imports at module load, plus itself. Checking for
-# `codex_flush.py` ALONE was the bug: an upgrade that half-populates the new
-# version directory still satisfies a one-file test, so the newest (broken)
-# version outranks a complete older one sitting right beside it. The flush child
-# then dies on `ModuleNotFoundError` — and since it is detached with stdout and
-# stderr to DEVNULL, that death is completely invisible. Reproduced: a full
-# 0.58.3 next to a 0.58.4 holding only codex_flush.py resolves to 0.58.4, every
-# hook event exits 0 with empty output, and nothing is ever captured.
-# TRANSITIVE, not just codex_flush's direct imports: `readers/__init__.py` does
-# `from . import claude, codex, cursor`, and `readers/codex.py` pulls in
-# `.strict_json`, `.jsonl` and `session_title`. A candidate holding only the
-# direct set still dies at import — the same silent death, one layer down.
-# `tests/codex_correctness_test.py` derives this set from the real import graph
-# and fails if it drifts, because maintaining it by hand got it wrong twice.
-_REQUIRED = (
-    "codex_flush.py", "atomic_write.py", "portable_lock.py", "mcp_http.py",
-    "pr_provenance.py", "_memhub_auth.py", "brain_resolve.py", "redact.py",
-    "transcript_filter.py", "room_map.py", "rulebook_hook.py",
-    "session_title.py", "pak.py",
-    "readers/__init__.py", "readers/codex.py", "readers/claude.py",
-    "readers/cursor.py", "readers/strict_json.py", "readers/jsonl.py",
-    "readers/discovery.py",
-)
-
-
-def _is_complete(root: Path) -> bool:
-    """Does this directory hold a plugin that can actually run?
-
-    Cheap (a dozen stats) and worth it: the alternative is discovering the
-    answer inside a detached child whose failure nobody ever sees.
-    """
-    scripts = root / "scripts"
-    return all((scripts / name).is_file() for name in _REQUIRED)
-
-
 def resolve_plugin_root() -> Path | None:
     for variable in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
         override = os.environ.get(variable)
         if override:
             root = Path(override).expanduser()
-            if _is_complete(root):
+            if (root / "scripts" / "codex_flush.py").is_file():
                 return root
 
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     cache = codex_home / "plugins" / "cache"
-    # Any marketplace name, not a two-entry allowlist: a user who registers the
-    # marketplace under a name of their own choosing had capture silently die
-    # at a cache path we never looked in. The completeness test above is what
-    # makes a wide search safe — we are identifying OUR plugin by its contents.
-    candidates = []
-    try:
-        candidates = [path for path in cache.glob("*/*/*") if _is_complete(path)]
-    except OSError:
-        candidates = []
-    if not candidates:
-        return None
-    # Tier by POSITION in _KNOWN_INSTALLS, never pooled: prod `memhub` and
-    # `memhub-staging` are separate installs against separate Auth0 tenants with
-    # separate token caches, and `_memhub_auth` derives the backend from
-    # whichever root wins. Ranking them together meant a prod user with a newer
-    # staging install would have had captures and Rulebook traffic sent to the
-    # WRONG ENVIRONMENT. The old ordered loop had this right; only the
-    # fall-back-past-a-broken-version behaviour needed changing.
-    def tier(path: Path) -> int:
-        pair = (path.parent.parent.name, path.parent.name)
-        return _KNOWN_INSTALLS.index(pair) if pair in _KNOWN_INSTALLS \
-            else len(_KNOWN_INSTALLS)
-
-    # Newest COMPLETE version within the most-preferred tier that has one, so a
-    # broken install can never mask a working one — and never across tiers.
-    best = min(tier(path) for path in candidates)
-    return max((p for p in candidates if tier(p) == best), key=_version_key)
+    for marketplace, plugin in _KNOWN_INSTALLS:
+        versions = [
+            path for path in (cache / marketplace / plugin).glob("*")
+            if (path / "scripts" / "codex_flush.py").is_file()
+        ]
+        if versions:
+            return max(versions, key=_version_key)
+    return None
 
 
 def _run(
@@ -504,13 +380,7 @@ def main() -> int:
         payload = sys.stdin.buffer.read()
         root = resolve_plugin_root()
         if root is None:
-            _report_unresolved(action, sys.argv[2] if len(sys.argv) > 2 else "")
             return 0
-        # Retract AFTER dispatching, never before: capture_health runs INSIDE
-        # _dispatch, so clearing first meant it could never see the breadcrumb a
-        # previous broken session left — and when the root is missing entirely,
-        # capture_health cannot run at all (it lives in that same root). Cleared
-        # up front, `_bridge.json` was readable by nothing.
         if action == "dispatch" and len(sys.argv) > 2:
             _dispatch(root, payload, sys.argv[2])
         elif action == "directive-pre":
@@ -521,7 +391,6 @@ def main() -> int:
             _artifact_sync(root, payload)
         elif action == "flush" and len(sys.argv) > 2:
             _detach_flush(root, payload, sys.argv[2])
-        _clear_unresolved()
     except BaseException as exc:  # A memory hook must always fail open.
         print(f"[memhub-codex-bridge] {type(exc).__name__}: {exc}", file=sys.stderr)
     return 0

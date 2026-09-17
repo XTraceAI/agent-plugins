@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-import importlib.util
 import json
 import os
 import shlex
@@ -231,60 +230,14 @@ def uninstall(home: Path) -> bool:
     return changed
 
 
-_HOOK_BLIND_TO = ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT")
-
-
-def _plugin_root(home: Path) -> Path | None:
-    """What the installed bridge will resolve AT HOOK TIME, or None.
-
-    Asks the bridge itself rather than reimplementing its search: a second copy
-    of that lookup would drift from the one that actually runs.
-
-    It must ask with the HOOK's environment, not ours. `resolve_plugin_root`
-    honours PLUGIN_ROOT / CLAUDE_PLUGIN_ROOT first, and this skill always runs
-    with one of them set (skills/setup/SKILL.md: "Codex sets `PLUGIN_ROOT`;
-    Claude Code sets `CLAUDE_PLUGIN_ROOT`") — while the user-level bridge is
-    invoked with neither. Answering under our own environment would report a
-    healthy plugin for an install where every real hook event finds nothing,
-    which is the exact failure this check exists to catch. `home` is honoured
-    for the same reason: `status --codex-home X` must judge X, not `~/.codex`.
-    """
-    saved = {name: os.environ.pop(name, None) for name in _HOOK_BLIND_TO}
-    saved["CODEX_HOME"] = os.environ.get("CODEX_HOME")
-    os.environ["CODEX_HOME"] = str(home)
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "_memhub_codex_bridge", RUNNER_SOURCE)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module.resolve_plugin_root()
-    except Exception:
-        return None
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-
-def status(home: Path) -> tuple[bool, int, int, Path | None]:
+def status(home: Path) -> tuple[bool, int, int]:
     current = _load_json(home / "hooks.json")
     bridge = _bridge_for_home(_load_json(BRIDGE_SOURCE), home)
     expected = _handler_count(bridge)
     actual = _handler_count(current)
     runner = home / _RUNNER_NAME
     runner_ok = runner.exists() and runner.read_bytes() == RUNNER_SOURCE.read_bytes()
-    # Wired-up handlers are only half of healthy. If the bridge cannot resolve
-    # a plugin root it exits 0 on every event, so capture is off while the
-    # handler count still looks perfect — the exact way this failed silently.
-    # Reported, not folded in: whether the hooks are wired and whether the
-    # bridge can find the plugin are two different facts, and a caller (or a
-    # test) needs to tell them apart. `main` requires both.
-    hooks_ok = runner_ok and _handler_actions(current) == _handler_actions(bridge)
-    return hooks_ok, actual, expected, _plugin_root(home)
+    return runner_ok and _handler_actions(current) == _handler_actions(bridge), actual, expected
 
 
 def main() -> int:
@@ -312,20 +265,8 @@ def main() -> int:
         if args.action == "remove":
             print("MemHub Codex hooks: " + ("removed" if uninstall(home) else "not installed"))
             return 0
-        hooks_ok, actual, expected, root = status(home)
-        healthy = hooks_ok and root is not None
-        # The headline describes the HOOKS; a missing plugin gets its own line
-        # below. Folding them here told the setup skill the bridge was not
-        # installed while printing "4/4 handlers" underneath, which invites it
-        # to reinstall and re-trust handlers that are already correct.
-        print(f"MemHub Codex hooks: {'OK' if hooks_ok else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
-        if root is None:
-            print("plugin: NOT FOUND — the bridge cannot locate the MemHub "
-                  "plugin's scripts, so capture and Rulebook telemetry are "
-                  "OFF even though the handlers above are wired.")
-            print("fix: reinstall the MemHub plugin, then re-run this check.")
-        else:
-            print(f"plugin: {root}")
+        healthy, actual, expected = status(home)
+        print(f"MemHub Codex hooks: {'OK' if healthy else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
         if healthy:
             print(f"trust: Codex-controlled; verify the {expected} MemHub handlers in /hooks")
         return 0 if healthy else 1

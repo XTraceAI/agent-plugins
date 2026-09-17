@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -123,72 +122,11 @@ def upgrade_context(payload: bytes) -> str | None:
     hook = {"cwd": data.get("cwd") or (roots[0] if roots else os.getcwd()),
             "session_id": data.get("conversation_id", ""), "tool_name": "Bash"}
     result = subprocess.run(
-        # `conversation_id` is passed through bare above, while cursor_flush
-        # uploads the session as `cursor-<uuid>` — the mismatch that leaves
-        # every Codex fire unlinked (ENG-1075) would be Cursor's too.
-        #
-        # Inert today, and deliberately so: the `upgrade` lane returns before
-        # rulebook_hook builds its ctx, so --host is not read here and Cursor
-        # has no rule-evaluation lane to log a fire from. It is passed because
-        # this is the one place Cursor names itself to the hook; the namespace
-        # itself is enforced in rulebook_hook.wire_session_id, which already
-        # handles `cursor`.
-        [sys.executable, str(Path(__file__).with_name("rulebook_hook.py")),
-         "upgrade", "--host", "cursor"],
+        [sys.executable, str(Path(__file__).with_name("rulebook_hook.py")), "upgrade"],
         input=json.dumps(hook).encode(), capture_output=True, timeout=2, check=False)
     if result.stdout:
         return json.loads(result.stdout).get("hookSpecificOutput", {}).get("additionalContext")
     return None
-
-
-def health_context(payload: bytes) -> str | None:
-    """Capture-health for the Cursor lane, at most once per session.
-
-    Cursor wires no session-start event, so there is nowhere to run the health
-    check the way Claude and Codex do — which is why a Cursor capture failure
-    previously reached the user through no channel at all. This rides the
-    message `beforeShellExecution` already injects rather than adding a hook
-    event (a manifest change costs every user a re-trust).
-
-    Once per session: the marker bounds it to one subprocess per session
-    instead of one per shell call, and capture_health's own staleness window
-    and retraction rules still decide whether there is anything to say.
-    """
-    data = json.loads(payload)
-    session = str(data.get("conversation_id") or "").strip()
-    if not session:
-        return None
-    state_dir = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session)[:80]
-    marker = state_dir / f"{safe}.health"
-    try:
-        if marker.exists():
-            return None
-        state_dir.mkdir(parents=True, exist_ok=True)
-        marker.write_text("", encoding="utf-8")
-    except OSError:
-        # Fail TOWARD running the check. An unwritable state dir is exactly when
-        # a breadcrumb is most likely to be sitting there unread; losing the
-        # once-per-session debounce is the acceptable cost, losing the warning
-        # because its debounce storage failed is not.
-        pass
-    roots = data.get("workspace_roots") or []
-    hook = {"cwd": data.get("cwd") or (roots[0] if roots else os.getcwd()),
-            "session_id": session}
-    # --plugin-root explicitly: capture_health resolves the backend from the
-    # installed plugin's own .mcp.json via MEMHUB_MCP_BASE_URL, --plugin-root or
-    # CLAUDE_PLUGIN_ROOT. Cursor sets CURSOR_PLUGIN_ROOT, which it does not read,
-    # so without this the checker exits silently and the whole lane is inert.
-    # This file's own parent is the authoritative root — no env var needed.
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("capture_health.py")),
-         "--host", "cursor",
-         "--plugin-root", str(Path(__file__).resolve().parents[1])],
-        input=json.dumps(hook).encode(), capture_output=True, timeout=3, check=False)
-    if not result.stdout:
-        return None
-    return json.loads(result.stdout).get(
-        "hookSpecificOutput", {}).get("additionalContext")
 
 
 def main() -> int:
@@ -200,16 +138,7 @@ def main() -> int:
         if payload is not None:
             spawn_cursor_flush(payload, event)
             if event == "beforeShellExecution":
-                parts = []
-                for lane in (upgrade_context, health_context):
-                    try:
-                        text = lane(payload)
-                    except Exception as exc:   # one lane must not cost the other
-                        _log(f"{lane.__name__} failed ({exc!r})")
-                        text = None
-                    if text:
-                        parts.append(text)
-                context = "\n\n".join(parts)
+                context = upgrade_context(payload)
                 if context:
                     output.update(agent_message=context, user_message=context)
     except Exception as exc:

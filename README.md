@@ -134,7 +134,7 @@ The detailed lifecycle below describes the Claude Code path. Codex and Cursor
 use equivalent host-specific readers and flushers under
 `plugins/memhub/scripts/`.
 
-Two Codex-specific rules fall out of that:
+One Codex-specific rule falls out of that:
 
 - **Codex's own threads are not captured.** Codex runs threads alongside
   yours — spawned subagents, guardian action-reviews, memory consolidation —
@@ -148,19 +148,6 @@ Two Codex-specific rules fall out of that:
   real sessions, and because the skip advances the capture cursor that loss
   would be unrecoverable. An unfamiliar value is captured and noted in the
   Codex capture log instead.
-- **An upgrade no longer breaks capture.** The bridge in `~/.codex` finds the
-  plugin at hook time, preferring the newest installed version. It used to
-  accept a version directory on the strength of a single file, so an upgrade
-  that left the new version half-populated was chosen over the complete older
-  one — and capture then died silently, because the flusher runs detached with
-  its output discarded. It now checks that a version actually holds every file
-  it needs and falls back to the newest complete one, so a partial upgrade
-  costs you nothing. It also finds the plugin whatever name you registered the
-  marketplace under, rather than only two hard-coded ones.
-- **A genuinely broken install says so.** When no complete install exists at
-  all, the bridge used to exit quietly. It now leaves a capture-health
-  breadcrumb and says once, at session start, that capture is off.
-  `memhub:setup` reports the same: wired handlers alone are no longer "OK".
 
 Capture runs on independent paths that all feed one server-side watermark
 (keyed on `conversation_id` = `session_id`), so re-sending never double-saves:
