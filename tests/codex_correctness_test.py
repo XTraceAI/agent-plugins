@@ -19,8 +19,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -350,6 +352,154 @@ def test_every_event_call_site_passes_a_host():
     assert not bad, (
         "log_event called with an inline ctx that omits 'host'; the event it "
         f"writes cannot be namespaced and folds into nothing: {bad}")
+
+
+def test_the_stop_lane_tells_the_hook_it_is_codex():
+    # The inline-ctx fix was not enough on its own: the bridge invoked
+    # `rulebook_hook.py flush final` with NO --host, so `_host_arg()` fell back
+    # to "claude" and the turn_end event was namespaced for the wrong host
+    # while the same session's fires were namespaced `codex`. Observed live on
+    # a real Codex Stop hook.
+    #
+    # The flush lane used to only SHIP rows that already carried their host, so
+    # it needed none — #240 made it also CREATE events, which is what turned a
+    # correct omission into a bug.
+    with patch.object(bridge, "_detach_flush"), patch.object(bridge, "_run") as run:
+        bridge._dispatch(Path("/plugin"), b"{}", "Stop")
+    args = run.call_args[0]
+    assert "rulebook_hook.py" in args, args
+    assert args[-2:] == ("--host", "codex"), args
+
+
+def test_every_bridge_lane_that_writes_a_row_names_its_host():
+    # Shape, not instance: any bridge call into rulebook_hook that can create a
+    # fire or an event must say which host it is, or the row it writes cannot
+    # be namespaced. `upgrade` and `book-path` return before ctx is built, so
+    # they are exempt.
+    import ast
+    src = (SCRIPTS / "codex_hook_bridge.py").read_text(encoding="utf-8")
+    exempt = {"upgrade", "book-path", "fetch"}
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call):
+            continue
+        consts = [a.value for a in node.args if isinstance(a, ast.Constant)
+                  and isinstance(a.value, str)]
+        if "rulebook_hook.py" not in consts:
+            continue
+        if exempt & set(consts):
+            continue
+        if "--host" not in consts:
+            bad.append((node.lineno, consts))
+    assert not bad, (
+        "a bridge lane invokes rulebook_hook.py without --host; any row it "
+        f"writes will be namespaced for the wrong host: {bad}")
+
+
+def test_a_plugin_root_that_cannot_be_found_is_not_silent():
+    # OBSERVED, not constructed: `codex plugin add` (Codex 0.154.0, local path
+    # marketplace) copies a plugin's regular files and SKIPS its symlinks. The
+    # staging build — scripts/ skills/ hooks/ references/ are relative symlinks
+    # into ../memhub/ — installed as exactly three files, with NO scripts/ at
+    # all, and the install printed success. A blind `codex exec` session against
+    # that install captured nothing, wrote no ledger row, and said nothing.
+    #
+    # The bridge must leave a breadcrumb capture_health can read, and say it
+    # once, on SessionStart.
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "codexflush"
+        with patch.object(bridge, "_STATE_DIR", state), \
+                patch.object(bridge, "_BRIDGE_STATE", state / "_bridge.json"), \
+                patch.object(bridge, "resolve_plugin_root", lambda: None), \
+                patch.object(sys, "argv", ["b", "dispatch", "SessionStart"]), \
+                patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert bridge.main() == 0
+        printed = out.getvalue()
+        assert "capture" in printed and "OFF" in printed, printed
+        doc = json.loads(printed)
+        assert doc["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+        # Both channels: additionalContext is the one the rest of this bridge
+        # uses on SessionStart, systemMessage is the one a person reads.
+        assert doc["hookSpecificOutput"]["additionalContext"], doc
+        assert doc["systemMessage"], doc
+        crumb = json.loads((state / "_bridge.json").read_text())
+        assert crumb["last_error"] == "plugin_root_unresolved", crumb
+        assert crumb["last_error_at"] > 0, crumb
+
+
+def test_only_session_start_says_it_but_every_event_records_it():
+    # One line per session, not one per tool call — a PostToolUse that shouted
+    # would be unusable. The breadcrumb is still written, so the next healthy
+    # session reports it through the ordinary health path.
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "codexflush"
+        with patch.object(bridge, "_STATE_DIR", state), \
+                patch.object(bridge, "_BRIDGE_STATE", state / "_bridge.json"), \
+                patch.object(bridge, "resolve_plugin_root", lambda: None), \
+                patch.object(sys, "argv", ["b", "dispatch", "PostToolUse"]), \
+                patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert bridge.main() == 0
+        assert out.getvalue() == "", out.getvalue()
+        assert (state / "_bridge.json").is_file()
+
+
+def test_the_breadcrumb_is_retracted_once_the_plugin_is_found_again():
+    # A stale last_error outliving the failure it recorded is its own bug, and
+    # it is retracted AFTER dispatch, because capture_health runs inside it.
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "codexflush"
+        state.mkdir(parents=True)
+        crumb = state / "_bridge.json"
+        crumb.write_text('{"last_error": "plugin_root_unresolved"}')
+        seen = []
+        with patch.object(bridge, "_STATE_DIR", state), \
+                patch.object(bridge, "_BRIDGE_STATE", crumb), \
+                patch.object(bridge, "resolve_plugin_root", lambda: Path("/p")), \
+                patch.object(bridge, "_dispatch",
+                             lambda *a: seen.append(crumb.is_file())), \
+                patch.object(sys, "argv", ["b", "dispatch", "SessionStart"]), \
+                patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}"))):
+            assert bridge.main() == 0
+        assert seen == [True], "cleared before capture_health could read it"
+        assert not crumb.exists()
+
+
+def test_the_unresolved_reason_has_its_own_remedy():
+    # Without an entry it renders "the capture hook failed … run /memhub:login
+    # --status", which points at a credential that is definitely fine.
+    health = _load("capture_health")
+    assert "plugin_root_unresolved" in health._REASONS
+    text = health._message("codex", None,
+                           ("plugin_root_unresolved", time.time()))
+    assert "login --status" not in text, text
+    assert "memhub:setup" in text, text
+
+
+def test_the_marketplace_scan_is_still_ordered_and_unpooled():
+    # The half of the reverted change that must NOT come back: ranking versions
+    # across marketplaces sent a prod user's captures to the staging backend,
+    # because _memhub_auth derives the backend from whichever root wins. The
+    # scan stays an ordered walk of _KNOWN_INSTALLS, prod tier first.
+    src = (SCRIPTS / "codex_hook_bridge.py").read_text(encoding="utf-8")
+    assert "_KNOWN_INSTALLS" in src
+    assert 'cache.glob("*/*/*")' not in src, "wide marketplace search is back"
+    assert bridge._KNOWN_INSTALLS[0] == ("xtrace-plugins", "memhub")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        for market, plugin, version in (("xtrace-plugins", "memhub", "0.1.0"),
+                                        ("memhub-internal", "memhub-staging", "9.9.9")):
+            d = home / "plugins" / "cache" / market / plugin / version / "scripts"
+            d.mkdir(parents=True)
+            (d / "codex_flush.py").write_text("")
+        with patch.dict(os.environ, {"CODEX_HOME": str(home)}, clear=False):
+            for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+                os.environ.pop(var, None)
+            root = bridge.resolve_plugin_root()
+    assert root is not None and "memhub-staging" not in str(root), root
 
 
 if __name__ == "__main__":

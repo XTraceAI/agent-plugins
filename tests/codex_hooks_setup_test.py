@@ -514,7 +514,8 @@ def test_stop_flushes_rule_fires_and_capture():
     with patch.object(bridge, "_detach_flush") as capture, patch.object(bridge, "_run") as fire_flush:
         bridge._dispatch(Path("/plugin"), b"{}", "Stop")
     capture.assert_called_once_with(Path("/plugin"), b"{}", "Stop")
-    fire_flush.assert_called_once_with(Path("/plugin"), "rulebook_hook.py", b"{}", "flush", "final", timeout=7)
+    fire_flush.assert_called_once_with(Path("/plugin"), "rulebook_hook.py", b"{}",
+                                       "flush", "final", "--host", "codex", timeout=7)
 
 
 if __name__ == "__main__":
