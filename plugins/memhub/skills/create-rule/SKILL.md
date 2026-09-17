@@ -47,21 +47,31 @@ lives here.
   nobody until a reviewer activates it, so every confirmation this skill asks
   for elsewhere is already held by whoever reviews the book. Concretely, on
   this path:
-  - **Step 0 (which rulebook)** does not ask. Take the one `bound` rulebook
-    whose scope admits the repo; with several, the `all_org` one; with several
-    of those or none at all, do not guess and do not create one — record a
-    verdict naming the ambiguity and stop.
+  - **Step 0 (which rulebook)** does not ask. `list_rulebooks` reports
+    membership scope (`all_org` / `explicit`) and `bound`; it does NOT report
+    which repositories a book admits, so "the book for this repo" is not a
+    question its response can answer. The rule is therefore arithmetic: exactly
+    one `bound` book → file there; exactly one `bound` book with
+    `scope: all_org` among several → file there; anything else, including none
+    at all → record an ambiguity verdict listing the candidates and stop. Never
+    guess, never create a book on this path.
   - **Step 4b.6** (no git checkout, no Agent tool) does not ask. Say the
     precondition was missing, file with the pattern proven only against the
     verifier's synthetic cases, and note that in the report.
   - **Step 5** does not ask. File, then tell the person one line naming the
     rule.
-  - **A `cross_book` conflict does not file and does not ask.** The mandatory
-    policy is that the person chooses, and this path may not interrupt them —
-    so record a verdict naming the other book and the rule id, and stop. The
-    moment is then judged-and-declined with a reason, not an unexplained
-    silence, and nothing is filed that would double-fire alongside a rule in a
-    book `supersedes_rule_id` cannot reach.
+  - **Every terminal path that does not file records a verdict.** This is the
+    general rule, and it exists because the alternative is the failure the
+    verdict lane was built to remove: a completed rejection and an ignored
+    handoff look identical from outside. So whenever the mandatory policy says
+    do not file — and this path may not ask the person instead — write a
+    `memhub-verdict` row naming the reason and stop. Known cases:
+    - `cross_book`: name the other book and rule id. Nothing is filed that
+      would double-fire beside a rule `supersedes_rule_id` cannot reach.
+    - `same_matcher` on an active rule that is not this one: name that rule id.
+    - the step-0 ambiguity above: list the candidate books.
+    - anything else that ends without a rule, including a conflict kind added
+      after this was written.
   - **Never pass `activate`.** Never put a person's name, home directory or
     e-mail in a rule.
 - **`scope_repos` is the harness line's, verbatim** — it is already narrowed by

@@ -561,7 +561,8 @@ def test_the_block_reason():
                  "Do NOT rebuild it from", 'source="session_draft"',
                  # each exception the harness path takes must be stated, or the
                  # agent hits a mandatory step it cannot satisfy (Codex, #244)
-                 "cross_book conflict does not file and does not ask",
+                 "Every terminal path that does not file records a verdict",
+                 "same_matcher", "ambiguity verdict",
                  "source_ref is passed EXACTLY as the harness line gives it"):
         assert owed in skill, owed
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
