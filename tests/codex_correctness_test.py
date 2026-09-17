@@ -157,6 +157,50 @@ def _fake_install(root: Path, *, complete: bool) -> Path:
     return root
 
 
+def test_required_covers_every_module_codex_flush_actually_imports():
+    # Maintained by hand, this list was wrong twice: first missing every
+    # transitive import, then missing `readers/__init__.py`'s siblings. A
+    # candidate that satisfies an incomplete list still dies at import, inside
+    # a detached child whose output is discarded — the exact silent death the
+    # check exists to stop. So derive the truth from the source and compare.
+    import ast
+
+    def local_deps(start: str) -> set[str]:
+        seen, queue = set(), [start]
+        while queue:
+            rel = queue.pop()
+            if rel in seen:
+                continue
+            path = SCRIPTS / rel
+            if not path.is_file():
+                continue
+            seen.add(rel)
+            pkg = rel.rpartition("/")[0]
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level:                      # from . import x / from .y import z
+                        base = f"{pkg}/" if pkg else ""
+                        names = ([f"{base}{node.module}"] if node.module else
+                                 [f"{base}{a.name}" for a in node.names])
+                    elif node.module:
+                        names = [node.module]
+                for name in names:
+                    candidate = name.replace(".", "/")
+                    for form in (f"{candidate}.py", f"{candidate}/__init__.py"):
+                        if (SCRIPTS / form).is_file():
+                            queue.append(form)
+        return seen
+
+    needed = local_deps("codex_flush.py")
+    missing = needed - set(bridge._REQUIRED)
+    assert not missing, (
+        "codex_hook_bridge._REQUIRED does not cover what codex_flush imports; "
+        f"a partial install holding only _REQUIRED would still die on: {sorted(missing)}")
+
+
 def test_a_half_installed_newer_version_never_beats_a_working_one():
     # THE upgrade bug. codex_flush.py imports ten siblings at module load, so a
     # directory holding only that one file passes a one-file check and then dies
@@ -188,6 +232,44 @@ def test_a_complete_newer_version_is_still_preferred():
             for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
                 os.environ.pop(var, None)
             assert bridge.resolve_plugin_root().name == "0.58.4"
+
+
+def test_production_is_never_displaced_by_a_newer_staging_install():
+    # prod `memhub` and `memhub-staging` are separate installs against separate
+    # Auth0 tenants with separate token caches, and _memhub_auth derives the
+    # backend from whichever root wins. Ranking them in one tier by version
+    # meant a prod user with a newer staging build would have had captures and
+    # Rulebook traffic sent to the WRONG ENVIRONMENT.
+    import os
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "plugins" / "cache"
+        _fake_install(cache / "xtrace-plugins" / "memhub" / "0.58.3", complete=True)
+        _fake_install(cache / "memhub-internal" / "memhub-staging" / "9.99.9", complete=True)
+        with patch.dict(os.environ, {"CODEX_HOME": td}, clear=False):
+            for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+                os.environ.pop(var, None)
+            picked = bridge.resolve_plugin_root()
+        assert picked.parent.name == "memhub", f"staging displaced production: {picked}"
+        assert picked.name == "0.58.3"
+
+
+def test_staging_is_used_when_production_is_absent_or_broken():
+    # The tiering must not become "prod or nothing" — a staging-only machine,
+    # and a machine whose prod install is half-extracted, both still capture.
+    import os
+    for prod_complete in (False, None):
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "plugins" / "cache"
+            if prod_complete is not None:
+                _fake_install(cache / "xtrace-plugins" / "memhub" / "0.58.3",
+                              complete=prod_complete)
+            _fake_install(cache / "memhub-internal" / "memhub-staging" / "0.57.0",
+                          complete=True)
+            with patch.dict(os.environ, {"CODEX_HOME": td}, clear=False):
+                for var in ("MEMHUB_PLUGIN_ROOT", "PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+                    os.environ.pop(var, None)
+                picked = bridge.resolve_plugin_root()
+            assert picked is not None and picked.parent.name == "memhub-staging", picked
 
 
 def test_a_marketplace_we_did_not_hardcode_is_still_found():

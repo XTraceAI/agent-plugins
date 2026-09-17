@@ -167,13 +167,23 @@ def health_context(payload: bytes) -> str | None:
         state_dir.mkdir(parents=True, exist_ok=True)
         marker.write_text("", encoding="utf-8")
     except OSError:
-        return None          # never let a marker failure cost the health line
+        # Fail TOWARD running the check. An unwritable state dir is exactly when
+        # a breadcrumb is most likely to be sitting there unread; losing the
+        # once-per-session debounce is the acceptable cost, losing the warning
+        # because its debounce storage failed is not.
+        pass
     roots = data.get("workspace_roots") or []
     hook = {"cwd": data.get("cwd") or (roots[0] if roots else os.getcwd()),
             "session_id": session}
+    # --plugin-root explicitly: capture_health resolves the backend from the
+    # installed plugin's own .mcp.json via MEMHUB_MCP_BASE_URL, --plugin-root or
+    # CLAUDE_PLUGIN_ROOT. Cursor sets CURSOR_PLUGIN_ROOT, which it does not read,
+    # so without this the checker exits silently and the whole lane is inert.
+    # This file's own parent is the authoritative root — no env var needed.
     result = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("capture_health.py")),
-         "--host", "cursor"],
+         "--host", "cursor",
+         "--plugin-root", str(Path(__file__).resolve().parents[1])],
         input=json.dumps(hook).encode(), capture_output=True, timeout=3, check=False)
     if not result.stdout:
         return None

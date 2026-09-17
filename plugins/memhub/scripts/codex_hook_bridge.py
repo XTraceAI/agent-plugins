@@ -132,11 +132,20 @@ def _version_key(path: Path) -> tuple:
 # stderr to DEVNULL, that death is completely invisible. Reproduced: a full
 # 0.58.3 next to a 0.58.4 holding only codex_flush.py resolves to 0.58.4, every
 # hook event exits 0 with empty output, and nothing is ever captured.
+# TRANSITIVE, not just codex_flush's direct imports: `readers/__init__.py` does
+# `from . import claude, codex, cursor`, and `readers/codex.py` pulls in
+# `.strict_json`, `.jsonl` and `session_title`. A candidate holding only the
+# direct set still dies at import — the same silent death, one layer down.
+# `tests/codex_correctness_test.py` derives this set from the real import graph
+# and fails if it drifts, because maintaining it by hand got it wrong twice.
 _REQUIRED = (
     "codex_flush.py", "atomic_write.py", "portable_lock.py", "mcp_http.py",
     "pr_provenance.py", "_memhub_auth.py", "brain_resolve.py", "redact.py",
     "transcript_filter.py", "room_map.py", "rulebook_hook.py",
-    "readers/__init__.py", "readers/codex.py",
+    "session_title.py", "pak.py",
+    "readers/__init__.py", "readers/codex.py", "readers/claude.py",
+    "readers/cursor.py", "readers/strict_json.py", "readers/jsonl.py",
+    "readers/discovery.py",
 )
 
 
@@ -171,18 +180,22 @@ def resolve_plugin_root() -> Path | None:
         candidates = []
     if not candidates:
         return None
-    # Prefer a known marketplace, then the newest version. Falling back through
-    # the sorted list rather than returning the first hit means one broken
-    # version cannot mask a working one.
-    known = [(m, p) for m, p in _KNOWN_INSTALLS]
-
-    def rank(path: Path) -> tuple:
+    # Tier by POSITION in _KNOWN_INSTALLS, never pooled: prod `memhub` and
+    # `memhub-staging` are separate installs against separate Auth0 tenants with
+    # separate token caches, and `_memhub_auth` derives the backend from
+    # whichever root wins. Ranking them together meant a prod user with a newer
+    # staging install would have had captures and Rulebook traffic sent to the
+    # WRONG ENVIRONMENT. The old ordered loop had this right; only the
+    # fall-back-past-a-broken-version behaviour needed changing.
+    def tier(path: Path) -> int:
         pair = (path.parent.parent.name, path.parent.name)
-        return (0 if pair in known else 1, _version_key(path))
+        return _KNOWN_INSTALLS.index(pair) if pair in _KNOWN_INSTALLS \
+            else len(_KNOWN_INSTALLS)
 
-    preferred = min(candidates, key=lambda p: rank(p)[0])
-    tier = rank(preferred)[0]
-    return max((p for p in candidates if rank(p)[0] == tier), key=_version_key)
+    # Newest COMPLETE version within the most-preferred tier that has one, so a
+    # broken install can never mask a working one — and never across tiers.
+    best = min(tier(path) for path in candidates)
+    return max((p for p in candidates if tier(p) == best), key=_version_key)
 
 
 def _run(
