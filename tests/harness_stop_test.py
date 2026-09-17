@@ -534,23 +534,21 @@ def test_the_block_reason():
     # the person as "Stop hook feedback:" and there is no Stop channel that
     # reaches only the model (Codex, #244), so every instruction that does not
     # have to be here lives in skills/create-rule/SKILL.md instead. What stays
-    # is what only this line knows: which turn, and where to record a decline.
+    # is what only this line knows: which turn, and where the skill is.
     assert "create-rule skill" in line
     assert 'source_ref="sess#2"' in line and "scope_repos=" in line
-    assert "memhub-verdict --session sess --ref sess#2" in line
-    # the reason is free prose; `--why '<why>'` dies on an apostrophe, and the
-    # silence instruction would then hide the failure (Codex, #244)
-    # no heredoc: a reason containing a line equal to the delimiter truncates
-    # the record and feeds the rest to the shell (Codex, #244). A path never
-    # touches shell syntax.
-    assert "<<" not in line and "--why-file" in line and "--outcome" in line
+    # The verdict lane is gone. Filed-per-block is already `handed` rows here
+    # against `session_draft` rules on the server, and whether a rule HELPS is
+    # the fire-event fold's question. Recording non-events cost seven of the
+    # fifteen findings on #244 and bought a ratio that was already free.
+    assert "verdict" not in line and "--why" not in line and "<<" not in line
     assert "say nothing to the person about this turn" in line
     # the manual moved out and must NOT be restated here
     for moved in ("not already a RULE", "restating the docs", "without asking",
                   "activate", "state=", '"hook_version"'):
         assert moved not in line, moved
-    # 1130 -> 411. A pointer, not a manual.
-    assert len(line) < 600, len(line)
+    # 1130 -> 347. A pointer, not a manual.
+    assert len(line) < 400, len(line)
     # ...and the skill must actually carry what the line dropped, or the two
     # halves diverge silently and the agent gets neither.
     skill = (pathlib.Path(__file__).resolve().parent.parent / "plugins" / "memhub"
@@ -559,19 +557,19 @@ def test_the_block_reason():
     # and reflowing prose to satisfy a substring test is the wrong direction
     skill = " ".join(skill.replace("*", "").replace("`", "").split())
     assert "conflict is still reported to the person" not in skill
+    assert "memhub-verdict" not in skill and "--why-file" not in skill
     for owed in ("not already a RULE", "does NOT disqualify it",
                  "restating the docs", "ask the person nothing at all",
                  "Never pass activate", "Step 4b.6", "Step 0 (which rulebook)",
                  "Do NOT rebuild it from", 'source="session_draft"',
                  # each exception the harness path takes must be stated, or the
                  # agent hits a mandatory step it cannot satisfy (Codex, #244)
-                 "Every terminal path that does not file records a verdict",
-                 "not_filed", "no_lesson",
+
                  # nothing on a non-filing path reaches the person (Codex, #244)
                  "hears about the turn only when a rule was filed",
+                 "File nothing, say nothing, stop", "same_matcher",
                  # an idempotent re-import ended WITH a rule (Codex, #244)
-                 "unchanged: true is not one of them",
-                 "same_matcher", "ambiguity verdict",
+                 "unchanged: true is a filing, not a blocker",
                  "source_ref is passed EXACTLY as the harness line gives it"):
         assert owed in skill, owed
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
@@ -579,57 +577,7 @@ def test_the_block_reason():
     print("PASS test_the_block_reason")
 
 
-def test_a_reason_with_an_apostrophe_survives(monkeypatch=None):
-    """`--why '<why>'` breaks on prose like "it's already covered": the command
-    dies, no row lands, and the block reason says to stay silent regardless —
-    the invisible skip this lane exists to remove (Codex, #244)."""
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        awkward = "it's already covered by the repo's own docs — \"see CONTRIBUTING\""
-        real_stdin = sys.stdin
-        sys.stdin = io.StringIO(awkward)
-        try:
-            assert hs.cmd_verdict("sess", "sess#2", "") == 0
-        finally:
-            sys.stdin = real_stdin
-        rows = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]
-        assert len(rows) == 1 and rows[0]["why"] == awkward, rows
-    print("PASS test_a_reason_with_an_apostrophe_survives")
 
-
-def test_a_filing_blocker_is_not_recorded_as_a_rejection():
-    """`no_lesson` is a judgement; `not_filed` is a blocker. Collapsing them
-    inflates the rejection rate with conflicts (Codex, #244)."""
-    with _Env() as env:
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        f = pathlib.Path(env.base)/"why.txt"
-        # prose that breaks BOTH a quoted arg and a heredoc
-        awkward = "it's blocked\nWHY\nrm -rf /\n\"quoted\""
-        f.write_text(awkward, encoding="utf-8")
-        assert hs.cmd_verdict("sess", "sess#2", "", "not_filed", str(f)) == 0
-        row = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")][0]
-        assert row["verdict"] == "not_filed", row
-        assert row["why"] == awkward, row
-        # an unknown outcome degrades to the safe default, never a crash
-        hx.append_jsonl(hs.moments_path("sess"), _moment(3))
-        assert hs.cmd_verdict("sess", "sess#3", "x", "nonsense") == 0
-        rows = [r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]
-        assert rows[-1]["verdict"] == "no_lesson", rows[-1]
-    print("PASS test_a_filing_blocker_is_not_recorded_as_a_rejection")
-
-
-def test_the_verdict_command_the_reason_names_is_on_the_agents_path():
-    """The reason names `memhub-verdict`; the wrapper must exist, be executable,
-    and sit in the `bin/` directory Claude Code puts on the agent's PATH."""
-    root = Path(__file__).resolve().parent.parent / "plugins" / "memhub"
-    wrapper = root / "bin" / "memhub-verdict"
-    assert wrapper.is_file(), wrapper
-    assert os.access(wrapper, os.X_OK), "wrapper must be executable"
-    assert "harness_stop.py" in wrapper.read_text(encoding="utf-8")
-    assert "/Users/" not in wrapper.read_text(encoding="utf-8")
-    print("PASS test_the_verdict_command_the_reason_names_is_on_the_agents_path")
 
 
 def test_the_block_shows_the_person_a_status_line_not_the_instructions():
@@ -647,24 +595,6 @@ def test_the_block_shows_the_person_a_status_line_not_the_instructions():
         assert "create-rule skill" not in payload["systemMessage"]
     print("PASS test_the_block_shows_the_person_a_status_line_not_the_instructions")
 
-
-def test_a_declined_moment_records_why_instead_of_printing_it():
-    """The half the hook cannot see. Without this row an ignored moment and a
-    judged-and-declined one are the same absence."""
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        assert hs.cmd_verdict("sess", "sess#2", "twin of an active rule") == 0
-        rows = hx.read_jsonl(hs.moments_path("sess"))
-        v = [r for r in rows if r.get("verdict_for")]
-        assert len(v) == 1 and v[0]["verdict"] == "no_lesson"
-        assert v[0]["why"] == "twin of an active rule"
-        # idempotent: a retry never double-writes
-        hs.cmd_verdict("sess", "sess#2", "again")
-        assert len([r for r in hx.read_jsonl(hs.moments_path("sess")) if r.get("verdict_for")]) == 1
-        # an unknown session or ref is a no-op, never a crash
-        assert hs.cmd_verdict("", "sess#2", "x") == 0 and hs.cmd_verdict("nope", "r", "x") == 0
-    print("PASS test_a_declined_moment_records_why_instead_of_printing_it")
 
 
 def test_a_recorded_block_is_not_a_turn():

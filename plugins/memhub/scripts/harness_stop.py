@@ -21,8 +21,10 @@ Why a blocking Stop and not a line injected with the next prompt: that lane
 reached the agent 19 times in five real sessions and produced 0 `create_rule`
 calls. A line stapled to the person's live request lost to the request every
 time, and "say nothing if there is no lesson" made ignoring it look exactly like
-judging it. At Stop the agent is idle, and the one-line verdict makes the
-outcome visible either way.
+judging it. At Stop the agent is idle and must answer before it can stop.
+How often that produces a rule is `handed` rows here against `session_draft`
+rules on the server — no extra bookkeeping needed for the ratio, and whether a
+rule HELPS is the fire-event fold's question, not this lane's.
 
 The block hands an EARLIER turn's moment: this turn's classifier is still
 running in the child. A moment from a session's last turn is never handed.
@@ -51,7 +53,6 @@ import json
 import os
 import sys
 import time
-import pathlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -358,8 +359,8 @@ BLOCK_PREFIX = "MemHub harness: before you stop"
 
 
 def block_reason(session: str, moment: dict, repo: str = "") -> str:
-    """What the blocked agent reads. Two jobs only: the verdict it owes, and
-    the harness's own provenance. `repo` is the session's, used only when the
+    """What the blocked agent reads. One job: point at the skill, with the
+    provenance only this line has. `repo` is the session's, used only when the
     moment's own stamp names none.
 
     The TEST it states is "not already a RULE", not "not already written
@@ -399,10 +400,8 @@ def block_reason(session: str, moment: dict, repo: str = "") -> str:
         f"memhub create-rule skill on source_ref=\"{ref}\", scope_repos="
         f"{json.dumps(scope)} — its Harness-draft section holds the test for whether "
         f"this is a lesson, where the stamp comes from, and how to file it.{narrow} "
-        f"If it does NOT end in a filed rule, say nothing to the person about this "
-        f"turn and record why: write the reason to a file with your file tool — never "
-        f"shell-quote it — then `memhub-verdict --session {session} --ref {ref} "
-        f"--outcome <no_lesson|not_filed> --why-file <that file>`."
+        f"If it is not a lesson, or you cannot file it, say nothing to the person "
+        f"about this turn."
     )
 
 
@@ -447,78 +446,16 @@ def hand_off(session: str) -> int:
     return 0
 
 
-# ------------------------------------------------------------- verdict lane
-VERDICT_OUTCOMES = ("no_lesson", "not_filed")
-
-
-def cmd_verdict(session: str, ref: str, why: str,
-                outcome: str = "no_lesson", why_file: str = "") -> int:
-    """The agent judged a handed moment and filed nothing. Record why.
-
-    This is the half of the outcome the hook cannot see: `hand_off` knows a
-    moment was handed, never what came of it. Without this row an ignored
-    moment and a judged-and-declined one are the same absence — the failure
-    that cost the prompt lane 19 handoffs and 0 rules.
-
-    Append-only, like every other write to this file: a detached extract child
-    may append a moment at any time.
-    """
-    if not session or not ref:
-        return 0
-    if outcome not in VERDICT_OUTCOMES:
-        outcome = "no_lesson"
-    if why_file:
-        # The prose never touches shell syntax. A heredoc reserves a content
-        # line — a reason containing a line equal to the delimiter truncates
-        # the record and feeds the remainder to the shell (Codex, #244) — and
-        # a quoted argument dies on an apostrophe. A path is neither.
-        try:
-            why = pathlib.Path(why_file).read_text(encoding="utf-8")
-        except Exception:
-            why = why or ""
-    if not why and not sys.stdin.isatty():
-        # The reason is free prose the agent writes, and an apostrophe in it
-        # ("it's already covered") closes the quoting of a `--why '<why>'`
-        # argument early: the command dies, no row is written, and the block
-        # reason tells the agent to stay silent anyway — precisely the
-        # indistinguishable ignored-handoff this lane exists to remove
-        # (Codex, #244). Heredoc-fed stdin cannot be broken by the prose.
-        try:
-            why = sys.stdin.read()
-        except Exception:
-            why = ""
-    path = moments_path(session)
-    if not path.is_file():
-        return 0
-    try:
-        rows = hx.read_jsonl(path)
-    except Exception:
-        return 0
-    if any(str(r.get("verdict_for") or "") == ref for r in rows):
-        return 0                          # already recorded; never double-write
-    # `no_lesson` is a judgement about the moment; `not_filed` is a filing
-    # blocker (ambiguous rulebook, cross-book or same-matcher conflict). Both
-    # end without a rule, but recording a blocker as a rejection would inflate
-    # exactly the number this lane exists to measure (Codex, #244).
-    hx.append_jsonl(path, {"verdict_for": ref, "verdict": outcome,
-                           "why": (why or "")[:400], "at": time.time()})
-    _log(f"verdict {session[:8]}: {outcome} on {ref}")
-    return 0
-
-
 # ------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("mode", choices=("stop", "extract", "verdict"))
+    p.add_argument("mode", choices=("stop", "extract"))
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
     p.add_argument("--cwd", default="")
     p.add_argument("--arcs", default="")
     p.add_argument("--upto", type=int, default=-1)
     p.add_argument("--ref", default="")
-    p.add_argument("--why", default="")
-    p.add_argument("--why-file", default="", dest="why_file")
-    p.add_argument("--outcome", default="no_lesson")
     return p
 
 
@@ -533,9 +470,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.mode == "stop":
         return cmd_stop(_read_payload())
-    if args.mode == "verdict":
-        return cmd_verdict(args.session, args.ref, args.why,
-                           args.outcome, args.why_file)
     if args.mode == "extract" and args.session:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     return 0

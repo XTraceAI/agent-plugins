@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
 argument-hint: [--rulebook "<name or id>"] [the rule, in your own words]
-allowed-tools: Bash, Bash(memhub-verdict:*), Read, Write, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
+allowed-tools: Bash, Read, Write, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
 ---
 
 You are creating a **Rulebook rule**: a human-authored, team-owned rule stored
@@ -39,9 +39,10 @@ lives here.
   this turn tripped over it anyway, the prose was not enough — file it and cite
   where it is written. Skip only when nothing went wrong and you would merely
   be restating the docs.
-- **No lesson** → record why with the `memhub-verdict` command the harness line
-  names, and say nothing to the person. That row is how a judged-and-declined
-  moment stays distinguishable from an ignored one.
+- **No lesson** → say nothing to the person about the turn, and stop. Nothing
+  is recorded: how often a block produces a rule is already the `handed` rows
+  in the moments file against `session_draft` rules on the server, and whether
+  a rule HELPS is the fire-event fold's question, not this one's.
 - **A lesson** → run this flow with it as the user's words, and **ask the
   person nothing at all**. A `session_draft` lands `proposed` and fires for
   nobody until a reviewer activates it, so every confirmation this skill asks
@@ -53,38 +54,24 @@ lives here.
     question its response can answer. The rule is therefore arithmetic: exactly
     one `bound` book → file there; exactly one `bound` book with
     `scope: all_org` among several → file there; anything else, including none
-    at all → record an ambiguity verdict listing the candidates and stop. Never
-    guess, never create a book on this path.
+    at all → file nothing, say nothing, and stop. Never guess, never create a
+    book on this path.
   - **Step 4b.6** (no git checkout, no Agent tool) does not ask. Say the
     precondition was missing, file with the pattern proven only against the
     verifier's synthetic cases, and note that in the report.
   - **Step 5** does not ask. File, then tell the person one line naming the
     rule.
-  - **Every terminal path that does not file records a verdict**, with the
-    `--outcome` that says which kind it was: `no_lesson` when you judged the
-    moment and there is no rule in it, `not_filed` when there IS a lesson but
-    something blocked the filing. Collapsing the two would inflate the
-    rejection rate with filing blockers, which is the one number this lane
-    exists to produce. This is the
-    general rule, and it exists because the alternative is the failure the
-    verdict lane was built to remove: a completed rejection and an ignored
-    handoff look identical from outside. So whenever the mandatory policy says
-    do not file — and this path may not ask the person instead — write a
-    `memhub-verdict` row naming the reason and stop. Known cases:
-    All four below are `not_filed`; only your own judgement is `no_lesson`.
-    **`unchanged: true` is not one of them.** That reply means the rule is
-    already in the book — a retry after a lost response, or a re-file of
-    identical content. The moment ended WITH a rule, so record no verdict and
-    tell the person as you would for any filing; a `not_filed` row there would
-    mark the same moment both imported and not filed.
-    - `cross_book`: name the other book and rule id. Nothing is filed that
-      would double-fire beside a rule `supersedes_rule_id` cannot reach.
-    - `same_matcher` on an active rule that is not this one: name that rule id.
-    - the step-0 ambiguity above: list the candidate books.
-    - anything else that ends without a rule, including a conflict kind added
-      after this was written.
+  - **A conflict that the mandatory policy says not to file, is not filed** —
+    and on this path it is not reported either: `cross_book` (a rule in a book
+    `supersedes_rule_id` cannot reach), or `same_matcher` on an active rule
+    that is not this one. File nothing, say nothing, stop.
   - **Never pass `activate`.** Never put a person's name, home directory or
     e-mail in a rule.
+  - **`unchanged: true` is a filing, not a blocker.** That reply means the rule
+    is already in the book — a retry after a lost response, or identical
+    content re-filed. The moment ended WITH a rule, so tell the person as you
+    would for any filing.
+
 - **`scope_repos` is the harness line's, verbatim** — it is already narrowed by
   `proposal_scope`. When the line says the turn worked in several repositories,
   cut it further to the ones the lesson is about. Do NOT rebuild it from
@@ -679,9 +666,8 @@ straight away and tells the person afterwards in one line. The draft lands
 `proposed` and fires for nobody until a reviewer activates it, so the approval
 asked for here is already held by whoever reviews the book; asking again
 mid-turn is the interruption the Stop block exists to avoid. A `cross_book`
-conflict does NOT reach the person on this path either: it files nothing,
-records a `not_filed` verdict naming the other book and rule id, and stops.
-The person hears about the turn only when a rule was filed.
+conflict does NOT reach the person on this path either: it files nothing and
+says nothing. The person hears about the turn only when a rule was filed.
 
 On approval — or immediately, for a harness draft — call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
