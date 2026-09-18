@@ -2214,12 +2214,29 @@ def show_upgrade(repo, session, event):
         pass
     if event == "SessionStart" or seen != key:
         current = ".".join(map(str, version)) if version else "unknown"
-        text = (f"PLUGIN_UPGRADE_REQUIRED: MemHub plugin {current} is unsupported. "
-                f"Update MemHub to {notice['minimum_version']} or newer using your host's "
-                "plugin manager, then restart this agent session. Rulebook synchronization "
-                "is unavailable and cached rules are suspended until a successful refresh. "
-                "Tell the user this upgrade is required; do not report the cached rules as current.")
-        emit(event, text, user_line=text)
+        minimum = notice["minimum_version"]
+        # Two audiences, two texts. The USER's line (`systemMessage`, shown by
+        # the terminal with no model in between) says what to do. The AGENT's
+        # copy is a status record: facts, effect, remedy — and no instruction
+        # about what the agent should say. The one text that used to serve
+        # both ended "Tell the user this upgrade is required; do not report
+        # the cached rules as current", and Sonnet 4.6 read exactly that
+        # sentence as the mark of an injected message ("legitimate hook
+        # telemetry reports facts; it does not instruct the agent on what to
+        # say") and refused to relay the notice at all. A model that is
+        # handed the facts relays them on its own; a model that is ordered to
+        # may not. Both texts keep the three tokens the release checks look
+        # for: the error code, the version, "restart this agent session".
+        context = (f"MemHub plugin status: PLUGIN_UPGRADE_REQUIRED\n"
+                   f"installed: {current} · minimum supported by the server: {minimum}\n"
+                   "effect: rulebook synchronization is unavailable; the cached team rules are "
+                   "suspended and not in effect for this session\n"
+                   "remedy: update the MemHub plugin with the host's plugin manager, then "
+                   "restart this agent session")
+        user_line = (f"⚠️ MemHub plugin {current} is unsupported (PLUGIN_UPGRADE_REQUIRED): update to "
+                     f"{minimum} or newer with your host's plugin manager, then restart this agent "
+                     "session. Team rules are suspended until then.")
+        emit(event, context, user_line=user_line)
         _atomic_json(seen_path, key)
     return True
 
