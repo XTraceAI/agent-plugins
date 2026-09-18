@@ -36,7 +36,18 @@ with fixed keys, the hosts are given that schema (`claude --json-schema`,
 the final text, and the minimum version is a per-run nonce so the answer can
 only contain it by reading the notice. The live prompt writes the allowed
 file before the command a hook denies and names the denial as expected, so a
-model that stops at a denial does not read as a plugin failure. Their aggregate check, `Real agent
+model that stops at a denial does not read as a plugin failure. Each prompt
+also explains the mechanism — where the hook's message will arrive and why it
+may carry an instruction — and asks a question the model may answer "none"
+to, and the nonce has the shape of a real release: a hook message that names
+exactly the fields the model is then asked for is the shape of a prompt
+injection, and a model not told to expect it can refuse to report it — Sonnet
+4.6 did, on about one Claude leg in five, calling a `999.NNNNNN.NNNNNN`
+minimum version "clearly fabricated" and the notice's own "tell the user…"
+sentence an injected instruction (runs 35172322137, 35172808877,
+35136738501, 35073585094; insisting harder in the prompt was itself read as
+a tell). Neither the error code nor the nonce nor the advice marker is in any
+prompt; a refusal is still a red leg, it is just no longer invited. Their aggregate check, `Real agent
 evidence`, is required on `main`: absent until the workflow has run on the
 PR's head commit, so the merge waits for it without a fake failure. See
 [.github/rulesets/README.md](../.github/rulesets/README.md) for the flow.

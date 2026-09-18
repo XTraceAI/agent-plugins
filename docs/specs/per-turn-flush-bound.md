@@ -5,7 +5,7 @@
 in the *urgent plugin fix (claude code)* brain, which holds the live evidence this was
 diagnosed from. This file is the standing description of the mechanism.
 
-**Status:** implemented in v0.59.2. Covered by `tests/turn_flush_bound_test.py`.
+**Status:** implemented in v0.59.3. Covered by `tests/turn_flush_bound_test.py`.
 
 ---
 
