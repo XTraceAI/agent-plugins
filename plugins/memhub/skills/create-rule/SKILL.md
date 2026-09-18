@@ -42,6 +42,14 @@ was written. Where a step says to stop and ask, stop silently instead. The
 enumerations below say what to DO at each such point; this says what the
 person sees, which is nothing until there is a rule.
 
+**One exception, and it is not about the rule.** If §4b.5 cannot restore the
+doctored rulebook cache byte-for-byte, say so, name the file, and abort — even
+though nothing was filed. The invariant covers disclosures about the CANDIDATE;
+it does not cover machine state this skill changed and could not put back. A
+failed restore can leave an unreviewed candidate armed in the local cache
+indefinitely, and a person who is not told cannot fix what they cannot see.
+Silence there is a safety bug wearing the costume of quiet.
+
 - **The test.** A lesson is one that would change what an agent DOES next time,
   is not already a RULE, is not project state, and will still be true next
   month. Already written in CLAUDE.md or the docs does NOT disqualify it: if

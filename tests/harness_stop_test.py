@@ -573,6 +573,11 @@ def test_the_block_reason():
                  "nothing on this path reaches the person",
                  "including ones added after this was written",
                  "A live verification that runs and fails is terminal",
+                 # the silence invariant must NOT swallow a failed restore: an
+                 # unreviewed candidate left armed in the local cache is state
+                 # the person cannot fix unseen (Codex, #244, the only P1)
+                 "cannot restore the doctored rulebook cache",
+                 "safety bug wearing the costume of quiet",
                  # an idempotent re-import ended WITH a rule (Codex, #244)
                  "unchanged: true is a filing, not a blocker",
                  "source_ref is passed EXACTLY as the harness line gives it"):
