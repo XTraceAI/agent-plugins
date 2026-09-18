@@ -16,10 +16,23 @@ one job is to **cross the empty-brain cold start**: seed the brain from real wor
 then prove it's immediately useful. Optimize for **time-to-first-useful-recall**,
 not steps completed. Report an activation funnel at the end.
 
-Arguments: `$ARGUMENTS` — an optional session id / `.jsonl` path to seed from.
-Omit → use the most recently modified `.jsonl` DIRECTLY inside the
-`~/.claude/projects/` directory matching the current working directory (top level
-only; subdirectory `.jsonl` are subagent/workflow transcripts, not sessions).
+Arguments: `$ARGUMENTS` — an optional session id / transcript path to seed from.
+Omit → pick the default across every installed host, the same readers step 5
+imports through:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" list --host all --limit 20
+```
+
+Take the newest row whose last column (the session's working directory) is this
+repo, and carry BOTH its id and its host — the first column — into step 5. Do not
+reach into `~/.claude/projects/` directly: on Codex or Cursor that directory holds
+nothing, so a Claude-only default seeds an unrelated session or fails outright on
+the hosts this skill now claims to support. `--session latest` is not the shortcut
+either — it is ambiguous across hosts and refused unless you also name one.
+(On Claude the reader lists only `.jsonl` DIRECTLY inside a project directory;
+subdirectory transcripts are subagent/workflow runs, not sessions, and never
+appear here.)
 
 Do exactly this:
 
@@ -96,7 +109,7 @@ handles any size):
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" import \
-  --session "<session-id-or-path>" --host auto \
+  --session "<session-id-or-path>" --host "<the host the listing named, else auto>" \
   --title "Onboarding seed — <org>/<repo>" \
   --agent-brain-id "<ROOM>"
 ```

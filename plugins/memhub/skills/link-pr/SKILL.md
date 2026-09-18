@@ -73,27 +73,30 @@ and fails silently as "session not found".
 ## 3. Link
 
 ```
-link_pr(pr_url="…", session_ids=["…"], link_source="manual")
+link_pr(pr_url="…", session_ids=["…"], link_source="…")
 ```
 
 `--unlink` calls `unlink_pr` with the same `pr_url` and `session_ids` instead.
-Use `link_source="manual"` here — this skill is a person saying so, which is
-what that value means. (`session_self` is the hook's, `session_found` is
-`/memhub:find-contributing-sessions`'s.)
 
-**Classifying the pull request is a separate, narrower claim.** `link_pr` also
-takes `pr_type` (`feat`, `fix`, `chore`, `docs`, `perf`, `refactor`, `other`)
-with `classification_session_id`, and the server accepts it only alongside
-`link_source="session_self"` — the classification has to come from a session
-that did the work, not from a person pointing at one. So:
+**`link_source` and `pr_type` are one decision, not two — make it here, once.**
+The server accepts `pr_type` (`feat`, `fix`, `chore`, `docs`, `perf`,
+`refactor`, `other`) with `classification_session_id` only alongside
+`link_source="session_self"`: a classification has to come from a session that
+did the work, not from a person pointing at one. So there are exactly two
+shapes this skill sends:
 
-- **This session opened or wrote the PR** (you are linking it to itself):
-  send `link_source="session_self"`, `classification_session_id=<that same
-  session id>` and the `pr_type` you judge from the actual change.
-- **Anything else** — a session the user named, a `--session` id, an unlink:
-  send no `pr_type`. Do not guess a type for work you did not see; the first
-  classification wins and an identical retry preserves it, while a different
-  one conflicts.
+- **You are linking THIS session, because it opened or wrote the PR.** Send
+  `link_source="session_self"`, `classification_session_id=<this session's
+  id>`, and the `pr_type` you judge from the actual change. It is the same
+  claim the hook makes; making it by hand does not weaken it.
+- **Anything else** — a session the user named, a `--session` id, an unlink.
+  Send `link_source="manual"` and no `pr_type`. `manual` is what this skill
+  usually is: a person saying so. Do not guess a type for work you did not
+  see; the first classification wins and an identical retry preserves it,
+  while a different one conflicts.
+
+(`session_found` is `/memhub:find-contributing-sessions`'s alone, never this
+skill's.)
 
 ## 4. Report the reply honestly
 
