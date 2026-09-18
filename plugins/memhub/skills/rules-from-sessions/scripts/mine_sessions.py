@@ -295,13 +295,20 @@ ORDERING_CANDS = [   # "X must have run (green) before Y". armed_by "edit": the 
  {"title": "fetch-before-origin-read", "required_rx": r"git\s+(fetch|pull)\b", "gated_rx": r"git\s+(log|diff|show|branch|merge-base|rev-list)\b[^\n]*\borigin/", "armed_by": "session",
   "did": "Claude read `origin/*` without a `git fetch` earlier in the session", "what": "Claude is warned at the `origin/*` read if no fetch ran this session", "claude_md_rx": r"git fetch|fetch (origin|first)|fetch before", "quote_rx": r"origin/|latest (origin|main|staging)|remote branch|\bstale\b|fetch first|get latest|pull (from )?origin"},
 ]
-def arming_lane(events):
-    """Which lane arms this ordering rule — the miner's echo of `rulebook_hook.arms_on`.
-    `session` wins over `prompt` for the same reason the engine's predicate does: a rule
-    armed from session start is already armed when a prompt arrives. Anything else is the
-    edit family, which is also the engine's default for an absent `armed_by_events`."""
-    ev = [e for e in (events or []) if isinstance(e, str)]
-    return "session" if "session" in ev else "prompt" if "prompt" in ev else "edit"
+def arming_lanes(events):
+    """`(the events as configured, the one lane to replay them on)`.
+
+    `rulebook_hook.arms_on` checks MEMBERSHIP per event — a rule listing
+    `["edit", "prompt"]` arms on an edit AND on a matching prompt. So the list is kept as
+    written and serialized back unchanged; collapsing it would file a different rule than
+    the one the report measured. Only the REPLAY picks a single lane, because the corpus
+    scores one obligation machine at a time: session arming subsumes the others (armed
+    from the first call), the edit family is next, and a lane left over — prompt-only, or
+    a name this miner does not know — has nothing offline to arm it, so it is not scored.
+    The engine's own default for an absent `armed_by_events` is the edit family."""
+    ev = [e for e in (events or []) if isinstance(e, str)] or ["edit"]
+    lane = "session" if "session" in ev else "edit" if ("edit" in ev or "write" in ev) else None
+    return ev, lane
 ANCHOR_CANDS = []   # rows that fire when a name comes up: --rule-file bodies carrying `anchors`; nothing is replayed for them
 bodies = []
 for path in args.rule_file:   # one create_rule body per file (create-rule's backtest)
@@ -324,10 +331,15 @@ for path, body in bodies:   # each joins the trigger it belongs to
             print(f"[warn] --rule-file {path}: ordering needs required_command_rx and gated_command_rx — skipped", file=sys.stderr); continue
         try: min_edits = int(o.get("min_edits", 1))
         except (TypeError, ValueError): min_edits = 1
-        armed = arming_lane(o.get("armed_by_events"))
-        if armed == "prompt" and not o.get("armed_by_rx"):   # `arms_on` arms a patternless prompt lane on nothing, so filing it would ship a rule that never fires
-            print(f"[warn] --rule-file {path}: armed_by_events ['prompt'] needs armed_by_rx — the engine arms a patternless prompt lane on no prompt at all — skipped", file=sys.stderr); continue
-        ORDERING_CANDS.append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits, "armed_by": armed, "armed_by_rx": o.get("armed_by_rx"), **extra})   # noqa: E501 — one row per candidate
+        events, lane = arming_lanes(o.get("armed_by_events"))
+        if "prompt" in events and not o.get("armed_by_rx"):
+            # `arms_on` arms a patternless prompt lane on NO prompt. If that is the rule's only
+            # lane it would never fire at all, so refuse it; alongside a lane that does fire,
+            # say so and file the rest rather than dropping a working rule over its dead lane.
+            if lane is None:
+                print(f"[warn] --rule-file {path}: armed_by_events {events} needs armed_by_rx — the engine arms a patternless prompt lane on no prompt at all — skipped", file=sys.stderr); continue
+            print(f"[warn] --rule-file {path}: armed_by_events {events} has no armed_by_rx — the prompt lane will arm on nothing; the {lane} lane still fires", file=sys.stderr)
+        ORDERING_CANDS.append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits, "armed_by": lane, "armed_by_events": events, "armed_by_rx": o.get("armed_by_rx"), **extra})   # noqa: E501 — one row per candidate
     elif isinstance(body.get("anchors"), list) and body["anchors"]: ANCHOR_CANDS.append({"title": body.get("title", path), "anchors": body["anchors"], **extra})
     elif m.get("event") == "output": OUTPUT_CANDS.append({"title": body.get("title", path), "content_rx": m["content_rx"], **extra})
     elif m: RULE_CANDS.append({"title": body.get("title", path), "matcher": m, "requires_prior_rx": body.get("requires_prior_rx"), **extra})
@@ -532,10 +544,10 @@ for r in live:
         print(f"  {r['title']:28s} fired in {res['fired_n']} sessions ({fmt_hosts(res['fired'])}), {sum(res['calls'].values())} calls{flag}")
     elif on == "ordering" and isinstance(hr.get("ordering"), dict):
         o = hr["ordering"]
-        lane = arming_lane(o.get("armed_by_events") or ["edit"])
-        if lane == "prompt":
+        _, lane = arming_lanes(o.get("armed_by_events") or ["edit"])
+        if lane is None:
             # Same reason as the unknown lanes below: a 0 here would read as a retire signal for a rule the engine does arm.
-            print(f"  {r['title']:28s} not replayable offline (prompt-armed ordering) — no signal either way")
+            print(f"  {r['title']:28s} not replayable offline (prompt-armed ordering) — no signal either way")   # noqa: E501
         else:
             res = replay_ordering(o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1))
             flag = "  <- never fired: retire candidate" if not res["violations"] else ""
@@ -553,10 +565,10 @@ for c in RULE_CANDS:
     res = replay(hr, c.get("requires_prior_rx"))
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": c["matcher"], "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), **res}))
 for c in ORDERING_CANDS:
-    unscored = c["armed_by"] == "prompt"   # the session and edit lanes replay; a prompt lane has nothing offline to arm it
+    unscored = c["armed_by"] is None   # the session and edit lanes replay; a prompt-only lane has nothing offline to arm it
     _o = {"gated": 0, "violations": 0, "no_run_at_all": 0, "samples": [], "fired_ids": []} if unscored else replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))
     T, V, Vany, ex, ids = _o["gated"], _o["violations"], _o["no_run_at_all"], _o["samples"], _o["fired_ids"]
-    pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]], "min_edits": c.get("min_edits", 1), "display_name": c["title"],
+    pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": c.get("armed_by_events") or [c["armed_by"] or "edit"], "min_edits": c.get("min_edits", 1), "display_name": c["title"],
                          **({"armed_by_rx": c["armed_by_rx"]} if c.get("armed_by_rx") else {})}}
     breakdown = f"{Vany} never ran it, {V - Vany} ran it piped so its exit code was lost" if V else ""
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"),

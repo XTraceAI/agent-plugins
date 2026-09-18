@@ -36,6 +36,7 @@ def main() -> int:
         sess_ord = Path(home) / "sess.json"; sess_ord.write_text(json.dumps({"title": "probe-session-ordering", "ordering": {"required_command_rx": "git\\s+fetch\\b", "gated_command_rx": "git\\s+log\\b[^\\n]*origin/", "armed_by_events": ["session"]}}))
         prompt_ord = Path(home) / "prompt.json"; prompt_ord.write_text(json.dumps({"title": "probe-prompt-ordering", "ordering": {"required_command_rx": "curl\\s+-s\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["prompt"], "armed_by_rx": "staging"}}))
         bare_prompt = Path(home) / "bare-prompt.json"; bare_prompt.write_text(json.dumps({"title": "probe-bare-prompt", "ordering": {"required_command_rx": "curl\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["prompt"]}}))
+        multi = Path(home) / "multi.json"; multi.write_text(json.dumps({"title": "probe-multi-lane", "ordering": {"required_command_rx": "\\bpytest\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["edit", "prompt"], "armed_by_rx": "staging"}}))
         cands = Path(home) / "cands.json"; cands.write_text(json.dumps([
             {"title": "declared-probe", "matcher": {"event": "bash", "command_rx": "never-happens-xyz\\b"}, "claude_md": {"heading": "Rules", "text": "Never pipe pytest into tail when deciding pass/fail."}, "source_ref": "CLAUDE.md@abc#rules", "did": "Claude did the declared thing", "what": "Claude is warned"},
             {"title": "empty-origin-probe", "matcher": {"event": "bash", "command_rx": "never-happens-abc\\b"}, "claude_md": {}},
@@ -43,7 +44,7 @@ def main() -> int:
         book = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; book.mkdir(parents=True)
         (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
                                                             {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
-        p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--rule-file", str(prompt_ord), "--rule-file", str(bare_prompt), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
+        p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--rule-file", str(prompt_ord), "--rule-file", str(bare_prompt), "--rule-file", str(multi), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
         ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "PROPOSED RULES" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and "=== WHAT WENT WRONG" not in p.stdout and (out / "digests").is_dir()
         print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md, warns on --facets vocab but reports no facet for a session not in the corpus, writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
@@ -66,9 +67,17 @@ def main() -> int:
               and pro.get("not_replayable") is True and pro.get("bucket") == "unmeasured" and pro["verdict"].startswith("Unmeasured"))
         print(("ok  " if ok else "FAIL"), "a prompt-armed ordering keeps armed_by_rx and is reported unmeasured, not scored as edit-armed"); fails += not ok
         if not ok: print(pro)
-        ok = "armed_by_events ['prompt'] needs armed_by_rx" in p.stderr and "probe-bare-prompt" not in p.stdout
-        print(("ok  " if ok else "FAIL"), "a patternless prompt lane is refused — the engine would arm it on no prompt at all"); fails += not ok
+        ok = "needs armed_by_rx" in p.stderr and "probe-bare-prompt" not in p.stdout
+        print(("ok  " if ok else "FAIL"), "a prompt-ONLY lane with no armed_by_rx is refused — the engine would arm it on no prompt at all"); fails += not ok
         if not ok: print(p.stderr[-500:])
+        # `arms_on` checks membership per event, so ['edit','prompt'] arms on BOTH. Collapsing it
+        # to one lane would file a different rule than the one the report measured.
+        multi_row = next((r for r in rows if r.get("title") == "probe-multi-lane"), None)
+        ok = (multi_row is not None and multi_row["predicate"]["ordering"]["armed_by_events"] == ["edit", "prompt"]
+              and multi_row["predicate"]["ordering"].get("armed_by_rx") == "staging"
+              and not multi_row.get("not_replayable") and multi_row.get("bucket") != "unmeasured")
+        print(("ok  " if ok else "FAIL"), "a multi-lane ordering keeps every configured event and is still replayed on its edit lane"); fails += not ok
+        if not ok: print(multi_row)
         decl = next((r for r in rows if r.get("title") == "declared-probe"), None)
         ok = decl is not None and decl.get("bucket") == "declared_unbroken" and decl.get("origin") == "claude_md" and decl["claude_md"]["text"].startswith("Never pipe pytest") and decl["source_ref"] == "CLAUDE.md@abc#rules" and decl["verdict"].startswith("Declared in CLAUDE.md") and "DECLARED IN CLAUDE.MD, NOT BROKEN HERE" in p.stdout
         print(("ok  " if ok else "FAIL"), "--candidates list: a body carrying its CLAUDE.md sentence is origin=claude_md, keeps its source_ref, and lands in the declared-not-broken section"); fails += not ok
