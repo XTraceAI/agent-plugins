@@ -57,7 +57,9 @@ Two constraints shaped this layout, both worth knowing before you "simplify" it:
   `plugins/memhub-staging/{skills,hooks,scripts,references}` — which are
   symlinks into `../memhub/` — arrive dangling and the plugin is silently
   broken. A path source copies from your local clone, where the symlink targets
-  exist, and dereferences them into real files.
+  exist, and dereferences them into real files — **on Claude Code only.**
+  Codex's installer skips symlinks rather than following them, so a path source
+  does not rescue staging there; see RELEASING.md.
 - **The marketplace root is `plugins/`, not the repo root.** Plugin sources are
   resolved relative to the directory containing `.claude-plugin/` and may not
   contain `..`. Rooting this marketplace at `plugins/` lets it say

@@ -21,8 +21,10 @@ Why a blocking Stop and not a line injected with the next prompt: that lane
 reached the agent 19 times in five real sessions and produced 0 `create_rule`
 calls. A line stapled to the person's live request lost to the request every
 time, and "say nothing if there is no lesson" made ignoring it look exactly like
-judging it. At Stop the agent is idle, and the one-line verdict makes the
-outcome visible either way.
+judging it. At Stop the agent is idle and must answer before it can stop.
+How often that produces a rule is `handed` rows here against `session_draft`
+rules on the server — no extra bookkeeping needed for the ratio, and whether a
+rule HELPS is the fire-event fold's question, not this lane's.
 
 The block hands an EARLIER turn's moment: this turn's classifier is still
 running in the child. A moment from a session's last turn is never handed.
@@ -357,9 +359,19 @@ BLOCK_PREFIX = "MemHub harness: before you stop"
 
 
 def block_reason(session: str, moment: dict, repo: str = "") -> str:
-    """What the blocked agent reads. Two jobs only: the verdict it owes, and
-    the harness's own provenance. `repo` is the session's, used only when the
+    """What the blocked agent reads. One job: point at the skill, with the
+    provenance only this line has. `repo` is the session's, used only when the
     moment's own stamp names none.
+
+    The TEST it states is "not already a RULE", not "not already written
+    down". Those were collapsed, and the collapse cost real lessons: a live
+    e2e hit a trap documented at CONTRIBUTING.md:123 and declined to file it —
+    yet the documentation is what had just failed to prevent the trap. Prose
+    nobody reads has no enforcement and no fire count; that is what a rule
+    adds, and `source='claude_md_import'` on 18 of the book's rules is the
+    same conversion done by hand. What still disqualifies a moment is being a
+    twin of an existing rule, or being narration of docs that nothing tripped
+    over — the `TEAM_DIRECTIVE_CAPTURE` failure of 2026-09-14.
 
     HOW to file a rule — the rulebook question, the twin check, the engine
     shapes, advise vs gate, the proof — lives in `skills/create-rule/SKILL.md`
@@ -367,10 +379,13 @@ def block_reason(session: str, moment: dict, repo: str = "") -> str:
     findings on #222: whatever it did not copy the harness path silently
     dropped, and whatever it did copy drifted from the skill.
 
-    The STAMP is carried, because it is the one thing only this line has: the
-    server refuses a `session_draft` without `repo`, `session_id`, `turn`,
-    `hook_version` and `at`, and a rule filed without it loses the turn's
-    branch and environment."""
+    The STAMP is NOT carried any more. `reason` is documented as feedback for
+    the model, but the host also renders it to the person behind a "Stop hook
+    feedback:" prefix, and ~400 characters of `state={...}` JSON is the bulk of
+    what they were reading. The stamp lives in the session's moments file,
+    which the skill reads; this line names the file instead of quoting it.
+    The server still refuses a `session_draft` without `repo`, `session_id`,
+    `turn`, `hook_version` and `at` — the skill supplies them from there."""
     turn = moment.get("turn")
     kind = moment.get("kind") or "a signal"
     scope = proposal_scope(moment, repo)
@@ -379,17 +394,14 @@ def block_reason(session: str, moment: dict, repo: str = "") -> str:
     hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
     derivable = (" The classifier thinks it may already be written down, so check "
                  "first.") if moment.get("derivable") else ""
-    stamp = json.dumps(moment.get("state") or {}, ensure_ascii=False, default=str)
+    ref = moment.get("source_ref") or session
     return (
-        f"{BLOCK_PREFIX}: turn {turn} of this session was flagged as {kind}{hint}."
-        f"{derivable} Decide now whether it holds a lesson that would change what an "
-        f"agent DOES next time, is not already in the repo, its docs, CLAUDE.md or the "
-        f"rulebook, is not project state, and will still be true next month. If it does, "
-        f"run the memhub create-rule skill on it, and pass these to create_rule verbatim: "
-        f"source=\"session_draft\", source_ref=\"{moment.get('source_ref') or session}\", "
-        f"scope_repos={json.dumps(scope)}, state={stamp}.{narrow} If it does not, or the "
-        f"user declines, end with exactly one line: \"No rule from turn {turn}: <why>\". "
-        f"Never pass activate. Never put a person's name, home directory or e-mail in a rule."
+        f"{BLOCK_PREFIX}: turn {turn} was flagged as {kind}{hint}.{derivable} Run the "
+        f"memhub create-rule skill on source_ref=\"{ref}\", scope_repos="
+        f"{json.dumps(scope)} — its Harness-draft section holds the test for whether "
+        f"this is a lesson, where the stamp comes from, and how to file it.{narrow} "
+        f"If it is not a lesson, or you cannot file it, say nothing to the person "
+        f"about this turn."
     )
 
 
@@ -421,8 +433,15 @@ def hand_off(session: str) -> int:
     # children append in the order their classifiers answered, not turn order
     chosen = max(fresh, key=lambda m: m["turn"])
     hx.append_jsonl(path, {"handed": _moment_key(chosen), "at": time.time()})
-    print(json.dumps({"decision": "block",
-                      "reason": block_reason(session, chosen, meta.get("repo") or "")}))
+    # `reason` reaches the model (and, as the host renders it, the person);
+    # `systemMessage` is the person's channel. The outcome line is the AGENT's
+    # own reply — the block runs before it has decided, so the hook can only
+    # say what is being looked at, never what came of it.
+    print(json.dumps({
+        "decision": "block",
+        "reason": block_reason(session, chosen, meta.get("repo") or ""),
+        "systemMessage": f"MemHub: reviewing turn {chosen.get('turn')} for a team rule",
+    }))
     _log(f"stop {session[:8]}: blocked on turn {chosen.get('turn')}")
     return 0
 
@@ -436,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", default="")
     p.add_argument("--arcs", default="")
     p.add_argument("--upto", type=int, default=-1)
+    p.add_argument("--ref", default="")
     return p
 
 

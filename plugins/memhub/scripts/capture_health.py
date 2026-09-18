@@ -105,7 +105,24 @@ _REASONS = {
     # attempt BEFORE it produced, which pointed at a cause that had already been
     # dealt with.
     "budget_exhausted": "capture ran out of time before it finished sending",
+    # The server refused a payload for its SIZE. Reported as the generic
+    # `error` until ENG-1085, which rendered as "the capture hook hit an
+    # unexpected error … run /memhub:login --status" — pointing at the
+    # credential, which was fine — above a session whose per-turn capture had
+    # been dead for hours. The flush bounds its batch now, so this is the rare
+    # tail (a request limit lower than the slice cap, or one record that cannot
+    # be split at all) and it corrects itself, which the advice has to say.
+    "payload_too_large": ("one turn was too large for the server to accept in "
+                          "one piece"),
     "error": "the capture hook hit an unexpected error",
+    # Not a credential problem, so the default "/memhub:login --status" advice
+    # would send someone to inspect the one thing that is definitely fine. Gets
+    # its own remedy in `_message`. Written by codex_hook_bridge when it cannot
+    # find the plugin's scripts at all — observed live: `codex plugin add`
+    # skips a plugin's symlinks, so the staging build installs as three files
+    # with no `scripts/` directory, and every hook then exits in silence.
+    "plugin_root_unresolved": ("this Codex install is missing the plugin's "
+                               "script files, so nothing was captured"),
 }
 
 
@@ -277,7 +294,7 @@ def _token_problem(host: str) -> str | None:
     return None
 
 
-def _recent_failure() -> tuple[str, float] | None:
+def _recent_failure() -> tuple[str, float, bool] | None:
     """The newest still-relevant ``(reason, when)`` recorded by a flush.
 
     Newest-first and returns on the first hit: an older breadcrumb cannot say
@@ -310,7 +327,12 @@ def _recent_failure() -> tuple[str, float] | None:
         # working?", not "did this particular path once stumble?".
         if _succeeded_since(path, when):
             continue
-        return str(reason), float(when)
+        # Whether per-turn capture went DORMANT for this session, not just
+        # whether it stumbled. The two need different advice: a transient
+        # failure retries on its own and the banner should say so, while a
+        # dormant session has stopped trying, so telling the user to wait is
+        # telling them to wait for something that will not happen.
+        return str(reason), float(when), bool(state.get("unsupported"))
     return None
 
 
@@ -466,7 +488,10 @@ def _message(host: str, token_problem: str | None,
                 f"$MEMHUB_TOKEN to a personal access key (mhk_…), which the "
                 f"hooks use directly and which does not expire.")
     if failure:
-        reason, when = failure
+        # Tolerant unpack: older callers (and tests) hand this a 2-tuple, and a
+        # banner is not worth a TypeError on SessionStart.
+        reason, when, *_rest = failure
+        dormant = bool(_rest[0]) if _rest else False
         detail = _REASONS.get(reason, "the capture hook failed")
         ago = max(0, int((time.time() - when) / 60))
         when_txt = f"{ago}m ago" if ago < 120 else f"{ago // 60}h ago"
@@ -483,6 +508,30 @@ def _message(host: str, token_problem: str | None,
                     "/memhub:import-session to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
+        elif reason == "payload_too_large" and dormant:
+            # The terminal case, and the ONE payload_too_large state where the
+            # reassuring wording below would be a lie: per-turn capture has
+            # stopped trying for this session, and the session-end path slices
+            # at a fixed size with no adaptive handling, so it can refuse the
+            # same content. Promising it lands would be the same mistake this
+            # whole reason slug exists to correct — a banner that tells the
+            # user nothing is wrong while capture is silently not happening.
+            # Name the state and give the one lever that is actually theirs.
+            tail = ("Per-turn capture is now dormant for this session and the "
+                    "session-end backstop may not recover it either — run "
+                    "/memhub:import-session to capture it directly.")
+        elif reason == "payload_too_large":
+            # Same reasoning as `budget_exhausted`: not a credential question,
+            # so `--status` would send them to inspect the one thing that was
+            # definitely fine. The flush sends less on each following turn and
+            # steps over anything it can never send, so this resolves itself.
+            tail = ("Capture splits it over the next few turns on its own, "
+                    "and the session-end backstop covers the rest.")
+        elif reason == "plugin_root_unresolved":
+            # Nothing about the credential is wrong, and nothing retries on its
+            # own — the files have to come back first.
+            tail = ("Reinstall the MemHub plugin, then run the memhub:setup "
+                    "skill to confirm the bridge can find it.")
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import pathlib
 import json
 import os
 import subprocess
@@ -333,9 +334,11 @@ def test_a_later_stop_blocks_on_the_moment_once():
         reason = _reason(out)
         assert rc == 0 and reason.startswith(hs.BLOCK_PREFIX)
         assert "turn 2" in reason and "correction" in reason and "router: wrong_target" in reason
-        assert '"session_id": "sess"' in reason and 'source_ref="sess#2"' in reason
+        assert '"session_id"' not in reason and 'source_ref="sess#2"' in reason
         assert 'scope_repos=["repo"]' in reason and "create-rule skill" in reason
-        assert "Never pass activate" in reason
+        # "Never pass activate" moved into the skill with the rest of the
+        # manual; this line is a pointer (Codex, #244)
+        assert "activate" not in reason
         rows = hx.read_jsonl(hs.moments_path("sess"))
         assert [r.get("handed") for r in rows] == [None, "sess#2"], "handed by appending"
         assert "handed_at" not in rows[0], "the moment row is never rewritten"
@@ -517,7 +520,9 @@ def test_an_older_turns_child_never_moves_the_meta_back():
 def test_the_block_reason():
     line = hs.block_reason("sess", _moment(2), "repo")
     assert line.startswith(hs.BLOCK_PREFIX)
-    assert "Never pass activate" in line and "/Users/" not in line and "@" not in line
+    # the privacy guards stay on the line itself: it reaches both the model and
+    # the person. "Never pass activate" moved into the skill (Codex, #244).
+    assert "/Users/" not in line and "@" not in line
     # HOW to file lives in skills/create-rule/SKILL.md. The prompt-lane line
     # restated it and drew five of six Codex findings on #222 (dropped whatever
     # it did not copy, drifted from whatever it did), so none of it is here.
@@ -525,17 +530,84 @@ def test_the_block_reason():
     for restated in ("list_rulebooks", "include_retired", "supersedes_rule_id",
                      "anchor_recall", "--fires", "mode"):
         assert restated not in line, restated
-    # the provenance only this line has: the server refuses a draft without it
-    assert 'source="session_draft"' in line and 'source_ref="sess#2"' in line
-    assert '"hook_version": "0.54.0"' in line and line.index("create-rule skill") < line.index("state=")
-    # the verdict is owed either way: a silent "no lesson" looked exactly like
-    # an ignored handoff, 19 handoffs to 0 create_rule calls
-    assert '"No rule from turn 2: <why>"' in line
-    # a budget, not an obstacle: the line carries a verdict and a stamp, nothing else
-    assert len(line) < 1000, len(line)
+    # The line is a POINTER now. Claude Code renders a blocking Stop reason to
+    # the person as "Stop hook feedback:" and there is no Stop channel that
+    # reaches only the model (Codex, #244), so every instruction that does not
+    # have to be here lives in skills/create-rule/SKILL.md instead. What stays
+    # is what only this line knows: which turn, and where the skill is.
+    assert "create-rule skill" in line
+    assert 'source_ref="sess#2"' in line and "scope_repos=" in line
+    # The verdict lane is gone. Filed-per-block is already `handed` rows here
+    # against `session_draft` rules on the server, and whether a rule HELPS is
+    # the fire-event fold's question. Recording non-events cost seven of the
+    # fifteen findings on #244 and bought a ratio that was already free.
+    assert "verdict" not in line and "--why" not in line and "<<" not in line
+    assert "say nothing to the person about this turn" in line
+    # the manual moved out and must NOT be restated here
+    for moved in ("not already a RULE", "restating the docs", "without asking",
+                  "activate", "state=", '"hook_version"'):
+        assert moved not in line, moved
+    # 1130 -> 347. A pointer, not a manual.
+    assert len(line) < 400, len(line)
+    # ...and the skill must actually carry what the line dropped, or the two
+    # halves diverge silently and the agent gets neither.
+    skill = (pathlib.Path(__file__).resolve().parent.parent / "plugins" / "memhub"
+             / "skills" / "create-rule" / "SKILL.md").read_text(encoding="utf-8")
+    # markdown wraps; the check is about content, not where the lines break,
+    # and reflowing prose to satisfy a substring test is the wrong direction
+    skill = " ".join(skill.replace("*", "").replace("`", "").split())
+    assert "conflict is still reported to the person" not in skill
+    assert "memhub-verdict" not in skill and "--why-file" not in skill
+    for owed in ("not already a RULE", "does NOT disqualify it",
+                 "restating the docs", "ask the person nothing at all",
+                 "Never pass activate", "Step 4b.6", "Step 0 (which rulebook)",
+                 "Do NOT rebuild it from", 'source="session_draft"',
+                 # each exception the harness path takes must be stated, or the
+                 # agent hits a mandatory step it cannot satisfy (Codex, #244)
+
+                 # nothing on a non-filing path reaches the person (Codex, #244)
+                 "hears about the turn only when a rule was filed",
+                 "File nothing, say nothing, stop", "same_matcher",
+                 # one invariant beats enumerating every step that talks: five
+                 # rounds of this PR were the next unexempted one (Codex, #244)
+                 "nothing on this path reaches the person",
+                 "including ones added after this was written",
+                 "A live verification that runs and fails is terminal",
+                 # the silence invariant must NOT swallow a failed restore: an
+                 # unreviewed candidate left armed in the local cache is state
+                 # the person cannot fix unseen (Codex, #244, the only P1)
+                 "A restore that fails",
+                 # success is not silence either: between the interruption and
+                 # now the candidate was armed and may have fired (Codex, #244)
+                 "found from an INTERRUPTED earlier run",
+                 "safety bug wearing the costume of quiet",
+                 # an idempotent re-import ended WITH a rule (Codex, #244)
+                 "unchanged: true is a filing, not a blocker",
+                 "source_ref is passed EXACTLY as the harness line gives it"):
+        assert owed in skill, owed
     assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
     assert "may already be written down" not in line
     print("PASS test_the_block_reason")
+
+
+
+
+
+def test_the_block_shows_the_person_a_status_line_not_the_instructions():
+    """`reason` is the model's channel and the host also renders it; the
+    person's channel is `systemMessage`. The hook blocks BEFORE the agent has
+    decided, so it can only name what is being looked at — the outcome line is
+    the agent's own reply."""
+    with _Env():
+        hs.save_meta("sess", repo="repo", last_turn=2)
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        rc, out = _stop()
+        payload = json.loads(out)
+        assert rc == 0 and payload["decision"] == "block"
+        assert payload["systemMessage"] == "MemHub: reviewing turn 2 for a team rule"
+        assert "create-rule skill" not in payload["systemMessage"]
+    print("PASS test_the_block_shows_the_person_a_status_line_not_the_instructions")
+
 
 
 def test_a_recorded_block_is_not_a_turn():

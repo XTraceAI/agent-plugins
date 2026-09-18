@@ -59,16 +59,16 @@ def test_tail():
         p = Path(d) / "t.jsonl"
 
         size = _write(p, [_rec("a"), _rec("b")])
-        recs, consumed = ft._read_tail(str(p), 0)
+        recs, _ends, consumed = ft._read_tail(str(p), 0)
         check("reads all from 0", [r["uuid"] for r in recs], ["a", "b"])
         check("consumes whole file", consumed, size)
 
-        recs, _ = ft._read_tail(str(p), size)
+        recs, _ends, _ = ft._read_tail(str(p), size)
         check("nothing new at eof", recs, [])
 
         prev = size
         size = _write(p, [_rec("a"), _rec("b"), _rec("c")])
-        recs, consumed = ft._read_tail(str(p), prev)
+        recs, _ends, consumed = ft._read_tail(str(p), prev)
         check("resumes at cursor", [r["uuid"] for r in recs], ["c"])
         check("consumed == size", consumed, size)
 
@@ -82,12 +82,12 @@ def test_tail_is_bytes_not_chars():
         p = Path(d) / "t.jsonl"
         # Emoji + CJK: many bytes per character.
         size = _write(p, [_rec("a", "🎉 fix the café — 日本語テキスト")])
-        recs, consumed = ft._read_tail(str(p), 0)
+        recs, _ends, consumed = ft._read_tail(str(p), 0)
         check("one record", len(recs), 1)
         check("byte-exact consume", consumed, size)
         check("consumed > char count", consumed > len(json.dumps(recs[0])), True)
 
-        recs, _ = ft._read_tail(str(p), consumed)
+        recs, _ends, _ = ft._read_tail(str(p), consumed)
         check("no re-read after non-ASCII", recs, [])
 
 
@@ -100,13 +100,13 @@ def test_tail_stops_before_partial_line():
         p = Path(d) / "t.jsonl"
         complete = json.dumps(_rec("a")) + "\n"
         _write(p, [_rec("a")], partial='{"type":"user","uu')
-        recs, consumed = ft._read_tail(str(p), 0)
+        recs, _ends, consumed = ft._read_tail(str(p), 0)
         check("skips the partial record", [r["uuid"] for r in recs], ["a"])
         check("cursor stops before it", consumed, len(complete.encode()))
 
         # Once the line lands whole, the next flush picks it up.
         _write(p, [_rec("a"), _rec("b")])
-        recs, _ = ft._read_tail(str(p), consumed)
+        recs, _ends, _ = ft._read_tail(str(p), consumed)
         check("completed line is not lost", [r["uuid"] for r in recs], ["b"])
 
 

@@ -28,15 +28,97 @@ MemHub's harness can block a stop with `MemHub harness: before you stop: turn
 N of this session was flagged as …`. Then you are here because a turn was
 flagged, not because the user asked for a rule, and two things differ:
 
-- **First decide whether there is a lesson at all**, by the test the harness
-  line gives. If there is none — or the user, asked in step 1, declines — end
-  with the one line the harness asked for (`No rule from turn N: <why>`) and do
-  nothing else.
-- **If there is, run this whole flow** with the lesson as the user's words.
-  In step 5 pass the `source`, `source_ref`, `scope_repos` and `state` the
-  harness handed you, verbatim; they replace the `source_ref` step 5
-  describes (put the step-1b numbers in your report instead). MemHub refuses a
-  `session_draft` without its `state`, and nothing else in the session has it.
+**This section, not the harness line, is the harness path.** The line is
+rendered to the person as `Stop hook feedback:` — there is no Stop channel that
+reaches only the model — so it stays a pointer and everything it used to carry
+lives here.
+
+**The invariant, before the details: nothing on this path reaches the person
+except one line naming a rule that was filed.** Every step of this skill that
+shows, asks, offers or reports — §4b.1's prompt preview, §4b's cleanup report,
+the revision offer when a forward test finds nothing, the conflict choices,
+the step-5 confirmation — is suppressed here, including ones added after this
+was written. Where a step says to stop and ask, stop silently instead. The
+enumerations below say what to DO at each such point; this says what the
+person sees, which is nothing until there is a rule.
+
+**One exception, and it is not about the rule: the rulebook cache.** The
+invariant covers disclosures about the CANDIDATE; it does not cover machine
+state this skill changed. Both of §4b.5's notices are therefore spoken even
+though nothing was filed:
+
+- **A restore that fails** — say so, name the file, abort. An unreviewed
+  candidate is left armed in the local cache, and a person who is not told
+  cannot fix what they cannot see.
+- **A `$BOOK.pretest-*` found from an INTERRUPTED earlier run** — restore it
+  and say so, even though this recovery succeeded. Between that interruption
+  and now, the candidate was armed: it may already have fired, in this session
+  or another. Success here means the cache is clean going forward, not that
+  nothing happened.
+
+Silence about either is a safety bug wearing the costume of quiet.
+
+- **The test.** A lesson is one that would change what an agent DOES next time,
+  is not already a RULE, is not project state, and will still be true next
+  month. Already written in CLAUDE.md or the docs does NOT disqualify it: if
+  this turn tripped over it anyway, the prose was not enough — file it and cite
+  where it is written. Skip only when nothing went wrong and you would merely
+  be restating the docs.
+- **No lesson** → say nothing to the person about the turn, and stop. Nothing
+  is recorded: how often a block produces a rule is already the `handed` rows
+  in the moments file against `session_draft` rules on the server, and whether
+  a rule HELPS is the fire-event fold's question, not this one's.
+- **A lesson** → run this flow with it as the user's words, and **ask the
+  person nothing at all**. A `session_draft` lands `proposed` and fires for
+  nobody until a reviewer activates it, so every confirmation this skill asks
+  for elsewhere is already held by whoever reviews the book. Concretely, on
+  this path:
+  - **Step 0 (which rulebook)** does not ask. `list_rulebooks` reports
+    membership scope (`all_org` / `explicit`) and `bound`; it does NOT report
+    which repositories a book admits, so "the book for this repo" is not a
+    question its response can answer. The rule is therefore arithmetic: exactly
+    one `bound` book → file there; exactly one `bound` book with
+    `scope: all_org` among several → file there; anything else, including none
+    at all → file nothing, say nothing, and stop. Never guess, never create a
+    book on this path.
+  - **Step 4b.6** (no git checkout, no Agent tool) does not ask. Say the
+    precondition was missing, file with the pattern proven only against the
+    verifier's synthetic cases, and note that in the report.
+  - **Step 5** does not ask. File, then tell the person one line naming the
+    rule.
+  - **A conflict that the mandatory policy says not to file, is not filed** —
+    and on this path it is not reported either: `cross_book` (a rule in a book
+    `supersedes_rule_id` cannot reach), or `same_matcher` on an active rule
+    that is not this one. File nothing, say nothing, stop.
+  - **A live verification that runs and fails is terminal.** The forward test
+    firing on zero candidate rows is not a conflict and not a missing
+    precondition: the pattern is unproven, so file nothing, say nothing, and
+    stop. Do not offer to revise it — that offer is the interruption this path
+    exists to avoid, and an unproven matcher is worse than no rule.
+  - **Never pass `activate`.** Never put a person's name, home directory or
+    e-mail in a rule.
+  - **`unchanged: true` is a filing, not a blocker.** That reply means the rule
+    is already in the book — a retry after a lost response, or identical
+    content re-filed. The moment ended WITH a rule, so tell the person as you
+    would for any filing.
+
+- **`scope_repos` is the harness line's, verbatim** — it is already narrowed by
+  `proposal_scope`. When the line says the turn worked in several repositories,
+  cut it further to the ones the lesson is about. Do NOT rebuild it from
+  `state.touched_repos`: that re-broadens it to repos the lesson has nothing to
+  do with, which then fire on unrelated work.
+- **`source_ref` is passed EXACTLY as the harness line gives it.** The generic
+  steps append `|applies N/M|precision P` to a `source_ref`; on this path they
+  do not. That value is half of the server's `(rulebook, source_ref, title)`
+  re-import identity, so a retry carrying different evidence counts files a
+  second row instead of matching the first. Put those numbers in the report to
+  the person instead.
+- **The stamp** comes from the moments file
+  (`$MEMHUB_HARNESS_DIR`, else `~/.config/memhub-plugin/harness`),
+  `<session_id>.moments.jsonl`: the last JSON object whose `source_ref` matches
+  the harness line's. Pass its `state` verbatim in step 5 with
+  `source="session_draft"` and that `source_ref` — MemHub refuses a
+  `session_draft` without its `state`.
 
 `mode: "gate"` still needs the user's own words asking for a block (step 3).
 
@@ -81,8 +163,10 @@ the name exceeded 200 characters — shorten it and retry once.)
 
 **Older backend:** if `list_rulebooks` / `create_rulebook` are not present, or
 `create_rule` rejects `rulebook_id`, the server predates rulebook containers.
-Fall back to today's behaviour — `agent_brain_id` from `--brain`, omitted
-otherwise — and carry on; the rest of this skill is unchanged.
+File with no destination — omit `rulebook_id` and let the server put the rule
+where it used to — and say so in step 6; the rest of this skill is unchanged.
+Do NOT reach for `agent_brain_id`: `create_rule` has no such parameter any
+more, so passing it turns a degraded-but-working file into a failed one.
 
 ## The flow — every step is mandatory
 
@@ -179,6 +263,14 @@ its own: a fire whose conversion has not been seen two turns later is closed
 nothing. The hook only reports what it saw — the command that converted, the
 override that set a rule aside, each turn ending — and the server decides the
 outcome from those facts (the earliest one after the fire wins).
+
+**Also say what the rule PREVENTS.** `predicts_rx` is a pattern over tool
+output naming the failure this rule exists to stop — the traceback, the
+`rejected` line, the 409. It changes nothing about when the rule fires; it is
+what lets a fire be scored as a catch rather than counted as a nag, and it is
+far easier to write now, while the war story that produced the rule is in
+front of you, than at review time. Write it wherever the failure has a
+recognisable line; skip it for a rule whose violation produces no output.
 
 Ask for it when the user's own words ask for it — "block", "stop me", "don't
 let me", "never let it happen again" — and never on your own initiative. Two
@@ -607,7 +699,17 @@ rule's `scope_repos` / `scope_paths`, or file anyway and accept the double
 fire).
 
 Show the user: the rule sentence, the delivery + engine block, the sample
-commands it does and doesn't match, and the conflict verdict. On approval call the memhub
+commands it does and doesn't match, and the conflict verdict.
+
+**A `session_draft` handed over by the harness skips that approval** — it files
+straight away and tells the person afterwards in one line. The draft lands
+`proposed` and fires for nobody until a reviewer activates it, so the approval
+asked for here is already held by whoever reviews the book; asking again
+mid-turn is the interruption the Stop block exists to avoid. A `cross_book`
+conflict does NOT reach the person on this path either: it files nothing and
+says nothing. The person hears about the turn only when a rule was filed.
+
+On approval — or immediately, for a harness draft — call the memhub
 **`create_rule`** tool with `title`, `statement`, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
 `user correction, session <id>`, with the step-1b numbers appended:

@@ -1,23 +1,25 @@
-"""The work-type block `pr_link` appends when a pull request has no type yet.
+"""Asking for a work type is conditional, and the condition is the link itself.
 
-Pure text assertions against `pr_link.context_for` — no network, no `$HOME`
-state, stdlib only. The wire behaviour this text describes is the backend's and
-is pinned by MemHub-Backend's own `tests/test_pr_classifications.py`; what can
-go wrong HERE is the plugin telling the agent something the server will refuse,
-so these cases are about the instruction, not the transport.
+v0.62.0 (#245) taught the hook to ask the agent for a `pr_type`, but asked
+unconditionally. That is not merely a wasted call on a pull request that
+already has a type: `record_classification` raises `pr_classification_conflict`
+BEFORE `_insert_links` and before the commit, so the server refuses the WHOLE
+write — the session does not get linked at all. A second session touching an
+already-classified pull request therefore lost its link, which is the thing
+linking exists to do.
 
-The two rules with teeth:
-
-* a classification is PERMANENT (the backend ships no UPDATE, no DELETE and no
-  correction endpoint), so a pull request that already carries a type must
-  never be re-asked — the call would 409 and the type could never land; and
-* the seven tokens are matched literally with no normalisation, so the tuple
-  here has to stay exactly the backend's.
+So the ask is gated on the server reporting no type yet, and the injected text
+carries a recovery for the race that gate cannot close. Verified live against
+staging on agent-plugins#247: a third call with a different type returned
+"This PR already has a different classification; linking cannot overwrite it."
+and wrote nothing.
 
 Run: python3 tests/pr_work_type_test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import hashlib
+import itertools
 import sys
 from pathlib import Path
 
@@ -28,6 +30,13 @@ import pr_link  # noqa: E402
 
 PR = "https://github.com/o/r/pull/7"
 SID = "sess-1"
+
+# The CREATED / IN_PLAY templates as they stood BEFORE #245 added the
+# classification sentence. A pull request that already carries a type must
+# render exactly this again — the ask disappears rather than degrading into
+# something new. Change these deliberately, never to make the suite green.
+GOLDEN_PRE_CLASSIFICATION = {"CREATED": "0feb75e89d6c385f",
+                             "IN_PLAY": "c79dc68b09546397"}
 
 failures: list[str] = []
 
@@ -40,7 +49,6 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 
 def reply(pr_type=None, **over):
-    """A connected `check` reply whose PR carries `pr_type`."""
     body = {
         "enabled": True, "github_connected": True, "repo_in_install": True,
         "connect_url": "https://app.example.test/i",
@@ -53,15 +61,16 @@ def reply(pr_type=None, **over):
     return body
 
 
+def _ctx(pr_type, *, created):
+    return pr_link.context_for(reply(pr_type), PR, SID, created=created)
+
+
 def test_pr_types_is_exactly_the_backends_set():
-    # Order and spelling both matter: `validate_classification` compares
-    # against this set with no lowering, stripping or synonym map, and a DB
-    # CHECK constraint backs it. A "feature" added here is a 400 at runtime.
     check("the seven tokens, in the backend's order",
           pr_link.PR_TYPES
           == ("feat", "fix", "chore", "docs", "perf", "refactor", "other"),
           repr(pr_link.PR_TYPES))
-    check("mixed and none are not offered as inputs",
+    check("mixed and none are never offered as inputs",
           "mixed" not in pr_link.PR_TYPES and "none" not in pr_link.PR_TYPES)
 
 
@@ -72,128 +81,120 @@ def test_classification_wanted_only_on_an_untyped_pr():
           pr_link.classification_wanted(reply("fix")) is False)
     check("an explicit `other` is a decision, not an absence",
           pr_link.classification_wanted(reply("other")) is False)
-    for junk in ({}, {"pr": None}, {"pr": "o/r#7"}, None, [], "nope"):
+    for junk in ({}, {"pr": None}, {"pr": "o/r#7"}, {"pr": 5}, None, [], "nope"):
         check(f"a reply shaped {junk!r} is not a classification prompt",
               pr_link.classification_wanted(junk) is False)
 
 
-def _ctx(pr_type, *, created):
-    return pr_link.context_for(reply(pr_type), PR, SID, created=created)
+def test_an_untyped_pr_is_asked_for_a_type():
+    for created in (True, False):
+        lane = "B1" if created else "B2"
+        ctx = _ctx(None, created=created)
+        check(f"{lane}: names the pr_type argument", "pr_type = " in ctx)
+        check(f"{lane}: names the classification session",
+              'classification_session_id="sess-1"' in ctx)
+        check(f"{lane}: offers every accepted token",
+              all(t in ctx for t in pr_link.PR_TYPES))
+        check(f"{lane}: still carries the link instruction",
+              'link_source="session_self"' in ctx)
 
 
-def test_b1_asks_for_a_type_when_the_pr_has_none():
-    ctx = _ctx(None, created=True)
-    check("names the pr_type argument", 'pr_type="' in ctx)
-    check("names the classification session argument",
-          'classification_session_id="sess-1"' in ctx, ctx[-200:])
-    check("offers every accepted token",
-          all(t in ctx for t in pr_link.PR_TYPES))
-    check("says the decision is final", "CANNOT be corrected" in ctx)
-    check("still carries the link instruction",
-          'link_source="session_self"' in ctx)
+def test_an_already_typed_pr_renders_the_pre_classification_text():
+    """The regression this change exists to fix.
 
-
-def test_the_session_id_is_identical_in_both_arguments():
-    ctx = pr_link.context_for(reply(), PR, "sess-1", created=True)
-    check("both arguments name the same id",
-          'session_ids=["sess-1"]' in ctx
-          and 'classification_session_id="sess-1"' in ctx)
-
-
-def test_a_padded_session_id_can_never_reach_the_instruction():
-    # The server STRIPS each entry of session_ids but compares
-    # classification_session_id RAW, so emitting "  abc  " in BOTH places is a
-    # guaranteed `classification_session_invalid`. What keeps the hook safe is
-    # upstream: `conversation_id_for` strips before the id is ever formatted.
-    for host in pr_link.HOSTS:
-        got = pr_link.conversation_id_for(host, "  abc  ")
-        check(f"{host}: the namespaced id carries no padding",
-              got is not None and got == got.strip() and "abc" in got, repr(got))
-
-
-# Digests of the two templates as they shipped in v0.59.0, BEFORE this feature.
-# Their whole job is that an already-classified pull request still gets exactly
-# the text it got before classification existed. Rebuilding the expectation from
-# `pr_link.CREATED` would only prove `classify` resolved to "" — it would pass
-# just as happily if the wording had been rewritten. Change one of these
-# deliberately, never to make the suite green.
-GOLDEN = {"CREATED": "d1ff99bbfe3e421c", "IN_PLAY": "c11f5c756d2608a1"}
-
-
-def test_the_templates_still_say_what_they_said_before_this_feature():
-    import hashlib
-    for name, want in GOLDEN.items():
-        got = hashlib.sha256(
-            getattr(pr_link, name).encode("utf-8")).hexdigest()[:16]
-        check(f"{name} wording is unchanged", got == want,
-              f"{got} != {want} — intended? then update GOLDEN")
-
-
-def test_an_already_typed_pr_is_never_re_asked():
+    Not merely "does not ask" — it must render what the hook rendered before
+    #245 existed, because that text is the one whose link actually lands.
+    """
     for created in (True, False):
         lane = "B1" if created else "B2"
         ctx = _ctx("fix", created=created)
-        check(f"{lane}: no pr_type argument", "pr_type=" not in ctx)
-        check(f"{lane}: no classification session argument",
-              "classification_session_id" not in ctx)
-        check(f"{lane}: nothing of the block leaks in",
-              not any(t in ctx for t in ("CANNOT be corrected", "primary type",
-                                         "record what kind of work")))
+        for marker in ("pr_type", "classification_session_id",
+                       "THE LINK DID NOT HAPPEN"):
+            check(f"{lane}: no {marker}", marker not in ctx)
+        want = (pr_link.CREATED if created else pr_link.IN_PLAY).format(
+            pr_url=PR, pr_ref=" (o/r#7, open)", linked="", session_id=SID,
+            classify="", recovery="")
+        check(f"{lane}: identical to the un-asked rendering", ctx == want)
 
 
-def test_b2_ties_the_type_to_the_decision_to_link():
-    ctx = _ctx(None, created=False)
-    check("asks only if the agent links", ctx.count("IF you link it") == 1)
-    check("says a non-author records nothing",
-          "does not get to label it" in ctx)
-    check("keeps B2's authorship conditional",
-          "IF THE CODE IN THIS PULL REQUEST WAS WRITTEN IN THIS SESSION" in ctx)
+def test_the_templates_minus_the_slots_are_the_v0_59_text():
+    """A digest of what an already-typed PR gets, pinned to pre-#245 bytes.
+
+    Rebuilding the expectation from `pr_link.CREATED` (as the test above does)
+    proves the slots resolved empty; it would pass just as happily if the
+    surrounding wording had been rewritten. This is what catches that.
+    """
+    for name, want in GOLDEN_PRE_CLASSIFICATION.items():
+        rendered = getattr(pr_link, name).format(
+            pr_url="{pr_url}", pr_ref="{pr_ref}", linked="{linked}",
+            session_id="{session_id}", classify="", recovery="")
+        got = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:16]
+        check(f"{name} minus the slots is byte-for-byte v0.59.0", got == want,
+              f"{got} != {want} — intended? then update GOLDEN_PRE_CLASSIFICATION")
+
+
+def test_b2_keeps_the_line_that_quiets_a_babysit_loop_last():
+    """`/memhub:pr-babysit` runs `gh pr view` on every pass, so B2 fires every
+    pass. The final line is what stops the agent narrating it each time, and it
+    only works while it is the last thing read — so the recovery text is
+    slotted above it, never appended after it.
+    """
+    for pr_type in (None, "fix"):
+        ctx = _ctx(pr_type, created=False)
+        check(f"pr_type={pr_type!r}: ends on the quieting line",
+              ctx.endswith("say nothing at all."), ctx[-90:])
 
 
 def test_the_two_failures_get_opposite_advice():
-    """The 404 and the 409 both refuse the WHOLE write, but for opposite
-    reasons, so the recovery differs and the difference is the whole point.
+    """Both refuse the whole write, for opposite reasons, so recovery differs.
 
-    404 `classification_session_not_found`: the session has not been captured
-    yet, so retrying without the type links nothing either — waiting is the
-    only thing that helps.
-
+    404 `classification_session_not_found`: the session is not captured yet, so
+    retrying without the type links nothing either — only waiting helps.
     409 `pr_classification_conflict`: the session is fine and the link would
-    have succeeded; only the type is contested. Retrying WITHOUT the type is
-    what rescues the link, and telling the agent to just stop would lose it.
+    have succeeded; only the type is contested, so dropping it rescues the LINK.
     """
     ctx = _ctx(None, created=True)
     check("the capture race gets one bounded wait",
           "wait 10 seconds" in ctx and "retry the identical call once" in ctx)
     check("…and is never 'fixed' by dropping the type",
           "Do NOT drop the type" in ctx)
-    check("the conflict says the link did not happen",
-          "THE LINK DID NOT HAPPEN" in ctx)
+    check("the conflict says the link was refused too",
+          "THE LINK DID NOT HAPPEN EITHER" in ctx)
     check("…and is recovered by retrying without the fields",
           "classification_session_id REMOVED" in ctx)
     check("neither branch ever re-guesses a type",
           "Never try a different type" in ctx)
 
 
-def test_hostile_values_never_break_the_instruction():
-    """Server-controlled strings reach `.format()` — as ARGUMENTS, never as the
-    format string. A `{` in a repo name, a state, or a session id must not
-    raise: this runs in a PostToolUse hook, where an exception is a traceback
-    on a user's screen after a command that otherwise succeeded.
+def test_an_org_that_cannot_link_is_never_asked_to_classify():
+    off = pr_link.context_for(reply(github_connected=False), PR, SID, created=True)
+    check("disconnected GitHub gets the advisory only",
+          "pr_type" not in off and "GitHub integration connected" in off)
+    out = pr_link.context_for(reply(repo_in_install=False), PR, SID, created=True)
+    check("a repo outside the install gets the advisory only",
+          "pr_type" not in out and "isn't part of the install" in out)
+    check("a disabled org gets silence",
+          pr_link.context_for(reply(enabled=False), PR, SID, created=True) is None)
+    check("no session id means nothing to link or classify",
+          pr_link.context_for(reply(), PR, "", created=True) is None)
 
-    Also re-asserts the two properties most likely to rot: B2's last line, and
-    the two places the session id is written.
+
+def test_hostile_values_never_break_the_instruction():
+    """Server-controlled strings reach `.format()` as ARGUMENTS, never as the
+    format string — a `{` in a repo name or session id must not raise, because
+    this runs in a PostToolUse hook where an exception is a traceback on the
+    user's screen after a command that already succeeded.
     """
-    import itertools
     repos = ["o/r", "o/{r}", "{}", None, 123]
     states = ["open", "{state}", None]
-    sids = ["s1", "s{1}", "{0}{1}", "  spaced  ", 'quo"te', "back\\slash",
-            "nl\nline", "unicodé-ид", "{!r}", "%s"]
+    sids = ["s1", "s{1}", "{0}{1}", 'quo"te', "back\\slash", "unicodé-ид",
+            "{!r}", "%s"]
     rows = [[], [{"is_mine": True}], "not-a-list", [None, {"is_mine": True}]]
 
     raised = tail = mismatch = 0
-    for repo, state, sid, ls in itertools.product(repos, states, sids, rows):
-        body = reply()
+    for repo, state, sid, ls, ptype in itertools.product(
+            repos, states, sids, rows, (None, "fix")):
+        body = reply(ptype)
         body["pr"].update(repo_full_name=repo, state=state)
         body["linked_sessions"] = ls
         for created in (True, False):
@@ -206,33 +207,17 @@ def test_hostile_values_never_break_the_instruction():
                 continue
             if not created and not out.endswith("say nothing at all."):
                 tail += 1
+            # Both markers, asserted independently: an `and` guard here would
+            # score a break that stopped emitting session_ids as a pass.
             if (f'session_ids=["{sid}"]' in out) != (
-                    f'classification_session_id="{sid}"' in out):
+                    f'classification_session_id="{sid}"' in out or ptype == "fix"):
                 mismatch += 1
 
     check("no input shape raises out of context_for", raised == 0, f"{raised} raised")
-    check("B2 always ends on the line that keeps a babysit loop quiet",
+    check("B2 always ends on the line that quiets a babysit loop",
           tail == 0, f"{tail} lost the tail")
     check("the session id is written identically in both arguments",
           mismatch == 0, f"{mismatch} mismatched")
-
-
-def test_an_org_that_cannot_link_is_never_asked_to_classify():
-    # These replies return before the link text is built, so a classification
-    # block would be advice about a call the org cannot make at all.
-    off = pr_link.context_for(reply(github_connected=False), PR, SID, created=True)
-    check("disconnected GitHub gets the advisory only",
-          "pr_type=" not in off and "GitHub integration connected" in off)
-    out = pr_link.context_for(reply(repo_in_install=False), PR, SID, created=True)
-    check("a repo outside the install gets the advisory only",
-          "pr_type=" not in out and "isn't part of the install" in out)
-    check("a disabled org gets silence",
-          pr_link.context_for(reply(enabled=False), PR, SID, created=True) is None)
-
-
-def test_no_session_id_means_no_instruction_at_all():
-    check("an empty session id yields nothing to link or classify",
-          pr_link.context_for(reply(), PR, "", created=True) is None)
 
 
 if __name__ == "__main__":

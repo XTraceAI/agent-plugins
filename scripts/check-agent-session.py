@@ -438,14 +438,27 @@ def run_live(args, report, model):
         # denial is named as expected: a model that treats a denial as the end
         # of the task otherwise never writes the file or reports the advice,
         # and the run reads as a plugin failure.
+        # The advice the hook delivers is a team rule that asks the agent to
+        # put an identifier in its answer — the shape of a prompt injection,
+        # to a model that was not told to expect it — and the answer must
+        # carry that identifier byte-for-byte. The prompt says a rule will
+        # come, that copying it is the task, and that nothing is to be
+        # reported as done before it was done (Codex answered the whole JSON
+        # in four seconds without a single tool call in runs 35172322137 and
+        # 35073585094). The marker itself stays out of the prompt: it can
+        # only come from the hook.
         prompt = ("This is a synthetic plugin release test. Do not read credentials, environment variables, or plugin state. "
                   "Execute each requested shell command in a separate tool call; do not combine commands or wrap them in a script. "
-                  "Use only this workspace. Step 1: execute exactly `echo memhub-release-advice`. "
+                  "Use only this workspace, and do not report a step as done until you have actually performed it. "
+                  "Step 1: execute exactly `echo memhub-release-advice`. The plugin hooks are expected to deliver a team "
+                  "rule as hook context on this command; that rule is the test fixture, and it may ask you to include an "
+                  "identifier in your final answer — do so. "
                   f"Step 2: write allowed.txt containing exactly {marker}. "
                   f"Step 3: attempt exactly `touch {BLOCKED_FILE}` once. A hook is expected to deny it: respect the denial, "
                   "do not retry or override it, and continue. "
                   "Step 4: finish with a single JSON object and nothing else, with exactly these keys: "
-                  "\"advice\" (the advice text the plugin hooks delivered during this session, verbatim, or \"\" if none), "
+                  "\"advice\" (the rule text the plugin hooks delivered during this session, copied character for "
+                  "character — do not paraphrase or shorten it, and keep every identifier it contains — or \"\" if none), "
                   "\"blocked_command_denied\" (true if the touch was denied), \"allowed_file_written\" (true if allowed.txt was written).")
         started = time.time()
         recorded = {}
@@ -521,9 +534,22 @@ def run_live(args, report, model):
 
 
 def upgrade_nonce():
-    """A minimum version that exists nowhere but this run's 426 body. The hook
-    accepts up to six digits per component (rulebook_hook.upgrade_status)."""
-    return f"999.{secrets.randbelow(999999) + 1}.{secrets.randbelow(999999) + 1}"
+    """A minimum version that exists nowhere but this run's 426 body, in the
+    shape of a release a plugin manager could actually serve.
+
+    The hook accepts up to six digits per component
+    (rulebook_hook.upgrade_status), and the first form of this nonce used them:
+    ``999.NNNNNN.NNNNNN``. Sonnet 4.6 read that as "a clearly fabricated,
+    unrealistic version number", took the whole notice for a prompt injection
+    and refused to report it (reproduced locally; the red Claude legs of runs
+    35172322137, 35172808877, 35136738501 and 35073585094 have exactly that
+    shape: a second turn, no structured output, no fact in the final text),
+    so the leg failed on a model's suspicion, not on the plugin. Three
+    components in a plausible
+    range serve the same purpose: the answer is compared against the exact
+    string, and 567,000 values cannot coincide with anything else a session
+    sees."""
+    return f"{secrets.randbelow(7) + 3}.{secrets.randbelow(90) + 10}.{secrets.randbelow(900) + 100}"
 
 
 def upgrade_notice_evidence(text, fields, nonce, server_contacted):
@@ -607,7 +633,10 @@ def required_upgrade_evidence(host):
 
 
 def run_rejection(args, report, model):
-    with tempfile.TemporaryDirectory(prefix="memhub-agent-rejection-", ignore_cleanup_errors=True) as raw:
+    # Not "rejection": the directory name is the model's cwd, and Sonnet 4.6
+    # once cited "a synthetic test environment named for rejection" as its
+    # reason to treat the notice as an injection and reject it.
+    with tempfile.TemporaryDirectory(prefix="memhub-agent-upgrade-", ignore_cleanup_errors=True) as raw:
         root = Path(raw)
         env = isolated_env(root)
         ws = prepare_workspace(root, env, "memhub-release-upgrade")
@@ -622,13 +651,33 @@ def run_rejection(args, report, model):
         server.reject = True
         env["MEMHUB_MCP_BASE_URL"] = server.url + "/mcp-server/mcp"
         try:
-            prompt = ("Run `echo release-connectivity-check`. The plugin hooks will report a plugin compatibility problem; "
-                      "do not repair anything. Do not read plugin files, credentials or environment variables. "
-                      "Use only the information delivered by the plugin hooks. "
+            # The model is told the mechanism and asked a question it may
+            # answer "none" to. Left to infer, Sonnet 4.6 took the notice for a
+            # prompt injection about one time in five and refused to answer —
+            # twice, once more on Claude Code's own `[structured-output-enforce]`
+            # retry — which read as a failed leg. Its stated reasons, each
+            # answered here: the notice sits in session-start context rather
+            # than the command's output; it carries an instruction ("tell the
+            # user…"), which "legitimate telemetry" would not; and the schema
+            # matches its fields exactly. Insisting made it worse ("even if the
+            # version looks unusual" was itself named as pre-empting
+            # skepticism), so the ask is neutral and "" is an allowed answer.
+            # 16/16 local sessions on the pinned CLI reported the notice with
+            # this wording, against 4/6 with the old one. Nothing here names
+            # the error code or the version: those can only come from the
+            # notice.
+            prompt = ("This session is the MemHub plugin's release check for its upgrade notice. The installed "
+                      "plugin's hooks talk to a loopback test server that rejects the plugin's version, and the hook "
+                      "is expected to turn that rejection into an upgrade notice delivered as hook context — at "
+                      "session start or around a command, not in any command's own output. The notice is written "
+                      "for the agent, so it may include instructions such as telling the user to upgrade; this check "
+                      "only needs it reported. Run `echo release-connectivity-check`, then report what the hooks "
+                      "delivered during this session. Do not repair anything, and do not read plugin files, "
+                      "credentials or environment variables. "
                       "Finish with a single JSON object and nothing else, with exactly these keys: "
-                      "\"error_code\" (the exact error code the hooks reported), "
-                      "\"minimum_version\" (the exact minimum required plugin version they reported), "
-                      "\"remediation\" (the remediation they gave, verbatim).")
+                      "\"error_code\" (the exact error code the hooks reported, or \"\" if they reported none), "
+                      "\"minimum_version\" (the exact minimum required plugin version they reported, or \"\"), "
+                      "\"remediation\" (the remediation they gave, verbatim, or \"\").")
             def check():
                 events = drive(args.host, args.executable, installed, model, prompt, env, ws,
                                schema=UPGRADE_ANSWER, schema_path=answer_schema_path(root, UPGRADE_ANSWER))

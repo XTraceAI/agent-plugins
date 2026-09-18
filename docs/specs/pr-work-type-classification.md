@@ -10,7 +10,17 @@ type: spec
 into `staging` as `cd0732ed` on 2026-09-11. **Companion:** this repo's
 `docs/specs/pr-linking-plugin-spec.md` — the linking half, which this extends and does not replace.
 
-**Status:** specified. **Must not merge before staging is promoted to production** (§7).
+**Status:** **superseded in part.** This spec was written as the feature spec; while it was in
+review, [#245](https://github.com/XTraceAI/agent-plugins/pull/245) shipped the feature itself in
+v0.60.0 — the hook asks for a type, `/memhub:link-pr` classifies only a self-link, and
+`/memhub:find-contributing-sessions` never classifies. **Those shapes are the baseline and this
+document no longer proposes changing them.**
+
+What remains, and what v0.63.0 delivers, is the correctness half §1.4 implies and #245 did not
+carry: the ask is now CONDITIONAL. #245 asked unconditionally, and on a pull request that already
+has a type that earns `pr_classification_conflict` — which refuses **the whole write**, so the
+session is not linked at all. §2's two-call design for the skills is **withdrawn**; §3 and §3.4
+are what shipped.
 
 ---
 
@@ -146,6 +156,13 @@ The four existing call sites (`docs/specs/pr-linking-plugin-spec.md` §4.5, §8,
 classification; two need a second call because the backend refuses classification from their
 `link_source`.
 
+**WITHDRAWN — superseded by #245.** The table below proposed a second `session_self` call so
+`/memhub:link-pr` and `/memhub:find-contributing-sessions` could classify too. #245 landed the
+narrower shape instead: link-pr classifies only when the session links itself (one call), and the
+finder never classifies, on the reasoning that a scan is in no position to say what the work was —
+which is also what the ENG-1031 handoff meant by "a later contributing session must not reclassify
+the PR". Kept here for the record of what was considered.
+
 | Site | Today's `link_source` | Shape | Why |
 |---|---|---|---|
 | **B1** `pr_link.CREATED` — this call opened the PR | `session_self` | **one call**: link + type | The session has the diff, the branch and the PR body it just wrote in context. The best-informed moment there is. |
@@ -238,11 +255,10 @@ def classification_wanted(reply: object) -> bool:
 write can never be applied. A genuine race — two sessions typing the same PR in the same moment —
 still reaches a 409, which §3.4 tells the agent to report and never retry.
 
-> **Release lever.** This reads `pr.get("pr_type") is None`, so on a backend that does not know the
-> field at all the key is absent and the answer is still "ask" — which is wrong for production
-> until it is promoted (§7). Changing the condition to `"pr_type" in pr and pr["pr_type"] is None`
-> makes the plugin safe against an old backend and lets this merge before promotion. That is a
-> one-line change and a deliberate non-goal today, per §7.
+**On an old backend** the key is absent, so this still answers "ask". That is now harmless rather
+than a release constraint: #245 already ships the unconditional ask to production, so this change
+can only ever reduce what a prod client sends. The prod exposure it introduces is #245's, not
+this change's, and it is fixed by the same promotion.
 
 ### 3.3 The classification block
 
@@ -413,18 +429,10 @@ the **four production** manifests only — staging is checked separately and nee
 version. Prod↔staging parity is convention plus a real cache-key hazard (the plugin cache is keyed
 by version, so a stale manifest is never re-fetched), not something a test will catch.
 
-**Merge ordering — the one hard constraint.** Production deploys from `main`
-(`.github/workflows/deploy-production.yml`), which is currently 74 commits behind `staging` and
-carries neither `app/models/pr_classification.py` nor the `pr_classifications` migration. A prod
-client sending `pr_type` to that backend gets its `link_pr` call rejected, and because
-classification refuses the whole write, the result is **no link at all** — a regression on a
-feature that works today.
-
-So: **open the PR, keep it unmerged until staging is promoted to production.** There is
-deliberately no runtime gate; §3.2 records the one-line change that would add one if this needs to
-merge sooner. `docs/ops/next-production-release.md` in the backend recorded an open ENG-1027
-prerequisite blocking normal releases as of 2026-09-12, so expect this to wait and to need a
-rebase.
+**Merge ordering.** No longer a blocker. v0.62.0 already ships the unconditional ask to
+production, so this change strictly narrows what a prod client sends — an already-typed pull
+request stops being asked about, which is right on every backend. The original constraint applied
+when this was the feature PR; #245 took that exposure first.
 
 ---
 

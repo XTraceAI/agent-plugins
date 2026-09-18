@@ -125,59 +125,15 @@ link_pr(pr_url="…", session_ids=[approved…], link_source="session_found")
 scan a human confirmed, which is a different claim from `session_self` (the
 session was there) and `manual` (a person named it outright).
 
-## 6. Record the work type
+**Never send `pr_type` from here.** The server takes a classification only with
+`link_source="session_self"`, and for good reason: this skill links sessions it
+found by scanning, so it is in no position to say what the pull request's work
+was. The session that opened the PR classifies it (the plugin's own hook asks
+it to); a scan does not.
 
-Read `pr.pr_type` on the reply from step 5. **If it is not null**, say which
-type the pull request already carries and go straight to step 7. A later contributing session
-does not get to relabel a pull request, and the backend would refuse it anyway:
-the first decision is permanent.
+## 6. Report
 
-If it is null, the type describes the work the scan just found. Take the
-**highest-scoring session the user approved** as the one that speaks for it —
-note that a stronger contributor may have been excluded in step 4 for being
-already linked, and the id you name here is recorded permanently as the
-classification's author. Show the user the choice alongside the links they just
-approved, and let them confirm:
-
-```
-feat — a new capability or behavior
-fix — corrects existing faulty behavior
-chore — maintenance, tooling, dependencies, tests, build/CI, style
-docs — documentation changes
-perf — performance improvements
-refactor — structural change that preserves intended behavior
-other — a deliberate choice when none of the above fit
-```
-
-Then one more call, naming only that session:
-
-```
-link_pr(pr_url="…", session_ids=["<highest-scoring approved id>"],
-        link_source="session_self", pr_type="<confirmed type>",
-        classification_session_id="<that same id>")
-```
-
-`session_self` rather than `session_found` is required — the server refuses
-classification from any other value — and it relabels nothing: the rows written
-in step 5 keep their `session_found` source, because a confirmed link is never
-rewritten. `classification_session_id` must be byte-identical to its entry in
-`session_ids`. The expected reply is `linked: []` with
-`skipped: already_linked` and `pr.pr_type` set; that is **success**, not a
-skipped link.
-
-If it fails saying the session **"was not found among your sessions"**, wait
-10s and retry that call once; if it fails again, say the links stand but the
-type was not recorded. If it fails saying the PR **"already has a different
-classification"**, someone classified it between step 5 and now — the links
-from step 5 already landed, so report the type that is there and never try
-another one.
-
-Never classify a session the user did not approve, and never classify at all if
-they approved nothing.
-
-## 7. Report
-
-Exactly as `/memhub:link-pr` step 5: relay `created` / `upgraded` /
+Exactly as `/memhub:link-pr` step 4: relay `created` / `upgraded` /
 `skipped: already_linked` / `skipped: session_not_found` honestly, relay
 `github_not_connected`, `repo_not_in_install` and `feature_disabled` with their
 messages and do not retry them, and mention the PR-comment refresh only if

@@ -114,7 +114,14 @@ installs from a local clone:
   into `../memhub/`. They arrive dangling — observed live on PR #56: the
   install came up with no `scripts/` directory at all and still reported
   success. A path source copies from the local clone and dereferences the
-  symlinks.
+  symlinks — **on Claude Code. Codex's installer does not.** Observed live on
+  Codex 0.154.0: `codex plugin add` from a local-path marketplace copies a
+  plugin's regular files and SKIPS its symlinks, so staging landed as three
+  files (`.claude-plugin/plugin.json`, `.mcp.json`, `mcp.json`) with no
+  `scripts/` at all — and reported success, printing the version. A blind
+  `codex exec` session against that install captured nothing and said nothing.
+  So "use a path source" makes staging installable on Claude Code only; on
+  Codex there is no source type that installs it correctly.
 - **Also nonconforming under Agent Plugins 1.0:** the spec requires
   symlinks to resolve inside the plugin root; staging's escape to
   `../memhub/` disqualifies it from any spec-conformant installer. One more

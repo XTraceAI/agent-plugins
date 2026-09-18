@@ -91,6 +91,15 @@ Restart, open `/hooks`, and trust only MemHub's `SessionStart`, `PreToolUse`,
 `PostToolUse`, and `Stop` handlers from `~/.codex/hooks.json`. Finally ask it to **Onboard MemHub
 for this repo**.
 
+> **Both of those steps are required, not optional.** Codex reports
+> `plugin_hooks` as `removed` (`codex features list`, verified on 0.146 and
+> 0.154), so the `hooks` key in the plugin's own manifest is never dispatched —
+> **Set up MemHub** installs the user-level bridge that is the only path by
+> which MemHub hooks run. And an untrusted handler is never dispatched either,
+> so a session started before the `/hooks` approval captures nothing. Skip
+> either step and capture is silently off, with the plugin otherwise appearing
+> installed and healthy.
+
 ### Cursor
 
 ```bash
@@ -134,6 +143,21 @@ The detailed lifecycle below describes the Claude Code path. Codex and Cursor
 use equivalent host-specific readers and flushers under
 `plugins/memhub/scripts/`.
 
+One Codex-specific rule falls out of that:
+
+- **Codex's own threads are not captured.** Codex runs threads alongside
+  yours — spawned subagents, guardian action-reviews, memory consolidation —
+  and each copies the conversation it is working on, so it looks like a real
+  transcript and takes its title from the reviewer's prompt. Capture reads
+  `thread_source` from the rollout header and skips those three kinds by name.
+  Everything else is yours and is captured: a rollout old enough to predate the
+  field, and — deliberately — a kind we have never seen. Codex's own
+  `ThreadSource` type is open-ended (`Feature(String)`), so new product
+  surfaces appear as new values; refusing them by default would silently drop
+  real sessions, and because the skip advances the capture cursor that loss
+  would be unrecoverable. An unfamiliar value is captured and noted in the
+  Codex capture log instead.
+
 Capture runs on independent paths that all feed one server-side watermark
 (keyed on `conversation_id` = `session_id`), so re-sending never double-saves:
 
@@ -145,7 +169,18 @@ Capture runs on independent paths that all feed one server-side watermark
    boundaries). A cheap prefilter (`turn_flush_prefilter.py`, plain `python3`,
    no `uv`) skips the expensive spawn when there's nothing new to send, a
    flush is already in flight, or capture is switched off
-   (`MEMHUB_TURN_FLUSH=0`).
+   (`MEMHUB_TURN_FLUSH=0`). The delta is **bounded** before it is sent — it
+   goes through `transcript_chunks.slices()`, the same splitter the
+   whole-transcript paths use, and only the first payload ships, with the
+   cursor landing on the last record in it. Without that bound, a session whose
+   pending delta outgrew the server's request limit got a `413` on every turn,
+   could not advance a cursor past bytes that were never sent, and re-sent the
+   same ever-growing delta forever — per-turn capture dead for the rest of that
+   session's life, on exactly the long sessions worth keeping. A backlog now
+   drains over the next few turns, because steady-state deltas are kilobytes;
+   if the server's limit turns out to be lower still the cap halves for that
+   session, and a single record no payload can carry is stepped over rather
+   than pinning every turn behind it.
 2. **`SessionEnd` (backstop).** Deliberately independent of the per-turn
    cursor — it re-sends the whole transcript-so-far and lets the server's
    watermark dedup, so it still captures a session whose per-turn path was
@@ -287,6 +322,17 @@ stay as short as they were. The server takes no position on any of this: it
 puts each rule's book, scope and member count on the wire and the client
 decides.
 
+A fire is reported under the same session identity capture used, so the fire
+history can show *which session* a rule fired in. That identity is namespaced
+per host — Claude sends the session id bare, Codex and Cursor send
+`codex-`/`cursor-`-prefixed, matching what their capture uploads. Before this,
+a Codex fire named the bare id while its session was stored prefixed, so every
+Codex fire showed as `Not linked yet`. The namespace is applied only on the
+wire: local ordering state, obligations and dedup keys still key off the raw
+id, so an in-flight session keeps its own state. Fires recorded by an older
+plugin keep the id they were written with and stay unlinked — linking those
+retroactively is a server-side change, not a client one.
+
 Authoring (`/memhub:create-rule`, `/memhub:rules-from-sessions`) resolves which
 book a rule lands in before drafting anything — one visible book is the answer,
 several is a question for you, none is an offer to create one that binds only
@@ -390,12 +436,13 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   to a pull request in MemHub, so the PR's session context is published from a
   confirmed fact rather than a branch-name guess. This is also how a PR opened
   by something the hook cannot see — a script, a CI helper — gets linked, and
-  on Cursor it is the only way to record a PR's work type.
+  on Cursor it is the only way to record a PR's work type, and only for a PR
+  this session itself wrote.
 - `/memhub:find-contributing-sessions [pr]` — scans this machine's session
   history (Claude Code, Codex, Cursor) for the sessions that wrote a PR's code,
   ranks the candidates by the evidence that matched, and links the ones you
-  approve. It never links anything without an explicit yes, and it records the
-  PR's work type only when the PR has none yet.
+  approve. It never links anything without an explicit yes, and it never
+  records a work type — a scan cannot say what the work was.
 
 ## PR babysitting
 
@@ -444,17 +491,20 @@ question and injects one instruction. There are three answers:
   it wrote that code in this session, and otherwise offers
   `/memhub:find-contributing-sessions`.
 
-**The agent also says what kind of work the PR is.** Whenever it links a pull
+**The agent also says what kind of work the PR is.** When it links a pull
 request that has no type yet, the same call carries one of `feat`, `fix`,
-`chore`, `docs`, `perf`, `refactor` or `other` — chosen from the diff the
-session actually produced, never parsed out of the title. MemHub deleted its
-own title-and-branch inference, so a pull request nobody labels simply has no
-type; there is no hidden backfill. **The first label is permanent** — there is
-no correction endpoint — so a PR that already carries one is never re-asked,
-and a genuine collision is reported rather than overwritten. A multi-purpose PR
-gets its primary purpose; `other` is a legitimate answer and a better one than
-a guess. `/memhub:link-pr` asks *you* for the type instead of deciding, since
-that path is a person speaking.
+`chore`, `docs`, `perf`, `refactor` or `other` — read off the change itself,
+never parsed out of the title. MemHub deleted its own title-and-branch
+inference, so a pull request nobody labels simply has no type; there is no
+hidden backfill.
+
+**The first label is permanent**, and that is why the type is asked for only
+when the server reports the PR as unclassified. A second attempt does not just
+lose the type: the server refuses the whole write, so the session would not get
+linked either. A PR that already carries a type therefore gets the plain link
+instruction, and a genuine race is reported rather than retried. A
+multi-purpose PR gets its primary purpose; `other` is a legitimate answer and a
+better one than a guess.
 
 Unconditional self-linking is deliberately the **narrow** lane. A hand-rolled
 `curl -X POST …/pulls` is not treated as a creation: recognising a write meant

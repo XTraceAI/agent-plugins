@@ -71,9 +71,16 @@ Ask Codex:
 Set up MemHub
 ```
 
-Codex 0.148 and 0.149 support user-level hooks but do not mount hooks bundled
-inside an installed plugin. The `setup` skill therefore merges four MemHub
-handlers into `~/.codex/hooks.json` while preserving unrelated hooks:
+Codex supports user-level hooks but does NOT dispatch hooks bundled by an
+installed plugin: `codex features list` reports `plugin_hooks` as
+`removed`, verified on 0.146 and 0.154, and enabling it is a no-op
+because a removed stage stays `false`. The plugin's own
+`.codex-plugin/plugin.json` `hooks` key is therefore inert, so this
+bridge is not a stopgap for one version window — it is the ONLY path by
+which MemHub hooks run on Codex. Without it capture is silently off.
+
+The `setup` skill merges four MemHub handlers into
+`~/.codex/hooks.json` while preserving unrelated hooks:
 
 - `SessionStart`: rulebook posture rules and any plugin-upgrade notice, the
   repo brain brief, and a capture-health warning;

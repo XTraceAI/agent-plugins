@@ -47,7 +47,9 @@ browser to refresh an expiring token. See `/memhub:login` for the full story.
 - `list_agent_brains` → **exact-name match**. Reuse the existing id if found (a
   teammate may have created it). **Only** `create_agent_brain` when there is no
   exact match — do NOT mint a second room for a repo that already has one, and
-  give it a real one-line description.
+  give it a real one-line description plus `category: "repo"`, which is what
+  declares this brain a code repository's room rather than leaving it
+  uncategorised.
 - Edge cases (SSH remotes, no remote, worktrees, **not a git repo at all**) and
   the full create-time rules are in
   `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
@@ -93,11 +95,15 @@ Import it via the helper script (never call `import_conversation` yourself; it
 handles any size):
 
 ```bash
-uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/import_session.py" \
-  --session "<session-id-or-path>" \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" import \
+  --session "<session-id-or-path>" --host auto \
   --title "Onboarding seed — <org>/<repo>" \
   --agent-brain-id "<ROOM>"
 ```
+
+`capture.py import` is the one import path for every host — it normalises a
+Codex or Cursor session and hands Claude's own transcripts straight through to
+the same shipper, so onboarding works wherever the plugin is installed.
 Do NOT pass `--conversation-id`. Omitted, it defaults to the session's own id —
 the one per-turn capture uses — so the seed lands as ONE conversation in this
 room rather than a second copy of a session capture may have already sent. A
@@ -138,14 +144,26 @@ source (grep-hostile, hierarchical) when the user wants the brain to help beyond
 the one session's slice.
 
 ## 3. Orient — the guaranteed aha (the brain describing the user's own repo)
-Poll `get_brain_overview(ROOM)` until it returns a non-null `overview`
-(the event-triggered digest refresh fires off the import). If it is still null
-after a couple of polls, call `refresh_brain_overview(ROOM)` to run the digest on
-demand rather than waiting on the async trigger, then poll again. Poll a few
-times over ~2–5 min; if still null, tell the user the overview is still compiling
-and to re-run `get_brain_overview` shortly — do NOT block indefinitely. When it renders,
-show it: *"Here's what MemHub already learned about your repo."* This is the
-reliable payoff and it's on the user's OWN content, not a demo.
+Call `get_brain_overview(ROOM)`. It returns `{overview, version, updated_at,
+index, index_markdown}` and the two halves arrive at different times, so read
+both:
+
+- **`index_markdown`** — the brain's Index, rendered from the rows themselves:
+  fact types with counts, episodes, and artifacts by group with the newest
+  lineages under each. It is present **as soon as there are rows to render**,
+  so show it on the FIRST call rather than waiting: a seeded brain can describe
+  itself before any summary exists.
+- **`overview`** — the compiled markdown summary, which is generated
+  asynchronously and is `null` (with a `message`) until it lands.
+
+So: show the Index immediately — *"Here's what MemHub already learned about
+your repo."* Then poll for `overview`; if it is still null after a couple of
+polls, call `refresh_brain_overview(ROOM)` to run the digest on demand rather
+than waiting on the async trigger, then poll again over ~2–5 min. Still null →
+say the summary is still compiling and that the Index above is already the
+brain's own map — do NOT block indefinitely, and never report the step as
+empty when `index_markdown` rendered. This is the reliable payoff and it's on
+the user's OWN content, not a demo.
 
 ## 4. Prove proactive recall — the delight aha
 Pick 2–3 concrete symbols the seeded work actually touched (from
