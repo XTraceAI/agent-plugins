@@ -86,7 +86,9 @@ Do exactly this:
    the page needs, not just the page: a deliverable uploaded without its
    stylesheet or images renders broken and looks like a server fault.
    `--entrypoint` takes the bundle path (`index.html` here), and a lone
-   attachment keeps its basename. Give a text body too whenever you have one:
+   attachment keeps its basename. Attach the paths the page references, symlinks
+   and all: the bundle path follows what you pass, so a symlinked `assets/`
+   directory stays `assets/` instead of becoming its link target. Give a text body too whenever you have one:
    the bytes are the payload, the text is what makes the deliverable findable
    by search. Keep the bundle to a few MB — a large file belongs in
    `ingest_document_from_url` instead.

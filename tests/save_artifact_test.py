@@ -174,6 +174,25 @@ with tempfile.TemporaryDirectory() as td:
     check(rc == 0 and paths == ["index.html", "static/js/app.js"],
           f"common parent is the bundle root, not the filesystem root: {paths}")
 
+    shared = out / "shared"; shared.mkdir()
+    (shared / "app.js").write_text("console.log(2)\n", encoding="utf-8")
+    site = out / "site"; site.mkdir()
+    (site / "index.html").write_bytes(b"<script src=assets/app.js></script>")
+    try:
+        (site / "assets").symlink_to(Path("..") / "shared", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        print("  (skipped: this filesystem has no symlinks)")
+    else:
+        rc = run("--attach", str(site / "index.html"), "--attach", str(site / "assets" / "app.js"),
+                 "--entrypoint", "index.html", "--name", "Site")
+        # Resolving the link instead would store `shared/app.js` and reject the
+        # entrypoint, so nothing is sent at all: report that, do not index into it.
+        paths = sorted(f["path"] for f in calls[-1]["files"]) if calls else []
+        check(rc == 0 and paths == ["assets/app.js", "index.html"],
+              f"a symlinked asset dir keeps the path the page references, not the link target: {paths}")
+        check(rc == 0 and calls and calls[-1].get("entrypoint") == "index.html",
+              "--entrypoint still names the page when an asset dir is a symlink")
+
     print("refusals")
     rc = run("--attach", str(out / "nope.png"), "--name", "Report")
     check(rc == 2 and not calls, "a missing attachment is an error, nothing is sent")

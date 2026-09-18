@@ -63,6 +63,14 @@ def _bundle(paths, entrypoint):
     `index.html` and `assets/chart.png`, and the page still resolves its own
     asset. A single file keeps its basename. Flattening every attachment to its
     basename would upload a page whose scripts, styles and images all 404.
+
+    The root is computed over the paths AS WRITTEN (`abspath`, which normalises
+    `.`/`..` lexically), never `resolve()`. A deliverable's asset directory is
+    often a symlink — `build/assets -> ../shared` — and resolving it replaces
+    the path the page references with the link's target, so `build/assets/app.js`
+    would be stored as `shared/app.js` and the page's own `assets/app.js` would
+    404. The bytes are still read THROUGH the link; only the name follows what
+    the caller wrote.
     """
     import base64
     import mimetypes
@@ -73,9 +81,9 @@ def _bundle(paths, entrypoint):
         return [], None
     resolved = []
     for path in paths:
-        if not path.is_file():
+        if not path.is_file():   # follows links: a symlinked asset must still be readable
             return [], f"attachment not found: {path}"
-        resolved.append(path.resolve())
+        resolved.append(Path(os.path.abspath(str(path))))
     parents = [str(p.parent) for p in resolved]
     root = os.path.commonpath(parents) if len(parents) > 1 else parents[0]
 
