@@ -57,6 +57,16 @@ def fixture_config(raw):
 
 
 def validate_live_fixture(package, fixture, token):
+    # The packaged transport imports sibling modules, just as installed hooks do.
+    # Keep that path available through lazy imports during the whole probe.
+    sys.path.insert(0, str(package / "scripts"))
+    try:
+        return _validate_live_fixture(package, fixture, token)
+    finally:
+        sys.path.pop(0)
+
+
+def _validate_live_fixture(package, fixture, token):
     require(token.startswith("mhk_") and not any(c.isspace() for c in token), "production E2E key is malformed")
     http = compat.load_module("release_http", package / "scripts/mcp_http.py")
     result = http.request(compat.PRODUCTION + "/mcp-server/mcp", token, "tools/call",
