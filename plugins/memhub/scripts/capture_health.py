@@ -106,6 +106,14 @@ _REASONS = {
     # dealt with.
     "budget_exhausted": "capture ran out of time before it finished sending",
     "error": "the capture hook hit an unexpected error",
+    # Not a credential problem, so the default "/memhub:login --status" advice
+    # would send someone to inspect the one thing that is definitely fine. Gets
+    # its own remedy in `_message`. Written by codex_hook_bridge when it cannot
+    # find the plugin's scripts at all — observed live: `codex plugin add`
+    # skips a plugin's symlinks, so the staging build installs as three files
+    # with no `scripts/` directory, and every hook then exits in silence.
+    "plugin_root_unresolved": ("this Codex install is missing the plugin's "
+                               "script files, so nothing was captured"),
 }
 
 
@@ -483,6 +491,11 @@ def _message(host: str, token_problem: str | None,
                     "/memhub:import-session to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
+        elif reason == "plugin_root_unresolved":
+            # Nothing about the credential is wrong, and nothing retries on its
+            # own — the files have to come back first.
+            tail = ("Reinstall the MemHub plugin, then run the memhub:setup "
+                    "skill to confirm the bridge can find it.")
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

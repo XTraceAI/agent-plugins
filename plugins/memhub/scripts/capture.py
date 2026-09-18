@@ -119,12 +119,23 @@ def _candidates(hosts: list[str], target: str, max_age_s: float, now: float) -> 
             listed = reader.list_sessions(limit=_CANDIDATE_SCAN)
         except Exception:  # noqa: BLE001 — one unreadable host must not blind the rest
             continue
+        own_thread = getattr(reader, "is_own_thread_path", None)
         for row in listed:
             mtime = row.get("mtime") or 0
             # Cheap first: this comes from the listing, so a stale session
             # costs nothing. Only survivors get their transcript opened.
             if now - mtime > max_age_s:
                 continue
+            # Codex runs its own threads (guardian reviews, subagents) in the
+            # same rollout store. Capture refuses them, so offering them as
+            # candidates here would propose exactly the sessions that cannot
+            # be captured. Bounded header read; hosts without the notion are
+            # unaffected.
+            try:
+                if own_thread is not None and not own_thread(row["path"]):
+                    continue
+            except Exception:  # noqa: BLE001 — unreadable header: keep the candidate
+                pass
             try:
                 cwd = reader.session_cwd(row["path"])
             except Exception:  # noqa: BLE001
