@@ -475,10 +475,37 @@ def _detach_flush(root: Path, payload: bytes, event: str) -> None:
         raise
 
 
+def _user_bridge_handles(event: str, payload: bytes) -> bool:
+    """Bundled hooks defer to the explicitly installed user bridge, per event."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    runner = home / "memhub_hook_bridge.py"
+    if not runner.is_file():
+        return False
+    try:
+        doc = json.loads((home / "hooks.json").read_text())
+        tool = json.loads(payload or b"{}").get("tool_name", "")
+        for group in doc.get("hooks", {}).get(event, []):
+            matcher = group.get("matcher")
+            if matcher and not re.search(matcher, tool):
+                continue
+            for handler in group.get("hooks", []):
+                command = handler.get("commandWindows" if os.name == "nt" else "command", "")
+                if (handler.get("type") == "command" and
+                        str(runner).replace("\\", "/") in command.replace("\\", "/") and
+                        "dispatch " + event in command):
+                    return True
+    except (OSError, ValueError, TypeError, AttributeError, re.error):
+        pass
+    return False
+
+
 def main() -> int:
     try:
         action = sys.argv[1] if len(sys.argv) > 1 else ""
         payload = sys.stdin.buffer.read()
+        if ("--plugin-hook" in sys.argv and len(sys.argv) > 2
+                and _user_bridge_handles(sys.argv[2], payload)):
+            return 0
         root = resolve_plugin_root()
         if root is None:
             _report_unresolved(action, sys.argv[2] if len(sys.argv) > 2 else "")

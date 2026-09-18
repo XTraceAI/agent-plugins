@@ -1,0 +1,3 @@
+observers:
+  - rule_fired: {rule: 'Harness fixture: override probe is gated', lane: pre, mode: gate, tool: Bash}
+  - tool_blocked: {command: 'harness-override-probe', blocked: true}

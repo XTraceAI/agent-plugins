@@ -6,8 +6,8 @@
           {
             "type": "command",
             "timeout": 8,
-            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch SessionStart; fi",
-            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch SessionStart) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch SessionStart)",
+            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch SessionStart --plugin-hook; fi",
+            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch SessionStart --plugin-hook) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch SessionStart --plugin-hook)",
             "statusMessage": "MemHub: orienting this session"
           }
         ]
@@ -20,8 +20,8 @@
           {
             "type": "command",
             "timeout": 8,
-            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch PreToolUse; fi",
-            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PreToolUse) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PreToolUse)",
+            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch PreToolUse --plugin-hook; fi",
+            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PreToolUse --plugin-hook) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PreToolUse --plugin-hook)",
             "statusMessage": "MemHub: checking for relevant directives"
           }
         ]
@@ -34,8 +34,8 @@
           {
             "type": "command",
             "timeout": 16,
-            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch PostToolUse; fi",
-            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PostToolUse) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PostToolUse)",
+            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch PostToolUse --plugin-hook; fi",
+            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PostToolUse --plugin-hook) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch PostToolUse --plugin-hook)",
             "statusMessage": "MemHub: checking memory context"
           }
         ]
@@ -47,8 +47,8 @@
           {
             "type": "command",
             "timeout": 30,
-            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch Stop; fi",
-            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch Stop) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch Stop)"
+            "command": "IN=$(cat); R=\"${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}\"; P=$(command -v python3 || command -v python); if [ -n \"$P\" ] && [ -n \"$R\" ] && [ -f \"$R/scripts/codex_hook_bridge.py\" ]; then printf %s \"$IN\" | \"$P\" \"$R/scripts/codex_hook_bridge.py\" dispatch Stop --plugin-hook; fi",
+            "commandWindows": "if defined PLUGIN_ROOT (py -3 \"%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch Stop --plugin-hook) else if defined CLAUDE_PLUGIN_ROOT (py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py\" dispatch Stop --plugin-hook)"
           }
         ]
       }
