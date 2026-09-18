@@ -461,6 +461,19 @@ def main():
                              "result_rx": "FAIL", "warn_once_per": "turn"}})
         check("to_hook_rule: result event maps command_rx→cmd_rx, result_rx→rx, turn→call",
               rr["cmd_rx"] == "pytest" and rr["rx"] == "FAIL" and rr["fire_scope"] == "call", str(rr))
+        # A create-rule §4b forward test arms an UNFILED candidate in this very
+        # book, and `deny` is decided from the book with no server round-trip.
+        # The skill writes `mode: advise` for that reason, but a sentence in a
+        # SKILL.md is an intention; the guard is what makes it true.
+        _gate = {"event": "pre", "command_rx": "git push"}
+        cand = H.to_hook_rule({"rule_id": "candidate-4f2a1b9c", "statement": "s",
+                               "mode": "gate", "matcher": dict(_gate)})
+        check("to_hook_rule: a forward-test candidate advises even when its row says gate",
+              cand["mode"] == "advise" and "candidate" in (cand.get("_degraded") or ""), str(cand))
+        filed = H.to_hook_rule({"rule_id": "r-filed", "statement": "s",
+                                "mode": "gate", "matcher": dict(_gate)})
+        check("to_hook_rule: the candidate guard leaves a filed gate rule alone",
+              filed["mode"] == "gate", str(filed))
         rows_, end_ = H._read_rows(ledger, os.path.getsize(ledger) + 10_000)
         check("_read_rows: a watermark past EOF (rotated ledger) restarts from 0", end_ == os.path.getsize(ledger) and rows_)
         with open(sent_p, "w", encoding="utf-8") as f:

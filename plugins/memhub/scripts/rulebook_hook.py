@@ -1926,11 +1926,27 @@ def _norm_given(r):
     return True
 
 
+#: The id /memhub:create-rule's forward test (§4b.3) gives the candidate it arms
+#: in the local book. Such a row is UNFILED and UNREVIEWED, so it must never be
+#: able to refuse a command — not the test sub-agent's, and not the person's.
+CANDIDATE_ID_PREFIX = "candidate-"
+
+
 def _degrade(row, r, given=None, unknown_matcher=""):
     """Mark `r` advise-only when this hook cannot honour `row` in full."""
     if r is None:
         return None
     r.pop("min_hook_version", None)      # answered here; never a matcher field
+    # A forward-test candidate advises, whatever its row says. create-rule §4b.3
+    # already writes `mode: advise` for exactly this reason — but that is a
+    # sentence in a SKILL.md, carried out by a model, so it is an intention and
+    # not a guarantee. The book is a plain file on disk and `deny` is decided
+    # from it with no server round-trip, so here is the only place the promise
+    # can be made true.
+    if str(r.get("id") or "").startswith(CANDIDATE_ID_PREFIX):
+        r["mode"] = "advise"
+        r["_degraded"] = "an unfiled forward-test candidate advises, never gates"
+        return r
     why = degradation(row, given, r.get("ordering"))
     if not why and unknown_matcher:
         why = f"this hook does not understand `matcher.{unknown_matcher}`"
