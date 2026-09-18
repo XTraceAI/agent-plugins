@@ -188,6 +188,30 @@ RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the t
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
+
+# ── forward-test redirect (spec §4.3.3) ─────────────────────────────────────
+#
+# /memhub:create-rule's §4b test has to arm its candidate in a book the hook
+# really reads, and until now that meant editing the SHARED book — one file per
+# repo, read by every session on this machine on every PreToolUse. Two tests
+# that interleave leave an unfiled candidate armed with no backup left to find
+# it by, and a sibling session's fire lands inside the test's own evidence
+# window.
+#
+# So the test may instead redirect ITS OWN calls to a private base. The
+# redirect is keyed on the session cwd, because §4b already confines the test
+# sub-agent to a scratch worktree: calls made in there read the doctored book,
+# every other session on the machine reads the real one. A marker that simply
+# said "use this base" would redirect everybody, which is the opposite of what
+# the test needs.
+#
+# Payload data must not steer where the hook looks (see `_acted_on_dir`). The
+# cwd is the host's, not the model's, so it is the trust boundary here as it is
+# there — and the redirect file itself must be the user's own and not group- or
+# world-writable, or it is ignored.
+REDIRECT_NAME = "pretest-redirect.json"
+REDIRECT_MAX_AGE_S = 3600    # a forgotten redirect stops steering anything after an hour
+_ACTIVE_BOOK_DIR = BOOK_DIR  # rebound once per process, by set_active_base()
 REFRESH_AFTER_S = 60         # pre lane: refresh a book this old in the background…
 REFRESH_RETRY_S = 60         # …and retry no more than this often while the server is down
 SESSION_FETCH_TIMEOUT_S = 1.0   # session lane: the ONE blocking fetch, and only on a stale book
@@ -1710,12 +1734,56 @@ def given_ok(rule, probes, read=None):
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
+def _redirect_base(cwd):
+    """The private base a §4b forward test claimed for `cwd`, or "".
+
+    Every failure — missing, unreadable, malformed, stale, someone else's file,
+    a writable-by-others file, a cwd outside the claimed prefix — reads as "no
+    redirect" and the real base is used. A broken redirect must never take a
+    session's rules away from it."""
+    if not cwd:
+        return ""
+    try:
+        p = os.path.join(BASE, REDIRECT_NAME)
+        st = os.stat(p)
+        if st.st_uid != os.getuid() or (st.st_mode & 0o022):
+            return ""                       # not ours, or writable by others
+        if time.time() - st.st_mtime > REDIRECT_MAX_AGE_S:
+            return ""                       # forgotten by an interrupted run
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        base, prefix = str(d.get("base") or ""), str(d.get("cwd_prefix") or "")
+        if not base or not prefix or not os.path.isdir(base):
+            return ""
+        here = os.path.normpath(os.path.abspath(cwd))
+        # Both spellings must hold, as in `_acted_on_dir`: a symlink must not
+        # be able to pull a session into the test's book or out of it.
+        if not (_under(here, os.path.normpath(os.path.abspath(prefix)))
+                and _under(os.path.realpath(here), os.path.realpath(prefix))):
+            return ""
+        return base
+    except Exception:
+        return ""
+
+
+def set_active_base(cwd):
+    """Bind this process to the base its `cwd` belongs to. Called once, after
+    the payload is parsed and before any book is read."""
+    global _ACTIVE_BOOK_DIR
+    base = _redirect_base(cwd)
+    _ACTIVE_BOOK_DIR = os.path.join(base, "book") if base else BOOK_DIR
+    return _ACTIVE_BOOK_DIR
+
+
 def book_path(repo):
     """Readable name + a hash of the RAW name, so two repos that sanitise to
-    the same string ('my repo' / 'my_repo') never share a book."""
+    the same string ('my repo' / 'my_repo') never share a book.
+
+    Under `_ACTIVE_BOOK_DIR`, which is the real base unless a forward test has
+    claimed this cwd (`set_active_base`)."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo)[:60] or "norepo"
     h = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:8]
-    return os.path.join(BOOK_DIR, f"{safe}-{h}.json")
+    return os.path.join(_ACTIVE_BOOK_DIR, f"{safe}-{h}.json")
 
 
 def load_book(repo):
@@ -4138,8 +4206,12 @@ def main():
         # test would then doctor a file nothing loads.
         repo = sys.argv[2] if len(sys.argv) > 2 else ""
         if not repo.strip():
-            print("usage: rulebook_hook.py book-path <repo>", file=sys.stderr)
+            print("usage: rulebook_hook.py book-path <repo> [cwd]", file=sys.stderr)
             return 2
+        # The optional cwd answers "where does a call made THERE read its book
+        # from" — which is what a forward test needs, and what tells it whether
+        # its redirect took effect before it writes a candidate anywhere.
+        set_active_base(sys.argv[3] if len(sys.argv) > 3 else "")
         print(book_path(repo))
         return 0
     if mode == "flush":
@@ -4206,6 +4278,10 @@ def main():
     # the SESSION's directory: a `cd` or `-C` in the command is resolved
     # against where the terminal is, not against the edited file's checkout.
     cwd = data.get("cwd") or os.getcwd()
+    # Before any book is read: a §4b forward test may have claimed this cwd,
+    # in which case every book read below comes from its private base instead
+    # of the shared one. No claim (the overwhelming case) → the real base.
+    set_active_base(cwd)
     repo, root, gitdir, branch = repo_of_call(data)
     if not repo:            # nothing this call touches is in a git repo → no rules apply
         return 0
