@@ -115,6 +115,14 @@ _REASONS = {
     "payload_too_large": ("one turn was too large for the server to accept in "
                           "one piece"),
     "error": "the capture hook hit an unexpected error",
+    # Not a credential problem, so the default "/memhub:login --status" advice
+    # would send someone to inspect the one thing that is definitely fine. Gets
+    # its own remedy in `_message`. Written by codex_hook_bridge when it cannot
+    # find the plugin's scripts at all — observed live: `codex plugin add`
+    # skips a plugin's symlinks, so the staging build installs as three files
+    # with no `scripts/` directory, and every hook then exits in silence.
+    "plugin_root_unresolved": ("this Codex install is missing the plugin's "
+                               "script files, so nothing was captured"),
 }
 
 
@@ -519,6 +527,11 @@ def _message(host: str, token_problem: str | None,
             # steps over anything it can never send, so this resolves itself.
             tail = ("Capture splits it over the next few turns on its own, "
                     "and the session-end backstop covers the rest.")
+        elif reason == "plugin_root_unresolved":
+            # Nothing about the credential is wrong, and nothing retries on its
+            # own — the files have to come back first.
+            tail = ("Reinstall the MemHub plugin, then run the memhub:setup "
+                    "skill to confirm the bridge can find it.")
         else:
             tail = ("It may have recovered since; "
                     "run /memhub:login --status to check.")

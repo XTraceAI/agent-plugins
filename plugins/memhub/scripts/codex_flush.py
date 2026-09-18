@@ -441,6 +441,31 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     # send simply retries; the retry is bounded by the 60s cooldown (non-Stop)
     # and by dormancy after MAX_UNCONFIRMED failures (Stop included), so it is
     # a re-probe, not an every-event loop. The sweep is the final backstop.
+    # Codex's own threads (guardian action-reviews, spawned subagents) are not
+    # the person's work and must never be captured as sessions: they copy the
+    # conversation under review, so they arrive looking like real transcripts.
+    # Checked from the bounded header, before the parse — this runs per event.
+    try:
+        source = codex_reader.thread_source_of_path(rollout)
+    except (OSError, ValueError) as exc:
+        source = None                       # unreadable header: capture as usual
+        _log(f"could not read thread_source ({exc!r}) — treating as own thread")
+    if source in codex_reader.BOT_THREAD_SOURCES:
+        _log(f"not this person's thread (thread_source={source!r}) — not captured")
+        # Clear any earlier failure the way the other never-contacted-the-
+        # server no-ops do: nothing will ever retry this session, so a stale
+        # last_error would warn about a recovery that cannot come.
+        _save_state(sid, skipped_thread_source=source, rollout_size=size,
+                    last_error=None, last_error_at=0, fail_streak=0)
+        return
+    if source not in codex_reader.KNOWN_OWN_THREAD_SOURCES:
+        # A Feature surface we have not seen before. It IS captured — the
+        # variant means a product surface the person is using — but say so, so
+        # a new kind gets classified deliberately rather than by silence. Not
+        # a failure, so deliberately NOT a last_error: a health banner reading
+        # "capture failed" over a session that captured fine is its own bug.
+        _log(f"unfamiliar thread_source={source!r} — capturing it as the "
+             f"person's work; classify it upstream if that is wrong")
     records, meta = codex_reader.to_canonical(rollout)
     state = _read_state(sid)
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
