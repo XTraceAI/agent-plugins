@@ -108,8 +108,11 @@ class ReleaseChecksTests(unittest.TestCase):
         seen = {agent.upgrade_nonce() for _ in range(20)}
         self.assertGreater(len(seen), 1)
         for nonce in seen:
-            self.assertRegex(nonce, r"^999\.[0-9]{1,6}\.[0-9]{1,6}$")
+            # The hook's shape, and a release's shape: `999.NNNNNN.NNNNNN` made
+            # Sonnet 4.6 call the notice fabricated and refuse to report it.
+            self.assertRegex(nonce, r"^[3-9]\.[1-9][0-9]\.[1-9][0-9]{2}$")
             self.assertNotEqual(nonce, "999.0.0")
+            self.assertNotEqual(nonce, agent.policy.PolicyServer().minimum_version)
 
     def test_policy_server_serves_the_configured_minimum_version(self):
         import urllib.request
