@@ -22,15 +22,25 @@ import json
 DEFAULT_CHUNK_BYTES = 3_500_000
 
 
-def slices(records: list, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> list[list]:
+def slices(records: list, chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+           max_slices: int | None = None) -> list[list]:
     """``records`` split into consecutive disjoint runs under ``chunk_bytes``.
 
     A single record larger than the budget still goes through alone: splitting
     inside a record would corrupt it, and one oversized payload that the server
     may reject beats silently dropping the record.
+
+    ``max_slices`` stops after that many payloads and discards the rest, for a
+    caller that will only send the first few. ``flush_turn`` sends exactly one
+    slice per turn: without this it re-serialized the WHOLE pending backlog on
+    every turn — 46 MB on the largest transcript measured here — only to throw
+    all but the first slice away, inside a 60s budget. The result is still a
+    PREFIX of ``records``, so a caller detects truncation by comparing lengths.
     """
     if chunk_bytes <= 0:
         return [list(records)] if records else []
+    if max_slices is not None and max_slices <= 0:
+        return []
     out: list[list] = []
     cur: list = []
     size = 0
@@ -38,6 +48,8 @@ def slices(records: list, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> list[list]:
         b = len(json.dumps(rec, separators=(",", ":")))
         if cur and size + b > chunk_bytes:
             out.append(cur)
+            if max_slices is not None and len(out) >= max_slices:
+                return out
             cur, size = [], 0
         cur.append(rec)
         size += b
