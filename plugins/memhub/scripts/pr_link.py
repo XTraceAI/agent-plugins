@@ -47,6 +47,13 @@ STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "prlink"
 
 HOSTS = ("claude", "codex", "cursor")
 
+# The work types the backend accepts, in its own order. EXACTLY these seven
+# lowercase tokens: the server compares against this set with no normalisation
+# and a DB CHECK constraint backs it, so "Feat" and "feature" are both a 400.
+# `mixed` and `none` are read-side grouping keys the server computes — never
+# valid inputs.
+PR_TYPES = ("feat", "fix", "chore", "docs", "perf", "refactor", "other")
+
 # ---------------------------------------------------------------- detectors
 
 # Quoted segments are stripped before matching so a search pattern like
@@ -1739,12 +1746,10 @@ CREATED = (
     "MemHub: you just opened {pr_url}{pr_ref}.\n"
     "{linked}"
     "Link this session to it now: `link_pr` with pr_url=\"{pr_url}\", "
-    "session_ids=[\"{session_id}\"], link_source=\"session_self\", "
-    "classification_session_id=\"{session_id}\", and pr_type = the one word that "
-    "describes THIS pull request's work: feat, fix, chore, docs, perf, refactor or "
-    "other. You read the diff and wrote it, so you are the one who can say; choose "
-    "from the change itself, not from the branch name. Do this without asking — "
+    "session_ids=[\"{session_id}\"], link_source=\"session_self\"{classify}. "
+    "Do this without asking — "
     "opening the pull request is itself work this session did, and the call is idempotent.\n"
+    "{recovery}"
     "Then, ONLY IF most of the code in this pull request was written in OTHER sessions (you "
     "opened it for work done earlier, or you are shipping someone else's branch), add one "
     "sentence offering `/memhub:find-contributing-sessions {pr_url}` so those sessions get "
@@ -1759,17 +1764,73 @@ IN_PLAY = (
     "from a different session is expected, not a duplicate.\n"
     "IF THE CODE IN THIS PULL REQUEST WAS WRITTEN IN THIS SESSION — you edited those files here "
     "— call `link_pr` with pr_url=\"{pr_url}\", session_ids=[\"{session_id}\"], "
-    "link_source=\"session_self\". Do it without asking; it is a record of work you did, and it "
-    "is idempotent. Add classification_session_id=\"{session_id}\" and pr_type = the one word "
-    "for this pull request's work (feat, fix, chore, docs, perf, refactor, other) when you can "
-    "judge it from the change itself; if you have only seen part of the pull request, link "
-    "without a type rather than guess — the first classification is the one that stands.\n"
+    "link_source=\"session_self\"{classify}. Do it without asking; it is a record of work you "
+    "did, and it is idempotent.\n"
     "IF IT WAS NOT — you are reviewing, checking out, or commenting on someone else's work, or "
     "work from an earlier session — do not link. Instead offer, in one sentence, to run "
     "`/memhub:find-contributing-sessions {pr_url}` to find the sessions that did write it. Do "
     "not run it without the user saying yes.\n"
+    "{recovery}"
     "If this session already linked itself to this pull request, say nothing at all."
 )
+
+
+# Slotted into CREATED / IN_PLAY where v0.62.0 stated the classification
+# unconditionally. `{lead}` differs per lane: B1 opened the pull request and has
+# its whole diff, while B2 may have seen only a slice of it.
+CLASSIFY = (
+    ", classification_session_id=\"{session_id}\", and pr_type = the one word for "
+    "THIS pull request's work ({types}) — {lead}"
+)
+
+CLASSIFY_LEAD_CREATED = (
+    "you opened it, so you are the one who can say; read it off the change "
+    "itself, never the branch name or the title"
+)
+CLASSIFY_LEAD_IN_PLAY = (
+    "but only if you can judge it from the change itself; if you have seen only "
+    "part of this pull request, link WITHOUT a type rather than guess, because "
+    "the first classification is the one that stands"
+)
+
+# Appended after the link instruction, whenever a type was asked for.
+CLASSIFY_RECOVERY = (
+    "If that call fails saying the classification session \"was not found among "
+    "your sessions\", this session's capture has not reached MemHub yet: wait 10 "
+    "seconds and retry the identical call once, then give up on the type. Do NOT "
+    "drop the type to force the link through — a session that has not arrived "
+    "links nothing either way.\n"
+    "If it fails saying the pull request \"already has a different classification\", "
+    "THE LINK DID NOT HAPPEN EITHER — the server refuses the whole write, not just "
+    "the type. Retry once with pr_type and classification_session_id REMOVED so "
+    "the link still lands, then report the type that is already there. Never try "
+    "a different type."
+)
+
+
+def classification_wanted(reply: object) -> bool:
+    """True when this pull request has no work type yet, so asking is useful.
+
+    A classification is PERMANENT: the backend has no UPDATE and no DELETE
+    against `pr_classifications`, unlinking does not clear it, and a second,
+    different type raises `pr_classification_conflict`.
+
+    That conflict is why this gate exists at all, and it is not only about a
+    wasted call. `record_classification` raises BEFORE `_insert_links` and
+    before the commit, so a 409 refuses THE WHOLE WRITE — asking for a type on
+    a pull request that already has one costs the LINK, not just the type.
+    v0.62.0 asked unconditionally and lost the link every time a second session
+    touched an already-classified pull request.
+    """
+    pr = reply.get("pr") if isinstance(reply, dict) else None
+    return isinstance(pr, dict) and pr.get("pr_type") is None
+
+
+def _classify_clause(session_id: str, *, created: bool) -> str:
+    return CLASSIFY.format(
+        session_id=session_id, types=", ".join(PR_TYPES),
+        lead=CLASSIFY_LEAD_CREATED if created else CLASSIFY_LEAD_IN_PLAY,
+    )
 
 
 def _pr_ref(reply: dict) -> str:
@@ -1825,9 +1886,23 @@ def context_for(reply: dict, pr_url: str, session_id: str, *, created: bool) -> 
         # Nothing to link. The advisory paths above still help; this one would
         # tell the agent to call a tool with no argument.
         return None
+    # Ask for a type only when the server says there is none. The advisory
+    # paths above return before this, so an org that cannot link is never asked
+    # to classify.
+    wanted = classification_wanted(reply)
+    # The recovery text is SLOTTED, not appended. B1 takes it right after the
+    # link instruction it is about; B2 takes it above its own last line, because
+    # that line — "if you already linked yourself, say nothing at all" — is what
+    # keeps a stateless hook quiet inside a `/memhub:pr-babysit` loop running
+    # `gh pr view` on every pass, and it only works while it is the last thing
+    # the agent reads.
     template = CREATED if created else IN_PLAY
-    return template.format(pr_url=pr_url, pr_ref=_pr_ref(reply),
-                           linked=_linked_line(reply), session_id=session_id)
+    return template.format(
+        pr_url=pr_url, pr_ref=_pr_ref(reply), linked=_linked_line(reply),
+        session_id=session_id,
+        classify=_classify_clause(session_id, created=created) if wanted else "",
+        recovery=(CLASSIFY_RECOVERY + "\n") if wanted else "",
+    )
 
 
 def context_for_call(tool_name: object, tool_input: object, tool_response: object,
@@ -1885,7 +1960,10 @@ def context_for_call(tool_name: object, tool_input: object, tool_response: objec
 
 
 __all__ = [
-    "CHECK_TIMEOUT_S", "CONNECT_ADVISORY", "CREATED", "HOSTS", "IN_PLAY",
+    "CHECK_TIMEOUT_S", "CLASSIFY", "CLASSIFY_LEAD_CREATED",
+    "CLASSIFY_LEAD_IN_PLAY", "CLASSIFY_RECOVERY", "PR_TYPES",
+    "classification_wanted",
+    "CONNECT_ADVISORY", "CREATED", "HOSTS", "IN_PLAY",
     "NEGATIVE_TTL_ENV", "NEGATIVE_TTL_S", "REPO_ADVISORY", "STATE_DIR",
     "breadcrumb", "check",
     "context_for", "context_for_call", "conversation_id_for", "creates_pr",

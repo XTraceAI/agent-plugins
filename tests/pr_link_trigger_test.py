@@ -285,6 +285,42 @@ def test_the_host_flag_namespaces_the_session_id():
           rc == 0 and '["s1"]' in context(out), out)
 
 
+def test_a_pr_with_no_type_yet_is_asked_for_one():
+    """`CONNECTED` carries no `pr_type` key, which is also what an OLD backend
+    returns. Absent reads as unclassified, so the hook asks — correct against a
+    backend that has the feature, and harmless against one that does not, since
+    the classification is simply refused there rather than losing the link.
+    """
+    FAKE.reply = dict(CONNECTED)
+    rc, out = run(payload("gh pr create"), home=_home())
+    ctx = context(out)
+    check("asks for a type alongside the link",
+          rc == 0 and "pr_type = " in ctx
+          and 'classification_session_id="s1"' in ctx, out)
+    check("carries the recovery for both failures",
+          "THE LINK DID NOT HAPPEN EITHER" in ctx and "wait 10 seconds" in ctx)
+
+
+def test_a_pr_that_already_has_a_type_keeps_its_link():
+    """The regression from v0.62.0, end to end.
+
+    Asking again would earn `pr_classification_conflict`, and that refuses the
+    WHOLE write — so the session would not be linked at all. The hook must fall
+    back to the plain link instruction.
+    """
+    reply = dict(CONNECTED)
+    reply["pr"] = {**CONNECTED["pr"], "pr_type": "fix",
+                   "pr_type_source": "agent_session"}
+    FAKE.reply = reply
+    rc, out = run(payload("gh pr create"), home=_home())
+    ctx = context(out)
+    check("still tells the session to link itself",
+          rc == 0 and 'link_source="session_self"' in ctx, out)
+    check("but asks for no type",
+          "pr_type" not in ctx and "classification_session_id" not in ctx,
+          ctx[-160:])
+
+
 def test_the_hook_is_stateless():
     FAKE.reply = dict(CONNECTED)
     home = _home()
