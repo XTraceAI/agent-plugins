@@ -2214,12 +2214,29 @@ def show_upgrade(repo, session, event):
         pass
     if event == "SessionStart" or seen != key:
         current = ".".join(map(str, version)) if version else "unknown"
-        text = (f"PLUGIN_UPGRADE_REQUIRED: MemHub plugin {current} is unsupported. "
-                f"Update MemHub to {notice['minimum_version']} or newer using your host's "
-                "plugin manager, then restart this agent session. Rulebook synchronization "
-                "is unavailable and cached rules are suspended until a successful refresh. "
-                "Tell the user this upgrade is required; do not report the cached rules as current.")
-        emit(event, text, user_line=text)
+        minimum = notice["minimum_version"]
+        # Two audiences, two texts. The USER's line (`systemMessage`, shown by
+        # the terminal with no model in between) says what to do. The AGENT's
+        # copy is a status record: facts, effect, remedy — and no instruction
+        # about what the agent should say. The one text that used to serve
+        # both ended "Tell the user this upgrade is required; do not report
+        # the cached rules as current", and Sonnet 4.6 read exactly that
+        # sentence as the mark of an injected message ("legitimate hook
+        # telemetry reports facts; it does not instruct the agent on what to
+        # say") and refused to relay the notice at all. A model that is
+        # handed the facts relays them on its own; a model that is ordered to
+        # may not. Both texts keep the three tokens the release checks look
+        # for: the error code, the version, "restart this agent session".
+        context = (f"MemHub plugin status: PLUGIN_UPGRADE_REQUIRED\n"
+                   f"installed: {current} · minimum supported by the server: {minimum}\n"
+                   "effect: rulebook synchronization is unavailable; the cached team rules are "
+                   "suspended and not in effect for this session\n"
+                   "remedy: update the MemHub plugin with the host's plugin manager, then "
+                   "restart this agent session")
+        user_line = (f"⚠️ MemHub plugin {current} is unsupported (PLUGIN_UPGRADE_REQUIRED): update to "
+                     f"{minimum} or newer with your host's plugin manager, then restart this agent "
+                     "session. Team rules are suspended until then.")
+        emit(event, context, user_line=user_line)
         _atomic_json(seen_path, key)
     return True
 
@@ -2408,14 +2425,57 @@ EVENT_WIRE_KEYS = ("event_id", "kind", "rule_id", "session_id", "agent_id", "wor
                    "repo", "branch", "reason", "at")
 
 
+# Capture namespaces a conversation id per host: Claude sends the session uuid
+# bare (flush_turn.py), Codex sends `codex-<uuid>` (codex_flush.py) and Cursor
+# `cursor-<uuid>` (cursor_flush.py). A fire carries the raw hook-payload
+# session id, so on Claude it matches the captured conversation by accident and
+# on the others it cannot match at all — every Codex fire shows "Not linked
+# yet" (ENG-1075). Namespace it HERE, at the wire, and nowhere else: ordering
+# state, obligations, dedup keys and state_path all key off the raw id, and
+# renaming that mid-session would strand an in-flight session's own state.
+def wire_session_id(session_id, host):
+    """The session id as CAPTURE wrote it, so the server can join the two.
+
+    Delegates to `pr_link.conversation_id_for`, which already owns this exact
+    projection for the PR-link lane — a second copy is how the two lanes come
+    to disagree about what a Codex session is called, and it already handles
+    the cases a fresh one forgets (surrounding whitespace, a host spelled
+    `Codex`, an id that already carries its prefix).
+
+    Imported lazily and on a fail-open path: only the flush lane projects rows,
+    so the per-call pre/post lanes never pay for the import, and a fire that
+    cannot be namespaced still ships (unlinked) rather than taking the hook
+    down.
+    """
+    try:
+        import pr_link
+        return pr_link.conversation_id_for(host, session_id) or session_id
+    except Exception:
+        return session_id
+
+
 def wire_row(row):
     """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
-    opt-in for excerpts is a server setting the hook does not consult)."""
-    return {k: row.get(k) for k in WIRE_KEYS}
+    opt-in for excerpts is a server setting the hook does not consult).
+
+    `host` is local-only, like `rulebook_id`: it is not a wire field, it is
+    how this projection knows which namespace the session id belongs in.
+    """
+    out = {k: row.get(k) for k in WIRE_KEYS}
+    out["session_id"] = wire_session_id(out.get("session_id"), row.get("host"))
+    return out
 
 
 def event_wire_row(row):
-    return {k: row.get(k) for k in EVENT_WIRE_KEYS}
+    """Same projection as `wire_row`, and the same namespacing.
+
+    The server folds these into each fire's outcome BY SESSION, so an event
+    that names the session differently from the fire it answers folds into
+    nothing. `host` is local-only here too.
+    """
+    out = {k: row.get(k) for k in EVENT_WIRE_KEYS}
+    out["session_id"] = wire_session_id(out.get("session_id"), row.get("host"))
+    return out
 
 
 def worktree_key(root):
@@ -3748,6 +3808,10 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
                     "worktree": ctx.get("worktree"),
+                    # Local-only (see wire_row): which host's namespace this
+                    # session id belongs to, recorded at fire time because the
+                    # flush that ships it may be a different invocation.
+                    "host": ctx.get("host"),
                     "source_message_id": ctx.get("source_message_id"),
                     "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
@@ -3777,6 +3841,7 @@ def log_event(ctx, kind, *, rule_id=None, reason=None, worktree=None, at=None):
     try:
         row = {"event_id": str(uuid.uuid4()), "kind": kind, "rule_id": rule_id,
                "session_id": ctx["session"], "agent_id": ctx.get("agent_id"),
+               "host": ctx.get("host"),        # local-only; see event_wire_row
                "worktree": worktree if worktree is not None or kind == "receipt" else ctx.get("worktree"),
                "repo": ctx.get("repo"), "branch": ctx.get("branch"),
                "reason": reason, "at": at or _now()}
@@ -4021,6 +4086,26 @@ def refresh_if_stale(repo, rules, fetched_at, sources):
     return rules, fetched_at, sources
 
 
+def _host_arg(argv=None):
+    """`--host claude|codex|cursor` — which agent host this call came from.
+
+    Same flag the other hook scripts already take (`capture_health.py --host`,
+    `pr_link_trigger.py --host codex`). Defaults to claude, whose manifest
+    passes nothing, so existing behaviour is byte-for-byte unchanged.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    for i, arg in enumerate(args):
+        if arg == "--host" and i + 1 < len(args):
+            value = args[i + 1]
+            if value in ("claude", "codex", "cursor"):
+                return value
+        elif arg.startswith("--host="):
+            value = arg.split("=", 1)[1]
+            if value in ("claude", "codex", "cursor"):
+                return value
+    return "claude"
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     codex_pre = mode == "codex-pre"
@@ -4084,8 +4169,15 @@ def main():
             # turn ended before this process started, so it ended before any
             # fire this session recorded after `started`; stamp it one tick
             # before the earliest of those.
+            # `host` too: this lane builds its ctx inline rather than reusing
+            # the one `main` assembles, and without it `event_wire_row` has no
+            # namespace to apply. Observed live — a Codex session's FIRES said
+            # `codex-<uuid>` while its own turn_end event said `<uuid>`, and the
+            # server folds events into fires by (org, session_id), so every
+            # turn_end folded into nothing.
             log_event({"session": session, "agent_id": None, "repo": repo or None,
-                       "branch": branch or None, "worktree": worktree_key(root)}, kind,
+                       "branch": branch or None, "worktree": worktree_key(root),
+                       "host": _host_arg()}, kind,
                       at=turn_end_at(session, started, data.get("transcript_path")))
         flush_fires(final=final)
         return 0
@@ -4118,7 +4210,8 @@ def main():
     tool = data.get("tool_name", "")
     ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
            "branch": branch, "tool": tool, "rule_version": rule_version,
-           "source_message_id": message_id_of(data), "worktree": worktree_key(root)}
+           "source_message_id": message_id_of(data), "worktree": worktree_key(root),
+           "host": _host_arg()}
     if mode == "prompt":
         # UserPromptSubmit. It arms and says nothing: anything printed here is
         # injected above the person's own words, and an arming is not news —

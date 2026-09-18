@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -44,6 +45,98 @@ _HEALTH_TIMEOUT_S = 3
 # shell and edit tools only, because widening it costs the user a re-trust of
 # a file already in ~/.codex/hooks.json.
 _GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
+
+
+# OBSERVED, not reasoned about: `codex plugin add` (Codex 0.154.0, local path
+# marketplace) copies a plugin's regular files and SKIPS its symlinks, so the
+# staging build — whose scripts/ skills/ hooks/ references/ are relative
+# symlinks into ../memhub/ — lands as three files: `.claude-plugin/plugin.json`,
+# `.mcp.json`, `mcp.json`. The install reports success and prints the version.
+# There is then no `scripts/` at all, resolve_plugin_root() returns None, and
+# main() used to exit 0 with no output, no record and no capture. A blind
+# `codex exec` session against that install produced: zero rows in the rulebook
+# ledger, no codexflush state file, and not one line anywhere naming MemHub.
+# The same session against a repaired install produced six fires and a health
+# file — so the hooks WERE firing the whole time; they were landing in silence.
+#
+# Leave a breadcrumb in the shape capture_health already reads, and say so once
+# per session. The breadcrumb alone is not enough: capture_health.py lives in
+# the very root we could not find, so with no root there is nothing to read it
+# back out.
+#
+# Deliberately NOT restored with it: the wide marketplace search and the
+# newest-complete-version fallback. Nothing observed here demonstrates either
+# precondition, and it is the ranking across marketplaces that once sent a prod
+# user's captures to staging. `_KNOWN_INSTALLS` stays an ordered, unpooled scan.
+_STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
+_BRIDGE_STATE = _STATE_DIR / "_bridge.json"
+_UNRESOLVED = "plugin_root_unresolved"
+_UNRESOLVED_MESSAGE = (
+    "MemHub: this Codex install is missing the plugin's script files, so "
+    "session capture and Rulebook telemetry are OFF. Reinstall the MemHub "
+    "plugin, then run the memhub:setup skill to confirm it is healthy."
+)
+
+
+def _record_unresolved() -> None:
+    """Record the failure where capture_health looks for one.
+
+    Same ``last_error``/``last_error_at`` shape codex_flush writes, so the
+    next healthy session surfaces it through the ordinary health path rather
+    than needing a second reporting channel.
+    """
+    name = None
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="._bridge.", dir=_STATE_DIR)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"last_error": _UNRESOLVED,
+                       "last_error_at": time.time()}, handle)
+        os.replace(name, _BRIDGE_STATE)
+        name = None
+    except OSError:
+        pass          # a breadcrumb is never worth failing a hook over
+    finally:
+        # A failed flush-on-close or a replace that loses a Windows sharing
+        # race would otherwise strand the temp file — once per hook event,
+        # forever, in the one directory we ask users to keep.
+        if name is not None:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def _clear_unresolved() -> None:
+    """Retract the breadcrumb once a root resolves again.
+
+    A stale ``last_error`` outliving the failure it recorded is its own bug —
+    this hook has been bitten by exactly that on the recall lane.
+    """
+    try:
+        _BRIDGE_STATE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _report_unresolved(action: str, event: str) -> None:
+    """One visible line, on SessionStart only — it is once per session.
+
+    Both channels, deliberately. `additionalContext` is the one every other
+    SessionStart lane here already uses (`_merge_results`), so it is the one
+    this host is known to consume; `systemMessage` is the one a person reads
+    rather than the model. Neither has been watched arriving on Codex — the
+    observation run that produced the breadcrumb below never completed a turn,
+    so nothing rendered — and a notice that exists only in the channel we
+    guessed wrong is the same silence this fixes.
+    """
+    _record_unresolved()
+    if action == "dispatch" and event == "SessionStart":
+        print(json.dumps({
+            "hookSpecificOutput": {"hookEventName": "SessionStart",
+                                   "additionalContext": _UNRESOLVED_MESSAGE},
+            "systemMessage": _UNRESOLVED_MESSAGE,
+        }))
 
 
 def _version_key(path: Path) -> tuple:
@@ -261,8 +354,10 @@ def _rulebook_payload(payload: bytes) -> bytes:
 
 
 def _rulebook_result(root: Path, payload: bytes, mode: str) -> subprocess.CompletedProcess:
+    # --host codex: capture uploads this session as `codex-<uuid>`, so a fire
+    # reported under the bare uuid can never be joined to it (ENG-1075).
     return _run(root, "rulebook_hook.py", _rulebook_payload(payload),
-                "codex-pre" if mode == "pre" else mode,
+                "codex-pre" if mode == "pre" else mode, "--host", "codex",
                 timeout=_SESSION_TIMEOUT_S if mode == "session" else 7)
 
 
@@ -328,7 +423,15 @@ def _dispatch(root: Path, payload: bytes, event: str) -> None:
         _dispatch_post(root, payload, hook)
     elif event == "Stop":
         _detach_flush(root, payload, "Stop")
-        _fail_open_job(lambda: _run(root, "rulebook_hook.py", payload, "flush", "final", timeout=7))
+        # --host codex here too. The flush lane used to only SHIP rows that
+        # already carried their host, so it needed none; #240 made it also
+        # CREATE the turn_end/session_end events, and without this they are
+        # namespaced `claude` while this session's fires are namespaced
+        # `codex` — observed live, and the server folds by (org, session_id),
+        # so every one of them folded into nothing.
+        _fail_open_job(lambda: _run(root, "rulebook_hook.py", payload,
+                                    "flush", "final", "--host", "codex",
+                                    timeout=7))
 
 
 def _detach_flush(root: Path, payload: bytes, event: str) -> None:
@@ -378,6 +481,7 @@ def main() -> int:
         payload = sys.stdin.buffer.read()
         root = resolve_plugin_root()
         if root is None:
+            _report_unresolved(action, sys.argv[2] if len(sys.argv) > 2 else "")
             return 0
         if action == "dispatch" and len(sys.argv) > 2:
             _dispatch(root, payload, sys.argv[2])
@@ -389,6 +493,12 @@ def main() -> int:
             _artifact_sync(root, payload)
         elif action == "flush" and len(sys.argv) > 2:
             _detach_flush(root, payload, sys.argv[2])
+        # Retract AFTER dispatching, never before: capture_health runs INSIDE
+        # _dispatch, so clearing first meant it could never see the breadcrumb a
+        # previous broken session left — and when the root is missing entirely,
+        # capture_health cannot run at all (it lives in that same root). Cleared
+        # up front, `_bridge.json` was readable by nothing.
+        _clear_unresolved()
     except BaseException as exc:  # A memory hook must always fail open.
         print(f"[memhub-codex-bridge] {type(exc).__name__}: {exc}", file=sys.stderr)
     return 0

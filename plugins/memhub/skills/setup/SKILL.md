@@ -16,8 +16,15 @@ Arguments: `$ARGUMENTS`
 
 ## Codex
 
-Codex 0.148 and 0.149 support user-level hooks but do not load hooks bundled by
-an installed plugin. Install MemHub's compatibility bridge:
+Codex supports user-level hooks but does NOT dispatch hooks bundled by an
+installed plugin: `codex features list` reports `plugin_hooks` as
+`removed`, verified on 0.146 and 0.154, and enabling it is a no-op
+because a removed stage stays `false`. The plugin's own
+`.codex-plugin/plugin.json` `hooks` key is therefore inert, so this
+bridge is not a stopgap for one version window — it is the ONLY path by
+which MemHub hooks run on Codex. Without it capture is silently off.
+
+Install the bridge:
 
 ```bash
 python3 "$ROOT/scripts/setup_codex_hooks.py" install
