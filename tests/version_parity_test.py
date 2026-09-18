@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sys
+from urllib.parse import urlsplit, parse_qs
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +126,13 @@ def main() -> int:
         print("\nFAIL MCP endpoints disagree — AP-installed hosts (Codex, Cursor)\n"
               "     would talk to a different backend than Claude installs.")
         return 1
+    for config, expected in ((ap_mcp, versions["memhub (AP root)"]),
+                             (claude_mcp, versions["memhub (claude)"]),
+                             (staging_mcp, staging_manifest["version"])):
+        reported = parse_qs(urlsplit(server_url(config)).query).get("memhub_plugin_version")
+        if reported != [expected]:
+            print(f"FAIL loaded MCP connection must report package version {expected}, got {reported}")
+            failures += 1
     print("ok  both MCP configs point at the same server")
     return 0 if not failures else 1
 

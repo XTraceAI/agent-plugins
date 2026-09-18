@@ -3,7 +3,7 @@
   "mcpServers": {
     "memhub": {
       "type": "streamable-http",
-      "url": "https://api.memhub.xtrace.ai/mcp-server/mcp"
+      "url": "https://api.memhub.xtrace.ai/mcp-server/mcp?memhub_plugin_version=0.64.0"
     }
   }
 }

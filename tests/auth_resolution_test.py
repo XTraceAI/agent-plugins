@@ -9,6 +9,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from plugin_version import request_headers
 import _memhub_auth as auth  # noqa: E402
 
 URL = "https://api.memhub.xtrace.ai/mcp-server/mcp"
@@ -33,12 +34,12 @@ def test_stored_pak_secret_validation():
                        {"secret": ["not", "a", "key"]}):
             auth._stored_pak = lambda _url, value=record: value
             assert auth.resolve_bearer(URL) == (URL, "oauth-token")
-            assert auth.resolve_url_and_auth(URL) == (URL, None, oauth)
+            assert auth.resolve_url_and_auth(URL) == (URL, request_headers(), oauth)
 
         auth._stored_pak = lambda _url: {"secret": "mhk_valid"}
         assert auth.resolve_bearer(URL) == (URL, "mhk_valid")
         assert auth.resolve_url_and_auth(URL) == (
-            URL, {"Authorization": "Bearer mhk_valid"}, None)
+            URL, {"Authorization": "Bearer mhk_valid", **request_headers()}, None)
     finally:
         auth._stored_pak = originals["stored_pak"]
         auth._refresh_cached_token_if_stale = originals["refresh"]
