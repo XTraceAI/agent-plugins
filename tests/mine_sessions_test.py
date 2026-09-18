@@ -34,6 +34,8 @@ def main() -> int:
         partial = Path(home) / "partial.json"; partial.write_text(json.dumps({"title": "partial-ordering", "ordering": {"gated_command_rx": "git push"}}))
         anchor = Path(home) / "anchor.json"; anchor.write_text(json.dumps({"title": "probe-anchor", "delivery": "anchor_recall", "anchors": ["ContextBusConfig"]}))
         sess_ord = Path(home) / "sess.json"; sess_ord.write_text(json.dumps({"title": "probe-session-ordering", "ordering": {"required_command_rx": "git\\s+fetch\\b", "gated_command_rx": "git\\s+log\\b[^\\n]*origin/", "armed_by_events": ["session"]}}))
+        prompt_ord = Path(home) / "prompt.json"; prompt_ord.write_text(json.dumps({"title": "probe-prompt-ordering", "ordering": {"required_command_rx": "curl\\s+-s\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["prompt"], "armed_by_rx": "staging"}}))
+        bare_prompt = Path(home) / "bare-prompt.json"; bare_prompt.write_text(json.dumps({"title": "probe-bare-prompt", "ordering": {"required_command_rx": "curl\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["prompt"]}}))
         cands = Path(home) / "cands.json"; cands.write_text(json.dumps([
             {"title": "declared-probe", "matcher": {"event": "bash", "command_rx": "never-happens-xyz\\b"}, "claude_md": {"heading": "Rules", "text": "Never pipe pytest into tail when deciding pass/fail."}, "source_ref": "CLAUDE.md@abc#rules", "did": "Claude did the declared thing", "what": "Claude is warned"},
             {"title": "empty-origin-probe", "matcher": {"event": "bash", "command_rx": "never-happens-abc\\b"}, "claude_md": {}},
@@ -41,7 +43,7 @@ def main() -> int:
         book = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; book.mkdir(parents=True)
         (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
                                                             {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
-        p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
+        p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--rule-file", str(prompt_ord), "--rule-file", str(bare_prompt), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
         ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "PROPOSED RULES" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and "=== WHAT WENT WRONG" not in p.stdout and (out / "digests").is_dir()
         print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md, warns on --facets vocab but reports no facet for a session not in the corpus, writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
@@ -53,8 +55,20 @@ def main() -> int:
         ok = anchor is not None and anchor.get("trigger") == "on_identifier" and anchor.get("delivery") == "anchor_recall" and "when the name comes up" in p.stdout
         print(("ok  " if ok else "FAIL"), "an anchors body lands under 'When a name comes up' (anchor_recall), unmeasured"); fails += not ok
         sess = next((r for r in rows if r.get("title") == "probe-session-ordering"), None)
-        ok = sess is not None and sess.get("needs_engine") is True and "session-armed" in sess.get("verdict", "") and sess["predicate"]["ordering"]["armed_by_events"] == ["session"] and sess.get("bucket") in ("note", "declared_unbroken")
-        print(("ok  " if ok else "FAIL"), "a session-armed ordering body is replayed and flagged as needing the engine mode"); fails += not ok
+        ok = (sess is not None and not sess.get("not_replayable") and "session-armed" not in sess.get("verdict", "")
+              and sess["predicate"]["ordering"]["armed_by_events"] == ["session"] and sess.get("trigger") == "before_action"
+              and sess.get("delivery") == "agent_hook" and sess.get("bucket") != "note")
+        print(("ok  " if ok else "FAIL"), "a session-armed ordering keeps the shape the engine arms — no demotion to a session-start note"); fails += not ok
+        if not ok: print(sess)
+        pro = next((r for r in rows if r.get("title") == "probe-prompt-ordering"), None)
+        ok = (pro is not None and pro["predicate"]["ordering"]["armed_by_events"] == ["prompt"]
+              and pro["predicate"]["ordering"].get("armed_by_rx") == "staging"
+              and pro.get("not_replayable") is True and pro.get("bucket") == "unmeasured" and pro["verdict"].startswith("Unmeasured"))
+        print(("ok  " if ok else "FAIL"), "a prompt-armed ordering keeps armed_by_rx and is reported unmeasured, not scored as edit-armed"); fails += not ok
+        if not ok: print(pro)
+        ok = "armed_by_events ['prompt'] needs armed_by_rx" in p.stderr and "probe-bare-prompt" not in p.stdout
+        print(("ok  " if ok else "FAIL"), "a patternless prompt lane is refused — the engine would arm it on no prompt at all"); fails += not ok
+        if not ok: print(p.stderr[-500:])
         decl = next((r for r in rows if r.get("title") == "declared-probe"), None)
         ok = decl is not None and decl.get("bucket") == "declared_unbroken" and decl.get("origin") == "claude_md" and decl["claude_md"]["text"].startswith("Never pipe pytest") and decl["source_ref"] == "CLAUDE.md@abc#rules" and decl["verdict"].startswith("Declared in CLAUDE.md") and "DECLARED IN CLAUDE.MD, NOT BROKEN HERE" in p.stdout
         print(("ok  " if ok else "FAIL"), "--candidates list: a body carrying its CLAUDE.md sentence is origin=claude_md, keeps its source_ref, and lands in the declared-not-broken section"); fails += not ok

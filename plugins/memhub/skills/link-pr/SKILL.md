@@ -81,6 +81,20 @@ Use `link_source="manual"` here — this skill is a person saying so, which is
 what that value means. (`session_self` is the hook's, `session_found` is
 `/memhub:find-contributing-sessions`'s.)
 
+**Classifying the pull request is a separate, narrower claim.** `link_pr` also
+takes `pr_type` (`feat`, `fix`, `chore`, `docs`, `perf`, `refactor`, `other`)
+with `classification_session_id`, and the server accepts it only alongside
+`link_source="session_self"` — the classification has to come from a session
+that did the work, not from a person pointing at one. So:
+
+- **This session opened or wrote the PR** (you are linking it to itself):
+  send `link_source="session_self"`, `classification_session_id=<that same
+  session id>` and the `pr_type` you judge from the actual change.
+- **Anything else** — a session the user named, a `--session` id, an unlink:
+  send no `pr_type`. Do not guess a type for work you did not see; the first
+  classification wins and an identical retry preserves it, while a different
+  one conflicts.
+
 ## 4. Report the reply honestly
 
 Relay what the server actually said; do not re-word a partial result into a

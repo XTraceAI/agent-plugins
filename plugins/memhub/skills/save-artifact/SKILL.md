@@ -57,10 +57,42 @@ Do exactly this:
    Optional flags when relevant: `--agent-brain-id <id>` to override the
    destination brain, `--no-room` to save into personal workspace memory
    instead, `--rationale "..."` to note why this version supersedes the last,
-   `--tags a,b` (the server normalises tags to lowercase snake_case —
-   `Skill-Design` is stored as `skill_design`; searches normalise too),
    `--parent-id <id>` only with the current head's id.
-4. Report the returned `{id, action}` to the user, **and which brain it landed
+
+   **Always pass `--tags`.** Two or three topic words is enough
+   (`--tags retry,reliability`); the server normalises them to lowercase
+   snake_case, so `Skill-Design` is stored as `skill_design` and searches
+   normalise the same way. Tags are what a later `search_memory(tags=…)` can
+   filter on, and an org with required tags turned on REFUSES an untagged save
+   and answers with the brain's own tag vocabulary — pick from what it offers
+   and re-run rather than inventing a new word.
+
+4. **A rendered deliverable — an HTML page, a chart PNG, a PDF — goes through
+   `--attach`, not `--file`.** `--file` reads UTF-8 text; a deliverable is
+   bytes, and they are base64-encoded by the script so they never pass through
+   your context either:
+
+   ```bash
+   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+     --attach "<rendered file>" [--attach "<another>"] \
+     [--entrypoint "<the file to render first>"] \
+     [--file "<a short text summary>"] --name "<name>" --type document
+   ```
+
+   `--attach` is repeatable, and the bundle keeps the structure **below the
+   attachments' common parent** — `--attach build/index.html --attach
+   build/assets/chart.png` stores `index.html` and `assets/chart.png`, so a
+   page that references `assets/chart.png` still resolves it. Attach every file
+   the page needs, not just the page: a deliverable uploaded without its
+   stylesheet or images renders broken and looks like a server fault.
+   `--entrypoint` takes the bundle path (`index.html` here), and a lone
+   attachment keeps its basename. Attach the paths the page references, symlinks
+   and all: the bundle path follows what you pass, so a symlinked `assets/`
+   directory stays `assets/` instead of becoming its link target. Give a text body too whenever you have one:
+   the bytes are the payload, the text is what makes the deliverable findable
+   by search. Keep the bundle to a few MB — a large file belongs in
+   `ingest_document_from_url` instead.
+5. Report the returned `{id, action}` to the user, **and which brain it landed
    in, by name** — automatic routing that happens silently reads as losing
    things. On first ever run the script may open the browser once for approval
    and then mint a personal access key (`mhk_…`) that later runs reuse without

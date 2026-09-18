@@ -290,11 +290,18 @@ OUTPUT_CANDS = [   # fires on the error: a signature in the tool result. Anchor 
 ORDERING_CANDS = [   # "X must have run (green) before Y". armed_by "edit": the engine's own semantics (edits arm, an unpiped last-segment X discharges).
  {"title": "tests-before-push", "required_rx": r"\bpytest\b|npm\s+test|run_all\.py", "gated_rx": r"git\s+push\b", "min_edits": 1, "armed_by": "edit",
   "did": "Claude pushed without a passing test run after its edits", "what": "Claude is warned at `git push` if no passing, unpiped test run followed its edits", "claude_md_rx": r"pre-push audit|before every push|before pushing|run the full test suite", "quote_rx": r"(so many|why)[^.]{0,30}(errors|bugs)|tests? (fail|broke|didn)|\bbroke\b|run the tests"},
- # armed_by "session": armed from the first call; X anywhere in a chain counts. The shipped engine cannot run this yet (it is only
- # edit-armed) — the row reports what the mode WOULD do, so the plugin change has its evidence.
+ # armed_by "session": armed from the first call; X anywhere in a chain counts. The shipped engine arms this lane
+ # (`rulebook_hook.arms_on` takes "session" and "prompt" alongside the edit family), so the row is a rule you can file as it stands.
  {"title": "fetch-before-origin-read", "required_rx": r"git\s+(fetch|pull)\b", "gated_rx": r"git\s+(log|diff|show|branch|merge-base|rev-list)\b[^\n]*\borigin/", "armed_by": "session",
   "did": "Claude read `origin/*` without a `git fetch` earlier in the session", "what": "Claude is warned at the `origin/*` read if no fetch ran this session", "claude_md_rx": r"git fetch|fetch (origin|first)|fetch before", "quote_rx": r"origin/|latest (origin|main|staging)|remote branch|\bstale\b|fetch first|get latest|pull (from )?origin"},
 ]
+def arming_lane(events):
+    """Which lane arms this ordering rule — the miner's echo of `rulebook_hook.arms_on`.
+    `session` wins over `prompt` for the same reason the engine's predicate does: a rule
+    armed from session start is already armed when a prompt arrives. Anything else is the
+    edit family, which is also the engine's default for an absent `armed_by_events`."""
+    ev = [e for e in (events or []) if isinstance(e, str)]
+    return "session" if "session" in ev else "prompt" if "prompt" in ev else "edit"
 ANCHOR_CANDS = []   # rows that fire when a name comes up: --rule-file bodies carrying `anchors`; nothing is replayed for them
 bodies = []
 for path in args.rule_file:   # one create_rule body per file (create-rule's backtest)
@@ -317,8 +324,10 @@ for path, body in bodies:   # each joins the trigger it belongs to
             print(f"[warn] --rule-file {path}: ordering needs required_command_rx and gated_command_rx — skipped", file=sys.stderr); continue
         try: min_edits = int(o.get("min_edits", 1))
         except (TypeError, ValueError): min_edits = 1
-        armed = "session" if "session" in (o.get("armed_by_events") or []) else "edit"
-        ORDERING_CANDS.append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits, "armed_by": armed, **extra})   # noqa: E501 — one row per candidate
+        armed = arming_lane(o.get("armed_by_events"))
+        if armed == "prompt" and not o.get("armed_by_rx"):   # `arms_on` arms a patternless prompt lane on nothing, so filing it would ship a rule that never fires
+            print(f"[warn] --rule-file {path}: armed_by_events ['prompt'] needs armed_by_rx — the engine arms a patternless prompt lane on no prompt at all — skipped", file=sys.stderr); continue
+        ORDERING_CANDS.append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits, "armed_by": armed, "armed_by_rx": o.get("armed_by_rx"), **extra})   # noqa: E501 — one row per candidate
     elif isinstance(body.get("anchors"), list) and body["anchors"]: ANCHOR_CANDS.append({"title": body.get("title", path), "anchors": body["anchors"], **extra})
     elif m.get("event") == "output": OUTPUT_CANDS.append({"title": body.get("title", path), "content_rx": m["content_rx"], **extra})
     elif m: RULE_CANDS.append({"title": body.get("title", path), "matcher": m, "requires_prior_rx": body.get("requires_prior_rx"), **extra})
@@ -380,8 +389,8 @@ def verdict(row):
     """One decision a user can act on. Thresholds are what the team measured: <3 sessions is noise, <50 % genuine is a nag."""
     n = row["fired_n"]
     if row["trigger"] == "on_identifier": return "Unmeasured — anchor rules are matched and judged on the server; turn on only with a stated reason"
-    if row.get("needs_engine"):   # before the declared checks: a session-armed ordering must never be filed as a plain rule the engine cannot run
-        return f"Turn on as a session-start note — firing at the command needs a plugin change (session-armed ordering); it would then catch {n} sessions" + (" (declared in CLAUDE.md, not broken here)" if row.get("claude_md") and n < 3 else "")
+    if row.get("not_replayable"):   # before the declared checks: an unscored row must not borrow a threshold it never earned
+        return "Unmeasured — a prompt-armed ordering arms on what the person said, and the corpus keeps no prompt-to-call ordering to replay that against; turn on only with a stated reason"
     if row.get("claude_md") and n == 0: return "Declared in CLAUDE.md, not broken here — 0 fires in these sessions; file it only if you want CLAUDE.md fully in the book"
     if row.get("claude_md") and n < 3: return f"Declared in CLAUDE.md, rarely broken here — {n} session{'s' if n != 1 else ''}; file it as a declared rule if you want it in the book"
     if n == 0: return "Skip — never would have fired in these sessions"
@@ -412,7 +421,7 @@ def add(row):
     row["verdict"] = verdict(row)
     row.setdefault("audience", "machine" if row["title"] in ("timeout-not-on-macos", "rg-not-installed", "db-tool-not-available", "missing-module-fresh-venv") else ("repo" if row.get("scope_repos") else "org"))
     n = row["fired_n"]
-    row["bucket"] = ("unmeasured" if row["trigger"] == "on_identifier" else "declared_unbroken" if row.get("claude_md") and n < 3
+    row["bucket"] = ("unmeasured" if row["trigger"] == "on_identifier" or row.get("not_replayable") else "declared_unbroken" if row.get("claude_md") and n < 3
                      else "note" if row["verdict"].startswith("Turn on as a session-start note") else "skip" if row["verdict"].startswith("Skip") else "on")
     # a session-armed ordering that is ALSO declared-and-unbroken is listed with the declared ones (its verdict still says the engine can't run it)
     if row["verdict"].startswith("Turn on as a session-start note"): row["trigger"] = "session_start"; row["delivery"] = "session_context"
@@ -523,10 +532,14 @@ for r in live:
         print(f"  {r['title']:28s} fired in {res['fired_n']} sessions ({fmt_hosts(res['fired'])}), {sum(res['calls'].values())} calls{flag}")
     elif on == "ordering" and isinstance(hr.get("ordering"), dict):
         o = hr["ordering"]
-        res = replay_ordering(o.get("required_command_rx") or "", o.get("gated_command_rx") or "",
-                              (o.get("armed_by_events") or ["edit"])[0], o.get("min_edits", 1))
-        flag = "  <- never fired: retire candidate" if not res["violations"] else ""
-        print(f"  {r['title']:28s} fired in {res['violations']} sessions, of the {res['gated']} that reached the gated command{flag}")
+        lane = arming_lane(o.get("armed_by_events") or ["edit"])
+        if lane == "prompt":
+            # Same reason as the unknown lanes below: a 0 here would read as a retire signal for a rule the engine does arm.
+            print(f"  {r['title']:28s} not replayable offline (prompt-armed ordering) — no signal either way")
+        else:
+            res = replay_ordering(o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1))
+            flag = "  <- never fired: retire candidate" if not res["violations"] else ""
+            print(f"  {r['title']:28s} fired in {res['violations']} sessions, of the {res['gated']} that reached the gated command{flag}")
     else:
         # Silence is not evidence: saying nothing beats printing a 0 that reads as a retire signal.
         print(f"  {r['title']:28s} not replayable offline ({on or 'unknown'} lane) — no signal either way")
@@ -540,13 +553,15 @@ for c in RULE_CANDS:
     res = replay(hr, c.get("requires_prior_rx"))
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": c["matcher"], "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), **res}))
 for c in ORDERING_CANDS:
-    _o = replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))
+    unscored = c["armed_by"] == "prompt"   # the session and edit lanes replay; a prompt lane has nothing offline to arm it
+    _o = {"gated": 0, "violations": 0, "no_run_at_all": 0, "samples": [], "fired_ids": []} if unscored else replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))
     T, V, Vany, ex, ids = _o["gated"], _o["violations"], _o["no_run_at_all"], _o["samples"], _o["fired_ids"]
-    pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]], "min_edits": c.get("min_edits", 1), "display_name": c["title"]}}
+    pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]], "min_edits": c.get("min_edits", 1), "display_name": c["title"],
+                         **({"armed_by_rx": c["armed_by_rx"]} if c.get("armed_by_rx") else {})}}
     breakdown = f"{Vany} never ran it, {V - Vany} ran it piped so its exit code was lost" if V else ""
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"),
                      "fired": {"gated": T, "violations": V, "no_run_at_all": Vany}, "fired_n": V, "fired_ids": ids, "real_misses": None, "breakdown": breakdown,
-                     "needs_engine": c["armed_by"] == "session", "samples": ex, "source_ref": c.get("source_ref") or f"{'claude_md' if (c.get('claude_md_given') or declared_for(c.get('claude_md_rx'), c['title'])) else 'sessions'}@{today}#{c['title']}|gated {T}/{M}|violations {V}"}))
+                     "not_replayable": unscored, "samples": ex, "source_ref": c.get("source_ref") or f"{'claude_md' if (c.get('claude_md_given') or declared_for(c.get('claude_md_rx'), c['title'])) else 'sessions'}@{today}#{c['title']}|gated {T}/{M}|violations {V}"}))
 for c in OUTPUT_CANDS:
     hit = collections.Counter(); ex = []; ids = []
     for s in corpus:
@@ -614,7 +629,7 @@ for k, (head, deliv, meaning) in TRIGGERS.items():
     if not group: print("  (none from the replay)")
 if declared_unbroken:
     print(f"\n=== DECLARED IN CLAUDE.MD, NOT BROKEN HERE — {len(declared_unbroken)} checks with 0–2 fires in {M} sessions (a sentence in a file, not a problem in your sessions; file as declared rules only if you want CLAUDE.md fully in the book)")
-    for r in declared_unbroken: print(f"  {r['title']:28s} {r['fired_n']} fires · CLAUDE.md § {r['claude_md']['heading'][:50]}: \"{r['claude_md']['text'][:90]}\"" + ("  (ordering: the engine cannot run it yet)" if r.get("needs_engine") else ""))
+    for r in declared_unbroken: print(f"  {r['title']:28s} {r['fired_n']} fires · CLAUDE.md § {r['claude_md']['heading'][:50]}: \"{r['claude_md']['text'][:90]}\"" + ("  (prompt-armed ordering: not replayable offline)" if r.get("not_replayable") else ""))
 
 # ---------------------------------------------------------------- skills your team keeps retyping
 installed = set()
