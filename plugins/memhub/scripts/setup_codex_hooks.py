@@ -224,20 +224,33 @@ def uninstall(home: Path) -> bool:
     cleaned = remove_hooks(current)
     changed = cleaned != current or runner_path.exists()
     if cleaned != current:
-        old_mode = stat.S_IMODE(hooks_path.stat().st_mode) if hooks_path.exists() else 0o600
-        _write_atomic(hooks_path, cleaned, old_mode)
+        # `remove` must be a true inverse of `install`. On a machine that had no
+        # hooks.json, writing `{"hooks": {}}` leaves a file the user never had —
+        # observed live. Only our own entries were ever in it, so when nothing
+        # is left and nothing else was in the document, take the file with them.
+        if not cleaned.get("hooks") and set(cleaned) <= {"hooks"}:
+            hooks_path.unlink(missing_ok=True)
+        else:
+            old_mode = stat.S_IMODE(hooks_path.stat().st_mode) if hooks_path.exists() else 0o600
+            _write_atomic(hooks_path, cleaned, old_mode)
     runner_path.unlink(missing_ok=True)
     return changed
 
 
-def status(home: Path) -> tuple[bool, int, int]:
+def status(home: Path) -> tuple[bool, int, int, bool, bool]:
     current = _load_json(home / "hooks.json")
     bridge = _bridge_for_home(_load_json(BRIDGE_SOURCE), home)
     expected = _handler_count(bridge)
     actual = _handler_count(current)
     runner = home / _RUNNER_NAME
     runner_ok = runner.exists() and runner.read_bytes() == RUNNER_SOURCE.read_bytes()
-    return runner_ok and _handler_actions(current) == _handler_actions(bridge), actual, expected
+    hooks_ok = _handler_actions(current) == _handler_actions(bridge)
+    # Reported apart, because they are different problems with different fixes.
+    # "NOT INSTALLED (4/4 handlers)" was observed live right after a plugin
+    # upgrade, while capture was demonstrably still working — only the copied
+    # runner was stale. It reads as "nothing is set up" and sends people to
+    # re-trust handlers that are already correct.
+    return hooks_ok and runner_ok, actual, expected, hooks_ok, runner_ok
 
 
 def main() -> int:
@@ -265,8 +278,14 @@ def main() -> int:
         if args.action == "remove":
             print("MemHub Codex hooks: " + ("removed" if uninstall(home) else "not installed"))
             return 0
-        healthy, actual, expected = status(home)
-        print(f"MemHub Codex hooks: {'OK' if healthy else 'NOT INSTALLED'} ({actual}/{expected} handlers)")
+        healthy, actual, expected, hooks_ok, runner_ok = status(home)
+        if healthy:
+            state = "OK"
+        elif hooks_ok and not runner_ok:
+            state = "STALE BRIDGE — re-run setup to refresh it"
+        else:
+            state = "NOT INSTALLED"
+        print(f"MemHub Codex hooks: {state} ({actual}/{expected} handlers)")
         if healthy:
             print(f"trust: Codex-controlled; verify the {expected} MemHub handlers in /hooks")
         return 0 if healthy else 1

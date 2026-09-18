@@ -563,8 +563,18 @@ def main() -> int:
             listed = reader.list_sessions(limit=args.limit)
         except Exception:  # noqa: BLE001 — one unreadable host must not blind the rest
             continue
+        own_thread = getattr(reader, "is_own_thread_path", None)
         for session in listed:
             path = session.get("path")
+            # A Codex guardian review CONTAINS a copy of the conversation it is
+            # reviewing, so it scores like a strong authorship match on the very
+            # evidence this ranks by. It wrote none of the PR. Bounded header
+            # read; an unreadable one keeps the candidate.
+            try:
+                if own_thread is not None and not own_thread(path):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 # The readers parse a whole transcript into memory, so a size
                 # guard is the only bound available here. It stays — but a
