@@ -642,7 +642,8 @@ def main() -> int:
     token_problem = _token_problem(host)
     failure = _recent_failure()
     rulebook = _rulebook_problem()
-    message = upgrade or _message(host, token_problem, failure, rulebook)
+    health = _message(host, token_problem, failure, rulebook)
+    message = "\n".join(part for part in (upgrade, health) if part)
     if not message:
         return 0
 
@@ -659,7 +660,7 @@ def main() -> int:
     print(json.dumps({
         # The channel that reaches the USER. Everything else this hook could
         # emit goes only to the model.
-        "systemMessage": f"⚠️  {message}",
+        "systemMessage": f"{'🚨' if upgrade and 'PLUGIN_UPGRADE_REQUIRED' in upgrade else 'ℹ️' if upgrade and not health else '⚠️'}  {message}",
         # And to the agent, so "is my memory working?" is answerable without
         # re-deriving any of it.
         "hookSpecificOutput": {

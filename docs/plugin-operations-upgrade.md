@@ -45,3 +45,20 @@ The backend flag is intentionally off until the candidate has been published
 and tested across all three hosts. No live minimum version is changed by this
 implementation PR. Refer to the backend's `docs/ops/plugin-operations-policy.md`
 for classification, activation, rollback and the standalone-key limitation.
+
+## Session-start update notices
+
+A newer public marketplace version produces an informational “MemHub update
+available” notice even when the active plugin is compatible. Claude uses the
+marketplace's pinned commit; Codex and Cursor use the version shipped on main.
+Cursor's notice explicitly notes that official-directory availability may lag.
+Staging is a locally copied marketplace and has no public optional-release feed.
+The public lookup sends no credentials, is bounded, and caches results (including
+failures) for one hour. An offline lookup never blocks work. Notices are deduplicated
+per session; a new session can remind the user again.
+
+A backend refusal takes priority: “UPDATE REQUIRED” names the active and minimum
+versions, paused operations, preserved pending captures and exact update/restart
+steps. Claude/Codex emit a prominent user-facing warning and mirror it to the agent;
+Cursor sends the same required notice to both. Optional notices do not mask other
+capture-health failures and never create a blocked-operation record.

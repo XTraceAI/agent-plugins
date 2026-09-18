@@ -139,7 +139,8 @@ def startup_message(host=None, session=None):
                     atomic_write.publish(marker, healthy_signature)
                 except OSError:
                     pass
-            return None
+            from plugin_updates import available_message
+            return available_message(host)
         if marker:
             signature = json.dumps([blocked["minimum_version"], ACTIVE_PLUGIN_VERSION])
             try:
