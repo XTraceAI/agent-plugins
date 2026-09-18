@@ -70,6 +70,28 @@ check("a zero budget on empty stays empty", slices(0 * [1], 0) == [])
 check("the default budget is a real size", DEFAULT_CHUNK_BYTES > 100_000)
 
 
+# ── max_slices ────────────────────────────────────────────────────────
+# `flush_turn` sends exactly one slice per turn. Without an early exit it
+# re-serialized the WHOLE pending backlog on every turn — 46 MB on the largest
+# transcript here — only to discard everything after the first slice.
+
+_wide = [{"i": i, "pad": "x" * 400} for i in range(20)]
+_full = slices(_wide, 1_000)
+_one = slices(_wide, 1_000, max_slices=1)
+check("max_slices=1 returns exactly one payload", len(_one) == 1)
+check("and it is the same payload the unbounded call produced",
+      _one[0] == _full[0])
+check("the result is still a PREFIX of the input, so truncation is detectable",
+      _one[0] == _wide[:len(_one[0])] and len(_one[0]) < len(_wide))
+check("max_slices=2 stops at two", len(slices(_wide, 1_000, max_slices=2)) == 2)
+check("a max_slices above the split count changes nothing",
+      slices(_wide, 1_000, max_slices=99) == _full)
+check("max_slices is inert when everything fits one payload",
+      slices(_wide, 10_000_000, max_slices=1) == slices(_wide, 10_000_000))
+check("max_slices=0 returns nothing", slices(_wide, 1_000, max_slices=0) == [])
+check("omitting max_slices is unchanged", slices(_wide, 1_000) == _full)
+
+
 # ── against the real transcripts on this machine ──────────────────────
 
 root = Path.home() / ".claude" / "projects"
