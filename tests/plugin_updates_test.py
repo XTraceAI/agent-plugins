@@ -1,5 +1,6 @@
 """Optional releases never gate operations; mandatory notices take precedence."""
 import json
+import io
 from pathlib import Path
 import sys
 import tempfile
@@ -71,6 +72,22 @@ class UpdatesTests(unittest.TestCase):
             self.assertIn('paused', message)
             self.assertIn('restart', message)
             notice.assert_not_called()
+
+    def test_required_hook_reaches_user_and_agent(self):
+        import capture_health as health
+        output = io.StringIO()
+        with patch.object(sys, 'stdin', io.StringIO('{"session_id":"s"}')), \
+             patch.object(sys, 'stdout', output), \
+             patch.object(health, '_env_host', return_value='api.memhub.xtrace.ai'), \
+             patch.object(health, '_token_problem', return_value=None), \
+             patch.object(health, '_recent_failure', return_value=None), \
+             patch.object(health, '_rulebook_problem', return_value=None), \
+             patch.object(health, '_already_warned', return_value=False), \
+             patch.object(compat, 'startup_message', return_value=version.upgrade_message('9.0.0')):
+            health.main()
+        result = json.loads(output.getvalue())
+        self.assertTrue(result['systemMessage'].startswith('🚨'))
+        self.assertIn('UPDATE REQUIRED', result['hookSpecificOutput']['additionalContext'])
 
 
 if __name__ == '__main__':
