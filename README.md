@@ -91,6 +91,15 @@ Restart, open `/hooks`, and trust only MemHub's `SessionStart`, `PreToolUse`,
 `PostToolUse`, and `Stop` handlers from `~/.codex/hooks.json`. Finally ask it to **Onboard MemHub
 for this repo**.
 
+> **Both of those steps are required, not optional.** Codex reports
+> `plugin_hooks` as `removed` (`codex features list`, verified on 0.146 and
+> 0.154), so the `hooks` key in the plugin's own manifest is never dispatched —
+> **Set up MemHub** installs the user-level bridge that is the only path by
+> which MemHub hooks run. And an untrusted handler is never dispatched either,
+> so a session started before the `/hooks` approval captures nothing. Skip
+> either step and capture is silently off, with the plugin otherwise appearing
+> installed and healthy.
+
 ### Cursor
 
 ```bash
@@ -133,6 +142,21 @@ the host exposes them.
 The detailed lifecycle below describes the Claude Code path. Codex and Cursor
 use equivalent host-specific readers and flushers under
 `plugins/memhub/scripts/`.
+
+One Codex-specific rule falls out of that:
+
+- **Codex's own threads are not captured.** Codex runs threads alongside
+  yours — spawned subagents, guardian action-reviews, memory consolidation —
+  and each copies the conversation it is working on, so it looks like a real
+  transcript and takes its title from the reviewer's prompt. Capture reads
+  `thread_source` from the rollout header and skips those three kinds by name.
+  Everything else is yours and is captured: a rollout old enough to predate the
+  field, and — deliberately — a kind we have never seen. Codex's own
+  `ThreadSource` type is open-ended (`Feature(String)`), so new product
+  surfaces appear as new values; refusing them by default would silently drop
+  real sessions, and because the skip advances the capture cursor that loss
+  would be unrecoverable. An unfamiliar value is captured and noted in the
+  Codex capture log instead.
 
 Capture runs on independent paths that all feed one server-side watermark
 (keyed on `conversation_id` = `session_id`), so re-sending never double-saves:
@@ -286,6 +310,17 @@ start names the books in play when there is more than one; in-flight advisories
 stay as short as they were. The server takes no position on any of this: it
 puts each rule's book, scope and member count on the wire and the client
 decides.
+
+A fire is reported under the same session identity capture used, so the fire
+history can show *which session* a rule fired in. That identity is namespaced
+per host — Claude sends the session id bare, Codex and Cursor send
+`codex-`/`cursor-`-prefixed, matching what their capture uploads. Before this,
+a Codex fire named the bare id while its session was stored prefixed, so every
+Codex fire showed as `Not linked yet`. The namespace is applied only on the
+wire: local ordering state, obligations and dedup keys still key off the raw
+id, so an in-flight session keeps its own state. Fires recorded by an older
+plugin keep the id they were written with and stay unlinked — linking those
+retroactively is a server-side change, not a client one.
 
 Authoring (`/memhub:create-rule`, `/memhub:rules-from-sessions`) resolves which
 book a rule lands in before drafting anything — one visible book is the answer,

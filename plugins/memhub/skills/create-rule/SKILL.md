@@ -42,13 +42,21 @@ was written. Where a step says to stop and ask, stop silently instead. The
 enumerations below say what to DO at each such point; this says what the
 person sees, which is nothing until there is a rule.
 
-**One exception, and it is not about the rule.** If §4b.5 cannot restore the
-doctored rulebook cache byte-for-byte, say so, name the file, and abort — even
-though nothing was filed. The invariant covers disclosures about the CANDIDATE;
-it does not cover machine state this skill changed and could not put back. A
-failed restore can leave an unreviewed candidate armed in the local cache
-indefinitely, and a person who is not told cannot fix what they cannot see.
-Silence there is a safety bug wearing the costume of quiet.
+**One exception, and it is not about the rule: the rulebook cache.** The
+invariant covers disclosures about the CANDIDATE; it does not cover machine
+state this skill changed. Both of §4b.5's notices are therefore spoken even
+though nothing was filed:
+
+- **A restore that fails** — say so, name the file, abort. An unreviewed
+  candidate is left armed in the local cache, and a person who is not told
+  cannot fix what they cannot see.
+- **A `$BOOK.pretest-*` found from an INTERRUPTED earlier run** — restore it
+  and say so, even though this recovery succeeded. Between that interruption
+  and now, the candidate was armed: it may already have fired, in this session
+  or another. Success here means the cache is clean going forward, not that
+  nothing happened.
+
+Silence about either is a safety bug wearing the costume of quiet.
 
 - **The test.** A lesson is one that would change what an agent DOES next time,
   is not already a RULE, is not project state, and will still be true next

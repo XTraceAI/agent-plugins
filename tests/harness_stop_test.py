@@ -576,7 +576,10 @@ def test_the_block_reason():
                  # the silence invariant must NOT swallow a failed restore: an
                  # unreviewed candidate left armed in the local cache is state
                  # the person cannot fix unseen (Codex, #244, the only P1)
-                 "cannot restore the doctored rulebook cache",
+                 "A restore that fails",
+                 # success is not silence either: between the interruption and
+                 # now the candidate was armed and may have fired (Codex, #244)
+                 "found from an INTERRUPTED earlier run",
                  "safety bug wearing the costume of quiet",
                  # an idempotent re-import ended WITH a rule (Codex, #244)
                  "unchanged: true is a filing, not a blocker",
