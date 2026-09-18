@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants spec-driven development backed by team memory — create, revise, drift-check, or report on a spec held in MemHub (e.g. "start a spec for X", "save this as the team spec", "revise the spec", "did the spec change under me?", "what's the status of the retry-policy spec?"). Specs are versioned artifacts in the repo's shared agent brain; every revision carries a rationale and is diffable.
 argument-hint: <init|revise|check|status> [file|topic] [...]
-allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__get_artifact, mcp__plugin_memhub-staging_memhub__get_artifact, mcp__plugin_memhub_memhub__get_artifact_lineage, mcp__plugin_memhub-staging_memhub__get_artifact_lineage, mcp__plugin_memhub_memhub__diff_artifact_versions, mcp__plugin_memhub-staging_memhub__diff_artifact_versions, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__search_brains, Bash, Read, Write, Edit
+allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__read_memory, mcp__plugin_memhub-staging_memhub__read_memory, mcp__plugin_memhub_memhub__get_artifact, mcp__plugin_memhub-staging_memhub__get_artifact, mcp__plugin_memhub_memhub__get_artifact_lineage, mcp__plugin_memhub-staging_memhub__get_artifact_lineage, mcp__plugin_memhub_memhub__diff_artifact_versions, mcp__plugin_memhub-staging_memhub__diff_artifact_versions, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__search_brains, Bash, Read, Write, Edit
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -102,10 +102,11 @@ we" → status) and treat all of `$ARGUMENTS` as its arguments.
 Every subcommand starts by **resolving the repo's room**: derive the name as
 above, then match it EXACTLY in `list_agent_brains` — it may be one a
 teammate created and shared with you; use theirs rather than creating a
-duplicate. Only `init` creates it when missing (`create_agent_brain`, omit
-`workspace_id` — you need creator access to share it); the other subcommands
-stop and point at init if no room exists. Not a git repo → ask which agent
-brain to use.
+duplicate. Only `init` creates it when missing (`create_agent_brain` with
+`category: "repo"`, the brain's declared purpose, so it groups with the other
+repo rooms; omit `workspace_id` — you need creator access to share it); the
+other subcommands stop and point at init if no room exists. Not a git repo →
+ask which agent brain to use.
 
 ## init `[file-path | title...] [for <teammates>]`
 
@@ -202,7 +203,10 @@ land it as a version.
 Answer: "is the spec I'm building against still the spec?"
 
 1. Resolve the room and the spec (as in revise), `get_artifact` the latest
-   version.
+   version. `check` compares whole files, so `get_artifact` (16,000 chars per
+   call — follow `next_offset` until `truncated` is false) is the right call
+   here, not `read_memory`'s outline. Use `read_memory(id, section_id=…)` when
+   you only need to QUOTE one section of a long spec back to the user.
 2. Find the local spec file — first existing match wins: the argument; the
    link's `path` (`artifact_map.py list`); `docs/specs/<slug>.md`; the file
    from earlier in this session. A candidate missing on disk just falls through to the next
@@ -238,13 +242,18 @@ The multiplayer view: what the team's memory holds about a spec — or the
 whole repo.
 
 1. Resolve the room. No topic given → repo overview: `search_memory` the room
-   for artifacts tagged `spec`, list each spec with its version count and
-   latest rationale plus any recent related activity, and stop.
+   for artifacts tagged `spec` (or browse `group: "Specs"` with no `query` —
+   newest first, `offset` for the next page), list each spec with its version
+   count and latest rationale plus any recent related activity, and stop.
 2. With a topic, pick the spec (as in revise), then `search_memory` the room
-   with `memory_type: "all"`, a raised `top_k` (~30), and the spec title +
-   topic as the query. The room is repo-wide — facts and episodes from OTHER
-   specs' sessions will surface; filter by relevance and drop them rather
-   than padding the report.
+   with `memory_type: "all"` (the tool now defaults to `"artifacts"`, so a
+   status report that wants the surrounding facts and episodes must say
+   `"all"`), a raised `top_k` (~30), and the spec title + topic as the query.
+   The room is repo-wide — facts and episodes from OTHER specs' sessions will
+   surface; filter by relevance and drop them rather than padding the report.
+   Hits may come back as POINTERS (`{id, kind, title, abstract, …}`, no
+   `content`) — open the few you actually cite with `read_memory(id)` rather
+   than reporting from abstracts.
 3. Report, citing memory types: current version + how many revisions and the
    latest rationale; decisions recorded (facts/episodes from imported
    implementation sessions); related artifacts (reviews, ADRs, handoffs);

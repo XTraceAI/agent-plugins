@@ -163,8 +163,10 @@ the name exceeded 200 characters — shorten it and retry once.)
 
 **Older backend:** if `list_rulebooks` / `create_rulebook` are not present, or
 `create_rule` rejects `rulebook_id`, the server predates rulebook containers.
-Fall back to today's behaviour — `agent_brain_id` from `--brain`, omitted
-otherwise — and carry on; the rest of this skill is unchanged.
+File with no destination — omit `rulebook_id` and let the server put the rule
+where it used to — and say so in step 6; the rest of this skill is unchanged.
+Do NOT reach for `agent_brain_id`: `create_rule` has no such parameter any
+more, so passing it turns a degraded-but-working file into a failed one.
 
 ## The flow — every step is mandatory
 
@@ -261,6 +263,14 @@ its own: a fire whose conversion has not been seen two turns later is closed
 nothing. The hook only reports what it saw — the command that converted, the
 override that set a rule aside, each turn ending — and the server decides the
 outcome from those facts (the earliest one after the fire wins).
+
+**Also say what the rule PREVENTS.** `predicts_rx` is a pattern over tool
+output naming the failure this rule exists to stop — the traceback, the
+`rejected` line, the 409. It changes nothing about when the rule fires; it is
+what lets a fire be scored as a catch rather than counted as a nag, and it is
+far easier to write now, while the war story that produced the rule is in
+front of you, than at review time. Write it wherever the failure has a
+recognisable line; skip it for a rule whose violation produces no output.
 
 Ask for it when the user's own words ask for it — "block", "stop me", "don't
 let me", "never let it happen again" — and never on your own initiative. Two

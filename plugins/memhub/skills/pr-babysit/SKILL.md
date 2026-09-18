@@ -25,8 +25,8 @@ already resolved.
    repo is already cached — take that id and skip the lookup. Otherwise: name
    `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
    stripped), match it EXACTLY in `list_agent_brains` — a teammate may have
-   created it; use theirs. No match → `create_agent_brain` (omit
-   `workspace_id`). Either way, persist what you resolved with `room_map.py set
+   created it; use theirs. No match → `create_agent_brain` with
+   `category: "repo"` (and omit `workspace_id`). Either way, persist what you resolved with `room_map.py set
    --brain-id <id> --org-id <org-id>` (the org id is the one you passed to
    `list_agent_brains`, or the default org's from `list_orgs` — the response's
    `scope` carries only `org_name`) so later passes and the capture hooks

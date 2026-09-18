@@ -125,6 +125,12 @@ link_pr(pr_url="…", session_ids=[approved…], link_source="session_found")
 scan a human confirmed, which is a different claim from `session_self` (the
 session was there) and `manual` (a person named it outright).
 
+**Never send `pr_type` from here.** The server takes a classification only with
+`link_source="session_self"`, and for good reason: this skill links sessions it
+found by scanning, so it is in no position to say what the pull request's work
+was. The session that opened the PR classifies it (the plugin's own hook asks
+it to); a scan does not.
+
 ## 6. Report
 
 Exactly as `/memhub:link-pr` step 4: relay `created` / `upgraded` /
