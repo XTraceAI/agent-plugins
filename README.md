@@ -435,11 +435,14 @@ format is gone; invocation is unchanged). Each is both user-invocable as
 - `/memhub:link-pr [pr] [--session <id>] [--unlink]` — links a coding session
   to a pull request in MemHub, so the PR's session context is published from a
   confirmed fact rather than a branch-name guess. This is also how a PR opened
-  by something the hook cannot see — a script, a CI helper — gets linked.
+  by something the hook cannot see — a script, a CI helper — gets linked, and
+  on Cursor it is the only way to record a PR's work type, and only for a PR
+  this session itself wrote.
 - `/memhub:find-contributing-sessions [pr]` — scans this machine's session
   history (Claude Code, Codex, Cursor) for the sessions that wrote a PR's code,
   ranks the candidates by the evidence that matched, and links the ones you
-  approve. It never links anything without an explicit yes.
+  approve. It never links anything without an explicit yes, and it never
+  records a work type — a scan cannot say what the work was.
 
 ## PR babysitting
 
@@ -487,6 +490,21 @@ question and injects one instruction. There are three answers:
 - **any other GitHub call naming one PR** → the agent decides. It links only if
   it wrote that code in this session, and otherwise offers
   `/memhub:find-contributing-sessions`.
+
+**The agent also says what kind of work the PR is.** When it links a pull
+request that has no type yet, the same call carries one of `feat`, `fix`,
+`chore`, `docs`, `perf`, `refactor` or `other` — read off the change itself,
+never parsed out of the title. MemHub deleted its own title-and-branch
+inference, so a pull request nobody labels simply has no type; there is no
+hidden backfill.
+
+**The first label is permanent**, and that is why the type is asked for only
+when the server reports the PR as unclassified. A second attempt does not just
+lose the type: the server refuses the whole write, so the session would not get
+linked either. A PR that already carries a type therefore gets the plain link
+instruction, and a genuine race is reported rather than retried. A
+multi-purpose PR gets its primary purpose; `other` is a legitimate answer and a
+better one than a guess.
 
 Unconditional self-linking is deliberately the **narrow** lane. A hand-rolled
 `curl -X POST …/pulls` is not treated as a creation: recognising a write meant

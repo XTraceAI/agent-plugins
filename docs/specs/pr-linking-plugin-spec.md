@@ -7,6 +7,10 @@ backend spec is authoritative if they ever disagree.
 **Status:** implemented in v0.50.0, and inert until the backend half ships (§12). This document
 is the sole source of truth for the plugin half: an implementer should need nothing else.
 
+**Superseded in part (v0.60.0)** by `docs/specs/pr-work-type-classification.md`, which adds a
+work type to every link. §4.5's context strings and §8/§9's skill steps below are the
+PRE-classification shapes; where the two disagree, the work-type spec is authoritative.
+
 ---
 
 ## 0. Overview
@@ -441,6 +445,13 @@ Exact strings live in `pr_link.py` as module constants so the tests can assert o
 skills can quote the same vocabulary. Each is prefixed with the PR URL and, when
 `linked_sessions` is non-empty, a one-line summary of what is already linked.
 
+**Since v0.60.0** each of B1 and B2 also carries a work-type block when — and only when —
+the `check` reply reports `pr.pr_type` as null. B1 appends it; B2 splices it in ABOVE its
+final "say nothing at all" line, because that line is what keeps a stateless hook quiet
+inside a `/memhub:pr-babysit` loop and must stay last. A pull request that already carries a
+type is never re-asked: classification is permanent server-side, so the call would only earn
+a 409. See `pr-work-type-classification.md` §3.
+
 **A — not connected** (`github_connected:false`):
 
 > MemHub: this org has no GitHub integration connected, so the sessions behind this pull request
@@ -713,6 +724,10 @@ allowed-tools: Bash, mcp__plugin_memhub_memhub__link_pr, mcp__plugin_memhub-stag
    namespaced form the server expects.
 4. **Link.** `link_pr(pr_url=…, session_ids=[…], link_source="manual")`. `--unlink` calls
    `unlink_pr` with the same arguments instead.
+4b. **Record the work type** (v0.60.0). A SECOND call carrying `pr_type` and
+   `classification_session_id` with `link_source="session_self"` — the backend refuses
+   classification from `manual`. It relabels nothing, because a confirmed link is never
+   rewritten. Skipped when the PR already has a type. The skill's report step is now 5.
 5. **Report the reply honestly**, without re-wording it into a success it does not claim:
    - `linked[]` entries with `created:true` → "linked"; `upgraded:true` → "upgraded an old
      inferred link to a confirmed one"; `skipped: already_linked` → "was already linked".
@@ -758,6 +773,9 @@ that it searches **local** session history on this machine.
    **link nothing without an explicit yes.**
 5. `link_pr(pr_url=…, session_ids=[approved…], link_source="session_found")` — one call for the
    whole approved set.
+5b. **Record the work type** (v0.60.0), as §8 step 4b, naming the highest-scoring APPROVED
+   session. Skipped when the PR already has a type — a later contributing session does not
+   relabel a pull request.
 6. Report as in §8 step 5. Sessions already in the `check` reply's `linked_sessions` are excluded
    in step 4 and mentioned as "already linked".
 
