@@ -57,7 +57,13 @@ def main():
         payload = {"cwd":tmp, "session_id":"spec-session", "tool_name":"Bash", "tool_input":{"command":"git push"}}
         code, output = run("pre", payload, env)
         assert code == 0 and "docs/specs/limit.md" in output and "app/limit.py" in output, output
+        git('checkout', '-b', 'unrelated')
         (root/'docs/specs/limit.md').write_text(TEXT+'Updated.\n')
+        code, output = run("post", {"cwd":tmp,"session_id":"spec-session","tool_name":"Edit", "tool_input":{"file_path":str(root/'docs/specs/limit.md')}}, env)
+        event_file = cache/'ledger/events.jsonl'
+        events = [json.loads(line) for line in event_file.read_text().splitlines()] if event_file.exists() else []
+        assert not any(e['kind']=='converted' and e['rule_id']=='spec-test' for e in events), events
+        git('checkout', 'change')
         code, output = run("post", {"cwd":tmp,"session_id":"spec-session","tool_name":"Edit", "tool_input":{"file_path":str(root/'docs/specs/limit.md')}}, env)
         events = [json.loads(line) for line in (cache/'ledger/events.jsonl').read_text().splitlines()]
         assert any(e['kind']=='converted' and e['rule_id']=='spec-test' for e in events), events

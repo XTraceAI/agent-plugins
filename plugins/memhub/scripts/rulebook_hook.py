@@ -4561,6 +4561,7 @@ def main():
             for rule in rules:
                 pending = st["spec_pending"].get(rule["id"])
                 if (isinstance(pending, dict) and pending.get("root") == probe_root
+                        and pending.get("branch") == probe_branch
                         and pending.get("paths") and all(path in changed for path in pending["paths"])
                         and scope_ok(rule, repo, gitdir)):
                     converted_hits.append(rule["id"])
@@ -4708,7 +4709,7 @@ def main():
             spec_given = (r.get("given") or {}).get("repo") or {}
             if spec_given.get("spec_untouched"):
                 hits = probes.untouched_specs(spec_given.get("spec_dir", "docs/specs")) or []
-                st["spec_pending"][rid] = {"root": probe_root, "paths": [spec.path for spec, _ in hits]}
+                st["spec_pending"][rid] = {"root": probe_root, "branch": probe_branch, "paths": [spec.path for spec, _ in hits]}
                 r = dict(r)
                 r["text"] += "\n" + "\n".join(
                     f"{spec.path} owns: {', '.join(paths[:10])}" for spec, paths in hits[:10])
