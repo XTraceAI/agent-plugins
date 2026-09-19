@@ -34,6 +34,14 @@ def read_contract(backend):
     ).stdout
     require(hashlib.sha256(pinned).hexdigest() == lock["sha256"], "contract digest mismatch")
     require((backend / relative).read_bytes() == pinned, "backend contract differs from pinned revision")
+    owns = lock.get("spec_owns")
+    if owns:
+        fixture = subprocess.run(["git", "-C", str(backend), "show", f"{lock['revision']}:{owns['path']}"], capture_output=True, check=True).stdout
+        require(hashlib.sha256(fixture).hexdigest() == owns["sha256"], "spec ownership fixture digest mismatch")
+        require((ROOT / "contracts/spec-owns.json").read_bytes() == fixture, "plugin spec fixture differs from backend pin")
+        require((backend / owns["path"]).read_bytes() == fixture, "backend spec fixture differs from pin")
+        parser = (backend / "app/services/spec_owns.py").read_bytes()
+        require(hashlib.sha256(parser).hexdigest() == owns["parser_sha256"], "backend spec parser differs from plugin contract")
     return json.loads(pinned)
 
 

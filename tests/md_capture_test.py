@@ -392,15 +392,12 @@ with tempfile.TemporaryDirectory() as td:
         asyncio.run(f.flush(sid7))
         check(resolved == [] and seen_args[-1].get("agent_brain_id") == "B-CACHED", "cache hit → no server resolution, cached brain used")
 
-        # (audit #3b) a file linked by `path` in .claude/artifact-map.json is
-        # owned by a hand-saved lineage (/memhub:spec) — the auto-capture must
-        # not open a second lineage under an H1-derived name.
+        # Git specs have one authored source; auto-capture must not publish another.
         sid8 = "sess-md-flush-linked"
-        (root / ".claude").mkdir(exist_ok=True)
-        owned = root / "owned-spec.md"; owned.write_text("# Owned\n" + "o" * 7000, encoding="utf-8")
+        (root / "docs/specs").mkdir(parents=True, exist_ok=True)
+        owned = root / "docs/specs/owned-spec.md"
+        owned.write_text("---\nspec: owned\nowns: [app/a.py]\n---\n# Owned\n" + "o" * 7000, encoding="utf-8")
         free = root / "free-spec.md"; free.write_text("# Free\n" + "f" * 7000, encoding="utf-8")
-        (root / ".claude" / "artifact-map.json").write_text(json.dumps({"version": 1, "links": [
-            {"glob": "app/*.py", "artifact_id": "a-owned", "artifact_name": "Spec: Owned", "path": "owned-spec.md"}]}))
         mc.save_state(sid8, {"dirty": [str(owned), str(free)], "saved": {}, "attempts": {}})
         seen_args.clear()
         f.read_room = lambda *a, **k: None
@@ -408,7 +405,7 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid8)
         check([a["name"] for a in seen_args] == ["Free (free-spec.md)"], f"linked file skipped, unlinked file saved: {[a['name'] for a in seen_args]}")
         check(st["dirty"] == [] and str(owned) not in st["saved"], f"linked file leaves dirty without a digest (not retried): {st}")
-        (root / ".claude" / "artifact-map.json").unlink()
+        owned.unlink()
 
         # ---- git sweep: markdown written through Bash never enters `dirty` ----
         # A harness that prefers shell edits (heredoc, sed -i) never fires the

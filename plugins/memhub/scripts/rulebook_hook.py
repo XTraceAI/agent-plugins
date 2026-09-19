@@ -1215,7 +1215,7 @@ _TURN_CHARS = 2000           # per turn
 _GIVEN = {
     "repo": {"branch_rx": "rx", "branch_not_rx": "rx", "diff_lines_gt": "int",
              "diff_files_gt": "int", "diff_paths_rx": "rx", "diff_paths_none_rx": "rx",
-             "dirty": "bool"},
+             "dirty": "bool", "spec_untouched": "bool", "spec_dir": "str"},
     "user": {"said_rx": "rx", "not_said_rx": "rx"},
     # what a read would pull into context — answered per EVENT (`read_facts`),
     # not per call, so a `cat a b` is measured file by file
@@ -1386,6 +1386,10 @@ def given_norm(g):
                     return None
             elif kind == "int":
                 if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    return None
+            elif kind == "str":
+                from spec_owns import safe_spec_dir
+                if safe_spec_dir(v) is None:
                     return None
             elif kind == "bool":
                 if not isinstance(v, bool):
@@ -1647,6 +1651,20 @@ class Probes:
             return sorted({l.strip() for l in (tracked + "\n" + untracked).split("\n") if l.strip()})
         return self._get("diff_paths", compute)
 
+    def untouched_specs(self, spec_dir="docs/specs"):
+        def compute():
+            from spec_owns import load_specs_from_tree, owning_specs, spec_file_changed
+            paths = self.diff_paths()
+            if paths is None:
+                return None
+            try:
+                return [(s, touched) for s, touched in owning_specs(
+                    paths, load_specs_from_tree(self.root, spec_dir), exclude_prefix=spec_dir
+                ) if not spec_file_changed(s, paths)]
+            except (OSError, ValueError):
+                return None
+        return self._get("untouched_specs:" + spec_dir, compute)
+
     def diff_lines(self):
         """Added + deleted lines against the base, working tree included;
         untracked files count their line total (at most 200 files, 1 MiB each)."""
@@ -1727,6 +1745,10 @@ def given_ok(rule, probes, read=None):
         elif k == "diff_paths_none_rx":
             ps = probes.diff_paths()
             if ps is None or any(re.search(v, p) for p in ps):
+                return False
+        elif k == "spec_untouched":
+            untouched = probes.untouched_specs((g.get("repo") or {}).get("spec_dir", "docs/specs"))
+            if untouched is None or bool(untouched) != v:
                 return False
         elif k == "dirty":
             d = probes.dirty()
@@ -3068,7 +3090,7 @@ def state_path(session_id):
 
 def load_state(p):
     st = {"fired": [], "counts": {}, "raw": {}, "armed": {},
-          "armed_once": [], "armed_version": {}}
+          "armed_once": [], "armed_version": {}, "spec_pending": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -3089,6 +3111,8 @@ def load_state(p):
         st["armed_once"] = []
     if not isinstance(st.get("armed_version"), dict):
         st["armed_version"] = {}
+    if not isinstance(st.get("spec_pending"), dict):
+        st["spec_pending"] = {}
     return st
 
 
@@ -3121,7 +3145,7 @@ def drop_arming(st, rid):
 # is on disk now.
 _ARMING_KEYS = ("armed", "armed_version")
 _APPEND_KEYS = ("armed_once",)      # only ever appended to
-_DELTA_KEYS = _ARMING_KEYS
+_DELTA_KEYS = _ARMING_KEYS + ("spec_pending",)
 
 
 def snapshot_arming(st):
@@ -4531,6 +4555,16 @@ def main():
     # fire's instant answers it. The old obligation logic converted only fires
     # already open; skipping the rules THIS call fires is the same statement.
     converted_hits = []
+    if mode == "post":
+        changed = probes.diff_paths()
+        if changed is not None:
+            for rule in rules:
+                pending = st["spec_pending"].get(rule["id"])
+                if (isinstance(pending, dict) and pending.get("root") == probe_root
+                        and pending.get("paths") and all(path in changed for path in pending["paths"])
+                        and scope_ok(rule, repo, gitdir)):
+                    converted_hits.append(rule["id"])
+                    del st["spec_pending"][rule["id"]]
     if mode == "post" and tool == "Bash" and cmd:
         stripped = strip_comments(shell_only(cmd))
         for r in rules:
@@ -4671,6 +4705,13 @@ def main():
                     continue
             st["fired"].append(key)
             dedup_keys[rid] = key
+            spec_given = (r.get("given") or {}).get("repo") or {}
+            if spec_given.get("spec_untouched"):
+                hits = probes.untouched_specs(spec_given.get("spec_dir", "docs/specs")) or []
+                st["spec_pending"][rid] = {"root": probe_root, "paths": [spec.path for spec, _ in hits]}
+                r = dict(r)
+                r["text"] += "\n" + "\n".join(
+                    f"{spec.path} owns: {', '.join(paths[:10])}" for spec, paths in hits[:10])
             fired_now.append(r)
             fired_on[rid] = ev
 

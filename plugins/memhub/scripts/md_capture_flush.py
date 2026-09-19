@@ -24,9 +24,8 @@ the ``auto-captured`` tag and a rationale naming the session. Re-saving the
 same ``name`` versions it (server behaviour), so an agent or human publishing
 the file later with ``save_artifact.py`` supersedes the draft in place rather
 than sitting beside it — the failure the artifact-sync reminder exists for.
-A file already linked in the repo's ``.claude/artifact-map.json`` (by its
-``path``) is SKIPPED outright: that lineage is hand-saved via ``/memhub:spec``
-under its own name, and a draft named from the H1 would open a second one.
+Git-authored specs are excluded from automatic memory capture.
+The backend owns their mirrors; capturing a draft would create a second lineage.
 
 Name = frontmatter ``title:`` > first ``# H1`` > filename stem. The agent keeps
 titles stable across rewrites (the Artifact tool asks it to), so the name is
@@ -57,7 +56,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from artifact_sync_reminder import MAP_RELPATH, link_for_path  # noqa: E402
+from spec_owns import load_specs_from_tree, DEFAULT_SPEC_DIR  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from md_capture import MAX_BYTES, MIN_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
@@ -323,7 +322,7 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                     try:
                         root = repo_root(p.parent)
                         if root is not None and _hand_saved(root, p):
-                            _log(f"skip {p.name}: linked in {MAP_RELPATH} — its lineage is hand-saved")
+                            _log(f"skip {p.name}: git-authored spec; the server owns its mirror")
                             processed.add(raw)
                             continue
                         name = derive_name(p, text, root)
@@ -384,11 +383,12 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
 
 
 def _hand_saved(root: Path, p: Path) -> bool:
-    """True when the repo's artifact map links this file by ``path`` — a
-    lineage ``/memhub:spec`` owns under its own name. Never raises."""
+    """Git-authored specs are mirrored by the backend, never auto-uploaded."""
     try:
-        return link_for_path(root, p.relative_to(root).as_posix()) is not None
-    except Exception:  # noqa: BLE001 — a lookup must not cost a capture
+        relative = p.relative_to(root).as_posix()
+        return any(s.path == relative for s in load_specs_from_tree(
+            root, os.environ.get("MEMHUB_SPEC_DIR", DEFAULT_SPEC_DIR)))
+    except (OSError, ValueError):
         return False
 
 

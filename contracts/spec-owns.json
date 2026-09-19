@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "files": {
+    "docs/specs/flow.md": "\ufeff---\r\nspec: \"flow\"\r\nowns: [\"app/a.py\", app/b/] # inline\r\nlast_verified_at: null\r\n---\r\nbody\r\n",
+    "docs/specs/list.md": "---\nspec: list\nowns:\n  - app/c.py # comment\n  - ../escape\n  - /private\n  - app/c.py\nlast_verified_at: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n---\n",
+    "docs/specs/retired/gone.md": "---\nspec: gone\nowns: [app/a.py]\n---\n",
+    "docs/specs/guide.md": "---\ntitle: Guide\n---\n"
+  },
+  "expected": [
+    {
+      "path": "docs/specs/flow.md",
+      "name": "flow",
+      "owns": [
+        "app/a.py",
+        "app/b"
+      ],
+      "last_verified_at": null
+    },
+    {
+      "path": "docs/specs/list.md",
+      "name": "list",
+      "owns": [
+        "app/c.py"
+      ],
+      "last_verified_at": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "changed": [
+    "app/a.py",
+    "app/b/nested.py",
+    "app/bee.py",
+    "app/c.py",
+    "docs/specs/list.md"
+  ],
+  "untouched": [
+    "docs/specs/flow.md"
+  ]
+}

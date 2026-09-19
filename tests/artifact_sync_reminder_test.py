@@ -1,292 +1,34 @@
-"""Self-test for the artifact-sync reminder hook.
-
-Covers the spec's acceptance criteria: mapped edit reminds with the exact
-save_artifact.py upload command (by name — no parent_id, no brain id in the
-repo tree), unmapped edit is silent, N files -> one reminder per artifact
-(session debounce), and a missing/invalid map is a clean no-op.
-
-Run: python3 artifact_sync_reminder_test.py  (stdlib only).
-"""
-from __future__ import annotations
-
+"""The real hook names owns-matched specs, debounces, and never uploads."""
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
+SCRIPTS = Path(__file__).resolve().parents[1] / 'plugins/memhub/scripts'
 
-# The tests live outside the plugin so they are not shipped to users;
-# the code under test is still in the plugin's scripts dir.
-SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-import artifact_sync_reminder as asr  # noqa: E402
-
-HOOK = SCRIPTS / "artifact_sync_reminder.py"
-
-BRAIN = "11111111-1111-4111-8111-111111111111"
-ARTIFACT = "22222222-2222-4222-8222-222222222222"
-SPEC_PATH = "docs/specs/appworld-harness.md"
-MAP = {
-    "version": 1,
-    "links": [
-        {
-            "glob": "appworld/{run,agent,worker}.py",
-            "artifact_id": ARTIFACT,
-            "artifact_name": "AppWorld eval harness + results (canonical)",
-            "path": SPEC_PATH,
-        },
-        {
-            # a pre-`path` link, as older maps still hold (brain_id is ignored)
-            "glob": "xmem/**/reanchor.py|xmem/serve/entities.py",
-            "brain_id": BRAIN,
-            "artifact_id": "33333333-3333-4333-8333-333333333333",
-            "artifact_name": "Directive-anchoring handoff",
-        },
-    ],
-}
-
-
-# --- glob semantics (spec §4: braces, **, alternation, non-match) -----------
-
-def test_brace_expansion():
-    glob = "appworld/{run,agent,worker}.py"
-    assert asr._matches(glob, "appworld/run.py")
-    assert asr._matches(glob, "appworld/worker.py")
-    assert not asr._matches(glob, "appworld/other.py")
-
-
-def test_alternation():
-    glob = "xmem/ingest/reanchor.py|xmem/serve/entities.py"
-    assert asr._matches(glob, "xmem/ingest/reanchor.py")
-    assert asr._matches(glob, "xmem/serve/entities.py")
-    assert not asr._matches(glob, "xmem/serve/other.py")
-
-
-def test_star_stops_at_slash_but_doublestar_crosses():
-    assert asr._matches("xmem/*.py", "xmem/run.py")
-    assert not asr._matches("xmem/*.py", "xmem/serve/run.py")
-    assert asr._matches("xmem/**/run.py", "xmem/serve/deep/run.py")
-    # **/ must also match zero directories.
-    assert asr._matches("xmem/**/run.py", "xmem/run.py")
-
-
-def test_non_match_is_not_a_substring_match():
-    # fullmatch, not search: a mapped path must not fire on a longer path.
-    assert not asr._matches("appworld/run.py", "vendor/appworld/run.py")
-
-
-# --- end-to-end through the real hook process ------------------------------
-
-def _repo(tmp: Path, write_map: str | None) -> Path:
-    root = tmp / "repo"
-    (root / ".git").mkdir(parents=True)
-    (root / "appworld").mkdir()
-    if write_map is not None:
-        (root / ".claude").mkdir()
-        (root / ".claude" / "artifact-map.json").write_text(write_map)
-    return root
-
-
-def _run(root: Path, relpath: str, session: str, tmpdir: Path) -> str:
-    payload = {
-        "tool_name": "Edit",
-        "tool_input": {"file_path": str(root / relpath)},
-        "cwd": str(root),
-        "session_id": session,
-    }
-    env = {**os.environ, "TMPDIR": str(tmpdir)}  # redirect the debounce state
-    proc = subprocess.run(
-        [sys.executable, str(HOOK)],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert proc.returncode == 0, f"hook must never fail an edit: {proc.stderr}"
-    return proc.stdout.strip()
-
-
-def test_mapped_edit_emits_the_upload_command_by_name():
+def main():
     with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        root = _repo(tmp, json.dumps(MAP))
-        out = _run(root, "appworld/run.py", "sess-a", tmp)
-        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert "scripts/save_artifact.py" in context
-        assert f'--file "{SPEC_PATH}"' in context
-        assert '--name "AppWorld eval harness + results (canonical)"' in context
-        assert ARTIFACT in context
-        assert "appworld/run.py" in context
-        assert "Do NOT create a new artifact" in context
-        # The server rejects a non-head parent_id (parent_stale) and the skill
-        # forbids re-emitting contents: neither may appear in the instruction.
-        assert "parent_id=" not in context and "--parent-id" not in context
-        assert "content=" not in context
-        # No brain id is read from the repo tree (room_map: account state).
-        assert BRAIN not in context
-
-
-def test_legacy_link_without_path_still_reminds_and_ignores_brain_id():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        root = _repo(tmp, json.dumps(MAP))
-        (root / "xmem" / "serve").mkdir(parents=True)
-        out = _run(root, "xmem/serve/entities.py", "sess-legacy", tmp)
-        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert '--name "Directive-anchoring handoff"' in context
-        assert "<the artifact's file>" in context
-        assert BRAIN not in context
-
-
-def test_link_for_path_finds_the_artifacts_own_file():
-    with tempfile.TemporaryDirectory() as tmp:
-        root = _repo(Path(tmp), json.dumps(MAP))
-        hit = asr.link_for_path(root, SPEC_PATH)
-        assert hit and hit["artifact_id"] == ARTIFACT
-        assert asr.link_for_path(root, "appworld/run.py") is None   # governed, not owned
-        assert asr.link_for_path(root / "nowhere", SPEC_PATH) is None
-
-
-def test_unmapped_edit_is_silent():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        root = _repo(tmp, json.dumps(MAP))
-        assert _run(root, "appworld/README.md", "sess-b", tmp) == ""
-
-
-def test_same_artifact_reminds_once_per_session():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        root = _repo(tmp, json.dumps(MAP))
-        assert _run(root, "appworld/run.py", "sess-c", tmp) != ""
-        assert _run(root, "appworld/worker.py", "sess-c", tmp) == ""
-        assert _run(root, "appworld/worker.py", "sess-d", tmp) != ""
-
-
-def test_missing_and_malformed_map_are_clean_noops():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        assert _run(_repo(tmp / "a", None), "appworld/run.py", "s1", tmp) == ""
-        assert _run(_repo(tmp / "b", "{not json"), "appworld/run.py", "s2", tmp) == ""
-        assert _run(_repo(tmp / "c", '{"links": "nope"}'), "appworld/run.py", "s3", tmp) == ""
-
-
-def test_failed_emit_does_not_burn_the_debounce():
-    # Pinned: the debounce is persisted only AFTER the reminder is out. If it
-    # were recorded first, a killed process or a failing write (BrokenPipe,
-    # UnicodeEncodeError under a non-UTF-8 locale) would mark the artifact
-    # reminded while the agent never saw it — a permanent silent miss for the
-    # rest of the session. Failing the emit here must leave no state behind.
-    import io
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        root = _repo(tmp, json.dumps(MAP))
-        payload = {
-            "tool_name": "Edit",
-            "tool_input": {"file_path": str(root / "appworld/run.py")},
-            "cwd": str(root),
-            "session_id": "sess-emit-fail",
-        }
-        state = Path(tempfile.gettempdir()) / f"{asr.STATE_PREFIX}sess-emit-fail.json"
-        state.unlink(missing_ok=True)
-
-        def boom(*_args, **_kwargs):
-            raise BrokenPipeError("hook consumer went away")
-
-        real_stdin = sys.stdin
-        sys.stdin = io.StringIO(json.dumps(payload))
-        asr.print = boom  # module global shadows the builtin
-        try:
-            try:
-                asr.main()
-            except BrokenPipeError:
-                pass  # the __main__ guard swallows this in the real hook
-        finally:
-            sys.stdin = real_stdin
-            del asr.print
-
-        assert not state.exists(), "debounce was recorded despite a failed emit"
-
-
-# --- artifact_map.py writes what the hook reads -----------------------------
-
-def _git_init(root: Path) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
-
-
-def _map_cli(root: Path, *argv: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(HOOK.parent / "artifact_map.py"), *argv],
-        cwd=str(root),
-        capture_output=True,
-        text=True,
-    )
-
-
-def test_map_add_is_idempotent_per_artifact_and_feeds_the_hook():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        root = tmp / "repo"
-        _git_init(root)
-        (root / "app").mkdir()
-
-        add = ["add", "--artifact-id", ARTIFACT, "--name", "Spec: Retry policy",
-               "--path", "docs/specs/retry-policy.md", "--glob", "app/retry.py"]
-        assert _map_cli(root, *add).returncode == 0
-        # Re-linking the same artifact with new globs replaces, never appends.
-        proc = _map_cli(root, *add[:-1], "app/{retry,backoff}.py")
-        assert proc.returncode == 0, proc.stderr
-        written = json.loads((root / ".claude" / "artifact-map.json").read_text())
-        assert len(written["links"]) == 1
-        link = written["links"][0]
-        assert link["path"] == "docs/specs/retry-policy.md"
-        # A brain id is account state — it never lands in the repo tree.
-        assert "brain_id" not in link
-        assert set(link) == {"glob", "artifact_id", "artifact_name", "path"}
-
-        # The hook picks the map up with no further wiring.
-        out = _run(root, "app/backoff.py", "sess-map", tmp)
-        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert '--file "docs/specs/retry-policy.md"' in context
-        assert '--name "Spec: Retry policy"' in context
-        assert _run(root, "app/unrelated.py", "sess-map2", tmp) == ""
-
-
-def test_map_add_refuses_a_brain_id():
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "repo"
-        _git_init(root)
-        proc = _map_cli(root, "add", "--artifact-id", ARTIFACT, "--brain-id", BRAIN,
-                        "--name", "x", "--path", "docs/x.md", "--glob", "app/x.py")
-        assert proc.returncode != 0
-        assert not (root / ".claude" / "artifact-map.json").exists()
-
-
-def test_map_list_for_path_reports_the_governing_artifact():
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "repo"
-        _git_init(root)
-        _map_cli(root, "add", "--artifact-id", ARTIFACT, "--name", "Spec: Retry policy",
-                 "--path", "docs/specs/retry-policy.md", "--glob", "app/**/retry.py")
-        hit = _map_cli(root, "list", "--for", "app/deep/retry.py")
-        assert "Spec: Retry policy" in hit.stdout
-        assert "docs/specs/retry-policy.md" in hit.stdout
-        miss = _map_cli(root, "list", "--for", "app/other.py")
-        assert "not linked to any artifact" in miss.stdout
-
-
-if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    print(f"\n{failures} failure(s)")
-    sys.exit(1 if failures else 0)
+        root = Path(tmp)
+        (root/'.git').mkdir(); (root/'docs/specs/retired').mkdir(parents=True)
+        text='---\nspec: limits\nowns: [app/limit.py]\n---\nMaximum 100.\n'
+        (root/'docs/specs/limits.md').write_text(text)
+        (root/'docs/specs/retired/old.md').write_text(text)
+        sid=str(uuid.uuid4())
+        def run(path,session=sid):
+            result=subprocess.run([sys.executable,str(SCRIPTS/'artifact_sync_reminder.py')],
+                input=json.dumps({'cwd':tmp,'session_id':session,'tool_input':{'file_path':str(root/path)}}),
+                text=True,capture_output=True,env={**os.environ,'TMPDIR':tmp})
+            assert result.returncode==0
+            return result.stdout
+        output=run('app/limit.py')
+        assert 'docs/specs/limits.md' in output and 'old.md' not in output
+        assert 'save_artifact' not in output
+        assert run('app/limit.py')==''
+        assert run('app/unowned.py',str(uuid.uuid4()))==''
+        assert run('docs/specs/limits.md',str(uuid.uuid4()))==''
+        (root/'docs/specs/limits.md').unlink()
+        assert run('app/limit.py',str(uuid.uuid4()))==''
+    print('owns reminder fire, silence, retirement and debounce passed')
+if __name__=='__main__': main()
