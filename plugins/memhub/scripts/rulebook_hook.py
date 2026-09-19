@@ -1644,7 +1644,7 @@ class Probes:
             mb = self.base()
             if mb is None:
                 return None
-            tracked = self._git("diff", "--name-only", mb)
+            tracked = self._git("diff", "--name-only", "--no-renames", mb)
             untracked = self._git("ls-files", "--others", "--exclude-standard")
             if tracked is None or untracked is None:
                 return None
@@ -4559,13 +4559,14 @@ def main():
         changed = probes.diff_paths()
         if changed is not None:
             for rule in rules:
-                pending = st["spec_pending"].get(rule["id"])
+                pending_key = json.dumps([rule["id"], probe_root, probe_branch])
+                pending = st["spec_pending"].get(pending_key)
                 if (isinstance(pending, dict) and pending.get("root") == probe_root
                         and pending.get("branch") == probe_branch
                         and pending.get("paths") and all(path in changed for path in pending["paths"])
                         and scope_ok(rule, repo, gitdir)):
                     converted_hits.append(rule["id"])
-                    del st["spec_pending"][rule["id"]]
+                    del st["spec_pending"][pending_key]
     if mode == "post" and tool == "Bash" and cmd:
         stripped = strip_comments(shell_only(cmd))
         for r in rules:
@@ -4709,7 +4710,7 @@ def main():
             spec_given = (r.get("given") or {}).get("repo") or {}
             if spec_given.get("spec_untouched"):
                 hits = probes.untouched_specs(spec_given.get("spec_dir", "docs/specs")) or []
-                st["spec_pending"][rid] = {"root": probe_root, "branch": probe_branch, "paths": [spec.path for spec, _ in hits]}
+                st["spec_pending"][json.dumps([rid, probe_root, probe_branch])] = {"root": probe_root, "branch": probe_branch, "paths": [spec.path for spec, _ in hits]}
                 r = dict(r)
                 r["text"] += "\n" + "\n".join(
                     f"{spec.path} owns: {', '.join(paths[:10])}" for spec, paths in hits[:10])
