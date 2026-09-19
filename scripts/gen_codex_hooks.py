@@ -37,14 +37,14 @@ _UNIX_DISPATCH = (
     'P=$(command -v python3 || command -v python); '
     'if [ -n "$P" ] && [ -n "$R" ] '
     '&& [ -f "$R/scripts/codex_hook_bridge.py" ]; then '
-    'printf %s "$IN" | "$P" "$R/scripts/codex_hook_bridge.py" dispatch {event}; '
+    'printf %s "$IN" | "$P" "$R/scripts/codex_hook_bridge.py" dispatch {event} --plugin-hook; '
     'fi'
 )
 _WINDOWS_DISPATCH = (
     'if defined PLUGIN_ROOT '
-    '(py -3 "%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py" dispatch {event}) '
+    '(py -3 "%PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py" dispatch {event} --plugin-hook) '
     'else if defined CLAUDE_PLUGIN_ROOT '
-    '(py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py" dispatch {event})'
+    '(py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\codex_hook_bridge.py" dispatch {event} --plugin-hook)'
 )
 _ALL_TOOLS = "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command)$"
 # PostToolUse also carries the PR-link check, which fires on GitHub MCP tool

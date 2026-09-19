@@ -16,13 +16,19 @@ Arguments: `$ARGUMENTS`
 
 ## Codex
 
-Codex supports user-level hooks but does NOT dispatch hooks bundled by an
-installed plugin: `codex features list` reports `plugin_hooks` as
-`removed`, verified on 0.146 and 0.154, and enabling it is a no-op
-because a removed stage stays `false`. The plugin's own
-`.codex-plugin/plugin.json` `hooks` key is therefore inert, so this
-bridge is not a stopgap for one version window — it is the ONLY path by
-which MemHub hooks run on Codex. Without it capture is silently off.
+Codex hook support depends on the host version. Current desktop builds can load
+bundled plugin hooks; older CLI releases need the user-level compatibility bridge.
+Both builds have a Codex manifest pointing at `hooks/codex-hooks.json`. Claude
+compatibility handlers must skip Codex payloads. When the user bridge is installed,
+bundled Codex handlers defer to it for matching events; the user handlers still
+need review and trust. Do not install both production and staging plugins.
+
+A projectless task may receive shell hook payloads containing the session directory
+instead of the command's explicit `workdir`. Use a shell-quoted absolute
+`cd <repo> && ...` prefix for repository shell calls, or start the task in the
+repository. The plugin cannot reconstruct an omitted working directory. This
+workaround enables command rules; session-start rules still require starting in
+the repository. Do not claim full parity from a successful directive recall.
 
 Install the bridge:
 

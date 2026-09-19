@@ -79,6 +79,19 @@ def is_cursor(payload: object,
     return event_name in _CURSOR_EVENTS and identity_markers >= 2
 
 
+def is_codex(payload: object, environ: Mapping[str, str] | None = None) -> bool:
+    """Recognize Codex without treating generic plugin variables as host identity."""
+    env = os.environ if environ is None else environ
+    transcript = payload.get("transcript_path") if isinstance(payload, dict) else None
+    normalized = str(transcript or "").replace("\\", "/")
+    # A genuine Claude child may inherit CODEX_THREAD_ID from its parent.
+    if "/.claude/projects/" in normalized:
+        return False
+    return (_nonempty_string(env.get("CODEX_THREAD_ID")) or
+            "/.codex/sessions/" in normalized or
+            "/.codex/archived_sessions/" in normalized)
+
+
 def _cursor_event(source_event: str) -> str | None:
     # Claude's terminal boundaries both mean the Cursor turn is complete.
     if source_event.lower() in {"stop", "sessionend"}:
@@ -109,6 +122,8 @@ def _spawn_cursor_flush(raw: bytes, event: str) -> None:
 def route(action: str, source_event: str, payload: object, raw: bytes,
           environ: Mapping[str, str] | None = None) -> bool:
     """Return True when the caller should continue its Claude handler."""
+    if is_codex(payload, environ):
+        return False  # Codex has its own bridge; never flush it as Claude.
     if not is_cursor(payload, environ):
         return True
     if action == "capture":

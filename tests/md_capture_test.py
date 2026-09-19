@@ -306,6 +306,21 @@ with tempfile.TemporaryDirectory() as td:
                 check(set(st["dirty"]) == {str(bad), str(undec)}, f"pass {i}: both still dirty ({st.get('attempts')})")
             else:
                 check(st["dirty"] == [] and st.get("attempts") == {}, f"pass {i}: both given up at the cap, counters cleared")
+        # Upgrade refusals never consume the content retry budget or give up.
+        sid_upgrade = "sess-md-upgrade"
+        mc.save_state(sid_upgrade, {"dirty": [str(bad)], "saved": {},
+                                   "attempts": {str(bad): f.MAX_ATTEMPTS - 1}})
+        async def upgrade_required(session, call_args):
+            raise f.mcp_http.PluginUpgradeRequired("999.0.0")
+        f._save = upgrade_required
+        for _ in range(f.MAX_ATTEMPTS + 2):
+            asyncio.run(f.flush(sid_upgrade))
+        retained = mc.load_state(sid_upgrade)
+        check(retained["dirty"] == [str(bad)], "upgrade keeps markdown pending across repeated attempts")
+        check(retained.get("attempts", {}).get(str(bad)) == f.MAX_ATTEMPTS - 1,
+              "upgrade never consumes the content retry budget")
+        check(not retained["saved"] and not retained.get("gaveup"), "upgrade records neither false success nor give-up")
+
         # a decode error that CLEARS (write completed) is saved on the next pass, counter reset
         undec.write_text("# U\n" + "z" * 7000, encoding="utf-8")
         mc.save_state(sid4, {"dirty": [str(undec)], "saved": {}, "attempts": {str(undec): 1}})

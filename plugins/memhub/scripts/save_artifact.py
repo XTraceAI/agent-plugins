@@ -48,6 +48,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, read_room, repo_root  # noqa: E402
@@ -265,6 +266,7 @@ async def main() -> int:
     async with streamablehttp_client(url, headers=headers, auth=auth) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            session = mcp_http.PolicySession(session, url, headers)
             if want_room and room is None and room_cwd is not None:
                 # Cache miss inside a repo: ask the server, the same exact-name
                 # lookup the capture hooks do. room_cwd is None only when the
@@ -290,4 +292,8 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    try:
+        raise SystemExit(asyncio.run(main()))
+    except mcp_http.PluginUpgradeRequired as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)

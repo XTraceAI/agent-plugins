@@ -2269,6 +2269,17 @@ def _upgrade_scope(api):
 
 
 def upgrade_status(repo):
+    # A rejection from capture/search also suspends cached rules, even if a
+    # fresh Rulebook cache would otherwise avoid a network fetch this session.
+    try:
+        api = _api()
+        if api:
+            from plugin_compatibility import status
+            notice = status(api[0], api[1])
+            if notice:
+                return {**notice, "scope": _upgrade_scope(api)}
+    except Exception:
+        pass
     try:
         with open(book_path(repo) + ".upgrade", encoding="utf-8") as f:
             notice = json.load(f)
@@ -3001,7 +3012,23 @@ def repo_of_call(data):
         info = repo_info(seed)
         if info[0]:
             return info
-    return repo_info(cwd)
+    info = repo_info(cwd)
+    if info[0]:
+        return info
+    # Desktop may normalize exec_command to Bash and omit workdir. A leading
+    # literal `cd ... &&` is explicit context; never guess from sibling repos,
+    # mid-command changes, or shell expansions. Keep repository-rooted behavior.
+    inp = data.get("tool_input") or {}
+    command = inp.get("command") if isinstance(inp, dict) else None
+    if data.get("tool_name") == "Bash" and isinstance(command, str):
+        match = _CD_PREFIX.match(command)
+        if match and match.group(0).rstrip().endswith("&&"):
+            target = next((g for g in match.groups() if g), "")
+            if target and not any(c in target for c in "$`*?[]{}~\\\n\r"):
+                root = command_root(cwd, command)
+                if root:
+                    return repo_info(root)
+    return info
 
 
 _HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")
@@ -4291,7 +4318,19 @@ def main():
     # of the shared one. No claim (the overwhelming case) → the real base.
     set_active_base(cwd)
     repo, root, gitdir, branch = repo_of_call(data)
-    if not repo:            # nothing this call touches is in a git repo → no rules apply
+    if not repo:            # never invent a repository for a projectless call
+        if mode == "session" and _host_arg() == "codex":
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": (
+                    "MemHub Rulebook: this task starts outside a Git repository. "
+                    "Codex may omit exec_command.workdir from hook payloads, so "
+                    "formal rules cannot identify that checkout. For repository "
+                    "shell commands, use an explicit, shell-quoted absolute "
+                    "`cd <repo> && ...` prefix (including when workdir is set), "
+                    "or start the task in the repository. Contextual directive "
+                    "recall is separate from formal Rulebook evaluation."
+                )}}))
         return 0
     if mode == "fetch":
         fetch_book(repo)
