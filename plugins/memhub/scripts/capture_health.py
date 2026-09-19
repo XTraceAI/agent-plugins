@@ -645,7 +645,10 @@ def main() -> int:
         return 0  # not running as an installed plugin — nothing to judge
 
     from plugin_compatibility import startup_message
-    upgrade = startup_message(host="codex" if "codex" in sys.argv else "claude-code")
+    # Cursor already delivers compatibility at beforeSubmitPrompt with its
+    # session debounce. This subprocess only adds local capture health.
+    upgrade = None if "cursor" in sys.argv else startup_message(
+        host="codex" if "codex" in sys.argv else "claude-code")
     token_problem = _token_problem(host)
     failure = _recent_failure()
     rulebook = _rulebook_problem()

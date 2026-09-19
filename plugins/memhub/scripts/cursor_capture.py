@@ -149,23 +149,28 @@ def main() -> int:
         payload = _normalize_payload(raw)
         if payload is not None:
             spawn_cursor_flush(payload, event)
+            contexts = []
             if event == "beforeSubmitPrompt":
                 from plugin_compatibility import startup_message
-                context = startup_message(host="cursor", session=json.loads(payload).get("conversation_id"))
-                if context:
-                    output.update(agent_message=context, user_message=context)
-            if event == "beforeShellExecution":
-                contexts = []
-                for read_context in (upgrade_context, capture_context):
-                    try:
-                        text = read_context(payload)
-                        if text:
-                            contexts.append(text)
-                    except Exception as exc:
-                        _log(f"context check failed ({exc!r})")
-                context = "\n\n".join(contexts)
-                if context:
-                    output.update(agent_message=context, user_message=context)
+                try:
+                    context = startup_message(host="cursor", session=json.loads(payload).get("conversation_id"))
+                    if context:
+                        contexts.append(context)
+                except Exception as exc:
+                    _log(f"compatibility check failed ({exc!r})")
+            readers = ((capture_context,) if event == "beforeSubmitPrompt" else
+                       (upgrade_context,) if event == "beforeShellExecution" else ())
+            for read_context in readers:
+                try:
+                    text = read_context(payload)
+                    if text:
+                        contexts.append(text)
+                except Exception as exc:
+                    _log(f"context check failed ({exc!r})")
+            context = "\n\n".join(contexts)
+            if context:
+                output.update(agent_message=context, user_message=context)
+
     except Exception as exc:
         # Capture observes; it must never gate the user's prompt or command.
         _log(f"could not launch hook capture ({exc!r})")

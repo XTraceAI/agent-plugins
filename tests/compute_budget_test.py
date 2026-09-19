@@ -83,13 +83,25 @@ class CaptureIntegrationTest(unittest.TestCase):
                     flush._save_state('test', last_ok_at=time.time(), last_error=None)
                     self.assertIsNone(capture_health._recent_failure())
 
+    def test_cursor_health_skips_duplicate_compatibility_network_check(self):
+        with patch.object(sys, 'argv', ['capture_health.py', '--host', 'cursor']), \
+             patch.object(sys, 'stdin', io.StringIO('{}')), \
+             patch.object(capture_health, '_configure'), \
+             patch.object(capture_health, '_env_host', return_value='api.memhub.xtrace.ai'), \
+             patch.object(capture_health, '_token_problem', return_value=None), \
+             patch.object(capture_health, '_recent_failure', return_value=None), \
+             patch.object(capture_health, '_rulebook_problem', return_value=None), \
+             patch('plugin_compatibility.startup_message') as startup:
+            self.assertEqual(capture_health.main(), 0)
+            startup.assert_not_called()
+
     def test_cursor_delivers_health_to_user_and_agent_without_blocking(self):
         import cursor_capture as capture
         output = io.StringIO()
-        with patch.object(sys, 'argv', ['cursor_capture.py', 'beforeShellExecution']), \
+        with patch.object(sys, 'argv', ['cursor_capture.py', 'beforeSubmitPrompt']), \
              patch.object(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(b'{"conversation_id":"test"}'))), \
              patch.object(sys, 'stdout', output), patch.object(capture, 'spawn_cursor_flush'), \
-             patch.object(capture, 'upgrade_context', return_value=None), \
+             patch('plugin_compatibility.startup_message', return_value=None), \
              patch.object(capture, 'capture_context', return_value='Compute credits exhausted'):
             capture.main()
         result = json.loads(output.getvalue())
