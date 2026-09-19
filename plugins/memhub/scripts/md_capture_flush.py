@@ -56,7 +56,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from spec_owns import load_specs_from_tree, DEFAULT_SPEC_DIR  # noqa: E402
+from spec_owns import safe_spec_dir, DEFAULT_SPEC_DIR  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from md_capture import MAX_BYTES, MIN_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
@@ -386,8 +386,11 @@ def _hand_saved(root: Path, p: Path) -> bool:
     """Git-authored specs are mirrored by the backend, never auto-uploaded."""
     try:
         relative = p.relative_to(root).as_posix()
-        return any(s.path == relative for s in load_specs_from_tree(
-            root, os.environ.get("MEMHUB_SPEC_DIR", DEFAULT_SPEC_DIR)))
+        directories = {DEFAULT_SPEC_DIR, safe_spec_dir(os.environ.get("MEMHUB_SPEC_DIR", DEFAULT_SPEC_DIR))}
+        # The directory is authoritative even while frontmatter is being edited,
+        # oversized, malformed, or retired. Do not create a competing auto-capture.
+        return p.suffix.lower() == ".md" and any(
+            directory and relative.startswith(directory + "/") for directory in directories)
     except (OSError, ValueError):
         return False
 

@@ -9,9 +9,16 @@ a generated audit diff locally. Humans review generated changes as GitHub PRs.
 
 ## init [file or topic]
 
-1. Read existing `docs/specs/*.md` and the bundled
-   `references/feature_spec_template.md`. Reuse an existing spec when it owns this
-   behavior; otherwise write the template to `docs/specs/<slug>.md`.
+1. Resolve the repo's spec directory from `MEMHUB_SPEC_DIR` or its configured
+   Rulebook `given.repo.spec_dir` / repo spec setup. Use `docs/specs` only when no
+   custom directory is configured. Honor an already agreed directory; if multiple
+   configured directories make the intended owner ambiguous, ask which applies.
+   Validate the directory with the bundled parser's `safe_spec_dir`. Read existing
+   specs recursively with `load_specs_from_tree(repo_root, spec_dir)`, which skips
+   retired specs, plus the bundled `references/feature_spec_template.md`. Reuse an
+   existing owner when appropriate; otherwise write `<spec_dir>/<slug>.md`.
+   Set the same `MEMHUB_SPEC_DIR` for post-edit reminders and automatic-capture
+   exclusion when using a custom directory.
 2. Set frontmatter `spec`, `owns` (repo-relative files or directories), and
    `last_verified_at: null`. Ask the user to confirm inferred ownership when it is
    ambiguous; use already-agreed ownership without asking again. `owns` entries

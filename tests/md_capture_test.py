@@ -405,6 +405,20 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid8)
         check([a["name"] for a in seen_args] == ["Free (free-spec.md)"], f"linked file skipped, unlinked file saved: {[a['name'] for a in seen_args]}")
         check(st["dirty"] == [] and str(owned) not in st["saved"], f"linked file leaves dirty without a digest (not retried): {st}")
+        owned.write_text("---\nspec: owned\nowns: [broken\n" + "x" * 7000, encoding="utf-8")
+        check(f._hand_saved(root, owned), "malformed git spec remains excluded")
+        owned.write_text("x" * 600000, encoding="utf-8")
+        check(f._hand_saved(root, owned), "oversized git spec remains excluded")
+        custom = root / "custom/specs/nested/broken.md"
+        custom.parent.mkdir(parents=True, exist_ok=True)
+        custom.write_text("broken", encoding="utf-8")
+        previous_dir = os.environ.get("MEMHUB_SPEC_DIR")
+        os.environ["MEMHUB_SPEC_DIR"] = "custom/specs/"
+        check(f._hand_saved(root, custom), "custom nested malformed spec remains excluded")
+        if previous_dir is None:
+            os.environ.pop("MEMHUB_SPEC_DIR", None)
+        else:
+            os.environ["MEMHUB_SPEC_DIR"] = previous_dir
         owned.unlink()
 
         # ---- git sweep: markdown written through Bash never enters `dirty` ----
