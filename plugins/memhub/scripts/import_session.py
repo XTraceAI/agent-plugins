@@ -40,6 +40,7 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 import pr_provenance  # noqa: E402
 from room_map import env_for_url, git_env, git_readonly, read_room  # noqa: E402
@@ -436,6 +437,7 @@ async def main() -> int:
     async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
+            s = mcp_http.PolicySession(s, url, headers)
             prev_gist_hash = await _gist_hash(
                 s, args.agent_brain_id, args.org_id)
             for i, sl in enumerate(slices, 1):
@@ -489,4 +491,8 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    try:
+        raise SystemExit(asyncio.run(main()))
+    except mcp_http.PluginUpgradeRequired as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)

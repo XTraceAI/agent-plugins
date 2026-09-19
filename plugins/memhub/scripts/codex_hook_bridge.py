@@ -34,7 +34,7 @@ _PR_LINK_TIMEOUT_S = 15
 # lane's one blocking fetch is capped at SESSION_FETCH_TIMEOUT_S = 1 s and
 # only happens on a stale book); the budgets below are ceilings, not costs.
 _SESSION_TIMEOUT_S = 5
-_HEALTH_TIMEOUT_S = 3
+_HEALTH_TIMEOUT_S = 5  # compatibility + bounded release lookup, inside the 8s hook budget
 # A GitHub MCP server — the same coarse test the hook manifests use, so a tool
 # called `mcp__notes__github_summary` is not mistaken for a GitHub client while
 # a server whose name contains underscores (`github_enterprise`, or any

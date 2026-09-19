@@ -137,6 +137,11 @@ def main() -> int:
         payload = _normalize_payload(raw)
         if payload is not None:
             spawn_cursor_flush(payload, event)
+            if event == "beforeSubmitPrompt":
+                from plugin_compatibility import startup_message
+                context = startup_message(host="cursor", session=json.loads(payload).get("conversation_id"))
+                if context:
+                    output.update(agent_message=context, user_message=context)
             if event == "beforeShellExecution":
                 context = upgrade_context(payload)
                 if context:

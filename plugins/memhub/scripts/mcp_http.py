@@ -43,6 +43,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from plugin_version import request_headers, upgrade_message
+
 # The version this client was written and verified against. Sent so the server
 # can negotiate; it echoed the same back.
 PROTOCOL_VERSION = "2025-06-18"
@@ -65,11 +67,29 @@ class McpError(RuntimeError):
 class PluginUpgradeRequired(McpError):
     """Structured rulebook policy rejection; safe fields only, no raw body."""
 
-    def __init__(self, minimum_version: str):
+    def __init__(self, minimum_version: str, scope="plugin_operations"):
         self.minimum_version = minimum_version
         super().__init__(
-            f"PLUGIN_UPGRADE_REQUIRED: Update the MemHub plugin to {minimum_version} "
-            "or newer and restart your agent session.", 426)
+            upgrade_message(minimum_version, scope=scope), 426)
+
+
+def _raise_upgrade(raw, url=None, bearer=None):
+    """Accept only the bounded, validated policy payload; never API shell text."""
+    try:
+        if isinstance(raw, str) and raw.startswith("Error executing tool "):
+            raw = raw.partition(": ")[2]
+        payload = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
+        policy = payload.get("data", {})
+        minimum = policy.get("minimum_version")
+        if (policy.get("error_code") == "PLUGIN_UPGRADE_REQUIRED"
+                and isinstance(minimum, str)
+                and re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", minimum)):
+            if url and bearer and policy.get("scope") == "plugin_operations":
+                from plugin_compatibility import record
+                record(url, bearer, minimum)
+            raise PluginUpgradeRequired(minimum, scope=policy.get("scope", "rulebook_fetch"))
+    except (ValueError, AttributeError, TypeError):
+        pass
 
 
 class McpNoResponse(McpError):
@@ -238,6 +258,8 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
     well-formed successful reply.
     """
     require_secure(url)
+    from plugin_compatibility import before_operation
+    before_operation(url, bearer)
     payload = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         payload["params"] = params
@@ -251,6 +273,7 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
             # even for a plain call, and rejects a request that will not take it.
             "Accept": "application/json, text/event-stream",
             "MCP-Protocol-Version": PROTOCOL_VERSION,
+            **request_headers(),
         })
 
     try:
@@ -258,7 +281,11 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
             body = resp.read().decode("utf-8", errors="replace")
             content_type = resp.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
-        detail = (exc.read() or b"").decode("utf-8", errors="replace")[:200]
+        raw_error = exc.read(16384)
+        exc.close()
+        if exc.code == 426:
+            _raise_upgrade(raw_error, url, bearer)
+        detail = raw_error.decode("utf-8", errors="replace")[:200]
         if exc.code == 429:
             raw = exc.headers.get("Retry-After")
             try:
@@ -273,6 +300,7 @@ def request(url: str, bearer: str, method: str, params: dict | None = None,
     envelope = _decode(body, content_type)
     if "error" in envelope:
         error = envelope["error"] or {}
+        _raise_upgrade(error, url, bearer)
         # The code goes in the MESSAGE, not on an attribute. An earlier revision
         # carried it as `exc.rpc_code` so callers could classify auth failures
         # delivered inside a 200 envelope — but this server does not deliver
@@ -328,10 +356,15 @@ def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
     errors; ``McpError`` carries the status for everything 4xx/5xx.
     """
     require_secure(url)
+    from plugin_compatibility import before_operation
+    before_operation(url, bearer)
     hdrs = {"Authorization": f"Bearer {bearer}", "Accept": "application/json"}
     if body is not None:
         hdrs["Content-Type"] = "application/json"
     hdrs.update(headers or {})
+    # Callers cannot accidentally report a downloaded manifest as loaded code.
+    hdrs = {k: v for k, v in hdrs.items() if k.lower() != "x-memhub-plugin-version"}
+    hdrs.update(request_headers())
     req = urllib.request.Request(
         url, method=method,
         data=json.dumps(body).encode("utf-8") if body is not None else None,
@@ -347,15 +380,7 @@ def rest(url: str, bearer: str, method: str = "GET", body: dict | None = None,
         raw_error = exc.read(16384)
         exc.close()
         if exc.code == 426:
-            try:
-                policy = json.loads(raw_error).get("data", {})
-                minimum = policy.get("minimum_version")
-                if (policy.get("error_code") == "PLUGIN_UPGRADE_REQUIRED"
-                        and isinstance(minimum, str)
-                        and re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", minimum)):
-                    raise PluginUpgradeRequired(minimum) from exc
-            except (ValueError, AttributeError, TypeError):
-                pass
+            _raise_upgrade(raw_error, url, bearer)
         detail = raw_error.decode("utf-8", errors="replace")[:200]
         if exc.code == 429:
             raw_ra = exc.headers.get("Retry-After")
@@ -388,10 +413,51 @@ def call_tool(url: str, bearer: str, name: str, arguments: dict,
     """Invoke a tool and return an SDK-shaped result."""
     result = request(url, bearer, "tools/call",
                      {"name": name, "arguments": arguments}, timeout)
+    raise_for_upgrade_result(result, url, bearer)
     blocks = [_Block(b.get("text") if isinstance(b, dict) else None)
               for b in (result.get("content") or [])]
     return ToolResult(blocks, result.get("structuredContent"),
                       bool(result.get("isError")))
+
+
+def raise_for_upgrade_result(result, url=None, bearer=None):
+    """Identical handling for stdlib dictionaries and native SDK result objects."""
+    def field(obj, name, default=None):
+        return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+    if field(result, "isError", False):
+        _raise_upgrade({"data": field(result, "structuredContent")}, url, bearer)
+        for block in field(result, "content", []) or []:
+            text = field(block, "text")
+            if isinstance(text, str):
+                _raise_upgrade(text[:16384], url, bearer)
+
+
+class PolicySession:
+    """Wrap a native SDK session without changing initialization or OAuth.
+
+    Foreground imports and background artifact capture must retain the same
+    policy/error behavior as the stdlib capture transport.
+    """
+    def __init__(self, session, url, headers=None):
+        self.session, self.url = session, url
+        self.headers = headers or {}
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
+    async def call_tool(self, *args, **kwargs):
+        auth = self.headers.get("Authorization", "")
+        bearer = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else None
+        if not bearer:
+            from _memhub_auth import resolve_bearer
+            _, bearer = resolve_bearer(self.url, refresh=False)
+        if bearer:
+            from plugin_compatibility import before_operation
+            before_operation(self.url, bearer)
+        result = await self.session.call_tool(*args, **kwargs)
+        raise_for_upgrade_result(result, self.url, bearer)
+        return result
 
 
 def list_tools(url: str, bearer: str,
