@@ -129,6 +129,18 @@ def upgrade_context(payload: bytes) -> str | None:
     return None
 
 
+def capture_context(payload: bytes) -> str | None:
+    data = json.loads(payload)
+    hook = {"session_id": data.get("conversation_id", "")}
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("capture_health.py")),
+         "--host", "cursor", "--plugin-root", str(Path(__file__).resolve().parent.parent)],
+        input=json.dumps(hook).encode(), capture_output=True, timeout=2, check=False)
+    if result.stdout:
+        return json.loads(result.stdout).get("systemMessage")
+    return None
+
+
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
     output = {"permission": "allow"}
@@ -137,15 +149,28 @@ def main() -> int:
         payload = _normalize_payload(raw)
         if payload is not None:
             spawn_cursor_flush(payload, event)
+            contexts = []
             if event == "beforeSubmitPrompt":
                 from plugin_compatibility import startup_message
-                context = startup_message(host="cursor", session=json.loads(payload).get("conversation_id"))
-                if context:
-                    output.update(agent_message=context, user_message=context)
-            if event == "beforeShellExecution":
-                context = upgrade_context(payload)
-                if context:
-                    output.update(agent_message=context, user_message=context)
+                try:
+                    context = startup_message(host="cursor", session=json.loads(payload).get("conversation_id"))
+                    if context:
+                        contexts.append(context)
+                except Exception as exc:
+                    _log(f"compatibility check failed ({exc!r})")
+            readers = ((capture_context,) if event == "beforeSubmitPrompt" else
+                       (upgrade_context,) if event == "beforeShellExecution" else ())
+            for read_context in readers:
+                try:
+                    text = read_context(payload)
+                    if text:
+                        contexts.append(text)
+                except Exception as exc:
+                    _log(f"context check failed ({exc!r})")
+            context = "\n\n".join(contexts)
+            if context:
+                output.update(agent_message=context, user_message=context)
+
     except Exception as exc:
         # Capture observes; it must never gate the user's prompt or command.
         _log(f"could not launch hook capture ({exc!r})")
