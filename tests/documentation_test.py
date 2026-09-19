@@ -188,19 +188,19 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
     for text in ("### 4b.", "scratch worktree", "advise mode",
                  "Never anchor a `command_rx` with `^`",
                  "command position",
-                 # The ledger window must bracket the sub-agent, not the whole
-                 # step — otherwise the skill's own setup fires the candidate.
-                 "immediately before the Agent call",
                  "worktree add -b",
-                 # The ledger is shared per repo, so another live session can
-                 # fire the armed candidate inside the window.
-                 "must be the sub-agent's rather than the parent's",
-                 # An interrupted run leaves a doctored book that SessionStart
-                 # deliberately considers fresh — it does not heal itself.
-                 'ls "$BOOK".pretest-*',
-                 # …and the no-original case needs its own marker, or an
-                 # interruption there leaves an armed candidate undiscoverable.
-                 "$BOOK.pretest-absent"):
+                 # ENG-1107: the test arms its candidate in a PRIVATE base
+                 # claimed for its scratch worktree, never in the book every
+                 # other session on the machine reads. These three pin the
+                 # claim, the check that it took, and its release — lose any
+                 # one and the step is doctoring the shared book again.
+                 "pretest-redirect.json",
+                 "must print a path under",
+                 "Release the claim",
+                 # The claim keeps other sessions out, but the skill's own
+                 # setup runs inside the same worktree, so a candidate matching
+                 # cp/git/python3/rm can still fire on the parent's shell.
+                 "must be the sub-agent's rather than the parent's"):
         check(f"create-rule keeps {text!r}", text in skill)
 
 

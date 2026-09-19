@@ -188,6 +188,38 @@ RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the t
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
+
+# ── forward-test redirect (spec §4.3.3) ─────────────────────────────────────
+#
+# /memhub:create-rule's §4b test has to arm its candidate in a book the hook
+# really reads, and until now that meant editing the SHARED book — one file per
+# repo, read by every session on this machine on every PreToolUse. Two tests
+# that interleave leave an unfiled candidate armed with no backup left to find
+# it by, and a sibling session's fire lands inside the test's own evidence
+# window.
+#
+# So the test may instead redirect ITS OWN calls to a private base. The
+# redirect is keyed on the session cwd, because §4b already confines the test
+# sub-agent to a scratch worktree: calls made in there read the doctored book,
+# every other session on the machine reads the real one. A marker that simply
+# said "use this base" would redirect everybody, which is the opposite of what
+# the test needs.
+#
+# Payload data must not steer where the hook looks (see `_acted_on_dir`). The
+# cwd is the host's, not the model's, so it is the trust boundary here as it is
+# there — and the redirect file itself must be the user's own and not group- or
+# world-writable, or it is ignored.
+REDIRECT_NAME = "pretest-redirect.json"
+REDIRECT_MAX_AGE_S = 3600    # a forgotten redirect stops steering anything after an hour
+#: "" = no claim, use BASE. A LAZY handle, never a snapshot of BASE: the
+#: tests rebind BASE after import, and a snapshot would quietly send their
+#: ledger and state writes to the REAL base instead.
+_ACTIVE_BASE = ""
+
+
+def _base():
+    """The base this process reads and writes under."""
+    return _ACTIVE_BASE or BASE
 REFRESH_AFTER_S = 60         # pre lane: refresh a book this old in the background…
 REFRESH_RETRY_S = 60         # …and retry no more than this often while the server is down
 SESSION_FETCH_TIMEOUT_S = 1.0   # session lane: the ONE blocking fetch, and only on a stale book
@@ -1021,8 +1053,9 @@ class OrderingEngine:
     fire of the rule in the checkout, whichever session fired it."""
 
     def __init__(self, worktree_root, branch):
-        os.makedirs(os.path.join(BASE, "state"), exist_ok=True)
-        self.path = os.path.join(BASE, "state", f"wt-{worktree_key(worktree_root)}.json")
+        os.makedirs(os.path.join(_base(), "state"), exist_ok=True)
+        self.path = os.path.join(_base(), "state",
+                                 f"wt-{worktree_key(worktree_root)}.json")
         self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
@@ -1710,12 +1743,55 @@ def given_ok(rule, probes, read=None):
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
+def _redirect_base(cwd):
+    """The private base a §4b forward test claimed for `cwd`, or "".
+
+    Every failure — missing, unreadable, malformed, stale, someone else's file,
+    a writable-by-others file, a cwd outside the claimed prefix — reads as "no
+    redirect" and the real base is used. A broken redirect must never take a
+    session's rules away from it."""
+    if not cwd:
+        return ""
+    try:
+        p = os.path.join(BASE, REDIRECT_NAME)
+        st = os.stat(p)
+        if st.st_uid != os.getuid() or (st.st_mode & 0o022):
+            return ""                       # not ours, or writable by others
+        if time.time() - st.st_mtime > REDIRECT_MAX_AGE_S:
+            return ""                       # forgotten by an interrupted run
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        base, prefix = str(d.get("base") or ""), str(d.get("cwd_prefix") or "")
+        if not base or not prefix or not os.path.isdir(base):
+            return ""
+        here = os.path.normpath(os.path.abspath(cwd))
+        # Both spellings must hold, as in `_acted_on_dir`: a symlink must not
+        # be able to pull a session into the test's book or out of it.
+        if not (_under(here, os.path.normpath(os.path.abspath(prefix)))
+                and _under(os.path.realpath(here), os.path.realpath(prefix))):
+            return ""
+        return base
+    except Exception:
+        return ""
+
+
+def set_active_base(cwd):
+    """Bind this process to the base its `cwd` belongs to. Called once, after
+    the payload is parsed and before any book is read."""
+    global _ACTIVE_BASE
+    _ACTIVE_BASE = _redirect_base(cwd)
+    return _base()
+
+
 def book_path(repo):
     """Readable name + a hash of the RAW name, so two repos that sanitise to
-    the same string ('my repo' / 'my_repo') never share a book."""
+    the same string ('my repo' / 'my_repo') never share a book.
+
+    Under `_base()`, which is the real base unless a forward test has claimed
+    this cwd (`set_active_base`)."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo)[:60] or "norepo"
     h = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:8]
-    return os.path.join(BOOK_DIR, f"{safe}-{h}.json")
+    return os.path.join(_base(), "book", f"{safe}-{h}.json")
 
 
 def load_book(repo):
@@ -1926,11 +2002,34 @@ def _norm_given(r):
     return True
 
 
+#: The id /memhub:create-rule's forward test (§4b.3) gives the candidate it arms.
+#:
+#: Such a row is UNFILED and UNREVIEWED, and the invariant is NOT "it never
+#: gates" — a gate candidate has to gate, or the test cannot show the author
+#: what their rule will do to the team. The invariant is that it never escapes
+#: the base that claimed it. Inside a claim the sub-agent is the only thing it
+#: can reach and the gate is the point; outside one, in the book every session
+#: on this machine reads, the row has no business existing at all.
+CANDIDATE_ID_PREFIX = "candidate-"
+
+
 def _degrade(row, r, given=None, unknown_matcher=""):
     """Mark `r` advise-only when this hook cannot honour `row` in full."""
     if r is None:
         return None
     r.pop("min_hook_version", None)      # answered here; never a matcher field
+    # A forward-test candidate is honoured ONLY under the claim that armed it,
+    # where the sub-agent is the only thing it can reach — gate included, since
+    # proving what a gate does to a real call is the whole point of the test.
+    # Read from the shared base it is a row nobody filed, reviewed or chose,
+    # reaching every session on this machine: dropped, not degraded, because
+    # advising on a rule that does not exist is still serving it.
+    #
+    # `deny` is decided from a plain file on disk with no server round-trip, so
+    # this is the only place the confinement can be enforced rather than
+    # intended.
+    if str(r.get("id") or "").startswith(CANDIDATE_ID_PREFIX) and not _ACTIVE_BASE:
+        return None
     why = degradation(row, given, r.get("ordering"))
     if not why and unknown_matcher:
         why = f"this hook does not understand `matcher.{unknown_matcher}`"
@@ -2961,7 +3060,7 @@ def _branch(head_path):
 
 
 def state_path(session_id):
-    sdir = os.path.join(BASE, "state")
+    sdir = os.path.join(_base(), "state")
     os.makedirs(sdir, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(session_id or ""))[:80] or "nosession"
     return os.path.join(sdir, f"{safe}.json")
@@ -3608,7 +3707,7 @@ def emit(event_name, text, *, user_line=None, deny=None):
 
 
 def _ledger_dir():
-    d = os.path.join(BASE, "ledger")
+    d = os.path.join(_base(), "ledger")
     os.makedirs(d, exist_ok=True)
     sv = os.path.join(d, "schema_version")
     if not os.path.exists(sv):
@@ -4149,8 +4248,12 @@ def main():
         # test would then doctor a file nothing loads.
         repo = sys.argv[2] if len(sys.argv) > 2 else ""
         if not repo.strip():
-            print("usage: rulebook_hook.py book-path <repo>", file=sys.stderr)
+            print("usage: rulebook_hook.py book-path <repo> [cwd]", file=sys.stderr)
             return 2
+        # The optional cwd answers "where does a call made THERE read its book
+        # from" — which is what a forward test needs, and what tells it whether
+        # its redirect took effect before it writes a candidate anywhere.
+        set_active_base(sys.argv[3] if len(sys.argv) > 3 else "")
         print(book_path(repo))
         return 0
     if mode == "flush":
@@ -4217,6 +4320,10 @@ def main():
     # the SESSION's directory: a `cd` or `-C` in the command is resolved
     # against where the terminal is, not against the edited file's checkout.
     cwd = data.get("cwd") or os.getcwd()
+    # Before any book is read: a §4b forward test may have claimed this cwd,
+    # in which case every book read below comes from its private base instead
+    # of the shared one. No claim (the overwhelming case) → the real base.
+    set_active_base(cwd)
     repo, root, gitdir, branch = repo_of_call(data)
     if not repo:            # never invent a repository for a projectless call
         if mode == "session" and _host_arg() == "codex":
@@ -4752,11 +4859,15 @@ def main():
         # the fire, once per session per rule — through `st["fired"]`, the
         # same dedup every `fire_scope: session` rule already uses, so this
         # cannot disagree with it about what "once per session" means.
+        # Held until AFTER this rule's own bullet, below. Emitted here it landed
+        # ABOVE the bullet — which for every rule but the first reads as a note
+        # on the PREVIOUS one, crediting one rule's degradation to another.
         stale_key = f"_degraded:{r['id']}"
+        note = ""
         if r.get("_degraded") and stale_key not in st["fired"]:
             st["fired"].append(stale_key)
-            lines.append(f"  _(advice only — {r['_degraded']}. Update the "
-                         f"{BRAND} plugin to let this rule gate.)_")
+            note = (f"  _(advice only — {r['_degraded']}. Update the "
+                    f"{BRAND} plugin to let this rule gate.)_")
         blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
@@ -4772,6 +4883,8 @@ def main():
             # a label shared by two gates is no address; give the id alongside
             ident = f" (rule id {r['id']})" if label_count.get(_label_of(r), 0) > 1 else ""
             deny_lines.append(f"[{label}]{ident} {r['text']}{detail}{_where(r)}")
+        if note:
+            lines.append(note)
         # A gate that was overridden still FIRED and the call still ran, so it
         # takes 📏; ⛔️ is reserved for a call that was actually stopped.
         line = disclosure_line(r, blocked=blocked_here)
