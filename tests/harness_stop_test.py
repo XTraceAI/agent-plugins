@@ -392,6 +392,63 @@ def test_stale_capped_and_missing_moments_never_block():
     print("PASS test_stale_capped_and_missing_moments_never_block")
 
 
+def test_a_later_session_in_the_repo_drains_what_an_earlier_one_stranded():
+    """The measured leak: 25 local sessions flagged 167 moments, handed 86,
+    and stranded 81 — the per-session cap, the turn window, and every
+    session's last turn, none of which any later Stop of that session can
+    reach. Nothing read those files again, so selection reads by REPO."""
+    with _Env():
+        # an earlier session leaves three kinds of stranded moment behind
+        old = hs.moments_path("dead")
+        early = _moment(2, session="dead")                        # capped/stale
+        early["state"] = dict(early["state"], at="2026-09-10T00:00:00Z")
+        hx.append_jsonl(old, early)
+        last = _moment(7, session="dead")                          # its last turn
+        last["state"] = dict(last["state"], at="2026-09-11T00:00:00Z")
+        hx.append_jsonl(old, last)
+        hs.save_meta("dead", repo="repo", last_turn=7)
+
+        # a NEW session in the same repo, with no moments of its own at all
+        hs.save_meta("sess", repo="repo", last_turn=1)
+        reason = _reason(_stop()[1])
+        assert 'source_ref="dead#7"' in reason, "adopts the newest stray, by stamp"
+        assert 'scope_repos=["repo"]' in reason
+
+        # the stamp must be findable where the skill looks: THIS session's file
+        mine = hx.read_jsonl(hs.moments_path("sess"))
+        copied = [r for r in mine if r.get("source_ref") == "dead#7"
+                  and r.get("adopted_from") == "dead"]
+        assert copied and copied[0]["state"]["repo"] == "repo", mine
+
+        # and it is marked handed where it came FROM, so nobody hands it twice
+        assert [r.get("handed") for r in hx.read_jsonl(old)] == [None, None, "dead#7"]
+        rc, out = _stop()
+        assert 'source_ref="dead#2"' in _reason(out), "the older stray drains next"
+        assert _stop() == (0, ""), "and then the backlog is empty"
+    print("PASS test_a_later_session_in_the_repo_drains_what_an_earlier_one_stranded")
+
+
+def test_adoption_is_scoped_by_repo_and_bounded_by_the_ttl():
+    with _Env():
+        other = hs.moments_path("elsewhere")
+        wrong = _moment(3, session="elsewhere")
+        wrong["state"] = dict(wrong["state"], repo="a-different-repo")
+        hx.append_jsonl(other, wrong)
+        stale = _moment(4, session="elsewhere")
+        stale["state"] = dict(stale["state"], at="2020-01-01T00:00:00Z")
+        hx.append_jsonl(other, stale)
+        hs.save_meta("sess", repo="repo", last_turn=1)
+        assert _stop() == (0, ""), "another repo's moment, and one past the TTL"
+        assert [r.get("handed") for r in hx.read_jsonl(other)] == [None, None]
+        # own moments always win over adoption
+        hx.append_jsonl(hs.moments_path("sess"), _moment(1))
+        hs.save_meta("sess", last_turn=2)
+        fresh = _moment(5, session="elsewhere")
+        hx.append_jsonl(other, fresh)
+        assert 'source_ref="sess#1"' in _reason(_stop()[1]), "this session's own first"
+    print("PASS test_adoption_is_scoped_by_repo_and_bounded_by_the_ttl")
+
+
 def test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept():
     with _Env():
         path = hs.moments_path("sess")

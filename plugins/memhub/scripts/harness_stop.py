@@ -27,16 +27,30 @@ rules on the server — no extra bookkeeping needed for the ratio, and whether a
 rule HELPS is the fire-event fold's question, not this lane's.
 
 The block hands an EARLIER turn's moment: this turn's classifier is still
-running in the child. A moment from a session's last turn is never handed.
-The continuation's own Stop carries `stop_hook_active` and passes, so one
-block is one continuation. Whatever the agent decides, a proposal lands
-`proposed` and a person activates it: nothing here fires or activates a rule.
+running in the child. The continuation's own Stop carries `stop_hook_active`
+and passes, so one block is one continuation. Whatever the agent decides, a
+proposal lands `proposed` and a person activates it: nothing here fires or
+activates a rule.
+
+A moment its own session cannot reach is NOT lost. Three things strand one —
+the per-session cap, the `HANDOFF_MAX_AGE_TURNS` window, and the last turn of
+every session, whose moment no later Stop of that session can take because its
+classifier child is still running. Measured over 25 local sessions: 167
+flagged, 86 handed, **81 never handed**, because nothing ever read those files
+again. So selection reads by REPO across every `*.moments.jsonl`, not by
+session id: a later session in the same repo adopts what an earlier one could
+not, through the hand-off path that already works. The state stamp each moment
+carries is what makes a dead session's moment usable without its process.
 
 Files, under $MEMHUB_HARNESS_DIR (default ~/.config/memhub-plugin/harness),
 all created private:
 
   <session>.moments.jsonl    flagged moments, then a `handed` row per block
-                             (append-only: two lanes write it at once)
+                             (append-only: two lanes write it at once). An
+                             adopted moment is copied in with `adopted_from`,
+                             because the create-rule skill reads the state
+                             stamp from the CURRENT session's file; the file it
+                             came from gets the `handed` row, marked `by`.
   <session>.meta.json        last extracted turn, repo, cwd, transcript cursor
   <session>.meta.json.lock   serializes the meta file's read-merge-write
   <session>.turn-*.claim     the turn an extract child already took
@@ -48,6 +62,7 @@ call or the session. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -63,6 +78,10 @@ import harness_extract as hx  # noqa: E402
 
 HANDOFF_MAX_AGE_TURNS = 3    # an older moment is left in its file, never handed stale
 HANDOFF_CAP_PER_SESSION = 8  # at most this many blocked stops in one session
+#: Past this, a moment left in someone's file is dropped rather than handed: a
+#: lesson about a branch two weeks gone is not worth a person's review round.
+#: Dropped with a log line, because a silent drop is the bug this lane has.
+MOMENT_TTL_S = 14 * 24 * 3600
 
 
 # --------------------------------------------------------------- plumbing
@@ -409,7 +428,70 @@ def _moment_key(moment: dict) -> str:
     return str(moment.get("source_ref") or f"turn-{moment.get('turn')}")
 
 
-def hand_off(session: str) -> int:
+def _repo_of(moment: dict) -> str:
+    return str((moment.get("state") or {}).get("repo") or "")
+
+
+def _stamped_at(moment: dict) -> float:
+    """Wall-clock seconds for the moment's state stamp, or 0.0 when unreadable.
+
+    Turn numbers are per-session, so they cannot order or age a moment that
+    came from someone else's file; the stamp is the only comparable clock."""
+    raw = str((moment.get("state") or {}).get("at") or "")
+    if not raw:
+        return 0.0
+    try:
+        return _dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _stranded(session: str, repo: str, now: float) -> list[tuple]:
+    """Un-handed moments for THIS repo sitting in OTHER sessions' files.
+
+    Three things strand a moment in the session that flagged it, and none of
+    them is rare: the per-session cap, the `HANDOFF_MAX_AGE_TURNS` window, and
+    the last turn of every session, whose moment no later Stop can reach
+    because its classifier child is still running. Measured over 25 local
+    sessions: 167 flagged, 86 handed, **81 never handed**.
+
+    Nothing reads those files again today, so those 81 are lost. Reading by
+    REPO instead of by session id is the whole fix — a later session in the
+    same repo drains what an earlier one could not, using the hand-off path
+    that already works. The stamp each moment already carries is what makes a
+    dead session's moment usable without its process."""
+    out: list[tuple] = []
+    try:
+        others = sorted(moments_path(session).parent.glob("*.moments.jsonl"))
+    except OSError:
+        return out
+    for path in others:
+        other = path.name[: -len(".moments.jsonl")]
+        if other == session:
+            continue
+        try:
+            rows = hx.read_jsonl(path)
+        except OSError:
+            continue
+        handed = {str(r["handed"]) for r in rows if r.get("handed")}
+        expired = 0
+        for m in rows:
+            if m.get("handed") or not isinstance(m.get("turn"), int):
+                continue
+            if _moment_key(m) in handed or _repo_of(m) != repo:
+                continue
+            stamped = _stamped_at(m)
+            if stamped and now - stamped > MOMENT_TTL_S:
+                expired += 1
+                continue
+            out.append((path, other, m, stamped))
+        if expired:
+            _log(f"stop {session[:8]}: {expired} moment(s) past the TTL in "
+                 f"{other[:8]} left undrained")
+    return out
+
+
+def hand_off(session: str, repo_hint: str = "") -> int:
     """At Stop: the newest fresh un-handed moment BLOCKS the stop, and is
     marked handed whether or not the agent files anything.
 
@@ -417,21 +499,47 @@ def hand_off(session: str) -> int:
     moments to the same file at any time, and a read-then-replace here would
     delete a moment appended in between."""
     path = moments_path(session)
-    if not path.is_file():
-        return 0
-    rows = hx.read_jsonl(path)
+    rows = hx.read_jsonl(path) if path.is_file() else []
     handed = {str(r["handed"]) for r in rows if r.get("handed")}
-    moments = [r for r in rows if not r.get("handed") and isinstance(r.get("turn"), int)]
-    if not moments or len(handed) >= HANDOFF_CAP_PER_SESSION:
+    if len(handed) >= HANDOFF_CAP_PER_SESSION:
         return 0
     meta = load_meta(session)
-    last_turn = max(int(meta.get("last_turn") or 0), max(m["turn"] for m in moments))
-    fresh = [m for m in moments if _moment_key(m) not in handed
-             and last_turn - m["turn"] < HANDOFF_MAX_AGE_TURNS]
-    if not fresh:
+    moments = [r for r in rows if not r.get("handed") and isinstance(r.get("turn"), int)]
+    chosen, adopted_from = None, ""
+    if moments:
+        last_turn = max(int(meta.get("last_turn") or 0), max(m["turn"] for m in moments))
+        fresh = [m for m in moments if _moment_key(m) not in handed
+                 and last_turn - m["turn"] < HANDOFF_MAX_AGE_TURNS]
+        if fresh:
+            # children append in the order their classifiers answered, not turn order
+            chosen = max(fresh, key=lambda m: m["turn"])
+    # Nothing of our own to hand: drain what an earlier session in this repo
+    # could not. A session with no moments at all reaches this too — it is
+    # exactly the session that should be draining, and returning early on a
+    # missing file is what made the backlog permanent.
+    # Meta is written by the extract CHILD, so on a session's very first Stop
+    # there is no repo yet and nothing is adopted; the second Stop drains.
+    # Deriving it here instead would mean running `git` inside a synchronous
+    # hook whose budget is two file reads and a spawn — the wrong trade for
+    # one turn of latency on a backlog that is already days old.
+    repo = str(meta.get("repo") or "") or repo_hint
+    if chosen is None and repo:
+        strays = [s for s in _stranded(session, repo, time.time())
+                  if _moment_key(s[2]) not in handed]
+        if strays:
+            # Newest stamp first, then the later turn: two moments from one
+            # session share a stamp often enough that `max` would otherwise
+            # return whichever the file happened to list first.
+            origin_path, adopted_from, chosen, _ = max(
+                strays, key=lambda s: (s[3], int(s[2].get("turn") or 0)))
+            # The create-rule skill reads the state stamp from THIS session's
+            # moments file, keyed by source_ref, so the adopted moment has to
+            # exist here as well as being marked handed where it came from.
+            hx.append_jsonl(path, dict(chosen, adopted_from=adopted_from))
+            hx.append_jsonl(origin_path, {"handed": _moment_key(chosen),
+                                          "by": session, "at": time.time()})
+    if chosen is None:
         return 0
-    # children append in the order their classifiers answered, not turn order
-    chosen = max(fresh, key=lambda m: m["turn"])
     hx.append_jsonl(path, {"handed": _moment_key(chosen), "at": time.time()})
     # `reason` reaches the model (and, as the host renders it, the person);
     # `systemMessage` is the person's channel. The outcome line is the AGENT's
@@ -442,7 +550,8 @@ def hand_off(session: str) -> int:
         "reason": block_reason(session, chosen, meta.get("repo") or ""),
         "systemMessage": f"MemHub: reviewing turn {chosen.get('turn')} for a team rule",
     }))
-    _log(f"stop {session[:8]}: blocked on turn {chosen.get('turn')}")
+    _log(f"stop {session[:8]}: blocked on turn {chosen.get('turn')}"
+         + (f" adopted from {adopted_from[:8]}" if adopted_from else ""))
     return 0
 
 
