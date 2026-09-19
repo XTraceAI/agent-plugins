@@ -556,13 +556,19 @@ under the same posture a real session has. Normalise the appended copy:
 - `_label`: the candidate's title, so disclosure renders as it will in
   production;
 - `status`: `active`;
-- **`mode`: `advise`.** A candidate is unfiled and unreviewed; it advises. The
-  hook enforces this independently — any id under `candidate-` is degraded to
-  advise before it can produce a `deny` — so the field is what you *intend* and
-  the guard is what makes it true. Gate behaviour is what `rulebook_verify`'s
-  table already proves; what this test adds is that the pattern fires in a real
-  session, and advise proves that just as well. Say so in the report rather
-  than letting the author believe blocking was exercised.
+- **`mode`: the mode the rule will ship with.** A gate candidate stays a gate.
+  Earlier versions of this step forced `advise` here, because a gate armed in
+  the SHARED book could refuse the person's own next command — but the claim
+  above is what removes that hazard, and forcing advise would throw away the
+  one thing a live test can show that `rulebook_verify`'s table cannot: what
+  the rule does to a real call, made by a real agent, in a real session. A
+  gate that fires is the evidence the author needs before asking anyone to
+  activate it for the team.
+
+  The hook confines this rather than weakening it: a `candidate-` row read
+  from the shared base is **dropped**, so the gate reaches the sub-agent under
+  your claim and reaches nobody at all outside it. Report what the sub-agent
+  actually hit — a refusal is a result, not a failure.
 
 **Defeat the background re-fetch.** `maybe_refresh` runs on every PreToolUse
 and will overwrite the book once the cache is an hour old — silently deleting

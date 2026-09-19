@@ -2002,9 +2002,14 @@ def _norm_given(r):
     return True
 
 
-#: The id /memhub:create-rule's forward test (§4b.3) gives the candidate it arms
-#: in the local book. Such a row is UNFILED and UNREVIEWED, so it must never be
-#: able to refuse a command — not the test sub-agent's, and not the person's.
+#: The id /memhub:create-rule's forward test (§4b.3) gives the candidate it arms.
+#:
+#: Such a row is UNFILED and UNREVIEWED, and the invariant is NOT "it never
+#: gates" — a gate candidate has to gate, or the test cannot show the author
+#: what their rule will do to the team. The invariant is that it never escapes
+#: the base that claimed it. Inside a claim the sub-agent is the only thing it
+#: can reach and the gate is the point; outside one, in the book every session
+#: on this machine reads, the row has no business existing at all.
 CANDIDATE_ID_PREFIX = "candidate-"
 
 
@@ -2013,16 +2018,18 @@ def _degrade(row, r, given=None, unknown_matcher=""):
     if r is None:
         return None
     r.pop("min_hook_version", None)      # answered here; never a matcher field
-    # A forward-test candidate advises, whatever its row says. create-rule §4b.3
-    # already writes `mode: advise` for exactly this reason — but that is a
-    # sentence in a SKILL.md, carried out by a model, so it is an intention and
-    # not a guarantee. The book is a plain file on disk and `deny` is decided
-    # from it with no server round-trip, so here is the only place the promise
-    # can be made true.
-    if str(r.get("id") or "").startswith(CANDIDATE_ID_PREFIX):
-        r["mode"] = "advise"
-        r["_degraded"] = "an unfiled forward-test candidate advises, never gates"
-        return r
+    # A forward-test candidate is honoured ONLY under the claim that armed it,
+    # where the sub-agent is the only thing it can reach — gate included, since
+    # proving what a gate does to a real call is the whole point of the test.
+    # Read from the shared base it is a row nobody filed, reviewed or chose,
+    # reaching every session on this machine: dropped, not degraded, because
+    # advising on a rule that does not exist is still serving it.
+    #
+    # `deny` is decided from a plain file on disk with no server round-trip, so
+    # this is the only place the confinement can be enforced rather than
+    # intended.
+    if str(r.get("id") or "").startswith(CANDIDATE_ID_PREFIX) and not _ACTIVE_BASE:
+        return None
     why = degradation(row, given, r.get("ordering"))
     if not why and unknown_matcher:
         why = f"this hook does not understand `matcher.{unknown_matcher}`"
@@ -4859,12 +4866,8 @@ def main():
         note = ""
         if r.get("_degraded") and stale_key not in st["fired"]:
             st["fired"].append(stale_key)
-            # A newer plugin fixes version skew. Nothing fixes a forward-test
-            # candidate, which is unfiled by definition — so that sentence is
-            # earned by the reason, not appended to every reason.
-            fix = ("" if str(r.get("id") or "").startswith(CANDIDATE_ID_PREFIX)
-                   else f" Update the {BRAND} plugin to let this rule gate.")
-            note = f"  _(advice only — {r['_degraded']}.{fix})_"
+            note = (f"  _(advice only — {r['_degraded']}. Update the "
+                    f"{BRAND} plugin to let this rule gate.)_")
         blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")

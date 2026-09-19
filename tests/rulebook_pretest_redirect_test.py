@@ -135,6 +135,26 @@ def main() -> int:
     finally:
         rb.BASE = real_base
 
+    # ── what a candidate row may do, and where ──────────────────────────
+    #
+    # The invariant is NOT "a candidate never gates". A gate candidate has to
+    # gate, or a live test cannot show the author what their rule does to a
+    # real call — which is the only thing it adds over rulebook_verify's table.
+    # The invariant is that it never escapes the base that claimed it.
+    cand = {"rule_id": "candidate-4f2a1b9c", "statement": "s", "mode": "gate",
+            "matcher": {"event": "pre", "command_rx": "git push"}}
+    rb.set_active_base(other_wt)                 # no claim here
+    check("a candidate row read from the SHARED base is dropped outright",
+          rb.to_hook_rule(dict(cand)) is None)
+    rb.set_active_base(scratch_wt)               # under the claim
+    armed = rb.to_hook_rule(dict(cand))
+    check("under its claim the candidate survives AND keeps its gate",
+          armed is not None and armed["mode"] == "gate", str(armed))
+    filed = rb.to_hook_rule({"rule_id": "r-filed", "statement": "s", "mode": "gate",
+                             "matcher": {"event": "pre", "command_rx": "git push"}})
+    check("a filed rule is untouched by the candidate rule, claim or no claim",
+          filed is not None and filed["mode"] == "gate")
+
     # ── the trust rules ─────────────────────────────────────────────────
     write_redirect(scratch_base, scratch_wt, mode=0o666)
     check("a redirect others can write is ignored", book_under(scratch_wt) == real_book)

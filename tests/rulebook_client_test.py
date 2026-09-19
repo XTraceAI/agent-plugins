@@ -461,18 +461,26 @@ def main():
                              "result_rx": "FAIL", "warn_once_per": "turn"}})
         check("to_hook_rule: result event maps command_rx→cmd_rx, result_rx→rx, turn→call",
               rr["cmd_rx"] == "pytest" and rr["rx"] == "FAIL" and rr["fire_scope"] == "call", str(rr))
-        # A create-rule §4b forward test arms an UNFILED candidate in this very
-        # book, and `deny` is decided from the book with no server round-trip.
-        # The skill writes `mode: advise` for that reason, but a sentence in a
-        # SKILL.md is an intention; the guard is what makes it true.
+        # A create-rule §4b forward test arms an UNFILED candidate, and `deny`
+        # is decided from the book with no server round-trip. The invariant is
+        # not "a candidate never gates" — a gate candidate must gate, or the
+        # test cannot show the author what their rule does to a real call. It
+        # is that a candidate never escapes the base that claimed it.
         _gate = {"event": "pre", "command_rx": "git push"}
-        cand = H.to_hook_rule({"rule_id": "candidate-4f2a1b9c", "statement": "s",
-                               "mode": "gate", "matcher": dict(_gate)})
-        check("to_hook_rule: a forward-test candidate advises even when its row says gate",
-              cand["mode"] == "advise" and "candidate" in (cand.get("_degraded") or ""), str(cand))
+        _cand = {"rule_id": "candidate-4f2a1b9c", "statement": "s", "mode": "gate",
+                 "matcher": dict(_gate)}
+        check("to_hook_rule: a candidate read from the SHARED base is dropped, not degraded",
+              H.to_hook_rule(dict(_cand)) is None)
+        H._ACTIVE_BASE = "/tmp/pretest-base"        # a claim is in force
+        try:
+            cand = H.to_hook_rule(dict(_cand))
+            check("to_hook_rule: under its claim the candidate keeps the gate it asked for",
+                  cand is not None and cand["mode"] == "gate", str(cand))
+        finally:
+            H._ACTIVE_BASE = ""
         filed = H.to_hook_rule({"rule_id": "r-filed", "statement": "s",
                                 "mode": "gate", "matcher": dict(_gate)})
-        check("to_hook_rule: the candidate guard leaves a filed gate rule alone",
+        check("to_hook_rule: a filed gate rule is untouched with or without a claim",
               filed["mode"] == "gate", str(filed))
         rows_, end_ = H._read_rows(ledger, os.path.getsize(ledger) + 10_000)
         check("_read_rows: a watermark past EOF (rotated ledger) restarts from 0", end_ == os.path.getsize(ledger) and rows_)
