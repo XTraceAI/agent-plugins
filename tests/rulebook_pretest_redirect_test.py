@@ -108,6 +108,33 @@ def main() -> int:
     check("a path that merely shares the prefix's name is not inside it",
           book_under(scratch_wt + "-sibling") == real_book)
 
+    # ── the claim covers the whole base, not just the book ──────────────
+    #
+    # The book alone is not enough: an unfiled candidate that fires writes a
+    # row to ledger/fires.jsonl, which SYNCS. Isolating the rules while leaving
+    # the evidence trail shared lets a candidate leak into the team's real fire
+    # history — and leaves §4b.4's byte-offset window just as untrustworthy.
+    rb.set_active_base(scratch_wt)
+    check("the claimed worktree's LEDGER is private too",
+          rb._ledger_dir() == os.path.join(scratch_base, "ledger"), rb._ledger_dir())
+    check("the claimed worktree's STATE is private too",
+          os.path.dirname(rb.state_path("s1")) == os.path.join(scratch_base, "state"))
+    rb.set_active_base(other_wt)
+    check("a sibling's ledger is still the real one",
+          rb._ledger_dir() == os.path.join(BASE, "ledger"), rb._ledger_dir())
+    check("a sibling's state is still the real one",
+          os.path.dirname(rb.state_path("s1")) == os.path.join(BASE, "state"))
+
+    # `_base()` is LAZY, never a snapshot: the other suites rebind BASE after
+    # import, and a snapshot would send their ledger writes to the REAL base.
+    rb.set_active_base("")
+    real_base, rb.BASE = rb.BASE, os.path.join(work, "rebound-base")
+    try:
+        check("rebinding BASE after import still moves the ledger (lazy, not a snapshot)",
+              rb._ledger_dir() == os.path.join(rb.BASE, "ledger"), rb._ledger_dir())
+    finally:
+        rb.BASE = real_base
+
     # ── the trust rules ─────────────────────────────────────────────────
     write_redirect(scratch_base, scratch_wt, mode=0o666)
     check("a redirect others can write is ignored", book_under(scratch_wt) == real_book)

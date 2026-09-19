@@ -211,7 +211,15 @@ BOOK_DIR = os.path.join(BASE, "book")
 # world-writable, or it is ignored.
 REDIRECT_NAME = "pretest-redirect.json"
 REDIRECT_MAX_AGE_S = 3600    # a forgotten redirect stops steering anything after an hour
-_ACTIVE_BOOK_DIR = BOOK_DIR  # rebound once per process, by set_active_base()
+#: "" = no claim, use BASE. A LAZY handle, never a snapshot of BASE: the
+#: tests rebind BASE after import, and a snapshot would quietly send their
+#: ledger and state writes to the REAL base instead.
+_ACTIVE_BASE = ""
+
+
+def _base():
+    """The base this process reads and writes under."""
+    return _ACTIVE_BASE or BASE
 REFRESH_AFTER_S = 60         # pre lane: refresh a book this old in the background…
 REFRESH_RETRY_S = 60         # …and retry no more than this often while the server is down
 SESSION_FETCH_TIMEOUT_S = 1.0   # session lane: the ONE blocking fetch, and only on a stale book
@@ -1045,8 +1053,9 @@ class OrderingEngine:
     fire of the rule in the checkout, whichever session fired it."""
 
     def __init__(self, worktree_root, branch):
-        os.makedirs(os.path.join(BASE, "state"), exist_ok=True)
-        self.path = os.path.join(BASE, "state", f"wt-{worktree_key(worktree_root)}.json")
+        os.makedirs(os.path.join(_base(), "state"), exist_ok=True)
+        self.path = os.path.join(_base(), "state",
+                                 f"wt-{worktree_key(worktree_root)}.json")
         self.branch = "*"            # branch is recorded on fires, not used as a key
 
     def _locked(self):
@@ -1769,21 +1778,20 @@ def _redirect_base(cwd):
 def set_active_base(cwd):
     """Bind this process to the base its `cwd` belongs to. Called once, after
     the payload is parsed and before any book is read."""
-    global _ACTIVE_BOOK_DIR
-    base = _redirect_base(cwd)
-    _ACTIVE_BOOK_DIR = os.path.join(base, "book") if base else BOOK_DIR
-    return _ACTIVE_BOOK_DIR
+    global _ACTIVE_BASE
+    _ACTIVE_BASE = _redirect_base(cwd)
+    return _base()
 
 
 def book_path(repo):
     """Readable name + a hash of the RAW name, so two repos that sanitise to
     the same string ('my repo' / 'my_repo') never share a book.
 
-    Under `_ACTIVE_BOOK_DIR`, which is the real base unless a forward test has
-    claimed this cwd (`set_active_base`)."""
+    Under `_base()`, which is the real base unless a forward test has claimed
+    this cwd (`set_active_base`)."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", repo)[:60] or "norepo"
     h = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:8]
-    return os.path.join(_ACTIVE_BOOK_DIR, f"{safe}-{h}.json")
+    return os.path.join(_base(), "book", f"{safe}-{h}.json")
 
 
 def load_book(repo):
@@ -3018,7 +3026,7 @@ def _branch(head_path):
 
 
 def state_path(session_id):
-    sdir = os.path.join(BASE, "state")
+    sdir = os.path.join(_base(), "state")
     os.makedirs(sdir, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(session_id or ""))[:80] or "nosession"
     return os.path.join(sdir, f"{safe}.json")
@@ -3665,7 +3673,7 @@ def emit(event_name, text, *, user_line=None, deny=None):
 
 
 def _ledger_dir():
-    d = os.path.join(BASE, "ledger")
+    d = os.path.join(_base(), "ledger")
     os.makedirs(d, exist_ok=True)
     sv = os.path.join(d, "schema_version")
     if not os.path.exists(sv):
@@ -4805,11 +4813,19 @@ def main():
         # the fire, once per session per rule — through `st["fired"]`, the
         # same dedup every `fire_scope: session` rule already uses, so this
         # cannot disagree with it about what "once per session" means.
+        # Held until AFTER this rule's own bullet, below. Emitted here it landed
+        # ABOVE the bullet — which for every rule but the first reads as a note
+        # on the PREVIOUS one, crediting one rule's degradation to another.
         stale_key = f"_degraded:{r['id']}"
+        note = ""
         if r.get("_degraded") and stale_key not in st["fired"]:
             st["fired"].append(stale_key)
-            lines.append(f"  _(advice only — {r['_degraded']}. Update the "
-                         f"{BRAND} plugin to let this rule gate.)_")
+            # A newer plugin fixes version skew. Nothing fixes a forward-test
+            # candidate, which is unfiled by definition — so that sentence is
+            # earned by the reason, not appended to every reason.
+            fix = ("" if str(r.get("id") or "").startswith(CANDIDATE_ID_PREFIX)
+                   else f" Update the {BRAND} plugin to let this rule gate.")
+            note = f"  _(advice only — {r['_degraded']}.{fix})_"
         blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
             lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
@@ -4825,6 +4841,8 @@ def main():
             # a label shared by two gates is no address; give the id alongside
             ident = f" (rule id {r['id']})" if label_count.get(_label_of(r), 0) > 1 else ""
             deny_lines.append(f"[{label}]{ident} {r['text']}{detail}{_where(r)}")
+        if note:
+            lines.append(note)
         # A gate that was overridden still FIRED and the call still ran, so it
         # takes 📏; ⛔️ is reserved for a call that was actually stopped.
         line = disclosure_line(r, blocked=blocked_here)
