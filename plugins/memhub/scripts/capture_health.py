@@ -46,7 +46,8 @@ CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 # the two writers keep the same last_error / last_error_at / last_ok_at shape,
 # so everything below reads either one unchanged.
 STATE_DIR = CACHE_DIR / "turnflush"
-_STATE_DIRS = {"claude": CACHE_DIR / "turnflush", "codex": CACHE_DIR / "codexflush"}
+_STATE_DIRS = {"claude": CACHE_DIR / "turnflush", "codex": CACHE_DIR / "codexflush",
+               "cursor": CACHE_DIR / "cursorflush"}
 _PLUGIN_ROOT_ARG: str | None = None     # `--plugin-root`, see _configure
 # The rulebook keeps its own tree, relocatable together for tests (the hook
 # reads the same variable).
@@ -89,6 +90,8 @@ _REASONS = {
     "upgrade_required": "the active MemHub plugin needs an upgrade",
     "auth": "the plugin's saved login expired and could not be renewed",
     "server_rejected": "the server rejected the last upload",
+    "compute_budget_exhausted": ("the organization used its monthly compute "
+                                 "budget, so the upload was not saved"),
     # Backpressure, not a fault: a key runs at one seat's throughput and a fleet
     # flushing every turn can reach it. Worded so it does not read as "your
     # session was refused" — the cursor is unmoved and the next turn retries.
@@ -504,6 +507,10 @@ def _message(host: str, token_problem: str | None,
         elif reason == "upgrade_required":
             tail = ("Update MemHub through your host's plugin manager and restart this agent session. "
                     "Pending captures are retained; logging in again does not update the plugin.")
+        elif reason == "compute_budget_exhausted":
+            tail = ("Open MemHub → Settings → Billing to check credits and the "
+                    "reset date. Ask an organization admin to add credits or "
+                    "upgrade. Capture can retry after credits are available.")
         elif reason == "budget_exhausted":
             # Not a credential question at all, so `--status` would send them
             # to inspect the one thing that was definitely fine. The session is

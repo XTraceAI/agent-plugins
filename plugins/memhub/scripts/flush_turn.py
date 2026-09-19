@@ -940,7 +940,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             _shrink_slice(session_id, state, batch, batch_consumed)
             return
         _log(f"flush FAILED: {detail}")
-        _mark_failure(session_id, "server_rejected", detail)
+        _mark_failure(session_id, "compute_budget_exhausted"
+                      if mcp_http.is_compute_budget_rejection(res)
+                      else "server_rejected", detail)
         return
 
     out = getattr(res, "structuredContent", None)

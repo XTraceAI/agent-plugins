@@ -1108,7 +1108,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                     unsupported_at=time.time(), fail_streak=0)
         return
     if verdict != "ok":
-        _note_failure(uuid, "unconfirmed_import")
+        _note_failure(uuid, "compute_budget_exhausted"
+                      if mcp_http.is_compute_budget_rejection(res)
+                      else "unconfirmed_import")
         return
 
     # `shipped` was fixed at the end of the transcript read (see above), NOT

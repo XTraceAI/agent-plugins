@@ -526,7 +526,9 @@ async def _send(session, arguments, room, title, namespace,
         # silent made the backstop's MOST LIKELY server-side failure — a slice
         # the server rejects — the one it reported least, which is the same
         # asymmetry the transport paths were fixed for one round earlier.
-        _breadcrumb(arguments.get("conversation_id"), "server_rejected", detail)
+        _breadcrumb(arguments.get("conversation_id"),
+                    "compute_budget_exhausted" if mcp_http.is_compute_budget_rejection(res)
+                    else "server_rejected", detail)
         return False, room
     out = getattr(res, "structuredContent", None)
     if isinstance(out, dict) and "conversation_id" not in out \
