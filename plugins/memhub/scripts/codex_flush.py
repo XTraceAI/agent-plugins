@@ -601,7 +601,9 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
                     fail_streak=0)
         return
     if verdict != "ok":
-        _note_failure(sid, "unconfirmed_import")
+        _note_failure(sid, "compute_budget_exhausted"
+                      if mcp_http.is_compute_budget_rejection(res)
+                      else "unconfirmed_import")
         return
 
     ack = mcp_http.ack_of(res, f"codex-{sid}")

@@ -117,7 +117,7 @@ def _note_failure(uuid: str, reason: str) -> None:
         # timer — a persistently-down server is attempted exactly once per
         # DORMANT_RETRY_S, not given a fresh MAX_UNCONFIRMED budget each
         # window that would let it hammer between windows.
-        _save_state(uuid, last_flush_at=now, last_error=reason,
+        _save_state(uuid, last_flush_at=now, last_error=reason, last_error_at=now,
                     unsupported=True, unsupported_at=now, fail_streak=0)
         return
     streak = int(st.get("fail_streak") or 0) + 1
@@ -125,12 +125,12 @@ def _note_failure(uuid: str, reason: str) -> None:
         _log(f"{streak} consecutive failed imports ({reason}) — per-event "
              f"flush is dormant for this session; run /memhub:import-session "
              f"to capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
-        _save_state(uuid, last_flush_at=now, last_error=reason,
+        _save_state(uuid, last_flush_at=now, last_error=reason, last_error_at=now,
                     unsupported=True, unsupported_at=now, fail_streak=0)
     else:
         # Sub-threshold: back off via the debounce (last_flush_at), stay in
         # normal mode (unsupported cleared) so the next event keeps counting.
-        _save_state(uuid, last_flush_at=now, last_error=reason,
+        _save_state(uuid, last_flush_at=now, last_error=reason, last_error_at=now,
                     unsupported=False, fail_streak=streak)
 
 
@@ -1108,7 +1108,9 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                     unsupported_at=time.time(), fail_streak=0)
         return
     if verdict != "ok":
-        _note_failure(uuid, "unconfirmed_import")
+        _note_failure(uuid, "compute_budget_exhausted"
+                      if mcp_http.is_compute_budget_rejection(res)
+                      else "unconfirmed_import")
         return
 
     # `shipped` was fixed at the end of the transcript read (see above), NOT

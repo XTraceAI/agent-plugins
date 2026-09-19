@@ -585,3 +585,11 @@ class Session:
         return await asyncio.to_thread(
             call_tool, self._url, self._bearer, name, arguments or {},
             self._timeout if timeout is None else timeout)
+
+
+def is_compute_budget_rejection(res) -> bool:
+    """Recognize the billing gate, never a hook timeout or a successful reply."""
+    if not getattr(res, "isError", False):
+        return False
+    return any("your organization has used its monthly compute budget" in text.lower()
+               for text in texts_of(res))
