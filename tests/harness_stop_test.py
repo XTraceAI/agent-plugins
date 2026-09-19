@@ -315,84 +315,109 @@ def _stop(**payload):
     return rc, out.getvalue()
 
 
+def _authored(**payload):
+    """The refs a Stop handed to a detached author pass, in order."""
+    seen = []
+    real = hx.spawn_detached
+    hx.spawn_detached = lambda argv, **kw: seen.append(list(argv))
+    try:
+        out = _stop(**payload)[1]
+    finally:
+        hx.spawn_detached = real
+    for argv in seen:
+        if argv and argv[0] == "author":
+            refs = argv[argv.index("--refs") + 1]
+            return [r for r in refs.split(",") if r], out
+    return [], out
+
+
 def _reason(out: str) -> str:
     doc = json.loads(out)
     assert doc["decision"] == "block", doc     # top-level, verified live on Claude Code 2.1.270
     return doc["reason"]
 
 
-def test_a_later_stop_blocks_on_the_moment_once():
+def test_a_later_stop_authors_the_moment_once():
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=2)
         hx.append_jsonl(hs.moments_path("sess"), _moment(2))
         # a subagent's Stop, carrying the parent session id, takes nothing; nor
-        # does the continuation's own Stop, or every block would chain another
-        assert _stop(agent_id="agent-7f") == (0, "")
-        assert _stop(stop_hook_active=True) == (0, "")
-        assert len(hx.read_jsonl(hs.moments_path("sess"))) == 1, "nothing handed"
-        rc, out = _stop()
-        reason = _reason(out)
-        assert rc == 0 and reason.startswith(hs.BLOCK_PREFIX)
-        assert "turn 2" in reason and "correction" in reason and "router: wrong_target" in reason
-        assert '"session_id"' not in reason and 'source_ref="sess#2"' in reason
-        assert 'scope_repos=["repo"]' in reason and "create-rule skill" in reason
-        # "Never pass activate" moved into the skill with the rest of the
-        # manual; this line is a pointer (Codex, #244)
-        assert "activate" not in reason
-        rows = hx.read_jsonl(hs.moments_path("sess"))
-        assert [r.get("handed") for r in rows] == [None, "sess#2"], "handed by appending"
-        assert "handed_at" not in rows[0], "the moment row is never rewritten"
-        assert _stop() == (0, ""), "one block per moment"
-    print("PASS test_a_later_stop_blocks_on_the_moment_once")
+        # does the continuation's own Stop
+        assert _authored(agent_id="agent-7f")[0] == []
+        assert _authored(stop_hook_active=True)[0] == []
+        assert len(hx.read_jsonl(hs.moments_path("sess"))) == 1, "nothing taken"
 
+        refs, out = _authored()
+        assert refs == ["sess#2"], refs
+        assert out == "", "a drain says nothing to the person; only an outcome does"
 
-def test_a_fast_child_never_makes_the_block_hand_the_stopping_turn():
-    """The handoff is chosen before the child is spawned. A child that wins the
-    race and appends THIS turn's moment at once must not become the block
-    (Codex, #230)."""
+        # the claim is what makes it once: a second Stop while the pass holds it
+        # spawns nothing, and the pass picks up anything parked meanwhile
+        assert _authored()[0] == [], "one drain per session at a time"
+        hs.hx.session_file("sess", ".drain.claim").unlink()
+        assert _authored()[0] == ["sess#2"], "still waiting: nothing DECIDED it yet"
+    print("PASS test_a_later_stop_authors_the_moment_once")
+
+def test_a_fast_child_never_makes_the_drain_take_the_stopping_turn():
+    """Selection happens before the extract child is spawned. A child that wins
+    the race and appends THIS turn's moment at once must not be authored by the
+    Stop that is still running (Codex, #230) — it is the next Stop's to take."""
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=2)
         hx.append_jsonl(hs.moments_path("sess"), _moment(2))
         tp = hx.harness_dir().parent / "race.jsonl"
         tp.write_text("", encoding="utf-8")
-        out, real_stdout, real_popen = io.StringIO(), sys.stdout, hx.subprocess.Popen
+        seen, real = [], hx.spawn_detached
 
-        def child_wins_the_race(args, **kw):
-            hx.append_jsonl(hs.moments_path("sess"), _moment(3))
+        def spawn(argv, **kw):
+            seen.append(list(argv))
+            if argv and argv[0] != "author":
+                hx.append_jsonl(hs.moments_path("sess"), _moment(3))   # the race
 
-        hx.subprocess.Popen, sys.stdout = child_wins_the_race, out
+        hx.spawn_detached = spawn
         try:
             hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp)})
         finally:
-            hx.subprocess.Popen, sys.stdout = real_popen, real_stdout
-        reason = _reason(out.getvalue())
-        assert "turn 2" in reason and "turn 3" not in reason, reason[:80]
-        assert [r.get("handed") for r in hx.read_jsonl(hs.moments_path("sess"))
-                if r.get("handed")] == ["sess#2"]
-    print("PASS test_a_fast_child_never_makes_the_block_hand_the_stopping_turn")
+            hx.spawn_detached = real
+        authored = [a for a in seen if a and a[0] == "author"]
+        assert authored, seen
+        assert authored[0][authored[0].index("--refs") + 1] == "sess#2"
+    print("PASS test_a_fast_child_never_makes_the_drain_take_the_stopping_turn")
 
-
-def test_stale_capped_and_missing_moments_never_block():
+def test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes():
+    """The per-session cap and the 3-turn window are GONE with the block: they
+    rationed interruptions, and a detached pass interrupts nobody. What bounds
+    a drain now is the reviewer's budget, the TTL, and the repo."""
     with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=9)
+        assert not hasattr(hs, "HANDOFF_CAP_PER_SESSION")
+        assert not hasattr(hs, "HANDOFF_MAX_AGE_TURNS")
+        hs.save_meta("sess", repo="repo", last_turn=99)
+        # an old moment is no longer skipped for being old in TURNS
         hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        assert _stop() == (0, ""), "a stale moment"
-        hs.save_meta("sess", last_turn=4)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(3))
-        hx.append_jsonl(hs.moments_path("sess"), _moment(4, kind="error_arc", hint="error_arc"))
-        reason = _reason(_stop()[1])
-        assert "turn 4" in reason and "turn 3" not in reason
-        for i in range(hs.HANDOFF_CAP_PER_SESSION):
-            hx.append_jsonl(hs.moments_path("sess"), {"handed": f"sess#old{i}", "at": 0})
-        hs.save_meta("sess", last_turn=5)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(5))
-        assert _stop() == (0, ""), "the session cap"
-        assert _stop(session_id="") == (0, "")
-        assert _stop(session_id="nobody") == (0, "")
-    print("PASS test_stale_capped_and_missing_moments_never_block")
+        assert _authored()[0] == ["sess#2"], "turn age no longer strands a moment"
+        hs.hx.session_file("sess", ".drain.claim").unlink()
 
+        stale = _moment(3)
+        stale["state"] = dict(stale["state"], at="2020-01-01T00:00:00Z")
+        hx.append_jsonl(hs.moments_path("sess"), stale)
+        elsewhere = _moment(4)
+        elsewhere["state"] = dict(elsewhere["state"], repo="another-repo")
+        hx.append_jsonl(hs.moments_path("sess"), elsewhere)
+        refs, _ = _authored()
+        assert "sess#3" not in refs and "sess#4" not in refs, refs
 
-def test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept():
+        # more than the reviewer's budget: taken in batches, never dropped
+        hs.hx.session_file("sess", ".drain.claim").unlink()
+        for turn in range(10, 10 + hs.FILING_BUDGET_PER_PASS + 3):
+            hx.append_jsonl(hs.moments_path("sess"), _moment(turn))
+        refs, _ = _authored()
+        assert len(refs) == hs.FILING_BUDGET_PER_PASS, refs
+
+        assert _authored(session_id="")[0] == []
+        assert _authored(session_id="nobody")[0] == [], "no meta, no repo, no drain"
+    print("PASS test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes")
+
+def test_a_moment_the_child_appends_while_a_drain_is_chosen_is_kept():
     with _Env():
         path = hs.moments_path("sess")
         hs.save_meta("sess", repo="repo", last_turn=2)
@@ -406,15 +431,12 @@ def test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept():
 
         hx.read_jsonl = read_then_the_child_appends
         try:
-            rc, out = _stop()
+            _authored()
         finally:
             hx.read_jsonl = real
-        assert rc == 0 and "turn 2" in _reason(out)
-        assert [r.get("turn") for r in hx.read_jsonl(path) if not r.get("handed")] == [2, 3]
-        hs.save_meta("sess", last_turn=3)
-        assert "turn 3" in _reason(_stop()[1])
-    print("PASS test_a_moment_the_child_appends_while_a_prompt_is_handed_is_kept")
-
+        keys = [r.get("source_ref") for r in real(path) if r.get("turn") is not None]
+        assert "sess#3" in keys, "the moment that landed in the gap is still there"
+    print("PASS test_a_moment_the_child_appends_while_a_drain_is_chosen_is_kept")
 
 def test_the_proposal_is_scoped_to_the_repo_the_turn_worked_in():
     with _Env() as env:
@@ -480,15 +502,18 @@ def test_each_stop_reads_from_the_cursor_not_from_byte_zero():
     print("PASS test_each_stop_reads_from_the_cursor_not_from_byte_zero")
 
 
-def test_the_newest_turn_is_handed_whatever_order_the_children_finished_in():
+def test_the_newest_moment_is_authored_first_whatever_order_children_finished_in():
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=5)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(5))      # turn 5's classifier answered first
-        hx.append_jsonl(hs.moments_path("sess"), _moment(4))
-        reason = _reason(_stop()[1])
-        assert "turn 5" in reason and "turn 4" not in reason, reason[:80]
-    print("PASS test_the_newest_turn_is_handed_whatever_order_the_children_finished_in")
-
+        newer = _moment(5)                       # turn 5's classifier answered first
+        newer["state"] = dict(newer["state"], at="2026-09-11T00:00:00Z")
+        hx.append_jsonl(hs.moments_path("sess"), newer)
+        older = _moment(4)
+        older["state"] = dict(older["state"], at="2026-09-10T00:00:00Z")
+        hx.append_jsonl(hs.moments_path("sess"), older)
+        refs, _ = _authored()
+        assert refs == ["sess#5", "sess#4"], refs
+    print("PASS test_the_newest_moment_is_authored_first_whatever_order_children_finished_in")
 
 def test_an_older_turns_child_never_moves_the_meta_back():
     with _Env():
@@ -597,22 +622,26 @@ def test_the_block_reason():
 
 
 
-def test_the_block_shows_the_person_a_status_line_not_the_instructions():
-    """`reason` is the model's channel and the host also renders it; the
-    person's channel is `systemMessage`. The hook blocks BEFORE the agent has
-    decided, so it can only name what is being looked at — the outcome line is
-    the agent's own reply."""
+def test_the_person_hears_about_a_filed_rule_and_about_a_pass_that_could_not_run():
+    """The only two things this lane says. A pass that RAN and found no lesson
+    is silent — that is the quiet the design is for. A pass that could not run
+    is not: a broken pipeline that looks exactly like a quiet one is the defect
+    this lane keeps rediscovering."""
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        rc, out = _stop()
-        payload = json.loads(out)
-        assert rc == 0 and payload["decision"] == "block"
-        assert payload["systemMessage"] == "MemHub: reviewing turn 2 for a team rule"
-        assert "create-rule skill" not in payload["systemMessage"]
-    print("PASS test_the_block_shows_the_person_a_status_line_not_the_instructions")
-
-
+        path = hs.moments_path("sess")
+        hx.append_jsonl(path, {"outcome": "none", "detail": "no lesson",
+                               "ref": "sess#1", "at": 1.0})
+        assert hs.report_outcomes("sess") == "", "a considered nothing is silent"
+        hx.append_jsonl(path, {"outcome": "filed", "detail": "rule-abc",
+                               "ref": "sess#2", "at": 2.0})
+        hx.append_jsonl(path, {"outcome": "failed", "detail": "no rulebook server",
+                               "ref": "sess#3", "at": 3.0})
+        said = hs.report_outcomes("sess")
+        assert "rule-abc" in said and "no rulebook server" in said, said
+        assert "create-rule skill" not in said, "the person gets an outcome, not a manual"
+        assert hs.report_outcomes("sess") == "", "each outcome is said once"
+    print("PASS test_the_person_hears_about_a_filed_rule_and_about_a_pass_that_could_not_run")
 
 def test_a_recorded_block_is_not_a_turn():
     """Claude Code records the block's reason as an isMeta `user` record

@@ -2,45 +2,58 @@
 """The harness-tied memory sensor. FLAGGED OFF by default.
 
 Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on. With it on,
-MemHub classifies each turn's moment and the coding agent that lived the turn
-decides whether it holds a lesson:
+every turn is classified and what survives is authored OFF the person's thread:
 
-  Stop(turn N)       `stop`     takes the turn's closed error arcs from the
-                                rulebook hook and spawns a detached `extract`
-                                child, which builds the redacted window, asks
-                                the classifier, and on a signal records the
-                                MOMENT (turn, kind, router hint, state stamp).
-                                Then, if an earlier turn's moment is waiting,
-                                it BLOCKS the stop: the agent that lived the
-                                turn, its work for the person done and nothing
-                                else competing, must decide whether the moment
-                                holds a lesson — run the create-rule skill on
-                                it, or say in one line why there is none.
+  Stop(turn N)  `stop`    takes the turn's closed error arcs from the rulebook
+                          hook, spawns a detached `extract` child, and returns.
+                          The child builds the redacted window, asks the
+                          classifier, and on a signal records the MOMENT (turn,
+                          kind, router hint, state stamp).
+                          The same Stop also spawns a detached `author` pass
+                          for whatever is already waiting, and says one line
+                          about what a FINISHED pass left (§ report_outcomes).
+  detached      `author`  one `claude -p --resume <owner> --fork-session` per
+                          moment, under the plugin's OWN MCP server and
+                          credential, filing through the create-rule skill.
+                          Nothing it does touches the person's session.
 
-Why a blocking Stop and not a line injected with the next prompt: that lane
-reached the agent 19 times in five real sessions and produced 0 `create_rule`
-calls. A line stapled to the person's live request lost to the request every
-time, and "say nothing if there is no lesson" made ignoring it look exactly like
-judging it. At Stop the agent is idle and must answer before it can stop.
-How often that produces a rule is `handed` rows here against `session_draft`
-rules on the server — no extra bookkeeping needed for the ratio, and whether a
-rule HELPS is the fire-event fold's question, not this lane's.
+Why detached rather than blocking the stop, which is what shipped before: the
+block was itself a fix. A line injected at the next prompt reached the agent 19
+times in five real sessions and produced 0 `create_rule` calls, because a line
+stapled to the person's live request loses to the request. Blocking fixed the
+attention problem and paid for it with the person's turn and context window.
+A detached pass keeps what the block bought — nothing competes for the agent's
+attention, because it is a different agent — and drops what it cost.
 
-The block hands an EARLIER turn's moment: this turn's classifier is still
-running in the child. A moment from a session's last turn is never handed.
-The continuation's own Stop carries `stop_hook_active` and passes, so one
-block is one continuation. Whatever the agent decides, a proposal lands
-`proposed` and a person activates it: nothing here fires or activates a rule.
+What the person sees: ONE line, when a rule was filed, or when a pass could not
+RUN. A pass that ran and found no lesson says nothing. Silence is allowed to
+mean "nothing worth filing" and nothing else — a broken pipeline that looks
+exactly like a quiet one is the defect this lane keeps rediscovering.
+
+Selection reads by REPO across every `*.moments.jsonl`, not by session id. A
+session can never hand its own last moment (that classifier child is still
+running when its Stop fires), and one that ends mid-work leaves the rest; read
+per-session, those are lost, because nothing opens those files again. Measured
+before this change, across 25 local sessions: 167 moments flagged, 86 handed,
+**81 never handed**.
+
+Whatever a pass decides, a proposal lands `proposed` and a person activates it:
+nothing here fires or activates a rule.
 
 Files, under $MEMHUB_HARNESS_DIR (default ~/.config/memhub-plugin/harness),
 all created private:
 
-  <session>.moments.jsonl    flagged moments, then a `handed` row per block
-                             (append-only: two lanes write it at once)
+  <session>.moments.jsonl    flagged moments, then one row per outcome
+                             (`handed` only once a pass DECIDED — a failed
+                             pass leaves the moment for a later drain, because
+                             a watermark past work nobody did is the silent
+                             version of this lane's bug). Append-only: several
+                             lanes write it at once.
   <session>.meta.json        last extracted turn, repo, cwd, transcript cursor
   <session>.meta.json.lock   serializes the meta file's read-merge-write
   <session>.turn-*.claim     the turn an extract child already took
-  stop.log / extract.log     one line per step, never prompt text
+  <session>.drain.claim      the author pass holding this session
+  stop.log / extract.log / author.log   one line per step, never prompt text
 
 Every path fails open and silent: a broken sensor must never touch the tool
 call or the session. Stdlib only.
@@ -48,10 +61,14 @@ call or the session. Stdlib only.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -61,8 +78,27 @@ if str(HERE) not in sys.path:
 
 import harness_extract as hx  # noqa: E402
 
-HANDOFF_MAX_AGE_TURNS = 3    # an older moment is left in its file, never handed stale
-HANDOFF_CAP_PER_SESSION = 8  # at most this many blocked stops in one session
+#: Two bounds used to live here — at most 8 blocked stops per session, and
+#: never a moment more than 3 turns old. Both were right for a design that
+#: INTERRUPTS: they capped what one hand-off cost the person, because every
+#: hand-off blocked their stop. Measured across 25 local sessions, they were
+#: also where the input went: 167 moments flagged, 86 handed, **81 never
+#: handed** — one session flagged 33 and handed exactly 8. Nothing ever read
+#: those files again, so each bound doubled as a deletion.
+#:
+#: They are gone with the block. Authoring is detached now, so an extra moment
+#: costs the person nothing and there is nothing to ration. The intent the cap
+#: really carried — do not drop 33 rules into a reviewer's queue — belongs at
+#: the FILING step and lives there instead (spec §4.3.4); rationing at hand-off
+#: conflated "do not interrupt the person" with "do not flood the reviewer".
+FILING_BUDGET_PER_PASS = 8   # rules one drain may propose; a reviewer's bound
+#: Past this a moment is dropped rather than authored: a lesson about a branch
+#: two weeks gone is not worth a review round. Dropped WITH a log line — silent
+#: dropping is this lane's whole bug.
+MOMENT_TTL_S = 14 * 24 * 3600
+#: One drain per session at a time. A holder that died leaves the claim behind,
+#: so it is breakable once it stops being touched.
+DRAIN_CLAIM_STALE_S = 900
 
 
 # --------------------------------------------------------------- plumbing
@@ -245,6 +281,12 @@ def cmd_stop(payload: dict) -> int:
     # otherwise append THIS turn's moment first, and the block would hand the
     # turn that is stopping (Codex, #230). Selection only reads the moments file
     # and appends a `handed` row; the boundary above is already taken.
+    # What a finished drain left for the person — the only thing this lane
+    # ever says to them, and it happens at a Stop because a detached child has
+    # no channel of its own.
+    said = report_outcomes(session)
+    if said:
+        print(json.dumps({"systemMessage": said}))
     rc = hand_off(session)
     hx.spawn_detached(args, script=Path(__file__).resolve(), log_name="stop.log")
     return rc
@@ -409,47 +451,326 @@ def _moment_key(moment: dict) -> str:
     return str(moment.get("source_ref") or f"turn-{moment.get('turn')}")
 
 
-def hand_off(session: str) -> int:
-    """At Stop: the newest fresh un-handed moment BLOCKS the stop, and is
-    marked handed whether or not the agent files anything.
+def _repo_of(moment: dict) -> str:
+    return str((moment.get("state") or {}).get("repo") or "")
 
-    This lane only APPENDS (a `handed` row). A detached extract child appends
-    moments to the same file at any time, and a read-then-replace here would
-    delete a moment appended in between."""
-    path = moments_path(session)
-    if not path.is_file():
-        return 0
-    rows = hx.read_jsonl(path)
-    handed = {str(r["handed"]) for r in rows if r.get("handed")}
-    moments = [r for r in rows if not r.get("handed") and isinstance(r.get("turn"), int)]
-    if not moments or len(handed) >= HANDOFF_CAP_PER_SESSION:
-        return 0
+
+def _stamped_at(moment: dict) -> float:
+    """Wall-clock seconds from the moment's state stamp, 0.0 when unreadable.
+
+    Turn numbers are per-session, so they can neither order nor age a moment
+    that came out of another session's file; the stamp is the only comparable
+    clock, and every moment already carries one."""
+    raw = str((moment.get("state") or {}).get("at") or "")
+    if not raw:
+        return 0.0
+    try:
+        return _dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def pending(session: str, repo: str, now: float) -> list[tuple[Path, dict]]:
+    """Every un-drained moment for THIS repo, across every session's file.
+
+    Reading one file — its own — is what made the bounds above into deletions,
+    and it is also the only reason a session's LAST moment was unreachable:
+    that moment's classifier child is still running when its Stop fires, so no
+    Stop of that session can ever take it. Whatever else changes, selection has
+    to be able to see another session's file."""
+    out: list[tuple[Path, dict]] = []
+    try:
+        files = sorted(moments_path(session).parent.glob("*.moments.jsonl"))
+    except OSError:
+        return out
+    for path in files:
+        try:
+            rows = hx.read_jsonl(path)
+        except OSError:
+            continue
+        done = {str(r["handed"]) for r in rows if r.get("handed")}
+        expired = 0
+        for m in rows:
+            if m.get("handed") or not isinstance(m.get("turn"), int):
+                continue
+            if _moment_key(m) in done or _repo_of(m) != repo:
+                continue
+            stamped = _stamped_at(m)
+            if stamped and now - stamped > MOMENT_TTL_S:
+                expired += 1
+                continue
+            out.append((path, m))
+        if expired:
+            _log(f"drain {session[:8]}: {expired} moment(s) past the TTL in "
+                 f"{path.name[:8]}")
+    # Newest stamp first, then the later turn: two moments from one session
+    # share a stamp often enough that sorting on the stamp alone would leave
+    # the order to however the file happened to list them.
+    out.sort(key=lambda pm: (_stamped_at(pm[1]), int(pm[1].get("turn") or 0)),
+             reverse=True)
+    return out
+
+
+def take_drain_claim(session: str, now: float):
+    """`<session>.drain.claim`, O_EXCL — one drain per session at a time.
+
+    The same shape the per-turn claim already uses. A holder that died leaves
+    the file behind, so a claim nobody has touched for DRAIN_CLAIM_STALE_S is
+    breakable; otherwise a single crash would stop this session draining ever
+    again."""
+    path = hx.session_file(session, ".drain.claim")
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.exists() and now - path.stat().st_mtime > DRAIN_CLAIM_STALE_S:
+            path.unlink(missing_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        return path
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
+
+
+def hand_off(session: str) -> int:
+    """At Stop: spawn a detached child to author what is waiting, and RETURN.
+
+    This used to block the stop and make the live agent do the authoring. The
+    block was chosen over a line injected at the next prompt for a measured
+    reason — that lane reached the agent 19 times in five sessions and produced
+    0 `create_rule` calls, because a line stapled to the person's live request
+    loses to the request. Detaching keeps what the block bought (nothing
+    competes for the agent's attention, because it is a different agent) and
+    drops what it cost (the person's turn, and their context window).
+
+    Only appends here: the extract child writes to these files at any time and
+    a read-then-replace would delete a moment landing in between."""
     meta = load_meta(session)
-    last_turn = max(int(meta.get("last_turn") or 0), max(m["turn"] for m in moments))
-    fresh = [m for m in moments if _moment_key(m) not in handed
-             and last_turn - m["turn"] < HANDOFF_MAX_AGE_TURNS]
-    if not fresh:
+    repo = str(meta.get("repo") or "")
+    if not repo:
+        # Meta is written by the extract CHILD, so a session's first Stop does
+        # not know its repo yet and its second does. Deriving it here means
+        # running `git` inside a synchronous hook whose budget is two file
+        # reads and a spawn.
         return 0
-    # children append in the order their classifiers answered, not turn order
-    chosen = max(fresh, key=lambda m: m["turn"])
-    hx.append_jsonl(path, {"handed": _moment_key(chosen), "at": time.time()})
-    # `reason` reaches the model (and, as the host renders it, the person);
-    # `systemMessage` is the person's channel. The outcome line is the AGENT's
-    # own reply — the block runs before it has decided, so the hook can only
-    # say what is being looked at, never what came of it.
-    print(json.dumps({
-        "decision": "block",
-        "reason": block_reason(session, chosen, meta.get("repo") or ""),
-        "systemMessage": f"MemHub: reviewing turn {chosen.get('turn')} for a team rule",
-    }))
-    _log(f"stop {session[:8]}: blocked on turn {chosen.get('turn')}")
+    now = time.time()
+    waiting = pending(session, repo, now)
+    if not waiting:
+        return 0
+    claim = take_drain_claim(session, now)
+    if claim is None:
+        # A drain is already running for this session. It reads the files when
+        # it gets there, so anything parked meanwhile is its problem, not this
+        # Stop's — nothing is dropped by declining here.
+        return 0
+    batch = waiting[:FILING_BUDGET_PER_PASS]
+    refs = [_moment_key(m) for _, m in batch]
+    hx.spawn_detached(["author", "--session", session, "--claim", str(claim),
+                       "--refs", ",".join(refs)],
+                      script=Path(__file__).resolve(), log_name="author.log")
+    _log(f"drain {session[:8]}: spawned for {len(batch)} of {len(waiting)} waiting")
     return 0
+
+
+# ------------------------------------------------------------- author lane
+MCP_SERVER_NAME = "memhub"
+#: What the child may call. Anything not named here is refused outright in a
+#: headless run, with nobody to grant it — which reads exactly like "no access"
+#: and cost a whole debugging round to tell apart.
+CHILD_TOOLS = ("Bash", "Read", "Glob", "Grep", "Skill", "Agent",
+               f"mcp__{MCP_SERVER_NAME}__create_rule",
+               f"mcp__{MCP_SERVER_NAME}__list_rules",
+               f"mcp__{MCP_SERVER_NAME}__list_rulebooks",
+               # `list_orgs` is not optional. Without it the first live run
+               # could not tell "this org has no rulebook" from "I was refused",
+               # and reported the refusal as the reason — a diagnosis the person
+               # then cannot act on.
+               f"mcp__{MCP_SERVER_NAME}__list_orgs")
+RESULT_PREFIX = "HARNESS-RESULT:"
+AUTHOR_TIMEOUT_S = 900
+
+
+def claude_bin() -> str:
+    return shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+
+
+def write_child_mcp_config(directory: Path) -> tuple[Path, str]:
+    """The plugin's OWN server and credential, written where the child reads it.
+
+    A headless child does NOT inherit the plugin's MCP server; it inherits the
+    person's claude.ai connectors. Measured 2026-09-18: those pointed at
+    PRODUCTION while the plugin's own credential is staging's, so a drain that
+    simply used what it found would file team rules into an environment nobody
+    named. `--strict-mcp-config` alongside this is what stops that happening by
+    accident rather than by policy."""
+    from _memhub_auth import resolve_url_and_auth  # noqa: PLC0415
+    url, headers, _ = resolve_url_and_auth(interactive=False)
+    cfg = {"mcpServers": {MCP_SERVER_NAME: {
+        "type": "http", "url": url,
+        "headers": {"Authorization": headers["Authorization"]}}}}
+    path = directory / "mcp.json"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh)
+    return path, url
+
+
+def author_prompt(session: str, moment: dict, repo: str) -> str:
+    """What the child is asked.
+
+    The body is `block_reason` — the same handoff the blocking Stop spent five
+    review rounds getting right, carrying `source_ref`, `scope_repos`, the
+    pointer to the skill's Harness-draft section and the derivable hint. This
+    lane adds only what is true of a DETACHED reader: nobody can answer a
+    question, and the result has to come back on a line a program can read."""
+    return (
+        block_reason(session, moment, repo)
+        + "\n\nYou are a detached pass: there is no one to answer a question, so "
+        "follow the Harness-draft section's arithmetic and ask nothing. If it is "
+        "not a lesson, file nothing.\n\n"
+        f"End your reply with one line and nothing after it:\n"
+        f"  {RESULT_PREFIX} filed <rule_id>\n"
+        f"  {RESULT_PREFIX} none <one short reason>\n"
+        f"  {RESULT_PREFIX} failed <one short reason>   (use this only if you COULD "
+        "NOT file — no rulebook server, a refused tool, an expired credential — "
+        "and never for 'there was no lesson')")
+
+
+def parse_result(stdout: str) -> tuple[str, str]:
+    """(outcome, detail) from the child's last contract line, or ('failed', …).
+
+    An unparseable answer is a FAILURE, never a quiet 'none'. Reading it as
+    'nothing here' is the defect this whole lane exists to stop: a broken
+    pipeline that looks exactly like a quiet one."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith(RESULT_PREFIX):
+            rest = line[len(RESULT_PREFIX):].strip().split(None, 1)
+            head = (rest[0] if rest else "").lower()
+            detail = rest[1].strip() if len(rest) > 1 else ""
+            if head in ("filed", "none", "failed"):
+                return head, detail
+            break
+    return "failed", "the child gave no result line"
+
+
+def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, str]:
+    owner = str((moment.get("state") or {}).get("session_id") or "")
+    if not owner:
+        return "failed", "the moment carries no session id to resume"
+    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
+        env = dict(os.environ,
+                   MEMHUB_HARNESS_CHILD="1",       # its hooks stay silent
+                   MEMHUB_HARNESS_EXTRACT="0",     # and it senses nothing
+                   # its forward test arms a candidate in ITS OWN base
+                   MEMHUB_RULEBOOK_BASE=os.path.join(scratch, "rulebook"))
+        argv = [claude_bin(), "-p", author_prompt(session, moment, repo),
+                "--resume", owner, "--fork-session",
+                "--mcp-config", str(mcp_cfg), "--strict-mcp-config",
+                "--permission-mode", "acceptEdits",
+                "--allowedTools", ",".join(CHILD_TOOLS)]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=AUTHOR_TIMEOUT_S, env=env,
+                                  stdin=subprocess.DEVNULL)
+        except FileNotFoundError:
+            return "failed", "no claude CLI on PATH"
+        except subprocess.TimeoutExpired:
+            return "failed", f"the child did not finish in {AUTHOR_TIMEOUT_S}s"
+        except OSError as exc:
+            return "failed", f"the child would not start ({exc.__class__.__name__})"
+    if proc.returncode != 0:
+        return "failed", f"the child exited {proc.returncode}"
+    return parse_result(proc.stdout)
+
+
+def cmd_author(session: str, claim: str, refs: list[str]) -> int:
+    """The detached pass. One `claude -p` per moment, then the outcome written
+    back beside the moment it came from.
+
+    `handed` is appended ONLY for a moment that was actually decided. A failed
+    pass leaves it untouched so a later drain retries it: a watermark that
+    advances past work nobody did is the silent, unrecoverable version of this
+    lane's bug."""
+    try:
+        meta = load_meta(session)
+        repo = str(meta.get("repo") or "")
+        wanted = [r for r in refs if r]
+        now = time.time()
+        waiting = {_moment_key(m): (path, m) for path, m in pending(session, repo, now)}
+        try:
+            with tempfile.TemporaryDirectory(prefix="memhub-mcp-") as cfg_dir:
+                mcp_cfg, url = write_child_mcp_config(Path(cfg_dir))
+                env = env_name()
+                _log(f"author {session[:8]}: {len(wanted)} moment(s) against {url} ({env})")
+                for ref in wanted:
+                    got = waiting.get(ref)
+                    if got is None:            # drained by someone else meanwhile
+                        continue
+                    path, moment = got
+                    outcome, detail = run_author(session, moment, repo, mcp_cfg)
+                    row = {"outcome": outcome, "detail": detail, "ref": ref,
+                           # WHICH MemHub. The first live run filed against
+                           # production because `resolve_url_and_auth` hands
+                           # back the plugin's default and nothing said so out
+                           # loud; a failure the person cannot place is a
+                           # failure they cannot fix.
+                           "env": env, "by": session, "at": time.time()}
+                    if outcome != "failed":
+                        row["handed"] = ref     # decided; never retried
+                    hx.append_jsonl(path, row)
+                    _log(f"author {session[:8]}: {ref} -> {outcome} ({detail[:60]})")
+        except Exception as exc:               # noqa: BLE001
+            # Never a quiet nothing: the pass could not run, and the next Stop
+            # says so on the health channel.
+            hx.append_jsonl(moments_path(session),
+                            {"outcome": "failed", "detail": f"drain could not start ({exc})",
+                             "by": session, "at": time.time()})
+            _log(f"author {session[:8]}: could not start — {exc}")
+    finally:
+        try:
+            Path(claim).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return 0
+
+
+def unreported(session: str) -> list[dict]:
+    """Outcomes this session has not yet shown the person."""
+    rows = hx.read_jsonl(moments_path(session)) if moments_path(session).is_file() else []
+    said = {str(r["reported"]) for r in rows if r.get("reported")}
+    return [r for r in rows
+            if r.get("outcome") and f"{r.get('ref')}@{r.get('at')}" not in said]
+
+
+def report_outcomes(session: str) -> str:
+    """The person's one line, and the ONLY thing this lane says to them.
+
+    A filed rule is named. A pass that could not RUN is named too, on its own
+    line — silence is allowed to mean "nothing worth filing" and nothing else.
+    A pass that ran and found no lesson says nothing: that is the quiet the
+    design is for, and it is readable in the moments file by anyone who asks."""
+    lines = []
+    for row in unreported(session):
+        if row.get("outcome") == "filed":
+            lines.append("MemHub: filed a proposed team rule in "
+                         f"{row.get('env') or 'an unnamed environment'} — "
+                         f"{row.get('detail') or 'see the rulebook'}")
+        elif row.get("outcome") == "failed":
+            lines.append("MemHub: could not review a flagged moment against "
+                         f"{row.get('env') or 'an unnamed environment'} — "
+                         f"{row.get('detail')}")
+        hx.append_jsonl(moments_path(session),
+                        {"reported": f"{row.get('ref')}@{row.get('at')}"})
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("mode", choices=("stop", "extract"))
+    p.add_argument("mode", choices=("stop", "extract", "author"))
+    p.add_argument("--claim", default="")
+    p.add_argument("--refs", default="")
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
     p.add_argument("--cwd", default="")
@@ -472,6 +793,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stop(_read_payload())
     if args.mode == "extract" and args.session:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
+    if args.mode == "author" and args.session:
+        return cmd_author(args.session, args.claim,
+                          [r for r in args.refs.split(",") if r])
     return 0
 
 
