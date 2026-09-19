@@ -44,19 +44,23 @@ person sees, which is nothing until there is a rule.
 
 **One exception, and it is not about the rule: the rulebook cache.** The
 invariant covers disclosures about the CANDIDATE; it does not cover machine
-state this skill changed. Both of §4b.5's notices are therefore spoken even
-though nothing was filed:
+state this skill changed. Since §4b.3 arms the candidate in a private base and
+never writes the shared book, there is now only one such notice, and it is
+spoken even though nothing was filed:
 
-- **A restore that fails** — say so, name the file, abort. An unreviewed
-  candidate is left armed in the local cache, and a person who is not told
-  cannot fix what they cannot see.
-- **A `$BOOK.pretest-*` found from an INTERRUPTED earlier run** — restore it
-  and say so, even though this recovery succeeded. Between that interruption
-  and now, the candidate was armed: it may already have fired, in this session
-  or another. Success here means the cache is clean going forward, not that
-  nothing happened.
+- **The claim did not take** — `book-path` still answers with the shared book
+  after you wrote the redirect. Say so, name the file, and **abort before
+  arming anything**. Carrying on would mean doctoring the book every other
+  session on the machine reads, which is what the claim exists to prevent.
 
-Silence about either is a safety bug wearing the costume of quiet.
+(There used to be a second notice: a failed restore, or a `$BOOK.pretest-*`
+left by an interrupted run, either of which meant an unreviewed candidate was
+armed in the shared cache. Neither can happen now — nothing shared is written,
+so there is nothing to restore and nothing to recover. If you are reading this
+skill against an older plugin, that recovery still matters; against this one it
+is gone rather than merely unlikely.)
+
+Silence about the claim failing is a safety bug wearing the costume of quiet.
 
 - **The test.** A lesson is one that would change what an agent DOES next time,
   is not already a RULE, is not project state, and will still be true next
@@ -508,117 +512,135 @@ say so, report the branch predicate as **unexercised**, and treat the run as
 `given` block to make the test pass: a fire the rule would not produce in
 production is a worse answer than no fire.
 
-**4b.3 Arm the candidate in the local book cache.** The candidate is not filed
-yet and a proposed rule never fires, so the test arms it by editing the book the
-hook actually reads. Ask the hook where that is — never recompute the hash:
+**4b.3 Arm the candidate in a book that is YOURS.** The candidate is not filed
+yet and a proposed rule never fires, so the test has to arm it in a book the
+hook really reads. It does **not** arm it in the shared one. That file is a
+single book per repo, read by every session on this machine working in that
+repo, on every `PreToolUse` — so doctoring it hands an unfiled, unreviewed rule
+to your colleagues' sessions and to your own other terminals, and two tests
+that interleave leave one armed with no backup left to find it by.
+
+Instead, claim a private base for the calls made inside your scratch worktree:
 
 ```bash
-BOOK=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>")
-cp "$BOOK" "$BOOK.pretest-$$"        # the restore source
+BASE="${MEMHUB_RULEBOOK_BASE:-$HOME/.config/memhub-plugin/rulebook}"
+PRIV="$(mktemp -d)/pretest-base"
+mkdir -p "$PRIV/book" "$PRIV/ledger" "$PRIV/state"
+cp -R "$BASE/book/." "$PRIV/book/"          # start from the real rules
+
+# the claim: calls made under <scratch worktree> read $PRIV, nothing else does
+python3 - "$BASE" "$PRIV" "<scratch worktree>" <<'EOF'
+import json, os, sys
+base, priv, wt = sys.argv[1:4]
+p = os.path.join(base, "pretest-redirect.json")
+fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump({"base": priv, "cwd_prefix": wt, "pid": os.getpid()}, f)
+EOF
+
+# where the sub-agent's calls will actually read from — check before arming
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>" "<scratch worktree>"
 ```
 
-Then write `$BOOK` back with the candidate **appended** to `rules` — never
-replacing the list, so the team's real rules stay armed and the test window
-cannot leave the user unprotected. Normalise the appended copy:
+That last line must print a path under `$PRIV`. If it prints the shared book,
+the claim did not take (a stale or unreadable redirect reads as *no redirect*,
+by design) — **stop, and do not arm anything**. Ask the hook rather than
+recomputing the hash, here as before.
+
+Then write the candidate into the book **under `$PRIV`**, appended to `rules` —
+never replacing the list, so the real rules stay armed and the sub-agent runs
+under the same posture a real session has. Normalise the appended copy:
 
 - `id`: `candidate-<8 hex>` — unique, and identifiable if a row ever leaks to
   the ledger;
 - `_label`: the candidate's title, so disclosure renders as it will in
   production;
 - `status`: `active`;
-- **`mode`: `advise`, ALWAYS — even for a rule that will ship as a gate.** A
-  gate armed in the user's live session can block the *user's own* next
-  command, not just the sub-agent's. Gate behaviour is what
-  `rulebook_verify`'s table already proves; what this test adds is that the
-  pattern fires in a real session, and advise proves that just as well. Say so
-  in the report rather than letting the author believe blocking was exercised.
+- **`mode`: `advise`.** A candidate is unfiled and unreviewed; it advises. The
+  hook enforces this independently — any id under `candidate-` is degraded to
+  advise before it can produce a `deny` — so the field is what you *intend* and
+  the guard is what makes it true. Gate behaviour is what `rulebook_verify`'s
+  table already proves; what this test adds is that the pattern fires in a real
+  session, and advise proves that just as well. Say so in the report rather
+  than letting the author believe blocking was exercised.
 
 **Defeat the background re-fetch.** `maybe_refresh` runs on every PreToolUse
 and will overwrite the book once the cache is an hour old — silently deleting
-the candidate mid-test, which reads exactly like "the rule never fired". You
-cannot set `MEMHUB_RULEBOOK_FETCH=0` for hooks that are already running, so
-defeat it on its own terms:
+the candidate mid-test, which reads exactly like "the rule never fired". The
+private base does not change this: the fetch lane writes into whichever base
+the call resolved to. You cannot set `MEMHUB_RULEBOOK_FETCH=0` for hooks that
+are already running, so defeat it on its own terms, in the private book:
 
-- write `fetched_at` in the doctored book as **now**, which makes the age check
-  return early;
-- also write `{"at": "<now>"}` to `$BOOK.refresh` (backing up any existing
-  stamp), which blocks a retry even if the age check is ever changed.
+- write `fetched_at` as **now**, which makes the age check return early;
+- also write `{"at": "<now>"}` to `<private book>.refresh`, which blocks a
+  retry even if the age check is ever changed.
 
 **No cached book for this repo** (nothing fetched yet, or no rulebook binds the
-user here) → there is no file to copy: **write one** containing exactly the
-candidate plus a `fetched_at` of now. Restore then means *deleting* the file.
-Nothing is displaced, because nothing was there — this is not the §4b.6 escape.
+user here) → `cp -R` copies nothing and you simply write the private book
+yourself, containing exactly the candidate plus a `fetched_at` of now. Nothing
+is displaced, because nothing was there and nothing shared is touched either
+way — this is not the §4b.6 escape.
 
-**Still leave a marker**: `touch "$BOOK.pretest-absent"` before writing the
-book. §4b.5's recovery looks for `$BOOK.pretest-*`, and with no original to
-back up there would otherwise be nothing on disk saying a test was running — so
-an interruption here would leave a freshly created book holding one unfiled,
-armed candidate that the next run cannot discover. The marker means "delete
-`$BOOK`", where a `pretest-<pid>` backup means "copy it back". Delete the
-marker as part of restoring.
+**4b.4 Run the sub-agent.** Run it with the Agent tool on the fake feature
+prompt, instructing it to work **only** inside the scratch worktree path —
+which is also what makes the claim apply to it, since the redirect is keyed on
+that path.
 
-**4b.4 Bracket the ledger around the sub-agent, then run it.** Note the byte
-offset of `<base>/ledger/fires.jsonl` (`<base>` is `$MEMHUB_RULEBOOK_BASE` or
-`~/.config/memhub-plugin/rulebook`) **immediately before the Agent call, after
-the book is already armed**, and note it again **immediately after the Agent
-returns, before restoring**. Only rows between those two offsets are evidence.
+No ledger bracketing is needed any more. The sub-agent's fires land in
+`$PRIV/ledger/fires.jsonl` and nothing else writes there, so **every row in
+that file is evidence**. The old byte-offset window existed because the shared
+ledger also carried your own setup commands and, worse, concurrent sessions'
+fires — a rule whose matcher covered `cp`, `git`, `python3` or `rm` could pass
+a test nothing exercised. A private ledger removes the problem rather than
+narrowing the window around it.
 
-**Why not "before arming, after restoring".** Your own setup and restore are
-shell commands, and the candidate is armed while you run them — so a rule whose
-matcher covers `cp`, `git`, `python3` or `rm` fires on §4b.3's
-`cp "$BOOK" "$BOOK.pretest-$$"` or §4b.5's restore. The wider window then
-reports a fire the sub-agent never caused, and the rule passes a test nothing
-exercised. That is worse than a failed test: it is a green light nobody earned.
-
-Then run the sub-agent with the Agent tool on the fake feature prompt,
-instructing it to work **only** inside the scratch worktree path.
-
-**4b.5 Restore the book — always, immediately after the sub-agent returns**,
-success or failure. Copy `$BOOK.pretest-$$` back over `$BOOK` (restoring its
-original `fetched_at` and `etag`), restore or delete the `.refresh` stamp, and
-delete the backup. **Verify by hashing**: if the restored file does not match
-the backup byte-for-byte, say so loudly and tell the user the path — a doctored
-book is a rule set they did not choose.
-
-**An interrupted run does NOT heal itself, so check for one first.** §4b.3
-writes `fetched_at` as *now* precisely so the background re-fetch leaves the
-book alone — which means that after a Ctrl-C the next SessionStart considers
-the doctored book FRESH, renders the candidate, and only spawns a best-effort
-background fetch. If that fetch fails, an unfiled rule stays armed
-indefinitely. (An earlier version of this step claimed the damage window was
-one session. It is not, and the mechanism that makes the test reliable is the
-same one that makes the interruption durable.)
-
-So **before arming anything**, look for a leftover from a previous run:
+**4b.5 Release the claim — always, immediately after the sub-agent returns**,
+success or failure:
 
 ```bash
-ls "$BOOK".pretest-* 2>/dev/null
+rm -f "$BASE/pretest-redirect.json"     # release first: the claim is what steers
+rm -rf "$PRIV"                          # then the private base
 ```
 
-Two shapes can come back and they mean OPPOSITE things:
+Release the claim **before** deleting the base, in that order: while the
+redirect still points at a base that no longer exists it reads as *no
+redirect*, which is the safe direction — a call falls back to the real book
+rather than to a missing one.
 
-- `$BOOK.pretest-<pid>` — a backup of a real book. **Copy it over `$BOOK`.**
-- `$BOOK.pretest-absent` — there was no book before the interrupted run.
-  **Delete `$BOOK`.** Restoring a file here would leave the candidate armed.
+There is nothing to restore and nothing to verify by hashing. The shared book
+was never written, so it cannot have been left doctored; that is the whole
+point of the claim, and it is what replaces the old backup-and-copy-back dance
+(`$BOOK.pretest-<pid>` / `$BOOK.pretest-absent`) along with its two markers
+that meant opposite things.
 
-Either way, restore or delete `$BOOK.refresh`, remove the marker, and tell the
-user you found and undid a doctored book from an interrupted run — naming the
-file, because a rule set they did not choose was live until you did.
+**An interrupted run now heals itself**, which it did not before. A Ctrl-C
+leaves a redirect file and a temp base behind; the redirect stops steering
+anything after an hour (`REDIRECT_MAX_AGE_S`), and until then it only ever
+affects calls made inside that scratch worktree, which the interruption also
+abandoned. No unfiled rule is left armed for the user or for anyone else on
+the machine, in any session, at any point — so there is no pre-run recovery
+scan to do and nothing to report.
+
+If you *do* find a `pretest-redirect.json` from an earlier run while setting
+up, just overwrite it: one claim at a time, and the newest one owns the file.
 
 **Evaluate: the ledger first (fact), the transcript second (judgment).**
 
-Read the rows between the two offsets from §4b.4 — not merely "since the
-start" — and keep those with `rule_id == "candidate-<hex>"` **that also belong
-to the sub-agent**: the row's `session_id` must be this session's, and its
-`agent_id` must be the sub-agent's rather than the parent's.
+Read `$PRIV/ledger/fires.jsonl` — all of it — and keep the rows with
+`rule_id == "candidate-<hex>"` **that also belong to the sub-agent**: the
+row's `session_id` must be this session's, and its `agent_id`
+must be the sub-agent's rather than the parent's.
 
-**Why the id check, not just the window.** The book you doctored is the repo's
-book, shared by every session on this machine. A teammate's terminal — or your
-own second window — working in the same repo loads the candidate too, and a
-fire it causes lands in the same ledger inside your window. Filtering on
-`rule_id` alone would then report a pass that your fake feature never earned,
-which is the one outcome this step exists to prevent. A candidate row outside
-the window, or carrying another session's ids, was not caused by the sub-agent
+**Why the id check, even now that the ledger is private.** The claim keeps
+other sessions out, so the old hazard — a teammate's terminal, or your own
+second window, loading the candidate from the shared book and firing it inside
+your measurement window — cannot happen any more. What the id check still
+catches is nearer to home: your own setup and teardown commands run inside the
+scratch worktree too, under the same claim, so a candidate whose matcher covers
+`cp`, `git`, `python3` or `rm` can fire on *your* shell rather than on the
+sub-agent's work. Filtering on `rule_id` alone would report a pass the fake
+feature never earned. A candidate row carrying another session's ids, or the
+parent's rather than the sub-agent's, was not caused by the sub-agent
 and proves nothing. Report per row: `hook_phase` (pre/post),
 `tool`, `mode`, `fired_at`, `excerpt`.
 

@@ -573,13 +573,17 @@ def test_the_block_reason():
                  "nothing on this path reaches the person",
                  "including ones added after this was written",
                  "A live verification that runs and fails is terminal",
-                 # the silence invariant must NOT swallow a failed restore: an
-                 # unreviewed candidate left armed in the local cache is state
-                 # the person cannot fix unseen (Codex, #244, the only P1)
-                 "A restore that fails",
-                 # success is not silence either: between the interruption and
-                 # now the candidate was armed and may have fired (Codex, #244)
-                 "found from an INTERRUPTED earlier run",
+                 # The silence invariant must NOT swallow machine state this
+                 # skill changed — state the person cannot fix unseen (Codex,
+                 # #244, the only P1). The INSTANCE moved in ENG-1107: the
+                 # forward test arms its candidate in a private base now, so
+                 # "a restore that fails" and "a $BOOK.pretest-* from an
+                 # INTERRUPTED earlier run" cannot arise — nothing shared is
+                 # written, so there is nothing to restore and nothing to
+                 # recover. What replaces them is the one way the isolation can
+                 # fail open: the claim not taking, which must abort the run.
+                 "The claim did not take",
+                 "abort before",
                  "safety bug wearing the costume of quiet",
                  # an idempotent re-import ended WITH a rule (Codex, #244)
                  "unchanged: true is a filing, not a blocker",
