@@ -1651,6 +1651,12 @@ class Probes:
             return sorted({l.strip() for l in (tracked + "\n" + untracked).split("\n") if l.strip()})
         return self._get("diff_paths", compute)
 
+    def active_spec_paths(self, spec_dir="docs/specs"):
+        def compute():
+            from spec_owns import load_specs_from_tree
+            return {s.path for s in load_specs_from_tree(self.root, spec_dir)}
+        return self._get("active_spec_paths:" + spec_dir, compute)
+
     def untouched_specs(self, spec_dir="docs/specs"):
         def compute():
             from spec_owns import load_specs_from_tree, owning_specs, spec_file_changed
@@ -4563,7 +4569,7 @@ def main():
                 pending = st["spec_pending"].get(pending_key)
                 if (isinstance(pending, dict) and pending.get("root") == probe_root
                         and pending.get("branch") == probe_branch
-                        and pending.get("paths") and all(path in changed for path in pending["paths"])
+                        and pending.get("paths") and all(path in changed and path in (probes.active_spec_paths(pending.get("spec_dir", "docs/specs")) or set()) for path in pending["paths"])
                         and scope_ok(rule, repo, gitdir)):
                     converted_hits.append(rule["id"])
                     del st["spec_pending"][pending_key]
@@ -4710,10 +4716,10 @@ def main():
             spec_given = (r.get("given") or {}).get("repo") or {}
             if spec_given.get("spec_untouched"):
                 hits = probes.untouched_specs(spec_given.get("spec_dir", "docs/specs")) or []
-                st["spec_pending"][json.dumps([rid, probe_root, probe_branch])] = {"root": probe_root, "branch": probe_branch, "paths": [spec.path for spec, _ in hits]}
+                st["spec_pending"][json.dumps([rid, probe_root, probe_branch])] = {"root": probe_root, "branch": probe_branch, "spec_dir": spec_given.get("spec_dir", "docs/specs"), "paths": [spec.path for spec, _ in hits]}
                 r = dict(r)
                 r["text"] += "\n" + "\n".join(
-                    f"{spec.path} owns: {', '.join(paths[:10])}" for spec, paths in hits[:10])
+                    f"{spec.path} owns: {', '.join(paths[:10])}" for spec, paths in hits)
             fired_now.append(r)
             fired_on[rid] = ev
 

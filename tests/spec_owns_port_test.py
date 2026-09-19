@@ -57,6 +57,12 @@ def main():
         payload = {"cwd":tmp, "session_id":"spec-session", "tool_name":"Bash", "tool_input":{"command":"git push"}}
         code, output = run("pre", payload, env)
         assert code == 0 and "docs/specs/limit.md" in output and "app/limit.py" in output, output
+        (root/'docs/specs/limit.md').unlink()
+        run("post", {"cwd":tmp,"session_id":"spec-session","tool_name":"Edit", "tool_input":{"file_path":str(root/'docs/specs/limit.md')}}, env)
+        event_file = cache/'ledger/events.jsonl'
+        deleted_events = [json.loads(line) for line in event_file.read_text().splitlines()] if event_file.exists() else []
+        assert not any(e['kind']=='converted' and e['rule_id']=='spec-test' for e in deleted_events)
+        (root/'docs/specs/limit.md').write_text(TEXT)
         git('checkout', '-b', 'unrelated')
         (root/'docs/specs/limit.md').write_text(TEXT+'Updated.\n')
         code, output = run("post", {"cwd":tmp,"session_id":"spec-session","tool_name":"Edit", "tool_input":{"file_path":str(root/'docs/specs/limit.md')}}, env)
@@ -88,5 +94,21 @@ def main():
         assert {'app/limit.py', 'new/limit.py'} <= set(rename_probe.diff_paths())
         assert rename_probe.untouched_specs()[0][1] == ['app/limit.py']
 
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        def git(*args):
+            return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL, text=True)
+        git('init', '-b', 'main'); git('config', 'user.email', 'test@example.com'); git('config', 'user.name', 'Test')
+        (root/'app').mkdir(); (root/'docs/specs').mkdir(parents=True)
+        for i in range(12):
+            (root/f'app/item{i}.py').write_text('limit = 100\n')
+            (root/f'docs/specs/item{i}.md').write_text(f'---\nspec: Item {i}\nowns: [app/item{i}.py]\n---\nLimit 100.\n')
+        git('add', '.'); git('commit', '-m', 'baseline'); git('checkout', '-b', 'change')
+        for i in range(12):
+            (root/f'app/item{i}.py').write_text('limit = 200\n')
+        cache = root/'cache'
+        seed_book(str(cache), root.name, [{"id":"many-specs", "on":"bash", "rx":r"git\s+push", "fire_scope":"branch", "repo_scope":"any", "text":"Update owning specs", "why":"", "given":{"repo":{"spec_untouched":True}}}])
+        output = run("pre", {"cwd":tmp,"session_id":"many","tool_name":"Bash","tool_input":{"command":"git push"}}, {"MEMHUB_RULEBOOK_BASE":str(cache),"MEMHUB_RULEBOOK_FETCH":"0"})[1]
+        assert all(f'docs/specs/item{i}.md' in output for i in range(12)), output
     print('spec ownership parser and git probe cases passed')
 if __name__=='__main__': main()
