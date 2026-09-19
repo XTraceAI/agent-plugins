@@ -86,6 +86,7 @@ _NO_REFRESH_WARN_WITHIN_S = 6 * 3600
 # to land silently. `flush_turn_test` asserts the two stay in step, because a
 # drifted vocabulary quietly degrades the exact diagnostic this feature is for.
 _REASONS = {
+    "upgrade_required": "the active MemHub plugin needs an upgrade",
     "auth": "the plugin's saved login expired and could not be renewed",
     "server_rejected": "the server rejected the last upload",
     # Backpressure, not a fault: a key runs at one seat's throughput and a fleet
@@ -500,6 +501,9 @@ def _message(host: str, token_problem: str | None,
         # diagnose this would contradict the whole reason this check exists.
         if reason == "auth":
             tail = fix
+        elif reason == "upgrade_required":
+            tail = ("Update MemHub through your host's plugin manager and restart this agent session. "
+                    "Pending captures are retained; logging in again does not update the plugin.")
         elif reason == "budget_exhausted":
             # Not a credential question at all, so `--status` would send them
             # to inspect the one thing that was definitely fine. The session is
@@ -633,10 +637,13 @@ def main() -> int:
     if not host:
         return 0  # not running as an installed plugin — nothing to judge
 
+    from plugin_compatibility import startup_message
+    upgrade = startup_message(host="codex" if "codex" in sys.argv else "claude-code")
     token_problem = _token_problem(host)
     failure = _recent_failure()
     rulebook = _rulebook_problem()
-    message = _message(host, token_problem, failure, rulebook)
+    health = _message(host, token_problem, failure, rulebook)
+    message = "\n".join(part for part in (upgrade, health) if part)
     if not message:
         return 0
 
@@ -645,7 +652,7 @@ def main() -> int:
     # — and SessionStart fires again on resume and /clear. The cause is what
     # should be shown once; only a genuinely DIFFERENT problem should interrupt
     # again.
-    signature = (f"{host}|{token_problem or ''}|{failure[0] if failure else ''}"
+    signature = (f"{upgrade or ''}|{host}|{token_problem or ''}|{failure[0] if failure else ''}"
                  f"|{rulebook[0] if rulebook else ''}")
     if _already_warned(session_id, signature):
         return 0
@@ -653,7 +660,7 @@ def main() -> int:
     print(json.dumps({
         # The channel that reaches the USER. Everything else this hook could
         # emit goes only to the model.
-        "systemMessage": f"⚠️  {message}",
+        "systemMessage": f"{'🚨' if upgrade and 'PLUGIN_UPGRADE_REQUIRED' in upgrade else 'ℹ️' if upgrade and not health else '⚠️'}  {message}",
         # And to the agent, so "is my memory working?" is answerable without
         # re-deriving any of it.
         "hookSpecificOutput": {

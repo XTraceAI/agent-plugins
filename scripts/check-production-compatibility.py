@@ -78,7 +78,7 @@ def package_version(root):
     require(len(set(versions)) == 1, "candidate manifest versions disagree")
     servers = json.loads((root / ".mcp.json").read_text()).get("mcpServers")
     require(isinstance(servers, dict) and set(servers) == {"memhub"}, "unexpected MCP configuration")
-    require(servers["memhub"].get("url") == PRODUCTION + "/mcp-server/mcp",
+    require((servers["memhub"].get("url") or "").split("?", 1)[0] == PRODUCTION + "/mcp-server/mcp",
             "candidate MCP must point to production")
     return versions[0]
 

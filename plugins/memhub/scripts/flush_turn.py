@@ -836,6 +836,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         nonlocal too_large
         try:
             return await session.call_tool("import_conversation", arguments=args)
+        except mcp_http.PluginUpgradeRequired as e:
+            _log(str(e))
+            _mark_failure(session_id, "upgrade_required", str(e))
         except mcp_http.McpRateLimited as e:
             wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
             _log(f"rate limited{wait} — the next turn retries (cursor unmoved)")

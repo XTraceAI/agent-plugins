@@ -2177,6 +2177,17 @@ def _upgrade_scope(api):
 
 
 def upgrade_status(repo):
+    # A rejection from capture/search also suspends cached rules, even if a
+    # fresh Rulebook cache would otherwise avoid a network fetch this session.
+    try:
+        api = _api()
+        if api:
+            from plugin_compatibility import status
+            notice = status(api[0], api[1])
+            if notice:
+                return {**notice, "scope": _upgrade_scope(api)}
+    except Exception:
+        pass
     try:
         with open(book_path(repo) + ".upgrade", encoding="utf-8") as f:
             notice = json.load(f)

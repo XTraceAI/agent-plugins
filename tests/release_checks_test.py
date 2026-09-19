@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -29,6 +30,30 @@ SID = "11111111-1111-4111-8111-111111111111"
 
 
 class ReleaseChecksTests(unittest.TestCase):
+    def test_fixture_probe_loads_transport_siblings_in_fresh_process(self):
+        code = r"""
+import importlib.util, sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, 'scripts')
+spec = importlib.util.spec_from_file_location('agent_check', 'scripts/check-agent-session.py')
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+original = list(sys.path)
+class ReachedTransport(Exception): pass
+with patch('urllib.request.OpenerDirector.open', side_effect=ReachedTransport):
+    try:
+        agent.validate_live_fixture(Path('plugins/memhub').resolve(), {}, 'mhk_test-only')
+    except ReachedTransport:
+        pass
+    else:
+        raise AssertionError('probe did not reach the transport')
+assert sys.path == original
+"""
+        result = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_upgrade_notice_diagnostics_identify_each_missing_requirement(self):
         nonce = "999.4242.17"
         fields = {"error_code": "PLUGIN_UPGRADE_REQUIRED", "minimum_version": nonce,

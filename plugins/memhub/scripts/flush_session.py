@@ -436,6 +436,9 @@ async def _send(session, arguments, room, title, namespace,
         try:
             return await session.call_tool("import_conversation",
                                            arguments=args, timeout=timeout)
+        except mcp_http.PluginUpgradeRequired as e:
+            _log(str(e))
+            _breadcrumb(args.get("conversation_id"), "upgrade_required", str(e))
         except mcp_http.McpRateLimited as e:
             wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
             _log(f"{label}rate limited{wait}; slices already sent are stored")

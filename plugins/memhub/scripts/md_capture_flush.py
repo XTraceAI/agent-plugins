@@ -55,6 +55,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
 from artifact_sync_reminder import MAP_RELPATH, link_for_path  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
@@ -207,6 +208,7 @@ async def _save(session, call_args: dict) -> dict:
     digest on an auth/quota rejection and silently lost the capture.
     """
     res = await session.call_tool("save_artifact", arguments=call_args)
+    mcp_http.raise_for_upgrade_result(res)
     texts = [c.text for c in getattr(res, "content", []) if getattr(c, "type", "") == "text"]
     body = texts[0] if texts else ""
     if getattr(res, "isError", False):
@@ -312,6 +314,7 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
         async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
             async with ClientSession(r, w) as s:
                 await s.initialize()
+                s = mcp_http.PolicySession(s, url, headers)
                 for raw, p, text, d in todo:
                     pending.pop(raw, None)
                     # The whole per-item body is guarded, not just the save:
@@ -344,6 +347,11 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                         if room:
                             call_args["agent_brain_id"] = room["brain_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
+                    except mcp_http.PluginUpgradeRequired as e:
+                        _log(str(e))
+                        # Preserve the dirty item and its retry budget. A plugin
+                        # update is required; this is not a content failure.
+                        break
                     except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
                         _bump(attempts, raw, processed, f"{type(e).__name__}: {str(e)[:120]}",
                               gaveup, d)
@@ -357,6 +365,8 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                          f"{', git sweep' if raw in swept else ''}) → "
                          f"{room['name'] if room else 'personal memory'} "
                          f"id={out.get('artifact_id') or out.get('id')}")
+    except mcp_http.PluginUpgradeRequired as e:
+        _log(str(e))
     except Exception as e:  # noqa: BLE001 — connection-level: SDK import, auth, initialize
         # Nothing per-item ran, so nothing was bumped. Count this pass against
         # every candidate that never got its turn, or an unreachable server

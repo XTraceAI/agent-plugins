@@ -116,7 +116,12 @@ def default_url() -> str:
     try:
         url = _plugin_mcp_config().get("url")
         if url:
-            return url
+            # Host-owned MCP connections use the version in their loaded config.
+            # Python transports report their own import-time version in a header.
+            parts = urllib.parse.urlsplit(url)
+            query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+                     if k != "memhub_plugin_version"]
+            return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
     except Exception:  # noqa: BLE001
         pass
     # .mcp.json was unreadable/corrupt. Don't guess a fixed URL — a single
@@ -685,10 +690,12 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     (see ``_refresh_cached_token_if_stale``) — the SDK cannot do this itself
     from a cold process, which silently broke the commit/PR flush hooks.
     """
+    from plugin_version import request_headers
+
     url = url or default_url()
     token = os.environ.get("MEMHUB_TOKEN", "").strip()
     if token:
-        return url, {"Authorization": f"Bearer {token}"}, None
+        return url, {"Authorization": f"Bearer {token}", **request_headers()}, None
 
     # A stored personal access key, minted by /memhub:login. Preferred over the
     # OAuth cache because it is a STATIC bearer: no expiry inside a session, no
@@ -702,10 +709,10 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     # reports the lapsed key either way.
     secret = _stored_pak_secret(url)
     if secret is not None:
-        return url, {"Authorization": f"Bearer {secret}"}, None
+        return url, {"Authorization": f"Bearer {secret}", **request_headers()}, None
 
     _refresh_cached_token_if_stale(url)
-    return url, None, build_oauth(url, interactive=interactive)
+    return url, request_headers(), build_oauth(url, interactive=interactive)
 
 
 if __name__ == "__main__":
