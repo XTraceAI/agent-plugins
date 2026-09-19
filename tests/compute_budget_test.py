@@ -4,6 +4,7 @@ import io
 import json
 import sys
 import time
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +60,28 @@ class CaptureIntegrationTest(unittest.TestCase):
             asyncio.run(flush._flush('test', Path('/tmp/not-read.jsonl'), 100))
         self.assertTrue(any(c.kwargs.get('last_error') == 'compute_budget_exhausted' for c in save.call_args_list))
         self.assertFalse(any('rollout_size' in c.kwargs for c in save.call_args_list))
+
+    def test_cursor_health_receives_installed_plugin_root(self):
+        import cursor_capture as capture
+        with patch.object(capture.subprocess, 'run', return_value=SimpleNamespace(stdout=b'{}')) as run:
+            capture.capture_context(b'{"conversation_id":"test"}')
+        argv = run.call_args.args[0]
+        root = argv[argv.index('--plugin-root') + 1]
+        with patch.object(capture_health, '_PLUGIN_ROOT_ARG', root), patch.dict('os.environ', {}, clear=True):
+            self.assertEqual(capture_health._env_host(), 'api.memhub.xtrace.ai')
+
+    def test_cursor_failure_breadcrumb_reaches_health_and_success_clears_it(self):
+        import cursor_flush as flush
+        for state in ({}, {'fail_streak': flush.MAX_UNCONFIRMED - 1}, {'unsupported': True}):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                with patch.object(flush, 'STATE_DIR', Path(directory)), patch.object(capture_health, 'STATE_DIR', Path(directory)):
+                    flush._save_state('test', **state)
+                    flush._note_failure('test', 'compute_budget_exhausted')
+                    failure = capture_health._recent_failure()
+                    self.assertIsNotNone(failure)
+                    self.assertEqual(failure[0], 'compute_budget_exhausted')
+                    flush._save_state('test', last_ok_at=time.time(), last_error=None)
+                    self.assertIsNone(capture_health._recent_failure())
 
     def test_cursor_delivers_health_to_user_and_agent_without_blocking(self):
         import cursor_capture as capture

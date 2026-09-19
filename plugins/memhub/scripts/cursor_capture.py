@@ -134,7 +134,7 @@ def capture_context(payload: bytes) -> str | None:
     hook = {"session_id": data.get("conversation_id", "")}
     result = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("capture_health.py")),
-         "--host", "cursor"],
+         "--host", "cursor", "--plugin-root", str(Path(__file__).resolve().parent.parent)],
         input=json.dumps(hook).encode(), capture_output=True, timeout=2, check=False)
     if result.stdout:
         return json.loads(result.stdout).get("systemMessage")
