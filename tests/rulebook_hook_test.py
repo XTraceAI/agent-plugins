@@ -242,8 +242,8 @@ def branch_name_checks() -> None:
         check("branch: a deep name survives whole",
               head("ref: refs/heads/user/feat/deep-thing\n") == "user/feat/deep-thing")
         check("branch: a plain name is unchanged", head("ref: refs/heads/main\n") == "main")
-        check("branch: a detached HEAD reads detached",
-              head("9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c\n") == "detached")
+        check("branch: a detached HEAD includes its commit identity",
+              head("9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c\n") == "detached@9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c")
         check("branch: an unreadable HEAD is empty, never an exception",
               H._branch(os.path.join(td, "nope")) == "")
         # the predicate that made this load-bearing

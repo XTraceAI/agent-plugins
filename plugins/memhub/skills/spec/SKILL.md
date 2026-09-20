@@ -1,274 +1,69 @@
 ---
-description: Use when the user wants spec-driven development backed by team memory — create, revise, drift-check, or report on a spec held in MemHub (e.g. "start a spec for X", "save this as the team spec", "revise the spec", "did the spec change under me?", "what's the status of the retry-policy spec?"). Specs are versioned artifacts in the repo's shared agent brain; every revision carries a rationale and is diffable.
-argument-hint: <init|revise|check|status> [file|topic] [...]
-allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__read_memory, mcp__plugin_memhub-staging_memhub__read_memory, mcp__plugin_memhub_memhub__get_artifact, mcp__plugin_memhub-staging_memhub__get_artifact, mcp__plugin_memhub_memhub__get_artifact_lineage, mcp__plugin_memhub-staging_memhub__get_artifact_lineage, mcp__plugin_memhub_memhub__diff_artifact_versions, mcp__plugin_memhub-staging_memhub__diff_artifact_versions, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__search_brains, mcp__plugin_memhub-staging_memhub__search_brains, Bash, Read, Write, Edit
+description: Create, revise, check, or report on git-authored specs with owns frontmatter; bootstrap a repo and find weekly audit remediation PRs.
+argument-hint: <init|revise|bootstrap|check|status> [file|topic]
 ---
 
-**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
-Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
-this plugin's root — the ancestor directory of this skill file that contains
-`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+Git is the only authored source of a spec. The repo brain holds read-only mirrors
+and derived audit reports. Never upload a spec, maintain an artifact map, or apply
+a generated audit diff locally. Humans review generated changes as GitHub PRs.
 
-Run spec-driven development on top of MemHub. The model:
+## init [file or topic]
 
-- **One agent brain per repo** — the repo's shared room, named
-  `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
-  stripped — e.g. `Repo: XTraceAI/agent-plugins`). Resolve it once with
-  `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show`; when that prints
-  nothing, match the name EXACTLY in `list_agent_brains` and reuse what you
-  find — a teammate may have created it — then cache it with `room_map.py set
-  --brain-id <id>`. Edge cases (SSH remotes, no remote, worktrees, not a git
-  repo) and the create-time rules — resolve before create, required
-  description, report where it landed — are in
-  `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
-  ALL of the repo's specs live there, alongside reviews, ADRs, and imported
-  implementation sessions — share it once per teammate and every current and
-  future spec in the repo is visible to them.
-- The **spec is a versioned artifact** (`artifact_type: "spec"`) inside that
-  room. Revisions are versions with a `rationale`; `diff_artifact_versions`
-  shows what moved and `get_artifact_lineage` shows why, in order.
-- A **work-item tag `spec:<slug>`** (kebab-case from the title) goes on the
-  spec and every related artifact. Many specs share one room, so the tag
-  (plus the artifact name `Spec: <title>`) is how revise/check/status pick
-  out THIS spec — never guess by name similarity alone. Tags are
-  **normalised by the server** — lowercased, every non-alphanumeric run
-  collapsed to `_`, capped at 64 chars — so `spec:retry-policy` is stored as
-  `spec_retry_policy`. Searches normalise the same way, so filtering on
-  `spec:retry-policy` still matches; just don't expect the stored tag to
-  carry punctuation, and never encode a file path in a tag (it would come
-  back as `path_docs_specs_x_md`).
-- The spec also lives **in the repo as a file** (default
-  `docs/specs/<slug>.md`). The file is what implementers read in their
-  worktree; the artifact is the shared truth. `check` compares the two.
-  Because `init` accepts any existing file as the spec, the file's
-  repo-relative path is recorded as the link's **`path`** in the repo-local
-  `.claude/artifact-map.json` (below) — that entry, not the default
-  location, is how later sessions find the file again.
-- The spec records **which source files it governs**, in the same
-  `.claude/artifact-map.json` (written by the helper script below, never by
-  hand). That map is what the plugin's artifact-sync PostToolUse hook reads:
-  editing a mapped file injects a reminder to VERSION this spec rather than
-  publish a parallel artifact. Writing it is part of `init`/`revise` — the
-  index is a byproduct of spec-driven development, not a second chore. The
-  map holds **no brain id** (a brain id is account state, not project state):
-  the upload script resolves the repo's room itself.
-- Sharing is **read-only**: teammates can search/check/status the room, but
-  uploads into it work only for its creator. The intended flow: the spec
-  owner runs `init`/`revise`; read-only members propose changes by editing
-  the repo file (PR), and the owner lands them as a revision.
+1. Resolve the repo's spec directory from `MEMHUB_SPEC_DIR` or its configured
+   Rulebook `given.repo.spec_dir` / repo spec setup. Use `docs/specs` only when no
+   custom directory is configured. Honor an already agreed directory; if multiple
+   configured directories make the intended owner ambiguous, ask which applies.
+   Validate the directory with the bundled parser's `safe_spec_dir`. Read existing
+   specs recursively with `load_specs_from_tree(repo_root, spec_dir)`, which skips
+   retired specs, plus the bundled `references/feature_spec_template.md`. Reuse an
+   existing owner when appropriate; otherwise write `<spec_dir>/<slug>.md`.
+   Set the same `MEMHUB_SPEC_DIR` for post-edit reminders and automatic-capture
+   exclusion when using a custom directory.
+2. Set frontmatter `spec`, `owns` (repo-relative files or directories), and
+   `last_verified_at: null`. Ask the user to confirm inferred ownership when it is
+   ambiguous; use already-agreed ownership without asking again. `owns` entries
+   are paths, not glob expressions. Do not invent verified behavior.
+3. Stop with the local file ready for normal git review. Do not create a brain,
+   upload an artifact, or write `.claude/artifact-map.json`.
 
-File uploads ALWAYS go through the helper script (never call the
-`save_artifact` MCP tool directly, never re-emit file contents):
+## revise [file] [reason]
 
-```bash
-uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
-  --file "<path>" --name "Spec: <title>" --type spec \
-  --agent-brain-id "<repo-ab-id>" --tags "spec,spec:<slug>" \
-  [--rationale "<why>"]
-```
+Read the spec and owned code, edit the spec in the same change as the implementation,
+and use normal git commit/PR review. A mirror is never edited independently.
 
-**Versioning is by name.** Re-uploading under the same `--name` into the same
-brain chains a new version onto that lineage's current head — no `--parent-id`
-needed. Don't pass one from memory: the server rejects any `parent_id` that
-is not the CURRENT latest version (`parent_stale`), so an id noted earlier in
-the session is already wrong after one revision. If you want explicit
-chaining anyway, `get_artifact_lineage` first and pass the head's id.
+## bootstrap
 
-Linking the spec to the code it governs ALWAYS goes through the map script
-(never hand-edit `.claude/artifact-map.json`). It is idempotent per artifact
-id — re-running replaces that artifact's link, so revisions just refresh the
-globs:
+Use the connected staging/production product consistently. An org admin configures
+`code_insight` with `mode: feature_specs`, repo installation/full name, and a granted
+workspace brain. With `domains` omitted, trigger pass 1 and show the partition
+artifact. Ask which domains to confirm; never launch the expensive generation pass
+without confirmed domains. Save the confirmed `{name, owns}` list and trigger pass 2
+with `open_pr: true`. Link the resulting PR for human review and merge. Missing
+GitHub write consent is actionable: show the run's reason and retain the candidates;
+do not bypass it using the user's personal credentials. Policy operations require
+a full user session; an MCP API key is not a substitute. If no supported authenticated
+product surface is available, explain that configuration gap rather than inventing a tool.
 
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/artifact_map.py" add \
-  --artifact-id "<root-version-id>" --name "Spec: <title>" \
-  --path "<repo-relative spec path>" --glob "<repo-relative globs>"
-```
+## check [file]
 
-`--path` is the spec file itself (repo-relative POSIX — the path the user
-gave or the `docs/specs/<slug>.md` you wrote; never absolute). `--glob` takes
-repo-relative POSIX patterns with `*`, `**`, `{a,b}` braces, and `|` between
-alternatives (e.g. `app/retry.py|app/**/backoff.py`). Use the
-`--artifact-id` of the lineage's FIRST version and keep it stable across
-revisions — it is the link's key, and the hook's reminder re-uploads the
-`--path` file by name, so it never goes stale.
+Read the spec on disk. Compare the spec's last commit against git history for its
+owned paths; report subsequent code changes as a reason to inspect consistency,
+not proof of drift. Include working-tree changes. No commit yet means unverified.
+Resolve the granted repo's bound brain through server repo resolution; do not mint
+another brain based on a cached name. Search for `spec_audit` reports for this repo,
+read the latest relevant report, and show this spec's verdict, evidence, and
+remediation PR link. Never claim a truncated audit verified the omitted specs.
 
-Arguments: `$ARGUMENTS` — the first token is the subcommand and is consumed
-before the per-subcommand parsing below; each subcommand reads only the
-REMAINING tokens. With no recognized subcommand, infer one from what the user
-said (creating → init, editing → revise, "did it change" → check, "where are
-we" → status) and treat all of `$ARGUMENTS` as its arguments.
+## status [topic]
 
-Every subcommand starts by **resolving the repo's room**: derive the name as
-above, then match it EXACTLY in `list_agent_brains` — it may be one a
-teammate created and shared with you; use theirs rather than creating a
-duplicate. Only `init` creates it when missing (`create_agent_brain` with
-`category: "repo"`, the brain's declared purpose, so it groups with the other
-repo rooms; omit `workspace_id` — you need creator access to share it); the
-other subcommands stop and point at init if no room exists. Not a git repo →
-ask which agent brain to use.
+Read local specs and search the bound repo brain for artifacts tagged `spec_mirror`.
+Open pointer results before citing them. Compare the file paths and reported git
+heads; explicitly say when a local file has no mirror yet. Read-only mirrors link
+back to GitHub. Report retired mirrors as retired, not current governing specs.
 
-## init `[file-path | title...] [for <teammates>]`
-
-1. Get the spec content. If the first remaining token is an existing file
-   path (e.g. `init docs/specs/retry.md` → `docs/specs/retry.md`), that
-   file IS the spec. Otherwise compose the spec from the current conversation
-   (sections: Goal, Non-goals, Design, Decisions, Open questions, Milestones)
-   and write it to `docs/specs/<slug>.md` in the repo — composing it yourself
-   is the point here; this is NOT the file-upload case the save-artifact
-   skill guards against. Derive `<title>` from the argument or content;
-   `<slug>` is its short kebab-case form. Start the file with YAML
-   frontmatter carrying the artifact name, quoted:
-
-   ```
-   ---
-   title: "Spec: <title>"
-   type: spec
-   ---
-   ```
-
-   The plugin's markdown auto-capture names drafts from this `title:` (else
-   from the H1 plus the path), so without it a Stop-hook draft and your
-   hand-saved spec would open two lineages. An existing file you were handed
-   gets the same frontmatter added before upload.
-2. Resolve the repo's room; create it only if no exact-name match exists.
-3. Check whether THIS spec already has a lineage there: `search_memory` with
-   `memory_type: "artifacts"`, `tags: ["spec:<slug>"]`, and the room's
-   `agent_brain_id`. A hit → STOP the init flow and run the **revise**
-   steps instead (rationale required) — the upload will version that
-   lineage by name, and a different name would create a second root artifact
-   and break check/revise diffs. Any `for <teammates>` sharing still applies
-   (step 6).
-4. Upload the file with the script — the first version of a fresh lineage.
-5. Link the spec to the code it governs: run the map script with the new
-   artifact's id and `--path` the spec file's repo-relative path (the path
-   the user gave, or the `docs/specs/<slug>.md` you wrote). Always write
-   the link — it is how `check`/`revise` find the file again and how the
-   auto-capture knows to leave it alone. Derive the globs from the spec's own Design/Milestones —
-   the files it says will be written or changed — and confirm them with the
-   user in one line before writing ("this spec governs `app/retry.py`,
-   `app/**/backoff.py` — right?"). A spec that governs nothing concrete yet
-   (pure research or a decision record) → say so and pass the spec's own
-   path as the `--glob`.
-6. If the user named teammates ("for Alice and Bob"), resolve each via
-   `list_teammates` (case-insensitive; ambiguous → show candidates and ask,
-   never guess between two people) and `share_agent_brain` with
-   `teammate_user_id` = that teammate's `user_id` from `list_teammates`
-   (`permission` defaults to `viewer`, which is what a spec room wants).
-   Tell the user this opens the repo's WHOLE room — every spec
-   and imported session in it, now and future — not just this spec. Nobody
-   named → skip; note it may already be shared from an earlier spec.
-7. Report: artifact id, room name, file path, the `spec:<slug>` tag, the
-   globs now linked to it, who can see it, and the line teammates send their
-   agent verbatim:
-
-   > Ask your agent: *search the "Repo: <org>/<name>" agent brain in
-   > memhub for "<title>"*
-
-## revise `[file-path] [rationale...]`
-
-1. Resolve the room, then the spec inside it: `search_memory` with
-   `memory_type: "artifacts"`, the room's `agent_brain_id`, and
-   `tags: ["spec:<slug>"]` if the slug is known from context, else
-   `tags: ["spec"]` plus a query for the topic. Several candidates → ask.
-2. `get_artifact_lineage` on it, so the report in step 6 can name the
-   version you are superseding.
-3. The revised content is the repo file — the path given as the argument,
-   else the link's `path` from `artifact_map.py list`, else
-   `docs/specs/<slug>.md`. If the change was discussed but not yet applied,
-   edit the file first. A rationale is REQUIRED — take it from the arguments
-   or the conversation; if you can't state why this version supersedes the
-   last, ask.
-4. Upload with the script (`--rationale`, the SAME `--name` and tags as
-   before — the same name is what chains this onto the lineage; no
-   `--parent-id`).
-5. Refresh the link if the revision changed which files the spec governs
-   (new components, moved paths) or the spec file itself moved: re-run the
-   map script with the SAME `--artifact-id` as the existing link
-   (`artifact_map.py list` shows it), the current `--path`, and the updated
-   globs — it replaces that link rather than adding a second. No link yet
-   (lineage predates the map) → add one now, keyed on the lineage's root
-   version id.
-6. `diff_artifact_versions` (previous → new) and report the delta in plain
-   English plus the rationale. Remind the user that teammates' agents see the
-   new version on their next `check` — there is no push notification.
-
-If the upload fails on permissions, the room belongs to a teammate and you
-are a read-only member: don't fight it — put the change in the repo file via
-the normal PR flow and tell the user the room's owner runs `spec revise` to
-land it as a version.
-
-## check `[file-path]`
-
-Answer: "is the spec I'm building against still the spec?"
-
-1. Resolve the room and the spec (as in revise), `get_artifact` the latest
-   version. `check` compares whole files, so `get_artifact` (16,000 chars per
-   call — follow `next_offset` until `truncated` is false) is the right call
-   here, not `read_memory`'s outline. Use `read_memory(id, section_id=…)` when
-   you only need to QUOTE one section of a long spec back to the user.
-2. Find the local spec file — first existing match wins: the argument; the
-   link's `path` (`artifact_map.py list`); `docs/specs/<slug>.md`; the file
-   from earlier in this session. A candidate missing on disk just falls through to the next
-   (only an explicit argument that doesn't exist is an error worth raising).
-   Compare contents:
-   - identical → in sync; say so, one line, done.
-   - local matches an OLDER version in the lineage (walk `get_artifact_lineage`,
-     compare against each) → the spec moved underneath: report every newer
-     version's rationale in order, `diff_artifact_versions` from the local
-     version to latest, and which changed sections touch work from this
-     session.
-   - local matches NO version → local edits never landed: show the
-     local-vs-latest difference and offer `revise` (if local should win) or
-     overwriting the file with the latest artifact content (if the team
-     version should win). Never overwrite without asking.
-2b. Also check the other direction — has the CODE moved out from under the
-   spec? Read this spec's globs and `path` (`artifact_map.py list`), take
-   the spec file's last commit date as the since-bound —
-   `git log -1 --format=%cI -- <spec path>` (the artifact tools return no
-   version dates) — and run
-   `git log --oneline --since=<that date> -- <globs>`. Commits there mean
-   mapped files changed after the spec file last moved: name them and ask
-   whether the spec needs a `revise`. An uncommitted spec file has no date →
-   say so and skip this half. No link for this spec → say so and offer to
-   add one, since without it the artifact-sync hook can't fire.
-3. No local file at all → print the latest version's content summary,
-   rationale chain, and where to write the file (the link's `path`, else
-   `docs/specs/<slug>.md`).
-
-## status `[topic]`
-
-The multiplayer view: what the team's memory holds about a spec — or the
-whole repo.
-
-1. Resolve the room. No topic given → repo overview: `search_memory` the room
-   for artifacts tagged `spec` (or browse `group: "Specs"` with no `query` —
-   newest first, `offset` for the next page), list each spec with its version
-   count and latest rationale plus any recent related activity, and stop.
-2. With a topic, pick the spec (as in revise), then `search_memory` the room
-   with `memory_type: "all"` (the tool now defaults to `"artifacts"`, so a
-   status report that wants the surrounding facts and episodes must say
-   `"all"`), a raised `top_k` (~30), and the spec title + topic as the query.
-   The room is repo-wide — facts and episodes from OTHER specs' sessions will
-   surface; filter by relevance and drop them rather than padding the report.
-   Hits may come back as POINTERS (`{id, kind, title, abstract, …}`, no
-   `content`) — open the few you actually cite with `read_memory(id)` rather
-   than reporting from abstracts.
-3. Report, citing memory types: current version + how many revisions and the
-   latest rationale; decisions recorded (facts/episodes from imported
-   implementation sessions); related artifacts (reviews, ADRs, handoffs);
-   open questions still in the spec. If nothing relevant exists beyond the
-   spec artifact itself, say so plainly — no implementation session touching
-   this spec has been imported yet.
-
-Do NOT import implementation sessions. Per-turn capture already ships each one
-into this same room as it happens, under the session's own id, and the server
-has already extracted it — an import would re-upload the transcript to have the
-watermark discard it. If a session genuinely never landed (capture dormant, or
-it predates capture), tell the user to run `/memhub:import-session`; that is the
-one skill that backfills, and it imports under the session's own id so the
-session stays a single conversation.
-
-Plain-English output throughout; surface ids only where the user needs them
-(artifact id, agent brain id for scripts). On first ever script run the
-browser may open once for OAuth approval — expected, not an error.
+The installed rulebook hook understands `given.repo.spec_untouched` and optional
+`spec_dir` (default `docs/specs`). When owned code changes without its spec, an active
+rule names the owning specs before push/PR creation. The post-edit reminder uses the
+same parser. Set `MEMHUB_SPEC_DIR` for post-edit reminders in repos using a custom
+directory. A rulebook admin activates the built-in proposed rule after installing a
+supporting plugin; enabling spec drift does not silently activate an old rule.
