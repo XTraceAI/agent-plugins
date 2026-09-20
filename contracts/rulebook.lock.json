@@ -1,6 +1,6 @@
 {
   "repository": "XTraceAI/MemHub-Backend",
-  "revision": "fba5b2c8ca193b1f0475628badf9bd45742c160c",
+  "revision": "9645653749aa02fd3e919982957b641d082c2d52",
   "path": "contracts/plugin-rulebook/v1/contract.json",
   "sha256": "0d7a62fc1f682398590dab91d65e5caa4fae9f10b03e072016e2029577d531d7",
   "spec_owns": {
