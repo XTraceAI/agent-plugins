@@ -82,6 +82,11 @@ def main() -> int:
     if staging_manifest is None or not staging_manifest.get("version"):
         return 1
 
+    staging_codex = _load(ROOT / "plugins/memhub-staging/.codex-plugin/plugin.json")
+    if staging_codex is None or staging_codex.get("version") != staging_manifest["version"]:
+        print("FAIL staging Claude and Codex versions differ")
+        return 1
+
     ap_root = _load(MEMHUB / "plugin.json")
     ap_mcp = _load(MCP_AP)
     claude_mcp = _load(MCP_CLAUDE)
