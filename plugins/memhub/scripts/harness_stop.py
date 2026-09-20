@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""The harness-tied memory sensor. FLAGGED OFF by default.
+"""The harness-tied memory sensor. ON by default since v0.69.0.
 
-Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on. With it on,
-every turn is classified and what survives is authored OFF the person's thread:
+`MEMHUB_HARNESS_EXTRACT=0` (or off/false/no) turns the whole lane off. With it
+on — which is now the default for every install — each turn is classified and
+what survives is authored OFF the person's thread:
 
   Stop(turn N)  `stop`    takes the turn's closed error arcs from the rulebook
                           hook, spawns a detached `extract` child, and returns.
@@ -54,6 +55,12 @@ all created private:
   <session>.turn-*.claim     the turn an extract child already took
   <session>.drain.claim      the author pass holding this session
   stop.log / extract.log / author.log   one line per step, never prompt text
+
+What default-on costs the person, said plainly because they did not ask for
+it: one classifier call per flagged turn against the MemHub backend, and one
+`claude -p --resume` per moment the drain authors — that second one spends
+THEIR model quota, not the server's. One machine's dogfood ran 32 such children
+in two hours. `MEMHUB_HARNESS_EXTRACT=0` stops both.
 
 Every path fails open and silent: a broken sensor must never touch the tool
 call or the session. Stdlib only.

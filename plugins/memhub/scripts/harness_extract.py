@@ -2,8 +2,9 @@
 """Harness-tied memory, the client half: which moments of a session deserve
 the coding agent's attention.
 
-Nothing here writes a rule. At each turn's Stop, `harness_stop.py` runs that
-turn through this pipeline in a detached child:
+Nothing here writes a rule. At each turn's Stop — on by default since v0.69.0,
+off with `MEMHUB_HARNESS_EXTRACT=0` — `harness_stop.py` runs that turn through
+this pipeline in a detached child:
 
     router       deterministic regexes over the turn, no model and no cost.
                  It labels a moment (a correction, a retraction, a reuse
@@ -46,6 +47,7 @@ HERE = Path(__file__).resolve().parent
 
 FLAG = "MEMHUB_HARNESS_EXTRACT"
 _ON = ("1", "on", "true", "yes")
+_OFF = ("0", "off", "false", "no")
 
 CLASSIFY_PATH = "/v1/team/rulebook/harness/classify"
 # The server bounds its judge at 20 s. One attempt, and this is the whole wait:
@@ -58,9 +60,19 @@ CLIENT_REASONS = ("no_credential", "transport_error", "bad_reply")
 
 
 def extract_enabled(environ=None) -> bool:
-    """The one switch for the whole sensor. Default OFF."""
+    """The one switch for the whole sensor. Default ON.
+
+    It was opt-in through the dogfood: the sensor spends a classifier call per
+    flagged turn, and the drain behind it spends a headless authoring run per
+    moment on the PERSON'S OWN model quota. (Naming that command literally here
+    trips `test_nothing_in_the_client_writes_a_rule`, whose substring scan
+    cannot tell prose from code — and the guard is worth more than the
+    sentence: nothing in THIS module may author.) Default-on means an install starts doing
+    both without being asked, which is a product decision (Felix, 2026-09-20)
+    and not one this function should relitigate — but it is why the off switch
+    has to keep working for every spelling someone reaches for."""
     env = os.environ if environ is None else environ
-    return str(env.get(FLAG, "")).strip().lower() in _ON
+    return str(env.get(FLAG, "")).strip().lower() not in _OFF
 
 
 # ------------------------------------------------------------------- files

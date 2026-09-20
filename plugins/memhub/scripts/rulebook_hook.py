@@ -3364,16 +3364,18 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
 # Stop sensor (`harness_stop.py`) takes at the end of the turn. The arcs live
 # in their own file on purpose: the session state is merged by delta under a
 # lock for the arming keys only, so a second whole-file writer there could
-# drop another call's arc. Behind the harness flag: with it off nothing here
-# is read or written.
+# drop another call's arc. Behind the harness flag, which now defaults ON:
+# with it explicitly off nothing here is read or written.
 HARNESS_FLAG = "MEMHUB_HARNESS_EXTRACT"
 ARCS_OPEN_MAX = 20            # distinct failing commands tracked per session
 ARCS_CLOSED_MAX = 20          # closed arcs waiting for the Stop sensor
 
 
 def harness_extract_on(environ=None):
+    """Default ON, matching `harness_extract.extract_enabled` — the two gates
+    are one switch and must not disagree about what it says."""
     env = os.environ if environ is None else environ
-    return str(env.get(HARNESS_FLAG, "")).strip().lower() in ("1", "on", "true", "yes")
+    return str(env.get(HARNESS_FLAG, "")).strip().lower() not in ("0", "off", "false", "no")
 
 
 def arcs_path(session_id):
