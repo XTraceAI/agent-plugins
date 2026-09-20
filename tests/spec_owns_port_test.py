@@ -85,6 +85,22 @@ def main():
         assert not hook.given_ok({'given':{'repo':{'spec_untouched':True,'spec_dir':'missing'}}},hook.Probes(str(root),''))
         assert hook.given_norm({'repo':{'spec_untouched':'yes'}}) is None
         assert hook.given_norm({'repo':{'spec_dir':'../outside'}}) is None
+        (root/'docs/specs/limit.md').write_text(TEXT)
+        git('checkout', '--detach', 'main')
+        detached_a = git('rev-parse', 'HEAD').strip()
+        detached_payload = {**payload, 'session_id':'detached-test'}
+        assert 'docs/specs/limit.md' in run('pre', detached_payload, env)[1]
+        git('commit', '--allow-empty', '-m', 'detached B')
+        (root/'docs/specs/limit.md').write_text(TEXT+'Updated.\n')
+        post = {'cwd':tmp,'session_id':'detached-test','tool_name':'Edit','tool_input':{'file_path':str(root/'docs/specs/limit.md')}}
+        run('post', post, env)
+        def detached_conversions():
+            return [json.loads(line) for line in event_file.read_text().splitlines() if json.loads(line).get('session_id')=='detached-test' and json.loads(line)['kind']=='converted']
+        assert not detached_conversions()
+        git('checkout', '--detach', detached_a)
+        run('post', post, env)
+        assert [e['branch'] for e in detached_conversions()] == ['detached@'+detached_a]
+        git('checkout', 'change')
         # Git's rename destination alone is insufficient: the removed owned path matters.
         (root/'docs/specs/limit.md').write_text(TEXT)
         (root/'app/limit.py').write_text('limit = 100\n')

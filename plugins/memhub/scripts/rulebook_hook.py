@@ -3082,7 +3082,7 @@ def _branch(head_path):
         if m:
             return m.group(1)
         # a symbolic ref outside refs/heads (rare) still is not a detached HEAD
-        return h.split(":", 1)[1].strip() if h.startswith("ref:") else "detached"
+        return h.split(":", 1)[1].strip() if h.startswith("ref:") else ("detached@" + h if re.fullmatch(r"[0-9a-f]{40,64}", h) else "detached")
     except Exception:
         return ""
 
