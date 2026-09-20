@@ -629,15 +629,21 @@ def author_prompt(session: str, moment: dict, repo: str) -> str:
         "follow the Harness-draft section's arithmetic and ask nothing. If it is "
         "not a lesson, file nothing.\n\n"
         f"End your reply with one line and nothing after it:\n"
-        f"  {RESULT_PREFIX} filed <rule_id>\n"
+        f"  {RESULT_PREFIX} filed <rule_id> | <the rule's title> | <what it catches, "
+        "in one short clause — the trigger in the words a person would use, e.g. "
+        "'a `claude -p` without --strict-mcp-config'>\n"
         f"  {RESULT_PREFIX} none <one short reason>\n"
         f"  {RESULT_PREFIX} failed <one short reason>   (use this only if you COULD "
         "NOT file — no rulebook server, a refused tool, an expired credential — "
         "and never for 'there was no lesson')")
 
 
-def parse_result(stdout: str) -> tuple[str, str]:
-    """(outcome, detail) from the child's last contract line, or ('failed', …).
+def parse_result(stdout: str) -> tuple[str, dict]:
+    """(outcome, fields) from the child's last contract line, or ('failed', …).
+
+    A filed rule carries `rule_id`, `title` and `catches`, pipe-separated —
+    because a bare id tells the person nothing about what they are being asked
+    to review, and the hook that shows it has no budget to look one up.
 
     An unparseable answer is a FAILURE, never a quiet 'none'. Reading it as
     'nothing here' is the defect this whole lane exists to stop: a broken
@@ -648,16 +654,24 @@ def parse_result(stdout: str) -> tuple[str, str]:
             rest = line[len(RESULT_PREFIX):].strip().split(None, 1)
             head = (rest[0] if rest else "").lower()
             detail = rest[1].strip() if len(rest) > 1 else ""
-            if head in ("filed", "none", "failed"):
-                return head, detail
+            if head == "filed":
+                parts = [x.strip() for x in detail.split("|")]
+                # A title is what makes the line readable, but a child that
+                # gives only an id is still a FILING — degrade the rendering,
+                # never the outcome.
+                return head, {"rule_id": parts[0] if parts else "",
+                              "title": parts[1] if len(parts) > 1 else "",
+                              "catches": parts[2] if len(parts) > 2 else ""}
+            if head in ("none", "failed"):
+                return head, {"detail": detail}
             break
-    return "failed", "the child gave no result line"
+    return "failed", {"detail": "the child gave no result line"}
 
 
-def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, str]:
+def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, dict]:
     owner = str((moment.get("state") or {}).get("session_id") or "")
     if not owner:
-        return "failed", "the moment carries no session id to resume"
+        return "failed", {"detail": "the moment carries no session id to resume"}
     with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
         env = dict(os.environ,
                    MEMHUB_HARNESS_CHILD="1",       # its hooks stay silent
@@ -674,13 +688,13 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[st
                                   timeout=AUTHOR_TIMEOUT_S, env=env,
                                   stdin=subprocess.DEVNULL)
         except FileNotFoundError:
-            return "failed", "no claude CLI on PATH"
+            return "failed", {"detail": "no claude CLI on PATH"}
         except subprocess.TimeoutExpired:
-            return "failed", f"the child did not finish in {AUTHOR_TIMEOUT_S}s"
+            return "failed", {"detail": f"the child did not finish in {AUTHOR_TIMEOUT_S}s"}
         except OSError as exc:
-            return "failed", f"the child would not start ({exc.__class__.__name__})"
+            return "failed", {"detail": f"the child would not start ({exc.__class__.__name__})"}
     if proc.returncode != 0:
-        return "failed", f"the child exited {proc.returncode}"
+        return "failed", {"detail": f"the child exited {proc.returncode}"}
     return parse_result(proc.stdout)
 
 
@@ -708,8 +722,8 @@ def cmd_author(session: str, claim: str, refs: list[str]) -> int:
                     if got is None:            # drained by someone else meanwhile
                         continue
                     path, moment = got
-                    outcome, detail = run_author(session, moment, repo, mcp_cfg)
-                    row = {"outcome": outcome, "detail": detail, "ref": ref,
+                    outcome, fields = run_author(session, moment, repo, mcp_cfg)
+                    row = {"outcome": outcome, "ref": ref, **fields,
                            # WHICH MemHub. The first live run filed against
                            # production because `resolve_url_and_auth` hands
                            # back the plugin's default and nothing said so out
@@ -744,22 +758,32 @@ def unreported(session: str) -> list[dict]:
 
 
 def report_outcomes(session: str) -> str:
-    """The person's one line, and the ONLY thing this lane says to them.
+    """The person's lines, and the ONLY thing this lane says to them.
 
-    A filed rule is named. A pass that could not RUN is named too, on its own
-    line — silence is allowed to mean "nothing worth filing" and nothing else.
-    A pass that ran and found no lesson says nothing: that is the quiet the
-    design is for, and it is readable in the moments file by anyone who asks."""
+    A filed rule is named and its trigger said in a person's words, because a
+    bare id asks someone to review something without telling them what it is.
+    What is NOT said: any claim that the rule helped. It has fired for nobody —
+    a proposed rule is served to no agent — and whether a rule helps is the
+    fire ledger's question, answered later and per rule, not here.
+
+    A pass that could not RUN is named too. A pass that ran and found no lesson
+    says nothing: that is the quiet the design is for, and it stays readable in
+    the moments file for anyone who asks."""
     lines = []
     for row in unreported(session):
+        env = row.get("env") or "an unnamed environment"
         if row.get("outcome") == "filed":
-            lines.append("MemHub: filed a proposed team rule in "
-                         f"{row.get('env') or 'an unnamed environment'} — "
-                         f"{row.get('detail') or 'see the rulebook'}")
+            title = (row.get("title") or "").strip()
+            head = f'"{title}"' if title else f"rule {row.get('rule_id') or '?'}"
+            lines.append(f"MemHub filed a rule for review — {head}")
+            if row.get("catches"):
+                lines.append(f"   catches: {row['catches']}")
+            if title and row.get("rule_id"):
+                lines.append(f"   {row['rule_id']} in {env}")
+            lines.append("   it fires for nobody until someone activates it")
         elif row.get("outcome") == "failed":
             lines.append("MemHub: could not review a flagged moment against "
-                         f"{row.get('env') or 'an unnamed environment'} — "
-                         f"{row.get('detail')}")
+                         f"{env} — {row.get('detail')}")
         hx.append_jsonl(moments_path(session),
                         {"reported": f"{row.get('ref')}@{row.get('at')}"})
     return "\n".join(lines)

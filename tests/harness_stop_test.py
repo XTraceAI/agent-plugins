@@ -626,20 +626,43 @@ def test_the_person_hears_about_a_filed_rule_and_about_a_pass_that_could_not_run
     """The only two things this lane says. A pass that RAN and found no lesson
     is silent — that is the quiet the design is for. A pass that could not run
     is not: a broken pipeline that looks exactly like a quiet one is the defect
-    this lane keeps rediscovering."""
+    this lane keeps rediscovering.
+
+    The filed line names the rule and says what it catches. It does NOT say the
+    rule helped: a proposed rule is served to no agent, so it has helped nobody,
+    and claiming otherwise is an artifact asserting behaviour the system does
+    not have. Whether a rule helps is the fire ledger's question."""
     with _Env():
         hs.save_meta("sess", repo="repo", last_turn=2)
         path = hs.moments_path("sess")
-        hx.append_jsonl(path, {"outcome": "none", "detail": "no lesson",
+        hx.append_jsonl(path, {"outcome": "none", "detail": "already an active rule",
                                "ref": "sess#1", "at": 1.0})
         assert hs.report_outcomes("sess") == "", "a considered nothing is silent"
-        hx.append_jsonl(path, {"outcome": "filed", "detail": "rule-abc",
-                               "ref": "sess#2", "at": 2.0})
-        hx.append_jsonl(path, {"outcome": "failed", "detail": "no rulebook server",
-                               "ref": "sess#3", "at": 3.0})
+
+        # the shape a real drain wrote on 2026-09-19
+        hx.append_jsonl(path, {"outcome": "filed", "ref": "sess#2", "at": 2.0,
+                               "env": "staging",
+                               "rule_id": "b43d6914-4cb3-4a91-84ad-cadbeb6dcfe4",
+                               "title": "Pin the MCP server when spawning claude -p",
+                               "catches": "a `claude -p` without --strict-mcp-config"})
         said = hs.report_outcomes("sess")
-        assert "rule-abc" in said and "no rulebook server" in said, said
-        assert "create-rule skill" not in said, "the person gets an outcome, not a manual"
+        assert "Pin the MCP server when spawning claude -p" in said, said
+        assert "--strict-mcp-config" in said, "it says what the rule catches"
+        assert "b43d6914-4cb3-4a91-84ad-cadbeb6dcfe4" in said and "staging" in said
+        assert "fires for nobody until someone activates it" in said
+        for claim in ("helped", "saved", "prevented", "improved"):
+            assert claim not in said.lower(), f"a proposed rule has not {claim} anything"
+
+        # a child that returned only an id is still a FILING; the line degrades
+        hx.append_jsonl(path, {"outcome": "filed", "ref": "sess#3", "at": 3.0,
+                               "env": "staging", "rule_id": "bare-id"})
+        bare = hs.report_outcomes("sess")
+        assert "rule bare-id" in bare, bare
+
+        hx.append_jsonl(path, {"outcome": "failed", "detail": "no rulebook server",
+                               "ref": "sess#4", "at": 4.0, "env": "staging"})
+        failed = hs.report_outcomes("sess")
+        assert "no rulebook server" in failed and "staging" in failed
         assert hs.report_outcomes("sess") == "", "each outcome is said once"
     print("PASS test_the_person_hears_about_a_filed_rule_and_about_a_pass_that_could_not_run")
 
