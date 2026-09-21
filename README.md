@@ -231,6 +231,18 @@ reads and manual imports. The state retains one exact sample per measured
 record rather than a second transcript archive. Unobserved historical usage
 stays unknown; a later read never invents missing measurements.
 
+### No second copy through `add_memory`
+
+`add_memory` saves a turn for MCP clients that capture nothing themselves.
+While this plugin is capturing a Claude Code session (per-turn capture not
+switched off, and a credential capture can use), a `PreToolUse` hook
+(`add_memory_gate.py`) denies it from any server that exposes it, including a
+claude.ai MemHub connector. The session is already stored verbatim; an
+`add_memory` call there only writes a second conversation, with a user turn
+the agent reconstructed. The denial points the agent at `save_artifact`,
+which is where findings meant for a brain belong. With capture off the call
+is allowed, and the hook fails open.
+
 ### Directive recall
 
 Independent of capture: `PreToolUse` (Edit/Write/NotebookEdit/Bash) and

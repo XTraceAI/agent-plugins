@@ -33,6 +33,16 @@
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" pre; fi"
           }
         ]
+      },
+      {
+        "matcher": "^mcp__.+__add_memory$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/add_memory_gate.py\"; fi"
+          }
+        ]
       }
     ],
     "PostToolUse": [
