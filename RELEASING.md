@@ -146,6 +146,35 @@ installs from a local clone:
 `plugins/memhub/` holds real files with no symlinks of its own, which is
 exactly why the PUBLIC entry is safe to pin via `git-subdir`.
 
+## Stable MCP URLs and compatibility versions (ENG-1118)
+
+Keep the MCP URL identical across releases. Codex derives its CIMD client ID
+from the full URL, including its query string. Adding a version query changed
+production's registered `YzZcYxKAiT6g` identity to `-ugMLRSp9raH` in 0.76.0,
+and Auth0 refused login before any backend compatibility check could run.
+
+Set `headers.X-MemHub-Plugin-Version` in each MCP config to that package's
+manifest version. The header is part of the loaded connection configuration;
+updating the installed files still requires restarting/reconnecting the host.
+The Python transports independently snapshot the loaded package version.
+`tests/version_parity_test.py` checks both the exact canonical URLs and header
+parity; do not add install-channel or release query parameters to the URL.
+
+For the 2026-09-22 release, keep the 0.76.1 candidate unmerged until the release
+window: merging its bump publishes to Codex and Cursor. Verify backend #1335
+and the ENG-1118 header regression coverage on the target deployment before
+activating the broader compatibility gate. Keep the legacy version query
+accepted server-side for older installs, with conflicting values rejected.
+Do not raise a floor or change enforcement flags as part of this OAuth repair.
+
+After release, update/restart the plugin and perform a fresh Codex OAuth login,
+then initialize MCP, call `list_orgs`, and verify token refresh. The production
+CIMD URL should end in `/codex/YzZcYxKAiT6g/client.json`. Verify supported and
+below-floor versions through the header using the staging policy first. Prepare
+the staging package with its own version bump, and publish it separately using
+the staging procedure above. Claude's production tag and marketplace pin also
+remain separate release steps; do not move the existing pin before tagging.
+
 ## Gotchas worth knowing before you hit them
 
 - **Version-keyed caches on BOTH Claude and Codex**
