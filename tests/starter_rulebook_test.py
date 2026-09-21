@@ -261,7 +261,8 @@ def test_a_push_that_names_the_default_branch_is_caught_from_any_checkout() -> N
         repo = _make(BARE_REPO, Path(tmp) / "bare")
         p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
         rx = {c["id"]: c["body"] for c in cands}["push-main-refspec"]["matcher"]["command_rx"]
-        for cmd in ("git push origin HEAD:trunk", "git push origin feat:refs/heads/trunk", "cd x && git push origin trunk"):
+        for cmd in ("git push origin HEAD:trunk", "git push origin feat:refs/heads/trunk", "cd x && git push origin trunk",
+                    "git push origin --delete trunk", "git push -d origin trunk", "git push origin :trunk"):
             check(f"fires on `{cmd}`", bool(re.search(rx, cmd)))
         for cmd in ("git push origin feat/x", "git push origin trunk-hotfix", "git push origin HEAD:feat/trunk"):
             check(f"silent on `{cmd}`", not re.search(rx, cmd))
@@ -297,6 +298,50 @@ def test_the_python_runner_is_named_from_evidence_never_assumed() -> None:
                 check(f"{label}: and not by a pytest the repo does not have", not re.search(rx, "pytest"), rx)
             check(f"{label}: no pytest-only flag leaks into a non-pytest repo",
                   "--cov" not in json.dumps(by_id.get("slow-only-asked", {})))
+
+
+def test_every_mix_of_toolchains_scans_seeds_and_verifies() -> None:
+    """Review kept finding one bug at a time in one family: a slot filled from
+    the wrong toolchain, or from none (pytest for any pyproject.toml, `npm test`
+    for any package.json, a Python case against a Go pattern, an IndexError on a
+    Makefile-only repo). Those only show up in COMBINATIONS, so this walks them:
+    every mix must scan without raising, verify everything it seeds, and seed
+    test rules only where a runner is evidenced — with a case that runner clears."""
+    import itertools
+    PY = {None: {}, "pytest": {"pyproject.toml": '[project]\nname="p"\n[dependency-groups]\ndev=["pytest"]\n', "tests/test_a.py": "def test_a(): pass\n"},
+          "tox": {"pyproject.toml": '[project]\nname="p"\n', "tox.ini": "[tox]\n"},
+          "make-only": {"pyproject.toml": '[project]\nname="p"\n', "Makefile": "test:\n\tpython -m unittest\n"},
+          "no-runner": {"pyproject.toml": '[project]\nname="p"\n'}}
+    NODE = {None: {}, "script": {"package.json": json.dumps({"scripts": {"test": "vitest run"}, "devDependencies": {"vitest": "2"}})},
+            "placeholder": {"package.json": json.dumps({"scripts": {"test": 'echo "Error: no test specified" && exit 1'}})},
+            "dep-only": {"package.json": json.dumps({"devDependencies": {"jest": "29"}})}}
+    GO = {False: {}, True: {"go.mod": "module m\n", "pkg/a.go": "package pkg\n", "pkg/a_test.go": "package pkg\n"}}
+    RUST = {False: {}, True: {"Cargo.toml": '[package]\nname="r"\n', "src/lib.rs": "\n"}}
+    evidenced = {"py": {"pytest", "tox", "make-only"}, "node": {"script", "dep-only"}}
+    bad = []
+    for py, node, go, rust in itertools.product(PY, NODE, GO, RUST):
+        files = {"README.md": "x\n", "app/a.py": "x=1\n", **PY[py], **NODE[node], **GO[go], **RUST[rust]}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "mix"
+            for rel, text in files.items():
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                (repo / rel).write_text(text)
+            out = Path(tmp) / "out"
+            p = subprocess.run([sys.executable, str(SCRIPT), "all", "--repo", str(repo), "--out", str(out)],
+                               capture_output=True, text=True, timeout=120)
+            label = f"py={py} node={node} go={go} rust={rust}"
+            if p.returncode != 0 or not (out / "verified.json").is_file():
+                bad.append(f"{label}: rc={p.returncode} {(p.stderr or p.stdout)[-160:].strip()}"); continue
+            slots = json.loads((out / "signals.json").read_text())["slots"]
+            ids = {c["id"] for c in json.loads((out / "candidates.json").read_text())}
+            want = py in evidenced["py"] or node in evidenced["node"] or go or rust
+            if ("suite-before-push" in ids) != bool(want):
+                bad.append(f"{label}: test rules {'missing' if want else 'seeded with no evidenced runner'}")
+            if want and not re.search(slots["test_cmd_rx"], slots["test_cmd_example"]):
+                bad.append(f"{label}: example {slots['test_cmd_example']!r} does not clear its own gate")
+            if "slow_example" in slots and not re.search(slots["test_cmd_rx"], slots["slow_example"]):
+                bad.append(f"{label}: slow example {slots['slow_example']!r} is from a runner this repo does not have")
+    check("all 80 toolchain mixes scan, seed and verify", not bad, " | ".join(bad[:6]))
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:

@@ -1157,12 +1157,12 @@
    "requires": [
     "default_branch_esc"
    ],
-   "statement": "This push names the default branch as its destination. Push your own branch and open a PR.",
-   "why": "`git push origin HEAD:{{default_branch}}` lands on the default branch from any checkout, so a rule that only looks at the current branch never sees it.",
+   "statement": "This push names the default branch as its destination (or deletes it). Push your own branch and open a PR.",
+   "why": "`git push origin HEAD:{{default_branch}}` lands on the default branch from any checkout, and `--delete {{default_branch}}` removes it; a rule that only looks at the current branch sees neither.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}push\\b[^|;&]*\\s(?:\\+?[^\\s:]*:)?(?:refs/heads/)?{{default_branch_esc}}(?:\\s|$|[;&|])",
-    "command_not_rx": "\\s--dry-run\\b|\\s-n\\b|\\s(?:--delete|-d)\\s"
+    "command_not_rx": "\\s--dry-run\\b|\\s-n\\b"
    },
    "seeded_from": "default branch, from origin/HEAD",
    "cases": {
@@ -1182,6 +1182,18 @@
      {
       "case": "git push -f origin +HEAD:{{default_branch}}",
       "branch": "feat/x"
+     },
+     {
+      "case": "git push origin --delete {{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push -d origin {{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push origin :{{default_branch}}",
+      "branch": "feat/x"
      }
     ],
     "silent": [
@@ -1199,6 +1211,10 @@
      },
      {
       "case": "git push --dry-run origin HEAD:{{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push origin --delete feat/x",
       "branch": "feat/x"
      }
     ]

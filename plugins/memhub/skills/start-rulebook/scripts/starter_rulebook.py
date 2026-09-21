@@ -153,88 +153,96 @@ def scan(repo: Path) -> dict:
     pm = "pnpm" if "pnpm-lock.yaml" in fset else "yarn" if "yarn.lock" in fset else \
         "bun" if ("bun.lockb" in fset or "bun.lock" in fset) else "npm"
 
-    test_rx, targeted, examples, slow_flags, slow_content = [], [], [], [], []
-    py_pytest = False
-    if "python" in chains:
-        # A pyproject.toml makes a repo Python; it does not make its runner pytest. An ordering
-        # gate is cleared only by a green run MATCHING its pattern, so a guessed `pytest` on a
-        # unittest or tox repo is a gate nobody can ever satisfy. Name the runner from evidence,
-        # and with none, leave the test rules out.
-        py_cfg = "".join(_read(repo / n) for n in ("pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini")
-                         if n in fset) + "".join(_read(repo / n) for n in fset if re.fullmatch(r"requirements[^/]*\.txt", n))
-        runners = []
-        if names["pytest.ini"] or names["conftest.py"] or re.search(r"\bpytest\b", py_cfg):
-            runners.append((r"(?:uv run |poetry run |python3? -m )?pytest", "pytest"))
-        if names["tox.ini"] or "[tool.tox" in py_cfg:
-            runners.append((r"(?:uv run |python3? -m )?tox\b", "tox"))
-        if names["noxfile.py"]:
-            runners.append((r"(?:uv run |python3? -m )?nox\b", "nox"))
-        if names["manage.py"] and not runners:
-            runners.append((r"python3? manage\.py test", "python manage.py test"))
-        if not runners:
-            test_files = [f for f in live if re.search(r"(^|/)test_[^/]+\.py$", f)][:20]
-            if any("unittest" in _read(repo / f, 4000) for f in test_files):
-                runners.append((r"python3? -m unittest", "python -m unittest"))
-        py_pytest = any(ex == "pytest" for _, ex in runners)
-        test_rx += [rx for rx, _ in runners]
-        if runners:
-            targeted.append(r"\s\S*(?:tests?/|\.py\b|::)|\s-k\s|\s--lf\b|\s--last-failed\b|\s-e\s+\S")
-            examples.append(runners[0][1])
-        slow_content.append(r"time\.sleep\(|\b(?:requests|httpx)\.(?:get|post|put|delete|Client)\(")
-    if "node" in chains:
-        test_rx.append(r"(?:npm|pnpm|yarn|bun)(?: run)? test|(?:npx |pnpm exec )?(?:jest|vitest)")
-        targeted.append(r"\s\S*\.(?:test|spec)\.|\s\S*(?:tests?|__tests__)/|\s-t\s|--testPathPattern")
-        examples.append("%s test" % pm)
-    if "go" in chains:
-        test_rx.append(r"go test")
-        targeted.append(r"\s-run\s|go test\s+\./(?!\.\.\.)\S")
-        examples.append("go test ./...")
-        slow_content.append(r"time\.Sleep\(|http\.(?:Get|Post)\(")
-    if "rust" in chains:
-        test_rx.append(r"cargo test")
-        targeted.append(r"cargo test\s+[a-zA-Z_]")
-        examples.append("cargo test")
-    if "test" in make_targets:
-        test_rx.append(r"make test")
-    if chains:
-        found("toolchain", ", ".join(chains) + ("" if test_rx else " — but no test runner it recognises, so the test rules are left out"),
-              value=chains, test_runner=examples[0] if examples else None)
-        if test_rx:                                 # no runner found → no slot → every rule that needs one is dropped
-            slots["test_cmd_rx"] = _alt(test_rx)
-            slots["targeted_rx"] = "|".join(targeted)
-            slots["test_cmd_example"] = examples[0]
-        slots["src_ext_rx"] = r"\.(?:%s)$" % "|".join(e for c in chains for e in _SRC_EXT[c])
-        if slow_content:
-            slots["test_slow_content_rx"] = "|".join(slow_content)
-            slots["test_slow_example"] = "/repo/pkg/a_test.go::time.Sleep(5)" if chains[0] == "go" \
-                else "/repo/tests/test_a.py::time.sleep(5)"
-    else:
-        missing("toolchain", "no pyproject.toml / package.json / go.mod / Cargo.toml")
+    # One record per test runner the repo gives EVIDENCE of. Every slot below is derived from these
+    # records and nothing else, so a pattern can never be seeded without the example that proves it, an
+    # example can never come from a toolchain that contributed no pattern, and a repo with no evidenced
+    # runner gets no test rules at all. An ordering gate is cleared only by a green run MATCHING its
+    # pattern: a runner guessed from a manifest (`pytest` for any pyproject.toml, `npm test` for any
+    # package.json) is a gate nobody can ever satisfy.
+    runners = []   # {"name", "rx", "example", "targeted", "slow_flag", "slow_example"}
 
-    # markers / slow tier
+    def runner(name, rx, example, targeted="", slow_flag="", slow_example=""):
+        runners.append({"name": name, "rx": rx, "example": example, "targeted": targeted,
+                        "slow_flag": slow_flag, "slow_example": slow_example})
+
     cfg = _read(repo / "pyproject.toml") + "\n" + _read(repo / "pytest.ini") + "\n" + _read(repo / "setup.cfg")
     block = re.search(r"markers\s*=\s*\[?(.*?)(?:\n\s*\]|\n\S|\Z)", cfg, re.S)
     marks = re.findall(r"^\s*[\"']?([A-Za-z_]\w*)\s*[:\"']", block.group(1), re.M) if block else []
     slow = [m for m in dict.fromkeys(marks)
             if re.search(r"slow|behavio|e2e|integration|perf|load|live|network|smoke", m)]
-    if py_pytest:                                   # --cov and -m are pytest's flags, not tox's or unittest's
-        slow_flags.append(r"--cov\b")
-        if slow:
-            slow_flags.append(r"-m\s+[\"']?(?:%s)" % "|".join(map(re.escape, slow)))
+
+    if "python" in chains:
+        py_cfg = "".join(_read(repo / n) for n in ("pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini")
+                         if n in fset) + "".join(_read(repo / n) for n in fset if re.fullmatch(r"requirements[^/]*\.txt", n))
+        py_targeted = r"\s\S*(?:tests?/|\.py\b|::)|\s-k\s|\s--lf\b|\s--last-failed\b|\s-e\s+\S"
+        before = len(runners)
+        if names["pytest.ini"] or names["conftest.py"] or re.search(r"\bpytest\b", py_cfg):
+            flags = [r"--cov\b"] + ([r"-m\s+[\"']?(?:%s)" % "|".join(map(re.escape, slow))] if slow else [])
+            runner("pytest", r"(?:uv run |poetry run |python3? -m )?pytest", "pytest", py_targeted,
+                   "|".join(flags), "pytest --cov=app")          # --cov and -m are pytest's flags, nobody else's
+        if names["tox.ini"] or "[tool.tox" in py_cfg:
+            runner("tox", r"(?:uv run |python3? -m )?tox\b", "tox", py_targeted)
+        if names["noxfile.py"]:
+            runner("nox", r"(?:uv run |python3? -m )?nox\b", "nox", py_targeted)
+        if names["manage.py"] and len(runners) == before:
+            runner("django", r"python3? manage\.py test", "python manage.py test", py_targeted)
+        if len(runners) == before:
+            test_files = [f for f in live if re.search(r"(^|/)test_[^/]+\.py$", f)][:20]
+            if any("unittest" in _read(repo / f, 4000) for f in test_files):
+                runner("unittest", r"python3? -m unittest", "python -m unittest", py_targeted)
     if "node" in chains:
-        slow_flags.append(r"--coverage\b")
+        deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})} if isinstance(pkg, dict) else {}
+        node_targeted = r"\s\S*\.(?:test|spec)\.|\s\S*(?:tests?|__tests__)/|\s-t\s|--testPathPattern"
+        script = str(scripts.get("test") or "")
+        if script and "no test specified" not in script:          # npm init's placeholder is not a test script
+            runner("%s test" % pm, r"(?:npm|pnpm|yarn|bun)(?: run)? test", "%s test" % pm, node_targeted,
+                   r"--coverage\b", "%s test -- --coverage" % pm)
+        direct = [d for d in ("jest", "vitest", "mocha", "ava") if d in deps]
+        if direct:
+            runner(direct[0], r"(?:npx |pnpm exec |yarn )?(?:%s)" % "|".join(direct), "npx %s" % direct[0], node_targeted,
+                   r"--coverage\b", "npx %s --coverage" % direct[0])
+    if "go" in chains:                                            # the toolchain IS the runner
+        runner("go test", r"go test", "go test ./...", r"\s-run\s|go test\s+\./(?!\.\.\.)\S",
+               r"\s-(?:race|cover(?:profile)?)\b", "go test -race ./...")
+    if "rust" in chains:
+        runner("cargo test", r"cargo test", "cargo test", r"cargo test\s+[a-zA-Z_]")
+    if "test" in make_targets:                                    # the repo's own entrypoint: evidence on its own
+        runner("make test", r"make test", "make test")
+
+    # content an edit rule looks for in a unit test, paired with a case that proves it matches
+    slow_content = []
+    if "python" in chains:
+        slow_content.append((r"time\.sleep\(|\b(?:requests|httpx)\.(?:get|post|put|delete|Client)\(",
+                             "/repo/tests/test_a.py::time.sleep(5)"))
     if "go" in chains:
-        slow_flags.append(r"\s-(?:race|cover(?:profile)?)\b")
-    if slow_flags:
+        slow_content.append((r"time\.Sleep\(|http\.(?:Get|Post)\(", "/repo/pkg/a_test.go::time.Sleep(5)"))
+
+    if chains:
+        found("toolchain", ", ".join(chains) + ("" if runners else " — but no test runner it can find evidence of, so the test rules are left out"),
+              value=chains, test_runner=runners[0]["example"] if runners else None,
+              test_runners=[r["name"] for r in runners])
+        slots["src_ext_rx"] = r"\.(?:%s)$" % "|".join(e for c in chains for e in _SRC_EXT[c])
+    else:
+        missing("toolchain", "no pyproject.toml / package.json / go.mod / Cargo.toml")
+    if runners:                                     # no evidenced runner → no slot → every rule that needs one is dropped
+        slots["test_cmd_rx"] = _alt(r["rx"] for r in runners)
+        slots["targeted_rx"] = "|".join(r["targeted"] for r in runners if r["targeted"]) or r"\s--this-repo-has-no-targeted-form\b"
+        slots["test_cmd_example"] = runners[0]["example"]
+    if slow_content:
+        slots["test_slow_content_rx"] = "|".join(c for c, _ in slow_content)
+        slots["test_slow_example"] = slow_content[0][1]
+
+    # markers / slow tier — only from a runner that has one, with that same runner's example
+    tiered = [r for r in runners if r["slow_flag"]]
+    if tiered:
         found("markers", ("markers: " + ", ".join(slow)) if slow else "no slow markers defined; coverage flags only",
               value=slow)
-        slots["slow_flag_rx"] = "|".join(slow_flags)
-        slots["slow_example"] = "pytest --cov=app" if py_pytest else \
-            "%s test -- --coverage" % pm if "node" in chains else "go test -race ./..."
+        slots["slow_flag_rx"] = "|".join(dict.fromkeys(r["slow_flag"] for r in tiered))
+        slots["slow_example"] = tiered[0]["slow_example"]
         slots["slow_words_rx"] = r"(?i:\b(?:%s)\b)" % "|".join(
             dict.fromkeys(slow + ["slow", "e2e", "coverage", "integration"]))
     else:
-        missing("markers", "no toolchain with a known slow tier")
+        missing("markers", "no test runner with a known slow or coverage tier")
 
     # lint tooling (repo entrypoint first, raw tool names second)
     dev_text = (cfg + _read(repo / ".pre-commit-config.yaml") + json.dumps(pkg)
