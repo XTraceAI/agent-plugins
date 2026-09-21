@@ -11,7 +11,7 @@ tokens, and this output goes straight into model context, so nothing that is
 not evidence leaves this script.
 
 Stdlib plus the memhub plugin's own readers, the same machinery
-`skills/rules-from-sessions/scripts/mine_sessions.py` uses. Candidates are
+`skills/start-rulebook/scripts/mine_sessions.py` uses. Candidates are
 candidates: the skill shows them to the user and links only what is approved.
 
 Repo-relative matching, not absolute paths. A worktree's absolute prefix

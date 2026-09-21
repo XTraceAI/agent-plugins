@@ -210,6 +210,19 @@ Then the one CTA: **keep working — MemHub learns as you go.** Import sessions
 after substantive work (`/memhub:import-session`), and (when available) enable
 PR-merge memory so the brain compounds automatically.
 
+**And name the other half, in one line — do not start it.** The brain is what
+the agent *remembers*; the Rulebook is what it is *told at the moment it
+matters* ("you're about to force-push"). This skill sets up only the first, and
+a new user has no way to know the second exists. So end with: *"Next, when you
+have a minute: `/memhub:start-rulebook` gives your team its first rules — the
+starter set takes about a minute, and nothing it files turns on until you say
+so."* A pointer, not a step: onboarding is judged on time-to-first-recall, the
+rulebook skill opens with questions, and it is run once per team rather than
+once per person — so say it and stop, even if they seem keen. This skill
+cannot see whether a rulebook already exists (it has no rulebook tools on
+purpose), which is why the line says "first rules" and lets
+`/memhub:start-rulebook` notice an existing book itself.
+
 Plain-English output throughout. If a step fails on authentication, send the
 user to `/memhub:login`, not to `/mcp` — the hooks and the scripts here use the
 plugin's own credential, and a connected `/mcp` says nothing about whether they

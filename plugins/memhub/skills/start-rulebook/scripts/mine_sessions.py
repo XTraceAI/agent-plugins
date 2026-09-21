@@ -13,7 +13,10 @@ Numbers per row: applies-in N/M sessions (by host), precision = real misses, sam
 Friction delta: --baseline-date splits facet friction before/after a rulebook change.
 
 Stdlib + the memhub plugin's readers + the real hook evaluate() (never re-implemented).
-Usage: mine_sessions.py [--out DIR] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
+Window: the last 30 days of sessions by default (--days N), by each transcript's LAST activity. --all reads everything
+and is for when the person asks for it: a rule should answer to how the team works now, and an old corpus is slow to read.
+
+Usage: mine_sessions.py [--out DIR] [--days N | --all] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
 """
 import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex, functools
 
@@ -22,6 +25,8 @@ ap.add_argument("--out", default="mine-out")
 ap.add_argument("--baseline-date", help="friction before vs after this date (rule activation day)")
 ap.add_argument("--skills-file", help="memhub list_skills JSON reply, for skill-lane dedup")
 ap.add_argument("--repo", help="only sessions in this repo (resolved, so a worktree counts)")
+ap.add_argument("--days", type=int, default=None, help="only sessions active in the last N days (default 30; widened automatically so a --baseline-date keeps 30 days of 'before')")
+ap.add_argument("--all", action="store_true", help="every session on this machine, however old — only when the person asks for it")
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
 ap.add_argument("--rule-file", action="append", default=[], help="a create_rule body (matcher / ordering / anchors) to backtest as a candidate (repeatable) — used by create-rule")
 ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST of create_rule bodies (repeatable) — the checks you derived from CLAUDE.md in step 2; each may carry `claude_md: {heading, text}` (its origin sentence), `did`, `what`, `quote_rx`, `source_ref`")
@@ -42,7 +47,7 @@ def _save_cache(name, data):
 def _plugin_scripts():
     here = os.path.dirname(os.path.abspath(__file__))
     for c in (os.environ.get("MEMHUB_PLUGIN_SCRIPTS"), os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts"),
-              os.path.normpath(os.path.join(here, "..", "..", "..", "scripts"))):   # shipped inside the plugin: skills/rules-from-sessions/scripts -> plugin scripts
+              os.path.normpath(os.path.join(here, "..", "..", "..", "scripts"))):   # shipped inside the plugin: skills/start-rulebook/scripts -> plugin scripts
         if c and os.path.isfile(os.path.join(c, "rulebook_hook.py")): return c
     cands = glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/memhub*/*/scripts/rulebook_hook.py")) + \
             glob.glob(os.path.expanduser("~/.claude/plugins/*/plugins/memhub*/scripts/rulebook_hook.py")) + \
@@ -60,12 +65,33 @@ for _fn in ("strip_leading_assignments", "strip_comments", "shell_only"):
     setattr(rh, _fn, functools.lru_cache(maxsize=None)(getattr(rh, _fn)))
 t0 = time.time()
 
+# ---------------------------------------------------------------- window
+# A month, not everything. Rules should answer to how the team works NOW: a habit dropped in the spring still
+# "fires" in March's transcripts and gets proposed as a problem. It is also most of the run time — a transcript
+# outside the window is skipped on its mtime, before it is parsed. mtime (last activity), not the first timestamp:
+# a long-lived session that was worked in yesterday belongs to this month.
+WINDOW_DAYS = None if args.all else (args.days if args.days is not None else 30)
+if WINDOW_DAYS is not None and args.days is None and args.baseline_date:
+    try:   # "did friction shrink?" needs a BEFORE: keep 30 days ahead of the baseline, however long ago it was
+        _since = (datetime.date.today() - datetime.date.fromisoformat(args.baseline_date)).days
+        WINDOW_DAYS = max(WINDOW_DAYS, _since + 30)
+    except ValueError: pass
+_cutoff = None if WINDOW_DAYS is None else time.time() - WINDOW_DAYS * 86400
+skipped_old = 0
+
 # ---------------------------------------------------------------- corpus
+def _in_window(p):
+    global skipped_old
+    if _cutoff is None: return True
+    try: fresh = os.path.getmtime(p) >= _cutoff
+    except OSError: return True
+    skipped_old += not fresh
+    return fresh
 def sessions():
-    for p in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")): yield "claude", p
-    for p in glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl")): yield "codex", p
-    for p in glob.glob(os.path.expanduser("~/.cursor/chats/*/*/store.db")): yield "cursor", p
-    for p in glob.glob(os.path.expanduser("~/.cursor/projects/*/agent-transcripts/*/*.jsonl")): yield "cursor", p
+    for host, pat in (("claude", "~/.claude/projects/*/*.jsonl"), ("codex", "~/.codex/sessions/*/*/*/rollout-*.jsonl"),
+                      ("cursor", "~/.cursor/chats/*/*/store.db"), ("cursor", "~/.cursor/projects/*/agent-transcripts/*/*.jsonl")):
+        for p in glob.glob(os.path.expanduser(pat)):
+            if _in_window(p): yield host, p
 R = {"claude": claude, "codex": codex, "cursor": cursor}
 corpus, errs = [], collections.Counter()
 def _repo_name(cwd):
@@ -134,6 +160,8 @@ _stamp = {s["id"]: f"{len(s['users'])}u{len(s['calls'])}c{len(s['results'])}r" f
 digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
 M = len(corpus); by_host = collections.Counter(s["host"] for s in corpus)
 print(f"sessions read: {dict(by_host)} (M={M})  read errors: {dict(errs)}  ({time.time()-t0:.0f}s)")
+print("window: every session on this machine (--all)" if WINDOW_DAYS is None else
+      f"window: sessions active in the last {WINDOW_DAYS} days — {skipped_old} older transcripts not read (any repo). --days N widens it; --all reads everything")
 print("tool calls per host:", {h: sum(len(s['calls']) for s in corpus if s['host'] == h) for h in R})
 def sample(s, text): return {"session": s["id"][:8], "host": s["host"], "repo": s["repo"], "text": text.replace("\n", " ")[:110]}
 
@@ -642,7 +670,7 @@ SKILL_INTENTS = [   # intent in a USER turn; `skill` = the name that would serve
  {"skill": "pr-babysit",     "intent_rx": r"babysit|watch (the |this )?pr|drive .* to green|until (it'?s )?green"},
  {"skill": "handoff-session","intent_rx": r"hand ?off|hand (this|it) (off|over) to"},
  {"skill": "search-memory",  "intent_rx": r"what do we know|did we decide|search (memhub|memory|the brain)|check (the )?(agent|repo) brain"},
- {"skill": "rules-from-sessions", "intent_rx": r"mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
+ {"skill": "start-rulebook", "intent_rx": r"set ?up (a|our|the) rulebook|(starter|default) rules|what rules should we (start|have)|mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
 ]
 def invoked(s, name): return any(f"skills/{name}" in u or f"/{name}" in u for u in s["users"])
 print(f"\n=== SKILLS — what users ask for in their own words vs. the skill they actually invoked ({len(installed)} skills installed)")

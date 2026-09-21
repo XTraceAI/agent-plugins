@@ -1,4 +1,4 @@
-"""rules-from-sessions: the shipped miner must parse, resolve the plugin's scripts/ RELATIVE
+"""start-rulebook: the shipped miner must parse, resolve the plugin's scripts/ RELATIVE
 to its own location (no env var), and run to completion on an empty HOME (zero
 sessions, no book, no facets) — the state a fresh teammate is in."""
 from __future__ import annotations
@@ -6,7 +6,7 @@ import hashlib, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "plugins" / "memhub" / "skills" / "rules-from-sessions" / "scripts" / "mine_sessions.py"
+SCRIPT = ROOT / "plugins" / "memhub" / "skills" / "start-rulebook" / "scripts" / "mine_sessions.py"
 
 def _run(*extra, home):
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS")}

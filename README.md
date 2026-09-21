@@ -333,7 +333,7 @@ id, so an in-flight session keeps its own state. Fires recorded by an older
 plugin keep the id they were written with and stay unlinked — linking those
 retroactively is a server-side change, not a client one.
 
-Authoring (`/memhub:create-rule`, `/memhub:rules-from-sessions`) resolves which
+Authoring (`/memhub:create-rule`, `/memhub:start-rulebook`) resolves which
 book a rule lands in before drafting anything — one visible book is the answer,
 several is a question for you, none is an offer to create one that binds only
 you. The conflict check spans every book you can see, and flags a collision in
@@ -429,13 +429,18 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   failure, correction, or procedure, resolves which rulebook it lands in (and
   offers to create one when you have none), and checks it for conflicts across
   every rulebook you can see before saving it.
-- `/memhub:rules-from-sessions` — one run over your CLAUDE.md **and** your
-  past coding sessions (Claude Code, Codex, Cursor): every candidate rule is
-  replayed through the real hook, and each proposal says why it exists (the
-  CLAUDE.md sentence, or the sessions and your own words), what it cost you,
-  and what changes with it on. Hook rules first — at the command, on the
-  error, when a name comes up — session-start notes last. Files survivors as
-  `proposed` into the rulebook you pick; never activates anything.
+- `/memhub:start-rulebook [--starter | --mine] [--days N | --all]` — where a
+  team's Rulebook starts. It asks first which you want: **starter rules** (a
+  tested set every team running a coding agent wants — irreversible git,
+  secrets, tests before push, big files read as slices — fitted to this repo
+  from a scan of it; about a minute), **rules from your own work** (your
+  CLAUDE.md and your last 30 days of Claude Code / Codex / Cursor sessions;
+  10–20 minutes, because it reads them), or **both**, de-duplicated into one
+  list. Every candidate is run through the real hook and replayed over your
+  sessions, and each proposal says why it exists, what it cost you, and what
+  changes with it on. Older sessions are read only if you ask (`--days N`,
+  `--all`). Files survivors as `proposed` into the rulebook you pick; never
+  activates anything. (Was `/memhub:rules-from-sessions`.)
 - `/memhub:pr-babysit [pr-number-or-url]` — usually **auto-armed**, not typed:
   a hook offers to start this as a self-paced loop right after `gh pr
   create` (see PR babysitting below). One pass polls the PR's review bots and

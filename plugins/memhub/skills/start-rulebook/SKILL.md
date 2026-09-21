@@ -1,23 +1,35 @@
 ---
-description: Use when the user wants rules for the Rulebook from what their team actually does — "/memhub:rules-from-sessions", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. One run reads the repo's CLAUDE.md AND the local Claude Code / Codex / Cursor transcripts, replays every candidate through the real hook, and proposes rules that each state why they exist (the CLAUDE.md sentence, or the sessions and the user's own words), what they cost, and what changes with them on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.
-argument-hint: [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--rulebook "<name or id>"] [--dry-run]
+description: Use when the user wants rules for the Rulebook — a first set for a repo that has none, or rules from what their team actually does. "/memhub:start-rulebook", "set up a rulebook for this repo", "what rules should we start with", "give us the default rules", "bootstrap rules for a new client", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. Asks first which the person wants: STARTER rules (a tested catalog of universal coding-agent rules, filled in from a scan of this repo — seconds) and/or rules MINED from their own CLAUDE.md and the last 30 days of local Claude Code / Codex / Cursor sessions (minutes — it reads their sessions). Every candidate is replayed through the real hook and says why it exists, what it cost, and what changes with it on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.
+argument-hint: [--starter | --mine] [--days N | --all] [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--rulebook "<name or id>"] [--dry-run]
 allowed-tools: Bash, Read, Write, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
 ---
 
-# Rules from sessions (and CLAUDE.md) — one run
+# Rules for the Rulebook — a starter set, their own, or both. One run
 
-The user runs this once. Two inputs, one table, one yes:
+The user runs this once. Up to three inputs, one table, one yes:
 
 ```
-CLAUDE.md sentences ──┐
-                      ├─► every candidate gets a check ─► replayed over the user's sessions ─► one table ─► yes ─► create_rule (proposed)
-past sessions ────────┘   (at the command · on the error · when a name comes up · note last)
+starter catalog ◄── scan of the repo ──┐                                                                  (seconds)
+CLAUDE.md sentences ───────────────────┼─► every candidate gets a check ─► replayed over the user's sessions ─► one table ─► yes ─► create_rule (proposed)
+past sessions (last 30 days) ──────────┘   (at the command · on the error · when a name comes up · note last)   (minutes)
 ```
+
+**Ask which before doing anything (step 0a).** The two sources answer
+different questions. *Starter* rules are what every team running a coding
+agent wants — irreversible git, secrets, the suite before push, big files read
+as slices — written and tested once, then filled in with this repo's own
+branch, test command, manifests and migrations. They need nothing but a
+checkout, which is why they are what a new team runs on day one. *Mined*
+rules are this team's own: what their CLAUDE.md declares and what their
+sessions show going wrong. They need history, and they take time.
 
 Every proposed rule answers three questions, in this order — a candidate
 that cannot answer the first is not proposed:
 
-1. **Why does it exist?** One of three origins, nothing else:
+1. **Why does it exist?** One of four origins, nothing else:
+   - **starter** — *a universal rule, fitted to your repo* (the value that
+     came from the scan — "`main`, from origin/HEAD" — and, where the replay
+     ran, what it would have fired on in your own sessions),
    - **declared** — *your CLAUDE.md says "…"* (the sentence quoted, its
      heading, and how often it was broken anyway),
    - **observed** — *from your sessions* (how many, plus the user's own
@@ -81,10 +93,26 @@ parses.
 
 ## 0. Prerequisites
 
-- Script: `${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py`
+- Script: `${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py`
   (in Codex / Cursor: `scripts/mine_sessions.py` relative to this skill). It
   finds the plugin's `scripts/` next to it — no env var.
-- Inputs it takes: `--claude-md <path>` (repeatable), `--candidates <json
+- Starter script: `${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/starter_rulebook.py`
+  with the catalog beside the skill (`catalog.json`). `all --repo . --out DIR`
+  runs `scan` → `seed` → `verify`; each is also a subcommand.
+- **The window: the last 30 days, unless the person asks for more.**
+  `mine_sessions.py` reads only sessions active in the last 30 days (by each
+  transcript's last activity). Pass `--days N` when they name a period ("the
+  last quarter" → `--days 90`). Pass `--all` **only when they ask for all of
+  it in their own words** ("everything", "my whole history") — never on your
+  own initiative, and never to make a thin report look fuller. A month is the
+  right default for a reason: a rule should answer to how the team works
+  *now*, and a habit they dropped in the spring still "fires" in March's
+  transcripts. With `--baseline-date` and no `--days`, the window widens by
+  itself to keep 30 days before the baseline. The report's `window:` line says
+  what was read and how many older transcripts were not — repeat it to the
+  user. (Claude Code itself deletes transcripts after about 30 days unless
+  `cleanupPeriodDays` was raised, so for most people `--all` adds little.)
+- Inputs it takes: `--days N` / `--all`, `--claude-md <path>` (repeatable), `--candidates <json
   list>` (repeatable: the checks you derive in step 2), `--rule-file <body>`
   (one check — what `create-rule` calls for its backtest), `--facets <file
   or dir>` (repeatable), `--skills-file`, `--repo`, `--baseline-date`,
@@ -95,8 +123,9 @@ parses.
 - memhub tools `list_rulebooks`, `list_rules`, `create_rule`, `create_rulebook`,
   `list_skills`, `create_skill`.
 - Arguments: `--rulebook "<name or id>"` → the destination `rulebook_id`
-  (`--brain` is still accepted for it); `--dry-run` → everything except the
-  `create_rule` calls.
+  (`--brain` is still accepted for it); `--starter` / `--mine` → answers step
+  0a without asking; `--days N` / `--all` → the window; `--dry-run` →
+  everything except the `create_rule` calls.
 
 **Resolve the rulebook before you file anything.** A rulebook is a container
 with its own membership — every member's agent is bound by its rules — and one
@@ -120,15 +149,203 @@ their org membership is inactive, and no rulebook can be created until someone
 fixes it in MemHub. Say that plainly and stop. (`rulebook_name_too_long` means
 the name exceeded 200 characters — shorten it and retry once.)
 
+## 0a. Ask what they want — first, in plain words
+
+Assume the person installed MemHub this week. They may not know what a rule
+is, that there are two places rules can come from, or that one of them is
+slow. So before any scan or any session is read, say this (your own words are
+fine; the content is not optional):
+
+> **A rule is a short instruction your coding agent gets at the exact moment
+> it matters** — "you're about to force-push", "this file is 4,000 lines, read
+> a slice" — instead of a line in a doc it read once and forgot. A rulebook is
+> your team's set of them. I can build yours two ways:
+
+Then ask with AskUserQuestion — **one question, single-select, these three
+options in this order**:
+
+| option | label | description to show |
+|---|---|---|
+| 1 | **Starter rules** | "A tested set of rules every team wants — no force-pushes, no reading secrets, run the tests before pushing, don't read huge files whole. I scan this repo and fit them to it (your branch, your test command). **About a minute.** Best if you're just getting started." |
+| 2 | **Rules from my own work** | "I read your CLAUDE.md and your last 30 days of coding sessions to find what actually goes wrong for you, and propose rules for that. **Takes 10–20 minutes** — I'm going through your sessions one by one. Best once you've been using your agent for a few weeks." |
+| 3 | **Both** | "Starter rules now, plus your own on top, de-duplicated into one list. **10–20 minutes**, almost all of it the session reading." |
+
+Mark the recommended one from what you can see, and say why in one clause:
+- no local sessions in the window for this repo **and** no CLAUDE.md →
+  recommend **1**, and say that 2 and 3 would find nothing yet ("come back in
+  a couple of weeks — I'll have sessions to learn from");
+- sessions exist and the rulebook is empty → recommend **3**;
+- the rulebook already holds `starter-rulebook@` rows → recommend **2**.
+
+Skip the question only when they already answered it: `--starter` / `--mine`,
+or their own words ("just the defaults" → 1; "mine our sessions", "turn our
+CLAUDE.md into rules" → 2). "Set up our rulebook" is NOT an answer — ask.
+
+Whatever they pick, close the loop in one sentence before you start: **nothing
+I file turns on by itself — every rule lands as a proposal, and you (or your
+admin) switch on the ones you want in MemHub.** A new user's first fear is
+that this will start blocking their work. It won't, and they should hear that
+before the wait, not after.
+
+**Before the slow part starts, say so.** If they chose 2 or 3, tell them
+right before step 1 — and again if the facet pass (step 3) is large:
+
+> This part takes a while — I'm going through your last 30 days of sessions
+> to learn how you work and discover rules worth having. Roughly 10–20
+> minutes for a month of daily use. You can keep working; I'll come back with
+> one list for you to say yes or no to.
+
+Give the real numbers as soon as step 1 prints them ("142 sessions, 30 of them
+worth a close read") so the wait has a shape. Never go silent for minutes on a
+new user: one line when the first pass finishes, one when the readers are out,
+one when they are back.
+
+Then route:
+
+| they chose | run |
+|---|---|
+| 1 Starter | S1 → S2 → S3, then 5 → 6. **Skip 1–4 entirely** — no facet pass, no readers. |
+| 2 Their own | 1 → 2 → 3 → 4 → 5 → 6 (the S steps are skipped). |
+| 3 Both | S1 first (seconds), then 1 → 4 with the starter candidates passed into the same replay, S2 → S3 for the starter half, then 5 → 6 once, over everything. |
+
+## S1. Starter: scan the repo, fill the catalog, prove every rule
+
+```bash
+OUT="${TMPDIR:-/tmp}/start-rulebook"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/starter_rulebook.py" all \
+  --repo . --out "$OUT"; echo "rc=$?"
+```
+
+Read-only over tracked files, no network, writes nothing in the repo. It
+leaves:
+
+- `signals.json` — what it found and where: default branch, toolchain, test
+  and lint commands, manifests and lock tool, test layout, slow markers,
+  migrations, dev server, generated files, the largest files, `.gitignore`
+  exclusions and secrets, protected paths, CI and production workflows, infra.
+- `candidates.json` — one `create_rule` body per seeded rule (`body`), with
+  `category`, `designed_mode`, `seeded_from`, `evidence`, `cases`.
+- `dropped.json` — every catalog rule left out and why, in the client's words
+  ("this repo has no migrations directory"). **Dropping is the feature:** a
+  rule about alembic in a repo without it is day-one noise. A rule whose
+  signal is missing is never filed with a guessed value.
+- `verified.json` — each candidate run through `rulebook_verify.verify`, the
+  live hook's own engine, against the catalog's `fires` / `silent` cases
+  re-seeded with this repo's values, plus the `grep` / `python -c`
+  self-mention cases.
+
+**Show the WHAT THE SCAN FOUND block and let them correct it.** It is
+heuristics over file names. The two it gets wrong most: the default branch
+when the team merges somewhere other than `origin/HEAD` (a `staging` flow),
+and the test command when the repo wraps it (`make check`, `nox`, `tox`). On
+a correction, edit the slot in `signals.json` and re-run `seed` then `verify`
+— never hand-edit a candidate's regex.
+
+**`rc=1` means a candidate failed; it is not offered and not filed.** Say
+which and why. A failure after seeding is a repo value the catalog's pattern
+did not expect — a catalog bug to report, not something to patch in-session.
+
+**If they chose Both**, or chose Starter and have sessions in the window,
+replay the starter candidates over their sessions — it is the only evidence
+of *usefulness* there is on day one, and it costs under a minute (no readers,
+no facet pass):
+
+```bash
+python3 - "$OUT" <<'PY'
+import json, sys
+out = sys.argv[1]
+bodies = [dict(c["body"], title=c["id"]) for c in json.load(open(out + "/candidates.json"))
+          if c["body"].get("delivery") == "agent_hook"]
+json.dump(bodies, open(out + "/starter-bodies.json", "w"))
+PY
+# Starter only: its own quick replay. Both: add this --candidates to the step-4 run instead.
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" \
+  --out "$OUT/mine" --candidates "$OUT/starter-bodies.json" --repo "<repo>" --digest-top 0
+```
+
+Three things to know before reading a number off that replay:
+
+- **A rule with a `given` block or `scope_paths` is replayed WITHOUT them** —
+  a transcript carries no branch, diff, dirty flag or agent identity. "Never
+  push to main" firing in every session that pushed is a count of pushes. For
+  those rules the number is a ceiling: say "up to N", or say nothing.
+- **Zero is not a verdict on a safety rule.** Wiping a home directory, piping
+  a download into a shell, tearing down infrastructure — these are insurance
+  and should be zero. Zero on a *budget* or *verification* rule means the team
+  does not have that problem: default it off and say so.
+- **Read the samples of anything that fired in more than ~10% of sessions.**
+  Mostly innocent → do not offer the rule. Designed as a gate → file it as
+  advice (S2). A gate that fires weekly on ordinary work is overridden by
+  habit within a month, and then it protects nothing.
+
+## S2. Starter: ask which problems are theirs — never show sixty rules
+
+`catalog.json`'s categories each carry an `ask` line written for a person who
+has never seen a rulebook. AskUserQuestion, `multiSelect: true`, at most four
+options per question, and **leave out any category with no seeded rules**:
+
+1. *Cost and speed* — Context budget · Cheap verification · Runtime traps
+2. *Safety* — Safety · Infrastructure pack · Subagent guardrails
+3. *Quality and intent* — Test hygiene · Repo hygiene · Intent alignment · Posture and anchors
+
+Each option's description carries its rule count and, where the replay ran,
+its evidence ("9 rules · 3 would have come up in your last month"). Then one
+single-select question — **how firm should they be on day one?**
+
+- **Remind only, to start (Recommended).** Every rule just shows the agent a
+  reminder. After two weeks you'll see which ones are quiet enough to let
+  block. Nothing can stop your work by surprise.
+- **Block the dangerous ones, remind on the rest.** Safety, Infrastructure and
+  Subagent rules stop the command; everything else reminds. Pick this if an
+  incident is why you're here.
+- **As designed.** Every rule keeps the catalog's mode, including "run X
+  before you push" blocks. For a team that has run hooks before.
+
+("Remind" is `mode: advise`, "block" is `mode: gate` — use their words with
+the user, the field names in the call.) Whatever they pick, the replay
+overrides it downward: a designed gate that came up in more than ~10% of their
+sessions is filed as a reminder, and the report says so. Say once what a block
+means: it stops that command for **everyone the rulebook binds**, and any of
+them can still run it with `RULEBOOK_OVERRIDE='<why>'`, which records why.
+
+## S3. Starter: show the shortlist, let them strike rows
+
+One row per rule in the categories they chose — no regex, no ids unless asked:
+
+```
+Safety — 14 rules
+  Stop irreversible git operations               blocks the command
+    when: git push --force · reset --hard · checkout -- . · clean -f · stash drop
+    says: "This rewrites or discards history… use --force-with-lease…"
+    here: came up in up to 19 of your 142 sessions (mostly `git checkout -- .`)
+  No direct push to the default branch           blocks the command
+    when: git push while on `main`                ← from origin/HEAD
+```
+
+`← from …` is the rule's `seeded_from` whenever a repo value went in, so they
+can see it is theirs and correct it. Ask which rows to drop; striking is cheap,
+and one unwanted rule is how a whole book gets switched off.
+
+Read them the catalog's **`not_rules`** too — what this set deliberately does
+not try to do with a pattern (secrets also belong in `permissions.deny`;
+reward hacking and scope creep need structural controls). And if they asked
+why a rule they expected is missing, the catalog's **`cut`** list is the honest
+answer: rules it used to carry, and the replay evidence that removed each.
+
 ## 1. First pass — every session, no model call
+
+**Say the wait out loud first** (step 0a's notice) — this is where it starts.
 
 ```bash
 git rev-parse --show-toplevel; git rev-parse --short HEAD     # provenance for the CLAUDE.md rows
 # save list_skills (all statuses) to skills.json for skill dedup, then:
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" --out mine-out \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out \
   --skills-file skills.json --claude-md ./CLAUDE.md [--claude-md <workspace>/CLAUDE.md] \
   [--repo <name>] [--baseline-date YYYY-MM-DD]
 ```
+
+No `--days` means the last 30 days; add `--days N` or `--all` only per step
+0. Repeat the report's `window:` line to the user.
 
 It prints the report (§4) with the built-in checks replayed, writes
 `mine-out/proposals.json` and `mine-out/corpus.json`, and writes
@@ -238,10 +455,23 @@ origin. Add the checkable ones to the same candidates list.
 ## 4. Second pass — everything replayed, one report
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/rules-from-sessions/scripts/mine_sessions.py" --out mine-out \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out \
   --candidates mine-out/candidates.json --facets mine-out/facets \
   --skills-file skills.json --claude-md ./CLAUDE.md
+# they chose Both → one replay for everything: add  --candidates "$OUT/starter-bodies.json"
 ```
+
+**Both: de-duplicate before anything is shown.** Three of this script's
+built-in checks cover the same ground as a starter rule under another title
+and another pattern, so the conflict script (step 5) cannot see the pair. The
+catalog names each in `same_as`: `suite-before-push` ↔ `tests-before-push`,
+`fetch-before-origin` ↔ `fetch-before-origin-read`, `git-irreversible` ↔
+`no-force-push`. When both are in this run, **show one row, not two**: keep
+the starter rule (it is the tested pattern, fitted to their repo) and put the
+mined row's evidence on it — its session count and the user's own words are
+the "why it matters *here*" the starter rule otherwise lacks. A mined row that
+is *narrower* in a way their sessions justify (they only ever force-push, never
+reset) is still one row: the starter rule, with that noted.
 
 The report, in order:
 
@@ -328,7 +558,16 @@ origin) and `quote_rx`.
    over `judge_by_statement`: `duplicate` → file with `supersedes_rule_id`;
    `same_matcher` against an active rule that is NOT the same rule → do not
    file, tell the user; `contradicts` → file without `supersedes_rule_id`
-   and name the rule it fights in the report. A hit marked **`cross_book`**
+   and name the rule it fights in the report. The `same_as` pairs above
+   apply against the BOOK too, in both directions: a starter rule about to be
+   filed whose counterpart is already in the book from an earlier mined run
+   (or a mined built-in whose starter counterpart is already there, its
+   `source_ref` starting `starter-rulebook@`) is a `duplicate` the script
+   will not flag — look for those titles in the `list_rules` reply yourself.
+   Keep what is in the book and add the new evidence to the report, unless the
+   incoming rule is strictly wider (`git-irreversible` over `no-force-push`),
+   which is filed with `supersedes_rule_id`. Retired counterpart → someone
+   already said no; skip it. A hit marked **`cross_book`**
    is in another rulebook: `supersedes_rule_id` cannot reach it and both
    rules will fire on the same call, so it goes to the user as a decision,
    never absorbed silently.
@@ -349,6 +588,16 @@ origin) and `quote_rx`.
      and `supersedes_rule_id` where step 2 said so. Everything lands
      `proposed`, advise — never pass `activate` from this skill, not even on
      a book that binds only the user.
+   - **Starter rules**: pass the candidate's `body` from `candidates.json` as
+     it is (`source: "authored"`, `source_ref: starter-rulebook@<catalog
+     version>#<id>` — keep titles stable, that pair is what makes a re-run
+     after a catalog update supersede instead of twin), plus `rulebook_id`.
+     `mode` is the one field you set: per the S2 answer and the replay's
+     downward override; omit it on `session_context` / `anchor_recall` rows
+     (the server refuses one there, and the seeder already left it off).
+     Only rows that verified (S1) and that they did not strike (S3).
+     Session-start notes are capped at 15 per repo scope server-side and the
+     catalog ships four — count what the book already holds first.
    - **CLAUDE.md**: open a PR adding `mine-out/grabs/claude-md-additions.md`'s
      chosen sections to the repo's CLAUDE.md — a PR, never a direct edit.
    - **Skills**: write the full SKILL.md for `PROPOSE this skill` rows and
@@ -370,6 +619,31 @@ number: it carries every facet for these sessions, earlier runs' included, so
 each version is the whole picture rather than one run's slice, and the fires ledger shares
 `session_id` with it, so "rule fired, friction still happened" is a join.
 
+**Write the report for someone in their first week.** Lead with the three
+things they need, in this order, before any table:
+
+1. **What you have now** — "N rules proposed in *<rulebook>*, which reaches
+   <you / your N teammates>": how many starter, how many from their own work.
+2. **Nothing is on yet, and how to turn it on** — proposals do nothing until
+   someone activates them in MemHub; suggest switching on the reminders in one
+   pass and any blocking rule one at a time. For a blocking starter rule say
+   plainly that it passed every engine case with this repo's values but has
+   not been tried in a live session: run `/memhub:create-rule` §4b on it
+   before arming it, and offer to do that now for the two or three they care
+   about most.
+3. **What to do next, and when** — if they took only the starter set: "use
+   your agent normally for two weeks, then run this again and pick *Rules from
+   my own work* — by then I'll have sessions to learn from." If they mined:
+   the activation date, and that the next run with `--baseline-date <that
+   date>` shows whether friction actually fell. If the scan found CI steps
+   that run locally (`signals.ci.local_checks`), each is a "run X before push"
+   rule worth adding with `/memhub:create-rule`; secrets also belong in
+   `permissions.deny`.
+
+Then what was left out and why — `dropped.json` ("no migrations directory"),
+verification failures, their own strikes — so an absent rule reads as a
+decision, not an oversight.
+
 Report per row: filed (with its trigger, and into which rulebook — name who
 that book binds) / replaces which rule / unchanged / skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
 already on with zero historical fires (retire candidates); skills with
@@ -379,3 +653,21 @@ Note the activation
 date — the next run with `--baseline-date <that date>` over fresh sessions
 (with a new facet pass) measures whether the friction shrank. Identical
 re-files are no-ops on the server, so re-running is safe.
+
+## Maintaining the starter catalog
+
+`catalog.json` is data with a test (`tests/starter_rulebook_test.py` seeds it
+against Python, Node and bare fixture repos and fails if any rule stops loading
+or any case flips). When you change a pattern:
+
+- match at command position with `{{CMD}}` / `{{GIT}}`, never `^` — real
+  commands arrive as `cd x && git push`;
+- match paths as `(?:^|/)dir/` — the hook is handed absolute paths, so
+  `^tests/` never fires on an Edit;
+- no quantified group containing `+`, `*` or `|` (`(\s+-\S+)*`) — the hook's
+  load lint drops the whole rule, silently;
+- `scope_paths` are `fnmatch` globs: `alembic/versions/*`, not the directory;
+- ship a `fires` case in chained form and a `silent` case for the
+  complied-with form, and replay the change over a real corpus before trusting
+  it. Every entry in `cut` and half the `command_not_rx` values came from a
+  replay, not from thinking about it.
