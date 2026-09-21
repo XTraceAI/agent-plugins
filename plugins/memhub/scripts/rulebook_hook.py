@@ -1877,7 +1877,13 @@ _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_versio
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
             "content_rx", "content_not_rx", "exclude_rx", "converted_rx")
-_RX_MAX = 400
+# Length is a bound on what one rule can cost to compile and store, NOT the
+# backtracking guard — `_RX_NESTED` below is. A 60-character pattern can stall
+# and a 1,500-character alternation of literal paths cannot, so the bound is
+# wide enough for the second. It was 400 before 0.75.0: a hook older than that
+# drops any rule carrying a longer pattern, which is why the server floors such
+# a rule at `min_hook_version` 0.75.0.
+_RX_MAX = 2000
 # (a+)+, (\d+)+$, (a|a)+, (.*), .*.* — the classic backtracking shapes. A
 # denylist, not a proof: stdlib `re` has no timeout, and a bounded matcher
 # (worker + wall clock) is the Phase 2 answer named in §5.1.
@@ -1886,7 +1892,7 @@ _RX_NESTED = re.compile(r"\([^()]*[+*|][^()]*\)\s*[+*{]|\(\.\*\)|(\.\*){2,}")
 
 def rx_ok(pat):
     """Load-time lint for a pattern that came off the wire (§5.1 fallback):
-    must compile, stay short, and avoid the nested-quantifier shapes that
+    must compile, stay under `_RX_MAX`, and avoid the nested-quantifier shapes that
     backtrack catastrophically. A rejected pattern drops the RULE, never the
     hook — a server book can advise, it cannot stall a tool call."""
     if not isinstance(pat, str) or len(pat) > _RX_MAX or _RX_NESTED.search(pat):
