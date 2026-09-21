@@ -1018,7 +1018,8 @@
    "why": "an undone action is the most expensive turn there is; filter-repo plus a force push caused a documented production outage. `branch -D` is left out: the reflog recovers it, and agents delete their own scratch branches constantly.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}(?:push\\b[^|;&]*(?:--force(?!-with-lease|-if-includes)|\\s-f\\b|\\s\\+[^\\s:]+)|reset\\s+--hard|stash\\s+(?:drop|clear)|filter-(?:repo|branch))"
+    "command_rx": "{{GIT}}(?:push\\b[^|;&]*(?:--force(?!-with-lease|-if-includes)|\\s-f\\b|\\s\\+[^\\s:]+)|reset\\s+--hard|stash\\s+(?:drop|clear)|filter-(?:repo|branch))",
+    "command_not_rx": "\\s--dry-run\\b"
    },
    "evidence": "matches every hook collection surveyed and Anthropic's own hook examples",
    "cases": {
@@ -1036,7 +1037,8 @@
      "git commit -m 'never git reset --hard here'",
      "git stash",
      "git branch -D rulebook-fwd-16fee5b1",
-     "git push --force-with-lease --force-if-includes origin feat"
+     "git push --force-with-lease --force-if-includes origin feat",
+     "git push --force --dry-run origin HEAD:refs/heads/zz-probe"
     ]
    },
    "same_as": [
@@ -1050,10 +1052,10 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "This throws away uncommitted work across the tree, and nothing records it. Commit or stash first, name the one file, or say why through the override.",
-   "why": "the reflog keeps commits, not edits: a tree-wide checkout, restore, clean or a forced worktree removal is the one git loss with no undo. A dry run (`git clean -n`) and a single named file are left alone.",
+   "why": "the reflog keeps commits, not edits: a tree-wide checkout, restore or clean is the one git loss with no undo. A dry run (`git clean -n`) and a single named file are left alone. `git worktree remove --force` is left out on evidence: replayed over 927 real sessions it matched 126 calls in 69 of them, every one the cleanup of a scratch worktree the agent had made itself.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}(?:checkout\\s+(?:--\\s+)?\\.(?:\\s|$)|(?:checkout|switch)\\s[^|;&]*(?:\\s-f\\b|--force\\b|--discard-changes\\b)|(?:checkout|switch)\\s+(?:-f|--force|--discard-changes)\\b|restore\\s+(?:--\\S+\\s+)?\\.(?:\\s|$)|clean\\b(?![^|;&]*(?:\\s-[a-zA-Z]*n|--dry-run))\\s+-[a-zA-Z]*f|worktree\\s+remove\\s[^|;&]*(?:--force\\b|\\s-f\\b))"
+    "command_rx": "{{GIT}}(?:checkout\\s+(?:--\\s+)?\\.(?:\\s|$)|(?:checkout|switch)\\s[^|;&]*(?:\\s-f\\b|--force\\b|--discard-changes\\b)|(?:checkout|switch)\\s+(?:-f|--force|--discard-changes)\\b|restore\\s+(?:--\\S+\\s+)?\\.(?:\\s|$)|clean\\b(?![^|;&]*(?:\\s-[a-zA-Z]*n|--dry-run))\\s+-[a-zA-Z]*f)"
    },
    "cases": {
     "fires": [
@@ -1062,8 +1064,7 @@
      "git checkout .",
      "git checkout -- .",
      "git checkout -f main",
-     "git switch --discard-changes main",
-     "git worktree remove --force ../wt"
+     "git switch --discard-changes main"
     ],
     "silent": [
      "git restore --staged a.py",
@@ -1071,8 +1072,9 @@
      "git clean -fdn",
      "git clean -n",
      "git checkout main",
-     "git worktree remove ../wt",
-     "git commit -m 'never git checkout . here'"
+     "git commit -m 'never git checkout . here'",
+     "git worktree remove --force /private/tmp/claude/scratch/wt",
+     "git worktree remove --force ../wt"
     ]
    }
   },
@@ -1453,11 +1455,11 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "Drops, truncates, unscoped deletes and downgrades stop here. Say which database and why through the override.",
-   "why": "cheap to type, impossible to undo without a backup. A commit message or a PR body that mentions the words is not a database call; lower-case `truncate` alone is English.",
+   "why": "cheap to type, impossible to undo without a backup. A commit message or a PR body that mentions the words is not a database call; lower-case `truncate` alone is English. A downgrade followed by an upgrade in the same command is the round-trip test of a migration, not a rollback: replayed over real sessions, 7 of the 9 downgrades were exactly that.",
    "matcher": {
     "event": "bash",
     "command_rx": "(?i:\\bDROP\\s+(?:TABLE|DATABASE|SCHEMA)\\b|\\bTRUNCATE\\s+TABLE\\s|\\bDELETE\\s+FROM\\s+[\\w.\\\"]+\\s*(?:;|[\\\"']|$))|\\bTRUNCATE\\s+\\w|\\bFLUSHALL\\b|{{CMD}}dropdb\\b|migrate:fresh|db:reset{{mig_destructive_alt}}",
-    "command_not_rx": "{{CMD}}(?:grep|rg|git grep|git log|git commit|gh pr|gh issue|gh release)\\b[^|;&]*(?i:\\bDROP\\s|\\bTRUNCATE\\s|\\bDELETE\\s+FROM\\b)"
+    "command_not_rx": "{{CMD}}(?:grep|rg|git grep|git log|git commit|gh pr|gh issue|gh release)\\b[^|;&]*(?i:\\bDROP\\s|\\bTRUNCATE\\s|\\bDELETE\\s+FROM\\b)|alembic downgrade\\b.*\\balembic upgrade\\b"
    },
    "seeded_from": "migrations dir: the repo's migration tool and its destructive verbs",
    "cases": {
@@ -1475,7 +1477,8 @@
      "gh pr create --title 'x' --body 'We truncate long tool outputs'",
      "gh issue comment 5 --body 'do not drop table users'",
      "git commit -m 'drop table cleanup' && git push",
-     "truncate -s 0 app.log"
+     "truncate -s 0 app.log",
+     "uv run alembic downgrade -1 2>&1 | tail -1; uv run alembic upgrade head 2>&1 | tail -1"
     ]
    }
   },
@@ -1536,10 +1539,11 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "Print the one variable you need, never the whole environment or an env file.",
-   "why": "a secret leak and a noise dump in one command.",
+   "why": "a secret leak and a noise dump in one command. Reading the NAMES is fine and is what careful agents already do: a `sed 's/=.*/=<hidden>/'` redaction, or grep's count / list / quiet flags, print no value. Replayed over 927 real sessions, those were the bulk of what this gate would have blocked.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}(?:env|printenv)\\s*(?:$|[>;&]|\\|\\s*(?!\\s|\\S*grep\\b|rg\\b))|{{CMD}}(?:cat|head|tail|sed|grep|rg|base64|xxd|strings|awk)\\b[^|;&]*\\s\\S*\\.env(?:rc|\\.(?!example|sample|template|dist)[\\w-]+)?(?:\\s|$)|{{CMD}}(?:set|export\\s+-p)\\s*(?:$|[|>])|\\bprint\\(\\s*(?:dict\\()?os\\.environ\\s*\\)|console\\.log\\(\\s*process\\.env\\s*\\)"
+    "command_rx": "{{CMD}}(?:env|printenv)\\s*(?:$|[>;&]|\\|\\s*(?!\\s|\\S*grep\\b|rg\\b))|{{CMD}}(?:cat|head|tail|sed|grep|rg|base64|xxd|strings|awk)\\b[^|;&\\n]*\\s\\S*\\.env(?:rc|\\.(?!example|sample|template|dist)[\\w-]+)?(?:\\s|$)|{{CMD}}(?:set|export\\s+-p)\\s*(?:$|[|>])|\\bprint\\(\\s*(?:dict\\()?os\\.environ\\s*\\)|console\\.log\\(\\s*process\\.env\\s*\\)",
+    "command_not_rx": "\\bsed\\s[^|;&]*s/=\\.\\*/|{{CMD}}(?:grep|rg)\\s+-[a-zA-Z]*[clq][a-zA-Z]*\\s"
    },
    "cases": {
     "fires": [
@@ -1551,7 +1555,8 @@
      "env | sort",
      "cat .env.staging | grep KEY",
      "python3 -c 'import os; print(os.environ)'",
-     "node -e 'console.log(process.env)'"
+     "node -e 'console.log(process.env)'",
+     "grep -n OPENAI_API_KEY .env.staging"
     ],
     "silent": [
      "env CI=1 pytest tests/test_a.py",
@@ -1561,7 +1566,12 @@
      "env | grep -i CLAUDE_PLUGIN_ROOT",
      "env | /usr/bin/grep -E '^(JEV|OPENAI)'",
      "python3 -c 'import os; print(os.environ[\"HOME\"])'",
-     "cat .env.example"
+     "cat .env.example",
+     "sed -E 's/=.*/=<hidden>/' .env.staging | grep -i database",
+     "grep -h '^ANTHROPIC_API_KEY' .env | sed 's/=.*/=<redacted>/'",
+     "grep -c . .env.staging",
+     "grep -l '^OPENAI_API_KEY=sk' .env",
+     "pytest -q | tail -3\ncp .env.development .env.local"
     ]
    }
   },
@@ -2557,7 +2567,7 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "The person asked for a plan. No edits until they say go.",
-   "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident. Known gap: the hook reads everything typed this session with no order, so an approval given EARLIER ('go ahead' on a previous task) also silences a later plan-only request. It fails open — it can miss, it cannot block work that was approved. A scoped prohibition (`don't touch the public API`) is not a plan-only request and does not arm this.",
+   "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident. Known gap: the hook reads everything typed this session with no order, so an approval given EARLIER ('go ahead' on a previous task) also silences a later plan-only request. It fails open — it can miss, it cannot block work that was approved. A scoped prohibition (`don't touch the public API`) is not a plan-only request and does not arm this. The release list is kept short on purpose: every phrase in it also silences a LATER plan-only request (the predicates are unordered), and in the one real session that asked for no code, a looser list (`build it`) had already been said 36 turns earlier.",
    "matcher": {
     "event": "edit",
     "path_rx": ".",
@@ -2565,7 +2575,7 @@
     "given": {
      "user": {
       "said_rx": "(?i:\\b(?:just plan|plan only|only (?:a )?plan|(?:don'?t|do not) (?:edit|change|touch|write) (?:anything|any files?|any code)|no code changes)\\b)",
-      "not_said_rx": "(?i:\\b(?:go ahead|proceed|implement (?:it|this|that|the plan)|do it|build it|start (?:implementing|coding|building)|yes,? start|make the changes?|execute the plan|looks good|lgtm|approved|ship it)\\b)"
+      "not_said_rx": "(?i:\\b(?:go ahead|proceed|implement (?:it|the plan)|do it|start (?:implementing|coding)|yes,? start|execute the plan|looks good|lgtm|approved|ship it)\\b)"
      }
     }
    },
@@ -2581,6 +2591,13 @@
       "case": "/repo/src/auth.py::x = 1",
       "user_said": [
        "walk me through the approach first, don't change anything yet"
+      ]
+     },
+     {
+      "case": "/repo/src/auth.py::x = 1",
+      "user_said": [
+       "break down the work and build it",
+       "don't write any code or do anything"
       ]
      }
     ],
