@@ -111,6 +111,13 @@ with tempfile.TemporaryDirectory() as td:
     sa.read_room = lambda cwd, env: {"brain_id": "B-CACHED", "name": "Repo: x/y"}
     run("--file", str(doc), "--name", "Spec: X")
     check(resolved == [] and calls[-1].get("agent_brain_id") == "B-CACHED", "cached brain used, resolver untouched")
+    check("org_id" not in calls[-1], "a room with no org recorded sends none (default org)")
+
+    print("room in a non-default org → its org rides along")
+    sa.read_room = lambda cwd, env: {"brain_id": "B-CACHED", "name": "Repo: x/y", "org_id": "ORG-2"}
+    run("--file", str(doc), "--name", "Spec: X")
+    check(calls[-1].get("agent_brain_id") == "B-CACHED" and calls[-1].get("org_id") == "ORG-2",
+          "org_id sent with the room's brain id")
 
     print("overrides")
     sa.read_room = lambda cwd, env: None
@@ -125,6 +132,19 @@ with tempfile.TemporaryDirectory() as td:
     sa.resolve_repo_brain = none_resolve
     rc = run("--file", str(doc), "--name", "Spec: X")
     check(rc == 0 and len(resolved) == 1 and "agent_brain_id" not in calls[-1], "no room anywhere → saved without a brain")
+
+    print("a refused save is not a saved artifact")
+    real_structured = _Result.structuredContent
+    _Result.structuredContent = None
+    _Result.isError = True
+    _Result.content = [types.SimpleNamespace(text="tags are required; this brain uses: billing, retries")]
+    try:
+        rc = run("--file", str(doc), "--name", "Spec: X")
+        check(rc == 1, f"isError from the server → exit 1, not 0 (rc={rc})")
+    finally:
+        _Result.structuredContent = real_structured
+        _Result.isError = False
+        _Result.content = []
 
 with tempfile.TemporaryDirectory() as td:
     out = Path(td)

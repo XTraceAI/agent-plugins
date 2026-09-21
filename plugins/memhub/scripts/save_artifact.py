@@ -281,6 +281,12 @@ async def main() -> int:
                     room = None
             if room:
                 call_args["agent_brain_id"] = room["brain_id"]
+                # The org that OWNS the room. A brain resolves inside exactly
+                # one org, so its id without the org fails with "Agent brain
+                # not found" whenever the room is outside the caller's default
+                # org — the same reason the capture flushes send it.
+                if room.get("org_id"):
+                    call_args["org_id"] = room["org_id"]
             if call_args.get("agent_brain_id"):
                 origin = f' (repo room "{room.get("name", "?")}")' if room else ""
                 print(f"brain    : {call_args['agent_brain_id']}{origin}")
@@ -288,6 +294,14 @@ async def main() -> int:
             res = await session.call_tool("save_artifact", arguments=call_args)
             out = unwrap(res)
     print(json.dumps(out, indent=2))
+    # A refusal (required tags, quota, a stale parent) arrives as a normal
+    # CallToolResult with isError set — `unwrap` cannot tell it from a saved
+    # artifact. Nothing was stored, so this must not exit 0: every caller,
+    # a person or onboard_docs.py, reads the exit code as "saved".
+    if getattr(res, "isError", False):
+        err = out.get("_raw") or out.get("error") or json.dumps(out)
+        print(f"ERROR: save_artifact was refused: {err}", file=sys.stderr)
+        return 1
     return 0
 
 
