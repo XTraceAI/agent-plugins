@@ -342,7 +342,7 @@ both will fire, so it goes to you as a decision.
 
 ### Harness-tied memory (flagged off)
 
-On by default since v0.69.0 (set `MEMHUB_HARNESS_EXTRACT=0` to turn it off), the plugin helps a
+With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin helps a
 correction you make in a session become a proposed team rule. At each turn's
 Stop, a detached child sends a redacted slice of that turn to MemHub
 (`POST /v1/team/rulebook/harness/classify`), whose classifier says whether the

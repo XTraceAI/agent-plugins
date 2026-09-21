@@ -302,5 +302,5 @@ HARNESS_CHILD_ENV = "MEMHUB_HARNESS_CHILD"
 
 def is_harness_child(environ=None) -> bool:
     env = os.environ if environ is None else environ
-    return str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() not in (
-        "", "0", "off", "false", "no")
+    return str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() in (
+        "1", "on", "true", "yes")

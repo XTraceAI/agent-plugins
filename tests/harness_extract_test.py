@@ -282,21 +282,21 @@ def test_session_files_are_confined_and_broken_lines_are_skipped():
     print("PASS test_session_files_are_confined_and_broken_lines_are_skipped")
 
 
-def test_the_flag_is_on_by_default_and_every_off_spelling_works():
-    """Default ON since v0.69.0. The empty string moved sides with it: an unset
-    or blank variable is an install that never chose, and default-on means that
-    install senses and drains.
+def test_the_flag_is_off_by_default_and_only_an_on_spelling_starts_it():
+    """Default OFF. v0.69.0 through v0.75.x defaulted it on; it is opt-in again
+    because on costs the person a classifier call per flagged turn and a
+    `claude -p` per authored moment, on THEIR quota.
 
-    The off spellings matter more than they did as a flag: this now costs the
-    person a classifier call per flagged turn and a `claude -p` per authored
-    moment, on THEIR quota, so someone reaching for the brake must find it
-    whichever word they reach with."""
-    assert hx.extract_enabled({}), "unset is on"
-    for on in ("", "1", "on", "true", "YES", "anything-unrecognised"):
-        assert hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": on}), on
-    for off in ("0", "off", "false", "no", "OFF", "False", " 0 ", "NO"):
+    So the empty string is back on the off side — an unset or blank variable is
+    an install that never chose — and so is anything unrecognised: a typo must
+    not start the spend."""
+    assert not hx.extract_enabled({}), "unset is off"
+    for off in ("", "0", "off", "false", "no", "OFF", "False", " 0 ", "NO",
+                "anything-unrecognised"):
         assert not hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": off}), off
-    print("PASS test_the_flag_is_on_by_default_and_every_off_spelling_works")
+    for on in ("1", "on", "true", "YES", " 1 ", "True"):
+        assert hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": on}), on
+    print("PASS test_the_flag_is_off_by_default_and_only_an_on_spelling_starts_it")
 
 
 def test_an_authoring_child_is_never_sensed_whatever_the_flag_says():
