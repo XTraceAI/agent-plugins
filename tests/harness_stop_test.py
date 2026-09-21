@@ -720,9 +720,9 @@ def test_the_hooks_are_wired_behind_the_guard():
     print("PASS test_the_hooks_are_wired_behind_the_guard")
 
 
-def test_the_hook_command_runs_by_default_and_stops_on_every_off_spelling():
+def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
     if os.name == "nt":
-        print("SKIP test_the_hook_commands_start_nothing_unless_the_flag_is_on (POSIX hook command)")
+        print("SKIP test_the_hook_command_starts_nothing_unless_the_flag_is_on (POSIX hook command)")
         return
     doc = json.loads((ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
     commands = [h["command"] for groups in doc["hooks"].values() for g in groups
@@ -734,14 +734,14 @@ def test_the_hook_command_runs_by_default_and_stops_on_every_off_spelling():
         (root / "scripts" / "claude_hook_guard.py").write_text("import sys\nsys.stdin.read()\n")
         (root / "scripts" / "harness_stop.py").write_text(
             "import sys\nsys.stdin.read()\nopen(%r, 'a').write(sys.argv[1] + ' ')\n" % str(ran))
-        # Default ON since v0.69.0: an unset or unrecognised value runs.
-        # Every off spelling must stop it — this costs the person a
-        # classifier call per flagged turn and an authoring run per moment,
-        # on their own quota, so the brake has to answer to any word.
-        for value, runs in (("", True), ("1", True), ("on", True), ("TRUE", True),
-                            ("Yes", True), ("anything-else", True),
+        # Default OFF: only an explicit on spelling runs. Unset, blank and
+        # unrecognised all stop here, before python starts — on costs the
+        # person a classifier call per flagged turn and an authoring run per
+        # moment on their own quota, so a typo must not start it.
+        for value, runs in (("", False), ("anything-else", False),
                             ("0", False), ("off", False), ("no", False),
-                            ("OFF", False), ("False", False), ("NO", False)):
+                            ("OFF", False), ("False", False), ("NO", False),
+                            ("1", True), ("on", True), ("TRUE", True), ("Yes", True)):
             env = {k: v for k, v in os.environ.items() if k != "MEMHUB_HARNESS_EXTRACT"}
             env.update(CLAUDE_PLUGIN_ROOT=str(root), MEMHUB_HARNESS_EXTRACT=value)
             for command in commands:
@@ -752,7 +752,7 @@ def test_the_hook_command_runs_by_default_and_stops_on_every_off_spelling():
             assert got == (["stop"] if runs else []), (value, got)
             if ran.exists():
                 ran.unlink()
-    print("PASS test_the_hook_command_runs_by_default_and_stops_on_every_off_spelling")
+    print("PASS test_the_hook_command_starts_nothing_unless_the_flag_is_on")
 
 
 def test_the_sensor_never_sends_activate():

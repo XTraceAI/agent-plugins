@@ -2,7 +2,7 @@
   "mcpServers": {
     "memhub": {
       "type": "http",
-      "url": "https://api.memhub.xtrace.ai/mcp-server/mcp?memhub_plugin_version=0.74.0",
+      "url": "https://api.memhub.xtrace.ai/mcp-server/mcp?memhub_plugin_version=0.76.0",
       "auth": {
         "CLIENT_ID": "xHoQkYd7uNUfaNX6Tyv143e1Ev7u3XS0"
       },
