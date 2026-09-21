@@ -9,10 +9,12 @@ last_verified_at: null
 # Feature Spec: <Feature Name>
 
 > **How to use this template**
-> Fill out every section before any code is written. A section is complete when an
+> Adapt the applicable sections to this feature. A section is complete when an
 > engineer who has never seen this feature can implement it correctly from this
 > document alone — no Slack threads, no follow-up questions. Leave nothing as
-> "TBD" at implementation time. Delete this callout block when the spec is ready
+> an unstated assumption at implementation time. During bootstrap, record unknowns
+> as open decisions and label observations as such; do not invent answers.
+> Delete this callout block when the spec is ready
 > for review.
 >
 > Section numbering follows the convention used across docs/ (Overview, Background,
@@ -226,4 +228,4 @@ Bullet list of test files + what each covers. Reviewer should be able to read th
 
 ---
 
-> Before opening the PR: bump nothing. `last_verified_at` stays `null` on a new spec; it's set to the merge SHA once the feature ships and a maintainer has read the spec end-to-end against the merged code.
+> New or substantively revised specs are unverified. `last_verified_at` stays `null` on a new spec; it's set to the merge SHA once the feature ships and a maintainer has read the spec end-to-end against the merged code.
