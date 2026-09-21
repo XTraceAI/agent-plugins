@@ -221,9 +221,22 @@ for d in pending[:args.digest_top]:
 k = max(1, args.digest_batch); batches = [paths[i:i + k] for i in range(0, len(paths), k)]
 json.dump(batches, open(os.path.join(args.out, "digest_batches.json"), "w"), indent=1)
 print(f"digests: {len(paths)} to read in {len(batches)} batches ({args.out}/digest_batches.json) — {len(pending)} sessions with signal not yet faceted, {sum(1 for d in digests if _faceted(d))} already faceted in earlier runs (SKILL.md step 3)")
+# /insights facets answer to the same window as everything else. They carry no date of their own, so the only
+# honest test is whether their session is one this run read: an /insights facet from the spring would otherwise
+# put March's friction and standards into a report that says "the last 30 days". Under --all nothing was left
+# out of the corpus for age, so there is nothing to hold them to.
+_in_corpus = {s["id"] for s in corpus}
+def _facet_in_window(d):
+    if WINDOW_DAYS is None: return True
+    sid = str(d.get("session_id") or "")
+    return bool(sid) and (sid in _in_corpus or (len(sid) >= 8 and any(full.startswith(sid) for full in _in_corpus)))
+insights_skipped = 0
 for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):   # optional extra seed if Claude Code /insights was ever run
-    try: d = json.load(open(f)); d.setdefault("source", "insights"); facets.append(d)
-    except Exception: pass
+    try: d = json.load(open(f)); d.setdefault("source", "insights")
+    except Exception: continue
+    if _facet_in_window(d): facets.append(d)
+    else: insights_skipped += 1
+if insights_skipped: print(f"window: {insights_skipped} /insights facets left out — their sessions are outside the window (or no longer on disk)")
 _start_full = {s["id"]: s["start"] for s in corpus}
 def start_of_id(sid):
     """facets.json may carry short ids (the digests print 8/12-char prefixes); match by prefix."""

@@ -154,10 +154,32 @@ def scan(repo: Path) -> dict:
         "bun" if ("bun.lockb" in fset or "bun.lock" in fset) else "npm"
 
     test_rx, targeted, examples, slow_flags, slow_content = [], [], [], [], []
+    py_pytest = False
     if "python" in chains:
-        test_rx.append(r"(?:uv run |poetry run |python3? -m )?pytest")
-        targeted.append(r"\s\S*(?:tests?/|\.py\b|::)|\s-k\s|\s--lf\b|\s--last-failed\b")
-        examples.append("pytest")
+        # A pyproject.toml makes a repo Python; it does not make its runner pytest. An ordering
+        # gate is cleared only by a green run MATCHING its pattern, so a guessed `pytest` on a
+        # unittest or tox repo is a gate nobody can ever satisfy. Name the runner from evidence,
+        # and with none, leave the test rules out.
+        py_cfg = "".join(_read(repo / n) for n in ("pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini")
+                         if n in fset) + "".join(_read(repo / n) for n in fset if re.fullmatch(r"requirements[^/]*\.txt", n))
+        runners = []
+        if names["pytest.ini"] or names["conftest.py"] or re.search(r"\bpytest\b", py_cfg):
+            runners.append((r"(?:uv run |poetry run |python3? -m )?pytest", "pytest"))
+        if names["tox.ini"] or "[tool.tox" in py_cfg:
+            runners.append((r"(?:uv run |python3? -m )?tox\b", "tox"))
+        if names["noxfile.py"]:
+            runners.append((r"(?:uv run |python3? -m )?nox\b", "nox"))
+        if names["manage.py"] and not runners:
+            runners.append((r"python3? manage\.py test", "python manage.py test"))
+        if not runners:
+            test_files = [f for f in live if re.search(r"(^|/)test_[^/]+\.py$", f)][:20]
+            if any("unittest" in _read(repo / f, 4000) for f in test_files):
+                runners.append((r"python3? -m unittest", "python -m unittest"))
+        py_pytest = any(ex == "pytest" for _, ex in runners)
+        test_rx += [rx for rx, _ in runners]
+        if runners:
+            targeted.append(r"\s\S*(?:tests?/|\.py\b|::)|\s-k\s|\s--lf\b|\s--last-failed\b|\s-e\s+\S")
+            examples.append(runners[0][1])
         slow_content.append(r"time\.sleep\(|\b(?:requests|httpx)\.(?:get|post|put|delete|Client)\(")
     if "node" in chains:
         test_rx.append(r"(?:npm|pnpm|yarn|bun)(?: run)? test|(?:npx |pnpm exec )?(?:jest|vitest)")
@@ -175,10 +197,12 @@ def scan(repo: Path) -> dict:
     if "test" in make_targets:
         test_rx.append(r"make test")
     if chains:
-        found("toolchain", ", ".join(chains), value=chains)
-        slots["test_cmd_rx"] = _alt(test_rx)
-        slots["targeted_rx"] = "|".join(targeted)
-        slots["test_cmd_example"] = examples[0]
+        found("toolchain", ", ".join(chains) + ("" if test_rx else " — but no test runner it recognises, so the test rules are left out"),
+              value=chains, test_runner=examples[0] if examples else None)
+        if test_rx:                                 # no runner found → no slot → every rule that needs one is dropped
+            slots["test_cmd_rx"] = _alt(test_rx)
+            slots["targeted_rx"] = "|".join(targeted)
+            slots["test_cmd_example"] = examples[0]
         slots["src_ext_rx"] = r"\.(?:%s)$" % "|".join(e for c in chains for e in _SRC_EXT[c])
         if slow_content:
             slots["test_slow_content_rx"] = "|".join(slow_content)
@@ -193,7 +217,7 @@ def scan(repo: Path) -> dict:
     marks = re.findall(r"^\s*[\"']?([A-Za-z_]\w*)\s*[:\"']", block.group(1), re.M) if block else []
     slow = [m for m in dict.fromkeys(marks)
             if re.search(r"slow|behavio|e2e|integration|perf|load|live|network|smoke", m)]
-    if "python" in chains:
+    if py_pytest:                                   # --cov and -m are pytest's flags, not tox's or unittest's
         slow_flags.append(r"--cov\b")
         if slow:
             slow_flags.append(r"-m\s+[\"']?(?:%s)" % "|".join(map(re.escape, slow)))
@@ -205,8 +229,8 @@ def scan(repo: Path) -> dict:
         found("markers", ("markers: " + ", ".join(slow)) if slow else "no slow markers defined; coverage flags only",
               value=slow)
         slots["slow_flag_rx"] = "|".join(slow_flags)
-        slots["slow_example"] = {"python": "pytest --cov=app", "node": "%s test -- --coverage" % pm,
-                                 "go": "go test -race ./..."}[[c for c in chains if c != "rust"][0]]
+        slots["slow_example"] = "pytest --cov=app" if py_pytest else \
+            "%s test -- --coverage" % pm if "node" in chains else "go test -race ./..."
         slots["slow_words_rx"] = r"(?i:\b(?:%s)\b)" % "|".join(
             dict.fromkeys(slow + ["slow", "e2e", "coverage", "integration"]))
     else:

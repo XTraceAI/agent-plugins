@@ -209,6 +209,18 @@ def test_the_miner_reads_a_month_unless_asked_for_more() -> None:
         check("--days widens it", "0 older" in window("--days", "90"), window("--days", "90"))
         check("--all reads everything", "every session" in window("--all"), window("--all"))
         long_ago = time.strftime("%Y-%m-%d", time.localtime(time.time() - 60 * 86400))
+        # /insights facets carry no date: one whose session this run did not read is outside the window
+        fdir = Path(home) / ".claude" / "usage-data" / "facets"
+        fdir.mkdir(parents=True)
+        (fdir / "gone.json").write_text(json.dumps({"session_id": "0ld5e55i-0000-4000-8000-000000000000", "outcome": "not",
+                                                     "friction_counts": {"wrong_approach": 1}, "friction_detail": "from the spring"}))
+
+        def out(*flags):
+            return subprocess.run([sys.executable, str(miner), "--out", str(Path(home) / "o"), "--digest-top", "0", *flags],
+                                  capture_output=True, text=True, env=env, cwd=home, timeout=120).stdout
+        check("an /insights facet for a session outside the window is left out, and the report says so",
+              "1 /insights facets left out" in out() and "from the spring" not in out())
+        check("--all holds /insights facets to nothing, as before", "from the spring" in out("--all"))
         check("a baseline keeps 30 days of BEFORE without being asked",
               "last 90 days" in window("--baseline-date", long_ago), window("--baseline-date", long_ago))
 
@@ -262,6 +274,29 @@ def test_no_statement_promises_a_full_suite_the_engine_cannot_check() -> None:
     for r in CATALOG["rules"]:
         if r.get("ordering") and "test_cmd_rx" in json.dumps(r["ordering"].get("required_command_rx", "")):
             check(f"{r['id']}: does not claim a full suite ran", "full suite" not in r["statement"].lower(), r["statement"])
+
+
+def test_the_python_runner_is_named_from_evidence_never_assumed() -> None:
+    """An ordering gate is cleared only by a green run matching its pattern.
+    `pytest` guessed onto a tox or unittest repo is a gate nobody can satisfy."""
+    base = {"pyproject.toml": '[project]\nname = "lib"\n', "lib/a.py": "x = 1\n", "lib/b.py": "x = 1\n", "lib/c.py": "x = 1\n"}
+    cases = (("tox", {**base, "tox.ini": "[tox]\nenvlist = py312\n[testenv]\ncommands = python -m unittest\n"}, "tox", True),
+             ("unittest", {**base, "tests/test_a.py": "import unittest\nclass T(unittest.TestCase):\n    pass\n"}, "python -m unittest", True),
+             ("no runner at all", base, None, False))
+    for label, files, runner, has_rules in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make(files, Path(tmp) / "lib")
+            p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+            by_id = {c["id"]: c["body"] for c in cands}
+            check(f"{label}: exit 0 and everything seeded verifies", p.returncode == 0 and all(r["ok"] for r in rows), p.stdout[-300:])
+            check(f"{label}: the scan names the runner it found", signals["signals"]["toolchain"].get("test_runner") == runner)
+            check(f"{label}: the push gate {'exists' if has_rules else 'is left out'}", ("suite-before-push" in by_id) == has_rules)
+            if has_rules:
+                rx = by_id["suite-before-push"]["ordering"]["required_command_rx"]
+                check(f"{label}: the gate is cleared by the repo's own runner", bool(re.search(rx, runner)), rx)
+                check(f"{label}: and not by a pytest the repo does not have", not re.search(rx, "pytest"), rx)
+            check(f"{label}: no pytest-only flag leaks into a non-pytest repo",
+                  "--cov" not in json.dumps(by_id.get("slow-only-asked", {})))
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:
