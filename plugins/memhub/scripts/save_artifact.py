@@ -281,6 +281,12 @@ async def main() -> int:
                     room = None
             if room:
                 call_args["agent_brain_id"] = room["brain_id"]
+                # The org that OWNS the room. A brain resolves inside exactly
+                # one org, so its id without the org fails with "Agent brain
+                # not found" whenever the room is outside the caller's default
+                # org — the same reason the capture flushes send it.
+                if room.get("org_id"):
+                    call_args["org_id"] = room["org_id"]
             if call_args.get("agent_brain_id"):
                 origin = f' (repo room "{room.get("name", "?")}")' if room else ""
                 print(f"brain    : {call_args['agent_brain_id']}{origin}")

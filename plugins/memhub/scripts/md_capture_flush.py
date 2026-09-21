@@ -345,6 +345,11 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                                 await resolve_repo_brain(s, p.parent, env)
                         if room:
                             call_args["agent_brain_id"] = room["brain_id"]
+                            # The room's org rides along, as in the capture
+                            # flushes: a brain id alone resolves only inside
+                            # the caller's default org.
+                            if room.get("org_id"):
+                                call_args["org_id"] = room["org_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
                     except mcp_http.PluginUpgradeRequired as e:
                         _log(str(e))

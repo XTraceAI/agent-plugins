@@ -376,11 +376,15 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   access key the background hooks use, distinct from `/mcp`'s connector
   login. `--status` reports without opening a browser; `--force` discards the
   cached credential and redoes the browser flow.
-- `/memhub:onboard [session-id-or-path]` — crosses the empty-brain cold
-  start for a repo: resolves or creates its agent brain, caches the room so
-  automatic capture routes there, seeds it from one real session, and proves
-  proactive directive recall on the repo's own symbols before reporting an
-  activation funnel.
+- `/memhub:onboard [folder-or-file ...]` — connects a repo: resolves or
+  creates its agent brain, caches the room so automatic capture routes there,
+  scans the repo for its own markdown documents wherever it keeps them (no
+  directory layout assumed — `scripts/onboard_docs.py`), saves the ones that
+  look important to the brain as artifacts without asking (arguments override
+  the choice), shows the brain's
+  Index, and ends with an optional hint that `/memhub:start-rulebook` creates
+  the team's rulebook. It imports no session: sessions are captured
+  automatically from the next turn.
 - `/memhub:import-session <id-or-path> [title]` — terminal upload of a past
   session transcript; auto-chunks very large sessions. The ONLY skill that
   imports: live sessions are captured per turn, so importing is for backfill —

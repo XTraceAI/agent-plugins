@@ -391,6 +391,14 @@ with tempfile.TemporaryDirectory() as td:
         f.read_room = lambda *a, **k: {"brain_id": "B-CACHED", "name": "Repo: x/y"}
         asyncio.run(f.flush(sid7))
         check(resolved == [] and seen_args[-1].get("agent_brain_id") == "B-CACHED", "cache hit → no server resolution, cached brain used")
+        check("org_id" not in seen_args[-1], "a room with no org recorded sends none")
+        # a room outside the default org carries its org with the brain id
+        resolved.clear(); seen_args.clear()
+        r7.write_text("# R7\n" + "z" * 7000, encoding="utf-8")
+        mc.save_state(sid7, {"dirty": [str(r7)], "saved": {}, "attempts": {}})
+        f.read_room = lambda *a, **k: {"brain_id": "B-CACHED", "name": "Repo: x/y", "org_id": "ORG-2"}
+        asyncio.run(f.flush(sid7))
+        check(seen_args and seen_args[-1].get("org_id") == "ORG-2", "the room's org_id is sent with its brain id")
 
         # Git specs have one authored source; auto-capture must not publish another.
         sid8 = "sess-md-flush-linked"
