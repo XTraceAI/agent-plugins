@@ -46,6 +46,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 FLAG = "MEMHUB_HARNESS_EXTRACT"
+CHILD_FLAG = "MEMHUB_HARNESS_CHILD"   # set by harness_stop.run_author
 _ON = ("1", "on", "true", "yes")
 _OFF = ("0", "off", "false", "no")
 
@@ -72,6 +73,13 @@ def extract_enabled(environ=None) -> bool:
     and not one this function should relitigate — but it is why the off switch
     has to keep working for every spelling someone reaches for."""
     env = os.environ if environ is None else environ
+    if str(env.get(CHILD_FLAG, "")).strip().lower() not in ("",) + _OFF:
+        # An authoring child is never sensed, whatever FLAG says. `run_author`
+        # sets FLAG=0 for it, but Claude Code applies a settings.json `env`
+        # OVER the environment a process inherits. So an install that opted in
+        # with FLAG=1 there re-armed the lane in every child. The child's own
+        # turns were classified and drained, and one fork spawned the next.
+        return False
     return str(env.get(FLAG, "")).strip().lower() not in _OFF
 
 

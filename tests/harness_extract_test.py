@@ -299,6 +299,20 @@ def test_the_flag_is_on_by_default_and_every_off_spelling_works():
     print("PASS test_the_flag_is_on_by_default_and_every_off_spelling_works")
 
 
+def test_an_authoring_child_is_never_sensed_whatever_the_flag_says():
+    """`run_author` sets EXTRACT=0 for its child, but Claude Code applies a
+    settings.json `env` over what a process inherits. So an install that opted
+    in with EXTRACT=1 there re-armed the sensor in every child, and forks
+    spawned forks. The child flag is the switch that setting cannot reach."""
+    for flag in ("1", "true", "yes"):
+        for extract in ("", "1", "on"):
+            env = {"MEMHUB_HARNESS_CHILD": flag, "MEMHUB_HARNESS_EXTRACT": extract}
+            assert not hx.extract_enabled(env), env
+    for flag in ("", "0", "off"):
+        assert hx.extract_enabled({"MEMHUB_HARNESS_CHILD": flag, "MEMHUB_HARNESS_EXTRACT": "1"}), flag
+    print("PASS test_an_authoring_child_is_never_sensed_whatever_the_flag_says")
+
+
 def test_spawn_detaches_and_returns():
     seen = {}
     real = hx.subprocess.Popen

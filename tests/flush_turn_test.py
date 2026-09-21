@@ -451,6 +451,40 @@ def test_pr_url_queue_survives_auth_failure_and_clears_on_ack():
             ft._log = originals["log"]
 
 
+def test_a_harness_child_is_never_captured():
+    """The harness's authoring pass is `claude -p --resume <owner>
+    --fork-session`: a NEW session id whose transcript copies the person's whole
+    history. Captured, it landed on staging as another conversation under the
+    same title, once per pass (80 copies of one session). The same payload
+    without the flag must reach the flush, or this proves nothing."""
+    print("harness child is never captured")
+    calls = []
+
+    async def fake_flush(session_id, transcript_path):
+        calls.append(session_id)
+
+    class FakeIn:
+        def read(self):
+            return json.dumps({"session_id": "fork-1", "transcript_path": __file__})
+
+    real_flush, real_state, stdin = ft._flush, ft.STATE_DIR, sys.stdin
+    saved = os.environ.pop("MEMHUB_HARNESS_CHILD", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            ft._flush, ft.STATE_DIR = fake_flush, Path(tmp)
+            for flag, want in (("1", []), ("", ["fork-1"])):
+                calls.clear()
+                os.environ["MEMHUB_HARNESS_CHILD"] = flag
+                sys.stdin = FakeIn()
+                check(f"CHILD={flag!r} exits 0", ft.main(), 0)
+                check(f"CHILD={flag!r} flushed", calls, want)
+    finally:
+        ft._flush, ft.STATE_DIR, sys.stdin = real_flush, real_state, stdin
+        os.environ.pop("MEMHUB_HARNESS_CHILD", None)
+        if saved is not None:
+            os.environ["MEMHUB_HARNESS_CHILD"] = saved
+
+
 def test_timeout_override_never_breaks_the_hook():
     """The override is parsed at CALL time and floors at the default. Parsing it
     at import meant a bad value crashed the module before the handler that keeps

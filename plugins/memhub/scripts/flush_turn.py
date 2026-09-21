@@ -72,6 +72,7 @@ import transcript_chunks  # noqa: E402
 from transcript_filter import (  # noqa: E402
     elide_oversized_tool_results,
     is_command_wrapper,
+    is_harness_child,
 )
 
 # All at module scope now. These used to be deferred into :func:`_flush`
@@ -1075,6 +1076,8 @@ class _NoCredential(RuntimeError):
 
 
 def main() -> int:
+    if is_harness_child():
+        return 0  # the harness's forked copy of a session; see is_harness_child
     lock_fd: int | None = None
     # Bound BEFORE the try so the handler can always write a breadcrumb. Reading
     # stdin or parsing it is itself a failure path, and a NameError raised from

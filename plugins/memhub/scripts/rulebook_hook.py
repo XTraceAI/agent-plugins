@@ -3375,6 +3375,8 @@ def harness_extract_on(environ=None):
     """Default ON, matching `harness_extract.extract_enabled` — the two gates
     are one switch and must not disagree about what it says."""
     env = os.environ if environ is None else environ
+    if str(env.get("MEMHUB_HARNESS_CHILD", "")).strip().lower() not in ("", "0", "off", "false", "no"):
+        return False          # an authoring child is never sensed (see extract_enabled)
     return str(env.get(HARNESS_FLAG, "")).strip().lower() not in ("0", "off", "false", "no")
 
 
