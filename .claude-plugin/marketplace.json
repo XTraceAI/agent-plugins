@@ -12,8 +12,8 @@
         "source": "git-subdir",
         "url": "https://github.com/XTraceAI/agent-plugins.git",
         "path": "plugins/memhub",
-        "ref": "memhub--v0.62.0",
-        "sha": "f06be52d985aea8e55b74422f15aba9e367f1094"
+        "ref": "memhub--v0.74.0",
+        "sha": "6b36dd982c9cb51d1f7bd7e0e12759fb8f21c0c7"
       },
       "description": "Team memory for coding agents: sessions capture into a shared agent brain, your team's rules and past lessons surface in the agent as it works and every rule that fires is disclosed on its own line, and the sessions behind a pull request are linked to it once a human confirms them."
     }
