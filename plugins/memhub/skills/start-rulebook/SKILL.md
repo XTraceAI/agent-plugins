@@ -134,10 +134,22 @@ person can be in several. Call `list_rulebooks` (rows carry `rulebook_id`,
 `--rulebook` by id then by name; with it omitted, one visible book is the
 destination and several means **ask** (AskUserQuestion, one option per book
 labelled with who it binds) rather than guess. No books at all → offer
-`create_rulebook(name: "<repo> rules", scope: "explicit")`, which binds only
-the user, and create it only on a yes; never pass `scope: "all_org"` or name
-another member — both are org-admin acts. Every proposal you show the user
-names the book it would land in, because that is who the rule would reach.
+`create_rulebook(name: "Rulebook: <repo>", scope: "explicit")` — the repo's
+own book, named exactly as `/memhub:create-rule` names it so the two skills
+land in the SAME book instead of making one each — which binds only the user,
+and create it only on a yes; never pass `scope: "all_org"` or name another
+member — both are org-admin acts. Every proposal you show the user names the
+book it would land in, because that is who the rule would reach.
+
+**Read `member_count` off the create reply before filing anything into a new
+book.** `create_rulebook` seeds an `explicit` book with its creator — *unless
+the creator is an organisation admin*, who is seeded only by naming themselves
+in `member_user_ids`. The person setting MemHub up for a new team is very
+often that admin. Taking the default, they get a book that binds NOBODY: sixty
+rules file, every reply says success, and not one reaches a session. So pass
+the user's own id in `member_user_ids` when you know it, and either way treat
+`member_count: 0` as a FAILURE — stop, say the book exists but binds nobody
+and needs a member added in MemHub, and file nothing until it has one.
 If the server has no `list_rulebooks`, it predates rulebook containers: file
 with no `rulebook_id` and carry on. Never pass `agent_brain_id` to
 `create_rule` — the parameter no longer exists and the call fails outright.

@@ -243,6 +243,9 @@ def test_the_skill_asks_before_it_reads_and_warns_before_it_waits() -> None:
     check("says the mined path takes time, and why", "going through your" in skill[ask:first_run] and "10–20" in skill[ask:first_run])
     check("says nothing turns on by itself", "nothing\nI file turns on by itself" in skill[ask:first_run] or "turns on by itself" in skill[ask:first_run])
     check("--all is only ever the person's ask", "only when they ask for all of" in skill)
+    check("a new book is the repo's own, named as create-rule names it, so both skills share one",
+          'create_rulebook(name: "Rulebook: <repo>"' in skill)
+    check("a book that binds nobody is a failure, not a success", "member_count: 0` as a FAILURE" in skill)
 
 
 def test_an_unknown_default_branch_drops_the_push_rules_instead_of_guessing() -> None:
