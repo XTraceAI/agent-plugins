@@ -260,7 +260,7 @@ json.dump(bodies, open(out + "/starter-bodies.json", "w"))
 PY
 # Starter only: its own quick replay. Both: add this --candidates to the step-4 run instead.
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" \
-  --out "$OUT/mine" --candidates "$OUT/starter-bodies.json" --repo "<repo>" --digest-top 0
+  --out "$OUT/mine" --candidates "$OUT/starter-bodies.json" --repo "<repo>" --digest-top 0   # + --days N / --all if they asked
 ```
 
 Three things to know before reading a number off that replay:
@@ -338,11 +338,21 @@ answer: rules it used to carry, and the replay evidence that removed each.
 
 ```bash
 git rev-parse --show-toplevel; git rev-parse --short HEAD     # provenance for the CLAUDE.md rows
+# The SELECTION — which sessions this run is about. Set it once; every miner call below takes it.
+SEL=(--repo "<name>")                      # add as they apply:  --days N | --all    --baseline-date YYYY-MM-DD
 # save list_skills (all statuses) to skills.json for skill dedup, then:
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out \
-  --skills-file skills.json --claude-md ./CLAUDE.md [--claude-md <workspace>/CLAUDE.md] \
-  [--repo <name>] [--baseline-date YYYY-MM-DD]
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out "${SEL[@]}" \
+  --skills-file skills.json --claude-md ./CLAUDE.md [--claude-md <workspace>/CLAUDE.md]
 ```
+
+**Every miner invocation in this run carries the same `"${SEL[@]}"`** — this
+one, the S1 starter replay, and the step-4 second pass. They are not
+defaults to re-derive: drop `--repo` from the second pass and it rebuilds the
+report from every repo on the machine; drop `--days` / `--all` and the session
+counts change under a user who already read digests from the other corpus;
+drop `--baseline-date` and "did friction shrink?" silently disappears. If the
+two passes print different `sessions read` / `window:` lines, stop — the
+selection drifted, and the table would not be about the sessions they reviewed.
 
 No `--days` means the last 30 days; add `--days N` or `--all` only per step
 0. Repeat the report's `window:` line to the user.
@@ -455,9 +465,9 @@ origin. Add the checkable ones to the same candidates list.
 ## 4. Second pass — everything replayed, one report
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out "${SEL[@]}" \
   --candidates mine-out/candidates.json --facets mine-out/facets \
-  --skills-file skills.json --claude-md ./CLAUDE.md
+  --skills-file skills.json --claude-md ./CLAUDE.md          # the SAME selection as step 1
 # they chose Both → one replay for everything: add  --candidates "$OUT/starter-bodies.json"
 ```
 

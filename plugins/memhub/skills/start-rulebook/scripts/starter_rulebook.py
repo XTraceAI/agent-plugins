@@ -290,15 +290,21 @@ def scan(repo: Path) -> dict:
         slots["install_cmd_rx"] = _alt([installs[c] for c in chains])
         slots["install_example"] = {"python": "pip install -r requirements.txt", "node": "%s install" % pm,
                                     "go": "go mod download", "rust": "cargo fetch"}.get(chains[0] if chains else "", "")
-        lock_tool = [(n, rx, ex) for n, rx, ex in (
-            ("uv.lock", r"uv lock", "uv lock"), ("poetry.lock", r"poetry lock", "poetry lock"),
-            ("package-lock.json", r"npm install", "npm install"), ("pnpm-lock.yaml", r"pnpm install", "pnpm install"),
-            ("yarn.lock", r"yarn(?: install)?\b", "yarn install"), ("go.sum", r"go mod tidy", "go mod tidy"),
-            ("Cargo.lock", r"cargo (?:update|generate-lockfile|build|check)", "cargo update")) if names[n]]
-        if lock_tool:
-            slots["lock_cmd_rx"] = _alt([t[1] for t in lock_tool])
-            slots["lock_cmd_example"] = lock_tool[0][2]
-            slots["manifest_example"] = mans[0] if mans else reqs[0]
+        # One (manifest, lockfile, tool) record each — never one shared receipt. In a polyglot repo a single
+        # rule over every lock tool lets `pnpm install` clear the obligation an edit to pyproject.toml armed,
+        # and the push goes out with uv.lock stale. The rule is seeded once per pair (`for_each`).
+        pairs = [{"lock_key": key, "lock_name": lock, "lock_manifest": man, "lock_cmd_rx": rx, "lock_cmd_example": ex}
+                 for key, lock, man, rx, ex in (
+                     ("uv", "uv.lock", "pyproject.toml", r"uv lock\b", "uv lock"),
+                     ("poetry", "poetry.lock", "pyproject.toml", r"poetry lock\b", "poetry lock"),
+                     ("npm", "package-lock.json", "package.json", r"npm (?:install|i)\b", "npm install"),
+                     ("pnpm", "pnpm-lock.yaml", "package.json", r"pnpm (?:install|i)\b", "pnpm install"),
+                     ("yarn", "yarn.lock", "package.json", r"yarn(?: install)?(?:\s|$)", "yarn install"),
+                     ("go", "go.sum", "go.mod", r"go mod tidy\b", "go mod tidy"),
+                     ("cargo", "Cargo.lock", "Cargo.toml", r"cargo (?:update|generate-lockfile|build|check)\b", "cargo update"))
+                 if names[lock] and names[man]]
+        if pairs:
+            slots["lock_pairs"] = pairs
     else:
         missing("manifests", "no dependency manifest found")
 
@@ -527,7 +533,7 @@ _SLOT_WORDS = {"test_cmd_rx": "recognised test command", "lint_cmd_rx": "linter 
                "devserver_rx": "dev server", "docker": "Dockerfile or compose file",
                "infra": "Terraform, Kubernetes or AWS usage",
                "heavy_anchors": "uniquely-named source file over 1,000 lines",
-               "lock_cmd_rx": "lockfile", "manifest_paths": "dependency manifest",
+               "lock_cmd_rx": "lockfile", "lock_pairs": "lockfile beside its manifest", "manifest_paths": "dependency manifest",
                "manifest_rx": "dependency manifest", "install_cmd_rx": "dependency manifest",
                "slow_flag_rx": "slow or coverage test tier", "test_path_rx": "test directory",
                "src_diff_rx": "clear source root", "tests_diff_rx": "test directory",
@@ -545,6 +551,13 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
                             "reason": "this repo has no %s" % " / ".join(
                                 dict.fromkeys(_SLOT_WORDS.get(n, n) for n in need))})
             continue
+        if rule.get("for_each"):                   # one candidate per record, each with its own slots
+            for item in slots[rule["for_each"]]:
+                one = seed({"slots": {**slots, **item, rule["for_each"]: None}},
+                           {"version": catalog["version"], "rules": [{k: v for k, v in rule.items() if k != "for_each"
+                                                                      and not (k == "requires")}]}, scope_repo)
+                out += one[0]; dropped += one[1]
+            continue
         try:
             filled = _fill({k: rule[k] for k in rule if k not in ("requires",)}, slots)
         except MissingSlot as exc:
@@ -560,8 +573,8 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
             body.pop("mode", None)                  # the server refuses a mode on notes and anchors
         body["scope_repos"] = [slots["repo"]] if scope_repo else []
         body["source"] = "authored"
-        body["source_ref"] = "starter-rulebook@%s#%s" % (catalog["version"], rule["id"])
-        out.append({"id": rule["id"], "category": rule["category"], "designed_mode": rule.get("mode"),
+        body["source_ref"] = "starter-rulebook@%s#%s" % (catalog["version"], filled["id"])
+        out.append({"id": filled["id"], "category": rule["category"], "designed_mode": rule.get("mode"),
                     "seeded_from": rule.get("seeded_from"), "evidence": rule.get("evidence"),
                     "cases": filled.get("cases") or {}, "body": body})
     return out, dropped

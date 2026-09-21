@@ -80,11 +80,29 @@ _cutoff = None if WINDOW_DAYS is None else time.time() - WINDOW_DAYS * 86400
 skipped_old = 0
 
 # ---------------------------------------------------------------- corpus
+def _last_activity(p):
+    """When a transcript was last written to. For a Cursor `store.db` the main file's mtime is NOT that: SQLite
+    keeps recent writes in `store.db-wal` until a checkpoint, and Cursor records the session's own recency in the
+    sibling `meta.json` (`updatedAtMs` — the value the Cursor reader itself treats as the session's age). Take the
+    newest of all of them, so a session worked in today is never dropped for the age of its main database file."""
+    stamps = []
+    for q in (p, p + "-wal", p + "-shm"):
+        try: stamps.append(os.path.getmtime(q))
+        except OSError: pass
+    if os.path.basename(p) == "store.db":
+        meta = os.path.join(os.path.dirname(p), "meta.json")
+        try:
+            stamps.append(os.path.getmtime(meta))
+            ms = json.load(open(meta)).get("updatedAtMs")
+            if isinstance(ms, (int, float)): stamps.append(ms / 1000.0)
+        except (OSError, ValueError, AttributeError): pass
+    return max(stamps) if stamps else None
 def _in_window(p):
     global skipped_old
     if _cutoff is None: return True
-    try: fresh = os.path.getmtime(p) >= _cutoff
-    except OSError: return True
+    seen = _last_activity(p)
+    if seen is None: return True           # unreadable: let the reader decide, never drop it silently
+    fresh = seen >= _cutoff
     skipped_old += not fresh
     return fresh
 def sessions():

@@ -1,6 +1,6 @@
 {
  "version": "2026-09-20",
- "about": "The starter rulebook: universal coding-agent rules whose repo-specific parts are {{slots}} filled by starter_rulebook.py from a scan of the checkout. `requires` names the slots a rule cannot exist without; a rule whose slot is missing is dropped, never filed with a guess. `cases` are run through the live hook's engine after seeding. Patterns match at command position ({{CMD}} / {{GIT}}), never `^`; paths match `(?:^|/)dir/` because the hook sees absolute paths; no quantified group contains + * or | because the hook's load lint drops those. `same_as` names the session miner's built-in hypothesis (mine_sessions.py) that covers the same ground under a different title and pattern: the deterministic conflict check cannot see those, so both skills read this list.",
+ "about": "The starter rulebook: universal coding-agent rules whose repo-specific parts are {{slots}} filled by starter_rulebook.py from a scan of the checkout. `requires` names the slots a rule cannot exist without; a rule whose slot is missing is dropped, never filed with a guess. `cases` are run through the live hook's engine after seeding. Patterns match at command position ({{CMD}} / {{GIT}}), never `^`; paths match `(?:^|/)dir/` because the hook sees absolute paths; no quantified group contains + * or | because the hook's load lint drops those. `same_as` names the session miner's built-in hypothesis (mine_sessions.py) that covers the same ground under a different title and pattern: the deterministic conflict check cannot see those, so both skills read this list. Rules with `given.user` share one limit: `said_rx` / `not_said_rx` see every user turn of the session, unordered, so they cannot tell an approval that came before a request from one that came after. Every such rule is written to fail OPEN on that ambiguity (stay silent), never to block.",
  "categories": [
   {
    "id": "budget",
@@ -1357,7 +1357,7 @@
    "why": "the structural fix is dev/prod separation; this is the tripwire until then.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}kubectl\\b[^|;&]*--context[= ]\\S*prod|--profile[= ]\\S*prod|{{CMD}}terraform\\s+(?:apply|destroy)\\b|{{CMD}}fly(?:ctl)?\\s+deploy\\b|{{CMD}}vercel\\b[^|;&]*--prod\\b{{prod_workflow_alt}}",
+    "command_rx": "{{CMD}}kubectl\\b[^|;&]*--context[= ]\\S*prod|{{CMD}}aws\\b[^|;&]*--profile[= ]\\S*prod|{{CMD}}terraform\\s+(?:apply|destroy)\\b|{{CMD}}fly(?:ctl)?\\s+deploy\\b|{{CMD}}vercel\\b[^|;&]*--prod\\b{{prod_workflow_alt}}",
     "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b[^|;&]*$"
    },
    "seeded_from": "CI workflows: the deploy and release workflow names",
@@ -1369,7 +1369,9 @@
     ],
     "silent": [
      "kubectl --context=dev get pods",
-     "terraform plan"
+     "terraform plan",
+     "python train.py --profile production",
+     "py-spy record --profile prod-like -- python app.py"
     ]
    }
   },
@@ -1793,36 +1795,39 @@
    }
   },
   {
-   "id": "lockfile-drift",
+   "id": "lockfile-drift-{{lock_key}}",
    "category": "hygiene",
-   "title": "Regenerate the lockfile after a manifest edit",
+   "title": "Regenerate {{lock_name}} after a manifest edit",
    "mode": "gate",
    "delivery": "agent_hook",
    "requires": [
-    "lock_cmd_rx",
-    "manifest_paths"
+    "lock_pairs"
    ],
-   "statement": "The manifest changed. Regenerate the lockfile with the repo's tool before push; never edit it by hand.",
-   "why": "CI will reject a stale lock.",
+   "statement": "`{{lock_manifest}}` changed. Regenerate `{{lock_name}}` with `{{lock_cmd_example}}` before push; never edit it by hand.",
+   "why": "CI will reject a stale lock. One rule per manifest and its own lock tool, so another ecosystem's install cannot clear this one.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{lock_cmd_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
     "armed_by_events": [
      "edit"
     ],
-    "display_name": "lockfile after manifest"
+    "display_name": "{{lock_name}} after {{lock_manifest}}"
    },
-   "scope_paths": "{{manifest_paths}}",
-   "seeded_from": "manifests: the lock tool present, scoped to the manifest paths",
+   "scope_paths": [
+    "{{lock_manifest}}"
+   ],
+   "seeded_from": "manifests: each lockfile found beside its manifest, paired with its own tool",
    "cases": {
     "fires": [
-     "edit:{{manifest_example}} >> gate:git push"
+     "edit:{{lock_manifest}} >> gate:git push",
+     "edit:{{lock_manifest}} >> ok:some-other-tool install >> gate:git push"
     ],
     "silent": [
-     "edit:{{manifest_example}} >> ok:{{lock_cmd_example}} >> gate:git push",
+     "edit:{{lock_manifest}} >> ok:{{lock_cmd_example}} >> gate:git push",
      "edit:src/a.py >> gate:git push"
     ]
-   }
+   },
+   "for_each": "lock_pairs"
   },
   {
    "id": "migration-handwritten",
@@ -2063,7 +2068,7 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "The person asked for a plan. No edits until they say go.",
-   "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident.",
+   "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident. Known gap: the hook reads everything typed this session with no order, so an approval given EARLIER ('go ahead' on a previous task) also silences a later plan-only request. It fails open — it can miss, it cannot block work that was approved.",
    "matcher": {
     "event": "edit",
     "path_rx": ".",
@@ -2403,6 +2408,10 @@
   {
    "what": "Team conventions written in CLAUDE.md / AGENTS.md",
    "instead": "Choose \"Rules from my own work\" (or \"Both\") in this skill: it imports them with a source_ref per sentence and replays them over real sessions."
+  },
+  {
+   "what": "\"The latest thing I said wins\" (a new plan-only request after an earlier go-ahead)",
+   "instead": "The hook's user predicates are unordered over the session, so this cannot be a pattern today. It needs a turn-scoped predicate in the hook; until then start a new session for the new plan, or say it through /memhub:create-rule as a prompt-armed ordering."
   }
  ],
  "cut": [

@@ -115,7 +115,7 @@ def test_a_python_service_seeds_every_rule_and_all_of_them_verify() -> None:
         check("repo name comes from the remote, not the directory", signals["repo"] == "svc")
         check("default branch comes from origin/HEAD", signals["slots"]["default_branch_rx"] == "^(trunk)$")
         by_id = {c["id"]: c["body"] for c in cands}
-        for rid in ("push-main", "migration-heads", "lockfile-drift", "suite-before-push", "anchor-heavy",
+        for rid in ("push-main", "migration-heads", "lockfile-drift-uv", "suite-before-push", "anchor-heavy",
                     "docker-destructive", "slow-only-asked", "no-dev-server"):
             check(f"seeds {rid}", rid in by_id)
         check("the slow tier is the repo's own marker, and only the slow one",
@@ -146,7 +146,7 @@ def test_a_node_repo_gets_node_commands_and_no_python_rules() -> None:
         gone = {d["id"] for d in dropped}
         check("the test command is the package manager's", "pnpm" in by_id["suite-before-push"]["ordering"]["required_command_rx"])
         check("lint prefers the repo's own entrypoint", "run lint" in by_id["lint-before-push"]["ordering"]["required_command_rx"])
-        check("the lock tool is pnpm", "pnpm install" in by_id["lockfile-drift"]["ordering"]["required_command_rx"])
+        check("the lock tool is pnpm", bool(re.search(by_id["lockfile-drift-pnpm"]["ordering"]["required_command_rx"], "pnpm install")))
         check("migration rules are dropped", {"migration-heads", "migration-handwritten", "anchor-migrations"} <= gone)
         check("the infra pack arrives with Terraform", "infra-destroy" in by_id)
         check("a dropped rule says why in the client's words",
@@ -342,6 +342,57 @@ def test_every_mix_of_toolchains_scans_seeds_and_verifies() -> None:
             if "slow_example" in slots and not re.search(slots["test_cmd_rx"], slots["slow_example"]):
                 bad.append(f"{label}: slow example {slots['slow_example']!r} is from a runner this repo does not have")
     check("all 80 toolchain mixes scan, seed and verify", not bad, " | ".join(bad[:6]))
+
+
+def test_a_polyglot_repo_gets_one_lockfile_rule_per_ecosystem() -> None:
+    """One shared rule over every lock tool lets `pnpm install` clear the
+    obligation an edit to pyproject.toml armed, and uv.lock ships stale."""
+    files = {**PYTHON_REPO, "package.json": NODE_REPO["package.json"], "pnpm-lock.yaml": NODE_REPO["pnpm-lock.yaml"]}
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(files, Path(tmp) / "poly")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        by_id = {c["id"]: c["body"] for c in cands}
+        check("exit 0 and everything verifies", p.returncode == 0 and all(r["ok"] for r in rows), p.stdout[-400:])
+        check("one rule per pair", {"lockfile-drift-uv", "lockfile-drift-pnpm"} <= set(by_id))
+        uv, pnpm = by_id["lockfile-drift-uv"], by_id["lockfile-drift-pnpm"]
+        check("each is scoped to its own manifest", uv["scope_paths"] == ["pyproject.toml"] and pnpm["scope_paths"] == ["package.json"])
+        check("uv.lock's rule is cleared by uv lock", bool(re.search(uv["ordering"]["required_command_rx"], "uv lock")))
+        check("and NOT by another ecosystem's install", not re.search(uv["ordering"]["required_command_rx"], "pnpm install"))
+        check("titles differ (the server's re-import identity includes the title)", uv["title"] != pnpm["title"])
+        check("source_refs differ", uv["source_ref"] != pnpm["source_ref"])
+
+
+def test_the_skill_passes_one_session_selection_to_every_miner_call() -> None:
+    """A second pass without --repo / --days / --baseline-date rebuilds the
+    report from a different corpus than the digests the user already read."""
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    calls = re.findall(r"mine_sessions\.py\"[^`]*?(?=\n```|\n#|\npython3)", skill, re.S)
+    mining = [c for c in calls if "--skills-file" in c]
+    check("found the first and second pass", len(mining) == 2, str(len(mining)))
+    check("both carry the same selection", all('"${SEL[@]}"' in c for c in mining))
+    check("and the skill says why", "selection drifted" in skill)
+
+
+def test_a_cursor_session_is_aged_by_its_activity_not_its_main_db_file() -> None:
+    """SQLite keeps recent writes in store.db-wal, and Cursor records recency in
+    meta.json: a session worked in today can have a months-old store.db."""
+    import time
+    miner = SKILL / "scripts" / "mine_sessions.py"
+    with tempfile.TemporaryDirectory() as home:
+        chat = Path(home) / ".cursor" / "chats" / "ws" / "c1"
+        chat.mkdir(parents=True)
+        old = time.time() - 80 * 86400
+        (chat / "store.db").write_text(""); os.utime(chat / "store.db", (old, old))
+        (chat / "meta.json").write_text(json.dumps({"updatedAtMs": int(time.time() * 1000)})); os.utime(chat / "meta.json", (old, old))
+        stale = Path(home) / ".cursor" / "chats" / "ws" / "c2"
+        stale.mkdir(parents=True)
+        (stale / "store.db").write_text(""); os.utime(stale / "store.db", (old, old))
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS")}
+        env.update(HOME=home, USERPROFILE=home)
+        out = subprocess.run([sys.executable, str(miner), "--out", str(Path(home) / "o"), "--digest-top", "0"],
+                             capture_output=True, text=True, env=env, cwd=home, timeout=120).stdout
+        line = next((l for l in out.splitlines() if l.startswith("window:")), out[-300:])
+        check("the live session is kept and only the truly stale one is skipped", "— 1 older" in line, line)
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:
