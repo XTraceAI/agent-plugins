@@ -1303,6 +1303,44 @@ def main() -> int:
         check("ordering: one state file per worktree, atomic (no temp leftovers)",
               len(statefiles) == 1 and not any(n.startswith(".wt-") for n in os.listdir(os.path.join(td, "state"))))
 
+        # --- ordering + path scope: only an in-scope edit arms -----------------
+        # The matcher lane honoured scope_paths; the ordering lane fed every
+        # edit to the engine, so "one alembic head before push" armed on a
+        # README edit and blocked the push of a branch with no migration in it.
+        seed_book(td, "scoperepo", [
+                {"id": "heads-before-push", "on": "ordering", "repo_scope": "any",
+                 "_scope_paths": ["alembic/versions/*"],
+                 "ordering": {"required_command_rx": r"alembic heads", "gated_command_rx": r"git\s+push",
+                              "armed_by_events": ["edit"], "display_name": "one head"},
+                 "text": "Check heads before push", "why": "w"},
+                {"id": "tests-before-push-src", "on": "ordering", "repo_scope": "any",
+                 "_scope_exclude_paths": ["*.md", "docs/*"],
+                 "ordering": {"required_command_rx": r"pytest", "gated_command_rx": r"git\s+push",
+                              "armed_by_events": ["edit"], "display_name": "tests"},
+                 "text": "Run tests before push", "why": "w"}])
+        sw = os.path.join(td, "scoperepo")
+        os.makedirs(os.path.join(sw, ".git"))
+        with open(os.path.join(sw, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/feat\n")
+
+        def s_edit(rel):
+            return {"cwd": sw, "session_id": "sc1", "tool_name": "Edit",
+                    "tool_input": {"file_path": os.path.join(sw, rel)}}
+        s_push = {"cwd": sw, "session_id": "sc1", "tool_name": "Bash",
+                  "tool_input": {"command": "git push -u origin feat"}}
+        run("post", s_edit("README.md"), oenv)
+        rc, out = run("pre", s_push, oenv)
+        check("ordering scope: an edit outside scope_paths / inside scope_exclude_paths arms nothing",
+              out.strip() == "", ctx(out))
+        run("post", s_edit("app/models.py"), oenv)
+        rc, out = run("pre", s_push, oenv)
+        check("ordering scope: a source edit arms the exclude-scoped rule and not the include-scoped one",
+              "[tests-before-push-src]" in ctx(out) and "[heads-before-push]" not in ctx(out), ctx(out))
+        run("post", s_edit("alembic/versions/0001_a.py"), oenv)
+        rc, out = run("pre", s_push, oenv)
+        check("ordering scope: an in-scope edit arms; the Bash gate itself carries no path and still fires",
+              "[heads-before-push]" in ctx(out), ctx(out))
+
     # --- message_id_of: the fire's link back to the transcript record ---
     sys.path.insert(0, os.path.dirname(HOOK))
     import rulebook_hook as rb  # noqa: E402

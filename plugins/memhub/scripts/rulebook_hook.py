@@ -4641,6 +4641,11 @@ def main():
                 continue
 
             if r.get("on") == "ordering":
+                # Path scope says which EDITS arm the obligation. The receipt
+                # and the gated call are Bash and carry no path, so they are
+                # never filtered here — only an edit outside the scope is.
+                if etool in EDIT_TOOLS and not path_in_scope(r, efp, root):
+                    continue
                 if stale_arming(st, r):
                     # Armed for an earlier version of this rule. The rule that
                     # arms on `staging` and the one that now arms on

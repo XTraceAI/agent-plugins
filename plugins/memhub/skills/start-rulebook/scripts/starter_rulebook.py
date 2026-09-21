@@ -47,7 +47,8 @@ PLUGIN_SCRIPTS = HERE.parents[2] / "scripts"
 CMD = r"(?:^|[;&]\s*|\|\s+)"
 # One `-C <dir>` / `-c k=v` is the evasion Anthropic's permission docs name.
 # Written without a quantified group: the hook's load lint drops those.
-GIT = CMD + r"(?:sudo\s+)?git\s+(?:-[cC]\s*\S+\s+)?"
+# `/usr/bin/git` is the same program: a path in front of it is not a way round every git rule.
+GIT = CMD + r"(?:sudo\s+)?(?:\S*/)?git\s+(?:-[cC]\s*\S+\s+)?"
 RX_MAX = 400
 # Appended to a command pattern to make it a RECEIPT: the command, but not an invocation that exits 0
 # having done none of the work — `pytest --version`, `eslint --help`, `pytest --collect-only`.
@@ -313,8 +314,10 @@ def scan(repo: Path) -> dict:
         # Paired by DIRECTORY, not by basename: `a/package-lock.json` belongs to `a/package.json` and nothing
         # else. A basename match gives both of a monorepo's packages the scope `package.json`, so editing one
         # arms the other's gate too, and the right install still leaves the wrong gate blocking the push.
-        tools = (("uv", "uv.lock", "pyproject.toml", r"uv lock\b", "uv lock"),
-                 ("poetry", "poetry.lock", "pyproject.toml", r"poetry lock\b", "poetry lock"),
+        # Every verb that REWRITES the lock is a receipt, not only the one named `lock`: `uv add requests`
+        # updates uv.lock, and a gate that still blocks the push after it teaches people to override.
+        tools = (("uv", "uv.lock", "pyproject.toml", r"uv (?:lock|add|remove|sync)\b", "uv lock"),
+                 ("poetry", "poetry.lock", "pyproject.toml", r"poetry (?:lock|add|remove|update)\b", "poetry lock"),
                  ("npm", "package-lock.json", "package.json", r"npm (?:install|i)\b", "npm install"),
                  ("pnpm", "pnpm-lock.yaml", "package.json", r"pnpm (?:install|i)\b", "pnpm install"),
                  ("bun", "bun.lock", "package.json", r"bun (?:install|i)\b", "bun install"),
@@ -343,8 +346,10 @@ def scan(repo: Path) -> dict:
                                   if o is not pr and o["lock_manifest"].endswith("/" + pr["lock_manifest"])]
         pairs = pairs[:8]
         for pr in pairs:
-            # `uv lock --dry-run` exits 0 and leaves uv.lock untouched: a preview is not a receipt
-            pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--dry-run\\b)" % pr["lock_cmd_rx"]
+            # `uv lock --dry-run` exits 0 and leaves uv.lock untouched, and so do `uv sync --frozen` and
+            # `--locked`: a preview or a read-only install is not a receipt. The flag must END there:
+            # yarn's `--frozen-lockfile` is a different flag, and it fails unless the lock is current.
+            pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--(?:dry-run|frozen|locked)(?:\\s|$|[;&|]))" % pr["lock_cmd_rx"]
         if pairs:
             slots["lock_pairs"] = pairs
     else:
@@ -380,7 +385,8 @@ def scan(repo: Path) -> dict:
         env_dirs = [os.path.dirname(f) for f in live if os.path.basename(f) == "env.py"
                     and any(g.startswith(os.path.dirname(f) + "/versions/") for g in live)]
         versions = (sorted(env_dirs, key=lambda d: (d.count("/"), d))[0] + "/versions") if env_dirs else "alembic/versions"
-        mig = ("alembic", r"(?:alembic|migrations|%s)/versions/.*\.py$" % re.escape(os.path.dirname(versions)),
+        mig_dirs = dict.fromkeys(["alembic", "migrations", re.escape(os.path.dirname(versions))])
+        mig = ("alembic", r"(?:%s)/versions/.*\.py$" % "|".join(mig_dirs),
                r"|alembic (?:downgrade|stamp)", "alembic revision --autogenerate", ["alembic", "alembic.ini"], versions)
     elif any(f.startswith("prisma/migrations/") or "/prisma/migrations/" in f for f in live):
         mig = ("prisma", r"prisma/migrations/.*\.sql$", r"|prisma migrate reset|prisma db push[^|;&]*--force-reset",
@@ -485,14 +491,14 @@ def scan(repo: Path) -> dict:
     slots["never_read_rx"] = _fit(base_never, ["(?:^|/)%s/" % re.escape(d) for d in extra])
     sec_extra = [l.lstrip("/") for l in ignore if re.search(r"secret|credential|\.pem|\.key|token", l, re.I)
                  and re.fullmatch(r"[\w./-]+", l)][:6]
-    base_secret = (r"(?:^|/)\.env(?:\.(?!example|sample|template|dist)[\w.-]+)?$|\.(?:pem|key|p12|pfx)$"
+    base_secret = (r"(?:^|/)\.env(?:rc|\.(?!example|sample|template|dist)[\w.-]+)?$|\.(?:pem|key|p12|pfx)$"
                    r"|(?:^|/)(?:credentials|secrets?)(?:\.(?:json|ya?ml|toml))?$|(?:^|/)id_(?:rsa|ed25519)$")
     slots["secrets_rx"] = _fit(base_secret, ["(?:^|/)%s$" % re.escape(s) for s in sec_extra])
     # The SAME set, shaped for a command line instead of a path: a token that starts after whitespace or a
     # `/` and ends at whitespace or a separator. One list, two shapes — a rule about staging secrets that
     # knows fewer secrets than the rule about reading them protects less than its title says.
     slots["secrets_cmd_rx"] = _fit(
-        r"\.env(?:\.(?!example|sample|template|dist)[\w.-]+)?|[^\s/]*\.(?:pem|key|p12|pfx)"
+        r"\.env(?:rc|\.(?!example|sample|template|dist)[\w.-]+)?|[^\s/]*\.(?:pem|key|p12|pfx)"
         r"|(?:credentials|secrets?)(?:\.(?:json|ya?ml|toml))?|id_(?:rsa|ed25519)",
         [re.escape(os.path.basename(x)) for x in sec_extra])
     found("gitignore", "%d ignore entries; %d extra read exclusions, %d secret patterns" % (len(ignore), len(extra), len(sec_extra))) \
@@ -668,12 +674,14 @@ def verify(candidates: list) -> tuple[list, bool]:
             body, cases = cand["body"], cand["cases"]
             fires = [materialise(c) for c in cases.get("fires", [])]
             silent = [materialise(c) for c in cases.get("silent", [])] + V._self_mention(body)
-            # `scope_paths` on an ordering is applied by the live lane before the
-            # engine ever sees the edit, and the verifier replays the engine only.
-            # So an edit outside the scope is decided here, by the hook's own
-            # `path_in_scope`, and must never reach a --fires case.
+            # `scope_paths` / `scope_exclude_paths` on an ordering are applied by the
+            # live lane before the engine ever sees the edit, and the verifier
+            # replays the engine only. So an edit outside the scope is decided
+            # here, by the hook's own `path_in_scope`, and must never reach a
+            # --fires case.
             scoped_out = []
-            if body.get("ordering") and body.get("scope_paths"):
+            scoped = bool(body.get("scope_paths") or body.get("scope_exclude_paths"))
+            if body.get("ordering") and scoped:
                 hook_rule = V.H.to_hook_rule(V._hook_row(body)) or {}
 
                 def outside(case) -> bool:
@@ -684,7 +692,7 @@ def verify(candidates: list) -> tuple[list, bool]:
                 fires_out = [c for c in fires if outside(c)]
             ok, testable, lines = V.verify(body, fires, silent)
             lines += ["SILENT ok    %s  (outside scope_paths: never arms)" % c for c in scoped_out]
-            if body.get("ordering") and body.get("scope_paths") and fires_out:
+            if body.get("ordering") and scoped and fires_out:
                 ok, lines = False, lines + ["FIRES  FAIL  %s  (outside scope_paths: can never arm)" % c for c in fires_out]
             if body.get("delivery") != "agent_hook":
                 testable = False                    # a note or an anchor: the server judges relevance
