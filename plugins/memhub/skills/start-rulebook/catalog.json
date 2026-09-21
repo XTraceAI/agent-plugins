@@ -1119,7 +1119,8 @@
      "repo": {
       "branch_rx": "{{default_branch_rx}}"
      }
-    }
+    },
+    "command_not_rx": "\\s--dry-run\\b|\\s-n\\b"
    },
    "seeded_from": "default branch, from origin/HEAD, anchored exactly. No origin/HEAD, no rule: a guessed `main` would leave a `trunk` repo unguarded while looking guarded",
    "cases": {
@@ -1141,6 +1142,14 @@
      {
       "case": "git push",
       "branch": "maintenance/1.x"
+     },
+     {
+      "case": "git push --dry-run",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push -n origin HEAD",
+      "branch": "{{default_branch}}"
      }
     ]
    },
@@ -1354,10 +1363,10 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "A secret or key file on this branch is not ignored, and this command stages everything. Add it to .gitignore, or stage by name.",
-   "why": "`git add -A` never names the file it sweeps in, so a rule that looks for `.env` in the command cannot see it; the branch's changed paths can.",
+   "why": "`git add -A` never names the file it sweeps in, so a rule that looks for `.env` in the command cannot see it; the branch's changed paths can. `git add -u` and `git commit -a` are left out on purpose: they touch tracked files only, so they cannot stage the untracked secret this rule is about.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}add\\b[^|;&]*\\s(?:-A|--all|-u|\\.|\\*)(?:\\s|$|[;&|])|{{GIT}}commit\\b[^|;&]*\\s-[a-zA-Z]*a",
+    "command_rx": "{{GIT}}add\\b[^|;&]*\\s(?:-A|--all|\\.|\\*)(?:\\s|$|[;&|])",
     "given": {
      "repo": {
       "diff_paths_rx": "{{secrets_rx}}"
@@ -1379,12 +1388,6 @@
       "diff_paths": [
        "certs/server.pem"
       ]
-     },
-     {
-      "case": "git commit -am 'parser: handle eof'",
-      "diff_paths": [
-       ".env.production"
-      ]
      }
     ],
     "silent": [
@@ -1405,6 +1408,18 @@
       "case": "git add -A",
       "diff_paths": [
        "src/environment.py"
+      ]
+     },
+     {
+      "case": "git add -u",
+      "diff_paths": [
+       ".env"
+      ]
+     },
+     {
+      "case": "git commit -am 'parser: handle eof'",
+      "diff_paths": [
+       ".env"
       ]
      }
     ]
@@ -1883,7 +1898,8 @@
    "cases": {
     "fires": [
      "edit:{{lock_manifest}} >> gate:git push",
-     "edit:{{lock_manifest}} >> ok:some-other-tool install >> gate:git push"
+     "edit:{{lock_manifest}} >> ok:some-other-tool install >> gate:git push",
+     "edit:{{lock_manifest}} >> ok:{{lock_cmd_example}} --dry-run >> gate:git push"
     ],
     "silent": [
      "edit:{{lock_manifest}} >> ok:{{lock_cmd_example}} >> gate:git push",

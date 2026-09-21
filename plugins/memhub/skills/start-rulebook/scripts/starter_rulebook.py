@@ -146,12 +146,19 @@ def scan(repo: Path) -> dict:
         chains.append("go")
     if names["Cargo.toml"]:
         chains.append("rust")
-    pkg = _json(repo / "package.json")
-    scripts = (pkg.get("scripts") or {}) if isinstance(pkg, dict) else {}
+    # Every tracked package.json, not only the root one: in a monorepo the Node project lives under
+    # `web/` or `packages/*`, and a root-only read finds `{}` — the repo is classed as Node and then
+    # loses every test rule for want of evidence that is sitting one directory down.
+    pkg_files = [f for f in sorted(live, key=lambda f: f.count("/")) if os.path.basename(f) == "package.json"][:25]
+    pkgs = [j for j in (_json(repo / f) for f in pkg_files) if isinstance(j, dict)]
+    pkg = {"scripts": {k: v for j in reversed(pkgs) for k, v in (j.get("scripts") or {}).items()},
+           "dependencies": {k: v for j in pkgs for k, v in (j.get("dependencies") or {}).items()},
+           "devDependencies": {k: v for j in pkgs for k, v in (j.get("devDependencies") or {}).items()}}
+    scripts = pkg["scripts"]
     makefile = _read(repo / "Makefile")
     make_targets = set(re.findall(r"^([A-Za-z][\w-]*):", makefile, re.M))
-    pm = "pnpm" if "pnpm-lock.yaml" in fset else "yarn" if "yarn.lock" in fset else \
-        "bun" if ("bun.lockb" in fset or "bun.lock" in fset) else "npm"
+    pm = "pnpm" if names["pnpm-lock.yaml"] else "yarn" if names["yarn.lock"] else \
+        "bun" if (names["bun.lockb"] or names["bun.lock"]) else "npm"     # the lockfile beside whichever package.json
 
     # One record per test runner the repo gives EVIDENCE of. Every slot below is derived from these
     # records and nothing else, so a pattern can never be seeded without the example that proves it, an
@@ -172,8 +179,9 @@ def scan(repo: Path) -> dict:
             if re.search(r"slow|behavio|e2e|integration|perf|load|live|network|smoke", m)]
 
     if "python" in chains:
-        py_cfg = "".join(_read(repo / n) for n in ("pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini")
-                         if n in fset) + "".join(_read(repo / n) for n in fset if re.fullmatch(r"requirements[^/]*\.txt", n))
+        py_cfg = "".join(_read(repo / f) for f in [f for f in live if os.path.basename(f) in (
+            "pyproject.toml", "setup.cfg", "tox.ini", "noxfile.py", "pytest.ini")
+            or re.fullmatch(r"requirements[^/]*\.txt", os.path.basename(f))][:25])     # nested projects count too
         py_targeted = r"\s\S*(?:tests?/|\.py\b|::)|\s-k\s|\s--lf\b|\s--last-failed\b|\s-e\s+\S"
         before = len(runners)
         if names["pytest.ini"] or names["conftest.py"] or re.search(r"\bpytest\b", py_cfg):
@@ -305,6 +313,8 @@ def scan(repo: Path) -> dict:
                      ("go", "go.sum", "go.mod", r"go mod tidy\b", "go mod tidy"),
                      ("cargo", "Cargo.lock", "Cargo.toml", r"cargo (?:update|generate-lockfile|build|check)\b", "cargo update"))
                  if names[lock] and names[man]]
+        for pr in pairs:                            # `uv lock --dry-run` exits 0 and leaves uv.lock untouched
+            pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--dry-run\\b)" % pr["lock_cmd_rx"]
         if pairs:
             slots["lock_pairs"] = pairs
     else:

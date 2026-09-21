@@ -224,6 +224,8 @@ def test_the_miner_reads_a_month_unless_asked_for_more() -> None:
         check("an /insights facet for a session outside the window is left out, and the report says so",
               "1 /insights facets left out" in out() and "from the spring" not in out())
         check("--all holds /insights facets to nothing, as before", "from the spring" in out("--all"))
+        check("but --all with --repo still keeps another repo's facets out",
+              "from the spring" not in out("--all", "--repo", "some-repo"))
         check("a baseline keeps 30 days of BEFORE without being asked",
               "last 90 days" in window("--baseline-date", long_ago), window("--baseline-date", long_ago))
 
@@ -453,6 +455,40 @@ def test_only_a_real_install_clears_a_yarn_lock_obligation() -> None:
             check(f"`{cmd}` clears it", bool(re.search(rx, cmd)))
         for cmd in ("yarn test", "yarn lint", "yarn --version", "yarn run build"):
             check(f"`{cmd}` does not", not re.search(rx, cmd))
+
+
+def test_a_monorepo_is_read_below_its_root() -> None:
+    """`web/package.json` makes the repo Node; a root-only read then finds no
+    test script and drops every test rule despite the evidence one level down."""
+    files = {"README.md": "x\n", "web/package.json": json.dumps({"scripts": {"test": "vitest run", "lint": "eslint ."}, "devDependencies": {"vitest": "2", "eslint": "9"}}),
+             "web/pnpm-lock.yaml": "lockfileVersion: '9.0'\n", "web/src/a.ts": "export {}\n", "web/src/b.ts": "export {}\n", "web/src/c.ts": "export {}\n",
+             "api/pyproject.toml": '[project]\nname="api"\n[dependency-groups]\ndev=["pytest"]\n', "api/app/a.py": "x=1\n"}
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(files, Path(tmp) / "mono")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        by_id = {c["id"]: c["body"] for c in cands}
+        check("exit 0 and everything verifies", p.returncode == 0 and all(r["ok"] for r in rows), p.stdout[-400:])
+        check("both nested runners are found", set(signals["signals"]["toolchain"]["test_runners"]) >= {"pytest", "pnpm test"},
+              str(signals["signals"]["toolchain"].get("test_runners")))
+        check("so the push gate exists", "suite-before-push" in by_id)
+        check("and the package manager is the one beside the nested manifest", "lockfile-drift-pnpm" in by_id)
+
+
+def test_a_preview_never_counts_as_the_real_thing() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(PYTHON_REPO, Path(tmp) / "svc")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        by_id = {c["id"]: c["body"] for c in cands}
+        lock = by_id["lockfile-drift-uv"]["ordering"]["required_command_rx"]
+        check("`uv lock` clears the lockfile obligation", bool(re.search(lock, "uv lock")))
+        check("`uv lock --check` does too — green means the lock is current", bool(re.search(lock, "uv lock --check")))
+        check("`uv lock --dry-run` does not — it writes nothing", not re.search(lock, "uv lock --dry-run"))
+        push = by_id["push-main"]["matcher"]
+        check("a dry-run push on the default branch is not gated", bool(re.search(push["command_not_rx"], "git push --dry-run")))
+        bulk = by_id["stage-secrets-bulk"]["matcher"]["command_rx"]
+        check("`git add -A` is a bulk stage", bool(re.search(bulk, "git add -A")))
+        check("`git add -u` and `git commit -a` cannot stage an untracked file, so they are not",
+              not re.search(bulk, "git add -u") and not re.search(bulk, "git commit -am 'x: y'"))
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:

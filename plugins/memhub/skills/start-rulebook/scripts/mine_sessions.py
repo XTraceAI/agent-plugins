@@ -242,10 +242,11 @@ print(f"digests: {len(paths)} to read in {len(batches)} batches ({args.out}/dige
 # /insights facets answer to the same window as everything else. They carry no date of their own, so the only
 # honest test is whether their session is one this run read: an /insights facet from the spring would otherwise
 # put March's friction and standards into a report that says "the last 30 days". Under --all nothing was left
-# out of the corpus for age, so there is nothing to hold them to.
+# out of the corpus for age — but with --repo the corpus is still one repo's, and another repo's facets have no
+# more business in its report than another month's.
 _in_corpus = {s["id"] for s in corpus}
 def _facet_in_window(d):
-    if WINDOW_DAYS is None: return True
+    if WINDOW_DAYS is None and not args.repo: return True   # --all lifts the AGE cutoff only; a --repo run is still about that repo
     sid = str(d.get("session_id") or "")
     return bool(sid) and (sid in _in_corpus or (len(sid) >= 8 and any(full.startswith(sid) for full in _in_corpus)))
 insights_skipped = 0
