@@ -236,6 +236,11 @@ def scan(repo: Path) -> dict:
         slots["test_cmd_rx"] = _alt(r["rx"] for r in runners)
         slots["targeted_rx"] = "|".join(r["targeted"] for r in runners if r["targeted"]) or r"\s--this-repo-has-no-targeted-form\b"
         slots["test_cmd_example"] = runners[0]["example"]
+        # What CLEARS a "tests ran" obligation. A targeted run does, on purpose; an invocation that runs no
+        # test does not — `pytest --version`, `--help`, `--collect-only` all exit 0 having tested nothing.
+        slots["test_receipt_rx"] = slots["test_cmd_rx"] + (
+            r"\b(?![^|;&]*\s(?:--version|--help|-h|--collect-only|--co|--fixtures|--markers|--setup-plan"
+            r"|--listenvs|--list|-list|--showconfig|--no-run)(?:\s|=|$))")
     if slow_content:
         slots["test_slow_content_rx"] = "|".join(c for c, _ in slow_content)
         slots["test_slow_example"] = slow_content[0][1]
@@ -301,19 +306,36 @@ def scan(repo: Path) -> dict:
         # One (manifest, lockfile, tool) record each — never one shared receipt. In a polyglot repo a single
         # rule over every lock tool lets `pnpm install` clear the obligation an edit to pyproject.toml armed,
         # and the push goes out with uv.lock stale. The rule is seeded once per pair (`for_each`).
-        pairs = [{"lock_key": key, "lock_name": lock, "lock_manifest": man, "lock_cmd_rx": rx, "lock_cmd_example": ex}
-                 for key, lock, man, rx, ex in (
-                     ("uv", "uv.lock", "pyproject.toml", r"uv lock\b", "uv lock"),
-                     ("poetry", "poetry.lock", "pyproject.toml", r"poetry lock\b", "poetry lock"),
-                     ("npm", "package-lock.json", "package.json", r"npm (?:install|i)\b", "npm install"),
-                     ("pnpm", "pnpm-lock.yaml", "package.json", r"pnpm (?:install|i)\b", "pnpm install"),
-                     # bare `yarn` IS the install alias; `yarn test`, `yarn lint`, `yarn --version` are not
-                     ("yarn", "yarn.lock", "package.json",
-                      r"yarn(?:\s+install)?(?=\s*(?:$|[;&|])|\s+--(?!version|help))", "yarn install"),
-                     ("go", "go.sum", "go.mod", r"go mod tidy\b", "go mod tidy"),
-                     ("cargo", "Cargo.lock", "Cargo.toml", r"cargo (?:update|generate-lockfile|build|check)\b", "cargo update"))
-                 if names[lock] and names[man]]
-        for pr in pairs:                            # `uv lock --dry-run` exits 0 and leaves uv.lock untouched
+        #
+        # Paired by DIRECTORY, not by basename: `a/package-lock.json` belongs to `a/package.json` and nothing
+        # else. A basename match gives both of a monorepo's packages the scope `package.json`, so editing one
+        # arms the other's gate too, and the right install still leaves the wrong gate blocking the push.
+        tools = (("uv", "uv.lock", "pyproject.toml", r"uv lock\b", "uv lock"),
+                 ("poetry", "poetry.lock", "pyproject.toml", r"poetry lock\b", "poetry lock"),
+                 ("npm", "package-lock.json", "package.json", r"npm (?:install|i)\b", "npm install"),
+                 ("pnpm", "pnpm-lock.yaml", "package.json", r"pnpm (?:install|i)\b", "pnpm install"),
+                 # bare `yarn` IS the install alias; `yarn test`, `yarn lint`, `yarn --version` are not
+                 ("yarn", "yarn.lock", "package.json",
+                  r"yarn(?:\s+install)?(?=\s*(?:$|[;&|])|\s+--(?!version|help))", "yarn install"),
+                 ("go", "go.sum", "go.mod", r"go mod tidy\b", "go mod tidy"),
+                 ("cargo", "Cargo.lock", "Cargo.toml", r"cargo (?:update|generate-lockfile|build|check)\b", "cargo update"))
+        live_set = set(live)
+        pairs = []
+        for key, lock, man, rx, ex in tools:
+            for lock_path in sorted((f for f in live if os.path.basename(f) == lock), key=lambda f: (f.count("/"), f)):
+                where = os.path.dirname(lock_path)
+                man_path = (where + "/" if where else "") + man
+                if man_path not in live_set:
+                    continue                        # a lockfile with no manifest beside it guards nothing we can name
+                pairs.append({"lock_key": key + ("-" + re.sub(r"[^A-Za-z0-9]+", "-", where).strip("-") if where else ""),
+                              "lock_name": lock_path, "lock_manifest": man_path, "lock_cmd_rx": rx, "lock_cmd_example": ex})
+        pairs = pairs[:8]
+        for pr in pairs:
+            # The hook also tries `*/<glob>`, so a ROOT manifest's scope would swallow every nested manifest of
+            # the same name. Hand each nested pair's manifest to the root rule as an exclusion.
+            pr["lock_exclude"] = [o["lock_manifest"] for o in pairs
+                                  if o is not pr and o["lock_manifest"].endswith("/" + pr["lock_manifest"])]
+            # `uv lock --dry-run` exits 0 and leaves uv.lock untouched: a preview is not a receipt
             pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--dry-run\\b)" % pr["lock_cmd_rx"]
         if pairs:
             slots["lock_pairs"] = pairs

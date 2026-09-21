@@ -490,12 +490,13 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "requires": [
-    "test_cmd_rx"
+    "test_cmd_rx",
+    "test_receipt_rx"
    ],
    "statement": "Edits are in flight and no test run has come back green since. Run the tests for what you changed (the whole suite if it is quick) before anything leaves the machine.",
    "why": "a push with no green run since the last edit is the cheapest failure to prevent. Any green test run clears it, targeted included: forcing a full local suite duplicates CI, and on a slow suite is how a rule gets switched off.",
    "ordering": {
-    "required_command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
+    "required_command_rx": "{{CMD}}{{test_receipt_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
     "armed_by_events": [
      "edit"
@@ -507,7 +508,9 @@
    "cases": {
     "fires": [
      "edit:src/a.py >> gate:git push",
-     "edit:src/a.py >> red:{{test_cmd_example}} >> gate:gh pr create --fill"
+     "edit:src/a.py >> red:{{test_cmd_example}} >> gate:gh pr create --fill",
+     "edit:src/a.py >> ok:{{test_cmd_example}} --version >> gate:git push",
+     "edit:src/a.py >> ok:{{test_cmd_example}} --help >> gate:git push"
     ],
     "silent": [
      "edit:src/a.py >> ok:{{test_cmd_example}} >> gate:git push"
@@ -1359,14 +1362,14 @@
   {
    "id": "stage-secrets-bulk",
    "category": "safety",
-   "title": "No bulk staging over an unignored secret",
+   "title": "No stage-everything over an unignored secret",
    "mode": "gate",
    "delivery": "agent_hook",
-   "statement": "A secret or key file on this branch is not ignored, and this command stages everything. Add it to .gitignore, or stage by name.",
+   "statement": "A secret or key file on this branch is not ignored, and `git add -A` stages the whole tree from any directory. Add it to .gitignore, or stage by name.",
    "why": "`git add -A` never names the file it sweeps in, so a rule that looks for `.env` in the command cannot see it; the branch's changed paths can. `git add -u` and `git commit -a` are left out on purpose: they touch tracked files only, so they cannot stage the untracked secret this rule is about.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}add\\b[^|;&]*\\s(?:-A|--all|\\.|\\*)(?:\\s|$|[;&|])",
+    "command_rx": "{{GIT}}add\\b[^|;&]*\\s(?:-A|--all)(?:\\s|$|[;&|])",
     "given": {
      "repo": {
       "diff_paths_rx": "{{secrets_rx}}"
@@ -1384,7 +1387,7 @@
       ]
      },
      {
-      "case": "cd api && git add .",
+      "case": "cd api && git add --all",
       "diff_paths": [
        "certs/server.pem"
       ]
@@ -1418,6 +1421,76 @@
      },
      {
       "case": "git commit -am 'parser: handle eof'",
+      "diff_paths": [
+       ".env"
+      ]
+     },
+     {
+      "case": "cd api && git add .",
+      "diff_paths": [
+       "certs/server.pem"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "stage-secrets-dot",
+   "category": "safety",
+   "title": "No `git add .` over an unignored secret",
+   "mode": "gate",
+   "delivery": "agent_hook",
+   "statement": "A secret or key file on this branch is not ignored, and `git add .` stages everything under this directory. Add it to .gitignore, or stage by name.",
+   "why": "`.` is a pathspec, not the whole tree: it reaches only what is under the directory the command runs in. So this fires only when the command changes directory nowhere (`cd`, `pushd`, `git -C`) — then `.` is as wide as the repo is from here. If the shell was already left in a subdirectory by an earlier call it can still over-fire; the override records why.",
+   "matcher": {
+    "event": "bash",
+    "command_rx": "{{CMD}}(?:sudo\\s+)?git\\s+add\\b[^|;&]*\\s(?:\\.|\\*)(?:\\s|$|[;&|])",
+    "command_not_rx": "(?:^|[;&|]\\s*)(?:cd|pushd)\\s|\\bgit\\s+-C\\s",
+    "given": {
+     "repo": {
+      "diff_paths_rx": "{{secrets_rx}}"
+     }
+    }
+   },
+   "seeded_from": ".gitignore secret patterns and .env templates, matched against the branch's changed and untracked paths",
+   "cases": {
+    "fires": [
+     {
+      "case": "git add .",
+      "diff_paths": [
+       "src/a.py",
+       ".env"
+      ]
+     },
+     {
+      "case": "git status && git add . && git commit -m 'x: y'",
+      "diff_paths": [
+       ".env.production"
+      ]
+     }
+    ],
+    "silent": [
+     {
+      "case": "cd api && git add .",
+      "diff_paths": [
+       "certs/server.pem"
+      ]
+     },
+     {
+      "case": "git -C web add .",
+      "diff_paths": [
+       ".env"
+      ]
+     },
+     {
+      "case": "git add .",
+      "diff_paths": [
+       "src/a.py",
+       ".env.example"
+      ]
+     },
+     {
+      "case": "git add ./src/a.py",
       "diff_paths": [
        ".env"
       ]
@@ -1875,14 +1948,14 @@
   {
    "id": "lockfile-drift-{{lock_key}}",
    "category": "hygiene",
-   "title": "Regenerate {{lock_name}} after a manifest edit",
+   "title": "Regenerate {{lock_name}} after its manifest changes",
    "mode": "gate",
    "delivery": "agent_hook",
    "requires": [
     "lock_pairs"
    ],
    "statement": "`{{lock_manifest}}` changed. Regenerate `{{lock_name}}` with `{{lock_cmd_example}}` before push; never edit it by hand.",
-   "why": "CI will reject a stale lock. One rule per manifest and its own lock tool, so another ecosystem's install cannot clear this one.",
+   "why": "CI will reject a stale lock. One rule per lockfile, paired with the manifest in its own directory and its own tool, so neither another ecosystem's install nor another package's edit touches this one. Known limit: the receipt is the tool's command, not where it ran — two packages on the same tool clear each other.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{lock_cmd_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -1906,7 +1979,8 @@
      "edit:src/a.py >> gate:git push"
     ]
    },
-   "for_each": "lock_pairs"
+   "for_each": "lock_pairs",
+   "scope_exclude_paths": "{{lock_exclude}}"
   },
   {
    "id": "migration-handwritten",
@@ -2193,12 +2267,13 @@
    "delivery": "agent_hook",
    "min_hook_version": "0.54.0",
    "requires": [
-    "test_cmd_rx"
+    "test_cmd_rx",
+    "test_receipt_rx"
    ],
    "statement": "A failure was reported. Reproduce it with a test, and have the tests green, before committing the fix.",
    "why": "a fix without a reproduction is a guess; the ablation evidence is 8-10 resolve points.",
    "ordering": {
-    "required_command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
+    "required_command_rx": "{{CMD}}{{test_receipt_rx}}",
     "gated_command_rx": "{{GIT}}commit\\b",
     "armed_by_events": [
      "prompt"
@@ -2209,7 +2284,8 @@
    "seeded_from": "toolchain: the repo's test command",
    "cases": {
     "fires": [
-     "prompt:login is broken after the last deploy >> gate:git commit -m 'auth: fix redirect'"
+     "prompt:login is broken after the last deploy >> gate:git commit -m 'auth: fix redirect'",
+     "prompt:login is broken after the last deploy >> ok:{{test_cmd_example}} --version >> gate:git commit -m 'auth: fix redirect'"
     ],
     "silent": [
      "prompt:add a logout button >> gate:git commit -m 'auth: add logout'",

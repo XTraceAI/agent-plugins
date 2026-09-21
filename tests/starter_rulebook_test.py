@@ -471,7 +471,39 @@ def test_a_monorepo_is_read_below_its_root() -> None:
         check("both nested runners are found", set(signals["signals"]["toolchain"]["test_runners"]) >= {"pytest", "pnpm test"},
               str(signals["signals"]["toolchain"].get("test_runners")))
         check("so the push gate exists", "suite-before-push" in by_id)
-        check("and the package manager is the one beside the nested manifest", "lockfile-drift-pnpm" in by_id)
+        check("and the lock rule is pnpm's, scoped to the manifest in web/",
+              by_id.get("lockfile-drift-pnpm-web", {}).get("scope_paths") == ["web/package.json"],
+              str(sorted(k for k in by_id if k.startswith("lockfile"))))
+
+
+def test_monorepo_lockfiles_pair_with_the_manifest_in_their_own_directory() -> None:
+    """Paired by basename, `a/` (npm) and `b/` (yarn) both scope to every
+    package.json: editing a/package.json arms yarn's gate, and the right
+    `npm install` leaves it blocking the push."""
+    pj = json.dumps({"scripts": {"test": "jest"}, "devDependencies": {"jest": "29"}})
+    files = {"README.md": "x\n", "a/package.json": pj, "a/package-lock.json": "{}\n", "a/src/i.js": "\n",
+             "b/package.json": pj, "b/yarn.lock": "# yarn\n", "b/src/i.js": "\n",
+             "package.json": pj, "pnpm-lock.yaml": "lockfileVersion: '9.0'\n", "orphan/yarn.lock": "# no manifest here\n"}
+    sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+    import rulebook_hook as H
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(files, Path(tmp) / "mono")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        by_id = {c["id"]: c["body"] for c in cands}
+        check("exit 0 and everything verifies", p.returncode == 0 and all(r["ok"] for r in rows), p.stdout[-500:])
+        check("one rule per lockfile that has a manifest beside it",
+              {k for k in by_id if k.startswith("lockfile-drift")} == {"lockfile-drift-pnpm", "lockfile-drift-npm-a", "lockfile-drift-yarn-b"},
+              str(sorted(k for k in by_id if k.startswith("lockfile-drift"))))
+        def armed_by(rule_id, path):
+            b = by_id[rule_id]
+            return H.path_in_scope({"_scope_paths": b["scope_paths"], "_scope_exclude_paths": b.get("scope_exclude_paths") or []},
+                                   "/repo/" + path, "/repo")
+        check("a/package.json arms a's rule", armed_by("lockfile-drift-npm-a", "a/package.json"))
+        check("and NOT b's", not armed_by("lockfile-drift-yarn-b", "a/package.json"))
+        check("and NOT the root's, though the hook also tries */package.json", not armed_by("lockfile-drift-pnpm", "a/package.json"))
+        check("the root manifest arms the root rule", armed_by("lockfile-drift-pnpm", "package.json"))
+        titles = [by_id[k]["title"] for k in by_id if k.startswith("lockfile-drift")]
+        check("titles are distinct", len(set(titles)) == 3, str(titles))
 
 
 def test_a_preview_never_counts_as_the_real_thing() -> None:
@@ -489,6 +521,16 @@ def test_a_preview_never_counts_as_the_real_thing() -> None:
         check("`git add -A` is a bulk stage", bool(re.search(bulk, "git add -A")))
         check("`git add -u` and `git commit -a` cannot stage an untracked file, so they are not",
               not re.search(bulk, "git add -u") and not re.search(bulk, "git commit -am 'x: y'"))
+        dot = by_id["stage-secrets-dot"]["matcher"]
+        check("`git add .` is its own rule, and only where `.` is as wide as the repo",
+              bool(re.search(dot["command_rx"], "git add .")) and not re.search(dot["command_not_rx"], "git add ."))
+        check("`cd api && git add .` reaches only api/, so a secret elsewhere does not gate it",
+              bool(re.search(dot["command_not_rx"], "cd api && git add .")) and not re.search(bulk, "cd api && git add ."))
+        receipt = by_id["suite-before-push"]["ordering"]["required_command_rx"]
+        check("a targeted test run clears the push gate, on purpose", bool(re.search(receipt, "pytest tests/test_a.py -q")))
+        for info in ("pytest --version", "pytest --help", "pytest --collect-only -q", "uv run pytest --co"):
+            check(f"`{info}` runs no test, so it clears nothing", not re.search(receipt, info))
+        check("reproduce-before-fix uses the same receipt", by_id["reproduce-before-fix"]["ordering"]["required_command_rx"] == receipt)
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:
