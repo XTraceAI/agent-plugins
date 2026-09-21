@@ -103,6 +103,20 @@ def test_allows_when_capture_is_switched_off():
     print("PASS test_allows_when_capture_is_switched_off")
 
 
+def test_allows_in_a_harness_child():
+    # The harness's forked authoring session is never captured (flush_turn and
+    # flush_session both return early on it), so add_memory is not a copy there.
+    _clear_credentials()
+    _with_key()
+    for value in ("1", "on", "TRUE", "yes"):
+        env = {"MEMHUB_HARNESS_CHILD": value}
+        assert gate.decide(_payload(), env) is None, value
+    for value in ("", "0", "off"):
+        env = {"MEMHUB_HARNESS_CHILD": value}
+        assert _denies(gate.decide(_payload(), env)), value
+    print("PASS test_allows_in_a_harness_child")
+
+
 def test_allows_without_a_working_credential():
     _clear_credentials()
     assert gate.decide(_payload()) is None  # never logged in

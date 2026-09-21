@@ -22,7 +22,9 @@ the rule is scoped to exactly that condition and nothing wider:
   ``user_message`` argument, so it covers this plugin's own server and a
   claude.ai MemHub connector alike (the blind agents used the connector) without
   catching an unrelated server's ``add_memory``;
-* per-turn capture is not switched off (``MEMHUB_TURN_FLUSH=0``);
+* per-turn capture is not switched off (``MEMHUB_TURN_FLUSH=0``), and this is
+  not a harness authoring child (``MEMHUB_HARNESS_CHILD``), which the flush
+  scripts never capture;
 * the payload names a transcript, which is what the flush reads;
 * the plugin holds a credential capture can authenticate with, judged by the
   same network-free check the capture-health banner uses — so this and that
@@ -85,6 +87,9 @@ def capture_is_active(payload: dict,
     env = os.environ if environ is None else environ
     if env.get("MEMHUB_TURN_FLUSH", "").strip().lower() in _CAPTURE_OFF:
         return False
+    import transcript_filter  # noqa: PLC0415 — stdlib-only, beside this file
+    if transcript_filter.is_harness_child(env):
+        return False  # both flush scripts skip the harness's forked copy
     transcript = payload.get("transcript_path")
     if not isinstance(transcript, str) or not transcript.strip():
         return False
