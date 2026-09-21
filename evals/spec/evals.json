@@ -1,0 +1,70 @@
+{
+  "skill_name": "spec",
+  "evals": [
+    {
+      "id": 1,
+      "name": "local-bootstrap-confirmed-scope",
+      "prompt": "/memhub:spec bootstrap --local. Use this checkout; our spec directory is engineering/specs. I already confirmed the billing domain owning app/billing.py. Generate only that domain. Existing retry specs must stay intact. Do not call cloud generation or open a PR.",
+      "expected_output": "A local billing draft with concrete owns and null verification, evidence-backed observed behavior, no duplicate retries spec, and no cloud call or repeated confirmation.",
+      "files": [
+        "fixtures/app/billing.py",
+        "fixtures/app/retries.py",
+        "fixtures/engineering/specs/retries.md"
+      ],
+      "assertions": [
+        "Creates a billing Markdown spec under engineering/specs with owns app/billing.py and last_verified_at null.",
+        "Preserves the existing retry spec byte-for-byte and creates no duplicate retry owner.",
+        "Generates without a redundant confirmation or requiring cloud authentication.",
+        "Makes no cloud generation or publication call and does not claim cloud credit usage."
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fresh-check-mutually-edited-requirement",
+      "prompt": "/memhub:spec check --base baseline. Directory is engineering/specs. The working change raises MAX_ATTEMPTS from 3 to 8 and edits the spec to say eight. No product decision approved a retry-limit change. There is also an untracked app/retry_metrics.py. Check the actual changes and leave the worktree unchanged. MemHub is unavailable; an old report said no drift at the baseline commit.",
+      "expected_output": "A fresh, read-only check identifies the unauthorized requirement change with source/code evidence, includes untracked coverage, and distinguishes the historical report from current analysis.",
+      "files": [
+        "fixtures/app/retries.py",
+        "fixtures/engineering/specs/retries.md"
+      ],
+      "assertions": [
+        "Flags the three-to-eight behavior change despite matching edited code and spec, citing the baseline requirement and current implementation.",
+        "Includes the untracked retry_metrics.py in coverage and marks it uncovered or unverified.",
+        "Does not use the old report or unavailable MemHub as a substitute for the local comparison.",
+        "Leaves tracked and untracked input files unchanged, including verification metadata."
+      ]
+    },
+    {
+      "id": 3,
+      "name": "brain-conflict-revision-proposal",
+      "prompt": "/memhub:spec work: plan the retry update against our explicitly selected governing Brain doc retry-policy (version 4, full text below). Git owns files are legacy and are not authoritative for this task. Brain text: Transient errors receive at most three attempts. Permanent errors receive one. Product has now explicitly approved five transient attempts, with permanent errors still one. Prepare an implementation plan and a reviewable revision proposal against version 4. There is no Brain write API available; do not publish or implement code.",
+      "expected_output": "A source-aware plan and v4-targeted Brain revision proposal for five attempts, appropriate acceptance checks, no repeated decision question, no Git rewrite or claimed publication.",
+      "files": [
+        "fixtures/app/retries.py",
+        "fixtures/engineering/specs/retries.md"
+      ],
+      "assertions": [
+        "Uses explicitly selected Brain retry-policy version 4 as the governing source rather than legacy Git specs.",
+        "Proposes five transient attempts and preserves one permanent attempt with corresponding acceptance checks.",
+        "Reuses the approved product decision without asking for it again.",
+        "Labels the Brain revision as a draft/proposal and reports missing publication capability without writing Git specs or code."
+      ]
+    },
+    {
+      "id": 4,
+      "name": "bootstrap-execution-choice",
+      "prompt": "/memhub:spec bootstrap. Use engineering/specs for this repository.",
+      "expected_output": "Asks local coding agent versus MemHub cloud, explains usage ownership, does not start generation or require cloud authentication just to choose. No previous choice or domain confirmation exists.",
+      "files": [
+        "fixtures/app/billing.py",
+        "fixtures/app/retries.py",
+        "fixtures/engineering/specs/retries.md"
+      ],
+      "assertions": [
+        "Offers local coding-agent generation and MemHub cloud generation before launching either.",
+        "Explains user agent usage versus MemHub backend usage without invented prices.",
+        "Makes no generation, publication, or repository mutation before execution and domain choices."
+      ]
+    }
+  ]
+}

@@ -363,7 +363,7 @@ With the variable unset, the default, none of this runs.
 
 ## Skills
 
-Thirteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Sixteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
@@ -402,20 +402,29 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   `share_agent_brain`, alongside the repo room where per-turn capture already
   extracted the session. No re-import: the session's memory exists once, and
   the brief points into it.
-- `/memhub:spec <init|revise|check|status>` — spec-driven development on team
-  memory. Each repo gets **one shared agent brain** (`Repo: <org>/<name>`,
-  derived from the git remote) holding ALL its specs alongside reviews, ADRs,
-  and imported implementation sessions — share it once per teammate and every
-  current and future spec is visible to them. Each spec is a **versioned
-  artifact** in that room (every revision carries a rationale; versions are
-  diffable via `diff_artifact_versions`), mirrored by a file in the repo
-  (`docs/specs/<slug>.md`); a `spec:<slug>` tag picks it out of the shared
-  room. `init` drafts/uploads and shares; `revise` versions with a required
-  rationale and reports the diff; `check` detects the spec drifting under
-  this session's work (local file vs. artifact lineage); `status` is the
-  multiplayer view — repo overview with no topic, per-spec activity with one.
-  Sharing is read-only, so the room's creator owns revisions; teammates
-  propose spec changes through the normal repo/PR flow.
+- `/memhub:spec <work|init|revise|bootstrap|check|resolve|status|setup>` — the
+  common entry point for the repository's spec workflow; routes to the focused
+  skills below and preserves existing `init`, `revise`, `check`, and `status` use.
+- `/memhub:spec-work <task>` — reads governing Git or Brain requirements before
+  implementation, maps them to acceptance checks, and follows through on the
+  requested code change without silently rewriting conflicting requirements.
+- `/memhub:spec-check [file|topic|PR] [--base <ref>]` — compares requirements
+  with the actual diff, including branch, staged, unstaged, untracked, renamed,
+  and deleted paths. Reports evidence and coverage gaps; historical audits are
+  context, not a substitute for fresh analysis.
+- `/memhub:spec-maintain <init|revise|bootstrap|resolve|status|setup>` — creates
+  and revises specs, resolves drift, and diagnoses workflow readiness. Bootstrap
+  offers `--local` (the coding agent's usage) or `--cloud` (MemHub backend usage,
+  subject to product credits). With neither a choice nor a supported saved
+  preference, it asks before discovery. Both modes confirm domains before
+  generation and never silently fall back to the other execution mode.
+  Git specs live in the configured directory with `owns` frontmatter; their
+  brain mirrors are read-only. Brain mode reads explicitly selected governing
+  documents and prepares revision proposals. Publication requires a supported
+  authenticated capability and a user request; a local draft isn't published.
+  Cloud bootstrap currently produces Git spec PRs. These skills do not add a
+  unified backend settings API or imply Brain parity for Git hooks/audits.
+
 - `/memhub:create-rule` — creates a situated Rulebook rule from a concrete
   failure, correction, or procedure, resolves which rulebook it lands in (and
   offers to create one when you have none), and checks it for conflicts across
