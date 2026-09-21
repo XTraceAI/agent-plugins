@@ -347,8 +347,9 @@ def scan(repo: Path) -> dict:
         pairs = pairs[:8]
         for pr in pairs:
             # `uv lock --dry-run` exits 0 and leaves uv.lock untouched, and so do `uv sync --frozen` and
-            # `--locked`: a preview or a read-only install is not a receipt
-            pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--(?:dry-run|frozen|locked)\\b)" % pr["lock_cmd_rx"]
+            # `--locked`: a preview or a read-only install is not a receipt. The flag must END there:
+            # yarn's `--frozen-lockfile` is a different flag, and it fails unless the lock is current.
+            pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--(?:dry-run|frozen|locked)(?:\\s|$|[;&|]))" % pr["lock_cmd_rx"]
         if pairs:
             slots["lock_pairs"] = pairs
     else:

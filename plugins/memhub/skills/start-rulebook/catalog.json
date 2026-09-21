@@ -1575,7 +1575,7 @@
    "why": "a committed secret costs a rotation; a committed build directory costs every clone. Bulk forms (`git add -A`) never name the file, so they are a separate rule that reads the branch's changed paths.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}add\\b[^|;&]*(?:\\s|/|[\"'])(?:{{secrets_cmd_rx}})(?=[\"']?(?:\\s|$|[;&|]))|{{GIT}}add\\b[^|;&]*(?:\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/)"
+    "command_rx": "{{GIT}}add\\b[^|;&]*(?:(?:\\s|/|[\"'])(?:{{secrets_cmd_rx}})(?=[\"']?(?:\\s|$|[;&|]))|\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/)"
    },
    "cases": {
     "fires": [
