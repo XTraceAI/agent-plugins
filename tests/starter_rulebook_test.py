@@ -228,6 +228,42 @@ def test_the_skill_asks_before_it_reads_and_warns_before_it_waits() -> None:
     check("--all is only ever the person's ask", "only when they ask for all of" in skill)
 
 
+def test_an_unknown_default_branch_drops_the_push_rules_instead_of_guessing() -> None:
+    """`main|master` on a repo whose default is `trunk` is a verified gate that
+    guards nothing, and it reads as protection. No origin/HEAD, no rule."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(BARE_REPO, Path(tmp) / "nohead")
+        subprocess.run(["git", "-C", str(repo), "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+                       check=True, capture_output=True)
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        ids, gone = {c["id"] for c in cands}, {d["id"]: d["reason"] for d in dropped}
+        check("exit 0", p.returncode == 0, p.stdout[-400:])
+        check("neither default-branch rule is seeded", not ids & {"push-main", "push-main-refspec"})
+        check("and the client is told why", "origin/HEAD" in gone.get("push-main", ""), str(gone.get("push-main")))
+        check("the scan says how to fix it", "set-head" in signals["signals"]["branch"]["evidence"])
+        check("no slot carries a guessed branch", "default_branch_rx" not in signals["slots"])
+
+
+def test_a_push_that_names_the_default_branch_is_caught_from_any_checkout() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(BARE_REPO, Path(tmp) / "bare")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        rx = {c["id"]: c["body"] for c in cands}["push-main-refspec"]["matcher"]["command_rx"]
+        for cmd in ("git push origin HEAD:trunk", "git push origin feat:refs/heads/trunk", "cd x && git push origin trunk"):
+            check(f"fires on `{cmd}`", bool(re.search(rx, cmd)))
+        for cmd in ("git push origin feat/x", "git push origin trunk-hotfix", "git push origin HEAD:feat/trunk"):
+            check(f"silent on `{cmd}`", not re.search(rx, cmd))
+
+
+def test_no_statement_promises_a_full_suite_the_engine_cannot_check() -> None:
+    """An ordering is discharged by ANY green command matching its pattern, a
+    targeted run included. A statement saying "the full suite" would describe
+    behaviour the rule does not implement."""
+    for r in CATALOG["rules"]:
+        if r.get("ordering") and "test_cmd_rx" in json.dumps(r["ordering"].get("required_command_rx", "")):
+            check(f"{r['id']}: does not claim a full suite ran", "full suite" not in r["statement"].lower(), r["statement"])
+
+
 def test_a_rule_that_fails_verification_fails_the_run() -> None:
     """The exit code is the gate the skill reads. A catalog whose rule cannot
     fire must not come back 0 — that is how an unverified rule gets filed."""

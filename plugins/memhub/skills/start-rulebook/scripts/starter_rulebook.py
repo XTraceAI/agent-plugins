@@ -128,10 +128,13 @@ def scan(repo: Path) -> dict:
         found("branch", "origin/HEAD → %s" % branch, value=branch)
         slots["default_branch_rx"] = "^(%s)$" % re.escape(branch)
         slots["default_branch"] = branch
+        slots["default_branch_esc"] = re.escape(branch)
     else:
-        missing("branch", "origin/HEAD is not set; main|master assumed")
-        slots["default_branch_rx"] = "^(main|master)$"
-        slots["default_branch"] = "main"
+        # No guess. `main|master` on a repo whose default is `trunk` yields a verified gate
+        # that guards nothing — worse than no rule, because it reads as protection. The two
+        # default-branch rules are dropped, and the report says how to get them back.
+        missing("branch", "origin/HEAD is not set, so the default branch is unknown — run "
+                          "`git remote set-head origin --auto` and scan again to get the push rules")
 
     # toolchains
     chains = []
@@ -495,7 +498,9 @@ _SLOT_WORDS = {"test_cmd_rx": "recognised test command", "lint_cmd_rx": "linter 
                "lock_cmd_rx": "lockfile", "manifest_paths": "dependency manifest",
                "manifest_rx": "dependency manifest", "install_cmd_rx": "dependency manifest",
                "slow_flag_rx": "slow or coverage test tier", "test_path_rx": "test directory",
-               "src_diff_rx": "clear source root", "tests_diff_rx": "test directory"}
+               "src_diff_rx": "clear source root", "tests_diff_rx": "test directory",
+               "default_branch_rx": "known default branch (origin/HEAD is not set)",
+               "default_branch_esc": "known default branch (origin/HEAD is not set)"}
 
 
 def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, list]:

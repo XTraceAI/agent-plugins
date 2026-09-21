@@ -382,7 +382,7 @@
    "requires": [
     "test_cmd_rx"
    ],
-   "statement": "Edits are uncommitted. Run the test file for what you changed; the full suite runs once, before push.",
+   "statement": "Edits are uncommitted. Run the test file for what you changed; leave the whole suite for CI or one run before push.",
    "why": "a bare suite run in the inner loop is the most common verification waste.",
    "matcher": {
     "event": "bash",
@@ -486,14 +486,14 @@
   {
    "id": "suite-before-push",
    "category": "verify",
-   "title": "Run the suite before push",
+   "title": "Run tests green before push",
    "mode": "gate",
    "delivery": "agent_hook",
    "requires": [
     "test_cmd_rx"
    ],
-   "statement": "Edits are in flight. The test suite runs green before anything leaves the machine.",
-   "why": "the exit is thorough so the loop can be cheap; a subagent's run counts.",
+   "statement": "Edits are in flight and no test run has come back green since. Run the tests for what you changed (the whole suite if it is quick) before anything leaves the machine.",
+   "why": "a push with no green run since the last edit is the cheapest failure to prevent. Any green test run clears it, targeted included: forcing a full local suite duplicates CI, and on a slow suite is how a rule gets switched off.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -1121,7 +1121,7 @@
      }
     }
    },
-   "seeded_from": "default branch, from origin/HEAD, anchored exactly",
+   "seeded_from": "default branch, from origin/HEAD, anchored exactly. No origin/HEAD, no rule: a guessed `main` would leave a `trunk` repo unguarded while looking guarded",
    "cases": {
     "fires": [
      {
@@ -1141,6 +1141,65 @@
      {
       "case": "git push",
       "branch": "maintenance/1.x"
+     }
+    ]
+   },
+   "requires": [
+    "default_branch_rx"
+   ]
+  },
+  {
+   "id": "push-main-refspec",
+   "category": "safety",
+   "title": "No pushing to the default branch by name",
+   "mode": "gate",
+   "delivery": "agent_hook",
+   "requires": [
+    "default_branch_esc"
+   ],
+   "statement": "This push names the default branch as its destination. Push your own branch and open a PR.",
+   "why": "`git push origin HEAD:{{default_branch}}` lands on the default branch from any checkout, so a rule that only looks at the current branch never sees it.",
+   "matcher": {
+    "event": "bash",
+    "command_rx": "{{GIT}}push\\b[^|;&]*\\s(?:\\+?[^\\s:]*:)?(?:refs/heads/)?{{default_branch_esc}}(?:\\s|$|[;&|])",
+    "command_not_rx": "\\s--dry-run\\b|\\s-n\\b|\\s(?:--delete|-d)\\s"
+   },
+   "seeded_from": "default branch, from origin/HEAD",
+   "cases": {
+    "fires": [
+     {
+      "case": "git push origin HEAD:{{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "cd api && git push origin feat/x:refs/heads/{{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push origin {{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push -f origin +HEAD:{{default_branch}}",
+      "branch": "feat/x"
+     }
+    ],
+    "silent": [
+     {
+      "case": "git push origin feat/x",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push -u origin {{default_branch}}-hotfix",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push origin HEAD:feat/{{default_branch}}",
+      "branch": "feat/x"
+     },
+     {
+      "case": "git push --dry-run origin HEAD:{{default_branch}}",
+      "branch": "feat/x"
      }
     ]
    }
@@ -2257,7 +2316,7 @@
    "category": "posture",
    "title": "Posture: verification order",
    "delivery": "session_context",
-   "statement": "Verification order: the linter, then the test file you touched, then the full suite once before push.",
+   "statement": "Verification order: the linter, then the test file you touched, then a wider run before push.",
    "why": "the ordering rules enforce it; this line means they rarely have to.",
    "cases": {}
   },
