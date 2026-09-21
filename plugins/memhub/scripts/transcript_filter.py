@@ -23,6 +23,7 @@ session.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 # The wrappers the client emits around a slash command: the invocation, the
@@ -287,3 +288,19 @@ def _hard_trim_block(block, keep: int):
                 HARD_MAX_RECORD_BYTES)}}
     return {"type": "text",
             "text": _elision_note(_size(block), None, HARD_MAX_RECORD_BYTES)}
+
+
+# Set on the headless `claude -p --resume <owner> --fork-session` that
+# `harness_stop.run_author` spawns. Its transcript is a COPY of the person's
+# session under a NEW session id, so shipping it lands the person's whole
+# history a second time as a separate conversation under the same title, and
+# every later pass adds another. It was measured on staging at 80 copies of one
+# session. The child is the plugin's own work, never the person's, so no path
+# may capture it.
+HARNESS_CHILD_ENV = "MEMHUB_HARNESS_CHILD"
+
+
+def is_harness_child(environ=None) -> bool:
+    env = os.environ if environ is None else environ
+    return str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() in (
+        "1", "on", "true", "yes")

@@ -755,6 +755,56 @@ def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
     print("PASS test_the_hook_command_starts_nothing_unless_the_flag_is_on")
 
 
+def test_an_authoring_child_neither_senses_nor_drains_when_settings_re_arm_the_flag():
+    """Live on staging: an install with MEMHUB_HARNESS_EXTRACT=1 in settings.json
+    `env` saw that value override the child's EXTRACT=0. The fork's own Stop
+    classified its turns and drained the repo's moments, which spawned more
+    forks. Under the child flag the Stop does nothing and the arc sensor records
+    nothing. The same Stop without the flag must still run."""
+    with _Env():
+        ran = []
+        real = hs.cmd_stop
+        hs.cmd_stop = lambda payload: ran.append(payload.get("session_id")) or 0
+        saved = os.environ.pop("MEMHUB_HARNESS_CHILD", None)
+        try:
+            os.environ["MEMHUB_HARNESS_CHILD"] = "1"      # EXTRACT is "1" in _Env
+            assert _stop(session_id="fork-1")[0] == 0
+            assert ran == [], ran
+            os.environ.pop("MEMHUB_HARNESS_CHILD")
+            _stop(session_id="owner-1")
+            assert ran == ["owner-1"], ran
+        finally:
+            hs.cmd_stop = real
+            os.environ.pop("MEMHUB_HARNESS_CHILD", None)
+            if saved is not None:
+                os.environ["MEMHUB_HARNESS_CHILD"] = saved
+        import rulebook_hook as rh  # noqa: PLC0415
+        assert not rh.harness_extract_on({"MEMHUB_HARNESS_CHILD": "1", "MEMHUB_HARNESS_EXTRACT": "1"})
+        assert rh.harness_extract_on({"MEMHUB_HARNESS_EXTRACT": "1"})
+    print("PASS test_an_authoring_child_neither_senses_nor_drains_when_settings_re_arm_the_flag")
+
+
+def test_the_author_child_is_launched_as_a_harness_child():
+    """The flag the capture and sensor lanes read is set by `run_author`."""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(argv=argv, env=kw.get("env") or {})
+        return subprocess.CompletedProcess(argv, 0, stdout="HARNESS-RESULT: none | x\n", stderr="")
+
+    real = hs.subprocess.run
+    hs.subprocess.run = fake_run
+    try:
+        hs.run_author("owner", {"state": {"session_id": "owner"}, "turn": 1,
+                                "source_ref": "owner#1", "kind": "error_arc"},
+                      "repo", Path("/nonexistent/mcp.json"))
+    finally:
+        hs.subprocess.run = real
+    assert "--fork-session" in seen["argv"]
+    assert seen["env"].get("MEMHUB_HARNESS_CHILD") == "1"
+    print("PASS test_the_author_child_is_launched_as_a_harness_child")
+
+
 def test_the_sensor_never_sends_activate():
     import re  # noqa: PLC0415
     src = (SCRIPTS / "harness_stop.py").read_text(encoding="utf-8")

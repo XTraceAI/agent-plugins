@@ -689,8 +689,14 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[st
         return "failed", {"detail": "the moment carries no session id to resume"}
     with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
         env = dict(os.environ,
-                   MEMHUB_HARNESS_CHILD="1",       # its hooks stay silent
-                   MEMHUB_HARNESS_EXTRACT="0",     # and it senses nothing
+                   # Its capture and harness lanes stay silent: the forked
+                   # transcript is a copy of the person's, and must neither
+                   # ship as a second conversation nor be sensed again. The
+                   # two lanes read this, not EXTRACT below, because a
+                   # settings.json `env` overrides what the child inherits.
+                   # Its rulebook hook still runs, for the forward test.
+                   MEMHUB_HARNESS_CHILD="1",
+                   MEMHUB_HARNESS_EXTRACT="0",
                    # its forward test arms a candidate in ITS OWN base
                    MEMHUB_RULEBOOK_BASE=os.path.join(scratch, "rulebook"))
         argv = [claude_bin(), "-p", author_prompt(session, moment, repo),

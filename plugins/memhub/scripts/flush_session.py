@@ -65,6 +65,7 @@ from redact import redact_records  # noqa: E402
 from transcript_filter import (  # noqa: E402
     drop_command_wrappers,
     elide_oversized_tool_results,
+    is_harness_child,
 )
 
 
@@ -591,6 +592,8 @@ def _auth_required(e: BaseException) -> bool:
 
 
 def main() -> int:
+    if is_harness_child():
+        return 0  # the harness's forked copy of a session; see is_harness_child
     # Bound BEFORE the try, because the handler reads them. Assigned inside it,
     # any failure earlier in the block — a malformed stdin payload is enough —
     # would make the handler itself raise NameError, and this script's one hard

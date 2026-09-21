@@ -46,6 +46,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 FLAG = "MEMHUB_HARNESS_EXTRACT"
+CHILD_FLAG = "MEMHUB_HARNESS_CHILD"   # set by harness_stop.run_author
 _ON = ("1", "on", "true", "yes")
 
 CLASSIFY_PATH = "/v1/team/rulebook/harness/classify"
@@ -71,6 +72,14 @@ def extract_enabled(environ=None) -> bool:
     ON; it went back to opt-in so an install never starts spending that
     without being asked. Unset, blank and unrecognised values are all off."""
     env = os.environ if environ is None else environ
+    if str(env.get(CHILD_FLAG, "")).strip().lower() in _ON:
+        # An authoring child is never sensed, whatever FLAG says. `run_author`
+        # sets FLAG=0 for it, but Claude Code applies a settings.json `env`
+        # OVER the environment a process inherits, and settings is where an
+        # install opts in with FLAG=1. So every opted-in install re-armed the
+        # lane in every child: the child's own turns were classified and
+        # drained, and one fork spawned the next.
+        return False
     return str(env.get(FLAG, "")).strip().lower() in _ON
 
 

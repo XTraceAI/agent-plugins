@@ -3375,7 +3375,10 @@ def harness_extract_on(environ=None):
     """Default OFF, matching `harness_extract.extract_enabled` — the two gates
     are one switch and must not disagree about what it says."""
     env = os.environ if environ is None else environ
-    return str(env.get(HARNESS_FLAG, "")).strip().lower() in ("1", "on", "true", "yes")
+    on = ("1", "on", "true", "yes")
+    if str(env.get("MEMHUB_HARNESS_CHILD", "")).strip().lower() in on:
+        return False          # an authoring child is never sensed (see extract_enabled)
+    return str(env.get(HARNESS_FLAG, "")).strip().lower() in on
 
 
 def arcs_path(session_id):
