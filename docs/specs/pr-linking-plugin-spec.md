@@ -65,7 +65,7 @@ are independent.
 | `plugins/memhub/scripts/cursor_capture.py` | Cursor's launcher. Today it only ever answers `{"permission": "allow"}` — see §5.3. |
 | `plugins/memhub/scripts/capture.py` + `scripts/readers/` | `list`/`import` over all three hosts. `current` is added here (§7). |
 | `plugins/memhub/skills/pr-babysit/SKILL.md` | House style for a skill that takes a PR argument, resolves the repo's room, and is auto-armed by a hook. |
-| `plugins/memhub/skills/rules-from-sessions/` | The precedent for a skill with its own `scripts/` that scans local transcripts and hands back JSON instead of transcript text. |
+| `plugins/memhub/skills/start-rulebook/` | The precedent for a skill with its own `scripts/` that scans local transcripts and hands back JSON instead of transcript text. |
 
 ---
 
@@ -788,7 +788,7 @@ python3 find_sessions.py --files-from <path> --branch <head-ref> [--base <base-r
 ```
 
 Stdlib only. Reads local sessions through `readers` — the same machinery
-`skills/rules-from-sessions/scripts/mine_sessions.py` uses; read that file first and follow its
+`skills/start-rulebook/scripts/mine_sessions.py` uses; read that file first and follow its
 shape (bounded reads, no transcript echo, JSON out).
 
 **Scanning.** For each of the most recent `--limit` sessions across the requested hosts, walk the

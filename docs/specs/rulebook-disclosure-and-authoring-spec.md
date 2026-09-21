@@ -109,7 +109,7 @@ Notes for the implementer:
   whatever the model does. This is the source of truth for "invariably".
 - **`additionalContext`** — an instruction to the agent to repeat the same line at the top of its
   reply. This is the copy that lands in the transcript, and therefore the only one that session
-  capture, `/memhub:rules-from-sessions`, a handoff, or a PR comment can ever see.
+  capture, `/memhub:start-rulebook`, a handoff, or a PR comment can ever see.
 
 Neither alone is enough: the first is invisible to everything downstream, the second is not
 guaranteed. The user sees the line twice when the model complies; that is the accepted cost.

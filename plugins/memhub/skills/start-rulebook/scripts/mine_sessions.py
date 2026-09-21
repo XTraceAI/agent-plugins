@@ -13,7 +13,10 @@ Numbers per row: applies-in N/M sessions (by host), precision = real misses, sam
 Friction delta: --baseline-date splits facet friction before/after a rulebook change.
 
 Stdlib + the memhub plugin's readers + the real hook evaluate() (never re-implemented).
-Usage: mine_sessions.py [--out DIR] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
+Window: the last 30 days of sessions by default (--days N), by each transcript's LAST activity. --all reads everything
+and is for when the person asks for it: a rule should answer to how the team works now, and an old corpus is slow to read.
+
+Usage: mine_sessions.py [--out DIR] [--days N | --all] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
 """
 import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex, functools
 
@@ -22,6 +25,8 @@ ap.add_argument("--out", default="mine-out")
 ap.add_argument("--baseline-date", help="friction before vs after this date (rule activation day)")
 ap.add_argument("--skills-file", help="memhub list_skills JSON reply, for skill-lane dedup")
 ap.add_argument("--repo", help="only sessions in this repo (resolved, so a worktree counts)")
+ap.add_argument("--days", type=int, default=None, help="only sessions active in the last N days (default 30; widened automatically so a --baseline-date keeps 30 days of 'before')")
+ap.add_argument("--all", action="store_true", help="every session on this machine, however old — only when the person asks for it")
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
 ap.add_argument("--rule-file", action="append", default=[], help="a create_rule body (matcher / ordering / anchors) to backtest as a candidate (repeatable) — used by create-rule")
 ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST of create_rule bodies (repeatable) — the checks you derived from CLAUDE.md in step 2; each may carry `claude_md: {heading, text}` (its origin sentence), `did`, `what`, `quote_rx`, `source_ref`")
@@ -42,7 +47,7 @@ def _save_cache(name, data):
 def _plugin_scripts():
     here = os.path.dirname(os.path.abspath(__file__))
     for c in (os.environ.get("MEMHUB_PLUGIN_SCRIPTS"), os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "scripts"),
-              os.path.normpath(os.path.join(here, "..", "..", "..", "scripts"))):   # shipped inside the plugin: skills/rules-from-sessions/scripts -> plugin scripts
+              os.path.normpath(os.path.join(here, "..", "..", "..", "scripts"))):   # shipped inside the plugin: skills/start-rulebook/scripts -> plugin scripts
         if c and os.path.isfile(os.path.join(c, "rulebook_hook.py")): return c
     cands = glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/memhub*/*/scripts/rulebook_hook.py")) + \
             glob.glob(os.path.expanduser("~/.claude/plugins/*/plugins/memhub*/scripts/rulebook_hook.py")) + \
@@ -60,12 +65,51 @@ for _fn in ("strip_leading_assignments", "strip_comments", "shell_only"):
     setattr(rh, _fn, functools.lru_cache(maxsize=None)(getattr(rh, _fn)))
 t0 = time.time()
 
+# ---------------------------------------------------------------- window
+# A month, not everything. Rules should answer to how the team works NOW: a habit dropped in the spring still
+# "fires" in March's transcripts and gets proposed as a problem. It is also most of the run time — a transcript
+# outside the window is skipped on its mtime, before it is parsed. mtime (last activity), not the first timestamp:
+# a long-lived session that was worked in yesterday belongs to this month.
+WINDOW_DAYS = None if args.all else (args.days if args.days is not None else 30)
+if WINDOW_DAYS is not None and args.days is None and args.baseline_date:
+    try:   # "did friction shrink?" needs a BEFORE: keep 30 days ahead of the baseline, however long ago it was
+        _since = (datetime.date.today() - datetime.date.fromisoformat(args.baseline_date)).days
+        WINDOW_DAYS = max(WINDOW_DAYS, _since + 30)
+    except ValueError: pass
+_cutoff = None if WINDOW_DAYS is None else time.time() - WINDOW_DAYS * 86400
+skipped_old = 0
+
 # ---------------------------------------------------------------- corpus
+def _last_activity(p):
+    """When a transcript was last written to. For a Cursor `store.db` the main file's mtime is NOT that: SQLite
+    keeps recent writes in `store.db-wal` until a checkpoint, and Cursor records the session's own recency in the
+    sibling `meta.json` (`updatedAtMs` — the value the Cursor reader itself treats as the session's age). Take the
+    newest of all of them, so a session worked in today is never dropped for the age of its main database file."""
+    stamps = []
+    for q in (p, p + "-wal", p + "-shm"):
+        try: stamps.append(os.path.getmtime(q))
+        except OSError: pass
+    if os.path.basename(p) == "store.db":
+        meta = os.path.join(os.path.dirname(p), "meta.json")
+        try:
+            stamps.append(os.path.getmtime(meta))
+            ms = json.load(open(meta)).get("updatedAtMs")
+            if isinstance(ms, (int, float)): stamps.append(ms / 1000.0)
+        except (OSError, ValueError, AttributeError): pass
+    return max(stamps) if stamps else None
+def _in_window(p):
+    global skipped_old
+    if _cutoff is None: return True
+    seen = _last_activity(p)
+    if seen is None: return True           # unreadable: let the reader decide, never drop it silently
+    fresh = seen >= _cutoff
+    skipped_old += not fresh
+    return fresh
 def sessions():
-    for p in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")): yield "claude", p
-    for p in glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*.jsonl")): yield "codex", p
-    for p in glob.glob(os.path.expanduser("~/.cursor/chats/*/*/store.db")): yield "cursor", p
-    for p in glob.glob(os.path.expanduser("~/.cursor/projects/*/agent-transcripts/*/*.jsonl")): yield "cursor", p
+    for host, pat in (("claude", "~/.claude/projects/*/*.jsonl"), ("codex", "~/.codex/sessions/*/*/*/rollout-*.jsonl"),
+                      ("cursor", "~/.cursor/chats/*/*/store.db"), ("cursor", "~/.cursor/projects/*/agent-transcripts/*/*.jsonl")):
+        for p in glob.glob(os.path.expanduser(pat)):
+            if _in_window(p): yield host, p
 R = {"claude": claude, "codex": codex, "cursor": cursor}
 corpus, errs = [], collections.Counter()
 def _repo_name(cwd):
@@ -134,6 +178,8 @@ _stamp = {s["id"]: f"{len(s['users'])}u{len(s['calls'])}c{len(s['results'])}r" f
 digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
 M = len(corpus); by_host = collections.Counter(s["host"] for s in corpus)
 print(f"sessions read: {dict(by_host)} (M={M})  read errors: {dict(errs)}  ({time.time()-t0:.0f}s)")
+print("window: every session on this machine (--all)" if WINDOW_DAYS is None else
+      f"window: sessions active in the last {WINDOW_DAYS} days — {skipped_old} older transcripts not read (any repo). --days N widens it; --all reads everything")
 print("tool calls per host:", {h: sum(len(s['calls']) for s in corpus if s['host'] == h) for h in R})
 def sample(s, text): return {"session": s["id"][:8], "host": s["host"], "repo": s["repo"], "text": text.replace("\n", " ")[:110]}
 
@@ -193,9 +239,23 @@ for d in pending[:args.digest_top]:
 k = max(1, args.digest_batch); batches = [paths[i:i + k] for i in range(0, len(paths), k)]
 json.dump(batches, open(os.path.join(args.out, "digest_batches.json"), "w"), indent=1)
 print(f"digests: {len(paths)} to read in {len(batches)} batches ({args.out}/digest_batches.json) — {len(pending)} sessions with signal not yet faceted, {sum(1 for d in digests if _faceted(d))} already faceted in earlier runs (SKILL.md step 3)")
+# /insights facets answer to the same window as everything else. They carry no date of their own, so the only
+# honest test is whether their session is one this run read: an /insights facet from the spring would otherwise
+# put March's friction and standards into a report that says "the last 30 days". Under --all nothing was left
+# out of the corpus for age — but with --repo the corpus is still one repo's, and another repo's facets have no
+# more business in its report than another month's.
+_in_corpus = {s["id"] for s in corpus}
+def _facet_in_window(d):
+    if WINDOW_DAYS is None and not args.repo: return True   # --all lifts the AGE cutoff only; a --repo run is still about that repo
+    sid = str(d.get("session_id") or "")
+    return bool(sid) and (sid in _in_corpus or (len(sid) >= 8 and any(full.startswith(sid) for full in _in_corpus)))
+insights_skipped = 0
 for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):   # optional extra seed if Claude Code /insights was ever run
-    try: d = json.load(open(f)); d.setdefault("source", "insights"); facets.append(d)
-    except Exception: pass
+    try: d = json.load(open(f)); d.setdefault("source", "insights")
+    except Exception: continue
+    if _facet_in_window(d): facets.append(d)
+    else: insights_skipped += 1
+if insights_skipped: print(f"window: {insights_skipped} /insights facets left out — their sessions are outside the window (or no longer on disk)")
 _start_full = {s["id"]: s["start"] for s in corpus}
 def start_of_id(sid):
     """facets.json may carry short ids (the digests print 8/12-char prefixes); match by prefix."""
@@ -333,17 +393,34 @@ for path, body in bodies:   # each joins the trigger it belongs to
     elif m: RULE_CANDS.append({"title": body.get("title", path), "matcher": m, "requires_prior_rx": body.get("requires_prior_rx"), **extra})
 def hook_rule(title, matcher):
     return rh.to_hook_rule({"rule_id": title, "title": title, "statement": "", "delivery": "agent_hook", "mode": "advise", "version": 1, "matcher": matcher, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []})
+@functools.lru_cache(maxsize=None)
+def _bash_reads(cmd):
+    try: return tuple(rh.bash_reads("/", cmd))      # no cwd in a transcript: relative paths resolve from /, which path patterns written as (?:^|/)name still match
+    except Exception: return ()
 def replay(rule, requires_prior_rx=None):
     """fired sessions (by host + ids), calls, genuine misses (fired with NO earlier required command that session), samples"""
     calls = collections.Counter(); sess = collections.Counter(); ids = []; misses = 0; ex = []
+    is_read = (rule or {}).get("on") == "read"
     for s in corpus:
         fired = False; prior = False
         for cl in s["calls"]:
-            tool_n = "Bash" if cl["tool"] == "Bash" else ("Write" if cl["tool"] in EDIT else None)
-            if not tool_n: continue
-            if requires_prior_rx and cl["cmd"] and re.search(requires_prior_rx, cl["cmd"]): prior = True
-            try: ok = rh.evaluate(rule, hook_phase="pre", tool=tool_n, cmd=cl["cmd"], file_path=cl["path"], body=cl["body"])
-            except Exception: ok = False
+            # A read rule sees what the live hook sees: the Read tool's path, and every file a Bash call would
+            # print (`cat .env`), through the hook's own parser. Skipping these made the whole read lane replay as
+            # ZERO — not "unmeasured", zero — which reads as "this team does not have that problem".
+            if is_read:
+                paths = [cl["path"]] if cl["tool"] == "Read" and cl["path"] else \
+                        [pth for pth, _ in _bash_reads(cl["cmd"])] if cl["tool"] == "Bash" and cl["cmd"] else []
+                ok = False
+                for pth in paths:
+                    try: ok = bool(rh.evaluate(rule, hook_phase="pre", tool="Read", cmd=cl["cmd"], file_path=pth))
+                    except Exception: ok = False
+                    if ok: break
+            else:
+                tool_n = "Bash" if cl["tool"] == "Bash" else ("Write" if cl["tool"] in EDIT else None)
+                if not tool_n: continue
+                if requires_prior_rx and cl["cmd"] and re.search(requires_prior_rx, cl["cmd"]): prior = True
+                try: ok = rh.evaluate(rule, hook_phase="pre", tool=tool_n, cmd=cl["cmd"], file_path=cl["path"], body=cl["body"])
+                except Exception: ok = False
             if ok:
                 calls[s["host"]] += 1
                 if not fired:
@@ -642,7 +719,7 @@ SKILL_INTENTS = [   # intent in a USER turn; `skill` = the name that would serve
  {"skill": "pr-babysit",     "intent_rx": r"babysit|watch (the |this )?pr|drive .* to green|until (it'?s )?green"},
  {"skill": "handoff-session","intent_rx": r"hand ?off|hand (this|it) (off|over) to"},
  {"skill": "search-memory",  "intent_rx": r"what do we know|did we decide|search (memhub|memory|the brain)|check (the )?(agent|repo) brain"},
- {"skill": "rules-from-sessions", "intent_rx": r"mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
+ {"skill": "start-rulebook", "intent_rx": r"set ?up (a|our|the) rulebook|(starter|default) rules|what rules should we (start|have)|mine (our|the|past) sessions|propose (rules|skills)|derive rules|backtest"},
 ]
 def invoked(s, name): return any(f"skills/{name}" in u or f"/{name}" in u for u in s["users"])
 print(f"\n=== SKILLS — what users ask for in their own words vs. the skill they actually invoked ({len(installed)} skills installed)")

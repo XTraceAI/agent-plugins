@@ -3710,7 +3710,7 @@ def disclosure_instruction(lines):
 
     The `systemMessage` copy is deterministic but invisible to everything
     downstream; this copy is the one that lands in the transcript, and so the
-    only one session capture, /memhub:rules-from-sessions, a handoff or a PR
+    only one session capture, /memhub:start-rulebook, a handoff or a PR
     comment can ever see. Neither alone is enough."""
     quoted = "\n".join(lines)
     return ("\n_Disclose these to the user. Begin your next reply with the following "
