@@ -282,13 +282,21 @@ def test_session_files_are_confined_and_broken_lines_are_skipped():
     print("PASS test_session_files_are_confined_and_broken_lines_are_skipped")
 
 
-def test_the_flag_is_off_by_default():
-    assert not hx.extract_enabled({})
-    for off in ("0", "off", "false", ""):
-        assert not hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": off}), off
-    for on in ("1", "on", "true", "YES"):
+def test_the_flag_is_on_by_default_and_every_off_spelling_works():
+    """Default ON since v0.69.0. The empty string moved sides with it: an unset
+    or blank variable is an install that never chose, and default-on means that
+    install senses and drains.
+
+    The off spellings matter more than they did as a flag: this now costs the
+    person a classifier call per flagged turn and a `claude -p` per authored
+    moment, on THEIR quota, so someone reaching for the brake must find it
+    whichever word they reach with."""
+    assert hx.extract_enabled({}), "unset is on"
+    for on in ("", "1", "on", "true", "YES", "anything-unrecognised"):
         assert hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": on}), on
-    print("PASS test_the_flag_is_off_by_default")
+    for off in ("0", "off", "false", "no", "OFF", "False", " 0 ", "NO"):
+        assert not hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": off}), off
+    print("PASS test_the_flag_is_on_by_default_and_every_off_spelling_works")
 
 
 def test_spawn_detaches_and_returns():
