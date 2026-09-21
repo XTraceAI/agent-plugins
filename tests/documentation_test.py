@@ -200,7 +200,17 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
                  # The claim keeps other sessions out, but the skill's own
                  # setup runs inside the same worktree, so a candidate matching
                  # cp/git/python3/rm can still fire on the parent's shell.
-                 "must be the sub-agent's rather than the parent's"):
+                 "must be the sub-agent's rather than the parent's",
+                 # Step 0 rule 3: ambiguity resolves to the repo's own book
+                 # instead of "file nothing", which read as fail-closed and was
+                 # not — on two bound all_org books it refused once and picked
+                 # a book every other time.
+                 "the repo's own book",
+                 "create_rulebook",
+                 # and the trap under it: an ORG ADMIN gets an empty book by
+                 # default, and a book that binds nobody serves nobody.
+                 "member_count: 0",
+                 "binds nobody"):
         check(f"create-rule keeps {text!r}", text in skill)
 
 
