@@ -1,6 +1,6 @@
 {
  "version": "2026-09-20",
- "about": "The starter rulebook: universal coding-agent rules whose repo-specific parts are {{slots}} filled by starter_rulebook.py from a scan of the checkout. `requires` names the slots a rule cannot exist without; a rule whose slot is missing is dropped, never filed with a guess. `cases` are run through the live hook's engine after seeding. Patterns match at command position ({{CMD}} / {{GIT}}), never `^`; paths match `(?:^|/)dir/` because the hook sees absolute paths; no quantified group contains + * or | because the hook's load lint drops those. `same_as` names the session miner's built-in hypothesis (mine_sessions.py) that covers the same ground under a different title and pattern: the deterministic conflict check cannot see those, so both skills read this list. Rules with `given.user` share one limit: `said_rx` / `not_said_rx` see every user turn of the session, unordered, so they cannot tell an approval that came before a request from one that came after. Every such rule is written to fail OPEN on that ambiguity (stay silent), never to block.",
+ "about": "The starter rulebook: universal coding-agent rules whose repo-specific parts are {{slots}} filled by starter_rulebook.py from a scan of the checkout. `requires` names the slots a rule cannot exist without; a rule whose slot is missing is dropped, never filed with a guess. `cases` are run through the live hook's engine after seeding. Patterns match at command position ({{CMD}} / {{GIT}}), never `^`; paths match `(?:^|/)dir/` because the hook sees absolute paths; no quantified group contains + * or | because the hook's load lint drops those. `same_as` names the session miner's built-in hypothesis (mine_sessions.py) that covers the same ground under a different title and pattern: the deterministic conflict check cannot see those, so both skills read this list. Rules with `given.user` share one limit: `said_rx` / `not_said_rx` see every user turn of the session, unordered, so they cannot tell an approval that came before a request from one that came after. Every such rule is written to fail OPEN on that ambiguity (stay silent), never to block. An ordering rule's `scope_paths` / `scope_exclude_paths` say which edits arm it; the hook honours them from 0.74.0, so every path-scoped gate carries that floor and an older hook advises instead of blocking on an edit the rule was never about.",
  "categories": [
   {
    "id": "budget",
@@ -224,11 +224,11 @@
    "mode": "advise",
    "delivery": "agent_hook",
    "statement": "The branch diff is over 400 lines. Run git diff --stat here and read it by file, or delegate the review one subagent per dimension.",
-   "why": "fires exactly when reading the diff costs the most.",
+   "why": "fires exactly when reading the diff costs the most. Only the whole-branch form: a diff narrowed to a path (`-- file`) or sent to a file is the advice already taken, and `git show <commit>` is that commit's size, not the branch's.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}(?:diff|show)\\b(?![^|;&]*\\s\\S+:\\S)",
-    "command_not_rx": "--stat|--name-only|--name-status|--shortstat|--quiet|\\|\\s*(?:head|wc|grep|sed|tail)",
+    "command_rx": "{{GIT}}diff\\b",
+    "command_not_rx": "--stat|--name-only|--name-status|--shortstat|--quiet|\\s--\\s+\\S|\\|\\s*(?:head|wc|grep|sed|tail)|\\s>>?\\s*\\S",
     "given": {
      "repo": {
       "diff_lines_gt": 400
@@ -265,6 +265,18 @@
      {
       "case": "git diff origin/main | grep -c '^+'",
       "diff_lines": 900
+     },
+     {
+      "case": "git diff origin/main -- app/x.py",
+      "diff_lines": 900
+     },
+     {
+      "case": "git diff origin/main > /tmp/x.patch",
+      "diff_lines": 900
+     },
+     {
+      "case": "git show HEAD~1",
+      "diff_lines": 900
      }
     ]
    }
@@ -280,7 +292,7 @@
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}(?:log\\b(?![^|;&]*(?:-n\\s*\\d|\\s-\\d|--max-count|\\.\\.|--since|--after|\\s-1\\b))|blame\\b(?![^|;&]*\\s-L))",
-    "command_not_rx": "\\|\\s*(?:head|wc|tail|grep)",
+    "command_not_rx": "\\|\\s*(?:head|wc|tail|grep)|\\s>>?\\s*\\S",
     "warn_once_per": "turn",
     "given": {
      "agent": {
@@ -300,7 +312,8 @@
      "git blame -L 10,40 src/app.py",
      "git log | head -30",
      "git log --oneline d3af5157..origin/main -- app/x.py",
-     "git log --since=2026-09-14 --oneline"
+     "git log --since=2026-09-14 --oneline",
+     "git log --oneline > /tmp/l.txt"
     ]
    }
   },
@@ -314,8 +327,13 @@
    "why": "recursive listings, dependency trees and container logs print until the buffer ends.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}(?:ls\\s+-[a-zA-Z]*R|tree\\b(?![^|;&]*-L)|pip3? freeze|npm ls\\b|docker logs\\b(?![^|;&]*--tail)|kubectl logs\\b(?![^|;&]*--tail)|journalctl\\b(?![^|;&]*\\s-n))",
-    "command_not_rx": "\\|\\s*(?:head|tail|wc|grep)"
+    "command_rx": "{{CMD}}(?:ls\\s+-[a-zA-Z]*R|tree\\b(?![^|;&]*-L)|pip3? freeze|npm ls\\b(?![^|;&]*--depth)|docker logs\\b(?![^|;&]*(?:--tail|\\s-n\\b|--since))|kubectl logs\\b(?![^|;&]*(?:--tail|--since))|journalctl\\b(?![^|;&]*(?:\\s-n|--since)))",
+    "command_not_rx": "\\|\\s*(?:head|tail|wc|grep)|\\s>>?\\s*\\S",
+    "given": {
+     "agent": {
+      "main": true
+     }
+    }
    },
    "cases": {
     "fires": [
@@ -327,7 +345,15 @@
      "tree -L 2",
      "docker logs --tail 100 api",
      "pip freeze | grep requests",
-     "ls -la"
+     "ls -la",
+     "pip freeze > requirements.txt",
+     "npm ls --depth=0",
+     "docker logs -n 50 api",
+     "docker logs --since 5m api",
+     {
+      "case": "ls -R",
+      "agent_main": false
+     }
     ]
    }
   },
@@ -452,7 +478,14 @@
     "silent": [
      "edit:src/a.py >> ok:{{lint_cmd_example}} >> gate:{{test_cmd_example}}"
     ]
-   }
+   },
+   "scope_exclude_paths": [
+    "*.md",
+    "*.mdx",
+    "*.rst",
+    "docs/*",
+    "LICENSE*"
+   ]
   },
   {
    "id": "lint-before-push",
@@ -482,9 +515,18 @@
      "edit:src/a.py >> ok:{{lint_cmd_example}} --version >> gate:git push"
     ],
     "silent": [
-     "edit:src/a.py >> ok:{{lint_cmd_example}} >> gate:git push"
+     "edit:src/a.py >> ok:{{lint_cmd_example}} >> gate:git push",
+     "edit:docs/a.md >> gate:git push"
     ]
-   }
+   },
+   "scope_exclude_paths": [
+    "*.md",
+    "*.mdx",
+    "*.rst",
+    "docs/*",
+    "LICENSE*"
+   ],
+   "min_hook_version": "0.74.0"
   },
   {
    "id": "suite-before-push",
@@ -497,7 +539,7 @@
     "test_receipt_rx"
    ],
    "statement": "Edits are in flight and no test run has come back green since. Run the tests for what you changed (the whole suite if it is quick) before anything leaves the machine.",
-   "why": "a push with no green run since the last edit is the cheapest failure to prevent. Any green test run clears it, targeted included: forcing a full local suite duplicates CI, and on a slow suite is how a rule gets switched off.",
+   "why": "a push with no green run since the last edit is the cheapest failure to prevent. Any green test run clears it, targeted included: forcing a full local suite duplicates CI, and on a slow suite is how a rule gets switched off. A docs-only edit never arms it: the suite cannot fail because of prose, and the non-code rule says to skip it.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{test_receipt_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -513,15 +555,26 @@
      "edit:src/a.py >> gate:git push",
      "edit:src/a.py >> red:{{test_cmd_example}} >> gate:gh pr create --fill",
      "edit:src/a.py >> ok:{{test_cmd_example}} --version >> gate:git push",
-     "edit:src/a.py >> ok:{{test_cmd_example}} --help >> gate:git push"
+     "edit:src/a.py >> ok:{{test_cmd_example}} --help >> gate:git push",
+     "edit:src/a.py >> ok:{{test_cmd_example}} >> edit:src/a.py >> gate:git push"
     ],
     "silent": [
-     "edit:src/a.py >> ok:{{test_cmd_example}} >> gate:git push"
+     "edit:src/a.py >> ok:{{test_cmd_example}} >> gate:git push",
+     "edit:README.md >> gate:git push",
+     "edit:docs/guide/setup.md >> gate:gh pr create --fill"
     ]
    },
    "same_as": [
     "tests-before-push"
-   ]
+   ],
+   "scope_exclude_paths": [
+    "*.md",
+    "*.mdx",
+    "*.rst",
+    "docs/*",
+    "LICENSE*"
+   ],
+   "min_hook_version": "0.74.0"
   },
   {
    "id": "tests-skip-noncode",
@@ -849,7 +902,7 @@
    "matcher": {
     "event": "edit",
     "path_rx": "{{test_path_rx}}",
-    "content_rx": "@pytest\\.mark\\.(?:skip|xfail)|pytest\\.skip\\(|\\b(?:it|test|describe)\\.skip\\(|\\bxit\\(|\\bt\\.Skip\\(|#\\[ignore\\]",
+    "content_rx": "@pytest\\.mark\\.(?:skip(?!if)|xfail)|pytest\\.skip\\(|\\b(?:it|test|describe)\\.skip\\(|\\bxit\\(|\\bt\\.Skip\\(|#\\[ignore\\]",
     "given": {
      "user": {
       "not_said_rx": "(?i:\\b(?:skip|xfail|ignore)\\b)"
@@ -878,6 +931,12 @@
       "user_said": [
        "make the build green"
       ]
+     },
+     {
+      "case": "/repo/tests/test_a.py::@pytest.mark.skipif(sys.platform == 'win32', reason='posix only')",
+      "user_said": [
+       "make the build green"
+      ]
      }
     ]
    }
@@ -892,7 +951,7 @@
    "why": "a snapshot update is a test deletion that looks like a fix.",
    "matcher": {
     "event": "bash",
-    "command_rx": "--snapshot-update|--update-snapshots?\\b|{{CMD}}(?:npx |pnpm exec )?(?:jest|vitest)\\b[^|;&]*\\s-u\\b|\\bINSTA_UPDATE=",
+    "command_rx": "--snapshot-update|--update-snapshots?\\b|{{CMD}}(?:jest|vitest)\\b[^|;&]*\\s-u\\b|{{CMD}}(?:npx|pnpm|yarn|npm|bun)\\s[^|;&]*\\b(?:jest|vitest|test)\\b[^|;&]*\\s-u\\b|\\bINSTA_UPDATE=",
     "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b",
     "given": {
      "user": {
@@ -913,6 +972,18 @@
       "user_said": [
        "fix the tests"
       ]
+     },
+     {
+      "case": "npm test -- -u",
+      "user_said": [
+       "fix the tests"
+      ]
+     },
+     {
+      "case": "pnpm vitest run -u",
+      "user_said": [
+       "fix the tests"
+      ]
      }
     ],
     "silent": [
@@ -927,6 +998,12 @@
       "user_said": [
        "fix the tests"
       ]
+     },
+     {
+      "case": "npx npm-check-updates -u",
+      "user_said": [
+       "fix the tests"
+      ]
      }
     ]
    }
@@ -937,11 +1014,11 @@
    "title": "Stop irreversible git operations",
    "mode": "gate",
    "delivery": "agent_hook",
-   "statement": "This rewrites or discards history or uncommitted work. Use the reversible form (--force-with-lease on your own branch, a commit on a scratch branch) or say why through the override.",
+   "statement": "This rewrites or discards history or stashed work. Use the reversible form (--force-with-lease on your own branch, a commit on a scratch branch) or say why through the override.",
    "why": "an undone action is the most expensive turn there is; filter-repo plus a force push caused a documented production outage. `branch -D` is left out: the reflog recovers it, and agents delete their own scratch branches constantly.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}(?:push\\b[^|;&]*(?:--force(?!-with-lease)|\\s-f\\b)|reset\\s+--hard|checkout\\s+--\\s+\\.(?:\\s|$)|restore\\s+(?:--\\S+\\s+)?\\.(?:\\s|$)|clean\\s+-[a-zA-Z]*f|stash\\s+(?:drop|clear)|filter-(?:repo|branch))"
+    "command_rx": "{{GIT}}(?:push\\b[^|;&]*(?:--force(?!-with-lease|-if-includes)|\\s-f\\b|\\s\\+[^\\s:]+)|reset\\s+--hard|stash\\s+(?:drop|clear)|filter-(?:repo|branch))"
    },
    "evidence": "matches every hook collection surveyed and Anthropic's own hook examples",
    "cases": {
@@ -949,18 +1026,17 @@
      "git push --force origin feat",
      "git push -f",
      "cd x && git reset --hard HEAD~1",
-     "git -C ../other clean -fd",
      "git stash clear",
-     "git restore ."
+     "git push origin +feat",
+     "/usr/bin/git reset --hard"
     ],
     "silent": [
      "git push --force-with-lease origin feat",
      "git push origin feat",
      "git commit -m 'never git reset --hard here'",
-     "git restore --staged a.py",
      "git stash",
-     "git checkout -- .env.example",
-     "git branch -D rulebook-fwd-16fee5b1"
+     "git branch -D rulebook-fwd-16fee5b1",
+     "git push --force-with-lease --force-if-includes origin feat"
     ]
    },
    "same_as": [
@@ -968,19 +1044,52 @@
    ]
   },
   {
+   "id": "git-discard-work",
+   "category": "safety",
+   "title": "Stop git commands that discard uncommitted work",
+   "mode": "gate",
+   "delivery": "agent_hook",
+   "statement": "This throws away uncommitted work across the tree, and nothing records it. Commit or stash first, name the one file, or say why through the override.",
+   "why": "the reflog keeps commits, not edits: a tree-wide checkout, restore, clean or a forced worktree removal is the one git loss with no undo. A dry run (`git clean -n`) and a single named file are left alone.",
+   "matcher": {
+    "event": "bash",
+    "command_rx": "{{GIT}}(?:checkout\\s+(?:--\\s+)?\\.(?:\\s|$)|(?:checkout|switch)\\s[^|;&]*(?:\\s-f\\b|--force\\b|--discard-changes\\b)|(?:checkout|switch)\\s+(?:-f|--force|--discard-changes)\\b|restore\\s+(?:--\\S+\\s+)?\\.(?:\\s|$)|clean\\b(?![^|;&]*(?:\\s-[a-zA-Z]*n|--dry-run))\\s+-[a-zA-Z]*f|worktree\\s+remove\\s[^|;&]*(?:--force\\b|\\s-f\\b))"
+   },
+   "cases": {
+    "fires": [
+     "git -C ../other clean -fd",
+     "git restore .",
+     "git checkout .",
+     "git checkout -- .",
+     "git checkout -f main",
+     "git switch --discard-changes main",
+     "git worktree remove --force ../wt"
+    ],
+    "silent": [
+     "git restore --staged a.py",
+     "git checkout -- .env.example",
+     "git clean -fdn",
+     "git clean -n",
+     "git checkout main",
+     "git worktree remove ../wt",
+     "git commit -m 'never git checkout . here'"
+    ]
+   }
+  },
+  {
    "id": "no-verify",
    "category": "safety",
    "title": "Never bypass commit hooks",
    "mode": "gate",
    "delivery": "agent_hook",
-   "statement": "--no-verify and core.hooksPath switch off the repo's own checks. Fix what the hook found, or ask.",
+   "statement": "--no-verify, HUSKY=0 and core.hooksPath switch off the repo's own checks. Fix what the hook found, or ask.",
    "why": "one documented session landed six commits with 63 failing tests this way, despite a written rule against it.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}[^|;&]*(?:--no-verify\\b|core\\.hooksPath)|{{GIT}}commit\\b[^|;&]*\\s-[a-mo-zA-Z]*n[a-zA-Z]*\\b(?![^|;&]*--dry-run)",
+    "command_rx": "{{GIT}}[^|;&\\\"']*(?:--no-verify\\b|core\\.hooksPath)|{{GIT}}[^|;&]*\\s--no-verify\\b[^\\\"'|;&]*(?:$|[|;&])|{{GIT}}commit\\b[^|;&\\\"']*\\s-[a-mo-zA-Z]*n[a-zA-Z]*\\b(?![^|;&]*--dry-run)|\\bHUSKY=0\\s",
     "given": {
      "user": {
-      "not_said_rx": "(?i:no.verify|skip (?:the )?hooks?)"
+      "not_said_rx": "(?i:no.verify|husky|skip (?:the )?hooks?)"
      }
     }
    },
@@ -1003,6 +1112,18 @@
       "user_said": [
        "commit this"
       ]
+     },
+     {
+      "case": "git commit -m 'wip: parser' --no-verify",
+      "user_said": [
+       "commit this"
+      ]
+     },
+     {
+      "case": "HUSKY=0 git commit -m 'x: y'",
+      "user_said": [
+       "commit this"
+      ]
      }
     ],
     "silent": [
@@ -1016,6 +1137,18 @@
       "case": "git commit --no-verify -m 'x'",
       "user_said": [
        "commit with --no-verify, the hook is broken"
+      ]
+     },
+     {
+      "case": "git commit -m 'cli: add -n flag for dry run'",
+      "user_said": [
+       "commit this"
+      ]
+     },
+     {
+      "case": "git commit -m 'docs: never use --no-verify'",
+      "user_said": [
+       "commit this"
       ]
      }
     ]
@@ -1058,11 +1191,11 @@
    "title": "Never recursively delete home or root",
    "mode": "gate",
    "delivery": "agent_hook",
-   "statement": "This recursive delete targets a home directory, the filesystem root, a parent directory or a bare glob. Stop: name the exact directory instead.",
+   "statement": "This recursive delete targets a home directory, the filesystem root, a system directory, a parent directory or a bare glob. Stop: name the exact directory instead.",
    "why": "the three documented home-directory wipes all had this shape; there is no legitimate agent task that needs it.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}(?:sudo\\s+)?(?:\\S*/)?rm(?=[^|;&]*\\s(?:-[a-zA-Z]*[rR]|--recursive))\\s[^|;&]*\\s[\"']?(?:~|\\$HOME|\\$\\{HOME\\}|/|\\.\\.?|\\*|/\\*|~/\\*|/(?:usr|etc|var|home|Users|opt|bin))/?[\"']?(?:\\s|$|[;&|])"
+    "command_rx": "{{CMD}}(?:sudo\\s+)?(?:\\S*/)?rm(?=[^|;&]*\\s(?:-[a-zA-Z]*[rR]|--recursive))\\s[^|;&]*\\s[\\\"']?(?:(?:~|\\$HOME|\\$\\{HOME\\}|\\.\\.?)[\\\"']?/?\\*?|/\\*?|\\*|/(?:usr|etc|var|home|Users|opt|bin)/?[^/\\s\\\"']*/?)[\\\"']?(?:\\s|$|[;&|])"
    },
    "evidence": "documented incidents 2025-07 to 2026-09",
    "cases": {
@@ -1074,39 +1207,73 @@
      "rm -rf \"$HOME\"",
      "cd x && rm -rf ..",
      "rm -rf *",
-     "rm -fr build ~/"
+     "rm -fr build ~/",
+     "rm -rf /Users/felix",
+     "rm -rf /home/me/",
+     "rm -rf ./*",
+     "rm -rf $HOME/*",
+     "rm -rf \"$HOME\"/"
     ],
     "silent": [
      "rm -rf build",
      "rm -rf ~/project/dist",
      "rm -rf ./node_modules",
      "rm -f ~/.cache/x.log",
-     "rm -rf \"$BASE\""
+     "rm -rf \"$BASE\"",
+     "rm -rf /Users/felix/project/dist",
+     "rm -rf ./build/*",
+     "rm -rf /var/folders/ab/T/x"
     ]
    }
   },
   {
    "id": "delete-by-other-means",
    "category": "safety",
-   "title": "Stop bulk deletes by other tools",
-   "mode": "gate",
+   "title": "Look before a bulk delete by another tool",
+   "mode": "advise",
    "delivery": "agent_hook",
-   "statement": "This deletes or overwrites in bulk without rm. Name what and why through the override.",
-   "why": "find -delete, xargs rm, rmtree and dd are how a delete gets past an rm rule.",
+   "statement": "This deletes in bulk without rm. Check what it matches first (run the find without -delete), then delete.",
+   "why": "find -delete, find -exec rm, xargs rm and rmtree are how a delete gets past an rm rule. Advises for the same reason the rm rule does: replayed, these are overwhelmingly cache and scratch cleanup, and a gate that fires that often gets overridden by habit.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}find\\b[^|;&]*\\s-delete\\b|\\|\\s*xargs\\s[^|;&]*\\brm\\b|shutil\\.rmtree\\(|{{CMD}}(?:sudo\\s+)?dd\\b[^|;&]*\\bof=/dev/|{{CMD}}(?:sudo\\s+)?mkfs",
-    "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b[^|;&]*$"
+    "command_rx": "{{CMD}}find\\b[^|;&]*\\s-delete\\b|{{CMD}}find\\b[^|;&]*-exec\\s+(?:sudo\\s+)?rm\\b|\\|\\s*xargs\\s[^|;&]*\\brm\\b|shutil\\.rmtree\\(",
+    "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b[^|;&]*$|{{CMD}}find\\s+[\\\"']?(?:/tmp/|/private/tmp/|/var/folders/|\\$\\{?TMPDIR\\b)",
+    "warn_once_per": "session"
    },
    "cases": {
     "fires": [
      "find . -name '*.pyc' -delete",
      "git ls-files | xargs rm",
-     "python3 -c \"import shutil; shutil.rmtree('data')\""
+     "python3 -c \"import shutil; shutil.rmtree('data')\"",
+     "find . -name '*.orig' -exec rm -rf {} +"
     ],
     "silent": [
      "find . -name '*.pyc'",
-     "grep -rn \"shutil.rmtree(\" ."
+     "grep -rn \"shutil.rmtree(\" .",
+     "find /tmp/claude/x -name '*.log' -delete"
+    ]
+   }
+  },
+  {
+   "id": "disk-overwrite",
+   "category": "safety",
+   "title": "Never write to a raw device",
+   "mode": "gate",
+   "delivery": "agent_hook",
+   "statement": "This writes to a raw device or makes a filesystem on one. Stop and confirm with the person.",
+   "why": "dd to /dev and mkfs erase a disk, not a directory; no agent task needs either unasked.",
+   "matcher": {
+    "event": "bash",
+    "command_rx": "{{CMD}}(?:sudo\\s+)?dd\\b[^|;&]*\\bof=/dev/(?!null\\b|stdout\\b|stderr\\b)|{{CMD}}(?:sudo\\s+)?mkfs"
+   },
+   "cases": {
+    "fires": [
+     "sudo dd if=image.iso of=/dev/disk2 bs=1m",
+     "mkfs.ext4 /dev/sdb1"
+    ],
+    "silent": [
+     "dd if=/dev/zero of=/dev/null count=1",
+     "dd if=/dev/urandom of=blob.bin bs=1k count=4"
     ]
    }
   },
@@ -1117,10 +1284,10 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "You are on the default branch. Work on a branch and open a PR.",
-   "why": "the most common written team rule, and one of the few that is fully deterministic. Only a push of the CURRENT branch: an explicitly named other ref (`git push origin feat/x`) does not touch the default branch, and one that names it is the companion rule's.",
+   "why": "the most common written team rule, and one of the few that is fully deterministic. Only a push of the CURRENT branch: an explicitly named other ref (`git push origin feat/x`) does not touch the default branch, and one that names it is the companion rule's. A token that starts a redirect (`2>&1`) or another command (`&& gh pr create`) is not a ref: the first version read them as one and went silent on the commonest push there is.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}push\\b(?![^|;&]*\\s[^-\\s]\\S*\\s+(?!HEAD(?:\\s|$|[;&|]))[^-\\s])",
+    "command_rx": "{{GIT}}push\\b(?![^|;&]*\\s(?!\\d?[<>])[^-\\s|;&][^\\s|;&]*\\s+(?!HEAD(?:\\s|$|[;&|])|\\d?[<>])[^-\\s|;&])",
     "given": {
      "repo": {
       "branch_rx": "{{default_branch_rx}}"
@@ -1145,6 +1312,30 @@
      },
      {
       "case": "git push -u origin HEAD",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push origin HEAD 2>&1",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push origin HEAD && echo done",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push && gh pr create --fill",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push 2>&1 | tail -3",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push -u origin HEAD; git status",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "/usr/bin/git push",
       "branch": "{{default_branch}}"
      }
     ],
@@ -1171,6 +1362,10 @@
      },
      {
       "case": "git push origin HEAD:feat/x",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push origin v1.2.3 2>&1 | tail -3",
       "branch": "{{default_branch}}"
      }
     ]
@@ -1258,22 +1453,29 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "Drops, truncates, unscoped deletes and downgrades stop here. Say which database and why through the override.",
-   "why": "cheap to type, impossible to undo without a backup.",
+   "why": "cheap to type, impossible to undo without a backup. A commit message or a PR body that mentions the words is not a database call; lower-case `truncate` alone is English.",
    "matcher": {
     "event": "bash",
-    "command_rx": "(?i:\\bDROP\\s+(?:TABLE|DATABASE|SCHEMA)\\b|\\bTRUNCATE\\s+(?:TABLE\\s+)?\\w|\\bDELETE\\s+FROM\\s+[\\w.\"]+\\s*(?:;|[\"']|$))|\\bFLUSHALL\\b|migrate:fresh|db:reset{{mig_destructive_alt}}",
-    "command_not_rx": "{{CMD}}(?:grep|rg|git grep|git log|git commit)\\b[^|;&]*$"
+    "command_rx": "(?i:\\bDROP\\s+(?:TABLE|DATABASE|SCHEMA)\\b|\\bTRUNCATE\\s+TABLE\\s|\\bDELETE\\s+FROM\\s+[\\w.\\\"]+\\s*(?:;|[\\\"']|$))|\\bTRUNCATE\\s+\\w|\\bFLUSHALL\\b|{{CMD}}dropdb\\b|migrate:fresh|db:reset{{mig_destructive_alt}}",
+    "command_not_rx": "{{CMD}}(?:grep|rg|git grep|git log|git commit|gh pr|gh issue|gh release)\\b[^|;&]*(?i:\\bDROP\\s|\\bTRUNCATE\\s|\\bDELETE\\s+FROM\\b)"
    },
    "seeded_from": "migrations dir: the repo's migration tool and its destructive verbs",
    "cases": {
     "fires": [
      "psql $URL -c 'DROP TABLE users'",
      "psql -c \"delete from sessions;\"",
-     "redis-cli FLUSHALL"
+     "redis-cli FLUSHALL",
+     "dropdb app_dev",
+     "psql -c 'TRUNCATE sessions'",
+     "git commit -m 'wip: x' && psql -c 'DROP TABLE users'"
     ],
     "silent": [
      "psql -c \"DELETE FROM sessions WHERE id = 4\"",
-     "grep -rn 'DROP TABLE' migrations/"
+     "grep -rn 'DROP TABLE' migrations/",
+     "gh pr create --title 'x' --body 'We truncate long tool outputs'",
+     "gh issue comment 5 --body 'do not drop table users'",
+     "git commit -m 'drop table cleanup' && git push",
+     "truncate -s 0 app.log"
     ]
    }
   },
@@ -1309,6 +1511,10 @@
       "case": "bash:cat .env",
       "file_lines": 12,
       "cwd": "/repo"
+     },
+     {
+      "case": "read:/repo/.envrc",
+      "file_lines": 12
      }
     ],
     "silent": [
@@ -1333,7 +1539,7 @@
    "why": "a secret leak and a noise dump in one command.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}(?:env|printenv)\\s*(?:$|[>;&]|\\|\\s*(?!\\s|\\S*grep\\b|rg\\b))|{{CMD}}(?:grep|rg|base64|xxd|strings|awk)\\b[^|;&]*\\s\\S*\\.env(?:\\.(?!example|sample|template)[\\w-]+)?(?:\\s|$)|{{CMD}}(?:set|export\\s+-p)\\s*(?:$|[|>])"
+    "command_rx": "{{CMD}}(?:env|printenv)\\s*(?:$|[>;&]|\\|\\s*(?!\\s|\\S*grep\\b|rg\\b))|{{CMD}}(?:cat|head|tail|sed|grep|rg|base64|xxd|strings|awk)\\b[^|;&]*\\s\\S*\\.env(?:rc|\\.(?!example|sample|template|dist)[\\w-]+)?(?:\\s|$)|{{CMD}}(?:set|export\\s+-p)\\s*(?:$|[|>])|\\bprint\\(\\s*(?:dict\\()?os\\.environ\\s*\\)|console\\.log\\(\\s*process\\.env\\s*\\)"
    },
    "cases": {
     "fires": [
@@ -1342,7 +1548,10 @@
      "cd api && env > /tmp/e",
      "grep KEY .env",
      "base64 .env.production",
-     "env | sort"
+     "env | sort",
+     "cat .env.staging | grep KEY",
+     "python3 -c 'import os; print(os.environ)'",
+     "node -e 'console.log(process.env)'"
     ],
     "silent": [
      "env CI=1 pytest tests/test_a.py",
@@ -1350,7 +1559,9 @@
      "grep KEY .env.example",
      "echo $HOME",
      "env | grep -i CLAUDE_PLUGIN_ROOT",
-     "env | /usr/bin/grep -E '^(JEV|OPENAI)'"
+     "env | /usr/bin/grep -E '^(JEV|OPENAI)'",
+     "python3 -c 'import os; print(os.environ[\"HOME\"])'",
+     "cat .env.example"
     ]
    }
   },
@@ -1539,7 +1750,7 @@
    "why": "the structural fix is dev/prod separation; this is the tripwire until then.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}kubectl\\b[^|;&]*--context[= ]\\S*prod|{{CMD}}aws\\b[^|;&]*--profile[= ]\\S*prod|{{CMD}}terraform\\s+(?:apply|destroy)\\b|{{CMD}}fly(?:ctl)?\\s+deploy\\b|{{CMD}}vercel\\b[^|;&]*--prod\\b{{prod_workflow_alt}}",
+    "command_rx": "{{CMD}}(?:kubectl\\b[^|;&]*--context|aws\\b[^|;&]*--profile)[= ]\\S*(?<!non)(?<!non-)(?<!pre)(?<!pre-)prod|{{CMD}}terraform\\s+(?:apply|destroy)\\b|{{CMD}}fly(?:ctl)?\\s+deploy\\b|{{CMD}}vercel\\b[^|;&]*--prod\\b{{prod_workflow_alt}}",
     "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b[^|;&]*$"
    },
    "seeded_from": "CI workflows: the deploy and release workflow names",
@@ -1553,7 +1764,9 @@
      "kubectl --context=dev get pods",
      "terraform plan",
      "python train.py --profile production",
-     "py-spy record --profile prod-like -- python app.py"
+     "py-spy record --profile prod-like -- python app.py",
+     "kubectl --context=nonprod get pods",
+     "aws s3 ls --profile acme-pre-prod"
     ]
    }
   },
@@ -1564,20 +1777,26 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "Download it, read it, then run it.",
-   "why": "the one supply-chain rule that costs nothing to enforce.",
+   "why": "the one supply-chain rule that costs nothing to enforce. The installer forms count too: `bash -c \"$(curl …)\"`, `bash <(curl …)`, a `tee` in the middle, and an interpreter reading the download from stdin.",
    "matcher": {
     "event": "bash",
-    "command_rx": "(?:curl|wget)\\b[^|;&]*\\|\\s*(?:sudo\\s+)?(?:ba|z|da)?sh\\b",
+    "command_rx": "(?:curl|wget)\\b[^;&]*\\|\\s*(?:sudo\\s+)?(?:(?:ba|z|da)?sh\\b|(?:python3?|node|perl|ruby)\\s*(?:-\\s*)?(?:$|[;&|]))|\\b(?:ba|z|da)?sh\\s+(?:-c\\s+)?[\\\"']?(?:\\$\\(|<\\()\\s*(?:curl|wget)\\b",
     "command_not_rx": "{{CMD}}(?:grep|rg|git grep|echo)\\b[^|;&]*$"
    },
    "cases": {
     "fires": [
      "curl -fsSL https://get.example.sh | sh",
-     "wget -qO- https://x.io/i.sh | sudo bash"
+     "wget -qO- https://x.io/i.sh | sudo bash",
+     "bash -c \"$(curl -fsSL https://x.io/install.sh)\"",
+     "bash <(curl -s https://x.io/i.sh)",
+     "curl -s https://x.io/i.py | python3",
+     "curl -s https://x.io/i.sh | tee i.sh | sh"
     ],
     "silent": [
      "curl -fsSL https://get.example.sh -o install.sh",
-     "curl -s https://api.example.com/v1 | jq ."
+     "curl -s https://api.example.com/v1 | jq .",
+     "curl -s https://api.example.com/v1 | python3 -m json.tool",
+     "curl -s https://api.example.com/v1 | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"id\"])'"
     ]
    }
   },
@@ -1588,13 +1807,13 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "This file configures the agent's own hooks, permissions or CI. Propose the change and let the person make it, unless they asked for it.",
-   "why": "an agent that can rewrite its hooks and workflows can switch off every other rule in this book.",
+   "why": "an agent that can rewrite its hooks and workflows can switch off every other rule in this book. `hooks` and `settings` on their own do not count as asking: a session about React hooks or a settings page says both.",
    "matcher": {
     "event": "edit",
-    "path_rx": "(?:^|/)\\.claude/(?:settings[^/]*\\.json$|hooks/)|(?:^|/)\\.cursor/hooks|(?:^|/)hooks\\.json$|(?:^|/)\\.git/hooks/|(?:^|/)\\.github/workflows/|(?:^|/)\\.pre-commit-config\\.yaml$",
+    "path_rx": "(?:^|/)\\.claude/(?:settings[^/]*\\.json$|hooks/)|(?:^|/)\\.cursor/hooks|(?:^|/)hooks\\.json$|(?:^|/)\\.git/hooks/|(?:^|/)\\.github/workflows/|(?:^|/)\\.pre-commit-config\\.yaml$|(?:^|/)\\.husky/|(?:^|/)lefthook\\.ya?ml$",
     "given": {
      "user": {
-      "not_said_rx": "(?i:\\b(?:hooks?|workflows?|settings|permissions?|ci|pipeline|pre-commit|github actions?)\\b)"
+      "not_said_rx": "(?i:\\b(?:(?:git|claude|agent|commit|pre-?commit|pre-?push) hooks?|hooks\\.json|settings\\.json|\\.claude|husky|lefthook|workflows?|permissions?|ci|pipeline|pre-commit|github actions?)\\b)"
      }
     }
    },
@@ -1611,6 +1830,18 @@
       "user_said": [
        "make the tests pass"
       ]
+     },
+     {
+      "case": "/repo/.husky/pre-commit::exit 0",
+      "user_said": [
+       "make the tests pass"
+      ]
+     },
+     {
+      "case": "/repo/.github/workflows/test.yml::continue-on-error: true",
+      "user_said": [
+       "fix the useAuth hooks in the settings page"
+      ]
      }
     ],
     "silent": [
@@ -1624,6 +1855,12 @@
       "case": "/repo/src/hooks.py::x = 1",
       "user_said": [
        "make the tests pass"
+      ]
+     },
+     {
+      "case": "/repo/.claude/settings.json::{}",
+      "user_said": [
+       "add a claude hook that runs the linter"
       ]
      }
     ]
@@ -1662,22 +1899,26 @@
    "requires": [
     "docker"
    ],
-   "statement": "This deletes volumes or prunes the machine's Docker state, which takes local databases with it. Name what and why through the override.",
-   "why": "a named volume is somebody's development database.",
+   "statement": "This deletes Docker volumes, which takes local databases with it. Name what and why through the override.",
+   "why": "a named volume is somebody's development database. Image and build-cache prunes are left alone: they cost a rebuild, not data.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}docker\\s+(?:system|volume|image|builder)\\s+prune|{{CMD}}docker\\s+volume\\s+rm\\b|{{CMD}}docker[ -]compose\\s[^|;&]*\\bdown\\b[^|;&]*\\s(?:-v|--volumes)\\b"
+    "command_rx": "{{CMD}}docker\\s+volume\\s+(?:prune|rm)\\b|{{CMD}}docker\\s+system\\s+prune\\b[^|;&]*--volumes\\b|{{CMD}}docker[ -]compose\\s[^|;&]*\\bdown\\b[^|;&]*\\s(?:-v|--volumes)\\b"
    },
    "seeded_from": "Dockerfile or compose file present",
    "cases": {
     "fires": [
-     "docker system prune -af",
+     "docker system prune -af --volumes",
+     "docker volume rm app_pgdata",
      "docker compose down -v",
      "docker-compose -f dev.yml down --volumes"
     ],
     "silent": [
      "docker compose down",
-     "docker ps"
+     "docker ps",
+     "docker builder prune -f",
+     "docker image prune -f",
+     "docker system prune -af"
     ]
    }
   },
@@ -1717,26 +1958,51 @@
    "title": "No commands that wait for a keyboard",
    "mode": "gate",
    "delivery": "agent_hook",
-   "statement": "This waits for a keyboard that is not there. Use the non-interactive form: git commit -m, git rebase without -i, python -c.",
-   "why": "a hung call wastes the whole turn and often the session.",
+   "statement": "This waits for a keyboard that is not there. Use the non-interactive form: python -c, psql -c, git rebase without -i, git add by name.",
+   "why": "a hung call wastes the whole turn and often the session. A REPL at the end of a pipe (`echo … | python3`) reads stdin and returns, so only a bare one at command position counts.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}(?:vim?|nano|emacs|top|htop|python3?|node|psql|irb|less|more)\\s*$|{{GIT}}(?:rebase|add)\\b[^|;&]*\\s(?:-i|--interactive|-p|--patch)\\b|{{GIT}}commit\\b(?![^|;&]*(?:\\s-[a-zA-Z]*m|\\s-F\\b|--message|--file|--no-edit|\\s-C\\b|--dry-run))"
+    "command_rx": "(?:^|[;&]\\s*)(?:vim?|nano|emacs|top|htop|python3?|node|psql|irb|less|more)\\s*$|{{GIT}}(?:rebase|add)\\b[^|;&]*\\s(?:-i|--interactive|-p|--patch)\\b"
    },
    "cases": {
     "fires": [
      "vim",
      "python3",
      "git rebase -i HEAD~3",
+     "cd x && git add -p"
+    ],
+    "silent": [
+     "python3 -c 'print(1)'",
+     "git rebase origin/main",
+     "echo 'print(1)' | python3",
+     "cat q.sql | psql"
+    ]
+   }
+  },
+  {
+   "id": "tty-git-editor",
+   "category": "traps",
+   "title": "No git commands that open an editor",
+   "mode": "gate",
+   "delivery": "agent_hook",
+   "statement": "This opens an editor for the message and hangs. Pass it: git commit -m, git commit --amend --no-edit, git revert --no-edit.",
+   "why": "a hung call wastes the whole turn and often the session. `--fixup` writes its own message and is left alone.",
+   "matcher": {
+    "event": "bash",
+    "command_rx": "{{GIT}}commit\\b(?![^|;&]*(?:\\s-[a-zA-Z]*m|\\s-F\\b|--message|--file|--no-edit|\\s-C\\b|--dry-run|--fixup))|{{GIT}}revert\\b(?![^|;&]*(?:--no-|\\s-n\\b|--abort|--quit|--skip))"
+   },
+   "cases": {
+    "fires": [
      "git commit",
-     "cd x && git commit --amend"
+     "cd x && git commit --amend",
+     "git revert abc123"
     ],
     "silent": [
      "git commit -m 'parser: handle eof'",
      "git commit -am 'parser: handle eof'",
      "git commit --amend --no-edit",
-     "python3 -c 'print(1)'",
-     "git rebase origin/main"
+     "git commit --fixup=abc123",
+     "git revert --no-edit abc123"
     ]
    }
   },
@@ -1750,8 +2016,8 @@
    "why": "same failure as a blocked terminal, with output attached. Advises rather than blocks because a backgrounded follower is legitimate and the hook cannot see the difference.",
    "matcher": {
     "event": "bash",
-    "command_rx": "\\s--watch(?:All)?\\b|{{CMD}}tail\\s+-[a-zA-Z]*[fF]|{{CMD}}watch\\s|{{CMD}}(?:npx\\s+)?nodemon\\b|\\bpytest-watch\\b|{{CMD}}ptw\\b",
-    "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b[^|;&]*$|\\bgh\\s+(?:pr checks|run watch)\\b"
+    "command_rx": "\\s--watch(?:All)?\\b(?!=false)|{{CMD}}tail\\s+-[a-zA-Z]*[fF]|{{CMD}}watch\\s|{{CMD}}(?:npx\\s+)?nodemon\\b|\\bpytest-watch\\b|{{CMD}}ptw\\b",
+    "command_not_rx": "{{CMD}}(?:grep|rg|git grep)\\b[^|;&]*$|\\bgh\\s+(?:pr checks|run watch)\\b|[^&]&\\s*$"
    },
    "cases": {
     "fires": [
@@ -1762,7 +2028,10 @@
     "silent": [
      "tail -n 50 logs/app.log",
      "npx jest src/a.test.ts",
-     "gh pr checks 1249 --watch --interval 20 | tail -3"
+     "gh pr checks 1249 --watch --interval 20 | tail -3",
+     "npm test -- --watchAll=false",
+     "npx vitest --watch=false",
+     "tail -f log.txt &"
     ]
    }
   },
@@ -1776,12 +2045,13 @@
    "why": "polling loops are the quiet turn-eater.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{CMD}}sleep\\s+\\d{2,}"
+    "command_rx": "{{CMD}}sleep\\s+\\d{2,}|\\bdo\\s+sleep\\s"
    },
    "cases": {
     "fires": [
      "sleep 60",
-     "gh run watch; sleep 120 && gh run view"
+     "gh run watch; sleep 120 && gh run view",
+     "until curl -s localhost:8000; do sleep 5; done"
     ],
     "silent": [
      "sleep 2",
@@ -1819,7 +2089,7 @@
    "title": "Clean the tree before branch operations",
    "mode": "advise",
    "delivery": "agent_hook",
-   "statement": "Uncommitted changes. Commit them (a WIP commit on your branch is fine) before you pull, rebase, or switch.",
+   "statement": "Uncommitted changes. Stash them (or commit them, if the person asked for commits) before you pull, rebase, or switch.",
    "why": "the cheapest merge conflict is the one that never starts; a documented postmortem lost work exactly here.",
    "matcher": {
     "event": "bash",
@@ -1869,19 +2139,28 @@
    "why": "debug scripts and notes at the root end up in the commit.",
    "matcher": {
     "event": "edit",
-    "path_rx": "(?:^|/)(?:scratch|tmp|temp|notes|debug|foo|bar|untitled|test_?\\d+)[^/]*\\.(?:py|js|ts|sh|md|txt|log|json)$",
+    "path_rx": "(?:^|/)(?:(?:scratch|tmp|temp)(?![a-zA-Z])[^/]*|(?:debug|foo|bar|untitled)[-_]?\\d*|test_?\\d+)\\.(?:py|js|ts|sh|md|txt|log|json)$",
     "path_not_rx": "^/(?:tmp|private/tmp|var/folders|private/var)/|/scratchpad/|(?:^|/)docs?/",
     "warn_once_per": "file"
    },
    "cases": {
     "fires": [
      "/repo/scratch.py::print(1)",
-     "/repo/src/debug_parser.py::print(1)"
+     "/repo/src/debug2.py::print(1)",
+     "/repo/tmp_check.sh::echo 1",
+     "/repo/test1.py::print(1)"
     ],
     "silent": [
      "/private/tmp/claude/scratchpad/scratch.py::print(1)",
      "/repo/src/parser.py::print(1)",
-     "/repo/docs/notes-on-auth.md::# notes"
+     "/repo/docs/notes-on-auth.md::# notes",
+     "/repo/src/template.py::x",
+     "/repo/src/barcode.py::x",
+     "/repo/app/notes_service.py::x",
+     "/repo/src/debug_toolbar.py::x",
+     "/repo/web/footer.ts::x",
+     "/repo/CHANGELOG/notes.md::x",
+     "/repo/src/temperature.ts::x"
     ]
    }
   },
@@ -1891,33 +2170,22 @@
    "title": "Stage by name on a wide branch",
    "mode": "advise",
    "delivery": "agent_hook",
-   "statement": "Many files changed. Stage by name so the commit is what you meant.",
-   "why": "git add -A on a wide branch is how scratch files and secrets get in.",
+   "statement": "Many files changed on this branch. Stage by name so the commit is what you meant.",
+   "why": "git add -A on a wide branch is how scratch files and secrets get in. `git commit -a` is left out: it takes tracked files only, so it cannot sweep in either.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}add\\s+(?:-A|--all|\\.)(?:\\s|$)|{{GIT}}commit\\s+-[a-zA-Z]*a",
+    "command_rx": "{{GIT}}add\\s+(?:-A|--all|\\.)(?:\\s|$)",
     "given": {
      "repo": {
       "diff_files_gt": 5
      }
-    }
+    },
+    "warn_once_per": "turn"
    },
    "cases": {
     "fires": [
      {
       "case": "git add -A",
-      "diff_paths": [
-       "a.py",
-       "b.py",
-       "c.py",
-       "d.py",
-       "e.py",
-       "f.py",
-       "g.py"
-      ]
-     },
-     {
-      "case": "git commit -am 'parser: handle eof'",
       "diff_paths": [
        "a.py",
        "b.py",
@@ -1947,6 +2215,18 @@
       "diff_paths": [
        "a.py"
       ]
+     },
+     {
+      "case": "git commit -am 'parser: handle eof'",
+      "diff_paths": [
+       "a.py",
+       "b.py",
+       "c.py",
+       "d.py",
+       "e.py",
+       "f.py",
+       "g.py"
+      ]
      }
     ]
    }
@@ -1957,7 +2237,7 @@
    "title": "Justify a new dependency",
    "mode": "advise",
    "delivery": "agent_hook",
-   "statement": "Editing a dependency manifest. Check the standard library and what is already installed first, and say why in the PR.",
+   "statement": "Editing a dependency manifest. If this adds a dependency, check the standard library and what is already installed first, and say why in the PR.",
    "why": "every dependency is a supply-chain and install-time cost forever.",
    "matcher": {
     "event": "edit",
@@ -2011,7 +2291,8 @@
     ]
    },
    "for_each": "lock_pairs",
-   "scope_exclude_paths": "{{lock_exclude}}"
+   "scope_exclude_paths": "{{lock_exclude}}",
+   "min_hook_version": "0.74.0"
   },
   {
    "id": "migration-handwritten",
@@ -2022,7 +2303,7 @@
    "requires": [
     "mig_versions_path_rx"
    ],
-   "statement": "Generate with `{{mig_generate_hint}}`, then edit the result. Never hand-number a revision.",
+   "statement": "Migration file. A new revision is generated with `{{mig_generate_hint}}` and then edited; never hand-number one.",
    "why": "hand-numbered revisions are how two heads happen.",
    "matcher": {
     "event": "edit",
@@ -2049,10 +2330,10 @@
     "alembic"
    ],
    "statement": "A migration changed. Run `alembic heads` and confirm a single head before push.",
-   "why": "two heads block every deploy after the merge.",
+   "why": "two heads block every deploy after the merge. The gate can see that the command ran, not what it printed: `alembic heads` exits 0 with two heads, so reading the output is on you.",
    "ordering": {
     "required_command_rx": "{{CMD}}(?:uv run |poetry run )?alembic (?:heads|check)\\b",
-    "gated_command_rx": "{{GIT}}push\\b",
+    "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
     "armed_by_events": [
      "edit"
     ],
@@ -2062,13 +2343,15 @@
    "seeded_from": "migrations dir: alembic",
    "cases": {
     "fires": [
-     "edit:{{mig_example_rel}} >> gate:git push"
+     "edit:{{mig_example_rel}} >> gate:git push",
+     "edit:{{mig_example_rel}} >> gate:gh pr create --fill"
     ],
     "silent": [
      "edit:{{mig_example_rel}} >> ok:alembic heads >> gate:git push",
      "edit:src/a.py >> gate:git push"
     ]
-   }
+   },
+   "min_hook_version": "0.74.0"
   },
   {
    "id": "pr-size",
@@ -2164,12 +2447,14 @@
    "why": "cheap now, expensive at bisect time.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}commit\\b[^|;&]*-[a-zA-Z]*m\\s+[\"'](?:wip|fix|fixes|fixed|update|updates|changes|stuff|misc|tmp|test)\\.?[\"']"
+    "command_rx": "{{GIT}}commit\\b[^|;&]*-[a-zA-Z]*m\\s+[\\\"'](?i:(?:wip|fix|fixes|fixed|update|updates|changes|stuff|misc|tmp|test)(?:\\s+(?:bugs?|it|stuff|tests?|things|code))?)\\.?[\\\"']"
    },
    "cases": {
     "fires": [
      "git commit -m 'fix'",
-     "git commit -am \"wip\""
+     "git commit -am \"wip\"",
+     "git commit -m \"fix bug\"",
+     "git commit -m 'Update'"
     ],
     "silent": [
      "git commit -m 'fix: parser drops the last token at eof'"
@@ -2187,7 +2472,8 @@
    "matcher": {
     "event": "edit",
     "path_rx": "{{generated_rx}}",
-    "warn_once_per": "file"
+    "warn_once_per": "file",
+    "path_not_rx": "\\.(?:md|mdx|rst|txt)$"
    },
    "seeded_from": "generated files: generated-by headers, plus known suffixes",
    "cases": {
@@ -2196,7 +2482,8 @@
      "/repo/web/src/generated/types.ts::export {}"
     ],
     "silent": [
-     "/repo/src/generator.py::x = 1"
+     "/repo/src/generator.py::x = 1",
+     "/repo/docs/generated/report.md::x"
     ]
    }
   },
@@ -2207,7 +2494,7 @@
    "mode": "advise",
    "delivery": "agent_hook",
    "statement": "They asked a question. Answer it first, and edit when asked.",
-   "why": "the most common scope creep: a how or a why turns into a patch. Scope creep shows up in ~10% of real sessions.",
+   "why": "the most common scope creep: a how or a why turns into a patch. Scope creep shows up in ~10% of real sessions. `Can you…`, `could you…` and `should…` are left out: they are how people phrase a task.",
    "matcher": {
     "event": "edit",
     "path_rx": ".",
@@ -2215,8 +2502,8 @@
     "warn_once_per": "session",
     "given": {
      "user": {
-      "said_rx": "(?i:^\\s*(?:how|why|what|where|which|does|is|are|can|could|should)\\b)",
-      "not_said_rx": "(?i:\\b(?:fix|change|implement|add|update|refactor|write|create|remove|make|build|rename|delete|migrate)\\b)"
+      "said_rx": "(?i:^\\s*(?:how|why|what|where|which|does|is|are)\\b)",
+      "not_said_rx": "(?i:\\b(?:fix|change|implement|add|update|refactor|write|create|remove|make|build|rename|delete|migrate|clean|bump|swap|move|replace|revert|apply|convert|extract|split|merge|please)\\b)"
      }
     }
    },
@@ -2241,6 +2528,24 @@
       "user_said": [
        "add a logout button"
       ]
+     },
+     {
+      "case": "/repo/src/a.py::x",
+      "user_said": [
+       "Can you clean up the login flow?"
+      ]
+     },
+     {
+      "case": "/repo/src/a.py::x",
+      "user_said": [
+       "could you bump the version to 1.2"
+      ]
+     },
+     {
+      "case": "/repo/src/a.py::x",
+      "user_said": [
+       "Should be simple: swap the two args"
+      ]
      }
     ]
    }
@@ -2252,15 +2557,15 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "The person asked for a plan. No edits until they say go.",
-   "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident. Known gap: the hook reads everything typed this session with no order, so an approval given EARLIER ('go ahead' on a previous task) also silences a later plan-only request. It fails open — it can miss, it cannot block work that was approved.",
+   "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident. Known gap: the hook reads everything typed this session with no order, so an approval given EARLIER ('go ahead' on a previous task) also silences a later plan-only request. It fails open — it can miss, it cannot block work that was approved. A scoped prohibition (`don't touch the public API`) is not a plan-only request and does not arm this.",
    "matcher": {
     "event": "edit",
     "path_rx": ".",
     "path_not_rx": "^/(?:tmp|private/tmp|var/folders|private/var)/|/scratchpad/|(?:^|/)\\.claude/plans/",
     "given": {
      "user": {
-      "said_rx": "(?i:\\b(?:just plan|plan only|only (?:a )?plan|don'?t (?:edit|change|touch|write)|do not (?:edit|change|touch|write)|no code changes)\\b)",
-      "not_said_rx": "(?i:\\b(?:go ahead|proceed|implement it|do it|looks good|lgtm|approved|ship it)\\b)"
+      "said_rx": "(?i:\\b(?:just plan|plan only|only (?:a )?plan|(?:don'?t|do not) (?:edit|change|touch|write) (?:anything|any files?|any code)|no code changes)\\b)",
+      "not_said_rx": "(?i:\\b(?:go ahead|proceed|implement (?:it|this|that|the plan)|do it|build it|start (?:implementing|coding|building)|yes,? start|make the changes?|execute the plan|looks good|lgtm|approved|ship it)\\b)"
      }
     }
    },
@@ -2270,6 +2575,12 @@
       "case": "/repo/src/auth.py::x = 1",
       "user_said": [
        "plan only: how would you add SSO?"
+      ]
+     },
+     {
+      "case": "/repo/src/auth.py::x = 1",
+      "user_said": [
+       "walk me through the approach first, don't change anything yet"
       ]
      }
     ],
@@ -2286,6 +2597,32 @@
       "user_said": [
        "add SSO"
       ]
+     },
+     {
+      "case": "/repo/src/auth.py::x = 1",
+      "user_said": [
+       "fix the parser bug but don't touch the public API"
+      ]
+     },
+     {
+      "case": "/repo/src/auth.py::x = 1",
+      "user_said": [
+       "refactor auth. do not change the tests"
+      ]
+     },
+     {
+      "case": "/repo/src/auth.py::x = 1",
+      "user_said": [
+       "plan only please",
+       "ok now implement the plan"
+      ]
+     },
+     {
+      "case": "/repo/src/auth.py::x = 1",
+      "user_said": [
+       "plan only please",
+       "yes, start"
+      ]
      }
     ]
    }
@@ -2293,16 +2630,16 @@
   {
    "id": "reproduce-before-fix",
    "category": "intent",
-   "title": "Reproduce before you fix",
-   "mode": "gate",
+   "title": "Run the tests before committing a fix",
+   "mode": "advise",
    "delivery": "agent_hook",
    "min_hook_version": "0.54.0",
    "requires": [
     "test_cmd_rx",
     "test_receipt_rx"
    ],
-   "statement": "A failure was reported. Reproduce it with a test, and have the tests green, before committing the fix.",
-   "why": "a fix without a reproduction is a guess; the ablation evidence is 8-10 resolve points.",
+   "statement": "A failure was reported and no test run has come back green this session. Reproduce it with a test if you can, and have a green run before committing the fix.",
+   "why": "a fix without a reproduction is a guess; the ablation evidence is 8-10 resolve points. What this checks is only that SOME test run was green after the report: it cannot tell a reproduction from any other test, nor a run made before the fix from one made after. So it advises, and never blocks.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{test_receipt_rx}}",
     "gated_command_rx": "{{GIT}}commit\\b",
@@ -2514,7 +2851,7 @@
    "category": "posture",
    "title": "Posture: answer with paths",
    "delivery": "session_context",
-   "statement": "Answer with paths and conclusions, not file contents. Read big files as slices; hand a search you cannot name the file for to an Explore subagent.",
+   "statement": "Answer with paths and conclusions, not file contents. Read big files as slices, and grep for a symbol before you think about delegating the search.",
    "why": "shapes the plan before the read gate has to fire.",
    "cases": {}
   },
