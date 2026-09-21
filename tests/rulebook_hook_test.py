@@ -2622,6 +2622,19 @@ def min_hook_version_checks() -> None:
               inert is not None and inert.get("mode") == "gate"
               and not inert.get("_degraded"), str(inert))
 
+        # The length bound is not the backtracking guard, so it is wide enough
+        # for a long alternation of literals — and still a bound.
+        long_rx = "^(?:" + "|".join(f"src/pkg{i:03d}/mod\\.py" for i in range(60)) + ")$"
+        check("regex length: a pattern between the old 400 bound and _RX_MAX loads",
+              400 < len(long_rx) <= H._RX_MAX
+              and H.to_hook_rule(_row("long-rx", {"event": "bash", "command_rx": long_rx}))
+              is not None, str(len(long_rx)))
+        check("regex length: a pattern at _RX_MAX loads and one past it drops the rule",
+              H.rx_ok("a" * H._RX_MAX) and not H.rx_ok("a" * (H._RX_MAX + 1))
+              and H.to_hook_rule(_row("over-rx", {"event": "bash",
+                                                  "command_rx": "a" * (H._RX_MAX + 1)}))
+              is None)
+
         # An ordering rule needs its arming event first; this one says
         # `session`, so the session lane has to have run.
         run("session", {"session_id": "v1", "cwd": repo,
