@@ -93,7 +93,10 @@ Every repo keeps its knowledge somewhere different — `docs/`, `design/`,
 `rfcs/`, a `handbook/`, READMEs beside each service — so **assume no layout**.
 A script finds the documents and scores them; the important ones go in without a question.
 
-**Look first.** `get_brain_overview(ROOM)` and read `index_markdown`. A brain a
+**Look first.** `get_brain_overview(ROOM, org_id=ORG_ID)` and read `index_markdown`
+(pass the `org_id` recorded in §1 on every brain call in this skill — a brain
+resolves inside one org, and without it a room outside your default org reads
+as "not found" or, worse, as empty). A brain a
 teammate already onboarded lists its artifacts there — say what it holds, and
 below offer only what is missing. Re-uploading is harmless (the same name
 versions the artifact, and identical content is deduplicated server-side) but
@@ -102,7 +105,8 @@ it is noise; don't.
 **Scan** (stdlib, no network, reads nothing outside the repo):
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard_docs.py" scan --out "${TMPDIR:-/tmp}/memhub-onboard-docs.json"
+MANIFEST="$(mktemp "${TMPDIR:-/tmp}/memhub-onboard-docs.XXXXXX")"; echo "manifest: $MANIFEST"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard_docs.py" scan --out "$MANIFEST"
 ```
 
 It lists every tracked markdown document (`.md` / `.mdx` / `.markdown`; every
@@ -114,8 +118,15 @@ changelogs, stubs, and **agent instruction files** (`CLAUDE.md`, `AGENTS.md`,
 `.claude/` …) — those are excluded on purpose, because
 `/memhub:start-rulebook` turns them into rules that fire at the moment they
 matter, where an artifact copy would only be read once, like the file is.
-The full list is in the `--out` manifest; read it when the printed top rows of
-a folder don't tell you what the folder is.
+Symlinked documents, and anything whose real path is outside the repo, are
+left out too — a link is how a file from somewhere else would get into a shared
+brain. The full list is in the `--out` manifest; read it when the printed top
+rows of a folder don't tell you what the folder is.
+
+If the scan exits with `ERROR` — inside a git repo it refuses to continue when
+git will not list the tracked files (dubious ownership, a timeout) — **stop and
+report it.** Do not list files yourself instead: everything found is uploaded
+without a question, and "tracked only" is what keeps private notes out.
 
 **Upload them — do not ask first.** The user ran onboarding to get their
 repo's knowledge into its brain, and the brain needs the specs there for
@@ -145,7 +156,7 @@ a failure, and exits non-zero naming every file that failed:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard_docs.py" upload \
-  --manifest "${TMPDIR:-/tmp}/memhub-onboard-docs.json" --min-score 3 \
+  --manifest "<the manifest path the scan printed>" --min-score 3 \
   [--exclude-folder "<mirrored spec dir>"] [--exclude "<file with credentials>"]
 ```
 
@@ -185,7 +196,7 @@ and move on. Do not pad the brain to have something to show; it fills from real
 work (§4).
 
 ## 3. Show what the brain holds now
-`get_brain_overview(ROOM)` again and show `index_markdown` — it is rendered
+`get_brain_overview(ROOM, org_id=ORG_ID)` again and show `index_markdown` — it is rendered
 from the rows themselves, so the artifacts you just saved appear at once:
 *"Here's what your repo's brain holds."* The `overview` prose summary is
 compiled asynchronously and may still be `null`; that is normal right after a
@@ -194,7 +205,7 @@ empty when `index_markdown` rendered.
 
 Then prove it is reachable the way an agent will reach it: one
 `search_memory(query="<a topic from one uploaded doc>", memory_type="artifacts",
-agent_brain_id=ROOM)` and show the hit. No hit on a doc you just saved usually
+agent_brain_id=ROOM, org_id=ORG_ID)` and show the hit. No hit on a doc you just saved usually
 means indexing has not caught up — say that, don't retry in a loop.
 
 ## 4. Say what happens from here, and end on the Rulebook
@@ -256,18 +267,6 @@ like to try rules next, `/memhub:start-rulebook` creates a rulebook for your
 team and proposes its first rules — the starter set takes about a minute, and
 nothing it files turns on until you say so."* A hint, not a step: the rulebook
 skill opens with questions of its own, and it is run once per team rather than
-once per person — so say it and stop, even if they seem keen. This skill cannot see whether a rulebook already exists (it
-has no rulebook tools on purpose), which is why the line says "first rules" and
-lets `/memhub:start-rulebook` notice an existing book itself.
-
-**And name the other half, in one line — do not start it.** The brain is what
-the agent *remembers*; the Rulebook is what it is *told at the moment it
-matters* ("you're about to force-push"). This skill sets up only the first, and
-a new user has no way to know the second exists. So end with: *"Next, when you
-have a minute: `/memhub:start-rulebook` gives your team its first rules — the
-starter set takes about a minute, and nothing it files turns on until you say
-so."* A pointer, not a step: onboarding is judged on time-to-first-recall, the
-rulebook skill opens with questions, and it is run once per team rather than
 once per person — so say it and stop, even if they seem keen. This skill
 cannot see whether a rulebook already exists (it has no rulebook tools on
 purpose), which is why the line says "first rules" and lets

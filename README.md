@@ -381,9 +381,9 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   scans the repo for its own markdown documents wherever it keeps them (no
   directory layout assumed — `scripts/onboard_docs.py`), saves the ones that
   look important to the brain as artifacts without asking (arguments override
-  the choice), shows the brain's
-  Index, and ends with an optional hint that `/memhub:start-rulebook` creates
-  the team's rulebook. It imports no session: sessions are captured
+  the choice), shows the brain's Index, says what now works (handoff, sharing,
+  search), and ends with an optional hint that `/memhub:start-rulebook`
+  creates the team's rulebook. It imports no session: sessions are captured
   automatically from the next turn.
 - `/memhub:import-session <id-or-path> [title]` — terminal upload of a past
   session transcript; auto-chunks very large sessions. The ONLY skill that

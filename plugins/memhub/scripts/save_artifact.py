@@ -294,6 +294,14 @@ async def main() -> int:
             res = await session.call_tool("save_artifact", arguments=call_args)
             out = unwrap(res)
     print(json.dumps(out, indent=2))
+    # A refusal (required tags, quota, a stale parent) arrives as a normal
+    # CallToolResult with isError set — `unwrap` cannot tell it from a saved
+    # artifact. Nothing was stored, so this must not exit 0: every caller,
+    # a person or onboard_docs.py, reads the exit code as "saved".
+    if getattr(res, "isError", False):
+        err = out.get("_raw") or out.get("error") or json.dumps(out)
+        print(f"ERROR: save_artifact was refused: {err}", file=sys.stderr)
+        return 1
     return 0
 
 

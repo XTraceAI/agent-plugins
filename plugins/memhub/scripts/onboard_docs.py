@@ -67,9 +67,26 @@ _USEFUL = re.compile(
 _SHELVED = re.compile(r"(^|/)(archive[ds]?|retired|deprecated|obsolete|old|legacy|attic)(/|$)", re.I)
 
 
+class ScanError(Exception):
+    """The scan cannot say which documents the repo tracks."""
+
+
+def _inside_git_repo(root: Path) -> bool:
+    """Whether ``root`` sits in a git work tree — decided from the filesystem,
+    not by asking git, so a git that REFUSES to answer (dubious ownership, a
+    timeout, a broken install) still counts as a repo."""
+    return any((d / ".git").exists() for d in (root, *root.parents))
+
+
 def _tracked(root: Path) -> list[Path]:
     """Documents the repo tracks; every document under ``root`` when it is not
-    a git repo (or git cannot be run)."""
+    a git repo at all.
+
+    Inside a repo, a failed listing is an ERROR, never a reason to walk the
+    disk instead: onboarding uploads what this returns without asking, and the
+    walk would offer untracked files — private notes, generated output — that
+    "tracked only" exists to keep out of a shared brain."""
+    in_repo = _inside_git_repo(root)
     try:
         proc = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z"], capture_output=True,
@@ -77,8 +94,13 @@ def _tracked(root: Path) -> list[Path]:
         if proc.returncode == 0:
             names = [n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n]
             return [root / n for n in names if n.lower().endswith(DOC_SUFFIXES)]
-    except (OSError, subprocess.SubprocessError):
-        pass
+        failure = (proc.stderr.decode("utf-8", "replace").strip().splitlines() or
+                   [f"git ls-files exited {proc.returncode}"])[-1]
+    except (OSError, subprocess.SubprocessError) as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+    if in_repo:
+        raise ScanError(f"{root} is a git repository but its tracked files could "
+                        f"not be listed ({failure}); nothing was scanned")
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -147,8 +169,24 @@ def scan(root: Path) -> dict:
     for p in sorted(_tracked(root)):
         try:
             rel = p.relative_to(root)
+        except ValueError:
+            continue
+        # A tracked NAME can be a symlink, or sit under a symlinked folder, and
+        # `stat` / `read_text` follow it — `notes.md -> ~/private.md` would put a
+        # file from outside the repo into a shared brain. The lexical
+        # `relative_to` above proves nothing about where the bytes live, so
+        # require the resolved file to be the path itself, inside the root.
+        try:
+            real = p.resolve(strict=True)
+            escaped = p.is_symlink() or real != root / rel or root not in real.parents
+        except (OSError, RuntimeError):
+            escaped = True
+        if escaped:
+            skipped["symlink or outside the repo"] = skipped.get("symlink or outside the repo", 0) + 1
+            continue
+        try:
             size = p.stat().st_size
-        except (OSError, ValueError):
+        except OSError:
             continue
         reason = _skip_reason(rel)
         if reason is None and size < MIN_BYTES:
@@ -184,7 +222,14 @@ def cmd_scan(args) -> int:
         print(f"ERROR: not a directory: {root}", file=sys.stderr)
         return 2
     top = repo_root(root)
-    result = scan(top if top is not None else root)
+    try:
+        if top is None and _inside_git_repo(root.resolve()):
+            raise ScanError(f"{root} is inside a git repository but git would not "
+                            "name its top level; nothing was scanned")
+        result = scan(top if top is not None else root)
+    except ScanError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     docs = result["docs"]
     if args.out:
         Path(args.out).write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -256,6 +301,12 @@ def cmd_upload(args) -> int:
     failed: list[tuple[str, str]] = []
     for n, d in enumerate(chosen, 1):
         tags = args.tags or _folder_tags(d)
+        # The manifest is a file on disk; re-check what the scan checked
+        # rather than trust that the path still is what it was.
+        if (root / d["path"]).is_symlink():
+            failed.append((d["path"], "is a symlink; not uploaded"))
+            print(f"  [{n}/{len(chosen)}] FAILED  {d['path']}: is a symlink; not uploaded")
+            continue
         cmd = ["uv", "run", "--with", "mcp<2", "python", str(_SAVE_ARTIFACT),
                "--file", str(root / d["path"]), "--name", d["name"],
                "--type", d["type"], "--tags", tags]

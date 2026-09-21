@@ -99,6 +99,47 @@ with tempfile.TemporaryDirectory() as td:
     else:
         print("  skip (git unavailable)")
 
+print("scan — a symlink never brings a file from outside the repo in")
+with tempfile.TemporaryDirectory() as td:
+    base = Path(td).resolve()
+    root = base / "repo"
+    root.mkdir()
+    write(base, "private/secret-design.md", "# Secret design\nTOKEN=abc\n" + BODY)
+    write(root, "README.md", "# Repo\n" + BODY)
+    try:
+        (root / "credential-design.md").symlink_to(base / "private/secret-design.md")
+        (root / "linked").symlink_to(base / "private", target_is_directory=True)
+        linkable = True
+    except OSError:
+        linkable = False
+    if linkable:
+        result = od.scan(root)
+        paths = {d["path"] for d in result["docs"]}
+        check(paths == {"README.md"}, f"symlinked file and symlinked folder are both left out: {sorted(paths)}")
+        check(result["skipped"].get("symlink or outside the repo", 0) >= 1,
+              f"…and counted, not dropped silently: {result['skipped']}")
+    else:
+        print("  skip (symlinks unavailable)")
+
+print("scan — a repo whose tracked files cannot be listed is an error, never a disk walk")
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td).resolve()
+    build(root)
+    (root / ".git").mkdir()          # a work tree git cannot read
+    write(root, "scratch/private-notes.md", "# Private design notes\n" + BODY)
+    real_run = od.subprocess.run
+    od.subprocess.run = lambda *a, **k: types.SimpleNamespace(
+        returncode=128, stdout=b"", stderr=b"fatal: detected dubious ownership in repository")
+    try:
+        try:
+            od.scan(root)
+            raised = ""
+        except od.ScanError as exc:
+            raised = str(exc)
+        check("dubious ownership" in raised, f"ScanError carries git's own reason: {raised[:90]}")
+    finally:
+        od.subprocess.run = real_run
+
 print("upload — selection, and failures reported by path")
 with tempfile.TemporaryDirectory() as td:
     root = Path(td).resolve()
