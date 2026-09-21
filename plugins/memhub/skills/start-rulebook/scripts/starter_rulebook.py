@@ -49,6 +49,10 @@ CMD = r"(?:^|[;&]\s*|\|\s+)"
 # Written without a quantified group: the hook's load lint drops those.
 GIT = CMD + r"(?:sudo\s+)?git\s+(?:-[cC]\s*\S+\s+)?"
 RX_MAX = 400
+# Appended to a command pattern to make it a RECEIPT: the command, but not an invocation that exits 0
+# having done none of the work — `pytest --version`, `eslint --help`, `pytest --collect-only`.
+_RAN_NOTHING = (r"\b(?![^|;&]*\s(?:--version|-V|--help|-h|--collect-only|--co|--fixtures|--markers|--setup-plan"
+                r"|--listenvs|--list|-list|--showconfig|--show-settings|--print-config|--no-run)(?:\s|=|$))")
 
 _SKIP_DIRS = ("node_modules/", "vendor/", "dist/", "build/", ".venv/", "venv/",
               "__pycache__/", ".git/", "target/", ".next/", "site-packages/")
@@ -238,9 +242,7 @@ def scan(repo: Path) -> dict:
         slots["test_cmd_example"] = runners[0]["example"]
         # What CLEARS a "tests ran" obligation. A targeted run does, on purpose; an invocation that runs no
         # test does not — `pytest --version`, `--help`, `--collect-only` all exit 0 having tested nothing.
-        slots["test_receipt_rx"] = slots["test_cmd_rx"] + (
-            r"\b(?![^|;&]*\s(?:--version|--help|-h|--collect-only|--co|--fixtures|--markers|--setup-plan"
-            r"|--listenvs|--list|-list|--showconfig|--no-run)(?:\s|=|$))")
+        slots["test_receipt_rx"] = slots["test_cmd_rx"] + _RAN_NOTHING
     if slow_content:
         slots["test_slow_content_rx"] = "|".join(c for c, _ in slow_content)
         slots["test_slow_example"] = slow_content[0][1]
@@ -279,6 +281,7 @@ def scan(repo: Path) -> dict:
     if lint:
         found("lint", ", ".join(lint_ex), value=lint_ex)
         slots["lint_cmd_rx"] = _alt(lint)
+        slots["lint_receipt_rx"] = slots["lint_cmd_rx"] + _RAN_NOTHING     # `eslint --version` checked no code
         slots["lint_cmd_example"] = lint_ex[0]
     else:
         missing("lint", "no linter or formatter in dev dependencies, pre-commit, Makefile or package scripts")
@@ -314,6 +317,8 @@ def scan(repo: Path) -> dict:
                  ("poetry", "poetry.lock", "pyproject.toml", r"poetry lock\b", "poetry lock"),
                  ("npm", "package-lock.json", "package.json", r"npm (?:install|i)\b", "npm install"),
                  ("pnpm", "pnpm-lock.yaml", "package.json", r"pnpm (?:install|i)\b", "pnpm install"),
+                 ("bun", "bun.lock", "package.json", r"bun (?:install|i)\b", "bun install"),
+                 ("bun", "bun.lockb", "package.json", r"bun (?:install|i)\b", "bun install"),
                  # bare `yarn` IS the install alias; `yarn test`, `yarn lint`, `yarn --version` are not
                  ("yarn", "yarn.lock", "package.json",
                   r"yarn(?:\s+install)?(?=\s*(?:$|[;&|])|\s+--(?!version|help))", "yarn install"),
@@ -473,6 +478,13 @@ def scan(repo: Path) -> dict:
     base_secret = (r"(?:^|/)\.env(?:\.(?!example|sample|template|dist)[\w.-]+)?$|\.(?:pem|key|p12|pfx)$"
                    r"|(?:^|/)(?:credentials|secrets?)(?:\.(?:json|ya?ml|toml))?$|(?:^|/)id_(?:rsa|ed25519)$")
     slots["secrets_rx"] = _fit(base_secret, ["(?:^|/)%s$" % re.escape(s) for s in sec_extra])
+    # The SAME set, shaped for a command line instead of a path: a token that starts after whitespace or a
+    # `/` and ends at whitespace or a separator. One list, two shapes — a rule about staging secrets that
+    # knows fewer secrets than the rule about reading them protects less than its title says.
+    slots["secrets_cmd_rx"] = _fit(
+        r"\.env(?:\.(?!example|sample|template|dist)[\w.-]+)?|[^\s/]*\.(?:pem|key|p12|pfx)"
+        r"|(?:credentials|secrets?)(?:\.(?:json|ya?ml|toml))?|id_(?:rsa|ed25519)",
+        [re.escape(os.path.basename(x)) for x in sec_extra])
     found("gitignore", "%d ignore entries; %d extra read exclusions, %d secret patterns" % (len(ignore), len(extra), len(sec_extra))) \
         if ignore else missing("gitignore", "no .gitignore; defaults only")
     templates = [f for f in live if re.search(r"\.env\.(example|sample|template)$|\.env\.dist$", f)]

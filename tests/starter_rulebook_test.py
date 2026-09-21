@@ -506,6 +506,18 @@ def test_monorepo_lockfiles_pair_with_the_manifest_in_their_own_directory() -> N
         check("titles are distinct", len(set(titles)) == 3, str(titles))
 
 
+def test_bun_lockfiles_are_paired_like_every_other_tool() -> None:
+    for lock in ("bun.lock", "bun.lockb"):
+        files = {"package.json": json.dumps({"scripts": {"test": "bun test"}}), lock: "x\n", "src/a.ts": "\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make(files, Path(tmp) / "b")
+            p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+            by_id = {c["id"]: c["body"] for c in cands}
+            check(f"{lock}: seeded and verified", p.returncode == 0 and "lockfile-drift-bun" in by_id, p.stdout[-300:])
+            rx = by_id.get("lockfile-drift-bun", {}).get("ordering", {}).get("required_command_rx", "$^")
+            check(f"{lock}: `bun install` clears it and `bun test` does not", bool(re.search(rx, "bun install")) and not re.search(rx, "bun test"))
+
+
 def test_a_preview_never_counts_as_the_real_thing() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         repo = _make(PYTHON_REPO, Path(tmp) / "svc")
@@ -531,6 +543,20 @@ def test_a_preview_never_counts_as_the_real_thing() -> None:
         for info in ("pytest --version", "pytest --help", "pytest --collect-only -q", "uv run pytest --co"):
             check(f"`{info}` runs no test, so it clears nothing", not re.search(receipt, info))
         check("reproduce-before-fix uses the same receipt", by_id["reproduce-before-fix"]["ordering"]["required_command_rx"] == receipt)
+        lint = by_id["lint-before-push"]["ordering"]["required_command_rx"]
+        check("a real lint run clears the lint gate", bool(re.search(lint, "ruff check .")) and bool(re.search(lint, "mypy app")))
+        for info in ("ruff --version", "mypy --help", "ruff check --show-settings"):
+            check(f"`{info}` checks no code, so it clears nothing", not re.search(lint, info))
+        pm = by_id["push-main"]["matcher"]["command_rx"]
+        for cmd in ("git push", "git push origin", "git push -u origin HEAD", "cd x && git push --force-with-lease"):
+            check(f"on the default branch `{cmd}` pushes it", bool(re.search(pm, cmd)))
+        for cmd in ("git push origin feat/x", "git push origin HEAD:feat/x", "git push upstream v1.2.0"):
+            check(f"`{cmd}` names another ref, so the current-branch rule leaves it alone", not re.search(pm, cmd))
+        stage = by_id["stage-secrets"]["matcher"]["command_rx"]
+        for cmd in ("git add .env", "git add certs/server.key", "git add secrets.json", "git add id_ed25519", "git add a.py config/credentials.yml"):
+            check(f"`{cmd}` stages a secret the read gate also knows", bool(re.search(stage, cmd)))
+        for cmd in ("git add .env.example", "git add src/secrets.py", "git add docs/keys.md", "git add src/environment.py"):
+            check(f"`{cmd}` does not", not re.search(stage, cmd))
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:

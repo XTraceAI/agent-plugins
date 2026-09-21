@@ -431,12 +431,13 @@
    "delivery": "agent_hook",
    "requires": [
     "lint_cmd_rx",
+    "lint_receipt_rx",
     "test_cmd_rx"
    ],
    "statement": "Run the linter before the suite. Syntax and type errors surface in a second, not after collection.",
    "why": "cheap check before expensive check. No study shows an ordering benefit, so this advises and never blocks.",
    "ordering": {
-    "required_command_rx": "{{CMD}}{{lint_cmd_rx}}",
+    "required_command_rx": "{{CMD}}{{lint_receipt_rx}}",
     "gated_command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
     "armed_by_events": [
      "edit"
@@ -460,12 +461,13 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "requires": [
-    "lint_cmd_rx"
+    "lint_cmd_rx",
+    "lint_receipt_rx"
    ],
    "statement": "Edits are in flight and the linter has not run green. Run it before anything leaves the machine, because CI will.",
    "why": "CI parity: a lint failure found in CI costs a round trip.",
    "ordering": {
-    "required_command_rx": "{{CMD}}{{lint_cmd_rx}}",
+    "required_command_rx": "{{CMD}}{{lint_receipt_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
     "armed_by_events": [
      "edit"
@@ -476,7 +478,8 @@
    "cases": {
     "fires": [
      "edit:src/a.py >> gate:git push",
-     "edit:src/a.py >> red:{{lint_cmd_example}} >> gate:git push"
+     "edit:src/a.py >> red:{{lint_cmd_example}} >> gate:git push",
+     "edit:src/a.py >> ok:{{lint_cmd_example}} --version >> gate:git push"
     ],
     "silent": [
      "edit:src/a.py >> ok:{{lint_cmd_example}} >> gate:git push"
@@ -1114,10 +1117,10 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "You are on the default branch. Work on a branch and open a PR.",
-   "why": "the most common written team rule, and one of the few that is fully deterministic.",
+   "why": "the most common written team rule, and one of the few that is fully deterministic. Only a push of the CURRENT branch: an explicitly named other ref (`git push origin feat/x`) does not touch the default branch, and one that names it is the companion rule's.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}push\\b",
+    "command_rx": "{{GIT}}push\\b(?![^|;&]*\\s[^-\\s]\\S*\\s+(?!HEAD(?:\\s|$|[;&|]))[^-\\s])",
     "given": {
      "repo": {
       "branch_rx": "{{default_branch_rx}}"
@@ -1134,6 +1137,14 @@
      },
      {
       "case": "cd api && git push origin HEAD",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push origin",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push -u origin HEAD",
       "branch": "{{default_branch}}"
      }
     ],
@@ -1152,6 +1163,14 @@
      },
      {
       "case": "git push -n origin HEAD",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push origin feat/x",
+      "branch": "{{default_branch}}"
+     },
+     {
+      "case": "git push origin HEAD:feat/x",
       "branch": "{{default_branch}}"
      }
     ]
@@ -1345,19 +1364,26 @@
    "why": "a committed secret costs a rotation; a committed build directory costs every clone. Bulk forms (`git add -A`) never name the file, so they are a separate rule that reads the branch's changed paths.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}add\\b[^|;&]*(?:\\.env(?!\\.(?:example|sample|template))\\b|\\.pem\\b|\\.p12\\b|\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/|id_rsa)"
+    "command_rx": "{{GIT}}add\\b[^|;&]*(?:\\s|/)(?:{{secrets_cmd_rx}})(?=\\s|$|[;&|])|{{GIT}}add\\b[^|;&]*(?:\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/)"
    },
    "cases": {
     "fires": [
      "git add .env",
      "git add config/server.pem src/a.py",
-     "cd web && git add node_modules"
+     "cd web && git add node_modules",
+     "git add certs/server.key",
+     "git add secrets.json",
+     "git add ~/.ssh/id_ed25519 src/a.py",
+     "git add config/credentials.yml"
     ],
     "silent": [
      "git add .env.example",
-     "git add src/environment.py"
+     "git add src/environment.py",
+     "git add src/secrets.py",
+     "git add docs/keys.md"
     ]
-   }
+   },
+   "seeded_from": "the same secret set the read gate uses (.gitignore patterns and .env templates), shaped for a command line"
   },
   {
    "id": "stage-secrets-bulk",
