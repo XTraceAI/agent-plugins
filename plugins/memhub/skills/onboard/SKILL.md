@@ -221,6 +221,32 @@ fastest way to confirm §1 took, since the brief only appears once a room
 resolves. From then on `/memhub:search-memory` searches this brain alongside
 personal memory.
 
+**Tell them what they can do now** — a short list, in their words, not a
+manual. Each line is something that works from this repo as of this moment:
+
+- *Hand work to a teammate* — "hand this off to Alice" (`/memhub:handoff-session
+  <teammate>`): writes a handoff brief into a small brain and shares it, plus
+  this repo's brain, read-only with them, so they pick up with your context
+  instead of a Slack summary.
+- *Share this repo's brain* — "share this brain with Bob" or "…with the
+  platform workspace": the agent does it through MemHub's sharing tools.
+  **If §1 CREATED the brain, lead with this one and say why:** a new brain is
+  private to the person who made it — being in the same workspace grants
+  nothing — so until it is shared, teammates cannot see the docs just added,
+  and a teammate who runs `/memhub:onboard` in this repo will not find it and
+  will create a second, empty brain for the same repo. Once it is shared, their
+  onboarding finds it by name and joins it. If §1 REUSED a teammate's brain,
+  skip the warning — it is already shared with them.
+- *Ask what the team knows* — "what do we know about retries?", "is there a
+  spec for billing?" (`/memhub:search-memory`): searches this brain's docs and
+  episodes alongside your own memory.
+- *Keep a document* — "save this spec to MemHub" (`/memhub:save-artifact
+  <file>`): versions it in this brain under the same name.
+
+Sharing and search go through the `/mcp` connector, which is a separate login
+from the one in §0 — if either says it is not authenticated, that is the fix
+(`/mcp` → `memhub` → Authenticate), not `/memhub:login`.
+
 **End with a hint about the Rulebook — optional, one or two lines, and do not
 start it.** Onboarding is finished at this point; the Rulebook is something to
 try next *if they want it*, not a remaining step. The brain is what the agent
