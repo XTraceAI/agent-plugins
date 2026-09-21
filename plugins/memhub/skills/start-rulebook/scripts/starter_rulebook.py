@@ -334,12 +334,15 @@ def scan(repo: Path) -> dict:
                     continue                        # a lockfile with no manifest beside it guards nothing we can name
                 pairs.append({"lock_key": key + ("-" + re.sub(r"[^A-Za-z0-9]+", "-", where).strip("-") if where else ""),
                               "lock_name": lock_path, "lock_manifest": man_path, "lock_cmd_rx": rx, "lock_cmd_example": ex})
-        pairs = pairs[:8]
         for pr in pairs:
             # The hook also tries `*/<glob>`, so a ROOT manifest's scope would swallow every nested manifest of
-            # the same name. Hand each nested pair's manifest to the root rule as an exclusion.
+            # the same name. Hand each nested pair's manifest to the root rule as an exclusion — computed over
+            # EVERY pair, before the cap below: a nested package that gets no rule of its own must still not
+            # arm the root's, or the right install for it can never clear the obligation.
             pr["lock_exclude"] = [o["lock_manifest"] for o in pairs
                                   if o is not pr and o["lock_manifest"].endswith("/" + pr["lock_manifest"])]
+        pairs = pairs[:8]
+        for pr in pairs:
             # `uv lock --dry-run` exits 0 and leaves uv.lock untouched: a preview is not a receipt
             pr["lock_cmd_rx"] = "(?:%s)(?![^|;&]*\\s--dry-run\\b)" % pr["lock_cmd_rx"]
         if pairs:
@@ -371,8 +374,14 @@ def scan(repo: Path) -> dict:
     # migrations
     mig = None
     if any(f.endswith("alembic.ini") for f in live) or any("/versions/" in f and "alembic" in f for f in live):
-        mig = ("alembic", r"(?:alembic|migrations)/versions/.*\.py$", r"|alembic (?:downgrade|stamp)",
-               "alembic revision --autogenerate", ["alembic", "alembic.ini"], "alembic/versions")
+        # Where the revisions actually live, from the tracked files: `<dir>/env.py` beside `<dir>/versions/`.
+        # alembic.ini's script_location is often `migrations`, and a scope of `alembic/versions/*` there
+        # never arms the pre-push check. Falls back to the default only when nothing is tracked yet.
+        env_dirs = [os.path.dirname(f) for f in live if os.path.basename(f) == "env.py"
+                    and any(g.startswith(os.path.dirname(f) + "/versions/") for g in live)]
+        versions = (sorted(env_dirs, key=lambda d: (d.count("/"), d))[0] + "/versions") if env_dirs else "alembic/versions"
+        mig = ("alembic", r"(?:alembic|migrations|%s)/versions/.*\.py$" % re.escape(os.path.dirname(versions)),
+               r"|alembic (?:downgrade|stamp)", "alembic revision --autogenerate", ["alembic", "alembic.ini"], versions)
     elif any(f.startswith("prisma/migrations/") or "/prisma/migrations/" in f for f in live):
         mig = ("prisma", r"prisma/migrations/.*\.sql$", r"|prisma migrate reset|prisma db push[^|;&]*--force-reset",
                "prisma migrate dev", ["prisma migrate", "schema.prisma"], "prisma/migrations")
@@ -388,6 +397,7 @@ def scan(repo: Path) -> dict:
                      mig_generate_hint=mig[3], mig_anchors=mig[4],
                      mig_scope_paths=[mig[5] + "/*"],   # fnmatch: a bare directory matches no file in it
                      mig_example_path="/repo/%s/0001_example.%s" % (mig[5].replace("**/", "app/"), "sql" if mig[0] == "prisma" else "rb" if mig[0] == "rails" else "py"))
+        slots["mig_example_rel"] = mig[5].replace("**/", "app/") + "/0001_add_users.py"
         if mig[0] == "alembic":
             slots["alembic"] = True
     else:

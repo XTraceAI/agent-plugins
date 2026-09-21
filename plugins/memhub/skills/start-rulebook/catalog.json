@@ -1364,7 +1364,7 @@
    "why": "a committed secret costs a rotation; a committed build directory costs every clone. Bulk forms (`git add -A`) never name the file, so they are a separate rule that reads the branch's changed paths.",
    "matcher": {
     "event": "bash",
-    "command_rx": "{{GIT}}add\\b[^|;&]*(?:\\s|/)(?:{{secrets_cmd_rx}})(?=\\s|$|[;&|])|{{GIT}}add\\b[^|;&]*(?:\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/)"
+    "command_rx": "{{GIT}}add\\b[^|;&]*(?:\\s|/|[\"'])(?:{{secrets_cmd_rx}})(?=[\"']?(?:\\s|$|[;&|]))|{{GIT}}add\\b[^|;&]*(?:\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/)"
    },
    "cases": {
     "fires": [
@@ -1374,13 +1374,18 @@
      "git add certs/server.key",
      "git add secrets.json",
      "git add ~/.ssh/id_ed25519 src/a.py",
-     "git add config/credentials.yml"
+     "git add config/credentials.yml",
+     "git add \".env\"",
+     "git add 'certs/server.key'",
+     "git add -- \"secrets.json\""
     ],
     "silent": [
      "git add .env.example",
      "git add src/environment.py",
      "git add src/secrets.py",
-     "git add docs/keys.md"
+     "git add docs/keys.md",
+     "git add \"src/secrets.py\"",
+     "git commit -m 'docs: explain .env handling'"
     ]
    },
    "seeded_from": "the same secret set the read gate uses (.gitignore patterns and .env templates), shaped for a command line"
@@ -2057,10 +2062,10 @@
    "seeded_from": "migrations dir: alembic",
    "cases": {
     "fires": [
-     "edit:alembic/versions/0001_add_users.py >> gate:git push"
+     "edit:{{mig_example_rel}} >> gate:git push"
     ],
     "silent": [
-     "edit:alembic/versions/0001_add_users.py >> ok:alembic heads >> gate:git push",
+     "edit:{{mig_example_rel}} >> ok:alembic heads >> gate:git push",
      "edit:src/a.py >> gate:git push"
     ]
    }

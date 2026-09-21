@@ -506,6 +506,40 @@ def test_monorepo_lockfiles_pair_with_the_manifest_in_their_own_directory() -> N
         check("titles are distinct", len(set(titles)) == 3, str(titles))
 
 
+def test_alembic_revisions_are_found_where_they_live() -> None:
+    files = {**{k: v for k, v in PYTHON_REPO.items() if not k.startswith("alembic/")},
+             "migrations/env.py": "# alembic env\n", "migrations/versions/0001_init.py": "revision = '0001'\n"}
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(files, Path(tmp) / "svc")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        by_id = {c["id"]: c["body"] for c in cands}
+        check("exit 0 and everything verifies", p.returncode == 0 and all(r["ok"] for r in rows), p.stdout[-400:])
+        check("the pre-push check is scoped to the real directory", by_id["migration-heads"]["scope_paths"] == ["migrations/versions/*"],
+              str(by_id["migration-heads"]["scope_paths"]))
+        check("and the edit rule matches a revision there",
+              bool(re.search(by_id["migration-handwritten"]["matcher"]["path_rx"], "/repo/migrations/versions/0002_x.py")))
+
+
+def test_a_nested_package_past_the_cap_still_does_not_arm_the_root_rule() -> None:
+    pj = json.dumps({"scripts": {"test": "jest"}, "devDependencies": {"jest": "29"}})
+    files = {"package.json": pj, "package-lock.json": "{}\n"}
+    for i in range(10):
+        files[f"pkgs/p{i:02d}/package.json"] = pj; files[f"pkgs/p{i:02d}/yarn.lock"] = "# yarn\n"
+    sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+    import rulebook_hook as H
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(files, Path(tmp) / "big")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        by_id = {c["id"]: c["body"] for c in cands}
+        root = by_id["lockfile-drift-npm"]
+        check("the emitted rules are capped", len([k for k in by_id if k.startswith("lockfile-drift")]) == 8)
+        check("but the root rule excludes EVERY nested manifest, emitted or not", len(root["scope_exclude_paths"]) == 10,
+              str(len(root["scope_exclude_paths"])))
+        last = "pkgs/p09/package.json"
+        check("so a package with no rule of its own cannot arm the root's",
+              not H.path_in_scope({"_scope_paths": root["scope_paths"], "_scope_exclude_paths": root["scope_exclude_paths"]}, "/repo/" + last, "/repo"))
+
+
 def test_bun_lockfiles_are_paired_like_every_other_tool() -> None:
     for lock in ("bun.lock", "bun.lockb"):
         files = {"package.json": json.dumps({"scripts": {"test": "bun test"}}), lock: "x\n", "src/a.ts": "\n"}
@@ -555,7 +589,9 @@ def test_a_preview_never_counts_as_the_real_thing() -> None:
         stage = by_id["stage-secrets"]["matcher"]["command_rx"]
         for cmd in ("git add .env", "git add certs/server.key", "git add secrets.json", "git add id_ed25519", "git add a.py config/credentials.yml"):
             check(f"`{cmd}` stages a secret the read gate also knows", bool(re.search(stage, cmd)))
-        for cmd in ("git add .env.example", "git add src/secrets.py", "git add docs/keys.md", "git add src/environment.py"):
+        for cmd in ('git add ".env"', "git add 'certs/server.key'", 'git add -- "secrets.json"'):
+            check(f"`{cmd}` — the shell strips the quotes, git still stages the secret", bool(re.search(stage, cmd)))
+        for cmd in ("git add .env.example", "git add src/secrets.py", "git add docs/keys.md", "git add src/environment.py", 'git add "src/secrets.py"'):
             check(f"`{cmd}` does not", not re.search(stage, cmd))
 
 
