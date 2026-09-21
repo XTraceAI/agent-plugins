@@ -1330,7 +1330,7 @@
    "mode": "gate",
    "delivery": "agent_hook",
    "statement": "That path does not belong in the repo. Check the ignore file and stage by name.",
-   "why": "a committed secret costs a rotation; a committed build directory costs every clone.",
+   "why": "a committed secret costs a rotation; a committed build directory costs every clone. Bulk forms (`git add -A`) never name the file, so they are a separate rule that reads the branch's changed paths.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}add\\b[^|;&]*(?:\\.env(?!\\.(?:example|sample|template))\\b|\\.pem\\b|\\.p12\\b|\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/|id_rsa)"
@@ -1344,6 +1344,69 @@
     "silent": [
      "git add .env.example",
      "git add src/environment.py"
+    ]
+   }
+  },
+  {
+   "id": "stage-secrets-bulk",
+   "category": "safety",
+   "title": "No bulk staging over an unignored secret",
+   "mode": "gate",
+   "delivery": "agent_hook",
+   "statement": "A secret or key file on this branch is not ignored, and this command stages everything. Add it to .gitignore, or stage by name.",
+   "why": "`git add -A` never names the file it sweeps in, so a rule that looks for `.env` in the command cannot see it; the branch's changed paths can.",
+   "matcher": {
+    "event": "bash",
+    "command_rx": "{{GIT}}add\\b[^|;&]*\\s(?:-A|--all|-u|\\.|\\*)(?:\\s|$|[;&|])|{{GIT}}commit\\b[^|;&]*\\s-[a-zA-Z]*a",
+    "given": {
+     "repo": {
+      "diff_paths_rx": "{{secrets_rx}}"
+     }
+    }
+   },
+   "seeded_from": ".gitignore secret patterns and .env templates, matched against the branch's changed and untracked paths",
+   "cases": {
+    "fires": [
+     {
+      "case": "git add -A",
+      "diff_paths": [
+       "src/a.py",
+       ".env"
+      ]
+     },
+     {
+      "case": "cd api && git add .",
+      "diff_paths": [
+       "certs/server.pem"
+      ]
+     },
+     {
+      "case": "git commit -am 'parser: handle eof'",
+      "diff_paths": [
+       ".env.production"
+      ]
+     }
+    ],
+    "silent": [
+     {
+      "case": "git add -A",
+      "diff_paths": [
+       "src/a.py",
+       ".env.example"
+      ]
+     },
+     {
+      "case": "git add src/a.py",
+      "diff_paths": [
+       ".env"
+      ]
+     },
+     {
+      "case": "git add -A",
+      "diff_paths": [
+       "src/environment.py"
+      ]
+     }
     ]
    }
   },

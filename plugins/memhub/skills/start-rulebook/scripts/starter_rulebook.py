@@ -299,7 +299,9 @@ def scan(repo: Path) -> dict:
                      ("poetry", "poetry.lock", "pyproject.toml", r"poetry lock\b", "poetry lock"),
                      ("npm", "package-lock.json", "package.json", r"npm (?:install|i)\b", "npm install"),
                      ("pnpm", "pnpm-lock.yaml", "package.json", r"pnpm (?:install|i)\b", "pnpm install"),
-                     ("yarn", "yarn.lock", "package.json", r"yarn(?: install)?(?:\s|$)", "yarn install"),
+                     # bare `yarn` IS the install alias; `yarn test`, `yarn lint`, `yarn --version` are not
+                     ("yarn", "yarn.lock", "package.json",
+                      r"yarn(?:\s+install)?(?=\s*(?:$|[;&|])|\s+--(?!version|help))", "yarn install"),
                      ("go", "go.sum", "go.mod", r"go mod tidy\b", "go mod tidy"),
                      ("cargo", "Cargo.lock", "Cargo.toml", r"cargo (?:update|generate-lockfile|build|check)\b", "cargo update"))
                  if names[lock] and names[man]]
@@ -427,8 +429,12 @@ def scan(repo: Path) -> dict:
     ign_dirs = [l.strip("/") for l in ignore if l.endswith("/") and re.fullmatch(r"[\w.-]+/?", l)]
     base_never = (r"(?:\.lock|-lock\.(?:json|yaml)|\.min\.(?:js|css)|\.map)$"
                   r"|(?:^|/)(?:dist|build|node_modules|vendor|\.venv|__pycache__|target|\.next)/")
+    # Only an ignored directory that EXISTS here. A .gitignore is mostly a language template — Python's
+    # ships `lib/`, `var/`, `parts/`, `env/` — and turning each line into a read gate blocks ordinary source
+    # under `src/lib/` in every repo the rule reaches. (Found by the first replay that counted reads.)
     extra = [d for d in ign_dirs if d not in ("dist", "build", "node_modules", "vendor", ".venv", "__pycache__", "target", ".next")
-             and not d.startswith(".env")][:8]
+             and not d.startswith(".env") and (repo / d).is_dir()
+             and not any(f.startswith(d + "/") for f in live)][:8]
     slots["never_read_rx"] = _fit(base_never, ["(?:^|/)%s/" % re.escape(d) for d in extra])
     sec_extra = [l.lstrip("/") for l in ignore if re.search(r"secret|credential|\.pem|\.key|token", l, re.I)
                  and re.fullmatch(r"[\w./-]+", l)][:6]
@@ -574,7 +580,12 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
         body["scope_repos"] = [slots["repo"]] if scope_repo else []
         body["source"] = "authored"
         body["source_ref"] = "starter-rulebook@%s#%s" % (catalog["version"], filled["id"])
+        engine = body.get("matcher") or body.get("ordering") or {}
         out.append({"id": filled["id"], "category": rule["category"], "designed_mode": rule.get("mode"),
+                    # A transcript has no branch, diff, dirty flag, file size or agent identity, so the
+                    # session replay evaluates the PATTERN alone. For these rows its count is a ceiling
+                    # on how often the pattern is even in play — never a fire rate.
+                    "replay_is_ceiling": bool(engine.get("given") or body.get("scope_paths")),
                     "seeded_from": rule.get("seeded_from"), "evidence": rule.get("evidence"),
                     "cases": filled.get("cases") or {}, "body": body})
     return out, dropped

@@ -127,6 +127,9 @@ def test_a_python_service_seeds_every_rule_and_all_of_them_verify() -> None:
               bool(re.search(by_id["prod-commands"]["matcher"]["command_rx"], "gh workflow run deploy-production.yml")))
         check("infra pack stays out of a repo with no Terraform/k8s/AWS", "infra-destroy" in {d["id"] for d in dropped})
         check("rules are scoped to the repo", all(c["body"]["scope_repos"] == ["svc"] for c in cands))
+        never = by_id["read-never"]["matcher"]["path_rx"]
+        check("an ignore-template line for a directory that is not here never becomes a read gate",
+              "htmlcov" not in never and not re.search(never, "/repo/src/lib/parser.py"), never)
         check("notes and anchors carry no mode (the server refuses one)",
               all("mode" not in c["body"] for c in cands if c["body"]["delivery"] != "agent_hook"))
         check("every statement fits the server's 400-character cap", all(len(c["body"]["statement"]) <= 400 for c in cands))
@@ -393,6 +396,63 @@ def test_a_cursor_session_is_aged_by_its_activity_not_its_main_db_file() -> None
                              capture_output=True, text=True, env=env, cwd=home, timeout=120).stdout
         line = next((l for l in out.splitlines() if l.startswith("window:")), out[-300:])
         check("the live session is kept and only the truly stale one is skipped", "— 1 older" in line, line)
+
+
+def test_the_replay_sees_reads_so_a_read_rule_is_never_a_false_zero() -> None:
+    """The replay used to skip every Read call, so the whole read lane came back
+    0 — and the skill reads 0 on a budget rule as "they do not have this
+    problem". Both forms the live hook sees must count: the Read tool, and a
+    Bash call that prints the file."""
+    miner = SKILL / "scripts" / "mine_sessions.py"
+    def tool_use(name, inp, i):
+        return json.dumps({"type": "assistant", "timestamp": "2026-09-01T00:00:00Z", "sessionId": "s1", "cwd": "/repo",
+                           "message": {"role": "assistant", "content": [{"type": "tool_use", "id": f"t{i}", "name": name, "input": inp}]}})
+    with tempfile.TemporaryDirectory() as home:
+        proj = Path(home) / ".claude" / "projects" / "-repo"
+        proj.mkdir(parents=True)
+        (proj / "s1.jsonl").write_text("\n".join([
+            json.dumps({"type": "user", "timestamp": "2026-09-01T00:00:00Z", "sessionId": "s1", "cwd": "/repo", "message": {"role": "user", "content": "check the config"}}),
+            tool_use("Read", {"file_path": "/repo/.env"}, 1),
+            tool_use("Bash", {"command": "cd /repo && cat uv.lock"}, 2),
+            tool_use("Read", {"file_path": "/repo/src/app.py"}, 3)]) + "\n")
+        cands = Path(home) / "c.json"
+        cands.write_text(json.dumps([
+            {"title": "secrets", "delivery": "agent_hook", "matcher": {"event": "read", "path_rx": "(?:^|/)\\.env$"}},
+            {"title": "lockfiles", "delivery": "agent_hook", "matcher": {"event": "read", "path_rx": "\\.lock$"}},
+            {"title": "never", "delivery": "agent_hook", "matcher": {"event": "read", "path_rx": "(?:^|/)nothing-like-this$"}}]))
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS")}
+        env.update(HOME=home, USERPROFILE=home)
+        out = Path(home) / "o"
+        p = subprocess.run([sys.executable, str(miner), "--out", str(out), "--all", "--digest-top", "0", "--candidates", str(cands)],
+                           capture_output=True, text=True, env=env, cwd=home, timeout=120)
+        rows = {r["title"]: r for r in json.loads((out / "proposals.json").read_text()) if r.get("title") in ("secrets", "lockfiles", "never")}
+        check("ran", p.returncode == 0 and len(rows) == 3, p.stderr[-300:])
+        check("a Read tool call fires a read rule", rows["secrets"]["fired_n"] == 1, str(rows["secrets"].get("fired_n")))
+        check("a Bash `cat` of the file fires one too", rows["lockfiles"]["fired_n"] == 1, str(rows["lockfiles"].get("fired_n")))
+        check("and a read rule nothing matches is an honest zero", rows["never"]["fired_n"] == 0)
+
+
+def test_bulk_staging_is_gated_by_what_the_branch_holds_not_by_the_command_text() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(BARE_REPO, Path(tmp) / "bare")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        c = {x["id"]: x for x in cands}["stage-secrets-bulk"]
+        check("seeded and verified", next(r["ok"] for r in rows if r["id"] == "stage-secrets-bulk"))
+        check("it reads the branch's changed paths", bool(c["body"]["matcher"]["given"]["repo"]["diff_paths_rx"]))
+        check("so its replay count is marked a ceiling", c["replay_is_ceiling"] is True)
+        check("while a pure pattern rule is not", {x["id"]: x for x in cands}["rm-rf-wipe"]["replay_is_ceiling"] is False)
+
+
+def test_only_a_real_install_clears_a_yarn_lock_obligation() -> None:
+    files = {"package.json": json.dumps({"scripts": {"test": "jest"}, "devDependencies": {"jest": "29"}}), "yarn.lock": "# yarn\n", "src/a.js": "\n"}
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(files, Path(tmp) / "y")
+        p, signals, cands, dropped, rows = _run(repo, Path(tmp) / "out")
+        rx = {c["id"]: c["body"] for c in cands}["lockfile-drift-yarn"]["ordering"]["required_command_rx"]
+        for cmd in ("yarn", "yarn install", "yarn install --frozen-lockfile", "cd web && yarn"):
+            check(f"`{cmd}` clears it", bool(re.search(rx, cmd)))
+        for cmd in ("yarn test", "yarn lint", "yarn --version", "yarn run build"):
+            check(f"`{cmd}` does not", not re.search(rx, cmd))
 
 
 def test_a_rule_that_fails_verification_fails_the_run() -> None:

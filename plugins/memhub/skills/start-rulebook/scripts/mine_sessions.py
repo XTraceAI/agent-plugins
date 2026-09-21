@@ -392,17 +392,34 @@ for path, body in bodies:   # each joins the trigger it belongs to
     elif m: RULE_CANDS.append({"title": body.get("title", path), "matcher": m, "requires_prior_rx": body.get("requires_prior_rx"), **extra})
 def hook_rule(title, matcher):
     return rh.to_hook_rule({"rule_id": title, "title": title, "statement": "", "delivery": "agent_hook", "mode": "advise", "version": 1, "matcher": matcher, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []})
+@functools.lru_cache(maxsize=None)
+def _bash_reads(cmd):
+    try: return tuple(rh.bash_reads("/", cmd))      # no cwd in a transcript: relative paths resolve from /, which path patterns written as (?:^|/)name still match
+    except Exception: return ()
 def replay(rule, requires_prior_rx=None):
     """fired sessions (by host + ids), calls, genuine misses (fired with NO earlier required command that session), samples"""
     calls = collections.Counter(); sess = collections.Counter(); ids = []; misses = 0; ex = []
+    is_read = (rule or {}).get("on") == "read"
     for s in corpus:
         fired = False; prior = False
         for cl in s["calls"]:
-            tool_n = "Bash" if cl["tool"] == "Bash" else ("Write" if cl["tool"] in EDIT else None)
-            if not tool_n: continue
-            if requires_prior_rx and cl["cmd"] and re.search(requires_prior_rx, cl["cmd"]): prior = True
-            try: ok = rh.evaluate(rule, hook_phase="pre", tool=tool_n, cmd=cl["cmd"], file_path=cl["path"], body=cl["body"])
-            except Exception: ok = False
+            # A read rule sees what the live hook sees: the Read tool's path, and every file a Bash call would
+            # print (`cat .env`), through the hook's own parser. Skipping these made the whole read lane replay as
+            # ZERO — not "unmeasured", zero — which reads as "this team does not have that problem".
+            if is_read:
+                paths = [cl["path"]] if cl["tool"] == "Read" and cl["path"] else \
+                        [pth for pth, _ in _bash_reads(cl["cmd"])] if cl["tool"] == "Bash" and cl["cmd"] else []
+                ok = False
+                for pth in paths:
+                    try: ok = bool(rh.evaluate(rule, hook_phase="pre", tool="Read", cmd=cl["cmd"], file_path=pth))
+                    except Exception: ok = False
+                    if ok: break
+            else:
+                tool_n = "Bash" if cl["tool"] == "Bash" else ("Write" if cl["tool"] in EDIT else None)
+                if not tool_n: continue
+                if requires_prior_rx and cl["cmd"] and re.search(requires_prior_rx, cl["cmd"]): prior = True
+                try: ok = rh.evaluate(rule, hook_phase="pre", tool=tool_n, cmd=cl["cmd"], file_path=cl["path"], body=cl["body"])
+                except Exception: ok = False
             if ok:
                 calls[s["host"]] += 1
                 if not fired:

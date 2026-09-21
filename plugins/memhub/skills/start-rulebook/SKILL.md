@@ -265,8 +265,16 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" \
 
 Three things to know before reading a number off that replay:
 
-- **A rule with a `given` block or `scope_paths` is replayed WITHOUT them** —
-  a transcript carries no branch, diff, dirty flag or agent identity. "Never
+- **What the replay covers.** Bash commands, edits, tool output, and reads —
+  both the Read tool's path and every file a Bash call would print
+  (`cat .env`), through the hook's own parser. `anchor_recall` and
+  `session_context` rows are never replayed (the server judges those), so
+  they carry no number at all: say "not measurable here", never "0".
+- **A rule with a `given` block or `scope_paths` is replayed WITHOUT them**
+  (`candidates.json` marks each such row `replay_is_ceiling: true`) —
+  a transcript carries no branch, diff, dirty flag, file size or agent
+  identity. "Read large files as a slice" has no pattern but file size, so it
+  "fires" on every read there is. "Never
   push to main" firing in every session that pushed is a count of pushes. For
   those rules the number is a ceiling: say "up to N", or say nothing.
 - **Zero is not a verdict on a safety rule.** Wiping a home directory, piping
