@@ -77,14 +77,37 @@ Silence about the claim failing is a safety bug wearing the costume of quiet.
   nobody until a reviewer activates it, so every confirmation this skill asks
   for elsewhere is already held by whoever reviews the book. Concretely, on
   this path:
-  - **Step 0 (which rulebook)** does not ask. `list_rulebooks` reports
-    membership scope (`all_org` / `explicit`) and `bound`; it does NOT report
-    which repositories a book admits, so "the book for this repo" is not a
-    question its response can answer. The rule is therefore arithmetic: exactly
-    one `bound` book → file there; exactly one `bound` book with
-    `scope: all_org` among several → file there; anything else, including none
-    at all → file nothing, say nothing, and stop. Never guess, never create a
-    book on this path.
+  - **Step 0 (which rulebook)** does not ask, and never guesses. In order:
+
+    1. Exactly one `bound` book → file there.
+    2. Exactly one `bound` book with `scope: all_org` among several → file
+       there.
+    3. **Otherwise — several `all_org` books bound, or no book bound at all —
+       the repo's own book**, named `Rulebook: <repo>` exactly as `scope_repos`
+       spells the repo. Use the bound one with that name if it exists; if none
+       does, `create_rulebook` it with `scope: "explicit"`.
+
+    Rule 3 replaced "anything else → file nothing". That clause read as
+    fail-closed and was not: the arithmetic is prose, a model applies it, and
+    on an org with TWO bound `all_org` books it refused once and picked a book
+    every other time. Silently non-deterministic about which team's rulebook
+    gets written to is worse than either answer — a per-repo book is one the
+    configuration can always produce, so there is nothing left to resolve.
+
+    **Read `member_count` off the create reply before filing into a new book.**
+    `create_rulebook` seeds an `explicit` book with you — *unless you are an
+    organisation admin*, who is seeded only by naming themselves in
+    `member_user_ids`. An admin who takes the default therefore gets a book
+    binding NOBODY, and "a book that binds nobody serves its rules to no
+    session": the rule files, the reply says success, and it reaches no one.
+    So pass your own id in `member_user_ids` when you know it, and either way
+    treat `member_count: 0` as a FAILURE — report that the book was created but
+    binds nobody and needs a member, rather than filing into a void.
+
+    A book created here is `explicit` and small on purpose. `all_org` is an
+    admin act that binds everyone in the organisation, now and in future, and
+    nobody can leave it — not a thing to do on a path that asks nobody
+    anything.
   - **Step 4b.6** (no git checkout, no Agent tool) does not ask. Say the
     precondition was missing, file with the pattern proven only against the
     verifier's synthetic cases, and note that in the report.

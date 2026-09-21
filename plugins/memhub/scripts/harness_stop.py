@@ -592,7 +592,15 @@ CHILD_TOOLS = ("Bash", "Read", "Glob", "Grep", "Skill", "Agent",
                # could not tell "this org has no rulebook" from "I was refused",
                # and reported the refusal as the reason — a diagnosis the person
                # then cannot act on.
-               f"mcp__{MCP_SERVER_NAME}__list_orgs")
+               f"mcp__{MCP_SERVER_NAME}__list_orgs",
+               # Step 0 rule 3 falls back to the repo's own book and creates it
+               # when absent. Without these the child is refused at exactly the
+               # step the skill sends it to — the same way a missing `list_orgs`
+               # turned "this org has no rulebook" into "I was refused".
+               # `list_teammates` is how it finds its own id, which an ORG ADMIN
+               # must pass to `create_rulebook` or the new book binds nobody.
+               f"mcp__{MCP_SERVER_NAME}__create_rulebook",
+               f"mcp__{MCP_SERVER_NAME}__list_teammates")
 RESULT_PREFIX = "HARNESS-RESULT:"
 AUTHOR_TIMEOUT_S = 900
 
