@@ -713,9 +713,11 @@ def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
 
 
 # ------------------------------------------------------------------- spawn
-def spawn_detached(argv: list[str], script: Path, log_name: str) -> int:
+def spawn_detached(argv: list[str], script: Path, log_name: str,
+                   pass_fds: tuple = ()) -> int:
     """Run `script argv` fully detached: the caller is a hook that must return
-    at once, and the child must survive the session ending."""
+    at once, and the child must survive the session ending. `pass_fds` are
+    inherited — the author lane hands its lock fds down this way."""
     args = [sys.executable, str(script)] + list(argv)
     log_file = log_path(log_name)
     try:
@@ -727,6 +729,8 @@ def spawn_detached(argv: list[str], script: Path, log_name: str) -> int:
     try:
         kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
                   "close_fds": True}
+        if pass_fds and os.name != "nt":
+            kwargs["pass_fds"] = tuple(pass_fds)
         if os.name == "nt":
             kwargs["creationflags"] = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

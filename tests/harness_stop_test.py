@@ -55,6 +55,9 @@ class _Env:
         return self
 
     def __exit__(self, *exc):
+        for fh in hs._HELD:                    # never leak a lock into the next test
+            fh.close()
+        hs._HELD.clear()
         for k, v in self.saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -873,7 +876,7 @@ def test_the_author_loop_survives_its_own_log_line():
         hs.run_author = lambda *a, **k: ("none", {"detail": "not a lesson"})
         hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
         try:
-            hs.cmd_author("sess", str(Path(td) / "claim"), ["sess#1", "sess#2"])
+            hs.cmd_author("sess", ["sess#1", "sess#2"])
             rows = hx.read_jsonl(hs.moments_path("sess"))   # while the dir is still td
         finally:
             hs.run_author, hs.write_child_mcp_config = real_run, real_cfg

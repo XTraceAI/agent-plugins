@@ -56,7 +56,8 @@ all created private:
   <session>.meta.json        last extracted turn, repo, cwd, transcript cursor
   <session>.meta.json.lock   serializes the meta file's read-merge-write
   <session>.turn-*.claim     the turn an extract child already took
-  <session>.drain.claim      the author pass holding this session
+  <session>.drain.claim      lock: the author pass holding this session
+  drain.slot-N               lock: one of MAX_LIVE_DRAINS passes machine-wide
   stop.log / extract.log / author.log   one line per step, never prompt text
 
 What turning it on costs the person, and why it is opt-in (v0.69.0 through
@@ -80,7 +81,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -109,9 +109,12 @@ FILING_BUDGET_PER_PASS = 8   # rules one drain may propose; a reviewer's bound
 #: two weeks gone is not worth a review round. Dropped WITH a log line — silent
 #: dropping is this lane's whole bug.
 MOMENT_TTL_S = 14 * 24 * 3600
-#: One drain per session at a time. A holder that died leaves the claim behind,
-#: so it is breakable once it stops being touched.
-DRAIN_CLAIM_STALE_S = 900
+#: The per-session claim and the machine-wide slots are OS advisory locks
+#: (`portable_lock`), held on an open file for the whole pass and handed to
+#: the detached child by fd. A holder that dies loses its lock to the kernel,
+#: so there is no staleness to guess at and nothing to unlink — the three
+#: shapes before this (count-then-claim, stat-then-unlink, token-checked
+#: release) each left a race for a burst of Stops to find (Codex, #275).
 #: Across the whole machine, this many author passes may run at once. This is
 #: the circuit breaker for the recursion in `children_path`'s docstring and for
 #: whatever the next one looks like: a loop that spawns faster than this stops
@@ -293,74 +296,70 @@ def author_depth(environ=None) -> int:
         return 1          # unreadable means "not a person's session"; refuse
 
 
-#: A slot older than this with no heartbeat is a dead holder's. It exceeds the
-#: longest silence a LIVE holder can have — HEARTBEAT_S between touches while
-#: its child runs — by a wide margin, so a live slot is never reclaimed. (It
-#: used to equal AUTHOR_TIMEOUT_S with a touch only between children, so a
-#: child at its timeout looked exactly like a dead holder — Codex, #275.)
-SLOT_STALE_S = 600
-HEARTBEAT_S = 30
-_TOKEN = f"{os.getpid()}:{uuid.uuid4()}"
-
-
-def slot_token() -> str:
-    """What this process writes into a slot it holds. Release checks it, so a
-    pass can never unlink a slot that a later Stop reclaimed and now owns."""
-    return _TOKEN
-
-
-def release_slot(path) -> None:
-    if not path:
-        return
+def _portable_lock():
     try:
-        if Path(path).read_text(encoding="utf-8") == slot_token():
-            Path(path).unlink(missing_ok=True)
-    except OSError:
-        pass
+        import portable_lock  # noqa: PLC0415
+        return portable_lock
+    except Exception:
+        return None
 
 
-def take_drain_slot(now: float):
-    """One of MAX_LIVE_DRAINS machine-wide slots, O_EXCL — or None.
+def take_lease(path: Path):
+    """An exclusive advisory lock on `path`, or None if someone holds it.
 
-    Counting live passes and then claiming was two steps, and concurrent Stops
-    all counted the same number before any of them claimed (Codex, #275): the
-    breaker held for one Stop at a time and not for the burst it exists for.
-    The slot IS the count. A holder that died leaves the file behind, so a
-    slot nobody has touched for SLOT_STALE_S is breakable; a live pass
-    heartbeats its slot every HEARTBEAT_S for as long as its child runs."""
-    base = hx.harness_dir()
+    Returns the open file: the lock lives exactly as long as some process
+    keeps that file description open. The Stop hook takes it, hands the fd
+    to the author child it spawns, and exits; the child closes it in its
+    `finally` — or dies, and the kernel closes it. Nobody decides whether a
+    holder is dead, and nobody unlinks anything."""
+    pl = _portable_lock()
+    if pl is None:
+        return None
     try:
-        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fh = open(path, "a+", encoding="utf-8")   # noqa: SIM115 — the lock IS the handle
     except OSError:
         return None
+    try:
+        pl.lock_exclusive(fh.fileno(), blocking=False)
+    except OSError:
+        fh.close()
+        return None
+    try:
+        os.set_inheritable(fh.fileno(), True)      # the child inherits the lock
+        fh.seek(0); fh.truncate()
+        fh.write(f"{os.getpid()} {time.time():.0f}\n"); fh.flush()
+    except OSError:
+        pass
+    return fh
+
+
+def take_drain_slot():
+    """One of MAX_LIVE_DRAINS machine-wide slots, or None. The slot IS the
+    count: no process can hold one that another holds."""
     for i in range(MAX_LIVE_DRAINS):
-        path = base / f"drain.slot-{i}"
-        for _ in range(2):
-            try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(slot_token())
-                return path
-            except FileExistsError:
-                try:
-                    if now - path.stat().st_mtime > SLOT_STALE_S:
-                        path.unlink(missing_ok=True)
-                        continue          # once: a live holder may have just re-taken it
-                except OSError:
-                    pass
-                break
-            except OSError:
-                break
+        got = take_lease(hx.harness_dir() / f"drain.slot-{i}")
+        if got is not None:
+            return got
     return None
 
 
-def live_drains(now: float) -> int:
+def live_drains() -> int:
     """Slots held right now; for the log line, never for a decision."""
-    try:
-        return sum(1 for p in hx.harness_dir().glob("drain.slot-*")
-                   if now - p.stat().st_mtime < SLOT_STALE_S)
-    except OSError:
-        return 0
+    n = 0
+    for i in range(MAX_LIVE_DRAINS):
+        probe = take_lease(hx.harness_dir() / f"drain.slot-{i}")
+        if probe is None:
+            n += 1
+        else:
+            probe.close()
+    return n
+
+
+#: Leases this process holds. The Stop hook keeps them here until it exits,
+#: so nothing garbage-collects (and so releases) a lease before the child it
+#: was handed to has started.
+_HELD: list = []
 
 
 # --------------------------------------------------------------- stop lane
@@ -662,25 +661,9 @@ def pending(session: str, repo: str, now: float) -> list[tuple[Path, dict]]:
     return out
 
 
-def take_drain_claim(session: str, now: float):
-    """`<session>.drain.claim`, O_EXCL — one drain per session at a time.
-
-    The same shape the per-turn claim already uses. A holder that died leaves
-    the file behind, so a claim nobody has touched for DRAIN_CLAIM_STALE_S is
-    breakable; otherwise a single crash would stop this session draining ever
-    again."""
-    path = hx.session_file(session, ".drain.claim")
-    try:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.exists() and now - path.stat().st_mtime > DRAIN_CLAIM_STALE_S:
-            path.unlink(missing_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(fd)
-        return path
-    except FileExistsError:
-        return None
-    except OSError:
-        return None
+def take_drain_claim(session: str):
+    """`<session>.drain.claim` as a lease — one drain per session at a time."""
+    return take_lease(hx.session_file(session, ".drain.claim"))
 
 
 def hand_off(session: str) -> int:
@@ -708,29 +691,29 @@ def hand_off(session: str) -> int:
     waiting = pending(session, repo, now)
     if not waiting:
         return 0
-    claim = take_drain_claim(session, now)
+    claim = take_drain_claim(session)
     if claim is None:
         # A drain is already running for this session. It reads the files when
         # it gets there, so anything parked meanwhile is its problem, not this
         # Stop's — nothing is dropped by declining here.
         return 0
-    slot = take_drain_slot(now)
+    slot = take_drain_slot()
     if slot is None:
         # Said out loud, because a breaker that trips silently is a lane that
         # went quiet for no reason anyone can see. The moments stay for a
         # later Stop.
-        try:
-            Path(claim).unlink(missing_ok=True)
-        except OSError:
-            pass
-        _log(f"drain {session[:8]}: {live_drains(now)} pass(es) already running "
+        claim.close()
+        _log(f"drain {session[:8]}: {live_drains()} pass(es) already running "
              f"on this machine (cap {MAX_LIVE_DRAINS}); {len(waiting)} left waiting")
         return 0
+    _HELD.extend((claim, slot))
     batch = waiting[:FILING_BUDGET_PER_PASS]
     refs = [_moment_key(m) for _, m in batch]
-    hx.spawn_detached(["author", "--session", session, "--claim", str(claim),
-                       "--slot", str(slot), "--refs", ",".join(refs)],
-                      script=Path(__file__).resolve(), log_name="author.log")
+    fds = (claim.fileno(), slot.fileno())
+    hx.spawn_detached(["author", "--session", session, "--refs", ",".join(refs),
+                       "--lease-fds", ",".join(map(str, fds))],
+                      script=Path(__file__).resolve(), log_name="author.log",
+                      pass_fds=fds)
     _log(f"drain {session[:8]}: spawned for {len(batch)} of {len(waiting)} waiting")
     return 0
 
@@ -975,42 +958,16 @@ def child_argv(prompt: str, mcp_cfg: Path, *, resume: str = "", session_id: str 
                    "--allowedTools", ",".join(tools)]
 
 
-class _Heartbeat:
-    """Touches the given files every HEARTBEAT_S until stopped, so a slot (and
-    the session claim) held by a pass whose child is still running never
-    looks like a dead holder's."""
-
-    def __init__(self, paths):
-        self.paths = [Path(p) for p in paths if p]
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self):
-        while not self.stop.wait(HEARTBEAT_S):
-            for path in self.paths:
-                try:
-                    os.utime(path, None)
-                except OSError:
-                    pass
-
-    def __enter__(self):
-        if self.paths:
-            self.thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self.stop.set()
-
-
-def run_child(argv: list[str], *, cwd: str | None = None,
-              keepalive=()) -> tuple[str, dict, str]:
-    """(reply, spent, why it failed). `why` is "" when the child ran.
-    `keepalive` are lease files touched while it runs."""
-    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch, _Heartbeat(keepalive):
+def run_child(argv: list[str], *, cwd: str | None = None) -> tuple[str, dict, str]:
+    """(reply, spent, why it failed). `why` is "" when the child ran."""
+    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=AUTHOR_TIMEOUT_S, env=child_env(scratch),
-                                  stdin=subprocess.DEVNULL, cwd=cwd)
+                                  # never the leases: `claude` outlives nothing here,
+                                  # but an inherited lock fd would hold the slot
+                                  # for as long as it ran
+                                  stdin=subprocess.DEVNULL, cwd=cwd, close_fds=True)
         except FileNotFoundError:
             return "", {}, "no claude CLI on PATH"
         except subprocess.TimeoutExpired:
@@ -1023,8 +980,7 @@ def run_child(argv: list[str], *, cwd: str | None = None,
     return reply, spent, ""
 
 
-def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path,
-               keepalive=()) -> tuple[str, dict]:
+def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, dict]:
     """One moment, one child. The outcome row names the `child` and what the
     pass `spent`, failed passes included — a pass that burned a full context
     and then died is the cost most worth seeing."""
@@ -1036,7 +992,7 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path,
                       resume=owner, session_id=child)
     # On the list BEFORE it exists: its first Stop must already find it there.
     register_child(child, owner, str(moment.get("source_ref") or ""))
-    reply, spent, why = run_child(argv, keepalive=keepalive)
+    reply, spent, why = run_child(argv)
     extra = {"child": child, **({"spent": spent} if spent else {})}
     if why:
         return "failed", {"detail": why, **extra}
@@ -1044,7 +1000,7 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path,
     return outcome, {**fields, **extra}
 
 
-def cmd_author(session: str, claim: str, refs: list[str], slot: str = "") -> int:
+def cmd_author(session: str, refs: list[str], lease_fds: tuple = ()) -> int:
     """The detached pass. One `claude -p` per moment, then the outcome written
     back beside the moment it came from.
 
@@ -1070,8 +1026,7 @@ def cmd_author(session: str, claim: str, refs: list[str], slot: str = "") -> int
                     path, moment = got
                     if quarantine_legacy(path, ref, moment, session):
                         continue
-                    outcome, fields = run_author(session, moment, repo, mcp_cfg,
-                                                 keepalive=(slot, claim))
+                    outcome, fields = run_author(session, moment, repo, mcp_cfg)
                     row = {"outcome": outcome, "ref": ref, **fields,
                            # WHICH MemHub. The first live run filed against
                            # production because `resolve_url_and_auth` hands
@@ -1093,11 +1048,11 @@ def cmd_author(session: str, claim: str, refs: list[str], slot: str = "") -> int
                              "by": session, "at": time.time()})
             _log(f"author {session[:8]}: could not start — {exc}")
     finally:
-        release_slot(slot)
-        try:
-            Path(claim).unlink(missing_ok=True)
-        except OSError:
-            pass
+        for fd in lease_fds:                    # the locks go with the fds
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return 0
 
 
@@ -1145,8 +1100,7 @@ def report_outcomes(session: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("mode", choices=("stop", "extract", "author"))
-    p.add_argument("--claim", default="")
-    p.add_argument("--slot", default="")
+    p.add_argument("--lease-fds", default="")
     p.add_argument("--refs", default="")
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
@@ -1171,8 +1125,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "extract" and args.session:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     if args.mode == "author" and args.session:
-        return cmd_author(args.session, args.claim,
-                          [r for r in args.refs.split(",") if r], slot=args.slot)
+        return cmd_author(args.session, [r for r in args.refs.split(",") if r],
+                          lease_fds=tuple(int(x) for x in args.lease_fds.split(",") if x))
     return 0
 
 

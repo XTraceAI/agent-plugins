@@ -13,7 +13,8 @@ the spawner and on the children list before the child runs; a Stop for a
 listed session senses nothing and spawns nothing even with the flag on and the
 child flag unset; a moment stamped inside a child is never drained, so debris
 from before the list existed cannot start the loop; the depth flag alone
-refuses; the machine-wide breaker holds under concurrent Stops; a pre-list child's
+refuses; the machine-wide breaker holds under concurrent Stops and its slots are
+kernel-held locks that a dead holder cannot keep; a pre-list child's
 moment is found by its transcript and quarantined, never authored;
 and the child's own hand-off prompt is harness text to the sensor. No test
 starts a `claude`.
@@ -146,14 +147,20 @@ def test_the_machine_wide_breaker_holds_under_concurrent_stops():
         finally:
             hx.subprocess.Popen = real
         assert len(spawned) == hs.MAX_LIVE_DRAINS, len(spawned)
-        assert hs.live_drains(time.time()) == hs.MAX_LIVE_DRAINS
+        assert hs.live_drains() == hs.MAX_LIVE_DRAINS
+        # the child is handed the lock fds, and only those
+        for args in spawned:
+            fds = [int(x) for x in args[args.index("--lease-fds") + 1].split(",")]
+            assert len(fds) == 2 and all(os.fstat(fd) for fd in fds)
         # a refused Stop released its per-session claim, so it can retry later
         held = {a[a.index("--session") + 1] for a in spawned}
         for n in range(1, 9):
-            assert hx.session_file(f"s{n}", ".drain.claim").exists() == (f"s{n}" in held)
-        # a finished pass frees its slot; the next Stop takes it
-        slot = spawned[0][spawned[0].index("--slot") + 1]
-        Path(slot).unlink()
+            probe = hs.take_drain_claim(f"s{n}")
+            assert (probe is None) == (f"s{n}" in held), n
+            if probe:
+                probe.close()
+        # a finished pass drops its fds; the next Stop takes the freed slot
+        hs._HELD.pop(1).close()                 # the first spawn's slot
         spawned.clear()
         hx.subprocess.Popen = lambda args, **kw: spawned.append(args)
         try:
@@ -200,7 +207,7 @@ def test_a_pre_list_childs_moment_is_quarantined_not_authored():
                                                       ("none", {"detail": "x"}))[1]
             hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
             try:
-                hs.cmd_author("drainer", str(env.base / "claim"), ["legacykid#3", "person#2"])
+                hs.cmd_author("drainer", ["legacykid#3", "person#2"])
             finally:
                 hs.run_author, hs.write_child_mcp_config = real_run, real_cfg
             assert authored == ["person#2"], authored
@@ -220,50 +227,56 @@ def test_a_pre_list_childs_moment_is_quarantined_not_authored():
     print("PASS test_a_pre_list_childs_moment_is_quarantined_not_authored")
 
 
-def test_a_slot_is_leased_not_merely_held():
-    """The slot's stale window used to equal the child's timeout, with a
-    touch only between children: a child at its timeout looked exactly like
-    a dead holder, another Stop reclaimed the slot, and the first pass's
-    `finally` then unlinked the reclaimer's slot (Codex, #275). Now: the
-    holder heartbeats while its child runs, and release checks the token."""
+def test_a_dead_holders_slot_is_freed_by_the_kernel_and_a_live_ones_is_not():
+    """No staleness heuristic, no unlink: the slot is an advisory lock on an
+    open file. Three shapes of file-based lease each left a race for a burst
+    of Stops (Codex, #275 ×3); a lock a dead process held is released by the
+    kernel, and a lock a live process holds cannot be taken by anyone."""
     with _Env():
-        now = time.time()
-        slot = hs.take_drain_slot(now)
-        assert slot is not None and slot.read_text() == hs.slot_token()
-        # a live holder's slot is never reclaimed, however long its child runs
-        old = now - hs.SLOT_STALE_S - 1
-        os.utime(slot, (old, old))
-        hs.HEARTBEAT_S, saved = 0.05, hs.HEARTBEAT_S
+        base = hx.harness_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        slot = base / "drain.slot-0"
+        # a holder that died mid-pass: lock taken, process gone, no release code ran
+        code = ("import os,sys; sys.path.insert(0, %r); import portable_lock as pl\n"
+                "f = open(%r, 'a+'); pl.lock_exclusive(f.fileno(), blocking=False)\n"
+                "print('locked', flush=True); os._exit(0)") % (str(ROOT / "plugins" / "memhub" / "scripts"), str(slot))
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+        assert "locked" in out.stdout, out
+        assert hs.take_lease(slot) is not None, "a dead holder's lock was not released"
+        hs._HELD.clear()
+        # a live holder in another process: nobody can take it while it lives
+        code = ("import os,sys,time; sys.path.insert(0, %r); import portable_lock as pl\n"
+                "f = open(%r, 'a+'); pl.lock_exclusive(f.fileno(), blocking=False)\n"
+                "print('locked', flush=True); sys.stdin.readline()") % (str(ROOT / "plugins" / "memhub" / "scripts"), str(slot))
+        holder = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True)
         try:
-            with hs._Heartbeat([slot]):
-                time.sleep(0.2)
+            assert holder.stdout.readline().strip() == "locked"
+            assert hs.take_lease(slot) is None, "took a slot a live process holds"
+            assert hs.live_drains() == 1
         finally:
-            hs.HEARTBEAT_S = saved
-        assert time.time() - slot.stat().st_mtime < 5, "heartbeat did not touch the slot"
-        # a slot someone else reclaimed is not ours to release
-        slot.write_text("999:someone-else")
-        hs.release_slot(slot)
-        assert slot.exists(), "released a slot owned by another pass"
-        slot.write_text(hs.slot_token())
-        hs.release_slot(slot)
-        assert not slot.exists()
-        # run_child heartbeats the leases it is handed
-        real = hs.subprocess.run
-        seen = {}
-        hs.subprocess.run = lambda argv, **kw: (seen.update(ran=True),
-                                                subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))[1]
+            holder.stdin.close()
+            holder.wait(timeout=30)
+        got = hs.take_lease(slot)
+        assert got is not None
+        got.close()
+        # the lock is inherited by a child that is handed the fd, and released
+        # when that child exits — the shape the Stop hook relies on
+        mine = hs.take_lease(slot)
+        code = "import os,sys; os.fstat(int(sys.argv[1])); sys.stdin.readline()"
+        kid = subprocess.Popen([sys.executable, "-c", code, str(mine.fileno())],
+                               pass_fds=(mine.fileno(),), stdin=subprocess.PIPE, text=True)
         try:
-            lease = hx.harness_dir() / "lease"
-            lease.write_text("x")
-            os.utime(lease, (old, old))
-            hs.HEARTBEAT_S = 0.05
-            real_run = subprocess.run
-            hs.subprocess.run = lambda argv, **kw: (time.sleep(0.2), real_run(["true"], capture_output=True))[1]
-            hs.run_child(["true"], keepalive=[lease])
-            assert time.time() - lease.stat().st_mtime < 5
+            mine.close()                        # the hook exits; the child still holds it
+            time.sleep(0.2)
+            assert hs.take_lease(slot) is None, "lock did not survive the parent closing"
         finally:
-            hs.subprocess.run, hs.HEARTBEAT_S = real, saved
-    print("PASS test_a_slot_is_leased_not_merely_held")
+            kid.stdin.close()
+            kid.wait(timeout=30)
+        got = hs.take_lease(slot)
+        assert got is not None, "lock did not release when the child exited"
+        got.close()
+    print("PASS test_a_dead_holders_slot_is_freed_by_the_kernel_and_a_live_ones_is_not")
 
 
 def test_the_childs_own_prompt_is_harness_text():
