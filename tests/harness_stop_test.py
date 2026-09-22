@@ -354,7 +354,7 @@ def test_a_later_stop_authors_the_moment_once():
         # the claim is what makes it once: a second Stop while the pass holds it
         # spawns nothing, and the pass picks up anything parked meanwhile
         assert _authored()[0] == [], "one drain per session at a time"
-        hs.hx.session_file("sess", ".drain.claim").unlink()
+        _drain_finished("sess")
         assert _authored()[0] == ["sess#2"], "still waiting: nothing DECIDED it yet"
     print("PASS test_a_later_stop_authors_the_moment_once")
 
@@ -384,6 +384,15 @@ def test_a_fast_child_never_makes_the_drain_take_the_stopping_turn():
         assert authored[0][authored[0].index("--refs") + 1] == "sess#2"
     print("PASS test_a_fast_child_never_makes_the_drain_take_the_stopping_turn")
 
+
+def _drain_finished(session):
+    """What cmd_author's `finally` does: release the session claim AND the
+    machine-wide slot. A test that frees only the claim leaves the slot held
+    and trips the breaker on its third spawn."""
+    hs.hx.session_file(session, ".drain.claim").unlink(missing_ok=True)
+    for slot in hx.harness_dir().glob("drain.slot-*"):
+        slot.unlink(missing_ok=True)
+
 def test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes():
     """The per-session cap and the 3-turn window are GONE with the block: they
     rationed interruptions, and a detached pass interrupts nobody. What bounds
@@ -395,7 +404,7 @@ def test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes():
         # an old moment is no longer skipped for being old in TURNS
         hx.append_jsonl(hs.moments_path("sess"), _moment(2))
         assert _authored()[0] == ["sess#2"], "turn age no longer strands a moment"
-        hs.hx.session_file("sess", ".drain.claim").unlink()
+        _drain_finished("sess")
 
         stale = _moment(3)
         stale["state"] = dict(stale["state"], at="2020-01-01T00:00:00Z")
@@ -407,7 +416,7 @@ def test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes():
         assert "sess#3" not in refs and "sess#4" not in refs, refs
 
         # more than the reviewer's budget: taken in batches, never dropped
-        hs.hx.session_file("sess", ".drain.claim").unlink()
+        _drain_finished("sess")
         for turn in range(10, 10 + hs.FILING_BUDGET_PER_PASS + 3):
             hx.append_jsonl(hs.moments_path("sess"), _moment(turn))
         refs, _ = _authored()

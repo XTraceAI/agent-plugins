@@ -292,10 +292,44 @@ def author_depth(environ=None) -> int:
         return 1          # unreadable means "not a person's session"; refuse
 
 
-def live_drains(now: float) -> int:
-    """Author passes running on this machine: fresh `*.drain.claim` files."""
+def take_drain_slot(now: float):
+    """One of MAX_LIVE_DRAINS machine-wide slots, O_EXCL — or None.
+
+    Counting live passes and then claiming was two steps, and concurrent Stops
+    all counted the same number before any of them claimed (Codex, #275): the
+    breaker held for one Stop at a time and not for the burst it exists for.
+    The slot IS the count. A holder that died leaves the file behind, so a
+    slot nobody has touched for DRAIN_CLAIM_STALE_S is breakable; the pass
+    touches its slot after every moment it authors."""
+    base = hx.harness_dir()
     try:
-        return sum(1 for p in hx.harness_dir().glob("*.drain.claim")
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return None
+    for i in range(MAX_LIVE_DRAINS):
+        path = base / f"drain.slot-{i}"
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+                return path
+            except FileExistsError:
+                try:
+                    if now - path.stat().st_mtime > DRAIN_CLAIM_STALE_S:
+                        path.unlink(missing_ok=True)
+                        continue          # once: a live holder may have just re-taken it
+                except OSError:
+                    pass
+                break
+            except OSError:
+                break
+    return None
+
+
+def live_drains(now: float) -> int:
+    """Slots held right now; for the log line, never for a decision."""
+    try:
+        return sum(1 for p in hx.harness_dir().glob("drain.slot-*")
                    if now - p.stat().st_mtime < DRAIN_CLAIM_STALE_S)
     except OSError:
         return 0
@@ -646,24 +680,28 @@ def hand_off(session: str) -> int:
     waiting = pending(session, repo, now)
     if not waiting:
         return 0
-    live = live_drains(now)
-    if live >= MAX_LIVE_DRAINS:
-        # Said out loud, because a breaker that trips silently is a lane that
-        # went quiet for no reason anyone can see. The moments stay for a
-        # later Stop.
-        _log(f"drain {session[:8]}: {live} pass(es) already running on this "
-             f"machine (cap {MAX_LIVE_DRAINS}); {len(waiting)} left waiting")
-        return 0
     claim = take_drain_claim(session, now)
     if claim is None:
         # A drain is already running for this session. It reads the files when
         # it gets there, so anything parked meanwhile is its problem, not this
         # Stop's — nothing is dropped by declining here.
         return 0
+    slot = take_drain_slot(now)
+    if slot is None:
+        # Said out loud, because a breaker that trips silently is a lane that
+        # went quiet for no reason anyone can see. The moments stay for a
+        # later Stop.
+        try:
+            Path(claim).unlink(missing_ok=True)
+        except OSError:
+            pass
+        _log(f"drain {session[:8]}: {live_drains(now)} pass(es) already running "
+             f"on this machine (cap {MAX_LIVE_DRAINS}); {len(waiting)} left waiting")
+        return 0
     batch = waiting[:FILING_BUDGET_PER_PASS]
     refs = [_moment_key(m) for _, m in batch]
     hx.spawn_detached(["author", "--session", session, "--claim", str(claim),
-                       "--refs", ",".join(refs)],
+                       "--slot", str(slot), "--refs", ",".join(refs)],
                       script=Path(__file__).resolve(), log_name="author.log")
     _log(f"drain {session[:8]}: spawned for {len(batch)} of {len(waiting)} waiting")
     return 0
@@ -720,6 +758,70 @@ def write_child_mcp_config(directory: Path) -> tuple[Path, str]:
     return path, url
 
 
+#: The sentence every author prompt has carried since the detached lane
+#: shipped (v0.66.0). It is how a child from BEFORE the children list is told
+#: apart: its transcript holds a human-role message saying this, and no
+#: person's does.
+CHILD_MARK = "You are a detached pass"
+
+
+def transcript_of(session: str) -> Path | None:
+    """The session's .jsonl under ~/.claude/projects, or None."""
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    try:
+        hits = sorted(root.glob(f"*/{session}.jsonl"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    return hits[0] if hits else None
+
+
+def is_legacy_child(session: str) -> bool:
+    """Was this session an author child of a release that kept no list?
+
+    v0.74.0–v0.76.0 wrote no `children.jsonl`, so the moments those children
+    stamped are on disk with nothing marking them (Codex, #275). Their
+    transcripts ARE marked: a fork's hand-off is a human-role record that
+    says CHILD_MARK. This reads the whole transcript, so it runs in the
+    detached author pass — never in the Stop hook — and its answer is
+    written to the list so it is asked once per session."""
+    path = transcript_of(session)
+    if path is None:
+        return False
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if CHILD_MARK not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") != "user":
+                    continue
+                text = hx._text_of((rec.get("message") or {}).get("content"))
+                if CHILD_MARK in text and text.lstrip().startswith(BLOCK_PREFIX):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def quarantine_legacy(path: Path, ref: str, moment: dict, by: str) -> bool:
+    """A moment stamped inside a pre-list child: listed now, marked handed
+    with outcome `quarantined`, never authored. True when quarantined."""
+    owner = str((moment.get("state") or {}).get("session_id") or "")
+    if not owner or is_registered_child(owner) or not is_legacy_child(owner):
+        return False
+    register_child(owner, "", f"legacy:{ref}")
+    hx.append_jsonl(path, {"outcome": "quarantined", "ref": ref, "handed": ref,
+                           "detail": "stamped inside an author child of a release "
+                                     "that kept no children list",
+                           "by": by, "at": time.time()})
+    _log(f"author {by[:8]}: {ref} -> quarantined (legacy child {owner[:8]})")
+    return True
+
+
 def author_prompt(session: str, moment: dict, repo: str) -> str:
     """What the child is asked.
 
@@ -730,7 +832,7 @@ def author_prompt(session: str, moment: dict, repo: str) -> str:
     question, and the result has to come back on a line a program can read."""
     return (
         block_reason(session, moment, repo)
-        + "\n\nYou are a detached pass: there is no one to answer a question, so "
+        + f"\n\n{CHILD_MARK}: there is no one to answer a question, so "
         "follow the Harness-draft section's arithmetic and ask nothing. If it is "
         "not a lesson, file nothing.\n\n"
         + result_contract())
@@ -884,7 +986,7 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[st
     return outcome, {**fields, **extra}
 
 
-def cmd_author(session: str, claim: str, refs: list[str]) -> int:
+def cmd_author(session: str, claim: str, refs: list[str], slot: str = "") -> int:
     """The detached pass. One `claude -p` per moment, then the outcome written
     back beside the moment it came from.
 
@@ -908,7 +1010,14 @@ def cmd_author(session: str, claim: str, refs: list[str]) -> int:
                     if got is None:            # drained by someone else meanwhile
                         continue
                     path, moment = got
+                    if quarantine_legacy(path, ref, moment, session):
+                        continue
                     outcome, fields = run_author(session, moment, repo, mcp_cfg)
+                    if slot:
+                        try:                    # still alive: not breakable
+                            os.utime(slot, None)
+                        except OSError:
+                            pass
                     row = {"outcome": outcome, "ref": ref, **fields,
                            # WHICH MemHub. The first live run filed against
                            # production because `resolve_url_and_auth` hands
@@ -930,10 +1039,12 @@ def cmd_author(session: str, claim: str, refs: list[str]) -> int:
                              "by": session, "at": time.time()})
             _log(f"author {session[:8]}: could not start — {exc}")
     finally:
-        try:
-            Path(claim).unlink(missing_ok=True)
-        except OSError:
-            pass
+        for held in (claim, slot):
+            try:
+                if held:
+                    Path(held).unlink(missing_ok=True)
+            except OSError:
+                pass
     return 0
 
 
@@ -982,6 +1093,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("mode", choices=("stop", "extract", "author"))
     p.add_argument("--claim", default="")
+    p.add_argument("--slot", default="")
     p.add_argument("--refs", default="")
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
@@ -1007,7 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     if args.mode == "author" and args.session:
         return cmd_author(args.session, args.claim,
-                          [r for r in args.refs.split(",") if r])
+                          [r for r in args.refs.split(",") if r], slot=args.slot)
     return 0
 
 

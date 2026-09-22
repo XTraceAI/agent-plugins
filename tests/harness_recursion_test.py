@@ -13,7 +13,8 @@ the spawner and on the children list before the child runs; a Stop for a
 listed session senses nothing and spawns nothing even with the flag on and the
 child flag unset; a moment stamped inside a child is never drained, so debris
 from before the list existed cannot start the loop; the depth flag alone
-refuses; the machine-wide breaker refuses a third pass whatever asked for it;
+refuses; the machine-wide breaker holds under concurrent Stops; a pre-list child's
+moment is found by its transcript and quarantined, never authored;
 and the child's own hand-off prompt is harness text to the sensor. No test
 starts a `claude`.
 """
@@ -118,19 +119,105 @@ def test_the_depth_flag_alone_refuses():
     print("PASS test_the_depth_flag_alone_refuses")
 
 
-def test_the_machine_wide_breaker_refuses_a_third_pass():
+def test_the_machine_wide_breaker_holds_under_concurrent_stops():
+    """Count-then-claim let every concurrent Stop count the same number and
+    all spawn (Codex, #275). The slot is the count: of N Stops racing, at
+    most MAX_LIVE_DRAINS hold one."""
+    import threading  # noqa: PLC0415
     with _Env():
-        hs._publish(hs.meta_path("s3"), json.dumps({"repo": "repo"}))
-        hx.append_jsonl(hs.moments_path("s3"), _moment(1, "s3"))
-        for other in ("s1", "s2"):
-            hs.take_drain_claim(other, time.time())      # two passes already running
-        assert hs.live_drains(time.time()) == 2
-        assert _spawns(lambda: hs.hand_off("s3")) == []
-        assert not hx.session_file("s3", ".drain.claim").exists(), "no claim taken when refused"
-        # one finishes → the next Stop spawns
-        hx.session_file("s1", ".drain.claim").unlink()
-        assert len(_spawns(lambda: hs.hand_off("s3"))) == 1
-    print("PASS test_the_machine_wide_breaker_refuses_a_third_pass")
+        for n in range(1, 9):
+            hs._publish(hs.meta_path(f"s{n}"), json.dumps({"repo": "repo"}))
+            hx.append_jsonl(hs.moments_path(f"s{n}"), _moment(1, f"s{n}"))
+        spawned = []
+        real = hx.subprocess.Popen
+        hx.subprocess.Popen = lambda args, **kw: spawned.append(args)
+        gate = threading.Barrier(8)
+
+        def stop(n):
+            gate.wait()
+            hs.hand_off(f"s{n}")
+
+        threads = [threading.Thread(target=stop, args=(n,)) for n in range(1, 9)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            hx.subprocess.Popen = real
+        assert len(spawned) == hs.MAX_LIVE_DRAINS, len(spawned)
+        assert hs.live_drains(time.time()) == hs.MAX_LIVE_DRAINS
+        # a refused Stop released its per-session claim, so it can retry later
+        held = {a[a.index("--session") + 1] for a in spawned}
+        for n in range(1, 9):
+            assert hx.session_file(f"s{n}", ".drain.claim").exists() == (f"s{n}" in held)
+        # a finished pass frees its slot; the next Stop takes it
+        slot = spawned[0][spawned[0].index("--slot") + 1]
+        Path(slot).unlink()
+        spawned.clear()
+        hx.subprocess.Popen = lambda args, **kw: spawned.append(args)
+        try:
+            free = next(n for n in range(1, 9) if f"s{n}" not in held)
+            hs.hand_off(f"s{free}")
+        finally:
+            hx.subprocess.Popen = real
+        assert len(spawned) == 1
+    print("PASS test_the_machine_wide_breaker_holds_under_concurrent_stops")
+
+
+def test_a_pre_list_childs_moment_is_quarantined_not_authored():
+    """v0.74.0–v0.76.0 kept no list. Their children's moments are on disk with
+    nothing marking them but the transcript, which holds the hand-off as a
+    human-role message (Codex, #275). Nothing here registers the child by
+    hand: the pass has to find it."""
+    with _Env() as env:
+        projects = env.base / "projects" / "-some-cwd"
+        projects.mkdir(parents=True)
+        old_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(env.base)
+        try:
+            # a legacy child: the owner's history, then the hand-off, then its own turn
+            legacy = projects / "legacykid.jsonl"
+            legacy.write_text("\n".join(json.dumps(r) for r in [
+                {"type": "user", "message": {"content": "fix the flaky test"}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+                {"type": "user", "message": {"content": hs.author_prompt("legacykid", _moment(1, "owner"), "repo")}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "HARNESS-RESULT: none x"}]}},
+            ]) + "\n", encoding="utf-8")
+            # a person's session that happens to QUOTE the sentence in a tool result
+            person = projects / "person.jsonl"
+            person.write_text("\n".join(json.dumps(r) for r in [
+                {"type": "user", "message": {"content": "why did the child say that?"}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                                          "content": hs.CHILD_MARK + ": there is no one"}]}},
+            ]) + "\n", encoding="utf-8")
+            hs._publish(hs.meta_path("drainer"), json.dumps({"repo": "repo"}))
+            hx.append_jsonl(hs.moments_path("legacykid"), _moment(3, "legacykid"))
+            hx.append_jsonl(hs.moments_path("person"), _moment(2, "person"))
+            authored = []
+            real_run, real_cfg = hs.run_author, hs.write_child_mcp_config
+            hs.run_author = lambda s, m, r, c: (authored.append(m["source_ref"]),
+                                                ("none", {"detail": "x"}))[1]
+            hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
+            try:
+                hs.cmd_author("drainer", str(env.base / "claim"), ["legacykid#3", "person#2"])
+            finally:
+                hs.run_author, hs.write_child_mcp_config = real_run, real_cfg
+            assert authored == ["person#2"], authored
+            assert hs.is_registered_child("legacykid") and not hs.is_registered_child("person")
+            rows = hx.read_jsonl(hs.moments_path("legacykid"))
+            q = [r for r in rows if r.get("outcome") == "quarantined"]
+            assert q and q[0]["handed"] == "legacykid#3"
+            # listed now: the Stop hook skips it without reading any transcript
+            assert [m["source_ref"] for _, m in hs.pending("drainer", "repo", time.time())] == []
+            # and a quarantined row is not something the person is told about
+            assert hs.report_outcomes("legacykid") == ""
+        finally:
+            if old_cfg is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+    print("PASS test_a_pre_list_childs_moment_is_quarantined_not_authored")
 
 
 def test_the_childs_own_prompt_is_harness_text():
