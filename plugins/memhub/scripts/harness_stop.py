@@ -80,6 +80,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -292,6 +293,32 @@ def author_depth(environ=None) -> int:
         return 1          # unreadable means "not a person's session"; refuse
 
 
+#: A slot older than this with no heartbeat is a dead holder's. It exceeds the
+#: longest silence a LIVE holder can have — HEARTBEAT_S between touches while
+#: its child runs — by a wide margin, so a live slot is never reclaimed. (It
+#: used to equal AUTHOR_TIMEOUT_S with a touch only between children, so a
+#: child at its timeout looked exactly like a dead holder — Codex, #275.)
+SLOT_STALE_S = 600
+HEARTBEAT_S = 30
+_TOKEN = f"{os.getpid()}:{uuid.uuid4()}"
+
+
+def slot_token() -> str:
+    """What this process writes into a slot it holds. Release checks it, so a
+    pass can never unlink a slot that a later Stop reclaimed and now owns."""
+    return _TOKEN
+
+
+def release_slot(path) -> None:
+    if not path:
+        return
+    try:
+        if Path(path).read_text(encoding="utf-8") == slot_token():
+            Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def take_drain_slot(now: float):
     """One of MAX_LIVE_DRAINS machine-wide slots, O_EXCL — or None.
 
@@ -299,8 +326,8 @@ def take_drain_slot(now: float):
     all counted the same number before any of them claimed (Codex, #275): the
     breaker held for one Stop at a time and not for the burst it exists for.
     The slot IS the count. A holder that died leaves the file behind, so a
-    slot nobody has touched for DRAIN_CLAIM_STALE_S is breakable; the pass
-    touches its slot after every moment it authors."""
+    slot nobody has touched for SLOT_STALE_S is breakable; a live pass
+    heartbeats its slot every HEARTBEAT_S for as long as its child runs."""
     base = hx.harness_dir()
     try:
         base.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -311,11 +338,12 @@ def take_drain_slot(now: float):
         for _ in range(2):
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                os.close(fd)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(slot_token())
                 return path
             except FileExistsError:
                 try:
-                    if now - path.stat().st_mtime > DRAIN_CLAIM_STALE_S:
+                    if now - path.stat().st_mtime > SLOT_STALE_S:
                         path.unlink(missing_ok=True)
                         continue          # once: a live holder may have just re-taken it
                 except OSError:
@@ -330,7 +358,7 @@ def live_drains(now: float) -> int:
     """Slots held right now; for the log line, never for a decision."""
     try:
         return sum(1 for p in hx.harness_dir().glob("drain.slot-*")
-                   if now - p.stat().st_mtime < DRAIN_CLAIM_STALE_S)
+                   if now - p.stat().st_mtime < SLOT_STALE_S)
     except OSError:
         return 0
 
@@ -947,9 +975,38 @@ def child_argv(prompt: str, mcp_cfg: Path, *, resume: str = "", session_id: str 
                    "--allowedTools", ",".join(tools)]
 
 
-def run_child(argv: list[str], *, cwd: str | None = None) -> tuple[str, dict, str]:
-    """(reply, spent, why it failed). `why` is "" when the child ran."""
-    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
+class _Heartbeat:
+    """Touches the given files every HEARTBEAT_S until stopped, so a slot (and
+    the session claim) held by a pass whose child is still running never
+    looks like a dead holder's."""
+
+    def __init__(self, paths):
+        self.paths = [Path(p) for p in paths if p]
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self.stop.wait(HEARTBEAT_S):
+            for path in self.paths:
+                try:
+                    os.utime(path, None)
+                except OSError:
+                    pass
+
+    def __enter__(self):
+        if self.paths:
+            self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+
+
+def run_child(argv: list[str], *, cwd: str | None = None,
+              keepalive=()) -> tuple[str, dict, str]:
+    """(reply, spent, why it failed). `why` is "" when the child ran.
+    `keepalive` are lease files touched while it runs."""
+    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch, _Heartbeat(keepalive):
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=AUTHOR_TIMEOUT_S, env=child_env(scratch),
@@ -966,7 +1023,8 @@ def run_child(argv: list[str], *, cwd: str | None = None) -> tuple[str, dict, st
     return reply, spent, ""
 
 
-def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, dict]:
+def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path,
+               keepalive=()) -> tuple[str, dict]:
     """One moment, one child. The outcome row names the `child` and what the
     pass `spent`, failed passes included — a pass that burned a full context
     and then died is the cost most worth seeing."""
@@ -978,7 +1036,7 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[st
                       resume=owner, session_id=child)
     # On the list BEFORE it exists: its first Stop must already find it there.
     register_child(child, owner, str(moment.get("source_ref") or ""))
-    reply, spent, why = run_child(argv)
+    reply, spent, why = run_child(argv, keepalive=keepalive)
     extra = {"child": child, **({"spent": spent} if spent else {})}
     if why:
         return "failed", {"detail": why, **extra}
@@ -1012,12 +1070,8 @@ def cmd_author(session: str, claim: str, refs: list[str], slot: str = "") -> int
                     path, moment = got
                     if quarantine_legacy(path, ref, moment, session):
                         continue
-                    outcome, fields = run_author(session, moment, repo, mcp_cfg)
-                    if slot:
-                        try:                    # still alive: not breakable
-                            os.utime(slot, None)
-                        except OSError:
-                            pass
+                    outcome, fields = run_author(session, moment, repo, mcp_cfg,
+                                                 keepalive=(slot, claim))
                     row = {"outcome": outcome, "ref": ref, **fields,
                            # WHICH MemHub. The first live run filed against
                            # production because `resolve_url_and_auth` hands
@@ -1039,12 +1093,11 @@ def cmd_author(session: str, claim: str, refs: list[str], slot: str = "") -> int
                              "by": session, "at": time.time()})
             _log(f"author {session[:8]}: could not start — {exc}")
     finally:
-        for held in (claim, slot):
-            try:
-                if held:
-                    Path(held).unlink(missing_ok=True)
-            except OSError:
-                pass
+        release_slot(slot)
+        try:
+            Path(claim).unlink(missing_ok=True)
+        except OSError:
+            pass
     return 0
 
 

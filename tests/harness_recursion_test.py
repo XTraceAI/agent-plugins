@@ -196,8 +196,8 @@ def test_a_pre_list_childs_moment_is_quarantined_not_authored():
             hx.append_jsonl(hs.moments_path("person"), _moment(2, "person"))
             authored = []
             real_run, real_cfg = hs.run_author, hs.write_child_mcp_config
-            hs.run_author = lambda s, m, r, c: (authored.append(m["source_ref"]),
-                                                ("none", {"detail": "x"}))[1]
+            hs.run_author = lambda s, m, r, c, **kw: (authored.append(m["source_ref"]),
+                                                      ("none", {"detail": "x"}))[1]
             hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
             try:
                 hs.cmd_author("drainer", str(env.base / "claim"), ["legacykid#3", "person#2"])
@@ -218,6 +218,52 @@ def test_a_pre_list_childs_moment_is_quarantined_not_authored():
             else:
                 os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
     print("PASS test_a_pre_list_childs_moment_is_quarantined_not_authored")
+
+
+def test_a_slot_is_leased_not_merely_held():
+    """The slot's stale window used to equal the child's timeout, with a
+    touch only between children: a child at its timeout looked exactly like
+    a dead holder, another Stop reclaimed the slot, and the first pass's
+    `finally` then unlinked the reclaimer's slot (Codex, #275). Now: the
+    holder heartbeats while its child runs, and release checks the token."""
+    with _Env():
+        now = time.time()
+        slot = hs.take_drain_slot(now)
+        assert slot is not None and slot.read_text() == hs.slot_token()
+        # a live holder's slot is never reclaimed, however long its child runs
+        old = now - hs.SLOT_STALE_S - 1
+        os.utime(slot, (old, old))
+        hs.HEARTBEAT_S, saved = 0.05, hs.HEARTBEAT_S
+        try:
+            with hs._Heartbeat([slot]):
+                time.sleep(0.2)
+        finally:
+            hs.HEARTBEAT_S = saved
+        assert time.time() - slot.stat().st_mtime < 5, "heartbeat did not touch the slot"
+        # a slot someone else reclaimed is not ours to release
+        slot.write_text("999:someone-else")
+        hs.release_slot(slot)
+        assert slot.exists(), "released a slot owned by another pass"
+        slot.write_text(hs.slot_token())
+        hs.release_slot(slot)
+        assert not slot.exists()
+        # run_child heartbeats the leases it is handed
+        real = hs.subprocess.run
+        seen = {}
+        hs.subprocess.run = lambda argv, **kw: (seen.update(ran=True),
+                                                subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))[1]
+        try:
+            lease = hx.harness_dir() / "lease"
+            lease.write_text("x")
+            os.utime(lease, (old, old))
+            hs.HEARTBEAT_S = 0.05
+            real_run = subprocess.run
+            hs.subprocess.run = lambda argv, **kw: (time.sleep(0.2), real_run(["true"], capture_output=True))[1]
+            hs.run_child(["true"], keepalive=[lease])
+            assert time.time() - lease.stat().st_mtime < 5
+        finally:
+            hs.subprocess.run, hs.HEARTBEAT_S = real, saved
+    print("PASS test_a_slot_is_leased_not_merely_held")
 
 
 def test_the_childs_own_prompt_is_harness_text():
