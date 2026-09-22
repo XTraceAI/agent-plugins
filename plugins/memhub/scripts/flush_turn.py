@@ -83,7 +83,7 @@ from transcript_filter import (  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
+from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
 
@@ -855,7 +855,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 # Unauthenticated: no credential, or one the server won't
                 # accept. /memhub:login mints a new one, so the advice
                 # converges.
-                _log("credential rejected; run /memhub:login — skipping")
+                _log(f"credential rejected; run {skill_command('login')} — skipping")
                 _mark_failure(session_id, "auth",
                               "server rejected the credential (401)")
             elif e.status == 403:
@@ -1112,7 +1112,7 @@ def main() -> int:
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
             reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
         elif isinstance(e, _NoCredential):
-            _log("no usable credential; run /memhub:login "
+            _log(f"no usable credential; run {skill_command('login')} "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
             # The one failure the user must act on personally, and the one that
             # stays broken forever until they do: no retry can mint a token.

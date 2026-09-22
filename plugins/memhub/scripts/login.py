@@ -60,6 +60,7 @@ from _memhub_auth import (  # noqa: E402
     _access_token_expiry,
     default_url,
     resolve_url_and_auth,
+    skill_command,
     token_cache_path,
 )
 from room_map import env_for_url  # noqa: E402
@@ -129,7 +130,7 @@ def _report_key(url: str, record: dict | None) -> int:
     print(f"credential  : access key '{record.get('label')}' "
           f"({_describe_expiry(record)})")
     print("renewal     : n/a — a key does not refresh; "
-          "/memhub:login mints a new one when this lapses")
+          f"{skill_command('login')} mints a new one when this lapses")
     return 0
 
 
@@ -153,7 +154,7 @@ def _ensure_key(url: str, env: str) -> bool:
     except PakError as exc:
         print(f"access key  : NOT created ({exc})")
         print("              capture will keep using the OAuth token, which "
-              "expires; re-run /memhub:login when it does.")
+              f"expires; re-run {skill_command('login')} when it does.")
         return False
     except Exception as exc:  # noqa: BLE001 — never fail a good login over this
         print(f"access key  : NOT created ({type(exc).__name__}: {exc})")
@@ -275,7 +276,7 @@ async def _run(status_only: bool, force: bool) -> int:
                 # --status only. Says nothing about whether a browser login
                 # WOULD work; it reports that no usable token is cached now.
                 print("status      : NOT LOGGED IN (no usable cached token)")
-                print("fix         : run /memhub:login")
+                print(f"fix         : run {skill_command('login')}")
                 return 1
             leaf = _leaf(exc)
             print(f"status      : FAILED ({type(leaf).__name__}: {leaf})")
@@ -307,7 +308,7 @@ async def _run(status_only: bool, force: bool) -> int:
             # would send the user to fix a tenant setting that no longer has
             # any bearing on whether capture keeps working.
             print("renewal     : not needed — the key is the credential now; "
-                  "/memhub:login mints a fresh one when it lapses")
+                  f"{skill_command('login')} mints a fresh one when it lapses")
             return 0
 
         ok, detail = _renewal_report(url)
@@ -319,10 +320,10 @@ async def _run(status_only: bool, force: bool) -> int:
             print()
             print("WARNING: the authorization server issued no refresh token, so this")
             print("login will stop working when the access token expires, and memory")
-            print("capture will go quiet until someone runs /memhub:login again.")
+            print(f"capture will go quiet until someone runs {skill_command('login')} again.")
             print("To fix it at the source, enable 'Allow Offline Access' on the")
             print(f"{env} API in Auth0 and make sure 'offline_access' appears in the")
-            print("server's advertised scopes_supported, then re-run /memhub:login --force.")
+            print(f"server's advertised scopes_supported, then re-run {skill_command('login')} --force.")
         return 0
     finally:
         _restore()

@@ -277,10 +277,12 @@ def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, s
     # leaves the existing key working, which is the strictly better failure.
     others = [k for k in keys if _is_live(k) and k.get("label") != label]
     if len(others) >= MAX_KEYS:
+        from _memhub_auth import skill_command  # noqa: PLC0415 — beside this file
+
         raise PakError(
             f"you already hold {len(others)} live access keys, the maximum is "
             f"{MAX_KEYS}. Revoke one you no longer use, then run "
-            f"/memhub:login again. Existing labels: "
+            f"{skill_command('login')} again. Existing labels: "
             f"{', '.join(sorted(str(k.get('label')) for k in others))}")
 
     for orphan in orphans:
