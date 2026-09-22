@@ -43,17 +43,12 @@ def test_license_files_present() -> None:
             source = ROOT / "plugins" / "memhub" / name
             check(f"installed {name} is a real identical copy",
                   not source.is_symlink() and (installed / name).read_bytes() == expected)
-            staging = ROOT / "plugins" / "memhub-staging" / name
-            check(f"staging {name} resolves to the shipped copy",
-                  staging.is_symlink() and staging.resolve() == source.resolve()
-                  and staging.read_bytes() == expected)
 
 
 def test_manifests_declare_apache_license() -> None:
     plugin = ROOT / "plugins" / "memhub"
     for path in (plugin / "plugin.json", plugin / ".claude-plugin" / "plugin.json",
-                 plugin / ".codex-plugin" / "plugin.json", plugin / ".cursor-plugin" / "plugin.json",
-                 ROOT / "plugins" / "memhub-staging" / ".claude-plugin" / "plugin.json"):
+                 plugin / ".codex-plugin" / "plugin.json", plugin / ".cursor-plugin" / "plugin.json"):
         check(f"{path.relative_to(ROOT)} declares Apache-2.0",
               json.loads(path.read_text(encoding="utf-8")).get("license") == "Apache-2.0")
 

@@ -35,7 +35,6 @@ MANIFESTS = {
 AP_SCHEMA_PREFIX = "https://agent-plugins.org/schemas/"
 MCP_AP = MEMHUB / "mcp.json"          # Agent Plugins format (Codex, Cursor, …)
 MCP_CLAUDE = MEMHUB / ".mcp.json"     # Claude Code format (carries oauth)
-MCP_STAGING = ROOT / "plugins" / "memhub-staging" / ".mcp.json"
 
 
 def _reject_dupes(pairs: list[tuple[str, object]]) -> dict:
@@ -76,23 +75,11 @@ def main() -> int:
               "     Bump ALL manifests together.")
         return 1
     print("\nok  all production manifests declare the same version")
-    # Staging is released separately. Do not advance its version as a side
-    # effect of a production release, but still validate its manifest JSON.
-    staging_manifest = _load(ROOT / "plugins/memhub-staging/.claude-plugin/plugin.json")
-    if staging_manifest is None or not staging_manifest.get("version"):
-        return 1
-
-    staging_codex = _load(ROOT / "plugins/memhub-staging/.codex-plugin/plugin.json")
-    if staging_codex is None or staging_codex.get("version") != staging_manifest["version"]:
-        print("FAIL staging Claude and Codex versions differ")
-        return 1
 
     ap_root = _load(MEMHUB / "plugin.json")
     ap_mcp = _load(MCP_AP)
     claude_mcp = _load(MCP_CLAUDE)
-    staging_mcp = _load(MCP_STAGING)
-    if (ap_root is None or ap_mcp is None or claude_mcp is None
-            or staging_mcp is None):
+    if ap_root is None or ap_mcp is None or claude_mcp is None:
         return 1
 
     failures = 0
@@ -104,8 +91,7 @@ def main() -> int:
     if not failures:
         print("ok  AP manifests carry the agent-plugins.org $schema")
 
-    for label, config in (("production", claude_mcp),
-                          ("staging", staging_mcp)):
+    for label, config in (("production", claude_mcp),):
         server = config.get("mcpServers", {}).get("memhub", {})
         cursor_client = server.get("auth", {}).get("CLIENT_ID")
         capture_client = server.get("oauth", {}).get("clientId")
@@ -132,8 +118,7 @@ def main() -> int:
               "     would talk to a different backend than Claude installs.")
         return 1
     for config, expected in ((ap_mcp, versions["memhub (AP root)"]),
-                             (claude_mcp, versions["memhub (claude)"]),
-                             (staging_mcp, staging_manifest["version"])):
+                             (claude_mcp, versions["memhub (claude)"])):
         reported = parse_qs(urlsplit(server_url(config)).query).get("memhub_plugin_version")
         if reported != [expected]:
             print(f"FAIL loaded MCP connection must report package version {expected}, got {reported}")

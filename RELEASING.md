@@ -97,54 +97,30 @@ both the main package and the separately pinned Claude package.
 - **Cursor + Codex:** there is no pin to hide behind — everything you used
   to check "before tagging" happens before the bump PR merges.
 
-## The staging build is different, and must stay different
+## There is no staging build in this repository
 
-`memhub-staging` is deliberately **not** in any public catalog. It lives in
-the internal manifest at `plugins/.claude-plugin/marketplace.json` and
-installs from a local clone:
+`memhub-staging` used to live here, in an internal-only marketplace at
+`plugins/.claude-plugin/marketplace.json`, as a shell of symlinks into
+`plugins/memhub/`. Both are gone: staging development moved to
+`XTraceAI/agent-plugins-internal`, where the plugin is one tree of real files
+and `plugins/memhub/` here is an export of it.
 
-```text
-/plugin marketplace add <path-to-repo>/plugins
-/plugin install memhub-staging@memhub-internal
-```
+Two things that arrangement taught, because they still constrain any plugin
+anyone ships from a checkout, and both are why the internal tree holds real
+files rather than links:
 
-- **The staging entry can never use `git-subdir`.** That fetch pulls only
-  the plugin's own subdirectory, and
-  `plugins/memhub-staging/{skills,hooks,scripts,references}` are symlinks
-  into `../memhub/`. They arrive dangling — observed live on PR #56: the
-  install came up with no `scripts/` directory at all and still reported
-  success. A path source copies from the local clone and dereferences the
-  symlinks — **on Claude Code. Codex's installer does not.** Observed live on
-  Codex 0.154.0: `codex plugin add` from a local-path marketplace copies a
-  plugin's regular files and SKIPS its symlinks, so staging landed as three
-  files (`.claude-plugin/plugin.json`, `.mcp.json`, `mcp.json`) with no
-  `scripts/` at all — and reported success, printing the version. A blind
-  `codex exec` session against that install captured nothing and said nothing.
-  So "use a path source" makes staging installable on Claude Code only; on
-  Codex there is no source type that installs it correctly.
-- **Also nonconforming under Agent Plugins 1.0:** the spec requires
-  symlinks to resolve inside the plugin root; staging's escape to
-  `../memhub/` disqualifies it from any spec-conformant installer. One more
-  reason it never enters the Codex/Cursor catalogs.
-- **Staging is an rsync of `main`'s working tree, not a git branch.** The
-  `staging` git branch is being retired; the internal marketplace at
-  `~/.claude/plugins/memhub-internal-marketplace` is refreshed by copying
-  the plugin directory out of the checkout, dereferencing the symlinks:
-
-  ```sh
-  rsync -aL --delete --exclude __pycache__ \
-    plugins/memhub-staging/ \
-    ~/.claude/plugins/memhub-internal-marketplace/plugins/memhub-staging/
-  ```
-
-  If the version did not change, the version-keyed cache dir
-  (`~/.claude/plugins/cache/memhub-internal/memhub-staging/<version>/`) is
-  never re-fetched, so rsync the same tree into it as well — otherwise
-  `/plugin update` reports success and installs nothing. Restart the
-  session afterwards; a running session does not pick up the new files.
+- **A `git-subdir` fetch pulls only the plugin's own subdirectory**, so a
+  symlink escaping it arrives dangling. Observed live on PR #56: the install
+  came up with no `scripts/` directory at all and still reported success.
+- **Codex's installer skips symlinks outright.** Observed live on Codex
+  0.154.0: a local-path install copied the regular files and landed three of
+  them, reported success, printed the version — and a blind `codex exec`
+  session against it captured nothing and said nothing. Agent Plugins 1.0
+  also requires symlinks to resolve inside the plugin root, so an escaping
+  link is nonconforming for any spec-conformant installer.
 
 `plugins/memhub/` holds real files with no symlinks of its own, which is
-exactly why the PUBLIC entry is safe to pin via `git-subdir`.
+exactly why the public entry is safe to pin via `git-subdir`.
 
 ## Gotchas worth knowing before you hit them
 
@@ -159,9 +135,10 @@ exactly why the PUBLIC entry is safe to pin via `git-subdir`.
   `.agents/plugins/marketplace.json`. Three catalogs, three schemas, no
   sharing. A differently-named file in `.claude-plugin/` parses as a
   *plugin* manifest.
-- **Both plugins register an MCP server named `memhub`** — install prod or
-  staging, never both. A repo that pins one backend in project settings
-  must explicitly set the other to `false`.
+- **The staging plugin registers an MCP server named `memhub` too** — a
+  developer running the internal build must have exactly one of the two
+  enabled, and a repo that pins one backend in project settings must set the
+  other to `false` explicitly.
 - **Plugin enable/disable does not apply to a running session** — on any
   host. Restart before judging a change.
 - **Cursor directory names are unique kebab-case** — claim `memhub` early.

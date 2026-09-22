@@ -83,10 +83,12 @@ def test_bundled_route_defers_only_for_installed_matching_user_handler():
         assert not bridge._user_bridge_handles('PreToolUse',b'{"tool_name":"Bash"}')
 
 
-def test_staging_selects_codex_hooks_and_projectless_notice():
-    manifest=json.loads((ROOT/'plugins/memhub-staging/.codex-plugin/plugin.json').read_text())
+def test_the_package_selects_codex_hooks_and_gives_a_projectless_notice():
+    # Was asserted against plugins/memhub-staging until the staging build moved
+    # to agent-plugins-internal; the shipped package makes the same promise.
+    manifest=json.loads((ROOT/'plugins/memhub/.codex-plugin/plugin.json').read_text())
     assert manifest['hooks']=='./hooks/codex-hooks.json'
-    assert manifest['name']=='memhub-staging'
+    assert manifest['name']=='memhub'
     with tempfile.TemporaryDirectory() as td, patch.object(sys,'argv',['hook','session','--host','codex']), \
          patch.object(sys,'stdin',io.StringIO(json.dumps({'cwd':td}))), \
          contextlib.redirect_stdout(io.StringIO()) as output:
