@@ -13,10 +13,13 @@ person's thread:
                           The same Stop also spawns a detached `author` pass
                           for whatever is already waiting, and says one line
                           about what a FINISHED pass left (§ report_outcomes).
-  detached      `author`  one `claude -p --resume <owner> --fork-session` per
-                          moment, under the plugin's OWN MCP server and
-                          credential, filing through the create-rule skill.
-                          Nothing it does touches the person's session.
+  detached      `author`  one `claude -p` per moment, under the plugin's OWN
+                          MCP server and credential, filing through the
+                          create-rule skill. Nothing it does touches the
+                          person's session. It resumes the owner with
+                          `--resume <owner> --fork-session`, leaves no
+                          transcript, and its outcome row records what the
+                          pass `spent`.
 
 Why detached rather than blocking the stop, which is what shipped before: the
 block was itself a fix. A line injected at the next prompt reached the agent 19
@@ -58,9 +61,10 @@ all created private:
 
 What turning it on costs the person, and why it is opt-in (v0.69.0 through
 v0.75.x defaulted it on): one classifier call per flagged turn against the
-MemHub backend, and one `claude -p --resume` per moment the drain authors —
-that second one spends THEIR model quota, not the server's. One machine's
-dogfood ran 32 such children in two hours.
+MemHub backend, and one `claude -p` per moment the drain authors — that second
+one spends THEIR model quota, not the server's, and it carries the owner's
+whole context into every call of its loop. One machine's dogfood
+ran 32 such children in two hours.
 
 Every path fails open and silent: a broken sensor must never touch the tool
 call or the session. Stdlib only.
@@ -77,6 +81,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -106,6 +111,13 @@ MOMENT_TTL_S = 14 * 24 * 3600
 #: One drain per session at a time. A holder that died leaves the claim behind,
 #: so it is breakable once it stops being touched.
 DRAIN_CLAIM_STALE_S = 900
+#: Across the whole machine, this many author passes may run at once. This is
+#: the circuit breaker for the recursion in `children_path`'s docstring and for
+#: whatever the next one looks like: a loop that spawns faster than this stops
+#: here, whatever its cause.
+MAX_LIVE_DRAINS = 2
+#: An author child cannot itself author. `1` in the child; unset elsewhere.
+DEPTH_FLAG = "MEMHUB_HARNESS_DEPTH"
 
 
 # --------------------------------------------------------------- plumbing
@@ -229,6 +241,66 @@ def _is_subagent(payload: dict) -> bool:
     return bool(str(payload.get("agent_id") or "").strip())
 
 
+# ------------------------------------------------------------ the children
+def children_path() -> Path:
+    """`children.jsonl`: every session id this lane ever launched as an author.
+
+    The recursion this exists for (v0.74.0–v0.76.0): `run_author` handed the
+    child `MEMHUB_HARNESS_EXTRACT=0`, and Claude Code applied the install's
+    settings.json `env` — where opting IN is `MEMHUB_HARNESS_EXTRACT=1` — over
+    it. So the child was sensed like a person's session; its own turn, which is
+    the create-rule flow, is exactly what the classifier flags; and its Stop
+    drained that moment by forking the child. Each generation spawned the next
+    until the machine ran out of something.
+
+    `extract_enabled` now refuses on `MEMHUB_HARNESS_CHILD` (7113985) — but
+    that is one more environment variable, and an environment variable is what
+    failed. This file is not the environment: the id is chosen by the spawner
+    (`--session-id`), written here BEFORE the child exists, and every lane
+    refuses a session on this list — its Stop is not sensed, it cannot spawn
+    an author, and a moment it stamped is never drained. Append-only, private,
+    one line per child, never pruned."""
+    return hx.harness_dir() / "children.jsonl"
+
+
+def register_child(child: str, owner: str, ref: str) -> None:
+    hx.append_jsonl(children_path(), {"child": child, "owner": owner, "ref": ref,
+                                      "at": time.time()})
+
+
+def is_registered_child(session: str) -> bool:
+    if not session:
+        return False
+    try:
+        return any(str(r.get("child")) == session for r in hx.read_jsonl(children_path()))
+    except OSError:
+        return False
+
+
+def registered_children() -> set[str]:
+    try:
+        return {str(r.get("child")) for r in hx.read_jsonl(children_path()) if r.get("child")}
+    except OSError:
+        return set()
+
+
+def author_depth(environ=None) -> int:
+    raw = (environ if environ is not None else os.environ).get(DEPTH_FLAG, "")
+    try:
+        return int(str(raw).strip() or 0)
+    except ValueError:
+        return 1          # unreadable means "not a person's session"; refuse
+
+
+def live_drains(now: float) -> int:
+    """Author passes running on this machine: fresh `*.drain.claim` files."""
+    try:
+        return sum(1 for p in hx.harness_dir().glob("*.drain.claim")
+                   if now - p.stat().st_mtime < DRAIN_CLAIM_STALE_S)
+    except OSError:
+        return 0
+
+
 # --------------------------------------------------------------- stop lane
 def cmd_stop(payload: dict) -> int:
     """Millisecond budget: two small file reads, one spawn, no transcript and
@@ -246,6 +318,11 @@ def cmd_stop(payload: dict) -> int:
     if not session or not transcript or not os.path.isfile(transcript):
         return 0
     if _is_subagent(payload):
+        return 0
+    if is_registered_child(session) or author_depth() > 0:
+        # An author child's Stop. Not sensed and not drained, whatever the
+        # environment says — see `children_path`.
+        _log(f"stop {session[:8]}: an author child; nothing sensed")
         return 0
     if payload.get("stop_hook_active"):
         # The blocked continuation's own Stop: no extraction and no second
@@ -486,6 +563,7 @@ def pending(session: str, repo: str, now: float) -> list[tuple[Path, dict]]:
     Stop of that session can ever take it. Whatever else changes, selection has
     to be able to see another session's file."""
     out: list[tuple[Path, dict]] = []
+    kids = registered_children()
     try:
         files = sorted(moments_path(session).parent.glob("*.moments.jsonl"))
     except OSError:
@@ -501,6 +579,10 @@ def pending(session: str, repo: str, now: float) -> list[tuple[Path, dict]]:
             if m.get("handed") or not isinstance(m.get("turn"), int):
                 continue
             if _moment_key(m) in done or _repo_of(m) != repo:
+                continue
+            if str((m.get("state") or {}).get("session_id") or "") in kids:
+                # Stamped inside an author child: the loop's own output, left
+                # behind by an install that had no registry yet.
                 continue
             stamped = _stamped_at(m)
             if stamped and now - stamped > MOMENT_TTL_S:
@@ -563,6 +645,14 @@ def hand_off(session: str) -> int:
     now = time.time()
     waiting = pending(session, repo, now)
     if not waiting:
+        return 0
+    live = live_drains(now)
+    if live >= MAX_LIVE_DRAINS:
+        # Said out loud, because a breaker that trips silently is a lane that
+        # went quiet for no reason anyone can see. The moments stay for a
+        # later Stop.
+        _log(f"drain {session[:8]}: {live} pass(es) already running on this "
+             f"machine (cap {MAX_LIVE_DRAINS}); {len(waiting)} left waiting")
         return 0
     claim = take_drain_claim(session, now)
     if claim is None:
@@ -643,6 +733,13 @@ def author_prompt(session: str, moment: dict, repo: str) -> str:
         + "\n\nYou are a detached pass: there is no one to answer a question, so "
         "follow the Harness-draft section's arithmetic and ask nothing. If it is "
         "not a lesson, file nothing.\n\n"
+        + result_contract())
+
+
+def result_contract() -> str:
+    """The line a program reads. Its own definition, so the prompt that asks
+    for it and `parse_result` that reads it cannot drift apart."""
+    return (
         f"End your reply with one line and nothing after it:\n"
         f"  {RESULT_PREFIX} filed <rule_id> | <the rule's title> | <what it catches, "
         "in one short clause — the trigger in the words a person would use, e.g. "
@@ -683,40 +780,108 @@ def parse_result(stdout: str) -> tuple[str, dict]:
     return "failed", {"detail": "the child gave no result line"}
 
 
+def read_child(stdout: str) -> tuple[str, dict]:
+    """(the child's reply, what it spent) from `--output-format json`.
+
+    What a pass cost used to be recorded nowhere, so the only way to learn it
+    was to read the forks' transcripts afterwards. Plain text — an older CLI,
+    or a test double — is the reply with nothing spent; never an error."""
+    try:
+        got = json.loads(stdout)
+    except ValueError:
+        return stdout or "", {}
+    if isinstance(got, list):
+        got = next((g for g in reversed(got)
+                    if isinstance(g, dict) and g.get("type") == "result"), {})
+    if not isinstance(got, dict) or "result" not in got:
+        return stdout or "", {}
+    use = got.get("usage") or {}
+    spent = {"in": use.get("input_tokens"),
+             "cache_write": use.get("cache_creation_input_tokens"),
+             "cache_read": use.get("cache_read_input_tokens"),
+             "out": use.get("output_tokens"),
+             "cost_usd": got.get("total_cost_usd"),
+             "calls": got.get("num_turns"),
+             "ms": got.get("duration_ms")}
+    return str(got.get("result") or ""), {k: v for k, v in spent.items() if v is not None}
+
+
+def child_env(scratch: str) -> dict:
+    return dict(os.environ,
+                # Its capture and harness lanes stay silent: a forked
+                # transcript is a copy of the person's, and must neither
+                # ship as a second conversation nor be sensed again. The
+                # two lanes read this, not EXTRACT below, because a
+                # settings.json `env` overrides what the child inherits.
+                # Its rulebook hook still runs, for the forward test.
+                MEMHUB_HARNESS_CHILD="1",
+                MEMHUB_HARNESS_EXTRACT="0",
+                **{DEPTH_FLAG: "1"},
+                # its forward test arms a candidate in ITS OWN base
+                MEMHUB_RULEBOOK_BASE=os.path.join(scratch, "rulebook"))
+
+
+def child_argv(prompt: str, mcp_cfg: Path, *, resume: str = "", session_id: str = "",
+               tools: tuple[str, ...] = CHILD_TOOLS) -> list[str]:
+    argv = [claude_bin(), "-p", prompt]
+    if resume:
+        argv += ["--resume", resume, "--fork-session"]
+    if session_id:
+        # Chosen here so it can be on the children list before the child
+        # runs. Verified on Claude Code 2.1.278 with and without --resume.
+        argv += ["--session-id", session_id]
+    return argv + ["--output-format", "json",
+                   # No transcript on disk. The child is the plugin's own work:
+                   # captured, it shipped the person's history a second time
+                   # under a new id (80 copies of one session on staging);
+                   # sensed, it forked itself. Every hook that could do either
+                   # needs a transcript_path that exists, so with none written
+                   # there is nothing to capture, sense or resume — whatever
+                   # the child's environment says. Verified on 2.1.278 with and
+                   # without --resume --fork-session.
+                   "--no-session-persistence",
+                   "--mcp-config", str(mcp_cfg), "--strict-mcp-config",
+                   "--permission-mode", "acceptEdits",
+                   "--allowedTools", ",".join(tools)]
+
+
+def run_child(argv: list[str], *, cwd: str | None = None) -> tuple[str, dict, str]:
+    """(reply, spent, why it failed). `why` is "" when the child ran."""
+    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=AUTHOR_TIMEOUT_S, env=child_env(scratch),
+                                  stdin=subprocess.DEVNULL, cwd=cwd)
+        except FileNotFoundError:
+            return "", {}, "no claude CLI on PATH"
+        except subprocess.TimeoutExpired:
+            return "", {}, f"the child did not finish in {AUTHOR_TIMEOUT_S}s"
+        except OSError as exc:
+            return "", {}, f"the child would not start ({exc.__class__.__name__})"
+    reply, spent = read_child(proc.stdout)
+    if proc.returncode != 0:
+        return reply, spent, f"the child exited {proc.returncode}"
+    return reply, spent, ""
+
+
 def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, dict]:
+    """One moment, one child. The outcome row names the `child` and what the
+    pass `spent`, failed passes included — a pass that burned a full context
+    and then died is the cost most worth seeing."""
     owner = str((moment.get("state") or {}).get("session_id") or "")
     if not owner:
         return "failed", {"detail": "the moment carries no session id to resume"}
-    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
-        env = dict(os.environ,
-                   # Its capture and harness lanes stay silent: the forked
-                   # transcript is a copy of the person's, and must neither
-                   # ship as a second conversation nor be sensed again. The
-                   # two lanes read this, not EXTRACT below, because a
-                   # settings.json `env` overrides what the child inherits.
-                   # Its rulebook hook still runs, for the forward test.
-                   MEMHUB_HARNESS_CHILD="1",
-                   MEMHUB_HARNESS_EXTRACT="0",
-                   # its forward test arms a candidate in ITS OWN base
-                   MEMHUB_RULEBOOK_BASE=os.path.join(scratch, "rulebook"))
-        argv = [claude_bin(), "-p", author_prompt(session, moment, repo),
-                "--resume", owner, "--fork-session",
-                "--mcp-config", str(mcp_cfg), "--strict-mcp-config",
-                "--permission-mode", "acceptEdits",
-                "--allowedTools", ",".join(CHILD_TOOLS)]
-        try:
-            proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=AUTHOR_TIMEOUT_S, env=env,
-                                  stdin=subprocess.DEVNULL)
-        except FileNotFoundError:
-            return "failed", {"detail": "no claude CLI on PATH"}
-        except subprocess.TimeoutExpired:
-            return "failed", {"detail": f"the child did not finish in {AUTHOR_TIMEOUT_S}s"}
-        except OSError as exc:
-            return "failed", {"detail": f"the child would not start ({exc.__class__.__name__})"}
-    if proc.returncode != 0:
-        return "failed", {"detail": f"the child exited {proc.returncode}"}
-    return parse_result(proc.stdout)
+    child = str(uuid.uuid4())
+    argv = child_argv(author_prompt(session, moment, repo), mcp_cfg,
+                      resume=owner, session_id=child)
+    # On the list BEFORE it exists: its first Stop must already find it there.
+    register_child(child, owner, str(moment.get("source_ref") or ""))
+    reply, spent, why = run_child(argv)
+    extra = {"child": child, **({"spent": spent} if spent else {})}
+    if why:
+        return "failed", {"detail": why, **extra}
+    outcome, fields = parse_result(reply)
+    return outcome, {**fields, **extra}
 
 
 def cmd_author(session: str, claim: str, refs: list[str]) -> int:
@@ -754,7 +919,9 @@ def cmd_author(session: str, claim: str, refs: list[str]) -> int:
                     if outcome != "failed":
                         row["handed"] = ref     # decided; never retried
                     hx.append_jsonl(path, row)
-                    _log(f"author {session[:8]}: {ref} -> {outcome} ({detail[:60]})")
+                    said = str(fields.get("title") or fields.get("rule_id")
+                               or fields.get("detail") or "")
+                    _log(f"author {session[:8]}: {ref} -> {outcome} ({said[:60]})")
         except Exception as exc:               # noqa: BLE001
             # Never a quiet nothing: the pass could not run, and the next Stop
             # says so on the health channel.

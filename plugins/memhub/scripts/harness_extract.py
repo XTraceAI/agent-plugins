@@ -167,6 +167,10 @@ _SYS_BLOCK = re.compile(
     re.S,
 )
 _HARNESS_PREFIX = (
+    # An author child's first prompt (harness_stop.BLOCK_PREFIX). Were such a
+    # session ever sensed, its one turn is the create-rule flow — the text most
+    # likely to be flagged — and flagging it is how one child spawned the next.
+    "MemHub harness: before you stop",
     "Base directory for this skill",
     "Continue from where you left off",
     "Caveat: The messages below",

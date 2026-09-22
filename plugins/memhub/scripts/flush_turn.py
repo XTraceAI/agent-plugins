@@ -1091,6 +1091,8 @@ def main() -> int:
         if not session_id or not transcript_path \
                 or not Path(transcript_path).exists():
             return 0
+        if is_harness_child(session_id=session_id):
+            return 0  # on the children list, whatever the environment says
         lock_fd = _acquire(session_id)
         if lock_fd is None:
             return 0  # a flush is already in flight; its successor carries ours

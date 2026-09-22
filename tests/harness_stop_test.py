@@ -795,9 +795,10 @@ def test_the_author_child_is_launched_as_a_harness_child():
     real = hs.subprocess.run
     hs.subprocess.run = fake_run
     try:
-        hs.run_author("owner", {"state": {"session_id": "owner"}, "turn": 1,
-                                "source_ref": "owner#1", "kind": "error_arc"},
-                      "repo", Path("/nonexistent/mcp.json"))
+        with _Env():                       # the children list lands in the temp dir
+            hs.run_author("owner", {"state": {"session_id": "owner"}, "turn": 1,
+                                    "source_ref": "owner#1", "kind": "error_arc"},
+                          "repo", Path("/nonexistent/mcp.json"))
     finally:
         hs.subprocess.run = real
     assert "--fork-session" in seen["argv"]
@@ -812,6 +813,67 @@ def test_the_sensor_never_sends_activate():
     assert not re.search(r"[\"']activate[\"']\s*:", code)
     assert "activate=" not in code and "call_tool" not in code
     print("PASS test_the_sensor_never_sends_activate")
+
+
+def _run_author(stdout):
+    """`run_author` against a fake claude, files under a temp harness dir."""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(argv=argv, env=kw.get("env") or {})
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    real_run = hs.subprocess.run
+    hs.subprocess.run = fake_run
+    try:
+        with _Env():
+            got = hs.run_author("sess", {"state": {"session_id": "owner"}, "turn": 2,
+                                         "source_ref": "owner#2", "kind": "error_arc"},
+                                "repo", Path("/nonexistent/mcp.json"))
+    finally:
+        hs.subprocess.run = real_run
+    return got, seen
+
+
+def test_what_a_pass_spent_is_read_from_the_childs_json():
+    body = json.dumps({"type": "result", "result": "thinking…\nHARNESS-RESULT: filed r1 | T | c",
+                       "usage": {"input_tokens": 2, "cache_creation_input_tokens": 300,
+                                 "cache_read_input_tokens": 4000, "output_tokens": 50},
+                       "total_cost_usd": 0.12, "num_turns": 6})
+    (outcome, fields), _ = _run_author(body)
+    assert outcome == "filed" and fields["rule_id"] == "r1" and fields["title"] == "T"
+    assert fields["spent"]["cache_read"] == 4000 and fields["spent"]["calls"] == 6
+    reply, spent = hs.read_child("HARNESS-RESULT: none plain text")
+    assert reply.startswith("HARNESS-RESULT") and spent == {}
+    print("PASS test_what_a_pass_spent_is_read_from_the_childs_json")
+
+
+
+def test_the_author_loop_survives_its_own_log_line():
+    """It named `detail` after the variable became `fields`: a NameError after
+    the FIRST moment of every drain, caught by the handler that reports "drain
+    could not start" — so a drain of eight authored one and told the person
+    the pass had failed."""
+    with tempfile.TemporaryDirectory() as td:
+        old = {k: os.environ.get(k) for k in ("MEMHUB_HARNESS_DIR",)}
+        os.environ["MEMHUB_HARNESS_DIR"] = td
+        hx.append_jsonl(hs.moments_path("sess"), _moment(1))
+        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
+        hs._publish(hs.meta_path("sess"), json.dumps({"repo": "repo"}))
+        real_run, real_cfg = hs.run_author, hs.write_child_mcp_config
+        hs.run_author = lambda *a, **k: ("none", {"detail": "not a lesson"})
+        hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
+        try:
+            hs.cmd_author("sess", str(Path(td) / "claim"), ["sess#1", "sess#2"])
+            rows = hx.read_jsonl(hs.moments_path("sess"))   # while the dir is still td
+        finally:
+            hs.run_author, hs.write_child_mcp_config = real_run, real_cfg
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        outcomes = [r for r in rows if r.get("outcome")]
+        assert [r["outcome"] for r in outcomes] == ["none", "none"], outcomes
+        assert {r["handed"] for r in outcomes} == {"sess#1", "sess#2"}
+    print("PASS test_the_author_loop_survives_its_own_log_line")
 
 
 if __name__ == "__main__":
