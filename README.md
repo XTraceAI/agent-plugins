@@ -378,7 +378,11 @@ that list is never sensed, never drained, never forked and never captured,
 whatever its environment says. The child also runs with
 `--no-session-persistence`: it leaves no transcript, so there is nothing for
 any hook to capture or resume in the first place. At most 2 author passes run
-on a machine at once.
+on a machine at once (two slot files taken atomically, so concurrent Stops
+cannot all count zero and spawn). A moment stamped by a child of a release
+that kept no list is recognised by its transcript — the hand-off is a
+human-role message no person's session holds — and quarantined, never
+authored.
 With `MEMHUB_HARNESS_EXTRACT` unset, the default, none of this runs.
 
 ## Skills
