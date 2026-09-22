@@ -729,7 +729,9 @@ def spawn_detached(argv: list[str], script: Path, log_name: str,
     try:
         kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
                   "close_fds": True}
-        if pass_fds and os.name != "nt":
+        if pass_fds:
+            # POSIX only: the author lane passes none on Windows, where an
+            # inherited handle carries no lock (harness_stop.take_lease).
             kwargs["pass_fds"] = tuple(pass_fds)
         if os.name == "nt":
             kwargs["creationflags"] = (

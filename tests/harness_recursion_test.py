@@ -279,6 +279,46 @@ def test_a_dead_holders_slot_is_freed_by_the_kernel_and_a_live_ones_is_not():
     print("PASS test_a_dead_holders_slot_is_freed_by_the_kernel_and_a_live_ones_is_not")
 
 
+def test_a_pass_handed_lease_paths_locks_them_itself_or_gives_up():
+    """The Windows lane (Codex, #275): an inherited handle carries no lock
+    there, so the child takes the leases by path before authoring, holds
+    them while it runs, and gives the pass up if a sibling holds one."""
+    with _Env() as env:
+        base = hx.harness_dir()
+        hs._publish(hs.meta_path("w"), json.dumps({"repo": "repo"}))
+        hx.append_jsonl(hs.moments_path("w"), _moment(1, "w"))
+        claim, slot = hx.session_file("w", ".drain.claim"), base / "drain.slot-0"
+        seen = {}
+        real_run, real_cfg = hs.run_author, hs.write_child_mcp_config
+        hs.run_author = lambda s, m, r, c, **kw: (
+            seen.update(held_during=(hs.take_lease(claim) is None and hs.take_lease(slot) is None)),
+            ("none", {"detail": "x"}))[1]
+        hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
+        try:
+            hs.cmd_author("w", ["w#1"], lease_paths=(str(claim), str(slot)))
+            assert seen.get("held_during") is True, "the pass authored without holding its leases"
+            for path in (claim, slot):
+                got = hs.take_lease(path)
+                assert got is not None, "a lease outlived the pass"
+                got.close()
+            # a sibling holds the slot: the pass gives up, authors nothing, hands nothing
+            seen.clear()
+            other = hs.take_lease(slot)
+            hx.append_jsonl(hs.moments_path("w"), _moment(2, "w"))
+            hs.LEASE_WAIT_S, saved = 0.5, hs.LEASE_WAIT_S
+            try:
+                hs.cmd_author("w", ["w#2"], lease_paths=(str(claim), str(slot)))
+            finally:
+                hs.LEASE_WAIT_S = saved
+                other.close()
+            assert not seen, "authored while a sibling held the slot"
+            rows = hx.read_jsonl(hs.moments_path("w"))
+            assert not any(r.get("handed") == "w#2" for r in rows)
+        finally:
+            hs.run_author, hs.write_child_mcp_config = real_run, real_cfg
+    print("PASS test_a_pass_handed_lease_paths_locks_them_itself_or_gives_up")
+
+
 def test_the_childs_own_prompt_is_harness_text():
     assert hx.is_harness_text(hs.BLOCK_PREFIX + ": turn 3 was flagged as correction.")
     assert hx.is_harness_text(hs.author_prompt("o", _moment(3, "o"), "repo"))

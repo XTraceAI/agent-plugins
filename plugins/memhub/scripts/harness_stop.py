@@ -304,14 +304,27 @@ def _portable_lock():
         return None
 
 
-def take_lease(path: Path):
+#: How long a Windows author pass waits for the leases the hook released to
+#: it (see take_lease). Bounded here rather than by the lock call, because
+#: POSIX flock's blocking mode has no budget at all.
+LEASE_WAIT_S = 60.0
+
+
+def take_lease(path: Path, wait_s: float = 0.0):
     """An exclusive advisory lock on `path`, or None if someone holds it.
 
     Returns the open file: the lock lives exactly as long as some process
-    keeps that file description open. The Stop hook takes it, hands the fd
-    to the author child it spawns, and exits; the child closes it in its
-    `finally` — or dies, and the kernel closes it. Nobody decides whether a
-    holder is dead, and nobody unlinks anything."""
+    keeps that file description open. On POSIX the Stop hook takes it, hands
+    the fd to the author child it spawns, and exits; the child closes it in
+    its `finally` — or dies, and the kernel closes it. Nobody decides whether
+    a holder is dead, and nobody unlinks anything.
+
+    On Windows a byte-range lock belongs to the PROCESS that took it and an
+    inherited handle carries nothing (Codex, #275), so there the hook takes
+    the leases only to decide, releases them after the spawn, and the child
+    takes them again by path — retrying for up to `wait_s` — before it
+    authors anything. If a sibling Stop won that window
+    the child gives the pass up rather than author unlocked."""
     pl = _portable_lock()
     if pl is None:
         return None
@@ -320,11 +333,16 @@ def take_lease(path: Path):
         fh = open(path, "a+", encoding="utf-8")   # noqa: SIM115 — the lock IS the handle
     except OSError:
         return None
-    try:
-        pl.lock_exclusive(fh.fileno(), blocking=False)
-    except OSError:
-        fh.close()
-        return None
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            pl.lock_exclusive(fh.fileno(), blocking=False)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                return None
+            time.sleep(0.25)
     try:
         os.set_inheritable(fh.fileno(), True)      # the child inherits the lock
         fh.seek(0); fh.truncate()
@@ -706,14 +724,25 @@ def hand_off(session: str) -> int:
         _log(f"drain {session[:8]}: {live_drains()} pass(es) already running "
              f"on this machine (cap {MAX_LIVE_DRAINS}); {len(waiting)} left waiting")
         return 0
-    _HELD.extend((claim, slot))
     batch = waiting[:FILING_BUDGET_PER_PASS]
     refs = [_moment_key(m) for _, m in batch]
-    fds = (claim.fileno(), slot.fileno())
-    hx.spawn_detached(["author", "--session", session, "--refs", ",".join(refs),
-                       "--lease-fds", ",".join(map(str, fds))],
-                      script=Path(__file__).resolve(), log_name="author.log",
-                      pass_fds=fds)
+    if os.name == "nt":
+        # The child re-locks by path; see take_lease. Released right after
+        # the spawn, not before: a Stop that decided must not hold what the
+        # child is about to take, and a Stop that has not decided must not
+        # see the slot free.
+        hx.spawn_detached(["author", "--session", session, "--refs", ",".join(refs),
+                           "--lease-paths", os.pathsep.join((claim.name, slot.name))],
+                          script=Path(__file__).resolve(), log_name="author.log")
+        claim.close()
+        slot.close()
+    else:
+        _HELD.extend((claim, slot))
+        fds = (claim.fileno(), slot.fileno())
+        hx.spawn_detached(["author", "--session", session, "--refs", ",".join(refs),
+                           "--lease-fds", ",".join(map(str, fds))],
+                          script=Path(__file__).resolve(), log_name="author.log",
+                          pass_fds=fds)
     _log(f"drain {session[:8]}: spawned for {len(batch)} of {len(waiting)} waiting")
     return 0
 
@@ -1000,7 +1029,8 @@ def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[st
     return outcome, {**fields, **extra}
 
 
-def cmd_author(session: str, refs: list[str], lease_fds: tuple = ()) -> int:
+def cmd_author(session: str, refs: list[str], lease_fds: tuple = (),
+               lease_paths: tuple = ()) -> int:
     """The detached pass. One `claude -p` per moment, then the outcome written
     back beside the moment it came from.
 
@@ -1008,7 +1038,18 @@ def cmd_author(session: str, refs: list[str], lease_fds: tuple = ()) -> int:
     pass leaves it untouched so a later drain retries it: a watermark that
     advances past work nobody did is the silent, unrecoverable version of this
     lane's bug."""
+    held: list = []
     try:
+        for lease in lease_paths:              # Windows: the locks are taken here
+            got = take_lease(Path(lease), wait_s=LEASE_WAIT_S)
+            if got is None:
+                # A sibling won the window between the hook's release and
+                # this. Authoring without the lease would void the cap; the
+                # moments are untouched and the next Stop drains them.
+                _log(f"author {session[:8]}: could not take {Path(lease).name}; "
+                     f"left for a later drain")
+                return 0
+            held.append(got)
         meta = load_meta(session)
         repo = str(meta.get("repo") or "")
         wanted = [r for r in refs if r]
@@ -1048,6 +1089,8 @@ def cmd_author(session: str, refs: list[str], lease_fds: tuple = ()) -> int:
                              "by": session, "at": time.time()})
             _log(f"author {session[:8]}: could not start — {exc}")
     finally:
+        for fh in held:
+            fh.close()
         for fd in lease_fds:                    # the locks go with the fds
             try:
                 os.close(fd)
@@ -1101,6 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("mode", choices=("stop", "extract", "author"))
     p.add_argument("--lease-fds", default="")
+    p.add_argument("--lease-paths", default="")
     p.add_argument("--refs", default="")
     p.add_argument("--session", default="")
     p.add_argument("--transcript", default="")
@@ -1126,7 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
     if args.mode == "author" and args.session:
         return cmd_author(args.session, [r for r in args.refs.split(",") if r],
-                          lease_fds=tuple(int(x) for x in args.lease_fds.split(",") if x))
+                          lease_fds=tuple(int(x) for x in args.lease_fds.split(",") if x),
+                          lease_paths=tuple(x for x in args.lease_paths.split(os.pathsep) if x))
     return 0
 
 
