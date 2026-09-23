@@ -2,8 +2,14 @@
 
 The Python transport snapshots its package version at import and sends it on
 every REST/MCP request, including the SDK auth path. Native host connections
-carry the version in their loaded MCP URL. `version_parity_test.py` requires the
-URL version to match that package's manifest; update both when cutting a release.
+carry the version in `headers.X-MemHub-Plugin-Version` in both MCP configs.
+`version_parity_test.py` requires the header to match the package manifest; bump
+all four manifests and both headers together in the internal repository, then
+promote the tested commit. Keep the MCP URL canonical and unchanged across
+releases: Codex hashes the full URL for its OAuth identity, so adding a version
+query breaks login. Public CI temporarily permits only the already-shipped
+0.76.1 query configuration until the first header-based promotion; it is not a
+template for a new release.
 Downloading a manifest does not upgrade an already-running connection/process.
 
 Valid upgrade errors are parsed from HTTP 426, JSON-RPC errors, and native MCP
