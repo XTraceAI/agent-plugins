@@ -167,6 +167,10 @@ _SYS_BLOCK = re.compile(
     re.S,
 )
 _HARNESS_PREFIX = (
+    # An author child's first prompt (harness_stop.BLOCK_PREFIX). Were such a
+    # session ever sensed, its one turn is the create-rule flow — the text most
+    # likely to be flagged — and flagging it is how one child spawned the next.
+    "MemHub harness: before you stop",
     "Base directory for this skill",
     "Continue from where you left off",
     "Caveat: The messages below",
@@ -709,9 +713,11 @@ def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
 
 
 # ------------------------------------------------------------------- spawn
-def spawn_detached(argv: list[str], script: Path, log_name: str) -> int:
+def spawn_detached(argv: list[str], script: Path, log_name: str,
+                   pass_fds: tuple = ()) -> int:
     """Run `script argv` fully detached: the caller is a hook that must return
-    at once, and the child must survive the session ending."""
+    at once, and the child must survive the session ending. `pass_fds` are
+    inherited — the author lane hands its lock fds down this way."""
     args = [sys.executable, str(script)] + list(argv)
     log_file = log_path(log_name)
     try:
@@ -723,6 +729,10 @@ def spawn_detached(argv: list[str], script: Path, log_name: str) -> int:
     try:
         kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
                   "close_fds": True}
+        if pass_fds:
+            # POSIX only: the author lane passes none on Windows, where an
+            # inherited handle carries no lock (harness_stop.take_lease).
+            kwargs["pass_fds"] = tuple(pass_fds)
         if os.name == "nt":
             kwargs["creationflags"] = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

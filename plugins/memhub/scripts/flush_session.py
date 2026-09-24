@@ -608,6 +608,8 @@ def main() -> int:
         if not session_id or not transcript_path or not Path(transcript_path).exists():
             _log("missing session_id/transcript_path; skipping")
             return 0
+        if is_harness_child(session_id=str(session_id)):
+            return 0  # on the children list, whatever the environment says
         # SessionEnd carries no tool_input; it reports its reason instead.
         cmd = str((hook_input.get("tool_input") or {}).get("command", ""))[:120]
         reason = str(hook_input.get("reason") or "")[:40]

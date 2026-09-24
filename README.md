@@ -346,20 +346,46 @@ With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin helps a
 correction you make in a session become a proposed team rule. At each turn's
 Stop, a detached child sends a redacted slice of that turn to MemHub
 (`POST /v1/team/rulebook/harness/classify`), whose classifier says whether the
-moment is worth the agent's attention. At a later turn's Stop, once the agent
-has finished your request, the hook **blocks the stop** and hands the flagged
-moment to the agent that lived the turn. The agent cannot end the turn without
-a verdict: if there is a lesson that would change what an agent does next
-time, it runs the create-rule skill on it (which asks you which rulebook,
-checks for a twin, and proves the rule), passing the turn's harness stamp;
-if there is none, it says so in one line, `No rule from turn N: <why>`. At most
-8 stops a session are blocked, and a moment more than 3 turns old is dropped. A
-moment from the session's last turn is never handed. The rule lands
-`proposed` for a person to activate; nothing fires from it, and the plugin
-never activates one. The slice is redacted before it leaves the machine
+moment is worth an author's attention. Authoring happens **off your thread**:
+a later Stop spawns a detached pass that runs one headless `claude -p` per
+waiting moment, under the plugin's own MCP server and credential. If there is
+a lesson that would change what an agent does next time, that child runs the
+create-rule skill on it (rulebook by arithmetic, twin check, proof), passing
+the turn's harness stamp, and asks you nothing. Your session is never blocked
+and never edited. You see one line when a rule was filed, or when a pass could
+not run; a pass that found no lesson says nothing. Moments are selected by
+repository across every session on the machine, at most 8 a pass, and one
+older than 14 days is dropped with a log line. The rule lands `proposed` for a
+person to activate; nothing fires from it, and the plugin never activates one.
+The slice sent to the classifier is redacted before it leaves the machine
 (MemHub keys, home directories, e-mail addresses, command-line credentials,
 quoted or not).
-With the variable unset, the default, none of this runs.
+
+That child spends **your** model quota: it resumes your session with
+`--fork-session`, so it inherits the whole session and re-reads it on every
+call of its loop.
+
+Each outcome row in `~/.config/memhub-plugin/harness/<session>.moments.jsonl`
+records the child's session id and what the pass `spent`.
+
+An author child can never author. v0.74.0–v0.76.0 had a loop: the child's
+`MEMHUB_HARNESS_EXTRACT=0` was overridden by the install's own settings.json
+`env`, the child was sensed like a person's session, its create-rule turn was
+flagged, and its Stop forked it — one generation per generation. The guard is
+no longer an environment variable: the spawner chooses the child's session id,
+writes it to `harness/children.jsonl` before the child runs, and a session on
+that list is never sensed, never drained, never forked and never captured,
+whatever its environment says. The child also runs with
+`--no-session-persistence`: it leaves no transcript, so there is nothing for
+any hook to capture or resume in the first place. At most 2 author passes run
+on a machine at once: each slot is an OS advisory lock the Stop hook takes
+and hands to the pass by file descriptor, so concurrent Stops cannot all
+count zero and spawn, and a pass that dies gives its slot back to the kernel
+rather than to a staleness guess. A moment stamped by a child of a release
+that kept no list is recognised by its transcript — the hand-off is a
+human-role message no person's session holds — and quarantined, never
+authored.
+With `MEMHUB_HARNESS_EXTRACT` unset, the default, none of this runs.
 
 ## Skills
 
