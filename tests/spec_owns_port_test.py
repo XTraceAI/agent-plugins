@@ -125,6 +125,45 @@ def main():
         cache = root/'cache'
         seed_book(str(cache), root.name, [{"id":"many-specs", "on":"bash", "rx":r"git\s+push", "fire_scope":"branch", "repo_scope":"any", "text":"Update owning specs", "why":"", "given":{"repo":{"spec_untouched":True}}}])
         output = run("pre", {"cwd":tmp,"session_id":"many","tool_name":"Bash","tool_input":{"command":"git push"}}, {"MEMHUB_RULEBOOK_BASE":str(cache),"MEMHUB_RULEBOOK_FETCH":"0"})[1]
-        assert all(f'docs/specs/item{i}.md' in output for i in range(12)), output
+        out = json.loads(output)
+        context = out['hookSpecificOutput']['additionalContext']
+        user = out['systemMessage']
+        # The spec list rides INLINE on the rule's own bullet, capped at 3 with the rest counted.
+        bullet = [l for l in context.split('\n') if l.startswith('- **[many-specs]**')]
+        assert len(bullet) == 1, context
+        named = [f'docs/specs/item{i}.md' for i in range(12) if f'docs/specs/item{i}.md' in bullet[0]]
+        assert len(named) == 3 and 'Specs not updated: ' in bullet[0] and '(+9 more)' in bullet[0], bullet[0]
+        # Every context line is a bullet, a heading, a note or prose — no bare `<spec> owns:` line.
+        assert not any(' owns' in l and not l.startswith('- **[') for l in context.split('\n')), context
+        # The agent still gets which owned paths each named spec answers for, on the same line.
+        assert all(f'{p} owns app/item' in bullet[0] for p in named), bullet[0]
+        # The user's systemMessage names the same capped list, one detail line, and no owned-path detail.
+        detail = [l for l in user.split('\n') if '[many-specs]' in l and '▸' in l]
+        assert len(detail) == 1 and '(+9 more)' in detail[0], user
+        assert ' owns ' not in user and 'app/item' not in user, user
+        assert len(user.split('\n')) == 2, user
+
+    # ENG-1153: a big shared file co-owned by narrow specs. Once the branch updates the
+    # spec that governs the change, the file's other owners are not flagged for it —
+    # only for changed paths no updated spec answers for.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        def git(*args):
+            return subprocess.check_output(['git', '-C', tmp, *args], stderr=subprocess.DEVNULL, text=True)
+        git('init', '-b', 'main'); git('config', 'user.email', 'test@example.com'); git('config', 'user.name', 'Test')
+        (root/'app').mkdir(); (root/'docs/specs').mkdir(parents=True)
+        (root/'app/shared.py').write_text('a = 1\n'); (root/'app/labels.py').write_text('b = 1\n')
+        (root/'docs/specs/labels.md').write_text('---\nspec: labels\nowns: [app/shared.py]\n---\nLabels.\n')
+        (root/'docs/specs/detect.md').write_text('---\nspec: detect\nowns: [app/shared.py, app/labels.py]\n---\nDetect.\n')
+        git('add', '.'); git('commit', '-m', 'baseline'); git('checkout', '-b', 'change')
+        (root/'app/shared.py').write_text('a = 2\n')
+        assert sorted(s.path for s, _ in hook.Probes(str(root), '').untouched_specs()) == ['docs/specs/detect.md', 'docs/specs/labels.md']
+        (root/'docs/specs/labels.md').write_text('---\nspec: labels\nowns: [app/shared.py]\n---\nLabels, amended.\n')
+        assert hook.Probes(str(root), '').untouched_specs() == []
+        assert not hook.given_ok({'given': {'repo': {'spec_untouched': True}}}, hook.Probes(str(root), ''))
+        # A path only the untouched spec owns still reports it — for that path alone.
+        (root/'app/labels.py').write_text('b = 2\n')
+        hits = hook.Probes(str(root), '').untouched_specs()
+        assert [(s.path, paths) for s, paths in hits] == [('docs/specs/detect.md', ['app/labels.py'])], hits
     print('spec ownership parser and git probe cases passed')
 if __name__=='__main__': main()
