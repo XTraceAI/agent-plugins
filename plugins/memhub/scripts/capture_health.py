@@ -462,7 +462,10 @@ def _message(host: str, token_problem: str | None,
     # /memhub:login, not /memhub:import-session — importing a session is a
     # different operation that does real unrequested work and can fail for
     # reasons unrelated to auth, which muddies the very signal being reported.
-    fix = ("Run /memhub:login to authenticate "
+    from _memhub_auth import skill_command  # noqa: PLC0415 — stdlib, beside this file
+
+    login = skill_command("login")
+    fix = (f"Run {login} to authenticate "
            "(the plugin has its own login, separate from /mcp).")
     if token_problem == "never":
         return (f"MemHub capture is not authenticated for {host}, so this "
@@ -516,7 +519,7 @@ def _message(host: str, token_problem: str | None,
             # to inspect the one thing that was definitely fine. The session is
             # partially captured and finishing it is a different command.
             tail = ("Nothing is broken — later flushes continue it; run "
-                    "/memhub:import-session to finish that session now.")
+                    f"{skill_command('import-session')} to finish that session now.")
         elif reason == "unconfirmed_provenance":
             tail = "A later capture hook will retry the URL automatically."
         elif reason == "payload_too_large" and dormant:
@@ -545,7 +548,7 @@ def _message(host: str, token_problem: str | None,
                     "skill to confirm the bridge can find it.")
         else:
             tail = ("It may have recovered since; "
-                    "run /memhub:login --status to check.")
+                    f"run {login} --status to check.")
         return (f"MemHub capture last failed {when_txt} — {detail}. {tail}")
 
     # Last, and only when capture itself is healthy: capture failing is the
@@ -563,12 +566,12 @@ def _message(host: str, token_problem: str | None,
             return ("Your team's rules are not refreshing — the last check "
                     f"failed {when_txt}, so this session is using a cached copy. "
                     "Rules activated or retired since then are not reflected. "
-                    "Run /memhub:login --status to check.")
+                    f"Run {login} --status to check.")
         if what == "flush":
             return ("Your team's rules are showing normally, but which ones "
                     f"fired is not reaching the server (last attempt {when_txt}), "
                     "so the team cannot see whether they are useful. "
-                    "Run /memhub:login --status to check.")
+                    f"Run {login} --status to check.")
         if what == "recall":
             # NOT told to check login: this lane runs on a 1.5 s budget inside
             # PreToolUse and the overwhelming majority of its failures are a
@@ -583,7 +586,7 @@ def _message(host: str, token_problem: str | None,
                     "the next lookup succeeds.")
         return ("A team-rule lookup failed "
                 f"{when_txt}; advice tied to specific files or commands may be "
-                "missing from this session. Run /memhub:login --status to check.")
+                f"missing from this session. Run {login} --status to check.")
     return None
 
 

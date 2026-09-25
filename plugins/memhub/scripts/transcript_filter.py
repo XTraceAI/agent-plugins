@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 
 # The wrappers the client emits around a slash command: the invocation, the
@@ -300,7 +301,29 @@ def _hard_trim_block(block, keep: int):
 HARNESS_CHILD_ENV = "MEMHUB_HARNESS_CHILD"
 
 
-def is_harness_child(environ=None) -> bool:
+def is_harness_child(environ=None, session_id: str = "") -> bool:
+    """By the environment, or by the children list the spawner writes.
+
+    The environment alone failed once: Claude Code applies settings.json `env`
+    over what a child inherits, and that is where an install opts the harness
+    in. `harness_stop.register_child` writes the child's session id BEFORE the
+    child runs, so a hook that has the payload's session_id can ask the list —
+    and the list cannot be overridden by anything."""
     env = os.environ if environ is None else environ
-    return str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() in (
-        "1", "on", "true", "yes")
+    if str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() in ("1", "on", "true", "yes"):
+        return True
+    if not session_id:
+        return False
+    path = Path(env.get("MEMHUB_HARNESS_DIR")
+                or (Path.home() / ".config" / "memhub-plugin" / "harness")) / "children.jsonl"
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    if str(json.loads(line).get("child")) == session_id:
+                        return True
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return False

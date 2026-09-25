@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks to save, store, or upload a file/document/spec to MemHub or team memory as an artifact (e.g. "save this spec to memhub", "store this doc as an artifact", "version this design doc in memhub"). Uploads the file's bytes via a terminal script — never call save_artifact directly or re-emit file contents.
 argument-hint: <file-path> [artifact name]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory
+allowed-tools: Bash, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -41,7 +41,9 @@ Do exactly this:
 1. Resolve the file path (`$1`) and a name. If no name was given, derive a short
    Title-Case name from the filename.
 2. Pick an `artifact_type` from the extension/content: `spec`, `design_doc`,
-   `adr`, `runbook`, or `document` (default).
+   `plan`, `runbook`, or `document` (default). These are the types the brain's
+   Index groups by; anything else folds into Documents — so an ADR goes in as
+   `design_doc`, not `adr`, to land under Design.
 3. Run the upload via Bash — substitute the real values, keep it one command:
 
    ```bash
@@ -49,13 +51,16 @@ Do exactly this:
      --file "<path>" --name "<name>" --type "<type>"
    ```
 
-   The artifact routes to the repo's room automatically — from the cache in
-   `~/.config/memhub-plugin/rooms.json`, or resolved from the server when the
-   cache is empty (the script prints which room it used) — so a file in a
-   repo lands where teammates search without any extra flag.
+   A file inside a git repo routes to that repo's room automatically — from
+   the cache in `~/.config/memhub-plugin/rooms.json`, or resolved from the
+   server when the cache is empty (the script prints which room it used) — so
+   it lands where teammates search without any extra flag. A file outside any
+   repo goes to personal memory unless you pass `--agent-brain-id`.
 
    Optional flags when relevant: `--agent-brain-id <id>` to override the
-   destination brain, `--no-room` to save into personal workspace memory
+   destination brain — with `--org-id <org>` when that brain is outside your
+   default org (`list_orgs`; without it the save fails "Agent brain not
+   found"), `--no-room` to save into personal workspace memory
    instead, `--rationale "..."` to note why this version supersedes the last,
    `--parent-id <id>` only with the current head's id.
 
@@ -65,7 +70,8 @@ Do exactly this:
    normalise the same way. Tags are what a later `search_memory(tags=…)` can
    filter on, and an org with required tags turned on REFUSES an untagged save
    and answers with the brain's own tag vocabulary — pick from what it offers
-   and re-run rather than inventing a new word.
+   and re-run rather than inventing a new word. `list_tags` shows that
+   vocabulary up front if you'd rather choose before the first try.
 
 4. **A rendered deliverable — an HTML page, a chart PNG, a PDF — goes through
    `--attach`, not `--file`.** `--file` reads UTF-8 text; a deliverable is
@@ -90,11 +96,16 @@ Do exactly this:
    and all: the bundle path follows what you pass, so a symlinked `assets/`
    directory stays `assets/` instead of becoming its link target. Give a text body too whenever you have one:
    the bytes are the payload, the text is what makes the deliverable findable
-   by search. Keep the bundle to a few MB — a large file belongs in
-   `ingest_document_from_url` instead.
+   by search. Keep the bundle to a few MB. `ingest_document_from_url` is not
+   an escape hatch for a big local file — it takes a public `https://` URL and
+   the server fetches it; a large file with no public URL needs trimming or
+   splitting.
 5. Report the returned `{id, action}` to the user, **and which brain it landed
    in, by name** — automatic routing that happens silently reads as losing
-   things. On first ever run the script may open the browser once for approval
+   things. `action: "existing"` means these exact bytes were already saved as
+   ANOTHER artifact in that brain: the returned `id`/`name` are that one's,
+   your `--name` was not used, and nothing new was written — report that name,
+   since it is the one to version later. On first ever run the script may open the browser once for approval
    and then mint a personal access key (`mhk_…`) that later runs reuse without
    one — that is expected, not an error. It is the plugin's own credential, not
    the `/mcp` connector's; `/memhub:login` provisions it up front if you would

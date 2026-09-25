@@ -252,6 +252,32 @@ def list_sessions(limit: int | None = 20, *, on_error=None, include_representati
     return rows[:limit]
 
 
+def readable(db_path: Path) -> bool:
+    """Can this store be opened for reading RIGHT NOW?
+
+    Existence is not readability. A cursor-agent CLI session keeps its store
+    open for the life of the process, and sqlite refuses a read-only open of a
+    live WAL database ("unable to open database file") because it cannot create
+    the -shm sidecar it would need. Measured on cursor-agent 2026.09.10: at
+    sessionEnd — the hook that captures a CLI session — `mode=ro` fails on a
+    store that opens fine seconds later, once the host has exited.
+
+    The read path is `mode=ro` (see _connect), so this probes exactly that,
+    not a weaker open that would answer a different question.
+    """
+    try:
+        con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    try:
+        con.execute("select 1 from sqlite_master limit 1")
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+
+
 def locate(ref: str) -> tuple[Path | None, str]:
     """Accept a native path, session directory, ``latest``, or session UUID."""
     p = Path(ref).expanduser()

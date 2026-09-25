@@ -486,6 +486,13 @@ def main() -> int:
     if generated:
         print("\n(the last %d SILENT cases were generated: a rule should not fire on a\n"
               " command that merely mentions its own trigger)" % len(generated))
+    elif not args.no_self_mention and (rule.get("matcher") or {}).get("command_rx") \
+            and (rule.get("matcher") or {}).get("event") in (None, "bash"):
+        # A structural command_rx has no literal to quote, so nothing was
+        # generated — say so, or the author reads the table as having covered
+        # the grep / python -c mention class when it never ran.
+        print("\n(no grep / python -c SILENT cases were generated: command_rx is not a\n"
+              " plain literal. Add them yourself, quoting the trigger.)")
     # Independent of the cases above: an author who supplied none has not shown
     # the rule can trigger at all, and needs telling even when something else
     # already failed.

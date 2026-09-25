@@ -30,7 +30,11 @@ can skip directives minted from this session's own conversation. A 90-site
 transcript audit (2026-08-02) found replayed same-session lessons — delivered
 minutes after the agent already applied them — were the dominant ignored-
 injection class; excluding them is a server-side filter, this client just
-supplies the id (with a legacy retry for servers predating the param).
+supplies the id (with a legacy retry for servers predating the param). The
+server matches it against the conversation id CAPTURE uploaded, which Codex
+namespaces ``codex-<uuid>``; the Codex bridge passes ``--host codex`` so the id
+is namespaced the same way on the wire (as ``rulebook_hook`` does, ENG-1075).
+Local state keeps the raw id.
 
 **First-touch-once + ranked cap.** The proactive path recalls at most once per
 identifying handle (file path / command string) per session — repeat touches
@@ -55,8 +59,8 @@ because the command said ``npm run gen:types``.
 trigger-in-handle contract before injection — transitional belt-and-braces for
 servers predating the match-semantics funnel; fail-open.
 
-Invoked as: ``uv run --with 'mcp<2' python directive_recall.py`` with the PreToolUse
-hook JSON on stdin.
+Invoked as: ``uv run --with 'mcp<2' python directive_recall.py [--host codex]``
+with the PreToolUse hook JSON on stdin.
 """
 from __future__ import annotations
 
@@ -107,6 +111,27 @@ _MAX_FIRED_SENT = served_state.MAX_IDS
 
 def _log(msg: str) -> None:
     print(f"[memhub-directive] {msg}", file=sys.stderr)
+
+
+def _host_arg(argv: list[str] | None = None) -> str:
+    """`--host claude|codex|cursor`, as the other hook scripts take it.
+    Defaults to claude, whose manifest passes nothing."""
+    args = sys.argv[1:] if argv is None else argv
+    for flag, value in zip(args, args[1:]):
+        if flag == "--host" and value in ("claude", "codex", "cursor"):
+            return value
+    return "claude"
+
+
+def _wire_session_id(session_id: str, host: str) -> str:
+    """The session id as capture uploaded it, so the server's self-echo filter
+    can find this conversation. Only the wire value changes: the fired/handle
+    state files keep keying on the raw hook id. Fails open to the raw id."""
+    try:
+        import pr_link  # noqa: PLC0415 — beside this file; only needed here
+        return pr_link.conversation_id_for(host, session_id) or session_id
+    except Exception:  # noqa: BLE001 — never lose the recall over this
+        return session_id
 
 
 # --- session already_fired state -------------------------------------------
@@ -679,7 +704,8 @@ def main() -> int:
         repo = _repo_name(cwd, recall_args)
         items = asyncio.run(
             asyncio.wait_for(
-                _recall(tool, recall_args, repo, fired, output, session_id),
+                _recall(tool, recall_args, repo, fired, output,
+                        _wire_session_id(session_id, _host_arg())),
                 _RECALL_TIMEOUT_S,
             )
         )

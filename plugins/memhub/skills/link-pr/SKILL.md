@@ -37,13 +37,14 @@ Arguments: `$ARGUMENTS`
   (no PR for this branch, not a repo, `gh` unauthenticated), **ask** which PR
   they mean rather than guessing.
 
-Normalise to `https://<host>/<owner>/<repo>/pull/<n>` — no trailing slash, no
-query, no fragment. **Keep the host the user gave you.** Most PRs are on
-`github.com`, but an enterprise PR (`https://ghe.corp/o/r/pull/7`) is equally
-valid and the hook already passes those to the same backend; rewriting the host
-to `github.com` would name a different pull request, and rejecting it would
-leave enterprise users — including every Cursor user, for whom this skill is
-the only path — with no way to link at all.
+Normalise to `https://github.com/<owner>/<repo>/pull/<n>` — no trailing
+slash, no query, no fragment; `www.github.com` is `github.com`. **Only
+github.com pull requests can be linked**: the server refuses any other host
+("Expected an exact pull request URL…"), so GitHub Enterprise is not
+supported yet. For an enterprise PR (`https://ghe.corp/o/r/pull/7`) do not call
+`link_pr`, and do not rewrite the host to `github.com` — that names a different
+pull request. Tell the user enterprise GitHub cannot be linked in MemHub yet
+and stop.
 
 ## 2. Resolve the sessions
 
@@ -107,12 +108,28 @@ success it does not claim.
 - `skipped: session_not_found` → the session is not in MemHub yet or belongs to
   someone else. If it may simply not have been captured, say so and offer
   `/memhub:import-session <id>`.
-- error `github_not_connected` / `repo_not_in_install` → relay the message and
-  the `connect_url` verbatim. **Do not retry** — nothing here can fix it; an
-  admin connects GitHub or adds the repo in MemHub.
-- error `feature_disabled` → PR linking is not enabled for this org yet. Stop.
-- `pr_not_found` immediately after `gh pr create` → GitHub may not have
-  published the PR yet. Suggest re-running in a moment; do not loop on it.
+- An error reaches you as the server's message only — match on its wording:
+  - "…has no active GitHub connection…" or "That repository is not part of
+    this organization's GitHub installation." → relay the message verbatim
+    (the first names where to connect GitHub when the server has that URL
+    configured). **Do not retry** — nothing here can fix it; an admin connects
+    GitHub or adds the repo in MemHub.
+  - "GitHub did not answer…" or "GitHub could not be reached…" → nothing was
+    written; retrying is safe. Retry once, then relay it.
+  - "GitHub returned no pull request…" immediately after `gh pr create` →
+    GitHub may not have published the PR yet. Suggest re-running in a moment;
+    do not loop on it. Otherwise relay it: the PR may not exist, or the GitHub
+    App may no longer be allowed to read it.
+  - "This PR already has a different classification…" → the first
+    classification stands. Re-send the link without `pr_type`; do not argue
+    the type.
+  - "The classification session was not found among your sessions." → that
+    session is not in MemHub yet (or not the user's), so nothing was linked.
+    Offer `/memhub:import-session <id>`, or re-send without `pr_type`.
+  - "Expected an exact pull request URL…" → the URL is malformed or not on
+    github.com; fix the spelling (step 1) or, for an enterprise host, stop.
+- A successful link (created or already linked) also clears the user's own
+  dismissal of that PR in MemHub, so it is no longer hidden from them.
 
 **Mention the payoff once, and only if it happened**: when a link was actually
 created and the org has PR session insights on, the PR's MemHub comment

@@ -682,6 +682,39 @@ def _names_of(path):
     return names
 
 
+_PATCH_FILE = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+?)\s*$")
+_PATCH_MOVE = re.compile(r"^\*\*\* Move to: (.+?)\s*$")
+
+
+def apply_patch_files(inp, cwd):
+    """(path, is_new, added text) for each file a Codex `apply_patch` names.
+
+    Codex edits with `apply_patch`, not Edit/Write: the whole patch arrives in
+    `tool_input.command`, with no `file_path`, and a path may be relative to
+    the call's cwd. Read as edits here, a patch reaches the edit lane and arms
+    an ordering obligation the way Claude's Edit does; unread, every edit rule
+    and every edit-armed obligation stayed silent on Codex. A moved file is
+    judged at its new path; a deleted one is an edit with nothing added."""
+    patch = inp.get("command") if isinstance(inp, dict) else None
+    if not isinstance(patch, str) or "*** Begin Patch" not in patch:
+        return []
+    files, current = [], None
+    for line in patch.splitlines():
+        head = _PATCH_FILE.match(line)
+        if head:
+            current = [head.group(2), head.group(1) == "Add", []]
+            files.append(current)
+            continue
+        move = _PATCH_MOVE.match(line)
+        if move and current is not None:
+            current[0] = move.group(1)
+        elif current is not None and line.startswith("+"):
+            current[2].append(line[1:])
+    base = cwd or os.getcwd()
+    return [(os.path.normpath(os.path.join(base, path)), is_new, "\n".join(added))
+            for path, is_new, added in files[:BASH_EDIT_MAX_FILES]]
+
+
 def bash_written_files(root, cmd, since):
     """(path, is_new) for each regular file a Bash call left modified or new.
 
@@ -1658,17 +1691,31 @@ class Probes:
         return self._get("active_spec_paths:" + spec_dir, compute)
 
     def untouched_specs(self, spec_dir="docs/specs"):
+        """`[(spec, paths)]` for each owning spec the branch left alone, naming
+        only the changed paths no UPDATED spec already answers for. A big
+        shared file is co-owned by several narrow specs; once the branch edits
+        the one that governs the change, flagging the file's other owners too
+        taught people to ignore the reminder (ENG-1153). A spec whose every
+        path is answered for that way is not reported."""
         def compute():
             from spec_owns import load_specs_from_tree, owning_specs, spec_file_changed
             paths = self.diff_paths()
             if paths is None:
                 return None
             try:
-                return [(s, touched) for s, touched in owning_specs(
+                owning = owning_specs(
                     paths, load_specs_from_tree(self.root, spec_dir), exclude_prefix=spec_dir
-                ) if not spec_file_changed(s, paths)]
+                )
             except (OSError, ValueError):
                 return None
+            updated = {s.path for s, _ in owning if spec_file_changed(s, paths)}
+            answered = {p for s, touched in owning if s.path in updated for p in touched}
+            out = []
+            for s, touched in owning:
+                left = [p for p in touched if p not in answered]
+                if s.path not in updated and left:
+                    out.append((s, left))
+            return out
         return self._get("untouched_specs:" + spec_dir, compute)
 
     def diff_lines(self):
@@ -1924,6 +1971,34 @@ def _one_line(v):
 def _clean_text(v):
     """`_one_line`, length-capped for the fields that enter the context."""
     return _one_line(v)[:_TEXT_MAX]
+
+
+_SPEC_LIST_MAX = 3      # specs named on a `spec_untouched` fire; the rest are counted
+_SPEC_OWNED_MAX = 5     # owned paths named per spec, agent context only
+
+
+def _spec_untouched_text(text, hits):
+    """A `spec_untouched` fire's rule text and its agent-only detail, each ONE
+    line. The spec list rides inline on the rule text — it reaches both the
+    `- **[label]** …` bullet and the user's one-line `systemMessage`, so a
+    newline here would break both — capped at `_SPEC_LIST_MAX` with the rest
+    counted. Which owned paths each spec answers for is detail for the agent,
+    not the user's terminal line, so it is returned separately."""
+    shown = hits[:_SPEC_LIST_MAX]
+    more = len(hits) - len(shown)
+    names = ", ".join(_one_line(spec.path) for spec, _ in shown)
+    if more > 0:
+        names += f" (+{more} more)"
+    if not names:
+        return text, ""
+    owned = []
+    for spec, paths in shown:
+        head = ", ".join(_one_line(p) for p in paths[:_SPEC_OWNED_MAX])
+        if len(paths) > _SPEC_OWNED_MAX:
+            head += f" (+{len(paths) - _SPEC_OWNED_MAX} more)"
+        owned.append(f"{_one_line(spec.path)} owns {head}")
+    detail = f"  _(changed owned paths: {'; '.join(owned)})_" if owned else ""
+    return f"{text.rstrip()} Specs not updated: {names}.", detail
 
 
 def _why(r):
@@ -4486,11 +4561,16 @@ def main():
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
+    # Codex's apply_patch: one Edit/Write event per file it names (below).
+    patched = apply_patch_files(inp, cwd) if tool == "apply_patch" else []
+    if patched:
+        fp = patched[0][0]
+        body = "\n".join(text for _, _, text in patched)
     # §5.3: the edit lane's own override. Which gates it actually excuses is
     # decided once the gates are known — a marker naming a rule excuses that
     # rule only.
     edit_markers = ({k: redact_secrets(v)[:2000] for k, v in find_edit_override(body).items()}
-                    if mode == "pre" and tool in EDIT_TOOLS else {})
+                    if mode == "pre" and (tool in EDIT_TOOLS or patched) else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
     # A subagent's arcs are its own: its Stop is ignored by harness_stop.py, so
@@ -4536,6 +4616,15 @@ def main():
                     events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
                                    "cmd": "", "fp": path, "body": text, "rtext": "",
                                    "resp": None, "via": "bash"})
+    # A patch is an edit tool call, not a file a command already wrote: its
+    # events keep the call's own phase, exactly like Claude's Edit. The edit
+    # lane judges it at pre, where a gate can still refuse it (via None), and
+    # the ordering engine arms at post — which Codex sends only for a patch
+    # that applied, so a failed or refused patch arms nothing.
+    for path, is_new, text in patched:
+        events.append({"tool": "Write" if is_new else "Edit", "phase": mode, "order_phase": mode,
+                       "cmd": "", "fp": path, "body": text, "rtext": rtext, "resp": None,
+                       "via": None, "read": None})
     events.append(real)
     # Reads (§5.1): what this call would pull into the context. The Read tool
     # is the call itself; a Bash call contributes one synthetic Read per file
@@ -4613,7 +4702,7 @@ def main():
     handles = {}
     if tool == "Bash" and cmd:
         handles["command"] = redact_secrets(shell_only(cmd))[:400]
-    elif tool in EDIT_TOOLS and fp:
+    elif (tool in EDIT_TOOLS or patched) and fp:
         handles["file_path"] = fp
     if mode == "pre" and anchor_rules and handles \
             and os.environ.get("MEMHUB_RULEBOOK_RECALL", "1") != "0":
@@ -4728,8 +4817,7 @@ def main():
                 hits = probes.untouched_specs(spec_given.get("spec_dir", "docs/specs")) or []
                 st["spec_pending"][json.dumps([rid, probe_root, probe_branch])] = {"root": probe_root, "branch": probe_branch, "spec_dir": spec_given.get("spec_dir", "docs/specs"), "paths": [spec.path for spec, _ in hits]}
                 r = dict(r)
-                r["text"] += "\n" + "\n".join(
-                    f"{spec.path} owns: {', '.join(paths[:10])}" for spec, paths in hits)
+                r["text"], r["_spec_detail"] = _spec_untouched_text(r["text"], hits)
             fired_now.append(r)
             fired_on[rid] = ev
 
@@ -4786,7 +4874,8 @@ def main():
             return r.get("on") in ("bash", "ordering") or (r.get("on") == "read" and via == "bash-read")
         if tool in READ_TOOLS:
             return r.get("on") == "read"
-        return tool in EDIT_TOOLS and r.get("on") == "edit"
+        # A patch at pre has not applied yet, so it can be refused like an Edit.
+        return (tool in EDIT_TOOLS or bool(patched)) and r.get("on") == "edit"
 
     gate_ids = {r["id"] for r in fired_now if _gateable(r)}
 
@@ -4929,15 +5018,15 @@ def main():
                     f"{BRAND} plugin to let this rule gate.)_")
         blocked_here = r["id"] in gate_ids and r["id"] not in overridden
         if r["id"] not in gate_ids:
-            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}{r.get('_spec_detail', '')}")
             detail_line = f"{BRAND} ▸ [{label}] {r['text']}{detail}{_where(r)}"
         elif r["id"] in overridden:
             why = overridden[r["id"]]
-            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)} "
+            lines.append(f"- **[{label}]** {r['text']}{detail}{_where(r)}{_why(r)}{r.get('_spec_detail', '')} "
                          f"_(gate overridden: {why})_")
             detail_line = f"{BRAND} ⚠ gate overridden — [{label}] {why}"
         else:
-            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}")
+            lines.append(f"- **BLOCKED [{label}]** {r['text']}{detail}{_where(r)}{_why(r)}{r.get('_spec_detail', '')}")
             detail_line = f"{BRAND} ⛔ blocked by [{label}] {r['text']}{detail}{_where(r)}"
             # a label shared by two gates is no address; give the id alongside
             ident = f" (rule id {r['id']})" if label_count.get(_label_of(r), 0) > 1 else ""

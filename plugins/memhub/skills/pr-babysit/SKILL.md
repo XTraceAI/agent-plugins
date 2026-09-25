@@ -1,12 +1,13 @@
 ---
-description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or auto-armed by the memhub hook right after `gh pr create`). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
+description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or, on Claude Code only, auto-armed by the memhub hook right after `gh pr create` — Codex and Cursor do not run that hook, so there it is started by hand). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
 argument-hint: [pr-number-or-url]
 allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash, Read, Edit, Write, Glob, Grep
 ---
 
-**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
-Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
-this plugin's root — the ancestor directory of this skill file that contains
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code
+exports it; Codex exports `PLUGIN_ROOT` instead. If it is unset, set it first —
+from `$PLUGIN_ROOT` when that is set, otherwise (e.g. on Cursor) to this
+plugin's root — the ancestor directory of this skill file that contains
 `.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
 
 Babysit a pull request until its review bots are satisfied, then bank what
@@ -21,18 +22,24 @@ already resolved.
    `gh pr view --json number,url,state,headRefName` on the current branch.
    PR merged or closed → report that and END the loop (no further passes).
 2. **Resolve the repo's room** (first pass only — reuse the id afterwards).
-   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show` prints it when the
-   repo is already cached — take that id and skip the lookup. Otherwise: name
-   `Repo: <org>/<name>` from `git remote get-url origin` (host and `.git`
-   stripped), match it EXACTLY in `list_agent_brains` — a teammate may have
-   created it; use theirs. No match → `create_agent_brain` with
-   `category: "repo"` (and omit `workspace_id`). Either way, persist what you resolved with `room_map.py set
-   --brain-id <id> --org-id <org-id>` (the org id is the one you passed to
-   `list_agent_brains`, or the default org's from `list_orgs` — the response's
-   `scope` carries only `org_name`) so later passes and the capture hooks
-   route without repeating this lookup. Edge cases (SSH remotes, no remote, worktrees, not a git
-   repo) and the create-time rules — resolve before create, required
-   description, report where it landed — are in
+   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show --json` prints the
+   cached entry when the repo is already cached — take its `brain_id` (the
+   room) and `org_id` (the org that owns it, when recorded; keep it as
+   `ORG_ID`) and skip the lookup. Otherwise: name `Repo: <org>/<name>` from
+   `git remote get-url origin` (host and `.git` stripped), match it EXACTLY in
+   `list_agent_brains` — a teammate may have created it; use theirs. No match →
+   `create_agent_brain` with `category: "repo"`, a description, and
+   `repo: "<org>/<name>"` (omit `workspace_id`); its "already exists" and
+   "requires an org admin" answers are handled as in
+   `references/repo-brain.md` §3. A brain you create is private to you — say
+   so in the final report, since teammates will not see the review record
+   until it is shared. Either way, persist what you resolved with
+   `room_map.py set --brain-id <id> --org-id <org-id>` (the org id is the one
+   you passed to `list_agent_brains`, or the default org's from `list_orgs` —
+   the response's `scope` carries only `org_name`) so later passes and the
+   capture hooks route without repeating this lookup. Edge cases (SSH remotes,
+   no remote, worktrees, not a git repo) and the create-time rules — resolve
+   before create, required description, report where it landed — are in
    `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
 3. **Collect findings** (`{owner}/{repo}` and `{n}` from step 1):
    - `gh pr view <n> --json state,mergeable,statusCheckRollup`
@@ -75,13 +82,7 @@ already resolved.
 ## Final pass — save the process to MemHub, then end the loop
 
 Save a **PR-scoped artifact** — the review record — into the repo's room.
-Do NOT import the session transcript. The Stop-hook capture already ships
-this session to this same room continuously, routed by the same room cache the
-capture hooks use,
-so an import would write a SECOND copy of the same conversation under a
-different id. Two transcripts of one session in one room produce competing
-facts and episodes that BOTH surface in retrieval — the exact failure
-artifact versioning exists to prevent — and it costs megabytes to do it.
+Do NOT import the session transcript (step 3 says why).
 
 What capture does not record is the judgment: which findings were real,
 which were rejected and why, and which commit answered each. That is this
@@ -100,8 +101,10 @@ step's whole value, and it is a page of text.
      section rather than padding it.
 2. **Save it** into the repo's room with `save_artifact`:
    `name: "PR review record — <owner>/<repo>#<n>"`,
-   `artifact_type: "document"`, `tags: ["pr-review", "<repo>"]`,
-   `agent_brain_id: <repo-room-id-from-step-2>`.
+   `content: <the record from step 1>`, `artifact_type: "document"`,
+   `tags: ["pr-review", "<repo>"]`,
+   `agent_brain_id: <repo-room-id-from-step-2>`, and `org_id: <ORG_ID>` when
+   step 2 has one.
 
    The stable `name` is load-bearing: saving it again VERSIONS the record,
    so a later babysit of the same PR supersedes the earlier one instead of
@@ -110,22 +113,25 @@ step's whole value, and it is a page of text.
    `save_artifact` failing with the brain not found usually means the
    WRONG-ORG lookup, not a stale id — CLI/MCP calls resolve the caller's
    default org, which follows the org last selected in the MemHub app, and
-   a repo room in another org is invisible from it. Re-resolve the room
-   ONCE (re-run "Every pass" step 2); still failing → report the error in
+   a repo room in another org is invisible from it. Recover ONCE: read the
+   org from `room_map.py show --json` (`org_id`) and retry `save_artifact`
+   with it. No `org_id` cached → `list_orgs`, then re-run the step-2 lookup
+   with `list_agent_brains(org_id=…)` in each of the OTHER orgs (a plain
+   re-run searches the default org again and finds nothing new); on a match,
+   re-cache it with `--org-id` and retry. Still failing → report the error in
    step 4 rather than retrying.
 3. **Never import the transcript.** Per-turn capture already ships this
-   session, as it happens, into the room its `cwd` resolves to. Importing it
-   again would re-upload megabytes for the watermark to discard, and into a
-   different room it would extract the same session's facts and episodes a
-   second time.
+   session as it happens — the transcript to the user's personal Sessions
+   view (a session is never brain content), its task episodes to the room its
+   `cwd` resolves to. Importing it again re-uploads megabytes for the
+   watermark to discard.
 
    The one gap: capture routes by the session's `cwd`, this babysit routes by
    the PR's repo, so if you babysat a PR in repo B from a checkout of repo A,
-   B's room gets the artifact but not the reasoning trail. Do not paper over
-   it with an import — say so in the report (step 4), naming the room the
-   session DID land in, and let the user run `/memhub:import-session` if they
-   want it in B as well. That skill is the only one that imports, and it
-   imports under the session's own id.
+   B's room gets the artifact but not the reasoning trail. An import cannot
+   fix that — the first room a session feeds keeps its memory — so do not
+   try. Say so in the report (step 4), naming the room the session's memory
+   DID land in.
 4. Add one short top-level outcome note IN THE REPORT to the user: PR url
    and title, branch, findings per bot with accepted/rejected counts, and
    any repo-specific gotcha or bot false-positive tendency observed.

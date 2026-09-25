@@ -83,8 +83,8 @@ Silence about the claim failing is a safety bug wearing the costume of quiet.
     2. Exactly one `bound` book with `scope: all_org` among several → file
        there.
     3. **Otherwise — several `all_org` books bound, or no book bound at all —
-       the repo's own book**, named `Rulebook: <repo>` exactly as `scope_repos`
-       spells the repo. Use the bound one with that name if it exists; if none
+       the repo's own book**, named `Rulebook: <repo>` exactly as the stamp's
+       `state.repo` spells the repo. Use the bound one with that name if it exists; if none
        does, `create_rulebook` it with `scope: "explicit"`.
 
     Rule 3 replaced "anything else → file nothing". That clause read as
@@ -128,12 +128,43 @@ Silence about the claim failing is a safety bug wearing the costume of quiet.
     is already in the book — a retry after a lost response, or identical
     content re-filed. The moment ended WITH a rule, so tell the person as you
     would for any filing.
+  - **A twin refusal is also already filed.** A `session_draft` whose
+    statement is near-identical to a rule already `proposed` in the book is
+    refused with `A proposed rule in this rulebook already says this: "<title>"
+    (twin_rule_id <id>)…`. The lesson is in the review queue under that id —
+    someone's earlier turn filed it. Do not re-file, do not supersede it, say
+    nothing to the person, and stop. (Detached author lane: end with
+    `HARNESS-RESULT: none already proposed`.)
+  - **A draft refused as `stamped by plugin hook <v>; drafts need <min> or
+    newer`** cannot be filed from this stamp — the hook that wrote it predates
+    the draft contract. Treat it as cannot-file: file nothing, say nothing
+    (detached lane: `HARNESS-RESULT: failed hook too old`).
 
-- **`scope_repos` is the harness line's, verbatim** — it is already narrowed by
-  `proposal_scope`. When the line says the turn worked in several repositories,
-  cut it further to the ones the lesson is about. Do NOT rebuild it from
-  `state.touched_repos`: that re-broadens it to repos the lesson has nothing to
-  do with, which then fire on unrelated work.
+- **`scope_repos` is yours to choose, from what the lesson is about.** The
+  harness line says where the turn WORKED; that is evidence, not the scope.
+  Scoping to the session's repo is what bound a `$?`-after-a-pipe lesson to
+  MemHub-Backend only, and scoped rules anchored on `harness_stop.py` constants
+  to a repo where those names do not exist, so they could never fire. Choose:
+  - **`[]` (every repo)** when the rule names nothing that lives in one repo —
+    shell, git, the sandbox, a CLI's flags, how to read a tool's error.
+  - **`["<repo>"]`** when the rule names a file, symbol, config key, table or
+    command that lives in that repo. It may be a repo the turn never touched —
+    a lesson learned in MemHub-Backend about the plugin belongs to the plugin's
+    repo.
+  - **Several** only when each one holds what the rule names. Never widen to
+    `state.touched_repos` just because the turn visited them: those then fire
+    on unrelated work.
+
+  **Prove a repo scope before filing.** For each repo you name, find its
+  checkout (`git remote get-url origin` basename, the name the hook matches)
+  and grep it for the rule's anchors or the paths its trigger names. If none of
+  them is there, the rule can never fire in that repo — re-scope it, and if no
+  repo holds them, file nothing. No checkout of that repo on this machine →
+  file it anyway and say the scope was not checked in the report.
+
+  **Which book (Step 0 rule 3) is still the stamp's repo** (`state.repo`), even
+  when you chose `[]` — a scope says where the rule fires, the book says whose
+  review queue it lands in.
 - **`source_ref` is passed EXACTLY as the harness line gives it.** The generic
   steps append `|applies N/M|precision P` to a `source_ref`; on this path they
   do not. That value is half of the server's `(rulebook, source_ref, title)`
@@ -167,10 +198,12 @@ me?) and `is_admin`. Then:
 - Omitted, several books → **ask** with AskUserQuestion, one option per book
   labelled with its name and who it binds ("org-wide" / "N members"). Do not
   guess: filing into the wrong book binds the wrong people. (This mirrors the
-  server's own `TOOL_MANY_RULEBOOKS` — it refuses to guess too.)
-- **No books at all** (an empty list, or `TOOL_NO_RULEBOOK` from a write) →
+  server, which refuses to guess too: `You can see more than one rulebook …`.)
+- **No books at all** (an empty list, or a write refused with `You don't have
+  a rulebook yet`) →
   nothing is auto-provisioned. Offer to create one: propose
-  `create_rulebook(name: "<repo> rules", scope: "explicit")` — a book that
+  `create_rulebook(name: "Rulebook: <repo>", scope: "explicit")` — the same
+  name the harness path gives a repo's own book, so both find it — a book that
   binds only the user, which is the only shape a non-admin may create — and
   ask. On yes, create it and file into it. On no, stop and report; there is
   nowhere to put the rule.
@@ -181,12 +214,14 @@ user in `member_user_ids`. Both are org-admin acts (`rulebook_scope_needs_admin`
 governance decision this skill does not make. Membership changes are not MCP
 tools at all — they are done in MemHub.
 
-**When the create is refused.** `create_rulebook` validates the creator as an
-active org member, so it can answer `rulebook_member_not_in_org` naming *the
-user themselves* — even though you named nobody. That is not a bug to retry:
-their org membership is inactive, and no rulebook can be created until someone
-fixes it in MemHub. Say that plainly and stop. (`rulebook_name_too_long` means
-the name exceeded 200 characters — shorten it and retry once.)
+**When the create is refused.** Only the English sentence reaches you — the
+tool forwards the message, never a reason code — so match on the wording.
+`create_rulebook` validates the creator as an active org member, so it can
+answer `<name> isn't in this organisation, so they can't be put in a rulebook`
+naming *the user themselves* — even though you named nobody. That is not a bug
+to retry: their org membership is inactive, and no rulebook can be created
+until someone fixes it in MemHub. Say that plainly and stop. (`That rulebook
+name is too long — keep it under N characters` — shorten it and retry once.)
 
 **Older backend:** if `list_rulebooks` / `create_rulebook` are not present, or
 `create_rule` rejects `rulebook_id`, the server predates rulebook containers.
@@ -231,7 +266,11 @@ Call the memhub `list_rules` tool with **no `rulebook_id`** and
 user can see in every state, and read the new rule against every title and
 statement. Same subject → plan to replace the existing rule
 instead of adding a twin: note its `rule_id` for `supersedes_rule_id` in step 5.
-The server does no title matching — you decide what a rule replaces. Keep the
+Without a `source_ref` the server does no title matching — you decide what a
+rule replaces. With one, its re-import key is (book, `source_ref` with its
+`@sha` and `#…` stripped, normalised title): re-filing under the same document and title
+lands as a supersede of that rule (or `unchanged` if nothing differs), so a
+`source_ref` is not free text to vary between attempts. Keep the
 `list_rules` reply: step 5 runs the deterministic check over it.
 
 `include_retired=True` matters: a rule someone already dismissed is exactly the
@@ -261,11 +300,12 @@ them decide — step 5 flags these as `cross_book`.
 
 Plus on every rule: `title` (short, imperative; the server allows up to 200
 chars but aim for under 60), `statement` (the advisory line and the nuance a
-reviewer needs: sanctioned forms, exemptions), `scope_repos` (`["<repo>"]` or
+reviewer needs: sanctioned forms, exemptions — at most 400 characters, or the
+server refuses it), `scope_repos` (`["<repo>"]` or
 `[]` for all — `<repo>` is the repo's name, `basename $(git remote get-url
 origin)` without `.git`, NEVER the directory you are in: in a worktree that
-is the branch name, and the hook matches `scope_repos` by exact string, so
-the rule would bind nobody), `scope_paths` / `scope_exclude_paths` (globs — they constrain
+is the branch name, and the hook matches `scope_repos` against the repo name
+(case-insensitively, but otherwise whole), so the rule would bind nobody), `scope_paths` / `scope_exclude_paths` (globs — they constrain
 edit rules by file path; a Bash call carries no path, so an include-scoped
 rule never fires on one).
 
@@ -281,7 +321,9 @@ make the message say what is actually missing.
 shown and the call goes through. Pass `mode: "gate"` and the rule DENIES a
 matching command before it runs — the person can still run that exact command
 by prefixing `RULEBOOK_OVERRIDE='<why>'`, and their reason is recorded with the
-fire. Advice has the same channel, one call later: an agent that reads an
+fire. A blocked edit has no command to prefix: it goes through with a
+`rulebook-override[<rule>]: <why>` marker in the content being written, naming
+the rule (an unnamed marker excuses nothing), and the marker stays in the diff. Advice has the same channel, one call later: an agent that reads an
 advisory and goes on without it says why on its next command as
 `RULEBOOK_OVERRIDE='[<label>] <why>'`, naming the rule, and the reason lands on
 that rule's fire. A rule with a `converted_rx` also records "not followed" on
@@ -464,7 +506,10 @@ exits non-zero, and show the table to the user.** What each line means:
 - **FIRES** — your `--fires` cases. At least one is required; without it
   nothing has shown the rule can trigger.
 - **SILENT** — your `--silent` cases, plus two generated for you: `grep` and
-  `python -c` quoting the rule's own trigger. Add one more yourself: the
+  `python -c` quoting the rule's own trigger. They are generated only when
+  `command_rx` reduces to a plain literal; a structural pattern (groups,
+  alternation, classes) gets none, and the verifier says so — then write those
+  two yourself. Add one more yourself: the
   trigger inside a quoted argument (`--allowedTools 'Bash(git push:*)'`,
   `echo "…"`, a commit message) — measured live, this mention-in-args form
   is the largest false-fire class after `grep`. Searching for a rule's trigger
@@ -580,7 +625,7 @@ under the same posture a real session has. Normalise the appended copy:
   production;
 - `status`: `active`;
 - **`mode`: the mode the rule will ship with.** A gate candidate stays a gate.
-  Earlier versions of this step forced `advise` here, because a gate armed in
+  Earlier versions of this step forced advise mode here, because a gate armed in
   the SHARED book could refuse the person's own next command — but the claim
   above is what removes that hazard, and forcing advise would throw away the
   one thing a live test can show that `rulebook_verify`'s table cannot: what
@@ -593,16 +638,14 @@ under the same posture a real session has. Normalise the appended copy:
   your claim and reaches nobody at all outside it. Report what the sub-agent
   actually hit — a refusal is a result, not a failure.
 
-**Defeat the background re-fetch.** `maybe_refresh` runs on every PreToolUse
-and will overwrite the book once the cache is an hour old — silently deleting
-the candidate mid-test, which reads exactly like "the rule never fired". The
-private base does not change this: the fetch lane writes into whichever base
-the call resolved to. You cannot set `MEMHUB_RULEBOOK_FETCH=0` for hooks that
-are already running, so defeat it on its own terms, in the private book:
-
-- write `fetched_at` as **now**, which makes the age check return early;
-- also write `{"at": "<now>"}` to `<private book>.refresh`, which blocks a
-  retry even if the age check is ever changed.
+**The background re-fetch cannot touch the private book.** `maybe_refresh`
+runs on every PreToolUse and spawns a refresh once the book is a minute old
+(`REFRESH_AFTER_S`). Under your claim it reads the private book's
+`fetched_at` and stamps `<private book>.refresh`, but the detached child it
+spawns fetches with no cwd and so refreshes the **shared** book — never the
+private one. The candidate cannot be deleted mid-test by a re-fetch. Still
+write `fetched_at` as **now**: it keeps the sub-agent's first minute from
+spawning a pointless fetch of the shared book.
 
 **No cached book for this repo** (nothing fetched yet, or no rulebook binds the
 user here) → `cp -R` copies nothing and you simply write the private book
@@ -624,9 +667,12 @@ a test nothing exercised. A private ledger removes the problem rather than
 narrowing the window around it.
 
 **4b.5 Release the claim — always, immediately after the sub-agent returns**,
-success or failure:
+success or failure. Keep the evidence first — the evaluation below reads it:
 
 ```bash
+cp "$PRIV/ledger/fires.jsonl" "$SCRATCH/fires.jsonl" 2>/dev/null || : > "$SCRATCH/fires.jsonl"
+cp "$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>" "<scratch worktree>")" \
+   "$SCRATCH/book.json"                 # is the candidate still there?
 rm -f "$BASE/pretest-redirect.json"     # release first: the claim is what steers
 rm -rf "$PRIV"                          # then the private base
 ```
@@ -655,7 +701,7 @@ up, just overwrite it: one claim at a time, and the newest one owns the file.
 
 **Evaluate: the ledger first (fact), the transcript second (judgment).**
 
-Read `$PRIV/ledger/fires.jsonl` — all of it — and keep the rows with
+Read `$SCRATCH/fires.jsonl` (the private ledger, kept in §4b.5) — all of it — and keep the rows with
 `rule_id == "candidate-<hex>"` **that also belong to the sub-agent**: the
 row's `session_id` must be this session's, and its `agent_id`
 must be the sub-agent's rather than the parent's.
@@ -676,8 +722,8 @@ and proves nothing. Report per row: `hook_phase` (pre/post),
 | Ledger result | Meaning | What you do |
 |---|---|---|
 | ≥1 candidate row | fired | continue to the transcript check |
-| 0 rows, candidate still in the book at restore time | did not fire | **do not file.** Report it as a real failure: the pattern passes the verifier's synthetic cases but not a real session. Offer to revise the pattern and re-run. First rule out §4b.2's branch trap — a `given.repo.branch_rx` that the scratch worktree's branch cannot satisfy fails the same way a bad pattern does |
-| 0 rows, candidate **gone** from the book | inconclusive — the book was re-fetched mid-test | re-run once; if it recurs, report the environment problem and do not file |
+| 0 rows, candidate still in `$SCRATCH/book.json` | did not fire | **do not file.** Report it as a real failure: the pattern passes the verifier's synthetic cases but not a real session. Offer to revise the pattern and re-run. First rule out §4b.2's branch trap — a `given.repo.branch_rx` that the scratch worktree's branch cannot satisfy fails the same way a bad pattern does |
+| 0 rows, candidate **gone** from `$SCRATCH/book.json` | inconclusive — something rewrote the private book mid-test | re-run once; if it recurs, report the environment problem and do not file |
 
 Then read the sub-agent's returned output (an Agent-tool sub-agent's turns are
 sidechain records of THIS session, not a separate session file, so `capture.py`
@@ -693,15 +739,14 @@ State these as **observations with the evidence quoted**, and be explicit that
 they are a judgment where the ledger result is a fact.
 
 **Report and clean up.** Name: the fake feature used, the worktree path (now
-removed), the ledger rows, the transcript judgment, and — always — the two
-caveats: *the candidate was armed in advise mode, so blocking was not
-exercised*, and *this proves the rule fires, not that it is worth firing*. Add a
-third when it applies: *the branch predicate was not exercised* (§4b.2).
+removed), the ledger rows, the transcript judgment, and — always — the caveat
+*this proves the rule fires, not that it is worth firing*. Add *the branch
+predicate was not exercised* when it applies (§4b.2).
 
-Cleanup is mandatory and happens even on failure: restore the book, `git
-worktree remove --force` the scratch worktree, delete the branch `-b` created
-(`git branch -D rulebook-fwd-<hex>`), `rm -rf` the temp dir, delete the backup
-files.
+Cleanup is mandatory and happens even on failure: release the claim (§4b.5, if
+not already), `git worktree remove --force` the scratch worktree, delete the
+branch `-b` created (`git branch -D rulebook-fwd-<hex>`), `rm -rf` the temp
+dir. There is no book to restore — the shared one was never written.
 
 **4b.6 The one thing that is not a failure.** If the step cannot be **run at
 all** — the repo is not a git checkout, `git worktree add` fails (a bare repo,
@@ -715,7 +760,7 @@ test, and it blocks. Cleanup still runs.
 ### 5. Conflict check, confirm, then file
 
 Before showing the rule, check it against the book — the server files a
-colliding title or matcher as a silent second draft unless you name what it
+colliding title or matcher as a silent second proposed rule unless you name what it
 replaces, so this is the only place it gets caught. Call `list_rules` (every
 status, no `rulebook_id`), save the reply, write the candidate `create_rule`
 body to a file, and run:
@@ -738,7 +783,7 @@ each hit). `duplicate` (or a `same_title` / `same_matcher` hit you judge to
 be the same rule) → file with `supersedes_rule_id: <that rule's rule_id>`;
 the server files it as `proposed` and activation replaces exactly that rule.
 `same_matcher` against an **active** rule that is NOT the same rule → do not
-file; tell the user. `contradicts` → file as a draft WITHOUT
+file; tell the user. `contradicts` → file it (it lands `proposed`) WITHOUT
 `supersedes_rule_id`, but name the rule it fights in the report; a reviewer
 retires one side before activating the other.
 
@@ -770,9 +815,20 @@ rule, `mode: "gate"` if the user asked for a rule that stops the command, and
 
 - `unchanged: true` → identical content is already in the book (a retried
   call with the same `source_ref` path and title); nothing written.
+  Only the `@sha` and `#…` tail is ignored in that match. A `source_ref` with
+  no `#` keeps its `|applies N/M` suffix in the key, so re-filing the same rule
+  with fresher counts (`user correction, session <id>|applies 1/40` after
+  `…|applies 0/39`) is NOT unchanged: it lands as a second `proposed` row with
+  no `supersedes_rule_id` (verified on staging). On a retry, reuse the first
+  filing's `source_ref` byte for byte, or name its `rule_id` in
+  `supersedes_rule_id` — the step-5 `same_title` hit gives it to you.
 - `status: "proposed"` + `supersedes_rule_id` → filed as a replacement for
   the rule you named; it retires that rule when a reviewer activates it.
-- `status: "draft"` → new.
+- `status: "proposed"` with no `supersedes_rule_id` → new, awaiting review.
+
+The server never answers `draft` — a call without `activate` lands
+`proposed`. Relay the reply's `message` to the user: it is the server's own
+sentence for what just happened.
 
 **New rules always land for review — never pass `activate`.** That holds even
 on a book that binds only the user, where the server would let them arm their
@@ -790,15 +846,17 @@ block.
 
 If the rule is better as a plain suggestion than a check — the user doesn't
 want to write a detector — file it the same way with
-`source="nomination"` and no engine block; it lands as `proposed` for a
-reviewer.
+`source="nomination"`, `delivery: "session_context"` and no engine block (or
+`anchor_recall` with its `anchors`); it lands as `proposed` for a reviewer.
+Not `agent_hook`: with no `matcher` or `ordering` the server refuses it as
+`This rule says nothing about how it is checked`.
 
 ### 6. Report
 
 Tell the user: which **rulebook** it went into and who that book binds
 ("org-wide" or "N members" — that is the set of people this rule will reach);
-that it is filed as a draft — or as `proposed`, naming the rule it replaces by
-title; and what happens next: the rule's owner or an admin activates it in
+that it is filed `proposed` and awaiting review — naming the rule it
+replaces by title when it supersedes one; and what happens next: the rule's owner or an admin activates it in
 MemHub (a `proposed` rule retires the one it replaces), every **member of that
 rulebook** picks it up on their next session, and its firing history accrues in
 MemHub as the evidence that later decides whether to keep, narrow, or retire
@@ -807,5 +865,6 @@ it. Name any `cross_book` collision here too, under **Conflicts to resolve**.
 If the rule was filed to stop the command, say so in the same breath as who it
 reaches: once it is turned on, that command stops for everyone the book binds,
 and each of them can still run it by putting `RULEBOOK_OVERRIDE='<why>'` in
-front. Do not report a blocking rule as already blocking — it is waiting for
+front (an edit gate takes a `rulebook-override[<rule>]: <why>` marker in the
+content instead). Do not report a blocking rule as already blocking — it is waiting for
 the same review as any other.

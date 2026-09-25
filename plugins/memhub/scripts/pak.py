@@ -180,7 +180,19 @@ def expires_in_s(record: dict | None) -> float | None:
 
 
 class PakError(RuntimeError):
-    """A key operation failed, with a message fit to show a person."""
+    """A key operation failed, with a message fit to show a person.
+
+    ``status`` and ``server_msg`` carry the HTTP status and the server's own
+    English ``msg`` when the failure came back from the API, so a caller can
+    recognise a specific refusal (an account with no provisioned workspace)
+    without re-parsing the truncated display text.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None,
+                 server_msg: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.server_msg = server_msg
 
 
 def _call(base: str, bearer: str, method: str, path: str,
@@ -194,8 +206,15 @@ def _call(base: str, bearer: str, method: str, path: str,
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
             payload = json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
-        detail = (e.read() or b"").decode(errors="replace")[:200]
-        raise PakError(f"{method} {path} failed ({e.code}): {detail}") from e
+        body = (e.read() or b"").decode(errors="replace")
+        try:
+            server_msg = json.loads(body).get("msg")
+        except (ValueError, AttributeError):
+            server_msg = None
+        raise PakError(f"{method} {path} failed ({e.code}): {body[:200]}",
+                       status=e.code,
+                       server_msg=server_msg if isinstance(server_msg, str) else None,
+                       ) from e
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise PakError(f"{method} {path} failed: {e}") from e
     # REST envelope: {"code": 0, "msg": "ok", "data": …}. A non-zero code is a
@@ -241,7 +260,23 @@ def mint(base: str, bearer: str, label: str,
 
 
 def _is_live(key: dict) -> bool:
-    return not key.get("revoked_at")
+    """Whether the server counts this key against the cap.
+
+    The server's cap counts keys that are neither revoked NOR expired, but its
+    list returns expired ones too — so treating an expired key as live would
+    refuse a mint the server would allow ("you already hold 5 live keys") for
+    a user whose old keys simply lapsed. It also means an expired orphan under
+    our label is left alone rather than revoked: it holds no slot. An
+    unreadable stamp counts as live, the conservative reading.
+    """
+    if key.get("revoked_at"):
+        return False
+    raw = key.get("expires_at")
+    if isinstance(raw, str) and raw:
+        epoch = parse_utc(raw)
+        if epoch is not None and epoch <= time.time():
+            return False
+    return True
 
 
 def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, str]:
@@ -277,10 +312,12 @@ def ensure(mcp_url: str, bearer: str, label: str | None = None) -> tuple[dict, s
     # leaves the existing key working, which is the strictly better failure.
     others = [k for k in keys if _is_live(k) and k.get("label") != label]
     if len(others) >= MAX_KEYS:
+        from _memhub_auth import skill_command  # noqa: PLC0415 — beside this file
+
         raise PakError(
             f"you already hold {len(others)} live access keys, the maximum is "
             f"{MAX_KEYS}. Revoke one you no longer use, then run "
-            f"/memhub:login again. Existing labels: "
+            f"{skill_command('login')} again. Existing labels: "
             f"{', '.join(sorted(str(k.get('label')) for k in others))}")
 
     for orphan in orphans:

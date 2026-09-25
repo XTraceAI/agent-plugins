@@ -1,42 +1,82 @@
 ---
-description: Use when the user wants to hand off the current session/work to a teammate via MemHub (e.g. "hand this off to Alice", "handoff this session to Bob", "share my context with Carol so she can pick this up", "pass this work to X"). Creates a shareable agent brain holding a handoff brief, and shares it read-only with the teammate along with the repo room where per-turn capture already extracted the session.
-argument-hint: <teammate> [title...]
-allowed-tools: mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, Bash
+description: Use when the user wants to hand off the current session/work to a teammate via MemHub (e.g. "hand this off to Alice", "handoff this session to Bob", "share my context with Carol so she can pick this up", "pass this work to X", "hand this to Sebastian and Tristan"). Uploads a handoff brief as an artifact into the standing handoff channel — one shared agent brain per set of people, reused for every handoff between them. A one-off brain only when the user asks for one.
+argument-hint: <teammate>[, <teammate>...] [title...] [--new]
+allowed-tools: mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_agent_brain_access, mcp__plugin_memhub-staging_memhub__list_agent_brain_access, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash
 ---
 
-**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
-Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
-this plugin's root — the ancestor directory of this skill file that contains
-`.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
+A handoff is one artifact: a brief you write from this conversation, uploaded
+into the **handoff channel** for exactly the people receiving it. The
+teammate's agent finds it by searching that brain. Nothing else moves — never
+import or share the session (a session is never brain content), so the brief
+must stand on its own.
 
-Hand the current session off to a teammate: write a concise handoff brief into
-a shareable agent brain and share it read-only, alongside the repo room where
-per-turn capture has already extracted this session. The teammate's agent picks
-it up by searching — no transcript pasting, no re-import, no shoulder-tap
-walkthrough.
+**One channel per set of people.** Felix↔Sebastian is one brain;
+Felix↔Sebastian↔Tristan is another. Every handoff between the same people
+lands in the same brain as its own brief, so the channel keeps the running
+history between them instead of a pile of one-shot brains. The channel is
+shared as **contributor**, so either side hands work back through it.
 
 Arguments: `$ARGUMENTS`
-- First token(s) = the teammate, by name or email (required). If missing, ask
-  who to hand off to.
-- Remaining text = an optional handoff title. If omitted, derive a short one
-  from what this session worked on (e.g. "Flush hook OAuth migration").
+- Leading name(s) = the teammate(s), by name or email (required), separated by
+  commas, `+` or "and". Missing → ask who. Can't tell where the names end and
+  the title begins → ask.
+- Remaining text = an optional title. Omitted → derive a short one from what
+  this session worked on (e.g. "Flush hook OAuth migration").
+- `--new`, or the user asking for a separate / dedicated brain → skip the
+  channel and make a one-off brain (step 2b).
 
-Do exactly this:
+Do exactly this. Every call below runs in ONE org: omit `org_id` for a
+single-org account; in several orgs (`list_orgs`), use the one the teammates
+are in (ask if it's unclear) and pass that `org_id` to every call — a brain
+and its people live in exactly one org.
 
-1. Resolve the teammate: call `list_teammates` and match name/email
-   case-insensitively. If nobody matches or several do, show the candidates
-   and ask — never guess between two people.
+1. **Resolve the teammates.** `list_teammates` (it never lists you), match
+   each name/email case-insensitively. No match or several → show the
+   candidates and ask; never guess between two people. Their `user_id`s are
+   the set **T**.
 
-2. Create the handoff container: `create_agent_brain` with
-   `name: "Handoff: <title>"` and a one-line `description` naming who it's
-   from, who it's for, and the topic. Omit `workspace_id` (your own workspace
-   — as creator you keep the contributor access that sharing requires).
+2. **Find or create the brain.**
 
-3. Write the handoff brief and save it with `save_artifact` into that agent
-   brain (`agent_brain_id` from step 2, `artifact_type: "document"`,
-   `tags: ["handoff"]`, `name: "Handoff brief: <title>"`). Compose it from
-   the current conversation — this is the one document the teammate reads
-   first, so keep it tight:
+   a. *Find the channel* (skip with `--new`). `list_agent_brains`; the
+      candidates are brains named `Handoffs: …`. For each, take the grantee
+      ids from `list_agent_brain_access` — active org members only, and never
+      the creator, who holds no grant. Drop yourself from them if present
+      (the grantee id not in `list_teammates`); call the rest **O**. The
+      brain's other members are **O** plus its creator, whom no tool names,
+      so match like this:
+      - `shared_by` null → you created it: match when **O** = **T**.
+      - `shared_by` set → someone else created it (`shared_by` is who
+        granted *you* access — the creator or a contributor who re-shared,
+        not necessarily the creator). Match when **O** ⊆ **T** and exactly
+        one person in **T** is not in **O** — that one is the creator. If
+        `shared_by` is a teammate who is not in **O**, they had access
+        without a grant, so they are the creator and must be that one
+        person.
+      Decide on members, not on the name after the prefix — the other person
+      may have created it under their own spelling. Several match → use the
+      oldest and mention the others. A match where you are only a `viewer`
+      can't take the brief — tell the user to ask its creator for
+      contributor, or use `--new`.
+
+   b. *Create* (no channel found, or `--new`). `create_agent_brain`, omitting
+      `workspace_id` (your own workspace; as creator you can share it):
+      - channel → `name: "Handoffs: <you> ↔ <teammate> [↔ <teammate>…]"`,
+        first names, yours from `git config user.name` (a label only), and
+        `description: "Standing handoff channel between <full names>: one
+        brief per handed-off task."`
+      - `--new` → `name: "Handoff: <title>"` and a one-line description
+        naming who it's from, who it's for, and the topic.
+
+      Then share it with everyone in **T** via `share_agent_brain`:
+      `"contributor"` for a channel, `"viewer"` for a `--new` brain. A reused
+      channel needs no sharing — matching it proved they already have it.
+
+3. **Upload the brief** with `save_artifact` into that brain:
+   `name: "Handoff brief: <title>"`, `artifact_type: "document"`,
+   `tags: ["handoff"]`. A title already in the channel VERSIONS that brief —
+   right for a follow-up on the same work, wrong for anything else, so make
+   the title specific. First line: `From <you> to <teammate(s)>, <YYYY-MM-DD>`
+   (plus `, repo <org>/<name>` in a repo). Then, tight:
    - **Goal** — what the work is trying to achieve and for whom.
    - **Current state** — what's done, what's in flight, what's untouched.
    - **Key decisions** — choices made and the why behind each.
@@ -45,41 +85,13 @@ Do exactly this:
    - **Pointers** — repos, branches, PRs, files, dashboards (absolute
      paths/URLs; the reader is on a different machine).
 
-   Composing this content yourself is the point here — this is NOT the
-   file-upload case the save-artifact skill guards against.
+   You compose this content — it is not the file-upload case the
+   save-artifact skill guards against.
 
-4. Share it: `share_agent_brain` with the agent brain id and
-   `teammate_user_id` = the teammate's `user_id` from `list_teammates`.
-   `permission` defaults to `viewer` — read-only, all a handoff needs.
+4. **Report back:** the brain's name and whether it was reused or created,
+   who it is shared with and at what level, and a line the user can send
+   verbatim:
 
-5. Give the teammate the session's memory — do NOT import the session.
-   Per-turn capture has been shipping this session into the repo's room since
-   it started, and the server has already extracted it. Re-importing would
-   re-upload the transcript and, into a second brain, extract every fact and
-   episode a second time — the same session's memory in two places, competing
-   in retrieval.
+   > Ask your agent: *search the "<brain name>" agent brain in memhub for "Handoff brief: <title>"*
 
-   ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
-   ```
-
-   - A room is cached → `share_agent_brain` that room with the teammate too,
-     read-only. That is where the session's facts, episodes and gist already
-     live; the handoff brain carries the brief that points into it.
-   - No room cached (`/memhub:onboard` never run here), or the session ran
-     before capture was working → say so plainly and tell the user to run
-     `/memhub:import-session`. That is the ONE skill that backfills a session,
-     and it imports under the session's own id so nothing is duplicated.
-
-6. Report back: the agent brain name, who it's shared with (brief brain and
-   repo room), and the receiving line the user can send their teammate
-   verbatim — e.g.:
-
-   > Ask your agent: *search the "Handoff: <title>" agent brain in memhub*
-
-   Both are readable immediately — the brief because you just wrote it, the
-   session's memory because capture extracted it as the session ran.
-
-If `share_agent_brain` fails on permissions, you don't have contributor
-access to the agent brain — this happens when reusing someone else's agent
-brain instead of creating one in step 2; create your own and retry.
+   The brief is readable the moment `save_artifact` returns.

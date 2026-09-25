@@ -33,6 +33,16 @@
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" pre; fi"
           }
         ]
+      },
+      {
+        "matcher": "^mcp__.+__add_memory$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/add_memory_gate.py\"; fi"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -204,7 +214,7 @@
           {
             "type": "command",
             "timeout": 10,
-            "command": "IN=$(cat); case \"${MEMHUB_HARNESS_EXTRACT:-}\" in 1|[Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) ;; *) exit 0 ;; esac; if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore Stop; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py\" stop; fi"
+            "command": "IN=$(cat); HX=${MEMHUB_HARNESS_EXTRACT:-}; HX=${HX#\"${HX%%[! \t\n\u000b\f\r\u001c\u001d\u001e\u001f]*}\"}; HX=${HX%\"${HX##*[! \t\n\u000b\f\r\u001c\u001d\u001e\u001f]}\"}; case \"$HX\" in 1|[Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) ;; *) exit 0 ;; esac; if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore Stop; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py\" stop; fi"
           }
         ]
       }

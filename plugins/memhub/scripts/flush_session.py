@@ -52,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 import pr_provenance  # noqa: E402
-from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer  # noqa: E402
+from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer, skill_command  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
 from session_title import (  # noqa: E402
@@ -336,7 +336,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             remaining = sum(len(p) for p in payloads[index - 1:])
             _log(f"deadline reached after {index - 1}/{len(payloads)} "
                  f"slices; {remaining} record(s) not sent. Re-run "
-                 f"/memhub:import-session --session {session_id} to "
+                 f"{skill_command('import-session')} --session {session_id} to "
                  "finish (it resumes from the server's watermark).")
             return
         arguments = {
@@ -449,7 +449,7 @@ async def _send(session, arguments, room, title, namespace,
             _breadcrumb(args.get("conversation_id"), "unrecognized_response", str(e))
         except mcp_http.McpError as e:
             if e.status == 401:
-                _log(f"{label}credential rejected (401); run /memhub:login")
+                _log(f"{label}credential rejected (401); run {skill_command('login')}")
                 _breadcrumb(args.get("conversation_id"), "auth", str(e))
             elif e.status == 403:
                 _log(f"{label}credential lacks permission (403); check its "
@@ -608,6 +608,8 @@ def main() -> int:
         if not session_id or not transcript_path or not Path(transcript_path).exists():
             _log("missing session_id/transcript_path; skipping")
             return 0
+        if is_harness_child(session_id=str(session_id)):
+            return 0  # on the children list, whatever the environment says
         # SessionEnd carries no tool_input; it reports its reason instead.
         cmd = str((hook_input.get("tool_input") or {}).get("command", ""))[:120]
         reason = str(hook_input.get("reason") or "")[:40]
@@ -641,11 +643,11 @@ def main() -> int:
             # Slices already sent are durable and deduped, so this is a
             # partial capture rather than a lost one — say which it is.
             _log(f"timed out after {timeout_s:.0f}s; slices already sent "
-                 "are stored. Re-run /memhub:import-session --session "
+                 f"are stored. Re-run {skill_command('import-session')} --session "
                  f"{session_id} to finish (it resumes from the server's "
                  "watermark).")
         elif _auth_required(e):
-            _log("no cached OAuth token; run /memhub:login "
+            _log(f"no cached OAuth token; run {skill_command('login')} "
                  "(or set MEMHUB_TOKEN) to enable commit flush — skipping")
         else:
             _log(f"skipped ({type(e).__name__}: {e})")

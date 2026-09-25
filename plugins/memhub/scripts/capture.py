@@ -290,6 +290,9 @@ def cmd_import(args) -> int:
         passthrough.append("--no-room")
     if args.namespace is not None:
         passthrough += ["--namespace", args.namespace]
+    # getattr: callers that build the namespace by hand predate the flag.
+    if getattr(args, "org_id", None):
+        passthrough += ["--org-id", args.org_id]
     if args.url:
         passthrough += ["--url", args.url]
 
@@ -419,6 +422,9 @@ def main() -> int:
     ip.add_argument("--namespace", default=None,
                     help="repo scope for captured directives; default resolves "
                          "from the session's cwd via git remote, '' disables")
+    ip.add_argument("--org-id", default=None,
+                    help="org that owns --agent-brain-id; default: the cached "
+                         "room's org, else the connection's default org")
     ip.add_argument("--url", default=None)
     ip.add_argument("--dry-run", action="store_true")
     ip.set_defaults(fn=cmd_import)
