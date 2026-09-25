@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import atomic_write  # noqa: E402 — stdlib-only, sits beside this file
 import pak  # noqa: E402 — stdlib-only, sits beside this file
+from plugin_onboarding import HOSTS, LoginCompletion, active_completion, guide_url
 from pak import PakError  # noqa: E402
 
 # The MCP SDK logs the OAuth flow's exception WITH a traceback before letting it
@@ -60,6 +61,7 @@ from _memhub_auth import (  # noqa: E402
     _access_token_expiry,
     default_url,
     resolve_url_and_auth,
+    skill_command,
     token_cache_path,
 )
 from room_map import env_for_url  # noqa: E402
@@ -129,20 +131,43 @@ def _report_key(url: str, record: dict | None) -> int:
     print(f"credential  : access key '{record.get('label')}' "
           f"({_describe_expiry(record)})")
     print("renewal     : n/a — a key does not refresh; "
-          "/memhub:login mints a new one when this lapses")
+          f"{skill_command('login')} mints a new one when this lapses")
     return 0
 
 
-def _ensure_key(url: str, env: str) -> bool:
+# The server's English refusals for an account that exists in Auth0 but not yet
+# in MemHub (no users row, or no provisioned team workspace). The row is only
+# created when the user first signs in to the web app, so a plugin-only user —
+# or one whose sign-in the web app refused (unverified email, a non-work
+# address) — passes the token check here and then fails on the key API.
+# Matched on wording because that is all the API promises.
+_UNPROVISIONED = ("user not found", "provisioned team workspace")
+
+
+def _is_unprovisioned(exc: PakError) -> bool:
+    msg = (getattr(exc, "server_msg", None) or "").lower()
+    return (getattr(exc, "status", None) in (401, 403)
+            and any(marker in msg for marker in _UNPROVISIONED))
+
+
+def _web_app(url: str) -> str:
+    guide = guide_url(url) or ""
+    return guide.rsplit("/plugin", 1)[0] or "the MemHub web app"
+
+
+def _ensure_key(url: str, env: str) -> str:
     """Mint (or reuse) this machine's access key using the fresh OAuth token.
 
-    Returns whether a key is now in place — which decides whether the OAuth
-    token's own renewal is still worth reporting.
+    Returns ``ok`` when a key is now in place, ``failed`` when the hooks stay
+    on the OAuth token, or ``unprovisioned`` when the account has no MemHub
+    workspace yet — which no credential here can fix.
 
     Best-effort by design. A failure here is NOT a failed login: OAuth just
     verified, so capture works today either way, and turning a successful login
     into an error over an optimisation would be the wrong trade. It is reported
     plainly so the user knows they are still on the short-lived credential.
+    The exception is ``unprovisioned``: every tool call would be refused too,
+    so calling that a login would be false.
     """
     try:
         cached = json.loads(token_cache_path(url).read_text(encoding="utf-8"))
@@ -151,13 +176,20 @@ def _ensure_key(url: str, env: str) -> bool:
             raise PakError("no access token to authorise minting with")
         record, how = pak.ensure(url, bearer)
     except PakError as exc:
+        if _is_unprovisioned(exc):
+            print("access key  : NOT created — this account has no MemHub team "
+                  "workspace yet")
+            print(f"fix         : sign in once to {_web_app(url)} with a verified "
+                  "work email (that creates the account and workspace), then "
+                  f"re-run {skill_command('login')}")
+            return "unprovisioned"
         print(f"access key  : NOT created ({exc})")
         print("              capture will keep using the OAuth token, which "
-              "expires; re-run /memhub:login when it does.")
-        return False
+              f"expires; re-run {skill_command('login')} when it does.")
+        return "failed"
     except Exception as exc:  # noqa: BLE001 — never fail a good login over this
         print(f"access key  : NOT created ({type(exc).__name__}: {exc})")
-        return False
+        return "failed"
 
     verb = {"reused": "reusing", "replaced": "replaced orphaned key",
             "minted": "created"}.get(how, how)
@@ -165,7 +197,7 @@ def _ensure_key(url: str, env: str) -> bool:
           f"({_describe_expiry(record)})")
     print(f"              the {env} hooks now authenticate with this key "
           "instead of the expiring OAuth token.")
-    return True
+    return "ok"
 
 
 async def _run(status_only: bool, force: bool) -> int:
@@ -262,7 +294,7 @@ async def _run(status_only: bool, force: bool) -> int:
         # the one command whose job is telling you which credential you are on.
         if os.environ.get("MEMHUB_TOKEN", "").strip():
             source = "bearer ($MEMHUB_TOKEN)"
-        elif headers:
+        elif headers and headers.get("Authorization"):
             source = "stored access key (mhk_)"
         else:
             source = "browser OAuth (plugin client)"
@@ -275,7 +307,7 @@ async def _run(status_only: bool, force: bool) -> int:
                 # --status only. Says nothing about whether a browser login
                 # WOULD work; it reports that no usable token is cached now.
                 print("status      : NOT LOGGED IN (no usable cached token)")
-                print("fix         : run /memhub:login")
+                print(f"fix         : run {skill_command('login')}")
                 return 1
             leaf = _leaf(exc)
             print(f"status      : FAILED ({type(leaf).__name__}: {leaf})")
@@ -291,7 +323,7 @@ async def _run(status_only: bool, force: bool) -> int:
             print("renewal     : n/a ($MEMHUB_TOKEN is supplied explicitly)")
             return 0
 
-        if headers:
+        if headers and headers.get("Authorization"):
             # A stored access key answered — this login had nothing to do but
             # confirm it still works.
             return _report_key(url, pak.load(url))
@@ -300,14 +332,17 @@ async def _run(status_only: bool, force: bool) -> int:
         # the hooks — which can never open a browser — stop depending on a
         # credential that expires inside a day and needs a refresh they cannot
         # perform from a cold process.
-        if _ensure_key(url, env):
+        minted = _ensure_key(url, env)
+        if minted == "unprovisioned":
+            return 1
+        if minted == "ok":
             # The OAuth token is now a bootstrap artefact, not the credential
             # anything runs on. Reporting its renewal here would describe the
             # wrong thing — and worse, an "issued no refresh token" warning
             # would send the user to fix a tenant setting that no longer has
             # any bearing on whether capture keeps working.
             print("renewal     : not needed — the key is the credential now; "
-                  "/memhub:login mints a fresh one when it lapses")
+                  f"{skill_command('login')} mints a fresh one when it lapses")
             return 0
 
         ok, detail = _renewal_report(url)
@@ -319,10 +354,10 @@ async def _run(status_only: bool, force: bool) -> int:
             print()
             print("WARNING: the authorization server issued no refresh token, so this")
             print("login will stop working when the access token expires, and memory")
-            print("capture will go quiet until someone runs /memhub:login again.")
+            print(f"capture will go quiet until someone runs {skill_command('login')} again.")
             print("To fix it at the source, enable 'Allow Offline Access' on the")
             print(f"{env} API in Auth0 and make sure 'offline_access' appears in the")
-            print("server's advertised scopes_supported, then re-run /memhub:login --force.")
+            print(f"server's advertised scopes_supported, then re-run {skill_command('login')} --force.")
         return 0
     finally:
         _restore()
@@ -399,6 +434,29 @@ def _is_noninteractive(exc: BaseException) -> bool:
     return False
 
 
+async def _run_with_onboarding(status_only: bool, force: bool, host: str | None) -> int:
+    if status_only:
+        return await _run(status_only, force)
+    completion = LoginCompletion(guide_url(default_url(), host))
+    context_token = active_completion.set(completion)
+    result = 1
+    try:
+        result = await _run(status_only, force)
+        return result
+    finally:
+        # _run returns success only AFTER MCP verification, following the SDK's
+        # successful token exchange and atomic storage (or a verified cached key).
+        completion.finish(result == 0)
+        active_completion.reset(context_token)
+        if completion.callback_received:
+            # Flush the redirect/error response before the CLI process exits.
+            await asyncio.to_thread(completion.response_sent.wait, 3)
+        if result == 0 and completion.destination:
+            print(f"next steps  : {completion.destination}")
+        elif result != 0:
+            print("fix         : return to your coding agent and run MemHub login again")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Authenticate this MemHub plugin install.")
@@ -406,11 +464,13 @@ def main() -> int:
                         help="report only; never opens a browser")
     parser.add_argument("--force", action="store_true",
                         help="discard the cached token and log in again")
+    parser.add_argument("--host", choices=HOSTS,
+                        help="coding agent that started login; omitted opens the guide chooser")
     args = parser.parse_args()
     if args.status and args.force:
         parser.error("--status and --force are contradictory: --status must "
                      "never open a browser, and --force exists to open one.")
-    return asyncio.run(_run(args.status, args.force))
+    return asyncio.run(_run_with_onboarding(args.status, args.force, args.host))
 
 
 if __name__ == "__main__":

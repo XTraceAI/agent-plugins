@@ -428,19 +428,27 @@ def _tool_calls(records):
                     yield "", {}, text[:MAX_TEXT_SCAN], is_proof
 
 
-def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) -> dict:
-    """What this session shows: PR files edited, branches seen, PR shas seen."""
-    files: list[str] = []
+def _features(records) -> dict:
+    """Everything a session shows that does NOT depend on which PR is asked
+    about: the paths it edited, the branches it named, and the sha-shaped
+    tokens printed by calls that made commits — each in first-seen order.
+
+    Walking the tool calls (shlex-splitting every command, pairing results to
+    calls) is the expensive part of scoring. Done per PR, a 25-PR batch was
+    ~18× slower than one PR on a real history — minutes, past a host's
+    command timeout — so it is done once per session and `_match` does only
+    the cheap suffix / prefix comparison per PR.
+    """
+    paths: list[str] = []
+    seen_paths: set[str] = set()
     branches: set[str] = set()
-    hit_shas: list[str] = []
-    sha_prefixes = {s[:7] for s in shas if len(s) >= 7}
+    sha_tokens: list[str] = []
+    seen_tokens: set[str] = set()
 
     def note_path(value):
-        if not isinstance(value, str):
-            return
-        hit = _matches_pr_file(value, pr_files)
-        if hit and hit not in files:
-            files.append(hit)
+        if isinstance(value, str) and value not in seen_paths:
+            seen_paths.add(value)
+            paths.append(value)
 
     for tool, payload, result, result_is_sha_proof in _tool_calls(records):
         if tool in EDIT_TOOLS:
@@ -463,13 +471,32 @@ def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) ->
             for name in _git_branches(command):
                 branches.add(name.strip())
         # A sha the session was SHOWN is not a sha it produced.
-        if result and sha_prefixes and result_is_sha_proof:
+        if result and result_is_sha_proof:
             for match in _SHA_RX.finditer(result):
                 token = match.group(0)
-                if token[:7] in sha_prefixes and token not in hit_shas:
-                    hit_shas.append(token)
+                if token not in seen_tokens:
+                    seen_tokens.add(token)
+                    sha_tokens.append(token)
 
-    return {"files": files, "branches": branches, "shas": hit_shas}
+    return {"paths": paths, "branches": branches, "sha_tokens": sha_tokens}
+
+
+def _match(features: dict, pr_files: dict[str, str], shas: set[str]) -> dict:
+    """One PR's evidence from a session's features."""
+    files: list[str] = []
+    for value in features["paths"]:
+        hit = _matches_pr_file(value, pr_files)
+        if hit and hit not in files:
+            files.append(hit)
+    sha_prefixes = {s[:7] for s in shas if len(s) >= 7}
+    hit_shas = ([t for t in features["sha_tokens"] if t[:7] in sha_prefixes]
+                if sha_prefixes else [])
+    return {"files": files, "branches": set(features["branches"]), "shas": hit_shas}
+
+
+def _evidence(records, pr_files: dict[str, str], branch: str, shas: set[str]) -> dict:
+    """What this session shows: PR files edited, branches seen, PR shas seen."""
+    return _match(_features(records), pr_files, shas)
 
 
 def _session_branches(records) -> set[str]:
@@ -512,55 +539,56 @@ def _created_at_epoch(raw: str | None) -> float | None:
         return None
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--files-from", required=True,
-                    help="a file of the PR's paths, one per line")
-    ap.add_argument("--branch", default="", help="the PR's head ref")
-    ap.add_argument("--base", default=None, help="the PR's base ref")
-    ap.add_argument("--sha", action="append", default=[],
-                    help="a commit oid on the PR (repeatable)")
-    ap.add_argument("--created-at", default=None, help="the PR's createdAt, ISO-8601")
-    ap.add_argument("--repo", default=None,
-                    help="only sessions in this repo (resolved from the git "
-                         "remote, so a worktree counts). Path matching is by "
-                         "SUFFIX, so without this an unrelated project's "
-                         "README.md scores against the PR's.")
-    ap.add_argument("--host", default="all", choices=["all", *readers.READERS])
-    ap.add_argument("--limit", type=int, default=200,
-                    help="how many recent sessions per host to scan")
-    ap.add_argument("--max-candidates", type=int, default=10)
-    ap.add_argument("--json", action="store_true",
-                    help="accepted for symmetry; output is always JSON")
-    args = ap.parse_args()
-
-    try:
-        raw = Path(args.files_from).read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        print(f"ERROR: cannot read {args.files_from}: {exc}", file=sys.stderr)
-        return 2
-    pr_files = {}
-    for line in raw.splitlines():
+def _pr_files(lines) -> dict[str, str]:
+    """Normalised path -> the PR's own spelling, first one wins."""
+    pr_files: dict[str, str] = {}
+    for line in lines:
+        if not isinstance(line, str):
+            continue
         norm = _norm(line)
         if norm:
             pr_files.setdefault(norm, line.strip())
-    if not pr_files:
-        print(f"ERROR: no paths in {args.files_from}", file=sys.stderr)
-        return 2
+    return pr_files
 
-    shas = {s.strip().lower() for s in args.sha if s and s.strip()}
-    created = _created_at_epoch(args.created_at)
-    window_start = (created - WINDOW_DAYS * 86400) if created else None
 
-    hosts = list(readers.READERS) if args.host == "all" else [args.host]
-    rows = []
+def _target(pr_files: dict[str, str], branch: str, base: str | None,
+            shas, created_at: str | None, repo: str | None) -> dict:
+    """One pull request as the scan sees it."""
+    created = _created_at_epoch(created_at)
+    return {"files": pr_files, "branch": branch or "", "base": base,
+            "shas": {s.strip().lower() for s in shas if s and s.strip()},
+            "created": created,
+            "window_start": (created - WINDOW_DAYS * 86400) if created else None,
+            "repo": repo}
+
+
+def _repo_matches(session_repo: str | None, wanted: str | None, fold: bool) -> bool:
+    if not wanted or session_repo is None:
+        return True
+    if fold:
+        return session_repo.casefold() == wanted.casefold()
+    return session_repo == wanted
+
+
+def _scan(targets: list[dict], hosts: list[str], limit: int,
+          fold_repo: bool = False) -> tuple[list[list[dict]], list[str], int]:
+    """Rank local sessions against every target in ONE pass over them.
+
+    Each transcript is parsed once, however many pull requests it is scored
+    against: parsing is the expensive part, and a batch of 25 PRs over 200
+    sessions would otherwise read every transcript 25 times.
+
+    Returns ``(rows per target, over-cap sessions, sessions parsed)``.
+    """
+    rows: list[list[dict]] = [[] for _ in targets]
     skipped: list[str] = []
+    parsed = 0
     for host in hosts:
         reader = readers.reader_for(host)
         if reader is None:
             continue
         try:
-            listed = reader.list_sessions(limit=args.limit)
+            listed = reader.list_sessions(limit=limit)
         except Exception:  # noqa: BLE001 — one unreadable host must not blind the rest
             continue
         own_thread = getattr(reader, "is_own_thread_path", None)
@@ -590,41 +618,299 @@ def main() -> int:
                 continue
             if not records:
                 continue
-            evidence = _evidence(records, pr_files, args.branch, shas)
-            evidence["branches"] |= _session_branches(records)
+            parsed += 1
+            features = _features(records)
+            features["branches"] |= _session_branches(records)
             mtime = session.get("mtime") or 0
-            in_window = bool(created) and window_start <= mtime <= created + 86400
-            score, detail = _score(evidence, args.branch, args.base, in_window)
-            if score <= 0:
-                continue
-            try:
-                cwd = reader.session_cwd(path)
-            except Exception:  # noqa: BLE001
-                cwd = None
-            # A session in ANOTHER repository can score on this one's files,
-            # because `_matches_pr_file` matches by suffix on purpose — an
-            # unrelated project's `README.md` or `src/index.ts` would otherwise
-            # take a slot on the capped list from a real contributor. A cwd
-            # that cannot be resolved is KEPT: dropping it would silently lose
-            # candidates, and the user still approves every link.
-            if args.repo:
-                session_repo = _session_repo(cwd)
-                if session_repo is not None and session_repo != args.repo:
+            resolved = False
+            cwd = session_repo = None
+            for index, target in enumerate(targets):
+                evidence = _match(features, target["files"], target["shas"])
+                created = target["created"]
+                in_window = (bool(created)
+                             and target["window_start"] <= mtime <= created + 86400)
+                score, detail = _score(evidence, target["branch"], target["base"],
+                                       in_window)
+                if score <= 0:
                     continue
-            rows.append({
-                "conversation_id": pr_link.conversation_id_for(host, session["id"]),
-                "session_id": session["id"], "host": host, "cwd": cwd,
-                "mtime": mtime, "score": score, "evidence": detail,
-            })
+                if not resolved:            # once per session, and only if it scored
+                    resolved = True
+                    try:
+                        cwd = reader.session_cwd(path)
+                    except Exception:  # noqa: BLE001
+                        cwd = None
+                    session_repo = _session_repo(cwd) if any(
+                        t["repo"] for t in targets) else None
+                # A session in ANOTHER repository can score on this one's
+                # files, because `_matches_pr_file` matches by suffix on
+                # purpose — an unrelated project's `README.md` or
+                # `src/index.ts` would otherwise take a slot on the capped list
+                # from a real contributor. A cwd that cannot be resolved is
+                # KEPT: dropping it would silently lose candidates, and the
+                # user still approves every link.
+                if not _repo_matches(session_repo, target["repo"], fold_repo):
+                    continue
+                rows[index].append({
+                    "conversation_id": pr_link.conversation_id_for(host, session["id"]),
+                    "session_id": session["id"], "host": host, "cwd": cwd,
+                    "mtime": mtime, "score": score, "evidence": detail,
+                })
+    for found in rows:
+        found.sort(key=lambda r: (-r["score"], -(r["mtime"] or 0)))
+    return rows, skipped, parsed
 
-    rows.sort(key=lambda r: (-r["score"], -(r["mtime"] or 0)))
-    print(json.dumps(rows[:args.max_candidates], indent=2))
+
+def _report_skipped_sessions(skipped: list[str]) -> None:
     if skipped:
         # stderr, so the JSON contract on stdout is untouched — the skill
         # reads this and tells the user what was NOT looked at.
         print(f"note: {len(skipped)} session(s) larger than "
               f"{MAX_BYTES // (1024 * 1024)} MiB were not scanned: "
               + ", ".join(skipped[:10]), file=sys.stderr)
+
+
+# --- batch mode: many pull requests, facts collected here ------------------
+
+MAX_BATCH_PRS = 25
+GH_TIMEOUT_S = 60
+# gh pr view --json files stops at 100; at or past that, ask the REST API.
+GH_FILES_PAGE = 100
+# A pasted PR URL is often a tab of it (`/files`, `/commits/<sha>`), and gh
+# accepts `http://` too; both name the same pull request.
+_PR_URL = re.compile(r"^https?://([^/\s]+)/([^/\s]+)/([^/\s]+)/pull/(\d+)"
+                     r"(?:/(?:files|commits|checks|changes)(?:/[^\s]*)?)?/?$", re.I)
+# Set by `_batch` to what shutil.which found: on Windows that can be a
+# `gh.cmd` shim, which subprocess would not find from the bare name.
+_GH_EXE = "gh"
+
+
+def _parse_pr_url(raw: str) -> dict | None:
+    """``https://<host>/<owner>/<repo>/pull/<n>`` — query/fragment and a tab
+    suffix dropped, host KEPT (an enterprise PR is a different pull request,
+    not a typo) apart from `www.github.com`, which IS github.com. `_batch`
+    then skips any host but github.com: MemHub links only github.com PRs."""
+    text = (raw or "").strip().split("#", 1)[0].split("?", 1)[0]
+    match = _PR_URL.match(text)
+    if not match:
+        return None
+    host, owner, repo, number = match.groups()
+    if host.casefold() == "www.github.com":
+        host = "github.com"
+    return {"url": f"https://{host}/{owner}/{repo}/pull/{int(number)}",
+            "host": host, "owner": owner, "repo": repo, "number": int(number)}
+
+
+def _gh(args: list[str]) -> tuple[int, str]:
+    """Run gh; ``(exit code, stdout)``. Its stderr is never echoed — it can
+    carry a token hint or a URL the user did not ask to see.
+
+    Decoded as UTF-8 explicitly: gh writes UTF-8, and Windows' locale default
+    (cp1252) raises on bytes such as those of `Á` or most Cyrillic — one PR
+    title would otherwise have crashed the whole batch.
+    """
+    import subprocess
+    try:
+        done = subprocess.run([_GH_EXE, *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=GH_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except (OSError, ValueError):
+        return 127, ""
+    return done.returncode, done.stdout or ""
+
+
+def _collect_pr(pr: dict) -> tuple[dict | None, str | None]:
+    """The PR's facts from gh, by URL — ``(facts, None)`` or ``(None, reason)``.
+
+    The URL, never the number: `gh pr view <n>` resolves a number against the
+    CURRENT checkout, so a PR in another repository would have been scanned
+    for the wrong branch, files and commits (Codex, #182).
+    """
+    code, out = _gh(["pr", "view", pr["url"], "--json",
+                     "url,title,headRefName,baseRefName,createdAt,files,commits"])
+    if code != 0:
+        return None, "gh_failed"
+    try:
+        view = json.loads(out)
+    except ValueError:
+        return None, "gh_failed"
+    if not isinstance(view, dict):
+        return None, "gh_failed"
+    returned = _parse_pr_url(str(view.get("url") or ""))
+    if returned is None:
+        return None, "url_mismatch"
+    if returned["url"].casefold() != pr["url"].casefold():
+        # Same host and number under another owner/repo is GitHub following a
+        # rename or transfer: the same pull request, but MemHub may know it by
+        # either name, so say so rather than silently scanning one and linking
+        # the other.
+        if (returned["host"].casefold() == pr["host"].casefold()
+                and returned["number"] == pr["number"]):
+            pr["canonical_url"] = returned["url"]
+            return None, "url_redirected"
+        return None, "url_mismatch"
+    files = [f.get("path") for f in view.get("files") or [] if isinstance(f, dict)]
+    if len(files) >= GH_FILES_PAGE:
+        api = ["api", f"repos/{pr['owner']}/{pr['repo']}/pulls/{pr['number']}/files",
+               "--paginate", "-q", ".[].filename"]
+        code, listed = _gh(api)
+        if code == 0 and listed.strip():
+            files = listed.splitlines()
+        else:
+            print(f"note: files_truncated {pr['url']} — the file list stops at "
+                  f"{len(files)}", file=sys.stderr)
+    pr_files = _pr_files(files)
+    if not pr_files:
+        return None, "no_files"
+    shas = [c.get("oid") for c in view.get("commits") or [] if isinstance(c, dict)]
+    facts = _target(pr_files, str(view.get("headRefName") or ""),
+                    view.get("baseRefName") or None,
+                    [s for s in shas if isinstance(s, str)],
+                    view.get("createdAt"), pr["repo"])
+    facts.update({"pr_url": pr["url"], "repo_full": f"{pr['owner']}/{pr['repo']}",
+                  "number": pr["number"], "title": view.get("title") or "",
+                  "head_ref": facts["branch"], "base_ref": facts["base"]})
+    return facts, None
+
+
+def _batch(args) -> int:
+    import shutil
+    raw_urls: list[str] = list(args.pr_url or [])
+    if args.prs_from:
+        try:
+            text = Path(args.prs_from).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"ERROR: cannot read {args.prs_from}: {exc}", file=sys.stderr)
+            return 2
+        raw_urls += [line.strip() for line in text.splitlines()
+                     if line.strip() and not line.strip().startswith("#")]
+    if not raw_urls:
+        print("ERROR: no pull request URLs given", file=sys.stderr)
+        return 2
+    global _GH_EXE
+    found = shutil.which("gh")
+    if found is None:
+        print("ERROR: gh not found — the GitHub CLI reads each PR's files, "
+              "branch and commits", file=sys.stderr)
+        return 2
+    _GH_EXE = found
+
+    skipped_prs: list[dict] = []
+    wanted: list[dict] = []
+    seen: set[str] = set()
+    for raw in raw_urls:
+        pr = _parse_pr_url(raw)
+        if pr is None:
+            skipped_prs.append({"pr_url": raw, "reason": "invalid_url"})
+            continue
+        key = pr["url"].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if pr["host"].casefold() != "github.com":
+            # MemHub's link_pr accepts github.com PRs only, so scanning one here
+            # would rank candidates nobody can link. Before the cap, and before
+            # gh is ever asked.
+            skipped_prs.append({"pr_url": pr["url"], "reason": "unsupported_host"})
+            continue
+        if len(wanted) >= args.max_prs:
+            skipped_prs.append({"pr_url": pr["url"], "reason": "over_cap"})
+            continue
+        wanted.append(pr)
+
+    targets: list[dict] = []
+    for pr in wanted:
+        facts, reason = _collect_pr(pr)
+        if facts is None:
+            entry = {"pr_url": pr["url"], "reason": reason}
+            if pr.get("canonical_url"):
+                entry["canonical_url"] = pr["canonical_url"]
+            skipped_prs.append(entry)
+        else:
+            targets.append(facts)
+
+    hosts = list(readers.READERS) if args.host == "all" else [args.host]
+    rows, skipped, parsed = (_scan(targets, hosts, args.limit, fold_repo=True)
+                             if targets else ([], [], 0))
+    print(json.dumps({
+        "prs": [{"pr_url": t["pr_url"], "repo": t["repo_full"], "number": t["number"],
+                 "title": t["title"], "head_ref": t["head_ref"],
+                 "base_ref": t["base_ref"],
+                 "candidates": found[:args.max_candidates]}
+                for t, found in zip(targets, rows)],
+        "skipped_prs": skipped_prs,
+        "sessions_scanned": parsed,
+    }, indent=2))
+    _report_skipped_sessions(skipped)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--files-from", default=None,
+                    help="single mode: a file of ONE PR's paths, one per line")
+    ap.add_argument("--pr-url", action="append", default=[],
+                    help="batch mode: a PR URL (repeatable); its facts are read "
+                         "with gh")
+    ap.add_argument("--prs-from", default=None,
+                    help="batch mode: a file of PR URLs, one per line")
+    ap.add_argument("--max-prs", type=int, default=MAX_BATCH_PRS,
+                    help="batch mode: how many PRs to scan at most")
+    ap.add_argument("--branch", default=None, help="the PR's head ref")
+    ap.add_argument("--base", default=None, help="the PR's base ref")
+    ap.add_argument("--sha", action="append", default=[],
+                    help="a commit oid on the PR (repeatable)")
+    ap.add_argument("--created-at", default=None, help="the PR's createdAt, ISO-8601")
+    ap.add_argument("--repo", default=None,
+                    help="only sessions in this repo (resolved from the git "
+                         "remote, so a worktree counts). Path matching is by "
+                         "SUFFIX, so without this an unrelated project's "
+                         "README.md scores against the PR's.")
+    ap.add_argument("--host", default="all", choices=["all", *readers.READERS])
+    ap.add_argument("--limit", type=int, default=200,
+                    help="how many recent sessions per host to scan")
+    ap.add_argument("--max-candidates", type=int, default=10)
+    ap.add_argument("--json", action="store_true",
+                    help="accepted for symmetry; output is always JSON")
+    args = ap.parse_args(argv)
+
+    batch = bool(args.pr_url or args.prs_from)
+    if batch == bool(args.files_from):
+        print("ERROR: give either --files-from (one PR) or --pr-url/--prs-from "
+              "(a batch), not both and not neither", file=sys.stderr)
+        return 2
+    if batch:
+        # In a batch every PR brings its own branch, base, shas, date and repo;
+        # a single value here would silently apply to all of them.
+        stray = [flag for flag, value in (
+            ("--branch", args.branch), ("--base", args.base), ("--sha", args.sha),
+            ("--created-at", args.created_at), ("--repo", args.repo)) if value]
+        if stray:
+            print(f"ERROR: {', '.join(stray)} belong to --files-from mode; in a "
+                  "batch each PR's own values are read with gh", file=sys.stderr)
+            return 2
+        if args.max_prs < 1:
+            print("ERROR: --max-prs must be at least 1", file=sys.stderr)
+            return 2
+        return _batch(args)
+
+    try:
+        raw = Path(args.files_from).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"ERROR: cannot read {args.files_from}: {exc}", file=sys.stderr)
+        return 2
+    pr_files = _pr_files(raw.splitlines())
+    if not pr_files:
+        print(f"ERROR: no paths in {args.files_from}", file=sys.stderr)
+        return 2
+
+    target = _target(pr_files, args.branch or "", args.base, args.sha,
+                     args.created_at, args.repo)
+    hosts = list(readers.READERS) if args.host == "all" else [args.host]
+    rows, skipped, _parsed = _scan([target], hosts, args.limit)
+    print(json.dumps(rows[0][:args.max_candidates], indent=2))
+    _report_skipped_sessions(skipped)
     return 0
 
 

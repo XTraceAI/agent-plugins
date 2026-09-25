@@ -90,9 +90,9 @@ def env_for_url(url: str) -> str:
 def current_env() -> str:
     """The backend THIS plugin install talks to.
 
-    `default_url()` reads the plugin's own .mcp.json (falling back to its
-    install path), so a script running from the memhub-staging install resolves
-    staging without the caller having to know which install it is.
+    `default_url()` reads the plugin's own .mcp.json, so a script running from
+    the memhub-staging install resolves staging without the caller having to
+    know which install it is.
     """
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))

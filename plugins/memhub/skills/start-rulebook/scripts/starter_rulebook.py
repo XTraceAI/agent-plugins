@@ -636,10 +636,12 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
         body = {k: filled[k] for k in _BODY_KEYS if filled.get(k) is not None}
         body["statement"] = statement
         if body.get("delivery") != "agent_hook":
-            body.pop("mode", None)                  # the server refuses a mode on notes and anchors
+            body.pop("mode", None)                  # notes and anchors cannot block: the server refuses mode="gate" there, and advise is the default
         body["scope_repos"] = [slots["repo"]] if scope_repo else []
         body["source"] = "authored"
-        body["source_ref"] = "starter-rulebook@%s#%s" % (catalog["version"], filled["id"])
+        # The server keys a re-file on the ref before `#` (a hex `@sha` stripped) plus the title, so the
+        # catalog version rides AFTER the `#`: a dated base would twin every rule on each catalog update.
+        body["source_ref"] = "starter-rulebook#%s|catalog %s" % (filled["id"], catalog["version"])
         engine = body.get("matcher") or body.get("ordering") or {}
         out.append({"id": filled["id"], "category": rule["category"], "designed_mode": rule.get("mode"),
                     # A transcript has no branch, diff, dirty flag, file size or agent identity, so the
@@ -726,7 +728,9 @@ def _summary(signals, cands, dropped, rows, catalog) -> str:
             lines.append("    %s %-26s %s" % ("✗" if c["id"] in bad else "·", c["id"], c["body"]["title"]))
     if dropped:
         lines += ["", "LEFT OUT (nothing in this repo for them to guard)"]
-        lines += ["  %-26s %s" % (d["id"], d["reason"]) for d in dropped]
+        # A per-slot template (`lockfile-drift-{{lock_key}}`) dropped for want of any
+        # slot value has no rendered id — show its family name, not the raw placeholder.
+        lines += ["  %-26s %s" % (re.sub(r"-?\{\{[^}]*\}\}", "", d["id"]), d["reason"]) for d in dropped]
     if bad:
         lines += ["", "FAILED VERIFICATION — not to be filed: " + ", ".join(sorted(bad))]
     lines += ["", "%d seeded · %d left out · %d failed verification" % (len(cands), len(dropped), len(bad))]

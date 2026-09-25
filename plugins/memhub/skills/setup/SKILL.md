@@ -44,8 +44,12 @@ trampoline that follows plugin version upgrades. It enables:
 - `SessionStart`: rulebook posture rules and any plugin-upgrade notice, the
   repo brain brief, and a capture-health warning — the same three scripts
   Claude Code runs at session start;
-- `PreToolUse`: situated directive recall before mutating shell and edit calls;
-- `PostToolUse`: reactive recall on failures and artifact-link reminders;
+- `PreToolUse`: the rulebook hook (which can deny the call) and situated
+  directive recall before mutating shell and edit calls;
+- `PostToolUse`: the rulebook hook, reactive recall on failures,
+  artifact-link reminders, and PR-link recording after GitHub-touching shell
+  calls (GitHub MCP calls only through the bundled plugin hooks — the bridge's
+  matcher stays narrow so upgrading it needs no re-trust);
 - `PostToolUse` + `Stop`: incremental session capture.
 
 After installation, report installation and trust as separate states. Codex
@@ -94,13 +98,21 @@ If it reports `NOT LOGGED IN`, explain that the hook credential is separate
 from the MCP connector login and run `/memhub:login` before calling setup
 complete. Do not silently start a browser login.
 
-Then run the local health check:
+Then run the local health check. On Codex:
+
+```bash
+echo '{}' | python3 "$ROOT/scripts/capture_health.py" --host codex --plugin-root "$ROOT"
+```
+
+On Claude Code and Cursor:
 
 ```bash
 echo '{}' | CLAUDE_PLUGIN_ROOT="$ROOT" python3 "$ROOT/scripts/capture_health.py"
 ```
 
-(It reads a hook payload from stdin; without the pipe it blocks on the tty.)
+(It reads a hook payload from stdin; without the pipe it blocks on the tty.
+Without `--host codex` it judges Claude Code's capture state, which on Codex
+reports the wrong host's health — the same flags the bridge passes.)
 
 No output is healthy. Relay any warning exactly enough that the user knows the
 remedy. Finish with a compact status: hook bridge installed/current, hook trust

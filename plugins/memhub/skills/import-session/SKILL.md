@@ -31,24 +31,33 @@ Arguments: `$ARGUMENTS`
 
 Do exactly this:
 
-1. **Resolve the destination — default to the repo's room.** A session about a
-   repo belongs in that repo's brain, where teammates and future sessions can
-   find it; raw workspace memory is the fallback, not the default.
+1. **Resolve where its memory goes — default to the repo's room.** A session is
+   never brain content: the transcript always lands in the user's personal
+   Sessions view. An import yields exactly two things, the session **gist**
+   and its task **episodes** — never facts, never directives — and the brain
+   only decides where those go: for a repo session, the repo's room, where
+   teammates and future sessions find them; personal memory is the fallback.
    - **Check the cache first** — `python3
      "<plugin-root>/scripts/room_map.py" show` prints the room's brain
-     id when the repo has one. The import script reads that same cache, so on a
-     cached repo you can simply omit `--agent-brain-id` and let it route.
+     id when the repo has one. The import script reads that same cache — the
+     brain id and the org that owns it — so on a cached repo you can simply
+     omit `--agent-brain-id` and let it route.
    - Nothing cached → derive `Repo: <org>/<name>` from `git remote get-url
      origin` (host and `.git` stripped), then `list_agent_brains` →
      **exact-name match**. Found → use its `agent_brain_id`, and persist it
      (`room_map.py set --brain-id <id> --org-id <org-id>` — the org id is the
      one you passed to `list_agent_brains`, or the default org's from
      `list_orgs`; the response's `scope` carries only `org_name`) so later
-     writers route without repeating this lookup.
+     writers — this import included — route to the right org without
+     repeating this lookup. A brain outside the default org imported without
+     its org fails with "Agent brain not found".
    - **No match, or not in a git repo → do NOT create a brain.** Import into
-     workspace memory (pass `--no-room`) and say so, mentioning that
+     personal memory (pass `--no-room`) and say so, mentioning that
      `/memhub:onboard` sets up the repo's room if they want one.
-   - The user naming a brain explicitly always wins over all of the above.
+   - The user naming a brain explicitly wins over all of the above — for a
+     session no brain has fed yet. The first brain a session feeds keeps it:
+     if capture already routed it to a room, naming another brain now does
+     not move it. Say so rather than reporting the named brain.
    - Edge cases (SSH remotes, no remote, worktrees) and the cache's rules are in
      `<plugin-root>/references/repo-brain.md`.
 
@@ -57,12 +66,15 @@ Do exactly this:
    ```bash
    python3 "<plugin-root>/scripts/capture.py" import \
      --session "<session-id-or-path>" --host auto [--title "<title>"] \
-     [--agent-brain-id "<id>"]
+     [--agent-brain-id "<id>" [--org-id "<org-id>"]]
+   ```
 
    For the literal ref `latest`, replace `--host auto` with the explicit current
    host. Pass `--agent-brain-id` only when step 1 resolved a room the cache did not
    already hold, or when the user named a brain explicitly; a cached repo
-   routes on its own. Use `--no-room` for the workspace-memory fallback.
+   routes on its own. With `--agent-brain-id`, also pass `--org-id` when the
+   brain is not in the default org (a cached room carries its own). Use
+   `--no-room` for the workspace-memory fallback.
    NEVER pass `--conversation-id`. Omitted, Claude uses the session id and
    Codex/Cursor use the same host-prefixed id as automatic capture. That keeps
    one conversation per room and makes re-imports incremental. A fresh id would
@@ -74,16 +86,19 @@ Do exactly this:
    before the next — payloads beyond ~8MB fail server-side as one shot, so
    never disable chunking for huge sessions. This is slow but unattended;
    just let the command run.
-   ```
 
-3. Report back the returned `conversation_id`, `source_platform`, `path` (should
-   be `"agentic"`), `messages_received`, and scope. Tell the user:
-   - **where it landed, by name** — "imported into `Repo: <org>/<name>`" or
-     "imported into your workspace memory" — so a wrong destination is
+3. Report back the returned `conversation_id`, `path` (should be
+   `"agentic"`), `messages_received`, and `scope`, plus the platform from the
+   script's `source platform :` line (the response does not echo it). Tell the
+   user:
+   - **where its memory landed, by name** — "memory extracted into
+     `Repo: <org>/<name>`" or "into your personal memory" (the transcript
+     itself is in their Sessions view either way) — so a wrong destination is
      obvious now rather than weeks from now;
    - extraction runs in the background (allow several minutes for large
-     sessions) — facts, episodes, artifacts, and the session **gist** land in
-     `search_memory` as it completes;
+     sessions) — the gist and episodes land in `search_memory` as it
+     completes. Don't promise facts or directives from it: an import creates
+     none;
    - re-importing the same session later is **incremental** (only new records
      are processed; the gist folds forward — nothing duplicates).
 

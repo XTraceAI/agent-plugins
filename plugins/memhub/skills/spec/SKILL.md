@@ -18,7 +18,8 @@ Relative links resolve from this file, including in an installed plugin.
 
 Preserve the user's arguments and existing decisions. `check` means a fresh
 comparison with code, not just a search for old audit reports. `bootstrap --local`
-uses the coding agent; `bootstrap --cloud` uses MemHub backend generation. See the
+uses the coding agent; `bootstrap --cloud` is run by the user from Studio's
+Repository → Specs, which also owns the repository's spec settings. See the
 maintenance workflow for execution choice and domain confirmation.
 
 With no subcommand, infer the requested task. If there is no task to infer, show

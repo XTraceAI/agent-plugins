@@ -212,8 +212,11 @@ def _directive_result(
         if gate.returncode != 0:
             return
 
+    # --host codex: the self-echo filter matches the conversation id capture
+    # uploaded (`codex-<uuid>`), not the bare hook session id (ENG-1075).
     return _run(
-        root, "directive_recall.py", payload, timeout=_RECALL_TIMEOUT_S
+        root, "directive_recall.py", payload, "--host", "codex",
+        timeout=_RECALL_TIMEOUT_S,
     )
 
 

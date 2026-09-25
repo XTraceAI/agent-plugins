@@ -106,17 +106,39 @@ def test_the_finder_collects_facts_from_the_pr_it_was_given() -> None:
     """`gh pr view <n>` resolves the number against the CURRENT checkout, so a
     URL for another repo would have ranked sessions against a different pull
     request and then linked them to the one the user named (Codex, #182)."""
+    base = ROOT / "plugins" / "memhub" / "skills" / "find-contributing-sessions"
+    skill = (base / "SKILL.md").read_text(encoding="utf-8")
+    scanner = (base / "scripts" / "find_sessions.py").read_text(encoding="utf-8")
+    flat = " ".join(skill.split())
+    # Since ENG-1128 the scanner collects the facts itself (batch mode), so the
+    # property moved into the script: step 1 still resolves a bare NUMBER to a
+    # URL, and the facts are read from that URL.
+    facts = skill[skill.index("## 2. Collect the facts"):skill.index("## 3. One consolidated")]
+    check("the skill hands the scanner URLs, not numbers",
+          "--prs-from" in facts and "**by URL**" in facts)
+    check("…and it says why", "resolves the number against the CURRENT checkout" in flat)
+    check("the scanner's gh pr view takes the URL",
+          '_gh(["pr", "view", pr["url"], "--json"' in scanner)
+    check("…and it checks the answer came from that PR",
+          '"url_mismatch"' in scanner and "checks that the `url`" in flat)
+
+
+def test_the_finder_maps_my_unlinked_prs() -> None:
+    """ENG-1128: no argument maps the caller's own unlinked PRs through the
+    backend's list tool, `--pr` names specific ones, and without a linked
+    GitHub identity the user's own `gh` is the fallback."""
     skill = (ROOT / "plugins" / "memhub" / "skills" / "find-contributing-sessions"
              / "SKILL.md").read_text(encoding="utf-8")
     flat = " ".join(skill.split())
-    # Step 1 resolving a bare NUMBER against the current repo is correct and
-    # stays; it is the facts section that must use the resolved URL.
-    facts = skill[skill.index("## 2. Collect the PR's facts"):skill.index("## 3. Run the scanner")]
-    check("the facts commands take the URL, not the bare number",
-          'gh pr view "$PR_URL" --json' in facts and "gh pr view <n> --json" not in facts)
-    check("…and it says why", "resolves the number against the CURRENT checkout" in flat)
-    check("…and it checks the answer came from that PR",
-          "Sanity-check the `url` that comes back" in flat)
+    for text in ("list_my_unlinked_prs(limit=25)", "--pr <url-or-number>",
+                 "gh search prs --author=@me", "`github_identity_linked: false`",
+                 "`github_connected: false`", "legacy_branch_sessions",
+                 "Link nothing without an explicit yes", "Never send `pr_type`"):
+        check(f"find-contributing-sessions says {text!r}", text in flat)
+    frontmatter = skill.split("---", 2)[1]
+    for spelling in ("mcp__plugin_memhub_memhub__list_my_unlinked_prs",
+                     "mcp__plugin_memhub_memhub__list_my_unlinked_prs"):
+        check(f"allowed-tools lists {spelling}", spelling in frontmatter)
 
 
 def test_readme_explains_session_pr_linking_and_its_per_host_gaps() -> None:
@@ -139,7 +161,7 @@ def test_readme_explains_session_pr_linking_and_its_per_host_gaps() -> None:
 
 
 _SPELLED = {11: "Eleven", 12: "Twelve", 13: "Thirteen", 14: "Fourteen",
-            15: "Fifteen", 16: "Sixteen"}
+            15: "Fifteen", 16: "Sixteen", 17: "Seventeen"}
 
 
 def test_the_specs_do_not_prescribe_patterns_the_code_rejects() -> None:
@@ -180,7 +202,7 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
     """The skill is prose, and prose silently loses steps."""
     skill = (ROOT / "plugins" / "memhub" / "skills" / "create-rule"
              / "SKILL.md").read_text(encoding="utf-8")
-    for text in ("### 4b.", "scratch worktree", "advise mode",
+    for text in ("### 4b.", "scratch worktree", "the mode the rule will ship with",
                  "Never anchor a `command_rx` with `^`",
                  "command position",
                  "worktree add -b",

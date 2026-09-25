@@ -484,7 +484,7 @@ def why_text(row):
     if d: return f'your CLAUDE.md says "{d["text"]}" (§ {d["heading"]}) — broken anyway in {n} of {M} sessions: {happened}'
     return f"not in CLAUDE.md. From your sessions: {happened} in {n} of {M} sessions"
 def fmt_hosts(d): return ", ".join(f"{h} {n}" for h, n in sorted(d.items())) or "none"
-today = datetime.date.today()
+today = datetime.date.today()   # rides AFTER the `#` in every source_ref: the server keys a re-file on the part before it (+ title), so a dated base would twin each rule every day
 proposals = []
 def add(row):
     row["delivery"] = TRIGGERS[row["trigger"]][1]; row["sessions_total"] = M
@@ -506,7 +506,7 @@ def add(row):
     stmt = f"{row['what']}. Why: {row['why']}"
     row["statement"] = stmt if len(stmt) <= 400 else stmt[:397].rstrip() + "…"   # the server caps a statement at 400 chars (MAX_STATEMENT); a longer one is refused, not truncated
     row["action"] = f"create_rule(delivery={row['delivery']}" + (", matcher/ordering=predicate)" if row["delivery"] == "agent_hook" else ", anchors=predicate)" if row["delivery"] == "anchor_recall" else ")")
-    row.setdefault("source_ref", (f"claude_md@{today}#{row['title']}" if d else f"sessions@{today}#{row['title']}") + f"|applies {row['fired_n']}/{M}" + (f"|precision {row['real_misses']}/{row['fired_n']}" if row.get("real_misses") is not None else ""))
+    row.setdefault("source_ref", (f"claude_md#{row['title']}|mined {today}" if d else f"sessions#{row['title']}|mined {today}") + f"|applies {row['fired_n']}/{M}" + (f"|precision {row['real_misses']}/{row['fired_n']}" if row.get("real_misses") is not None else ""))
     proposals.append(row); return row
 def show(row):
     n = row["fired_n"]; ev = row["evidence"]
@@ -638,7 +638,7 @@ for c in ORDERING_CANDS:
     breakdown = f"{Vany} never ran it, {V - Vany} ran it piped so its exit code was lost" if V else ""
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"),
                      "fired": {"gated": T, "violations": V, "no_run_at_all": Vany}, "fired_n": V, "fired_ids": ids, "real_misses": None, "breakdown": breakdown,
-                     "not_replayable": unscored, "samples": ex, "source_ref": c.get("source_ref") or f"{'claude_md' if (c.get('claude_md_given') or declared_for(c.get('claude_md_rx'), c['title'])) else 'sessions'}@{today}#{c['title']}|gated {T}/{M}|violations {V}"}))
+                     "not_replayable": unscored, "samples": ex, "source_ref": c.get("source_ref") or f"{'claude_md' if (c.get('claude_md_given') or declared_for(c.get('claude_md_rx'), c['title'])) else 'sessions'}#{c['title']}|mined {today}|gated {T}/{M}|violations {V}"}))
 for c in OUTPUT_CANDS:
     hit = collections.Counter(); ex = []; ids = []
     for s in corpus:
@@ -731,7 +731,7 @@ for c in SKILL_INTENTS:
     verdict_ = ("skill exists but was retyped by hand — make it easier to find" if exists and n > k else "covered" if exists else "PROPOSE this skill") if n else "no signal"
     print(f"  {c['skill']:20s} asked for in {n}/{M} sessions ({fmt_hosts(collections.Counter(s['host'] for s in intent))}), invoked in {k}  -> {verdict_}")
     ex = [sample(s, next(u for u in s["users"] if re.search(c["intent_rx"], u.lower()[:600]))) for s in intent[:3]]
-    proposals.append({"lane": "skill", "title": c["skill"], "predicate": c["intent_rx"], "sessions": {"intent": n, "invoked": k}, "sessions_total": M, "exists": exists, "verdict": verdict_, "samples": ex, "source_ref": f"sessions@{today}#{c['skill']}|intent {n}/{M}|invoked {k}", "action": "create_skill (host-agnostic SKILL.md) into the repo brain" if not exists else "improve trigger wording / surface the existing skill"})
+    proposals.append({"lane": "skill", "title": c["skill"], "predicate": c["intent_rx"], "sessions": {"intent": n, "invoked": k}, "sessions_total": M, "exists": exists, "verdict": verdict_, "samples": ex, "source_ref": f"sessions#{c['skill']}|mined {today}|intent {n}/{M}|invoked {k}", "action": "create_skill (host-agnostic SKILL.md) into the repo brain" if not exists else "improve trigger wording / surface the existing skill"})
 
 # ---------------------------------------------------------------- block candidates: a command that was later undone or questioned
 def to_ere(rx):
@@ -770,7 +770,7 @@ for c in HOOK_CANDS:
     snippet = ({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": f"cmd=$(jq -r .tool_input.command); printf '%s' \"$cmd\" | grep -Eq {shlex.quote(ere)} && {{ echo {shlex.quote(c['block_msg'])} >&2; exit 2; }}; exit 0"}]}]}}   # every interpolated value is shell-quoted
                if ere else {"note": f"no PreToolUse snippet: the pattern {c['trigger_rx']!r} uses constructs POSIX ERE cannot express; file it as a rulebook rule instead"})
     if ere and "\\b" in ere: snippet["requires"] = "GNU or BSD grep (-E with \\b word boundaries) — the developer machine's grep, not busybox"
-    proposals.append({"lane": "hook", "title": c["title"], "predicate": {"trigger_rx": c["trigger_rx"], "outcome_rx": c.get("outcome_rx") or c.get("user_rx"), "repair_rx": c.get("repair_rx")}, "sessions": {"trigger": T, "bad_outcome": B}, "sessions_total": M, "rate": rate, "samples": ex, "source_ref": f"sessions@{today}#{c['title']}|trigger {T}/{M}|bad-outcome {B}", "action": "advise: rulebook rule; block: PreToolUse hook (settings snippet) or plugin PR", "settings_snippet": snippet})
+    proposals.append({"lane": "hook", "title": c["title"], "predicate": {"trigger_rx": c["trigger_rx"], "outcome_rx": c.get("outcome_rx") or c.get("user_rx"), "repair_rx": c.get("repair_rx")}, "sessions": {"trigger": T, "bad_outcome": B}, "sessions_total": M, "rate": rate, "samples": ex, "source_ref": f"sessions#{c['title']}|mined {today}|trigger {T}/{M}|bad-outcome {B}", "action": "advise: rulebook rule; block: PreToolUse hook (settings snippet) or plugin PR", "settings_snippet": snippet})
 
 # ---------------------------------------------------------------- repeated workflows: Makefile / setup-skill material
 WORKFLOW_CANDS = [   # curated and counted — raw n-gram mining only surfaces ad-hoc analysis commands
@@ -790,7 +790,7 @@ for c in WORKFLOW_CANDS:
         hits = sum(1 for cl in s_["calls"] if cl["cmd"] and re.search(c["rx"], rh.shell_only(cl["cmd"])))
         if hits >= c.get("min_per_session", 1): k += 1
     wf_rows.append({"lane": "workflow", "title": c["name"], "predicate": c["rx"], "sessions": {"used": k}, "sessions_total": M,
-                    "make_target": c.get("make"), "note": c.get("note"), "source_ref": f"sessions@{today}#{c['name']}|used {k}/{M}"})
+                    "make_target": c.get("make"), "note": c.get("note"), "source_ref": f"sessions#{c['name']}|mined {today}|used {k}/{M}"})
     print(f"  {c['name']:18s} in {k}/{M} sessions" + (f"  ({c['note'][:90]})" if c.get("note") else ""))
 proposals += wf_rows
 
