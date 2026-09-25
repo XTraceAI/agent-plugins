@@ -69,7 +69,9 @@ def main() -> int:
           V._literal_of(r"grep\s+-[a-zA-Z]*r") == "" and V._literal_of(r"(a|b)+") == "")
     rc, out = run(bash(command_rx=r"rm\s+-[a-z]*f"), "--fires", "rm -rf build")
     check("a pattern we cannot render as a literal generates no self-mention case",
-          rc == 0 and "generated" not in out, out)
+          rc == 0 and "(the last" not in out and "grep -rn" not in out, out)
+    check("... and says so, so the author writes those mention cases by hand",
+          "no grep / python -c SILENT cases were generated" in out, out)
 
     # --- the complied-with class ------------------------------------------
     edit = {"title": "t", "statement": "s", "delivery": "agent_hook",
