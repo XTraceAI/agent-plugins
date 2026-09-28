@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks what the team knows, decided, discussed, or saved about a topic, or wants to check MemHub/team memory (e.g. "what do we know about X", "did we decide on Y", "search memhub for Z", "is there a spec for W"). Read-only — searches facts, episodes, artifacts, and documents.
 argument-hint: <what to look for>
-allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__read_memory, mcp__plugin_memhub-staging_memhub__read_memory, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, Bash
+allowed-tools: mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__read_memory, mcp__plugin_memhub-staging_memhub__read_memory, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__search_all_brains, mcp__plugin_memhub-staging_memhub__search_all_brains, Bash
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -33,18 +33,22 @@ Do exactly this:
      on a topic.
    - `agent_brain_id`: **in a repo with an agent brain, search that brain
      first.** The SessionStart brief names it (`MemHub: this repo's agent brain
-     is …`); `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show` prints
-     the id if the brief is not in context. That brain is where this repo's
-     sessions are captured, so it is where the answer usually is — omitting it
-     searches personal memory instead and reads as "the team never wrote that
-     down".
+     is …`); `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show --json`
+     prints the cached entry (`brain_id`, and `org_id` when known) if the brief
+     is not in context. Pass that `org_id` alongside `agent_brain_id` — here and
+     on `read_memory`: a brain is resolved inside one org, and without it a room
+     outside the default org fails with "Agent brain not found". That brain is
+     where this repo's sessions are captured, so it is where the answer usually
+     is — omitting it searches personal memory instead and reads as "the team
+     never wrote that down".
      Then run the SAME query again WITHOUT `agent_brain_id` and merge: widen,
      never replace. Personal workspace memory holds things the repo brain does
      not, and silently dropping it is the failure this default exists to fix,
      in the other direction. Skip the second call only when the user asked
      about the repo/team specifically.
      When the user names a DIFFERENT brain, resolve it via `list_agent_brains`
-     and search that one instead.
+     and search that one instead. When you don't know which brain holds it,
+     `search_all_brains` searches every brain you can read in one call.
    - `tags` (+ `match`: `"all"`/`"any"`): narrows to artifacts carrying the
      tag(s) — check the vocabulary with `list_tags` first. Note that a tag
      filter restricts results to artifacts only. Tags are stored normalised
@@ -56,7 +60,9 @@ Do exactly this:
    - `group` / `author`: artifact filters that mirror the brain's Index (see
      `get_brain_overview`) — `group` is one of `"Specs"`, `"Runbooks"`,
      `"Design"`, `"Briefs"`, `"Routine output"`, `"Documents"`; `author` is a
-     teammate's display name. Both narrow to artifacts.
+     teammate's display name. Both narrow to artifacts. `author` naming anyone
+     but you needs `agent_brain_id` — personal memory holds only your own, so
+     the call errors rather than returning nothing.
    - **Browsing** — leave `query` EMPTY to list rather than search: with the
      artifacts default (or `group`/`tags`) you get the matching artifacts
      newest first, `top_k` per page, `offset=top_k` for the next page. This is

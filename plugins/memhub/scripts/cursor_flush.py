@@ -60,7 +60,7 @@ import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
+from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from readers.strict_json import loads as load_json  # noqa: E402
@@ -123,7 +123,7 @@ def _note_failure(uuid: str, reason: str) -> None:
     streak = int(st.get("fail_streak") or 0) + 1
     if streak >= MAX_UNCONFIRMED:
         _log(f"{streak} consecutive failed imports ({reason}) — per-event "
-             f"flush is dormant for this session; run /memhub:import-session "
+             f"flush is dormant for this session; run {skill_command('import-session')} "
              f"to capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
         _save_state(uuid, last_flush_at=now, last_error=reason, last_error_at=now,
                     unsupported=True, unsupported_at=now, fail_streak=0)
@@ -424,9 +424,21 @@ def _source_for(uuid: str, payload: dict, state: dict
 
     # Prefer the richer store when both exist (current CLI; older IDE). A
     # current IDE session has no store, so the validated hook transcript wins.
+    #
+    # Readability, not existence, decides. cursor_reader.locate names
+    # <session>/store.db without opening it, and a cursor-agent CLI session
+    # holds that database open until it exits — so at sessionEnd, the one hook
+    # that captures a CLI session, the file is there and unreadable. Choosing
+    # it anyway made every cursor-agent session log "store source unreadable —
+    # skipping" and reach MemHub never, while its transcript sat beside it
+    # fully written. Measured on cursor-agent 2026.09.10 (harness lane
+    # harness/drivers/cursor_run.py: 0 of 3 cases captured before, 3 of 3
+    # after).
     store, store_err = cursor_reader.locate(uuid)
     if store is not None and store.name == "store.db":
-        return "store", store, ""
+        if cursor_reader.readable(store):
+            return "store", store, ""
+        store_err = f"store exists but cannot be read yet ({store})"
     transcript, transcript_err = _valid_transcript_path(
         payload.get("transcript_path"), uuid)
     if transcript is not None:
@@ -979,11 +991,11 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # the no_credential case, not a contacted-server failure, so it must
         # not count toward dormancy. Clear the streak and skip, exactly like
         # the no-bearer path below.
-        _log(f"credential resolve failed ({e!r}) — skipping (run /memhub:login)")
+        _log(f"credential resolve failed ({e!r}) — skipping (run {skill_command('login')})")
         _save_state(uuid, last_error="no_credential", fail_streak=0)
         return
     if not bearer:
-        _log("no usable credential — skipping (run /memhub:login)")
+        _log(f"no usable credential — skipping (run {skill_command('login')})")
         # A local auth gap, not a server failure — never contacted it, so
         # clear any failure run rather than let a login blip tip a session
         # toward dormancy.
@@ -1102,7 +1114,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # unconfirmable server costs redundant work exactly once instead of
         # on every event. /memhub:import-session still captures the session.
         _log("server does not report ack_through — per-event flush is "
-             "dormant for this session; run /memhub:import-session to "
+             f"dormant for this session; run {skill_command('import-session')} to "
              "capture it, or upgrade the server")
         _save_state(uuid, last_flush_at=time.time(), unsupported=True,
                     unsupported_at=time.time(), fail_streak=0)

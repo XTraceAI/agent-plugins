@@ -58,11 +58,18 @@ code path and line, expected versus observed behavior, and supporting evidence.
 Then give the checked files/requirements, tests and results, and omitted scope
 with reasons. State whether the comparison includes uncommitted changes.
 
-When accessible, read the latest relevant `spec_audit` report from the resolved
-repo brain and link its remediation PR. Keep historical verdicts separate from
-this check and compare their recorded head with the current code. A truncated
-report did not verify omitted specs; an unchanged-head rerun does not resume
-omitted work. If memory is unavailable, still complete the local comparison.
+When accessible, read the latest relevant scheduled-audit report — artifact
+type `spec_audit_report`, tag `spec_audit`, saved to the routine's configured
+brain, else the bound repo brain. Keep historical verdicts separate from this
+check and compare their recorded head with the current code. An incomplete
+report (truncated, `not_audited`, or `unreadable` specs) did not verify the
+omitted specs; its run is marked failed, and the next run on the same head
+resumes only those. A remediation PR exists only when the routine has
+`open_pr` on (off by default); link it when present. Its delivery status is
+`opened`/`updated`, `no_changes`, `closed` (every proposed spec already
+exists), `not_opened` (with a reason), or `dismissed` — a reviewer closed the
+same changes unmerged, which is a human decision to respect, not open drift.
+If memory is unavailable, still complete the local comparison.
 
 A check is read-only by default. For requested fixes, follow `resolve` in
 [Maintain specs](../spec-maintain/SKILL.md), retaining the original requirement

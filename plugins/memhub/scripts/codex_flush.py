@@ -40,7 +40,7 @@ import atomic_write  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
+from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
 from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
@@ -122,7 +122,7 @@ def _note_failure(sid: str, reason: str) -> None:
     streak = int(st.get("fail_streak") or 0) + 1
     if streak >= MAX_UNCONFIRMED:
         _log(f"{streak} consecutive failed imports ({reason}) — per-event "
-             f"flush is dormant for this session; run /memhub:import-session "
+             f"flush is dormant for this session; run {skill_command('import-session')} "
              f"to capture it. Re-probes in {DORMANT_RETRY_S / 60:.0f} min.")
         _save_state(sid, last_error=reason, last_error_at=now,
                     unsupported=True, unsupported_at=now, fail_streak=0)
@@ -499,7 +499,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
 
     url, bearer = await asyncio.to_thread(resolve_bearer)
     if not bearer:
-        _log("no usable credential — skipping (run /memhub:login)")
+        _log(f"no usable credential — skipping (run {skill_command('login')})")
         # Local auth gap, not a server failure — clear any failure run rather
         # than let a login blip tip the session toward dormancy.
         _save_state(sid, last_error="no_credential",
@@ -595,7 +595,7 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
     verdict = _verdict(res, f"codex-{sid}")
     if verdict == "unsupported":
         _log("server does not report ack_through — per-event flush is "
-             "dormant for this session; run /memhub:import-session to "
+             f"dormant for this session; run {skill_command('import-session')} to "
              "capture it, or upgrade the server")
         _save_state(sid, unsupported=True, unsupported_at=time.time(),
                     fail_streak=0)

@@ -151,7 +151,11 @@ async def _gist_hash(
     """
     import hashlib
     args = {"query": "GOAL INTENT OUTCOME ROUTE RESUME STATE next step",
-            "memory_type": "episodes", "top_k": 5}
+            "memory_type": "episodes", "top_k": 5,
+            # Where pointer hits are on, a hit carries no body unless asked
+            # for — and without the body there is no "## GOAL" to find, so
+            # every slice wait would run to its timeout.
+            "include_content": True}
     if agent_brain_id:
         args["agent_brain_id"] = agent_brain_id
     if org_id:
@@ -235,6 +239,33 @@ def _cwd_from_records(records: list[dict]) -> str | None:
                  and r.get("cwd")), None)
 
 
+def apply_cached_room(args, records: list[dict], env: str | None) -> dict | None:
+    """Fill ``args.agent_brain_id`` (and ``args.org_id``) from the repo's room.
+
+    An explicit --agent-brain-id always wins, and --no-room opts out. The room
+    is keyed on the TRANSCRIPT's cwd, not this process's: read_room(None)
+    would fall back to the caller's directory, and this script is routinely
+    run from a different repo than the session it imports, so that would file
+    the session under an unrelated room. Unknown origin -> no room.
+
+    The room's ``org_id`` travels with its brain id. A brain is resolved inside
+    exactly one org, so importing a room that lives outside the caller's
+    default org without it fails with "Agent brain not found" — which reads
+    like a stale id rather than a wrong-org lookup. An explicit --org-id wins.
+    """
+    if args.agent_brain_id or args.no_room:
+        return None
+    rec_cwd = _cwd_from_records(records)
+    room = read_room(rec_cwd, env) if rec_cwd else None
+    if not room:
+        return None
+    args.agent_brain_id = room["brain_id"]
+    org = room.get("org_id")
+    if not args.org_id and isinstance(org, str) and org:
+        args.org_id = org
+    return room
+
+
 def _cwd_ok(cwd: str | None) -> bool:
     """Whether a transcript-provided cwd is safe to pass as ``git -C``."""
     if not isinstance(cwd, str) or not cwd or cwd.startswith("-"):
@@ -285,7 +316,8 @@ async def main() -> int:
                     help="originating host recorded on the imported session")
     ap.add_argument("--title", default=None)
     ap.add_argument("--agent-brain-id", default=None,
-                    help="route the extracted facts/episodes into an agent brain "
+                    help="route the session's task episodes and gist into an "
+                         "agent brain "
                          "(isolated, shareable) instead of raw workspace memory. "
                          "Default: the repo's cached room "
                          "(~/.config/memhub-plugin/rooms.json), if any")
@@ -298,9 +330,11 @@ async def main() -> int:
                          "via the git remote basename; pass '' to disable.")
     ap.add_argument("--org-id", default=None,
                     help="Organization to import into, for accounts in more "
-                         "than one. Default: the connection's default org — "
-                         "which is why an --agent-brain-id created in ANOTHER "
-                         "org fails with 'Agent brain not found'.")
+                         "than one. Default: the cached room's org when the "
+                         "brain comes from the room, else the connection's "
+                         "default org — which is why an --agent-brain-id "
+                         "created in ANOTHER org fails with 'Agent brain not "
+                         "found' unless this is passed too.")
     ap.add_argument("--url", default=None)
     ap.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES,
                     help="transcripts larger than this are sent as sequential "
@@ -395,16 +429,7 @@ async def main() -> int:
     # personal memory. Keyed by the resolved endpoint's backend, and derived from
     # the TRANSCRIPT's cwd rather than the caller's — the script is often run
     # from a different directory than the session it is importing.
-    room = None
-    if not args.agent_brain_id and not args.no_room:
-        # Only when the transcript says where it ran. read_room(None) would fall
-        # back to THIS process's cwd — and this script is routinely run from a
-        # different repo than the session it imports, so that would file the
-        # session under an unrelated room. Unknown origin → stays personal.
-        rec_cwd = _cwd_from_records(records)
-        room = read_room(rec_cwd, env_for_url(url)) if rec_cwd else None
-        if room:
-            args.agent_brain_id = room["brain_id"]
+    room = apply_cached_room(args, records, env_for_url(url))
 
     slices = make_slices(records, args.chunk_bytes) if args.chunk_bytes else [records]
     size = f.stat().st_size
@@ -484,8 +509,8 @@ async def main() -> int:
                     )
     print("-" * 56)
     print("Queued. Extraction runs in the background (minutes for large "
-          "sessions); facts/episodes/artifacts + the session gist appear in "
-          "search_memory as it completes. Re-running the same session later "
+          "sessions); the session's task episodes + its gist appear in "
+          "search_memory(memory_type=\"episodes\") as it completes. Re-running the same session later "
           "imports only NEW records (watermark) and folds the gist forward.")
     return 0
 

@@ -21,7 +21,8 @@ MemHub cloud (backend usage; product credits may apply)?"
 Don't start cloud discovery while waiting: discovery itself can cost money.
 Ordinary local inventory needed to explain the choice is fine. Remember the
 answer for this conversation; don't invent a persistence API or new configuration
-file. If asked to save it and no supported setting exists, explain that limitation.
+file. If asked to save it, the saved choice is the bootstrap executor in Studio's
+Repository → Specs, which the user sets there; this plugin cannot write it.
 
 ### Local generation
 
@@ -53,24 +54,36 @@ No MemHub backend generation call is needed. Use the local checkout and agent.
 
 ### Cloud generation
 
-The currently documented backend bootstrap produces Git-authored spec PRs.
-For Brain-only bootstrap, offer local document drafts or require a discovered
-supported cloud capability; do not send a Git generation request and pretend it
-creates governing Brain documents.
+Cloud bootstrap runs in MemHub Studio, not from this agent. Repository → Specs
+owns it: it configures the run, proposes domains, and takes the confirmed
+`{name, owns}` choices. The plugin's personal access key
+cannot call the policy API that bootstrap uses, and configuring a `code_insight`
+policy or triggering passes by hand would fight the managed setup, so do none
+of that. Instead send the user to Studio:
 
-Use the connected staging/production product consistently. An org admin configures
-`code_insight` with `mode: feature_specs`, the correct repo installation/full name,
-configured spec directory, and granted workspace brain. Discover and validate the
-actual configuration schema before writing; don't assume field names from prose.
-With `domains` omitted, trigger pass 1 and show the partition artifact. Obtain or
-reuse confirmed `{name, owns}` choices, then trigger pass 2 with `open_pr: true`.
-Link the returned PR and report actual run state and available usage evidence.
+1. Connected sources → GitHub → this repository → **Repository specs**.
+2. In Repository → Specs, choose Git as the source and cloud as the bootstrap
+   executor, then **Open cloud bootstrap** and run **Bootstrap feature specs**.
+   Review the proposed domains there before generation.
 
-Policy operations require a full user session; an MCP API key is not a substitute.
-Missing GitHub write consent is actionable: retain the candidates and report the
-run's reason. Do not bypass cloud app permissions using the user's personal
-credentials. If no supported authenticated surface is available, explain the
-specific gap. Offer local generation but switch only on the user's choice.
+Each generated spec always lands in the repo brain as a `candidate_spec`
+artifact (tags `candidate_spec`, `spec_feature`). A Git spec PR opens only when
+the open-PR setting is on (off by default); without it there is no PR to look
+for. A PR never overwrites a spec already in the repository: those destinations
+are skipped and named in the PR body.
+
+Name the repository and spec directory you resolved so the user can check them
+against the Studio settings. If the **Repository specs** button is absent, the
+feature is not enabled for their organization, or the repository has no GitHub
+grant; say so rather than guessing a workaround. Cloud bootstrap produces
+Git-authored spec PRs only: for a Brain source, offer local document drafts.
+
+Afterwards, read what the run left rather than what was configured: link the
+spec PR the user reports or that you can see on the repository and report its
+state, or, with no PR, point at the `candidate_spec` artifacts in the repo
+brain. Missing GitHub write consent is fixed in Studio, not with the user's
+personal credentials. Offer local generation, but switch only on the user's
+choice.
 
 ## init [file or topic]
 
@@ -111,26 +124,55 @@ rewrite specs simply to make a drift check green. When a decision is already
 clear, implement it without asking again. Run relevant checks and present the
 code/spec diff or Brain proposal for review. Cloud-generated remediation stays
 in its existing PR; do not blindly apply the audit diff locally or create a
-second competing remediation PR.
+second competing remediation PR. A `dismissed` remediation PR was closed
+unmerged by a reviewer: treat that as their decision, not as drift to re-raise,
+unless the user asks to revisit it.
 
 ## status [topic] / setup
 
 Read configuration and readiness; `setup` diagnoses before proposing changes.
+Start with `get_spec_workflow(repo="<owner>/<name>")`, taking the name from the
+`origin` remote. It returns what Repository → Specs holds: `settings` (source,
+directory or brain, reminders, PR checks, audit schedule, `only_stale`, remediation
+PRs, bootstrap executor), each resource with its status and teamspace, `managed`
+(false means nobody has saved the workflow and the settings are inferred),
+`report_brain_id`, `last_audit`, `reminder_rule`, `warnings` and `conflicts`.
+If the tool is unavailable (an older server) or refuses, say so and fall back to
+`list_rules(repo=…)` for the ownership rule; everything else is then unknown.
 Report the source and directory/brain, agent/plugin connection, ownership rule
 state, PR reviewer, audit schedule, and delivery mode only where evidence is
 available. Identify conflicting settings with their origins. Separate configured,
 observed working, missing, and unknown. Don't install or activate everything as
 a side effect of a status request.
 
-In Git mode, compare local paths/heads with `spec_mirror` artifacts in the resolved
-repo brain. Open pointer results before citing them; report absent or retired
-mirrors accurately. Read relevant `spec_audit` reports for verdicts, recorded
-head, checked/omitted coverage, and remediation PR links. Brain mode reports
+- A non-empty `reminder_rule.behind_builtin` means the stored rule predates the
+  current built-in (for example, its text still shows a literal `<spec>`). Say so,
+  and say that an org admin re-saving Repository → Specs refreshes it.
+- A `last_audit` with status `failed` and `not_audited` > 0 is an incomplete run
+  the next one resumes, not a verdict. Report its counts and `error` as such.
+- In Git mode, list every `*.md` directly under the spec directory that has no
+  `owns:` frontmatter, by name. No check, audit or reminder reads those files.
+  Don't leave this to chance: compare the directory listing with the parsed specs.
+
+In Git mode, compare local paths/heads with the mirrors in the resolved repo
+brain: artifacts tagged `spec_mirror` (retired ones also `spec_retired`), named
+`Spec: <name>`, with rationale `Mirror <repo>@<sha12>` giving the mirrored head.
+MCP does not return their metadata, so read the head from the rationale and the
+spec's frontmatter from its content. Open pointer results before citing them;
+report absent or retired mirrors accurately. Read relevant `spec_audit` reports for verdicts, recorded
+head, checked/omitted coverage, and remediation PR links. They are in
+`report_brain_id` from `get_spec_workflow`, which is often NOT the repo brain:
+search that brain (`search_memory(agent_brain_id=<report_brain_id>, memory_type="artifacts")`),
+or open `last_audit.artifact_id` directly with `get_artifact`. Finding none in the
+repo brain does not mean there are none. Brain mode reports
 versions and retrieval access to the selected governing documents, not Git mirror
 health. Do not change brain membership or create another brain to repair access.
 
 The ownership rule uses `given.repo.spec_untouched` and optional `spec_dir`.
-A proposed rule needs explicit activation through the product; enabling spec
-drift doesn't silently activate it. Hooks, audits, and PR review remain separate
-resources until a connected product exposes unified management. Link the actual
-management surface if available rather than pretending this skill installed it.
+Repository → Specs in Studio (Connected sources → GitHub → the repository →
+**Repository specs**) is the single place that configures the spec source and
+directory, bootstrap executor, developer reminders (this rule), PR checks, the
+scheduled drift audit, and remediation PRs. Saving those settings needs an org
+admin. `setup` changes go there: tell the user what to set and where (and that
+an admin must save them), and don't create or edit rules, policies, or
+routines one by one to reproduce it. This skill installs and activates nothing.

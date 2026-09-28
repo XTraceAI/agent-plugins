@@ -152,14 +152,17 @@ the user's own id in `member_user_ids` when you know it, and either way treat
 and needs a member added in MemHub, and file nothing until it has one.
 If the server has no `list_rulebooks`, it predates rulebook containers: file
 with no `rulebook_id` and carry on. Never pass `agent_brain_id` to
-`create_rule` — the parameter no longer exists and the call fails outright.
+`create_rule` — the parameter no longer exists, and the server drops it
+without a word: the rule files wherever `rulebook_id` (or its absence) sends
+it, not into the brain you meant.
 
-**When the create is refused.** `create_rulebook` validates the creator as an
-active org member, so it can answer `rulebook_member_not_in_org` naming *the
-user themselves* — even though you named nobody. That is not a bug to retry:
+**When the create is refused.** The reply is a sentence, not a code — match
+on its wording. `create_rulebook` validates the creator as an active org
+member, so it can answer "*<name> isn't in this organisation, so they can't
+be put in a rulebook*" about *the user themselves* — even though you named nobody. That is not a bug to retry:
 their org membership is inactive, and no rulebook can be created until someone
-fixes it in MemHub. Say that plainly and stop. (`rulebook_name_too_long` means
-the name exceeded 200 characters — shorten it and retry once.)
+fixes it in MemHub. Say that plainly and stop. ("*That rulebook name is too
+long*" means it exceeded 200 characters — shorten it and retry once.)
 
 ## 0a. Ask what they want — first, in plain words
 
@@ -187,7 +190,10 @@ Mark the recommended one from what you can see, and say why in one clause:
   recommend **1**, and say that 2 and 3 would find nothing yet ("come back in
   a couple of weeks — I'll have sessions to learn from");
 - sessions exist and the rulebook is empty → recommend **3**;
-- the rulebook already holds `starter-rulebook@` rows → recommend **2**.
+- the rulebook already holds starter rules → recommend **2**. `list_rules`
+  returns no `source_ref`, and a starter rule's `source` is plain `authored`,
+  so tell them by title: any row titled like a `catalog.json` rule (`Stop
+  irreversible git operations`, `Never read secrets`, …).
 
 Skip the question only when they already answered it: `--starter` / `--mine`,
 or their own words ("just the defaults" → 1; "mine our sessions", "turn our
@@ -360,7 +366,8 @@ answer: rules it used to carry, and the replay evidence that removed each.
 git rev-parse --show-toplevel; git rev-parse --short HEAD     # provenance for the CLAUDE.md rows
 # The SELECTION — which sessions this run is about. Set it once; every miner call below takes it.
 SEL=(--repo "<name>")                      # add as they apply:  --days N | --all    --baseline-date YYYY-MM-DD
-# save list_skills (all statuses) to skills.json for skill dedup, then:
+# save list_skills(agent_brain_id=<repo brain id>) to skills.json for skill dedup
+# (approved skills only — without the brain id it reads your personal memory), then:
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" --out mine-out "${SEL[@]}" \
   --skills-file skills.json --claude-md ./CLAUDE.md [--claude-md <workspace>/CLAUDE.md]
 ```
@@ -591,9 +598,10 @@ origin) and `quote_rx`.
    and name the rule it fights in the report. The `same_as` pairs above
    apply against the BOOK too, in both directions: a starter rule about to be
    filed whose counterpart is already in the book from an earlier mined run
-   (or a mined built-in whose starter counterpart is already there, its
-   `source_ref` starting `starter-rulebook@`) is a `duplicate` the script
-   will not flag — look for those titles in the `list_rules` reply yourself.
+   (or a mined built-in whose starter counterpart is already there — a row
+   titled like a `catalog.json` rule; `list_rules` carries no `source_ref`)
+   is a `duplicate` the script will not flag — look for those titles in the
+   `list_rules` reply yourself.
    Keep what is in the book and add the new evidence to the report, unless the
    incoming rule is strictly wider (`git-irreversible` over `no-force-push`),
    which is filed with `supersedes_rule_id`. Retired counterpart → someone
@@ -619,15 +627,18 @@ origin) and `quote_rx`.
      `proposed`, advise — never pass `activate` from this skill, not even on
      a book that binds only the user.
    - **Starter rules**: pass the candidate's `body` from `candidates.json` as
-     it is (`source: "authored"`, `source_ref: starter-rulebook@<catalog
-     version>#<id>` — keep titles stable, that pair is what makes a re-run
-     after a catalog update supersede instead of twin), plus `rulebook_id`.
+     it is (`source: "authored"`, `source_ref: starter-rulebook#<id>|catalog
+     <version>` — the server keys a re-file on the part before `#` plus the
+     title, so keep titles stable: that is what makes a re-run after a catalog
+     update supersede instead of twin), plus `rulebook_id`.
      `mode` is the one field you set: per the S2 answer and the replay's
      downward override; omit it on `session_context` / `anchor_recall` rows
-     (the server refuses one there, and the seeder already left it off).
+     (a note or anchor cannot block, so the server refuses `gate` there and
+     advise is the default; the seeder already left it off).
      Only rows that verified (S1) and that they did not strike (S3).
-     Session-start notes are capped at 15 per repo scope server-side and the
-     catalog ships four — count what the book already holds first.
+     Sessions are shown at most 15 session-start notes per scope — the rest
+     file but never appear — and the catalog ships four, so count what the
+     book already holds first.
    - **CLAUDE.md**: open a PR adding `mine-out/grabs/claude-md-additions.md`'s
      chosen sections to the repo's CLAUDE.md — a PR, never a direct edit.
    - **Skills**: write the full SKILL.md for `PROPOSE this skill` rows and
@@ -641,13 +652,15 @@ origin) and `quote_rx`.
 
 ```bash
 uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
-  --file mine-out/facets.merged.json --name "session-facets" --agent-brain-id <repo brain id>
+  --file mine-out/facets.merged.json --name "session-facets" --agent-brain-id <repo brain id> \
+  --tags rulebook
 ```
 
 Same name every time, so it versions. That is what makes friction a TEAM
 number: it carries every facet for these sessions, earlier runs' included, so
 each version is the whole picture rather than one run's slice, and the fires ledger shares
-`session_id` with it, so "rule fired, friction still happened" is a join.
+`session_id` with it, so "rule fired, friction still happened" is a join. The tag is there
+because some workspaces refuse an untagged new artifact.
 
 **Write the report for someone in their first week.** Lead with the three
 things they need, in this order, before any table:
@@ -682,7 +695,9 @@ session- and prompt-armed orderings and the `min_hook_version` each carries.
 Note the activation
 date — the next run with `--baseline-date <that date>` over fresh sessions
 (with a new facet pass) measures whether the friction shrank. Identical
-re-files are no-ops on the server, so re-running is safe.
+re-files are no-ops on the server, so re-running is safe: the `source_ref`
+bases (`starter-rulebook`, `sessions`, `claude_md`; `CLAUDE.md@<sha>` has its
+hex sha stripped) carry no date, so the same rule matches itself run to run.
 
 ## Maintaining the starter catalog
 

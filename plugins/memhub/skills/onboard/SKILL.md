@@ -4,9 +4,10 @@ argument-hint: [folder-or-file ...]
 allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub-staging_memhub__list_orgs
 ---
 
-**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
-Codex export it automatically; if it is unset (e.g. on Cursor), set it first to
-this plugin's root — the ancestor directory of this skill file that contains
+**Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code
+exports it; Codex exports `PLUGIN_ROOT` instead. If it is unset, set it first —
+from `$PLUGIN_ROOT` when that is set, otherwise (e.g. on Cursor) to this
+plugin's root — the ancestor directory of this skill file that contains
 `.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
 
 Onboard a new user onto MemHub for the repo they're in. Three things, in this
@@ -49,7 +50,9 @@ being captured" are independent facts — never treat the first as evidence of t
 second. What the hooks actually use is a **personal access key** (`mhk_…`) that
 `/memhub:login` mints and stores at `~/.config/memhub-plugin/pak-<host>.json`: a
 static bearer, because a hook is a cold background process that can never open a
-browser to refresh an expiring token. See `/memhub:login` for the full story.
+browser to refresh an expiring token. On Claude Code that same key also
+authenticates the memhub MCP tools, so no `/mcp` login is needed there. See
+`/memhub:login` for the full story.
 
 ## 1. Resolve the repo room (the durable boundary)
 - Derive the room name from the repo: `Repo: <org>/<name>` from
@@ -57,9 +60,12 @@ browser to refresh an expiring token. See `/memhub:login` for the full story.
 - `list_agent_brains` → **exact-name match**. Reuse the existing id if found (a
   teammate may have created it). **Only** `create_agent_brain` when there is no
   exact match — do NOT mint a second room for a repo that already has one, and
-  give it a real one-line description plus `category: "repo"`, which is what
-  declares this brain a code repository's room rather than leaving it
-  uncategorised.
+  give it a real one-line description, `category: "repo"` (what declares this
+  brain a code repository's room rather than leaving it uncategorised), and
+  `repo: "<org>/<name>"`, which ties it to the repository server-side. That
+  call can answer "Repo brain already exists: … (<id>)" (reuse that id) or
+  "…requires an org admin" (retry without `repo`) — the exact handling is
+  `references/repo-brain.md` §3; follow it.
 - Edge cases (SSH remotes, no remote, worktrees, **not a git repo at all**) and
   the full create-time rules are in
   `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
@@ -236,14 +242,16 @@ personal memory.
 manual. Each line is something that works from this repo as of this moment:
 
 - *Hand work to a teammate* — "hand this off to Alice" (`/memhub:handoff-session
-  <teammate>`): writes a handoff brief into a small brain and shares it, plus
-  this repo's brain, read-only with them, so they pick up with your context
-  instead of a Slack summary.
+  <teammate>`): writes a handoff brief into the handoff channel you share with
+  them (one brain per set of people, reused every time), so they pick up with
+  your context instead of a Slack summary.
 - *Share this repo's brain* — "share this brain with Bob" or "…with the
   platform workspace": the agent does it through MemHub's sharing tools.
   **If §1 CREATED the brain, lead with this one and say why:** a new brain is
   private to the person who made it — being in the same workspace grants
-  nothing — so until it is shared, teammates cannot see the docs just added,
+  nothing (the one exception: a brain bound to a granted GitHub repo, when the
+  org has turned on derived repo access) — so until it is shared, teammates
+  cannot see the docs just added,
   and a teammate who runs `/memhub:onboard` in this repo will not find it and
   will create a second, empty brain for the same repo. Once it is shared, their
   onboarding finds it by name and joins it. If §1 REUSED a teammate's brain,
@@ -254,9 +262,10 @@ manual. Each line is something that works from this repo as of this moment:
 - *Keep a document* — "save this spec to MemHub" (`/memhub:save-artifact
   <file>`): versions it in this brain under the same name.
 
-Sharing and search go through the `/mcp` connector, which is a separate login
-from the one in §0 — if either says it is not authenticated, that is the fix
-(`/mcp` → `memhub` → Authenticate), not `/memhub:login`.
+On Claude Code, sharing and search run on the same plugin key as §0, so if
+either says it is not authenticated the fix is `/memhub:login`. Cursor and
+Codex are the exception: their memhub tools use the host's own MCP sign-in
+(Cursor's connector UI, `codex mcp login`), so that is the fix there.
 
 **End with a hint about the Rulebook — optional, one or two lines, and do not
 start it.** Onboarding is finished at this point; the Rulebook is something to

@@ -130,10 +130,15 @@ def test_a_python_service_seeds_every_rule_and_all_of_them_verify() -> None:
         never = by_id["read-never"]["matcher"]["path_rx"]
         check("an ignore-template line for a directory that is not here never becomes a read gate",
               "htmlcov" not in never and not re.search(never, "/repo/src/lib/parser.py"), never)
-        check("notes and anchors carry no mode (the server refuses one)",
+        check("notes and anchors carry no mode (they cannot gate; advise is the default)",
               all("mode" not in c["body"] for c in cands if c["body"]["delivery"] != "agent_hook"))
         check("every statement fits the server's 400-character cap", all(len(c["body"]["statement"]) <= 400 for c in cands))
-        check("source_ref is stable across runs", by_id["push-main"]["source_ref"] == "starter-rulebook@%s#push-main" % CATALOG["version"])
+        check("source_ref names the rule and catalog after '#'", by_id["push-main"]["source_ref"] == "starter-rulebook#push-main|catalog %s" % CATALOG["version"])
+        # The server's re-file key base (reimport.source_ref_base): strip a hex @sha, cut at '#'. A version
+        # in the base would make every catalog update file a twin of each rule instead of superseding it.
+        base = lambda ref: re.sub(r"@[0-9a-fA-F]{7,64}(?=#|$)", "", ref, count=1).split("#", 1)[0].strip()
+        check("the re-file key base is the same for every rule and every catalog version",
+              {base(c["body"]["source_ref"]) for c in cands} == {"starter-rulebook"})
         check("nothing was written into the scanned repo",
               subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout == "")
 

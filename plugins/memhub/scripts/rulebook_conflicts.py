@@ -5,7 +5,7 @@ they are filed. Deterministic, offline-capable, stdlib only.
 Why this lives in the skill and not on the server: the server's re-import
 identity is (rulebook, source_ref path, title) and it deliberately never
 adopts a rule owned by another document — so a candidate whose title or
-matcher collides with an existing rule is filed as a second draft, silently.
+matcher collides with an existing rule is filed as a second proposed rule, silently.
 The agent running `/memhub:create-rule` or `/memhub:start-rulebook` is the
 right place to notice: it is already holding the candidates and the book, and
 it can read two statements and say "same rule" better than any key can.
@@ -58,12 +58,16 @@ import sys
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rulebook_hook import API_PATH, FETCH_TIMEOUT_S, _api, load_book  # noqa: E402
+from rulebook_hook import API_PATH, FETCH_TIMEOUT_S, _api, hook_version, load_book  # noqa: E402
 
 _NON_WORD = re.compile(r"[^\w]+")
 _ID_OK = re.compile(r"[^\x00-\x1f\x7f]{1,64}")   # a UUID is 36; no control bytes, ever
 _WS = re.compile(r"\s+")
-RETIRED = ("deprecated", "superseded")
+# Everything outside the server's SUPERSEDABLE_STATUSES (active, paused,
+# proposed — app/enums/rulebook.py). `dismissed` is a declined nomination: a
+# decision NOT to have the rule, so a title match on it must not hand out a
+# supersede line the server would refuse as `supersedes_unknown`.
+RETIRED = ("deprecated", "superseded", "dismissed")
 PRIMARY_RX = ("command_rx", "path_rx", "content_rx")
 
 
@@ -229,21 +233,37 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
             "active_book": "checked" if active is not None else "unavailable"}
 
 
-def fetch_active(repo: str) -> list[dict] | None:
+def fetch_active(repo: str) -> tuple[list[dict] | None, str]:
     """The hook view of the active book, straight from the server, NOT written
-    to the hook cache (that cache arms rules; this is a read for a report)."""
+    to the hook cache (that cache arms rules; this is a read for a report).
+
+    (rules, "") on success, else (None, why) — `why` says whether the server
+    could not be reached or answered with an error, because "unreachable" on a
+    426 sends the reader after the network when the fix is a plugin upgrade.
+
+    Sends `hook_version` exactly as the hook's own fetch does: the hook view
+    is policy-gated on it, and a request without one is refused 426 once the
+    server enforces a minimum plugin version."""
     api = _api()
     if not api:
-        return None
+        return None, "not logged in"
     base, bearer, http = api
     q = "view=hook&repo=" + urllib.parse.quote(repo, safe="")
+    have = hook_version()
+    if have:
+        q += "&hook_version=" + ".".join(str(n) for n in have)
     try:
         reply = http.rest(f"{base}{API_PATH}/rules?{q}", bearer, "GET", timeout=FETCH_TIMEOUT_S)
-    except Exception:
-        return None
+    except Exception as exc:
+        status = getattr(exc, "status", None)
+        if status:
+            minimum = getattr(exc, "minimum_version", None)
+            return None, (f"server refused the fetch (HTTP {status}"
+                          + (f", plugin {minimum} or newer required" if minimum else "") + ")")
+        return None, "server unreachable"
     if reply.status == 200 and isinstance(reply.data, dict) and isinstance(reply.data.get("rules"), list):
-        return reply.data["rules"]
-    return None
+        return reply.data["rules"], ""
+    return None, f"server answered HTTP {reply.status} without a book"
 
 
 def _load(path: str):
@@ -271,9 +291,13 @@ def _summary(report: dict) -> str:
             lines.append(f"  {c['title']}: {'+'.join(h['reasons'])} -> {h['title']} "
                          f"[{h['status']}]{where}{extra}")
             if h.get("cross_book"):
-                lines.append("    ANOTHER RULEBOOK — supersedes_rule_id cannot reach it. Both books "
-                             "bind you, so both rules fire on the same call: tell the user and let a "
-                             "human retire one side or narrow its scope.")
+                # This script never sees `bound` / membership, so it cannot say
+                # the two books bind the same person — only that anyone in both
+                # gets both rules on one call (check `bound` in list_rulebooks).
+                lines.append("    ANOTHER RULEBOOK — supersedes_rule_id cannot reach it. Anyone both "
+                             "books bind gets both rules on the same call (check `bound` in "
+                             "list_rulebooks): tell the user and let a human retire one side or "
+                             "narrow its scope.")
             elif h.get("cross_book") is None:
                 lines.append("    WHICH RULEBOOK? — this rule's own book could not be identified, "
                              "so it cannot be compared to your destination. Ask the user before "
@@ -321,12 +345,14 @@ def main(argv=None) -> int:
         except Exception as exc:
             print(f"could not read --book {matches[0]}: {exc}", file=sys.stderr)
     elif args.repo:
-        active = fetch_active(args.repo)
+        active, why = fetch_active(args.repo)
         if active is None:
             cached = load_book(args.repo)
             active = cached["rules"] if cached else None
             if active is not None:
-                print("server unreachable — using the hook's cached active book", file=sys.stderr)
+                print(f"{why} — using the hook's cached active book", file=sys.stderr)
+            else:
+                print(f"{why} — no cached active book either", file=sys.stderr)
     report = find_conflicts(candidates, existing, active, args.rulebook_id)
     print(json.dumps(report, indent=1))
     print("\nCONFLICTS (deterministic; then judge the rest by statement):\n" + _summary(report),

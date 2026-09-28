@@ -71,18 +71,14 @@ _CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 
 
 def _plugin_root() -> Path:
-    """The installed plugin dir — prod ``memhub`` or ``memhub-staging``.
+    """The installed plugin dir, whose manifests and ``.mcp.json`` say what it is.
 
     Claude sets ``$CLAUDE_PLUGIN_ROOT``, but Cursor's compatibility loader can
     set it to a different installed plugin. Trust the variable only when its
-    auth module is this running file. This also preserves the staging layout:
-    ``scripts/`` is symlinked into the prod plugin in the source tree, so
-    ``samefile`` recognizes the shared module while returning the staging root
-    and its staging ``.mcp.json``.
+    auth module is this running file.
 
     When no trustworthy root is present (a standalone script or Cursor), use
-    this file's unresolved location. Resolving it would collapse the staging
-    symlink to the prod plugin and select the wrong backend.
+    this file's unresolved location.
     """
     root = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if root:
@@ -92,8 +88,8 @@ def _plugin_root() -> Path:
                 return candidate
         except OSError:
             pass
-    # A copied staging install passes samefile above because __file__ is in that
-    # copy; reaching here means the advertised root does not own this module.
+    # A copied install passes samefile above because __file__ is in that copy;
+    # reaching here means the advertised root does not own this module.
     return Path(__file__).parent.parent
 
 
@@ -109,6 +105,17 @@ def _plugin_mcp_config() -> dict:
 
 
 def default_url() -> str:
+    """The backend this install talks to: the url in its own ``.mcp.json``.
+
+    ``$MEMHUB_MCP_BASE_URL`` overrides it, and nothing else is consulted. The
+    plugin's directory says nothing about the backend: the public ``memhub`` is
+    an export of the ``memhub-staging`` tree with a different ``.mcp.json``. So
+    an unreadable config raises rather than guessing. Background-hook callers
+    (flush_session, directive_recall) wrap resolve_url_and_auth() in a
+    top-level ``except BaseException`` and exit 0 quietly; the raise only
+    surfaces to a foreground script, where failing loud beats silently talking
+    to the wrong backend.
+    """
     base = os.environ.get("MEMHUB_MCP_BASE_URL")
     if base:
         path = os.environ.get("MEMHUB_MCP_SERVER_PATH", "/mcp-server/mcp")
@@ -121,29 +128,43 @@ def default_url() -> str:
             parts = urllib.parse.urlsplit(url)
             query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
                      if k != "memhub_plugin_version"]
-            return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
-    except Exception:  # noqa: BLE001
-        pass
-    # .mcp.json was unreadable/corrupt. Don't guess a fixed URL — a single
-    # hardcoded env is wrong for one of the two installs (this module is shared
-    # with memhub-staging). Derive the backend from the plugin PATH: the install
-    # dir is .../<plugin-name>/<version>/, so the version basename says nothing —
-    # match the whole path, which always contains "memhub" for a real install, so
-    # the raise below is unreachable in practice. Background-hook callers
-    # (flush_session, directive_recall) wrap resolve_url_and_auth() in a
-    # top-level `except BaseException` and exit 0 quietly, so even if it did fire
-    # it degrades soft there; the raise only ever surfaces to a foreground
-    # script, where failing loud beats silently talking to the wrong backend.
-    root = str(_plugin_root()).lower()
-    if "staging" in root:
-        return "https://api.staging.memhub.xtrace.ai/mcp-server/mcp"
-    if "memhub" in root:
-        return "https://api.memhub.xtrace.ai/mcp-server/mcp"
-    raise RuntimeError(
-        "Cannot determine the MemHub backend: .mcp.json is unreadable and the "
-        f"plugin path ({_plugin_root()}) is unrecognized. "
-        "Set MEMHUB_MCP_BASE_URL explicitly."
-    )
+            url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Cannot determine the MemHub backend: {_plugin_root() / '.mcp.json'} "
+            f"is unreadable ({type(exc).__name__}). Set MEMHUB_MCP_BASE_URL explicitly."
+        ) from exc
+    if not url:
+        raise RuntimeError(
+            f"Cannot determine the MemHub backend: {_plugin_root() / '.mcp.json'} "
+            "names no url. Set MEMHUB_MCP_BASE_URL explicitly.")
+    return url
+
+
+def plugin_name() -> str:
+    """This install's plugin name: ``memhub``, or ``memhub-staging``.
+
+    Every host namespaces the plugin's skills by it, so a message telling the
+    user which command to run must use it: ``/memhub:login`` does not exist on
+    a staging install. Read from the installed manifests, which
+    tests/version_parity_test.py keeps in agreement; ``memhub`` when none is
+    readable.
+    """
+    root = _plugin_root()
+    for rel in ("plugin.json", ".claude-plugin/plugin.json",
+                ".codex-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+        try:
+            name = json.loads((root / rel).read_text(encoding="utf-8")).get("name")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(name, str) and name:
+            return name
+    return "memhub"
+
+
+def skill_command(skill: str) -> str:
+    """How the user runs ``skill`` on this install, e.g. ``/memhub-staging:login``."""
+    return f"/{plugin_name()}:{skill}"
 
 
 def token_cache_path(url: str) -> Path:
@@ -268,34 +289,52 @@ def _make_callback_handler(port: int):
     never replaying a stale code."""
 
     async def callback_handler() -> tuple[str, str | None]:
+        from plugin_onboarding import active_completion, send_callback_response
+
+        completion = active_completion.get()
         result: dict = {}
         done = threading.Event()
 
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                q = parse_qs(urlparse(self.path).query)
+                parsed = urlparse(self.path)
+                if parsed.path != "/callback":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                q = parse_qs(parsed.query)
                 code = q.get("code", [None])[0]
                 error = q.get("error", [None])[0]
                 if code is None and error is None:
-                    # favicon / browser prefetch / stray probe — NOT the
-                    # OAuth redirect; keep waiting.
                     self.send_response(404)
                     self.end_headers()
                     return
                 result["code"] = code
                 result["state"] = q.get("state", [None])[0]
                 result["error"] = error
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                self.wfile.write(
-                    b"<html><body><h3>MemHub plugin authenticated."
-                    b" You can close this tab.</h3></body></html>"
-                    if code else
-                    b"<html><body><h3>Authentication failed - see terminal."
-                    b"</h3></body></html>"
-                )
+                if completion is not None:
+                    completion.callback_received = True
+                # Unblock the SDK for state validation, PKCE exchange and storage.
+                # Hold the browser response until the foreground command verifies
+                # the credential. Closing the listening socket does not close this
+                # accepted request socket.
                 done.set()
+                try:
+                    if code and not error and completion is not None:
+                        finished = completion.finished.wait(120)
+                        send_callback_response(
+                            self, succeeded=finished and completion.succeeded,
+                            destination=completion.destination,
+                        )
+                    else:
+                        # Callers outside login.py have no verified completion
+                        # signal. A callback code must never be called a success.
+                        send_callback_response(self, succeeded=bool(code) and not error)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # A closed browser must not discard a valid login.
+                finally:
+                    if completion is not None:
+                        completion.response_sent.set()
 
             def log_message(self, *args):
                 return

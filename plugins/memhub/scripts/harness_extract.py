@@ -2,9 +2,9 @@
 """Harness-tied memory, the client half: which moments of a session deserve
 the coding agent's attention.
 
-Nothing here writes a rule. At each turn's Stop — on by default since v0.69.0,
-off with `MEMHUB_HARNESS_EXTRACT=0` — `harness_stop.py` runs that turn through
-this pipeline in a detached child:
+Nothing here writes a rule. At each turn's Stop — only with
+`MEMHUB_HARNESS_EXTRACT=1`; off by default — `harness_stop.py` runs that turn
+through this pipeline in a detached child:
 
     router       deterministic regexes over the turn, no model and no cost.
                  It labels a moment (a correction, a retraction, a reuse
@@ -46,8 +46,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 FLAG = "MEMHUB_HARNESS_EXTRACT"
+CHILD_FLAG = "MEMHUB_HARNESS_CHILD"   # set by harness_stop.run_author
 _ON = ("1", "on", "true", "yes")
-_OFF = ("0", "off", "false", "no")
 
 CLASSIFY_PATH = "/v1/team/rulebook/harness/classify"
 # The server bounds its judge at 20 s. One attempt, and this is the whole wait:
@@ -60,19 +60,27 @@ CLIENT_REASONS = ("no_credential", "transport_error", "bad_reply")
 
 
 def extract_enabled(environ=None) -> bool:
-    """The one switch for the whole sensor. Default ON.
+    """The one switch for the whole sensor. Default OFF.
 
-    It was opt-in through the dogfood: the sensor spends a classifier call per
+    Opt-in because of what on costs: the sensor spends a classifier call per
     flagged turn, and the drain behind it spends a headless authoring run per
-    moment on the PERSON'S OWN model quota. (Naming that command literally here
-    trips `test_nothing_in_the_client_writes_a_rule`, whose substring scan
-    cannot tell prose from code — and the guard is worth more than the
-    sentence: nothing in THIS module may author.) Default-on means an install starts doing
-    both without being asked, which is a product decision (Felix, 2026-09-20)
-    and not one this function should relitigate — but it is why the off switch
-    has to keep working for every spelling someone reaches for."""
+    moment on the PERSON'S OWN model quota, filing proposals into a shared team
+    rulebook. (Naming that command literally here trips
+    `test_nothing_in_the_client_writes_a_rule`, whose substring scan cannot
+    tell prose from code — and the guard is worth more than the sentence:
+    nothing in THIS module may author.) v0.69.0 through v0.75.x defaulted this
+    ON; it went back to opt-in so an install never starts spending that
+    without being asked. Unset, blank and unrecognised values are all off."""
     env = os.environ if environ is None else environ
-    return str(env.get(FLAG, "")).strip().lower() not in _OFF
+    if str(env.get(CHILD_FLAG, "")).strip().lower() in _ON:
+        # An authoring child is never sensed, whatever FLAG says. `run_author`
+        # sets FLAG=0 for it, but Claude Code applies a settings.json `env`
+        # OVER the environment a process inherits, and settings is where an
+        # install opts in with FLAG=1. So every opted-in install re-armed the
+        # lane in every child: the child's own turns were classified and
+        # drained, and one fork spawned the next.
+        return False
+    return str(env.get(FLAG, "")).strip().lower() in _ON
 
 
 # ------------------------------------------------------------------- files
@@ -159,6 +167,10 @@ _SYS_BLOCK = re.compile(
     re.S,
 )
 _HARNESS_PREFIX = (
+    # An author child's first prompt (harness_stop.BLOCK_PREFIX). Were such a
+    # session ever sensed, its one turn is the create-rule flow — the text most
+    # likely to be flagged — and flagging it is how one child spawned the next.
+    "MemHub harness: before you stop",
     "Base directory for this skill",
     "Continue from where you left off",
     "Caveat: The messages below",
@@ -701,9 +713,11 @@ def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
 
 
 # ------------------------------------------------------------------- spawn
-def spawn_detached(argv: list[str], script: Path, log_name: str) -> int:
+def spawn_detached(argv: list[str], script: Path, log_name: str,
+                   pass_fds: tuple = ()) -> int:
     """Run `script argv` fully detached: the caller is a hook that must return
-    at once, and the child must survive the session ending."""
+    at once, and the child must survive the session ending. `pass_fds` are
+    inherited — the author lane hands its lock fds down this way."""
     args = [sys.executable, str(script)] + list(argv)
     log_file = log_path(log_name)
     try:
@@ -715,6 +729,10 @@ def spawn_detached(argv: list[str], script: Path, log_name: str) -> int:
     try:
         kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
                   "close_fds": True}
+        if pass_fds:
+            # POSIX only: the author lane passes none on Windows, where an
+            # inherited handle carries no lock (harness_stop.take_lease).
+            kwargs["pass_fds"] = tuple(pass_fds)
         if os.name == "nt":
             kwargs["creationflags"] = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

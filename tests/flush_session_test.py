@@ -371,6 +371,39 @@ check("a malformed payload is reported, not raised",
       any("skipped" in line for line in lines))
 
 
+# The harness's authoring pass forks the person's session under a NEW id
+# (`claude -p --resume <owner> --fork-session`). Its SessionEnd and commit
+# flushes shipped that copy as another conversation, once per pass. The same
+# payload without the flag must reach the flush, or this proves nothing.
+
+
+def _child_run(flag):
+    calls = []
+
+    async def fake_flush(session_id, transcript_path):
+        calls.append(session_id)
+
+    class FakeIn:
+        def read(self):
+            return _json.dumps({"session_id": "fork-1", "transcript_path": __file__})
+
+    real_flush, real_log, stdin = fs._flush, fs._log, sys.stdin
+    saved = os.environ.pop("MEMHUB_HARNESS_CHILD", None)
+    os.environ["MEMHUB_HARNESS_CHILD"] = flag
+    fs._flush, fs._log, sys.stdin = fake_flush, (lambda _m: None), FakeIn()
+    try:
+        return fs.main(), calls
+    finally:
+        fs._flush, fs._log, sys.stdin = real_flush, real_log, stdin
+        os.environ.pop("MEMHUB_HARNESS_CHILD", None)
+        if saved is not None:
+            os.environ["MEMHUB_HARNESS_CHILD"] = saved
+
+
+check("a harness child exits 0 and ships nothing", _child_run("1") == (0, []))
+check("the same payload outside a child ships", _child_run("") == (0, ["fork-1"]))
+
+
 print(f"{'FAIL' if FAILURES else 'PASS'}: flush_session")
 for f in FAILURES:
     print(f"  - {f}")

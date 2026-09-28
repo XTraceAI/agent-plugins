@@ -72,6 +72,7 @@ import transcript_chunks  # noqa: E402
 from transcript_filter import (  # noqa: E402
     elide_oversized_tool_results,
     is_command_wrapper,
+    is_harness_child,
 )
 
 # All at module scope now. These used to be deferred into :func:`_flush`
@@ -82,7 +83,7 @@ from transcript_filter import (  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
-from _memhub_auth import resolve_bearer  # noqa: E402
+from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room  # noqa: E402
 
@@ -854,7 +855,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 # Unauthenticated: no credential, or one the server won't
                 # accept. /memhub:login mints a new one, so the advice
                 # converges.
-                _log("credential rejected; run /memhub:login — skipping")
+                _log(f"credential rejected; run {skill_command('login')} — skipping")
                 _mark_failure(session_id, "auth",
                               "server rejected the credential (401)")
             elif e.status == 403:
@@ -1075,6 +1076,8 @@ class _NoCredential(RuntimeError):
 
 
 def main() -> int:
+    if is_harness_child():
+        return 0  # the harness's forked copy of a session; see is_harness_child
     lock_fd: int | None = None
     # Bound BEFORE the try so the handler can always write a breadcrumb. Reading
     # stdin or parsing it is itself a failure path, and a NameError raised from
@@ -1088,6 +1091,8 @@ def main() -> int:
         if not session_id or not transcript_path \
                 or not Path(transcript_path).exists():
             return 0
+        if is_harness_child(session_id=session_id):
+            return 0  # on the children list, whatever the environment says
         lock_fd = _acquire(session_id)
         if lock_fd is None:
             return 0  # a flush is already in flight; its successor carries ours
@@ -1109,7 +1114,7 @@ def main() -> int:
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
             reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
         elif isinstance(e, _NoCredential):
-            _log("no usable credential; run /memhub:login "
+            _log(f"no usable credential; run {skill_command('login')} "
                  "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
             # The one failure the user must act on personally, and the one that
             # stays broken forever until they do: no retry can mint a token.

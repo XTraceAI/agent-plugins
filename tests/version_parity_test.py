@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import sys
-from urllib.parse import urlsplit, parse_qs
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +34,29 @@ MANIFESTS = {
 AP_SCHEMA_PREFIX = "https://agent-plugins.org/schemas/"
 MCP_AP = MEMHUB / "mcp.json"          # Agent Plugins format (Codex, Cursor, …)
 MCP_CLAUDE = MEMHUB / ".mcp.json"     # Claude Code format (carries oauth)
-MCP_STAGING = ROOT / "plugins" / "memhub-staging" / ".mcp.json"
+PRODUCTION_MCP_URL = "https://api.memhub.xtrace.ai/mcp-server/mcp"
+
+
+def connection_errors(config: dict, version: str, canonical_url: str) -> list[str]:
+    """Permit the shipped baseline while requiring stable OAuth URLs on promotions."""
+    server = config.get("mcpServers", {}).get("memhub", {})
+    # CI must land before the generated promotion (which contains only plugins/).
+    # Preserve only the already-shipped 0.76.1 baseline; remove this exception
+    # after the first header-based promotion. Never allow it for new versions.
+    if (version == "0.76.1"
+            and server.get("url") == canonical_url + "?memhub_plugin_version=0.76.1"
+            and not server.get("headers")):
+        return []
+    errors = []
+    if server.get("url") != canonical_url:
+        errors.append(f"MCP URL must stay {canonical_url!r} across releases; "
+                      "query parameters change the registered OAuth identity")
+    reported = [value for name, value in server.get("headers", {}).items()
+                if name.lower() == "x-memhub-plugin-version"]
+    if reported != [version]:
+        errors.append(f"loaded MCP connection must send one version header "
+                      f"matching package {version}, got {reported}")
+    return errors
 
 
 def _reject_dupes(pairs: list[tuple[str, object]]) -> dict:
@@ -76,23 +97,11 @@ def main() -> int:
               "     Bump ALL manifests together.")
         return 1
     print("\nok  all production manifests declare the same version")
-    # Staging is released separately. Do not advance its version as a side
-    # effect of a production release, but still validate its manifest JSON.
-    staging_manifest = _load(ROOT / "plugins/memhub-staging/.claude-plugin/plugin.json")
-    if staging_manifest is None or not staging_manifest.get("version"):
-        return 1
-
-    staging_codex = _load(ROOT / "plugins/memhub-staging/.codex-plugin/plugin.json")
-    if staging_codex is None or staging_codex.get("version") != staging_manifest["version"]:
-        print("FAIL staging Claude and Codex versions differ")
-        return 1
 
     ap_root = _load(MEMHUB / "plugin.json")
     ap_mcp = _load(MCP_AP)
     claude_mcp = _load(MCP_CLAUDE)
-    staging_mcp = _load(MCP_STAGING)
-    if (ap_root is None or ap_mcp is None or claude_mcp is None
-            or staging_mcp is None):
+    if ap_root is None or ap_mcp is None or claude_mcp is None:
         return 1
 
     failures = 0
@@ -104,8 +113,7 @@ def main() -> int:
     if not failures:
         print("ok  AP manifests carry the agent-plugins.org $schema")
 
-    for label, config in (("production", claude_mcp),
-                          ("staging", staging_mcp)):
+    for label, config in (("production", claude_mcp),):
         server = config.get("mcpServers", {}).get("memhub", {})
         cursor_client = server.get("auth", {}).get("CLIENT_ID")
         capture_client = server.get("oauth", {}).get("clientId")
@@ -124,19 +132,13 @@ def main() -> int:
     ap_url, claude_url = server_url(ap_mcp), server_url(claude_mcp)
     print(f"  mcp.json   → {ap_url}")
     print(f"  .mcp.json  → {claude_url}")
-    # Compare ignoring query string: the AP entry may carry an install-channel
-    # tag (?client=…) without pointing anywhere different.
-    strip = lambda u: (u or "").split("?")[0]
-    if not ap_url or strip(ap_url) != strip(claude_url):
-        print("\nFAIL MCP endpoints disagree — AP-installed hosts (Codex, Cursor)\n"
-              "     would talk to a different backend than Claude installs.")
+    if not ap_url or ap_url != claude_url:
+        print("FAIL MCP endpoints disagree between AP and Claude installs")
         return 1
     for config, expected in ((ap_mcp, versions["memhub (AP root)"]),
-                             (claude_mcp, versions["memhub (claude)"]),
-                             (staging_mcp, staging_manifest["version"])):
-        reported = parse_qs(urlsplit(server_url(config)).query).get("memhub_plugin_version")
-        if reported != [expected]:
-            print(f"FAIL loaded MCP connection must report package version {expected}, got {reported}")
+                             (claude_mcp, versions["memhub (claude)"])):
+        for error in connection_errors(config, expected, PRODUCTION_MCP_URL):
+            print(f"FAIL {error}")
             failures += 1
     print("ok  both MCP configs point at the same server")
     return 0 if not failures else 1

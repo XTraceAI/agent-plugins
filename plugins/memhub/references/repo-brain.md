@@ -116,12 +116,37 @@ Creating a brain is the last resort, never the first move.
 2. `list_agent_brains` → look for an **exact-name match**. Reuse that
    `agent_brain_id` if found — a teammate may have created the room, and
    theirs is the right one.
-3. No exact match → before creating, run `search_brains` with the repo or
-   topic in natural language. An existing brain may hold this subject under
-   a different name; prefer it over minting a near-duplicate.
-4. Only when both come back empty: `create_agent_brain` (omit
-   `workspace_id` so it lands in your own workspace and you keep the
-   contributor access that sharing requires).
+3. *Optional*, when a person is in the loop to judge a near-match: run
+   `search_brains` with the repo or topic in natural language — an existing
+   brain may hold this subject under a different name. The skills that
+   resolve a repo room (onboard, pr-babysit) skip it: the exact name is the
+   dedup that matters.
+4. No exact match: `create_agent_brain` with `name: "Repo: <org>/<name>"`,
+   `category: "repo"`, a description (§5), and **`repo: "<org>/<name>"`** —
+   the §1 name without the `Repo: ` prefix. Omit `workspace_id`. `repo` ties
+   the brain to the repository on the server: when the org has granted that
+   GitHub repo to a workspace, the brain is bound there (and the grant
+   already auto-created a `Repo: <org>/<name>` brain, so there is usually one
+   to find); when it has not, the brain is created unbound (`repo.bound:
+   false`) and **the server does not refuse a second one** — step 2's
+   exact-name match is the only guard. A later grant adopts the unbound brain
+   only when it is the ONLY one for that repo; with two, it adopts neither and
+   creates a third. Read the error
+   **message** — the tool passes back text, not a reason code:
+   - `Repo brain already exists: <name> (<id>)` → the repo's bound brain
+     exists but you could not see it in step 2. Reuse the id in the
+     parentheses; do not create another. (Not visible usually means not
+     shared with you — if a write to it is refused, ask for it to be shared.)
+   - `Repo brain governance requires an org admin` → the repo is granted and
+     only an org admin may create its brain. Retry the same call **without**
+     `repo`, and tell the user an admin-owned brain for this repo exists
+     that an admin can share with them.
+   - `Use a GitHub URL or owner/repo` / `Use a repository name or owner/repo`
+     → the server could not parse the name (rare); retry without `repo`.
+
+   Omitting `workspace_id` lands an unbound brain in your own workspace, so
+   you keep the contributor access that sharing requires; a bound brain
+   lands in the grant's workspace, and you still hold it as its creator.
 
 Duplicate brains are the main way a MemHub org degrades: cross-brain routing
 ranks brains by their overview, so several near-identical rooms on one
@@ -191,8 +216,8 @@ description is effectively invisible when picking from a list.
 Write one line answering **what questions this brain can answer**. Name the
 subject and the kind of content.
 
-- Good — "Shared room for the xmem repo: specs, PR babysit sessions,
-  reviews, and imported implementation sessions."
+- Good — "Shared room for the xmem repo: specs, PR review records, and the
+  task episodes of the sessions that built it."
 - Useless — "xmem stuff", "notes", or an empty description.
 
 ## 6. Say where things landed

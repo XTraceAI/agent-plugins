@@ -1,0 +1,4 @@
+{
+  "description": "The MemHub companion above the prompt: one animal (/goose by default, /hippo, /penguin, and any other in animals/), asleep while idle, looking around while Claude answers or you type, and up announcing each MemHub rule that fires — crossly when one blocks a call.",
+  "modules": ["./register.ts"]
+}

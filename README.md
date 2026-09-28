@@ -342,7 +342,7 @@ both will fire, so it goes to you as a decision.
 
 ### Harness-tied memory (flagged off)
 
-On by default since v0.69.0 (set `MEMHUB_HARNESS_EXTRACT=0` to turn it off), the plugin helps a
+With `MEMHUB_HARNESS_EXTRACT=1` in the environment, the plugin helps a
 correction you make in a session become a proposed team rule. At each turn's
 Stop, a detached child sends a redacted slice of that turn to MemHub
 (`POST /v1/team/rulebook/harness/classify`), whose classifier says whether the
@@ -363,11 +363,16 @@ With the variable unset, the default, none of this runs.
 
 ## Skills
 
-Sixteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Seventeen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
 
+- `/memhub:companion [on | off | status]` — turns on the companion, the
+  pixel animal in the band above the prompt that sleeps while idle, watches
+  while Claude works, and stands up to announce a rule that fired. Enables
+  the function-hook runtime it needs and persists it; `/hippo` is the
+  animal's own command.
 - `/memhub:setup [--status | --remove]` — installs, checks, or removes the
   Codex user-hooks compatibility bridge; on Claude Code and Cursor it checks
   the native integration without writing Codex configuration.

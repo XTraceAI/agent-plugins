@@ -149,6 +149,10 @@ async def main() -> int:
                     help="agent brain to save into. Default: the repo's room — "
                          "cached in ~/.config/memhub-plugin/rooms.json, or resolved "
                          "from the server on a cache miss")
+    ap.add_argument("--org-id", default=None,
+                    help="org that owns --agent-brain-id, for accounts in more than "
+                         "one org (list_orgs). A brain resolves inside one org, so "
+                         "without it a brain outside the default org is 'not found'")
     ap.add_argument("--no-room", action="store_true",
                     help="ignore the repo's cached room and save into personal "
                          "workspace memory")
@@ -210,6 +214,8 @@ async def main() -> int:
             call_args["entrypoint"] = args.entrypoint
     if args.agent_brain_id:
         call_args["agent_brain_id"] = args.agent_brain_id
+    if args.org_id:
+        call_args["org_id"] = args.org_id
     if args.parent_id:
         call_args["parent_id"] = args.parent_id
     if args.rationale:
