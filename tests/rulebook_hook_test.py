@@ -2641,6 +2641,12 @@ def min_hook_version_checks() -> None:
               len(deep_rx) <= H._RX_MAX and not H.rx_ok(deep_rx)
               and H.to_hook_rule(_row("deep-rx", {"event": "bash", "command_rx": deep_rx}))
               is None)
+        # Short, and never caught by the length bound: the parser raises
+        # OverflowError for a repetition count it cannot hold.
+        check("regex: a repetition count too large for the parser drops the rule, no traceback",
+              not H.rx_ok("a{99999999999}")
+              and H.to_hook_rule(_row("big-rep", {"event": "bash", "command_rx": "a{99999999999}"}))
+              is None)
 
         # An ordering rule needs its arming event first; this one says
         # `session`, so the session lane has to have run.

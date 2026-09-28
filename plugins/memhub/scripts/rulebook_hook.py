@@ -1946,9 +1946,10 @@ def rx_ok(pat):
         return False
     try:
         re.compile(pat)
-    except (re.error, RecursionError):
-        # A deeply nested pattern trips the parser's recursion limit rather
-        # than `re.error`; the wider length bound lets it reach `re.compile`.
+    except Exception:
+        # Not only `re.error`: a deeply nested pattern raises RecursionError
+        # and `a{99999999999}` raises OverflowError. Whatever the parser
+        # objects to, the answer is the same — this pattern does not load.
         return False
     return True
 
