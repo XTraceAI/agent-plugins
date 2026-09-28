@@ -1927,9 +1927,9 @@ _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_
 # Length is a bound on what one rule can cost to compile and store, NOT the
 # backtracking guard — `_RX_NESTED` below is. A 60-character pattern can stall
 # and a 1,500-character alternation of literal paths cannot, so the bound is
-# wide enough for the second. It was 400 before 0.75.0: a hook older than that
+# wide enough for the second. It was 400 before 0.88.0: a hook older than that
 # drops any rule carrying a longer pattern, which is why the server floors such
-# a rule at `min_hook_version` 0.75.0.
+# a rule at `min_hook_version` 0.88.0.
 _RX_MAX = 2000
 # (a+)+, (\d+)+$, (a|a)+, (.*), .*.* — the classic backtracking shapes. A
 # denylist, not a proof: stdlib `re` has no timeout, and a bounded matcher
@@ -1946,7 +1946,9 @@ def rx_ok(pat):
         return False
     try:
         re.compile(pat)
-    except re.error:
+    except (re.error, RecursionError):
+        # A deeply nested pattern trips the parser's recursion limit rather
+        # than `re.error`; the wider length bound lets it reach `re.compile`.
         return False
     return True
 

@@ -93,6 +93,9 @@ def main() -> int:
     rc, out = run(bash(command_rx="(a+)+$"), "--fires", "aaa")
     check("a catastrophically backtracking pattern is a LOAD failure",
           rc == 1 and "LOAD   FAIL" in out, out)
+    rc, out = run(bash(command_rx="(" * 500 + "a" + ")" * 500), "--fires", "aaa")
+    check("a deeply nested pattern under the length bound is a LOAD failure, not a traceback",
+          rc == 1 and "LOAD   FAIL" in out and "Traceback" not in out, out)
     rc, out = run(bash(command_rx="[unclosed"), "--fires", "x")
     check("a pattern that does not compile is a LOAD failure", rc == 1 and "LOAD   FAIL" in out, out)
 

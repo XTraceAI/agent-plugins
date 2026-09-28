@@ -2634,6 +2634,13 @@ def min_hook_version_checks() -> None:
               and H.to_hook_rule(_row("over-rx", {"event": "bash",
                                                   "command_rx": "a" * (H._RX_MAX + 1)}))
               is None)
+        # Under the bound but past the parser's recursion limit: `re.compile`
+        # raises RecursionError, not re.error. The rule drops; nothing tracebacks.
+        deep_rx = "(" * 500 + "a" + ")" * 500
+        check("regex length: a deeply nested pattern under _RX_MAX drops the rule, no traceback",
+              len(deep_rx) <= H._RX_MAX and not H.rx_ok(deep_rx)
+              and H.to_hook_rule(_row("deep-rx", {"event": "bash", "command_rx": deep_rx}))
+              is None)
 
         # An ordering rule needs its arming event first; this one says
         # `session`, so the session lane has to have run.
