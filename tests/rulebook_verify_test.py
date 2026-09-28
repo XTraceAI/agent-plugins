@@ -87,12 +87,18 @@ def main() -> int:
           rc == 1 and "SILENT FAIL" in out, out)
 
     # --- the silent-drop class --------------------------------------------
-    rc, out = run(bash(command_rx="a" * 450), "--fires", "aaa")
+    rc, out = run(bash(command_rx="a" * 2050), "--fires", "aaa")
     check("a pattern over the hook's length bound is reported as a LOAD failure",
           rc == 1 and "LOAD   FAIL" in out and "longer than" in out, out)
     rc, out = run(bash(command_rx="(a+)+$"), "--fires", "aaa")
     check("a catastrophically backtracking pattern is a LOAD failure",
           rc == 1 and "LOAD   FAIL" in out, out)
+    rc, out = run(bash(command_rx="(" * 500 + "a" + ")" * 500), "--fires", "aaa")
+    check("a deeply nested pattern under the length bound is a LOAD failure, not a traceback",
+          rc == 1 and "LOAD   FAIL" in out and "Traceback" not in out, out)
+    rc, out = run(bash(command_rx="a{" + "9" * 500 + "}"), "--fires", "aaa")
+    check("a repetition count the parser cannot hold is a LOAD failure, not a traceback",
+          rc == 1 and "LOAD   FAIL" in out and "Traceback" not in out, out)
     rc, out = run(bash(command_rx="[unclosed"), "--fires", "x")
     check("a pattern that does not compile is a LOAD failure", rc == 1 and "LOAD   FAIL" in out, out)
 

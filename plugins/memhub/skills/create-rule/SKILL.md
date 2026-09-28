@@ -499,7 +499,7 @@ raised the subject.
 It exits non-zero until every case behaves. **Do not file a rule while it
 exits non-zero, and show the table to the user.** What each line means:
 
-- **LOAD** — whether the hook would load the rule at all. A pattern over 400
+- **LOAD** — whether the hook would load the rule at all. A pattern over 2000
   characters, one that does not compile, or one that backtracks is dropped
   *silently* on every teammate's machine: the rule exists, is active, and
   never fires. This line is the only warning you get.

@@ -49,7 +49,7 @@ CMD = r"(?:^|[;&]\s*|\|\s+)"
 # Written without a quantified group: the hook's load lint drops those.
 # `/usr/bin/git` is the same program: a path in front of it is not a way round every git rule.
 GIT = CMD + r"(?:sudo\s+)?(?:\S*/)?git\s+(?:-[cC]\s*\S+\s+)?"
-RX_MAX = 400
+RX_MAX = 2000        # the hook's `_RX_MAX` since 0.88.0; the server floors a pattern over 400 at that version
 # Appended to a command pattern to make it a RECEIPT: the command, but not an invocation that exits 0
 # having done none of the work — `pytest --version`, `eslint --help`, `pytest --collect-only`.
 _RAN_NOTHING = (r"\b(?![^|;&]*\s(?:--version|-V|--help|-h|--collect-only|--co|--fixtures|--markers|--setup-plan"
@@ -96,7 +96,7 @@ def _alt(parts) -> str:
 
 def _fit(prefix: str, extras: list[str], suffix: str = "") -> str:
     """Append alternatives while the whole pattern stays loadable. The hook
-    drops a rule whose pattern passes 400 characters, silently, so a long
+    drops a rule whose pattern passes `RX_MAX` characters, silently, so a long
     repo-derived list is cut here rather than shipped dead."""
     rx = prefix
     for e in extras:

@@ -4,7 +4,7 @@
       "type": "http",
       "url": "https://api.memhub.xtrace.ai/mcp-server/mcp",
       "headers": {
-        "X-MemHub-Plugin-Version": "0.87.0"
+        "X-MemHub-Plugin-Version": "0.88.0"
       },
       "headersHelper": "python3 -s -E \"${CLAUDE_PLUGIN_ROOT}/scripts/mcp_headers.py\"",
       "auth": {
