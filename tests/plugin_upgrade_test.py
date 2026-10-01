@@ -104,10 +104,14 @@ class UpgradeTests(unittest.TestCase):
         notice = {'hookSpecificOutput': {'additionalContext': 'PLUGIN_UPGRADE_REQUIRED'}}
         result = subprocess.CompletedProcess([], 0, json.dumps(notice).encode(), b'')
         other = subprocess.CompletedProcess([], 0, json.dumps({'hookSpecificOutput': {'additionalContext': 'existing'}}).encode(), b'')
-        with patch.object(codex, '_run', return_value=result), patch.object(codex, '_directive_result', return_value=other):
+        # PostToolUse: the rulebook lane (which carries the notice) runs
+        # beside the artifact lane, and their contexts are merged.
+        with patch.object(codex, '_rulebook_result', return_value=result), \
+                patch.object(codex, '_artifact_sync_result', return_value=other):
             output = io.StringIO()
             with redirect_stdout(output):
-                codex._dispatch(ROOT / 'plugins/memhub', b'{"cwd":"/tmp"}', 'PreToolUse')
+                codex._dispatch(ROOT / 'plugins/memhub',
+                                b'{"cwd":"/tmp","tool_name":"apply_patch"}', 'PostToolUse')
         value = json.loads(output.getvalue())
         self.assertEqual(value['hookSpecificOutput']['additionalContext'], 'PLUGIN_UPGRADE_REQUIRED\n\nexisting')
 

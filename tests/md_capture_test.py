@@ -400,34 +400,65 @@ with tempfile.TemporaryDirectory() as td:
         asyncio.run(f.flush(sid7))
         check(seen_args and seen_args[-1].get("org_id") == "ORG-2", "the room's org_id is sent with its brain id")
 
-        # Git specs have one authored source; auto-capture must not publish another.
-        sid8 = "sess-md-flush-linked"
+        # A cached room the backend disowns is evicted — session capture used
+        # to do that as a side effect, and sessions never name a brain now.
+        forgot: list = []
+        f.forget_room = lambda cwd=None, env=None: forgot.append(cwd) or True
+        async def refuse_missing(session, call_args):
+            raise f.SaveRejected("tool error: Agent brain not found")
+        async def refuse_other(session, call_args):
+            raise f.SaveRejected("tool error: tags are required")
+        f.read_room = lambda *a, **k: {"brain_id": "B-DEAD", "name": "Repo: x/y"}
+        f._save = refuse_missing
+        r7.write_text("# R7\n" + "d" * 7000, encoding="utf-8")
+        mc.save_state(sid7, {"dirty": [str(r7)], "saved": {}, "attempts": {}})
+        asyncio.run(f.flush(sid7))
+        check(forgot == [r7.parent], f"'Agent brain not found' for a cached room → forgotten: {forgot}")
+        check(mc.load_state(sid7)["dirty"] == [str(r7)], "the file stays dirty for the next Stop")
+        forgot.clear()
+        f._save = refuse_other
+        asyncio.run(f.flush(sid7))
+        check(forgot == [], "any other refusal keeps the cached room")
+        f._save = capture_save
+
+        # Spec files are captured like any markdown; the SERVER decides whether
+        # to store one (it answers "mirror_owns_file" when the brain mirrors the
+        # file from git). A mirror-owned answer is handled, not failed: recorded
+        # with its digest, never retried until the content changes.
+        sid8 = "sess-md-flush-specs"
         (root / "docs/specs").mkdir(parents=True, exist_ok=True)
         owned = root / "docs/specs/owned-spec.md"
         owned.write_text("---\nspec: owned\nowns: [app/a.py]\n---\n# Owned\n" + "o" * 7000, encoding="utf-8")
-        free = root / "free-spec.md"; free.write_text("# Free\n" + "f" * 7000, encoding="utf-8")
-        mc.save_state(sid8, {"dirty": [str(owned), str(free)], "saved": {}, "attempts": {}})
+        unmirrored = root / "docs/specs/fresh-spec.md"
+        unmirrored.write_text("# Fresh\n" + "f" * 7000, encoding="utf-8")
+        mc.save_state(sid8, {"dirty": [str(owned), str(unmirrored)], "saved": {}, "attempts": {}})
         seen_args.clear()
         f.read_room = lambda *a, **k: None
+
+        async def mirror_owns_owned(session, call_args):
+            seen_args.append(call_args)
+            if call_args["name"] == "Owned (docs/specs/owned-spec.md)":
+                return {"id": "mirror-row", "name": "Spec: owned", "action": "mirror_owns_file"}
+            return {"id": "new-row", "name": call_args["name"], "action": "created"}
+
+        f._save = mirror_owns_owned
         asyncio.run(f.flush(sid8))
+        f._save = capture_save
         st = mc.load_state(sid8)
-        check([a["name"] for a in seen_args] == ["Free (free-spec.md)"], f"linked file skipped, unlinked file saved: {[a['name'] for a in seen_args]}")
-        check(st["dirty"] == [] and str(owned) not in st["saved"], f"linked file leaves dirty without a digest (not retried): {st}")
-        owned.write_text("---\nspec: owned\nowns: [broken\n" + "x" * 7000, encoding="utf-8")
-        check(f._hand_saved(root, owned), "malformed git spec remains excluded")
-        owned.write_text("x" * 600000, encoding="utf-8")
-        check(f._hand_saved(root, owned), "oversized git spec remains excluded")
-        custom = root / "custom/specs/nested/broken.md"
-        custom.parent.mkdir(parents=True, exist_ok=True)
-        custom.write_text("broken", encoding="utf-8")
-        previous_dir = os.environ.get("MEMHUB_SPEC_DIR")
-        os.environ["MEMHUB_SPEC_DIR"] = "custom/specs/"
-        check(f._hand_saved(root, custom), "custom nested malformed spec remains excluded")
-        if previous_dir is None:
-            os.environ.pop("MEMHUB_SPEC_DIR", None)
-        else:
-            os.environ["MEMHUB_SPEC_DIR"] = previous_dir
+        check(sorted(a["name"] for a in seen_args) == ["Fresh (docs/specs/fresh-spec.md)",
+                                                       "Owned (docs/specs/owned-spec.md)"],
+              f"both spec files are offered to the server: {[a['name'] for a in seen_args]}")
+        check(st["dirty"] == [] and str(owned) in st["saved"] and str(unmirrored) in st["saved"],
+              f"a mirror-owned answer is recorded like a save, not retried: {st}")
+        check(not (st.get("attempts") or {}), f"no retry budget spent on a mirror-owned file: {st}")
+        seen_args.clear()
+        mc.save_state(sid8, {**st, "dirty": [str(owned)]})
+        f._save = mirror_owns_owned
+        asyncio.run(f.flush(sid8))
+        f._save = capture_save
+        check(seen_args == [], f"an unchanged mirror-owned file is not offered again: {seen_args}")
         owned.unlink()
+        unmirrored.unlink()
 
         # ---- git sweep: markdown written through Bash never enters `dirty` ----
         # A harness that prefers shell edits (heredoc, sed -i) never fires the

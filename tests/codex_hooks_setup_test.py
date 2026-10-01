@@ -244,21 +244,28 @@ def test_runner_selects_latest_known_install():
     print("PASS test_runner_selects_latest_known_install")
 
 
-def test_runner_relays_directive_and_artifact_context():
+def _legacy_directive_scripts(scripts: Path) -> None:
+    """The scripts an older plugin shipped. Retired: nothing may run them."""
+    for name in ("directive_prefilter.py", "reactive_prefilter.py"):
+        (scripts / name).write_text(
+            "import sys; sys.stdin.read(); raise SystemExit(0)\n", encoding="utf-8"
+        )
+    (scripts / "directive_recall.py").write_text(
+        "import json; print(json.dumps({'hookSpecificOutput':{"
+        "'additionalContext':'SHOULD_NOT_RUN'}}))\n",
+        encoding="utf-8",
+    )
+
+
+def test_retired_directive_actions_are_silent_and_artifact_relays():
+    """`directive-pre` / `directive-post` stay accepted (an older user-level
+    bridge may still invoke them) but do nothing and exit 0."""
     with tempfile.TemporaryDirectory() as raw:
         plugin = Path(raw)
         scripts = plugin / "scripts"
         scripts.mkdir()
         (scripts / "codex_flush.py").write_text("", encoding="utf-8")
-        (scripts / "directive_prefilter.py").write_text(
-            "import sys; sys.stdin.read(); raise SystemExit(0)\n", encoding="utf-8"
-        )
-        (scripts / "directive_recall.py").write_text(
-            "import json,sys; json.load(sys.stdin); "
-            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PreToolUse',"
-            "'additionalContext':'proof'}}))\n",
-            encoding="utf-8",
-        )
+        _legacy_directive_scripts(scripts)
         (scripts / "artifact_sync_reminder.py").write_text(
             "import json,sys; sys.stdin.read(); "
             "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse',"
@@ -266,14 +273,20 @@ def test_runner_relays_directive_and_artifact_context():
             encoding="utf-8",
         )
         env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
+        for tool_name in ("Bash", "shell", "local_shell", "apply_patch"):
+            payload = json.dumps({
+                "tool_name": tool_name, "tool_input": {"command": "touch x"},
+                "tool_response": "error: failed",
+            }).encode()
+            for action in ("directive-pre", "directive-post"):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"), action],
+                    input=payload, capture_output=True, env=env, check=True,
+                )
+                assert result.stdout == b"", (tool_name, action, result.stdout)
         payload = json.dumps({
             "tool_name": "Bash", "tool_input": {"command": "touch x"}
         }).encode()
-        directive = subprocess.run(
-            [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"), "directive-pre"],
-            input=payload, capture_output=True, env=env, check=True,
-        )
-        assert json.loads(directive.stdout)["hookSpecificOutput"]["additionalContext"] == "proof"
         artifact = subprocess.run(
             [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"), "artifact-sync"],
             input=payload, capture_output=True, env=env, check=True,
@@ -283,7 +296,38 @@ def test_runner_relays_directive_and_artifact_context():
             "hookEventName": "PostToolUse",
             "additionalContext": "version the linked artifact",
         }
-    print("PASS test_runner_relays_directive_and_artifact_context")
+    print("PASS test_retired_directive_actions_are_silent_and_artifact_relays")
+
+
+def test_dispatch_pre_tool_runs_only_the_rulebook():
+    with tempfile.TemporaryDirectory() as raw:
+        plugin = Path(raw)
+        scripts = plugin / "scripts"
+        scripts.mkdir()
+        (scripts / "codex_flush.py").write_text("", encoding="utf-8")
+        _legacy_directive_scripts(scripts)
+        (scripts / "rulebook_hook.py").write_text(
+            "import json,sys; assert sys.argv[1:] == ['codex-pre', '--host', 'codex'], sys.argv; "
+            "json.load(sys.stdin); "
+            "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PreToolUse',"
+            "'additionalContext':'rule proof'}}))\n",
+            encoding="utf-8",
+        )
+        env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
+        for tool_name in ("Bash", "shell", "local_shell", "apply_patch"):
+            payload = json.dumps({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name, "tool_input": {"command": "touch x"},
+            }).encode()
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"),
+                 "dispatch", "PreToolUse"],
+                input=payload, capture_output=True, env=env, check=True,
+            )
+            assert json.loads(result.stdout)["hookSpecificOutput"] == {
+                "hookEventName": "PreToolUse", "additionalContext": "rule proof",
+            }, tool_name
+    print("PASS test_dispatch_pre_tool_runs_only_the_rulebook")
 
 
 def test_dispatch_combines_post_tool_contexts():
@@ -292,13 +336,11 @@ def test_dispatch_combines_post_tool_contexts():
         scripts = plugin / "scripts"
         scripts.mkdir()
         (scripts / "codex_flush.py").write_text("", encoding="utf-8")
-        (scripts / "reactive_prefilter.py").write_text(
-            "import sys; sys.stdin.read(); raise SystemExit(0)\n", encoding="utf-8"
-        )
-        (scripts / "directive_recall.py").write_text(
-            "import json,sys; json.load(sys.stdin); "
+        _legacy_directive_scripts(scripts)
+        (scripts / "rulebook_hook.py").write_text(
+            "import json,sys; assert sys.argv[1] == 'post', sys.argv; json.load(sys.stdin); "
             "print(json.dumps({'hookSpecificOutput':{'hookEventName':'PostToolUse',"
-            "'additionalContext':'reactive proof'}}))\n",
+            "'additionalContext':'rule proof'}}))\n",
             encoding="utf-8",
         )
         (scripts / "artifact_sync_reminder.py").write_text(
@@ -322,20 +364,18 @@ def test_dispatch_combines_post_tool_contexts():
         output = json.loads(result.stdout)["hookSpecificOutput"]
         assert output == {
             "hookEventName": "PostToolUse",
-            "additionalContext": "reactive proof\n\nversion the artifact",
+            "additionalContext": "rule proof\n\nversion the artifact",
         }
     print("PASS test_dispatch_combines_post_tool_contexts")
 
 
-def test_dispatch_keeps_artifact_context_when_recall_fails():
-    original_directive = bridge._directive_result
+def test_dispatch_keeps_artifact_context_when_rulebook_fails():
+    original_rulebook = bridge._rulebook_result
     original_artifact = bridge._artifact_sync_result
     original_stdout = sys.stdout
 
-    def fail_directive(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(
-            "directive_recall.py", bridge._RECALL_TIMEOUT_S
-        )
+    def fail_rulebook(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("rulebook_hook.py", 7)
 
     artifact = subprocess.CompletedProcess(
         args=[], returncode=0, stdout=json.dumps({
@@ -345,7 +385,7 @@ def test_dispatch_keeps_artifact_context_when_recall_fails():
             }
         }).encode(), stderr=b"",
     )
-    bridge._directive_result = fail_directive
+    bridge._rulebook_result = fail_rulebook
     bridge._artifact_sync_result = lambda *_args, **_kwargs: artifact
     output = io.StringIO()
     sys.stdout = output
@@ -355,12 +395,12 @@ def test_dispatch_keeps_artifact_context_when_recall_fails():
         )
     finally:
         sys.stdout = original_stdout
-        bridge._directive_result = original_directive
+        bridge._rulebook_result = original_rulebook
         bridge._artifact_sync_result = original_artifact
 
     result = json.loads(output.getvalue())["hookSpecificOutput"]
     assert result["additionalContext"] == "artifact survived"
-    print("PASS test_dispatch_keeps_artifact_context_when_recall_fails")
+    print("PASS test_dispatch_keeps_artifact_context_when_rulebook_fails")
 
 
 def test_dispatch_session_start_merges_the_three_claude_scripts():
@@ -413,12 +453,8 @@ def test_dispatch_session_start_merges_the_three_claude_scripts():
 
 
 def test_dispatch_subprocess_budgets_fit_hook_timeouts():
-    assert bridge._GATE_TIMEOUT_S + bridge._RECALL_TIMEOUT_S < 8
     assert max(bridge._SESSION_TIMEOUT_S, bridge._HEALTH_TIMEOUT_S) < 8
-    assert max(
-        bridge._GATE_TIMEOUT_S + bridge._RECALL_TIMEOUT_S,
-        bridge._ARTIFACT_TIMEOUT_S,
-    ) < 16
+    assert bridge._ARTIFACT_TIMEOUT_S < 16
     print("PASS test_dispatch_subprocess_budgets_fit_hook_timeouts")
 
 
@@ -454,34 +490,6 @@ def test_cli_names_only_the_memhub_handlers_for_review():
     print("PASS test_cli_names_only_the_memhub_handlers_for_review")
 
 
-def test_every_shell_alias_uses_the_directive_prefilter():
-    with tempfile.TemporaryDirectory() as raw:
-        plugin = Path(raw)
-        scripts = plugin / "scripts"
-        scripts.mkdir()
-        (scripts / "codex_flush.py").write_text("", encoding="utf-8")
-        # Read-only shell calls must stop at this non-zero gate. If an alias
-        # bypasses it, directive_recall's proof output exposes the regression.
-        (scripts / "directive_prefilter.py").write_text(
-            "import sys; sys.stdin.read(); raise SystemExit(1)\n", encoding="utf-8"
-        )
-        (scripts / "directive_recall.py").write_text(
-            "print('SHOULD_NOT_RUN')\n", encoding="utf-8"
-        )
-        env = {**os.environ, "MEMHUB_PLUGIN_ROOT": str(plugin)}
-        for tool_name in ("Bash", "shell", "local_shell"):
-            payload = json.dumps({
-                "tool_name": tool_name, "tool_input": {"command": "ls"}
-            }).encode()
-            result = subprocess.run(
-                [sys.executable, str(SCRIPTS / "codex_hook_bridge.py"),
-                 "directive-pre"],
-                input=payload, capture_output=True, env=env, check=True,
-            )
-            assert result.stdout == b"", tool_name
-    print("PASS test_every_shell_alias_uses_the_directive_prefilter")
-
-
 def test_rulebook_normalizes_shell_calls_without_losing_identity():
     for name, inp in (("shell", {"command": ["/bin/bash", "-lc", "touch blocked"]}),
                       ("exec_command", {"cmd": "touch blocked", "workdir": "/repo"}),
@@ -494,14 +502,13 @@ def test_rulebook_normalizes_shell_calls_without_losing_identity():
         assert result["session_id"] == "session" and result["cwd"] == "/repo"
 
 
-def test_rulebook_denial_survives_context_merge_and_recall_failure():
+def test_rulebook_denial_survives_context_merge():
     denied = subprocess.CompletedProcess([], 0, json.dumps({
         "systemMessage": "Rule fired", "hookSpecificOutput": {
             "permissionDecision": "deny", "permissionDecisionReason": "blocked",
             "additionalContext": "rule evidence"}}).encode(), b"")
     out = io.StringIO()
     with patch.object(bridge, "_rulebook_result", return_value=denied), \
-            patch.object(bridge, "_directive_result", side_effect=RuntimeError("recall failed")), \
             contextlib.redirect_stdout(out):
         bridge._dispatch(Path("/unused"), b'{}', "PreToolUse")
     doc = json.loads(out.getvalue())

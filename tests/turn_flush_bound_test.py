@@ -443,19 +443,12 @@ def _patched(tmp):
     originals = {
         "state_dir": ft.STATE_DIR, "namespace": ft._namespace,
         "resolve_bearer": ft.resolve_bearer,
-        "resolve_repo_brain": ft.resolve_repo_brain,
-        "env_for_url": ft.env_for_url, "session": ft.mcp_http.Session,
+        "session": ft.mcp_http.Session,
         "log": ft._log,
     }
-
-    async def no_room(_session, _cwd, _env):
-        return None
-
     ft.STATE_DIR = Path(tmp) / "state"
     ft._namespace = lambda _records: ("/repo", "agent-plugins")
     ft.resolve_bearer = lambda: ("https://example.test/mcp", "token")
-    ft.resolve_repo_brain = no_room
-    ft.env_for_url = lambda _url: "staging"
     ft._log = lambda _message: None
     return originals
 
@@ -464,8 +457,6 @@ def _restore(originals):
     ft.STATE_DIR = originals["state_dir"]
     ft._namespace = originals["namespace"]
     ft.resolve_bearer = originals["resolve_bearer"]
-    ft.resolve_repo_brain = originals["resolve_repo_brain"]
-    ft.env_for_url = originals["env_for_url"]
     ft.mcp_http.Session = originals["session"]
     ft._log = originals["log"]
 

@@ -224,6 +224,40 @@ def _git(cwd, *args):
     return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env, timeout=30)
 
 
+def spec_untouched_text_checks() -> None:
+    """A `spec_untouched` fire names the stale specs INLINE on the rule text.
+    The text reaches the agent's `- **[label]** …` bullet and the user's
+    one-line `systemMessage`; the old form appended `\n<spec> owns: …` per
+    spec, which broke both and grew without bound. Owned-path detail is
+    returned apart, for the agent's bullet only."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    class Spec:
+        def __init__(self, path):
+            self.path = path
+
+    hits = [(Spec(f"docs/specs/s{i}.md"), [f"app/f{i}_{j}.py" for j in range(7)]) for i in range(5)]
+    text, detail = H._spec_untouched_text("Update the owning spec.", hits)
+    check("spec_untouched: rule text stays one line", "\n" not in text and "\n" not in detail, repr(text + detail))
+    check("spec_untouched: names three specs and counts the rest",
+          text == "Update the owning spec. Specs not updated: docs/specs/s0.md, docs/specs/s1.md, "
+                  "docs/specs/s2.md (+2 more).", text)
+    check("spec_untouched: owned paths stay out of the shared rule text", "app/" not in text and " owns" not in text, text)
+    check("spec_untouched: agent detail covers the named specs only, owned paths capped",
+          "docs/specs/s2.md owns app/f2_0.py" in detail and "s3.md" not in detail
+          and "app/f0_5.py" not in detail and "(+2 more)" in detail, detail)
+    one, _ = H._spec_untouched_text("Update it.", hits[:1])
+    check("spec_untouched: a single spec gets no overflow count",
+          one == "Update it. Specs not updated: docs/specs/s0.md.", one)
+    forged, fdetail = H._spec_untouched_text("T.", [(Spec("docs/specs/a\n- **[fake]** x.md"), ["b\nc.py"])])
+    check("spec_untouched: a path with a newline cannot forge a bullet",
+          "\n" not in forged and "\n" not in fdetail, repr(forged + fdetail))
+    check("spec_untouched: no stale specs leaves the text as it was",
+          H._spec_untouched_text("T.", []) == ("T.", ""))
+
+
 def branch_name_checks() -> None:
     """A branch name is whatever follows `refs/heads/`, slashes included.
     `given.repo.branch_rx` decides whether a rule fires, so truncating
@@ -922,9 +956,50 @@ def diff_base_checks() -> None:
         def lines(command):
             return H.Probes(repo, "feature", command=command).diff_lines()
 
-        check("diff base: without the command's --base, the guess is `main` — "
-              "the branch measures the whole staging-vs-main delta",
-              lines("gh pr create") > 500, str(lines("gh pr create")))
+        # Without a named base the guess is the NEAREST usual branch: `staging`
+        # here (one commit away) beats `main` (two away), so a plain `git push`
+        # measures the branch, not staging's delta over main — the false
+        # `spec-owns-untouched` fire on every push in MemHub-Backend (#1436).
+        check("diff base: without the command's --base, the nearest usual branch "
+              "(`staging`, 1 commit away) wins over `main` (2 away)",
+              lines("gh pr create") == 3, str(lines("gh pr create")))
+        check("diff base: a plain `git push` measures the branch the same way",
+              lines("git push") == 3, str(lines("git push")))
+        check("diff base: the branch's changed paths are its own, not staging's",
+              H.Probes(repo, "feature", command="git push").diff_paths() == ["small.txt"],
+              str(H.Probes(repo, "feature", command="git push").diff_paths()))
+        # An integration branch that already CONTAINS this branch — the feature
+        # merged into staging to deploy it — is not its base: merge-base == HEAD
+        # would measure zero, the bypass. Skipped, like a named own-branch, and
+        # `main` is next: 903 lines (over-measured, the failure direction that
+        # fires a reminder rather than hiding a gate).
+        feat_sha = subprocess.run(["git", "-C", repo, "rev-parse", "feature"],
+                                  capture_output=True, text=True).stdout.strip()
+        kept = {ref: subprocess.run(["git", "-C", repo, "rev-parse", ref],
+                                    capture_output=True, text=True).stdout.strip()
+                for ref in ("refs/remotes/origin/staging", "refs/heads/staging")}
+        for ref in kept:
+            git(repo, "update-ref", ref, feat_sha)
+        try:
+            check("diff base: a candidate that already contains HEAD is never the guess — "
+                  "it would measure zero; `main` is next and over-measures",
+                  lines("git push") > 500, str(lines("git push")))
+        finally:
+            for ref, sha in kept.items():
+                git(repo, "update-ref", ref, sha)
+        check("diff base: …and once the refs are restored the branch measures 3 again",
+              lines("git push") == 3, str(lines("git push")))
+        # ON `staging` itself, `origin/staging` contains HEAD and is not the
+        # default, so it is not the guess (merge-base == HEAD would measure
+        # zero); `main`, the default, is next.
+        git(repo, "checkout", "-q", "staging")
+        try:
+            on_staging = H.Probes(repo, "staging", command="git push").diff_lines()
+        finally:
+            git(repo, "checkout", "-q", "feature")
+        check("diff base: on `staging` itself, its own remote copy is never the guess — "
+              "the delta is measured against `main`",
+              on_staging > 500, str(on_staging))
         n = lines("gh pr create --base staging --title x")
         check("diff base: `--base staging` measures the branch, not the base branch",
               n == 3, str(n))
@@ -942,22 +1017,25 @@ def diff_base_checks() -> None:
             del os.environ["MEMHUB_RULEBOOK_BASE_BRANCH"]
 
         # --- a named base is CHECKED, because the gated party writes it ------
-        # Every refusal falls through to the remote default, which OVER-measures:
-        # the safe direction for a size gate.
+        # Every refusal falls through to the guess (the nearest usual branch,
+        # `staging` here: 3 lines). What the refusal must never do is honour
+        # the named rev: `feature` / `HEAD` would measure ZERO (the bypass),
+        # `staging~1` would measure 903 (elsewhere in history).
         check("named base: your own branch is refused — `merge-base(base, HEAD) == HEAD` "
-              "measures zero, and a PR onto it would be empty",
-              lines("gh pr create --base feature") > 500, str(lines("gh pr create --base feature")))
+              "would measure zero, and a PR onto it would be empty",
+              lines("gh pr create --base feature") == 3, str(lines("gh pr create --base feature")))
         for rev, why in [("HEAD", "rev, not a branch"),
                          ("staging~1", "rev arithmetic reaches elsewhere in history"),
                          ("../../etc/passwd", "path traversal"),
                          ("-oProxyCommand=x", "leading dash")]:
             check(f"named base: `{rev}` is refused ({why})",
-                  lines(f"gh pr create --base {rev}") > 500)
+                  lines(f"gh pr create --base {rev}") == 3, str(lines(f"gh pr create --base {rev}")))
         check("named base: a branch that is not on the remote is refused",
-              lines("gh pr create --base no-such-branch") > 500)
+              lines("gh pr create --base no-such-branch") == 3)
         check("named base: two different bases in one command are refused — "
-              "`--base <mine> || --base staging` would probe one and open the other",
-              lines("gh pr create --base staging || gh pr create --base feature") > 500)
+              "`--base <mine> || --base staging` would probe one and open the other; "
+              "neither measures zero",
+              lines("gh pr create --base staging || gh pr create --base feature") == 3)
         check("named base: the same base named twice is still honoured",
               lines("gh pr create --base staging --base staging") == 3)
 
@@ -991,6 +1069,78 @@ def diff_base_checks() -> None:
               H.command_root(td, f"cd {td} && gh pr create") == "")
         check("probe root: a `cd` to a missing directory keeps the session's tree",
               H.command_root(td, "cd /nope/nowhere && gh pr create") == "")
+
+
+def apply_patch_checks() -> None:
+    """Codex edits with `apply_patch`: the whole patch in `tool_input.command`,
+    no `file_path`, a path absolute or relative to cwd. Payloads are the shape
+    Codex 0.146/0.154 send (PreToolUse always; PostToolUse only when the patch
+    applied). Until 0.85.2 the hook read none of it as an edit, so on Codex no
+    edit rule fired and no edit armed an ordering obligation."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "patchrepo")
+        os.makedirs(os.path.join(repo, "src"))
+        os.makedirs(os.path.join(repo, "alembic", "versions"))
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+        seed_book(td, "patchrepo", [
+            _row("no-bare-ignore", {"event": "edit", "path_rx": r"\.py$",
+                                    "content_rx": r"type:\s*ignore(?!\[)"}),
+            _row("new-table-retention", {"event": "edit", "path_rx": r"alembic/versions/[^/]*\.py$",
+                                         "content_rx": r"create_table\("}),
+            _row("no-secret-in-settings", {"event": "edit", "path_rx": r"settings\.py$",
+                                           "content_rx": r"SECRET\s*="}, mode="gate"),
+            {"id": "tests-before-push", "on": "ordering", "repo_scope": "any",
+             "ordering": {"required_command_rx": r"pytest", "gated_command_rx": r"git\s+push",
+                          "armed_by_events": ["edit", "write"], "min_edits": 1,
+                          "display_name": "the suite"},
+             "text": "Run the suite before pushing", "why": "w"},
+        ])
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+
+        def patch_ev(body, session, tid="p1"):
+            return {"cwd": repo, "session_id": session, "tool_name": "apply_patch", "tool_use_id": tid,
+                    "tool_input": {"command": f"*** Begin Patch\n{body}\n*** End Patch"}}
+
+        def pre(ev):
+            return run("pre", ev, env)[1]
+
+        c = ctx(pre(patch_ev("*** Update File: src/app.py\n@@\n+y = f()  # type: ignore", "a1")))
+        check("apply_patch: a relative Update reaches the edit rule", "[no-bare-ignore]" in c, c)
+        c = ctx(pre(patch_ev("*** Update File: src/app.py\n@@\n+y = f()  # type: ignore[x]", "a2")))
+        check("apply_patch: the complied-with form does not fire", "[no-bare-ignore]" not in c, c)
+        c = ctx(pre(patch_ev("*** Update File: src/app.py\n@@\n y = f()  # type: ignore\n+z = 1", "a3")))
+        check("apply_patch: context lines are not added content", "[no-bare-ignore]" not in c, c)
+        mig = os.path.join(repo, "alembic", "versions", "20260924_logins.py")
+        c = ctx(pre(patch_ev(f"*** Add File: {mig}\n+def upgrade():\n+    op.create_table('logins')", "a4")))
+        check("apply_patch: an absolute Add File is a Write the path rule matches",
+              "[new-table-retention]" in c, c)
+        c = ctx(pre(patch_ev("*** Update File: notes.txt\n*** Move to: src/moved.py\n@@\n+q = 1  # type: ignore",
+                             "a5")))
+        check("apply_patch: a moved file is judged at its new path", "[no-bare-ignore]" in c, c)
+        c = ctx(pre(patch_ev("*** Update File: README.md\n@@\n+hello\n"
+                             "*** Update File: src/two.py\n@@\n+w = 2  # type: ignore", "a6")))
+        check("apply_patch: every file of a multi-file patch is read", "[no-bare-ignore]" in c, c)
+        out = pre(patch_ev("*** Update File: src/settings.py\n@@\n+SECRET = 'x'", "a7"))
+        hso = json.loads(out)["hookSpecificOutput"] if out.strip() else {}
+        check("apply_patch: an edit gate refuses the patch before it applies",
+              hso.get("permissionDecision") == "deny", out)
+        out = pre({"cwd": repo, "session_id": "a8", "tool_name": "apply_patch", "tool_input": {}})
+        check("apply_patch: no patch text is silent, never a crash", out.strip() == "", out)
+
+        push = {"cwd": repo, "session_id": "o1", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}}
+        failed = patch_ev("*** Update File: src/app.py\n@@\n+x = 1", "o1", tid="f1")
+        pre(failed)                          # the patch did not apply: Codex sends no PostToolUse
+        c = ctx(pre(push))
+        check("apply_patch ordering: a patch that never applied arms nothing",
+              "[tests-before-push]" not in c, c)
+        applied = patch_ev("*** Update File: src/app.py\n@@\n+x = 2", "o1", tid="s1")
+        pre(applied)
+        run("post", dict(applied, tool_response="Success. Updated the following files:\nM src/app.py\n"), env)
+        c = ctx(pre(push))
+        check("apply_patch ordering: an applied patch arms the obligation, like an Edit",
+              "[tests-before-push]" in c, c)
 
 
 def main() -> int:
@@ -1031,8 +1181,13 @@ def main() -> int:
                               "tool_input": {"command": "forbidden-cmd"}}, env)
         check("non-git cwd is silent", rc == 0 and out.strip() == "")
 
+        # FETCH=0 here too: with no cached book the session lane fetches one
+        # SYNCHRONOUSLY, and on a machine whose plugin has a usable credential
+        # that fetch succeeds and the lane renders the real book — so the case
+        # would be measuring this machine's login, not the empty base.
         rc, out = run("session", {"cwd": repo},
-                      {"MEMHUB_RULEBOOK_BASE": os.path.join(td, "empty-base")})
+                      {"MEMHUB_RULEBOOK_BASE": os.path.join(td, "empty-base"),
+                       "MEMHUB_RULEBOOK_FETCH": "0"})
         check("no cached book is silent exit-0", rc == 0 and out.strip() == "")
 
         badbase = os.path.join(td, "bad-base")
@@ -1886,10 +2041,13 @@ def main() -> int:
     repo_identity_checks()
     given_and_scope_checks()
     bash_edit_checks()
+    apply_patch_checks()
     read_lane_checks()
     diff_base_checks()
     armed_lane_checks()
     min_hook_version_checks()
+    prompt_lane_checks()
+    spec_untouched_text_checks()
 
     print()
     if FAILURES:
@@ -2493,6 +2651,126 @@ def armed_lane_checks() -> None:
               rb_mod.to_hook_rule(dict(probe_rule)) is not None)
 
 
+def prompt_lane_checks() -> None:
+    """`event: prompt` (ENG-1184): a rule that speaks when a wake-up arrives.
+    A `/loop` tick or a `<task-notification>` reaches the hook only as a
+    UserPromptSubmit, so that is where the rule is matched — against the RAW
+    prompt, wrappers included, which the arming path strips on purpose."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    wake_rx = r"<task-notification>|<command-message>loop</command-message>"
+    tick = _row("loop-tick", {"event": "prompt", "prompt_rx": wake_rx, "warn_once_per": "session"},
+                title="A loop tick says what it is for",
+                statement="Lead a status tick with the task, its target and what you wait for.")
+    every = _row("every-tick", {"event": "prompt", "prompt_rx": wake_rx,
+                                "prompt_not_rx": "quiet-please", "warn_once_per": "turn"})
+    gate = _row("prompt-gate", {"event": "prompt", "prompt_rx": "deploy now"}, mode="gate")
+    bare = _row("prompt-bare", {"event": "prompt", "warn_once_per": "session"})
+
+    # --- translation ---------------------------------------------------------
+    r = H.to_hook_rule(tick)
+    check("prompt: a server prompt rule loads on the prompt lane, undegraded",
+          r is not None and r["on"] == "prompt" and r["rx"] == wake_rx
+          and r["fire_scope"] == "session" and not r.get("_degraded"), str(r))
+    r = H.to_hook_rule(every)
+    check("prompt: warn_once_per turn is per prompt; prompt_not_rx is the veto",
+          r is not None and r["fire_scope"] == "call" and r["not_rx"] == "quiet-please", str(r))
+    r = H.to_hook_rule(gate)
+    check("prompt: a gate on the prompt event loads as advice — there is no call to block",
+          r is not None and r["mode"] == "advise" and not r.get("_degraded"), str(r))
+    check("prompt: a prompt rule with no prompt_rx is dropped, never fired on every prompt",
+          H.to_hook_rule(bare) is None)
+    r = H.to_hook_rule(_row("mixed", {"event": "prompt", "prompt_rx": "<task-notification>",
+                                      "command_rx": "git push"}))
+    check("prompt: a prompt rule reads prompt_rx, never a stray command_rx onto the same slot",
+          r is not None and r["rx"] == "<task-notification>", str(r))
+    r = H.to_hook_rule(_row("mixed-bash", {"event": "bash", "command_rx": "git push",
+                                           "prompt_rx": "<task-notification>"}))
+    check("prompt: a bash rule never reads prompt_rx",
+          r is not None and r["rx"] == "git push", str(r))
+    check("prompt: prompt_rx / prompt_not_rx are keys this hook knows",
+          H.matcher_unsupported({"event": "prompt", "prompt_rx": "x", "prompt_not_rx": "y"}) == "")
+
+    # --- the lane, end to end -------------------------------------------------
+    wake = ("<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n"
+            "</task-notification>")
+    loop = ("<command-message>loop</command-message>\n<command-name>/loop</command-name>\n"
+            "<command-args>babysit PR 91</command-args>")
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "promptrepo")
+        os.makedirs(repo)
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+
+        def prompt(session, text):
+            return run("prompt", {"session_id": session, "cwd": repo,
+                                  "hook_event_name": "UserPromptSubmit", "prompt": text}, env)[1]
+
+        def fires(rid):
+            try:
+                with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+                    return [x for x in map(json.loads, f) if x["rule_id"] == rid]
+            except OSError:
+                return []
+
+        seed_book(td, "promptrepo", [tick, gate])
+        out = prompt("p1", wake)
+        doc = json.loads(out) if out.strip() else {}
+        hso = doc.get("hookSpecificOutput") or {}
+        check("prompt: a wrapped wake-up fires the rule, on the UserPromptSubmit envelope",
+              hso.get("hookEventName") == "UserPromptSubmit"
+              and "[A loop tick says what it is for]" in hso.get("additionalContext", ""), out)
+        check("prompt: …and discloses it on both channels",
+              "📏 Rule fired: A loop tick says what it is for" in doc.get("systemMessage", "")
+              and "📏 Rule fired: A loop tick says what it is for" in hso.get("additionalContext", ""),
+              out)
+        check("prompt: …and never denies anything", "permissionDecision" not in hso, out)
+        rows = fires("loop-tick")
+        check("prompt: the fire is recorded on the prompt lane as UserPromptSubmit, advise",
+              len(rows) == 1 and rows[0]["hook_phase"] == "prompt"
+              and rows[0]["tool"] == "UserPromptSubmit" and rows[0]["mode"] == "advise"
+              and rows[0]["excerpt"] == "<task-notification>", str(rows))
+        out = prompt("p1", loop)
+        check("prompt: warn_once_per session — the second wake-up of the session is quiet",
+              out.strip() == "" and len(fires("loop-tick")) == 1, out)
+        out = prompt("p2", loop)
+        check("prompt: …while another session's first wake-up fires",
+              "A loop tick says what it is for" in out and len(fires("loop-tick")) == 2, out)
+        out = prompt("p3", "what are you doing with the loop here?")
+        check("prompt: a typed prompt that lacks the wrapper does not fire", out.strip() == "", out)
+        out = prompt("p4", "please deploy now")
+        doc = json.loads(out) if out.strip() else {}
+        check("prompt: a gate-mode prompt rule advises and never blocks",
+              "Rule fired: prompt-gate" in doc.get("systemMessage", "")
+              and "permissionDecision" not in (doc.get("hookSpecificOutput") or {})
+              and "BLOCKED" not in out
+              and [x["mode"] for x in fires("prompt-gate")] == ["advise"], out)
+
+        seed_book(td, "promptrepo", [every])
+        n0 = len(fires("every-tick"))
+        a, b = prompt("t1", wake), prompt("t1", loop)
+        check("prompt: warn_once_per turn fires on every matching prompt",
+              "every-tick" in a and "every-tick" in b and len(fires("every-tick")) == n0 + 2, a + b)
+        out = prompt("t1", wake + "\nquiet-please")
+        check("prompt: prompt_not_rx vetoes a prompt the pattern matched", out.strip() == "", out)
+
+        seed_book(td, "promptrepo", [dict(every, scope_paths=["src/**"])])
+        out = prompt("t3", wake)
+        check("prompt: an include-path-scoped prompt rule never fires — a prompt has no path",
+              out.strip() == "", out)
+        seed_book(td, "promptrepo", [dict(every, scope_exclude_paths=["docs/**"])])
+        out = prompt("t3", wake)
+        check("prompt: …an exclude-only one still does", "every-tick" in out, out)
+
+        # the pre lane never evaluates a prompt rule against a shell command
+        c = ctx(run("pre", {"session_id": "t2", "cwd": repo, "tool_name": "Bash",
+                            "tool_use_id": "x1",
+                            "tool_input": {"command": "echo '<task-notification>'"}}, env)[1])
+        check("prompt: a prompt rule never fires on a tool call", c == "", c)
+
+
 def min_hook_version_checks() -> None:
     """A rule can be newer than the hook reading it, and that used to be
     silent in the worst direction.
@@ -2621,32 +2899,6 @@ def min_hook_version_checks() -> None:
               "`predicts_rx` (inert by definition) and `min_chars` do not degrade",
               inert is not None and inert.get("mode") == "gate"
               and not inert.get("_degraded"), str(inert))
-
-        # The length bound is not the backtracking guard, so it is wide enough
-        # for a long alternation of literals — and still a bound.
-        long_rx = "^(?:" + "|".join(f"src/pkg{i:03d}/mod\\.py" for i in range(60)) + ")$"
-        check("regex length: a pattern between the old 400 bound and _RX_MAX loads",
-              400 < len(long_rx) <= H._RX_MAX
-              and H.to_hook_rule(_row("long-rx", {"event": "bash", "command_rx": long_rx}))
-              is not None, str(len(long_rx)))
-        check("regex length: a pattern at _RX_MAX loads and one past it drops the rule",
-              H.rx_ok("a" * H._RX_MAX) and not H.rx_ok("a" * (H._RX_MAX + 1))
-              and H.to_hook_rule(_row("over-rx", {"event": "bash",
-                                                  "command_rx": "a" * (H._RX_MAX + 1)}))
-              is None)
-        # Under the bound but past the parser's recursion limit: `re.compile`
-        # raises RecursionError, not re.error. The rule drops; nothing tracebacks.
-        deep_rx = "(" * 500 + "a" + ")" * 500
-        check("regex length: a deeply nested pattern under _RX_MAX drops the rule, no traceback",
-              len(deep_rx) <= H._RX_MAX and not H.rx_ok(deep_rx)
-              and H.to_hook_rule(_row("deep-rx", {"event": "bash", "command_rx": deep_rx}))
-              is None)
-        # Short, and never caught by the length bound: the parser raises
-        # OverflowError for a repetition count it cannot hold.
-        check("regex: a repetition count too large for the parser drops the rule, no traceback",
-              not H.rx_ok("a{99999999999}")
-              and H.to_hook_rule(_row("big-rep", {"event": "bash", "command_rx": "a{99999999999}"}))
-              is None)
 
         # An ordering rule needs its arming event first; this one says
         # `session`, so the session lane has to have run.
