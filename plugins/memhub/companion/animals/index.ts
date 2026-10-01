@@ -7,9 +7,10 @@ import type { Animal } from '../animal'
 import { goose } from './goose'
 import { hippo } from './hippo'
 import { penguin } from './penguin'
+import { shiba } from './shiba'
 
 // Gus first: the band shows the first of these to anyone who has not picked
 // one, and a saved choice wins over it.
-export const ANIMALS: readonly Animal[] = [goose as Animal, hippo as Animal, penguin as Animal]
+export const ANIMALS: readonly Animal[] = [goose as Animal, hippo as Animal, penguin as Animal, shiba as Animal]
 
 export const DEFAULT_ANIMAL = ANIMALS[0]!

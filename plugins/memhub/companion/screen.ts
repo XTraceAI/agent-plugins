@@ -10,11 +10,15 @@ import type { Build, Painted, Tone } from './animal'
 import type { RGB } from './pixels'
 
 const BUB_BG: RGB = [35, 29, 44]
+/** The bubble's inside, for an element drawn over it (the proposal's buttons). */
+export const BUB_BG_HEX = '#231d2c'
 const BUB_BORDER: RGB = [74, 63, 92]
 const BUB_ACCENT: RGB = [183, 156, 255]
 const BUB_TEXT: RGB = [236, 232, 242]
 const BUB_DIM: RGB = [150, 140, 165]
 const BUB_ANGRY: RGB = [255, 112, 112]
+/** A new rule waiting on an answer: the goose's gold, not advice's violet. */
+const BUB_PROPOSED: RGB = [250, 214, 84]
 export const BUB_W = 42
 /** The footer's right-hand line, where hippo_band.py names the dismiss key —
  *  which the band has no equivalent of, the bubble timing out on its own. */
@@ -58,7 +62,7 @@ function wrap(msg: string, width: number): string[] {
 
 type Seg = readonly [text: string, fg: RGB]
 
-function bubbleLines(title: string, tag: string, msg: string, shown: number, accent: RGB): Seg[][] {
+function bubbleLines(title: string, tag: string, msg: string, shown: number, accent: RGB, tone?: Tone): Seg[][] {
   const inner = BUB_W - 4
   const lines: Seg[][] = [
     [[title, accent], [tag.padStart(Math.max(1, inner - title.length)), BUB_DIM]],
@@ -69,12 +73,17 @@ function bubbleLines(title: string, tag: string, msg: string, shown: number, acc
     lines.push([[ln.slice(0, Math.max(0, left)), BUB_TEXT]])
     left -= ln.length + 1
   }
-  lines.push([], [['Got it', BUB_DIM], [SIGNATURE.padStart(inner - 6), BUB_BORDER]])
+  // a proposal's footer is left empty: its Activate / Reject / Later buttons
+  // are drawn over that row (see footerOf), where the others say Got it
+  lines.push([], tone === 'proposed' ? [] : [['Got it', BUB_DIM], [SIGNATURE.padStart(inner - 6), BUB_BORDER]])
   return lines
 }
 
-function drawBubble(buf: Buf, top: number, left: number, title: string, tag: string, msg: string, shown: number, accent: RGB) {
-  const lines = bubbleLines(title, tag, msg, shown, accent)
+function drawBubble(
+  buf: Buf, top: number, left: number, title: string, tag: string, msg: string, shown: number, tone: Tone,
+) {
+  const accent = accentOf(tone)
+  const lines = bubbleLines(title, tag, msg, shown, accent, tone)
   put(buf, top, left, '╭' + '─'.repeat(BUB_W - 2) + '╮', BUB_BORDER)
   lines.forEach((segs, j) => {
     const i = j + 1
@@ -245,28 +254,89 @@ export function compose(painted: Painted, build: Build, title: string, lay: Layo
     }
   }
   const { bubble } = painted
-  if (bubble) {
-    const bh = bubbleHeight(bubble.text)
-    let left: number
-    let bottom: number
-    if (lay.isBeside) {
-      left = col0 + build.bubbleAt.column * s - BUB_W
-      bottom = row0 + Math.floor(((build.bubbleAt.row - lay.cropTop) * s) / 2)
-    } else {
-      left = Math.max(0, columns - BUB_W - 1)
-      bottom = row0 + aboveBottom(build, s, lay.cropTop) - 1
-    }
-    drawBubble(buf, Math.max(0, bottom - bh + 1), left, title, bubble.tag, bubble.text,
-      bubble.shown, accentOf(bubble.tone))
+  const at = bubbleAt(painted, build, lay)
+  if (bubble && at) {
+    drawBubble(buf, at.top, at.left, title, bubble.tag, bubble.text, bubble.shown, bubble.tone)
   }
   return buf
+}
+
+/** Where the bubble's box goes in the band: its top row and left column, in cells. */
+function bubbleAt(painted: Painted, build: Build, lay: Layout): { top: number; left: number } | null {
+  const { bubble } = painted
+  if (!bubble) return null
+  const { s, columns, col0, row0 } = lay
+  const bh = bubbleHeight(bubble.text)
+  let left: number
+  let bottom: number
+  if (lay.isBeside) {
+    left = col0 + build.bubbleAt.column * s - BUB_W
+    bottom = row0 + Math.floor(((build.bubbleAt.row - lay.cropTop) * s) / 2)
+  } else {
+    left = Math.max(0, columns - BUB_W - 1)
+    bottom = row0 + aboveBottom(build, s, lay.cropTop) - 1
+  }
+  return { top: Math.max(0, bottom - bh + 1), left }
+}
+
+/**
+ * The row inside a proposal's bubble where Got it would be, once its text is
+ * all typed out: the cell the buttons are drawn at, and how wide they may be.
+ * Null while there is no such bubble, so the buttons come and go with it.
+ */
+export function footerOf(painted: Painted, build: Build, lay: Layout): { row: number; col: number; width: number } | null {
+  const { bubble } = painted
+  const at = bubbleAt(painted, build, lay)
+  if (!bubble || !at || bubble.tone !== 'proposed' || bubble.shown < bubble.text.length) return null
+  // the box's top border, its lines, then the bottom border: the footer is the
+  // last line, one above the bottom border
+  return { row: at.top + bubbleHeight(bubble.text) - 2, col: at.left + 2, width: BUB_W - 4 }
+}
+
+/**
+ * Where `word` starts in a proposal's bubble text, as a cell of the band,
+ * once it has been typed out: the first whole-word match, on the line the
+ * bubble wrapped it to. Null while there is no such bubble or word yet, so a
+ * link drawn over it comes and goes with the typing.
+ */
+export function wordAt(painted: Painted, build: Build, lay: Layout, word: string): { row: number; col: number } | null {
+  const { bubble } = painted
+  const at = bubbleAt(painted, build, lay)
+  if (!bubble || !at || bubble.tone !== 'proposed') return null
+  const whole = new RegExp(`(^|[^A-Za-z0-9])(${word})(?![A-Za-z0-9])`)
+  let seen = 0
+  const lines = wrap(bubble.text, BUB_W - 4)
+  for (let i = 0; i < lines.length; i++) {
+    const m = whole.exec(lines[i]!)
+    if (m) {
+      const index = m.index + m[1]!.length
+      if (bubble.shown < seen + index + word.length) return null
+      // the top border, the title, a blank row, then the text lines
+      return { row: at.top + 3 + i, col: at.left + 2 + index }
+    }
+    seen += lines[i]!.length + 1
+  }
+  return null
+}
+
+/**
+ * Where the ♥ that pets the animal goes, as a cell of the band: on the
+ * canvas's bottom row (the ground), one column left of where it begins —
+ * beside the grass, not in it. At the band's left edge, on the ground's first
+ * cell. While a bubble hangs beside the animal its bottom border runs along
+ * that row, so the ♥ sits on the border then, still pressable (Got it).
+ */
+export function petAt(build: Build, lay: Layout): { top: number; left: number } {
+  const ch = Math.ceil((lay.cropRows * lay.s) / 2)
+  return { top: lay.row0 + ch - 1, left: Math.max(0, lay.col0 - 1) }
 }
 
 /** The row the bubble's bottom sits on when it hangs over the animal, in cells. */
 const aboveBottom = (build: Build, s: number, cropTop: number) =>
   Math.floor((((build.bubbleAt.rowWhenAbove ?? build.bubbleAt.row) - cropTop) * s) / 2)
 
-const accentOf = (tone: Tone): RGB => (tone === 'blocked' ? BUB_ANGRY : BUB_ACCENT)
+const accentOf = (tone: Tone): RGB =>
+  tone === 'blocked' ? BUB_ANGRY : tone === 'proposed' ? BUB_PROPOSED : BUB_ACCENT
 
 const DEFAULT_COLOR = 0x01000000
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'

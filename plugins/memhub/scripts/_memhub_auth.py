@@ -63,9 +63,9 @@ from urllib.parse import parse_qs, urlparse
 #
 # Keeping it out of module scope is what lets the hooks import this file under a
 # bare python3. Measured, that is 0.07s against 1.09s for `uv run --with
-# 'mcp<2'`, and three of the hooks paying that cost are SYNCHRONOUS — the
-# PreToolUse directive check has no prefilter, so it was a second of latency on
-# every single file edit.
+# 'mcp<2'`, and three of the hooks paying that cost were SYNCHRONOUS — the
+# (since retired) PreToolUse directive check had no prefilter, so it was a
+# second of latency on every single file edit.
 
 _CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
 
@@ -111,7 +111,7 @@ def default_url() -> str:
     plugin's directory says nothing about the backend: the public ``memhub`` is
     an export of the ``memhub-staging`` tree with a different ``.mcp.json``. So
     an unreadable config raises rather than guessing. Background-hook callers
-    (flush_session, directive_recall) wrap resolve_url_and_auth() in a
+    (flush_session) wrap resolve_url_and_auth() in a
     top-level ``except BaseException`` and exit 0 quietly; the raise only
     surfaces to a foreground script, where failing loud beats silently talking
     to the wrong backend.
@@ -582,7 +582,7 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         return
     # ATOMIC, and that matters more now than it used to. Several hooks resolve
     # a credential concurrently — the per-turn flush, the SessionEnd backstop,
-    # and the PreToolUse directive check, which fires on every edit — so a
+    # and the PreToolUse hooks, which fire on tool calls — so a
     # plain write_text leaves a window where another process reads a truncated
     # file. That reader does not fail loudly: it decides there is no usable
     # credential and skips, so a torn write reads exactly like "not logged in"

@@ -84,3 +84,22 @@ except ImportError:  # native Windows
 def fileno_of(f) -> int:
     """Accept a raw fd or anything with .fileno() (room_map passes a handle)."""
     return f if isinstance(f, int) else f.fileno()
+
+
+def still_at(fd: int, path) -> bool:
+    """True when the locked ``fd`` is still the file at ``path``.
+
+    A lock lives on the file, not the name. state_sweep.py deletes an idle
+    lock file (holding its lock while it does); a process that opened the
+    old file just before the delete can then lock it, and a process that
+    opens the path afterwards creates a new one — both "hold the lock". So a
+    locker checks this after acquiring and, on False, releases and reopens.
+    Windows refuses to delete an open file, so the question does not arise
+    there."""
+    if os.name == "nt":
+        return True
+    try:
+        a, b = os.fstat(fd), os.stat(path)
+    except OSError:
+        return False
+    return (a.st_ino, a.st_dev) == (b.st_ino, b.st_dev)

@@ -2,7 +2,7 @@
 """Cursor capture: hook-triggered flush of a cursor-agent session into MemHub.
 
 The Cursor analog of ``flush_turn.py``, reusing its whole downstream —
-``redact``, ``_memhub_auth.resolve_bearer``, ``brain_resolve``, ``room_map``,
+``redact``, ``_memhub_auth.resolve_bearer``, ``room_map``'s git helpers,
 ``mcp_http`` — and differing in exactly the two places Cursor differs:
 
 1. **Data source**: legacy Cursor/CLI sessions use the full-fidelity v1
@@ -61,12 +61,11 @@ import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
 from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from readers.strict_json import loads as load_json  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly  # noqa: E402
+from room_map import git_env, git_readonly  # noqa: E402
 
 STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "cursorflush"
 _CURSOR_PROJECTS = Path.home() / ".cursor" / "projects"
@@ -901,7 +900,9 @@ def _namespace_of(cwd: str | None) -> str | None:
         url = out.stdout.strip()
         if out.returncode == 0 and url:
             return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-    except (OSError, subprocess.SubprocessError):
+    # ValueError covers an origin URL git prints in bytes that do not decode:
+    # that is "no namespace", not a flush error counted toward dormancy.
+    except (OSError, subprocess.SubprocessError, ValueError):
         pass
     return None
 
@@ -1001,55 +1002,22 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         # toward dormancy.
         _save_state(uuid, last_error="no_credential", fail_streak=0)
         return
-    env = env_for_url(url)
     session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
 
     cwd = meta.get("cwd")
-    # Both derive from cwd alone and neither feeds the other, so they run
-    # CONCURRENTLY: one is a network round trip, the other a `git remote
-    # get-url` subprocess with a 2s budget (off the loop, like resolve_bearer
-    # above). Awaiting them in series spent the flush deadline twice over for
-    # no ordering reason.
-    # ONE guard for both consumers: cwd is store content, and
-    # resolve_repo_brain resolves it as a path too — validating only inside
-    # _namespace_of would have left that half open.
+    # cwd is store content, so it is validated before it becomes a
+    # `git -C` argument. Off the loop, like resolve_bearer above.
     if _cwd_ok(cwd):
-        try:
-            room, namespace = await asyncio.gather(
-                resolve_repo_brain(session, cwd, env),
-                asyncio.to_thread(_namespace_of, cwd),
-            )
-        except Exception as e:  # noqa: BLE001
-            # resolve_repo_brain is documented never to raise (its body is a
-            # broad except returning None), so this is belt-and-braces — but
-            # if it ever did, ABORT and retry rather than either of the wrong
-            # answers: degrading room to None would route the FIRST receive to
-            # personal LTM and set the conversation's partition there stickily,
-            # and letting it propagate would count a routing hiccup as an
-            # import failure toward dormancy. A clean return does neither.
-            # Not _note_failure: a routing hiccup is local, not a
-            # server-import failure, so it must not count toward dormancy or
-            # degrade room to None (which would mis-home the partition). The
-            # afterFileEdit debounce already rate-limits the frequent event;
-            # boundaries retry next turn.
-            _log(f"room/namespace resolve failed transiently ({e!r}) — "
-                 f"retrying next event")
-            # Advance the debounce (like the empty-redaction / no-credential
-            # paths): a persistent resolve failure — a wedged git subprocess,
-            # a repeatedly-failing brain resolve — would otherwise re-run the
-            # full parse + redact + 2s git probe on every afterFileEdit. And
-            # like those paths, CLEAR fail_streak: the server was never
-            # contacted, so this neutral no-op must not preserve a prior run
-            # of contacted failures that a later single failure tips into
-            # dormancy (see _note_failure's documented contract).
-            _save_state(uuid, last_error="resolve_error",
-                        last_flush_at=time.time(), fail_streak=0)
-            return
+        namespace = await asyncio.to_thread(_namespace_of, cwd)
     else:
         if cwd:
             _log(f"ignoring unusable cwd from Cursor source: {str(cwd)[:60]!r}")
-        room, namespace = None, None
+        namespace = None
 
+    # No `agent_brain_id` and no `org_id`, ever: a session is captured into
+    # the author's personal memory, never into a brain — the repo's room
+    # included. Naming a brain on any flush makes the server pin the whole
+    # session to it and re-extract its earlier turns there.
     arguments = {
         "messages": sendable,
         # Host-namespaced so server-side watermarks never collide across
@@ -1060,10 +1028,6 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         "source_platform": cursor_reader.HOST,
         "flush": flush_mode,
     }
-    if room:
-        arguments["agent_brain_id"] = room["brain_id"]
-        if room.get("org_id"):
-            arguments["org_id"] = room["org_id"]
     if namespace:
         # Same scope stamp flush_turn sends: directives extracted from this
         # session must recall in this repo's context, not everywhere.
@@ -1167,8 +1131,7 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
     if applied_usage is not None:
         fields["sent_usage_generations"] = sorted(applied_usage)
     _save_state(uuid, **fields)
-    _log(f"flushed {len(sendable)} records → cursor-{uuid}"
-         + (f" (room {room['brain_id'][:8]}…)" if room else " (personal)"))
+    _log(f"flushed {len(sendable)} records → cursor-{uuid} (personal)")
 
 
 _OBSERVATION_FIELDS = (

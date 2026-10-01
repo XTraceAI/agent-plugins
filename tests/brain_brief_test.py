@@ -18,11 +18,11 @@ session's first prompt:
 * ``refresh`` is throttled and never raises, whatever the cache contains;
 * the map is drawn from the Index when the digest has one, else from the
   footer counts; the prose clip is short;
-* apply / recall pointers come from a cache a detached child refreshes, are
-  rendered once per session (served ids are shared with directive_recall),
-  and are the first thing cut under the budget — never the map;
-* the prompt hook is silent and free on a prompt with no identifier, fires
-  one recall otherwise, and delivers a pending pointer cache exactly once.
+* recall pointers come from a cache a detached child refreshes, are rendered
+  once per session, and are the first thing cut under the budget — never the
+  map; a legacy ``apply`` list in an old cache is never rendered;
+* the prompt hook makes no recall of its own: it delivers a pending pointer
+  cache exactly once, and is silent otherwise.
 
 Run: python3 tests/brain_brief_test.py  (from the repo root; stdlib only).
 """
@@ -136,8 +136,8 @@ off = _brief()
 check("says so when capture is switched off", "capture is OFF" in _ctx(off))
 os.environ.pop("MEMHUB_TURN_FLUSH")
 on = _brief()
-check("says sessions are captured when it is on",
-      "captured into it automatically" in _ctx(on))
+check("says sessions go to personal memory, not the brain",
+      "captured into your personal memory, never into this brain" in _ctx(on))
 
 # ── the overview: injected, and clipped ────────────────────────────────────
 cache = brain_brief._cache_path("staging", BRAIN)
@@ -287,8 +287,12 @@ check("the map is the five-line top of the Index",
       "    ├── Specs 4" in m and "Docs 5" not in m and "(full Index" in m)
 check("with an Index the counts tree is not drawn too", "Facts      " not in m)
 m = "\n".join(brain_brief._render_map(BRAIN, FOOTERED))
-check("without an Index the map is drawn from the footer counts",
-      "├── Facts        2,553" in m and 'memory_type="episodes")' in m)
+check("without an Index the map is drawn from the footer's artifact count",
+      "└── Artifacts       51" in m and 'kind="artifact")' in m
+      and "read_memory(id)" in m)
+check("the footer map names no facts, no in-brain episodes, no removed tool",
+      "Facts" not in m and "Episodes" not in m and "get_artifact" not in m
+      and "memory_type" not in m)
 check("no digest at all points at get_brain_overview",
       "No compiled overview cached yet" in "\n".join(brain_brief._render_map(BRAIN, "")))
 m = "\n".join(brain_brief._render_map(BRAIN, "just prose, no footer"))
@@ -298,21 +302,19 @@ m = "\n".join(brain_brief._render_map(BRAIN, "P" * 5000))
 check("the prose clip is 600 chars", "truncated" in m
       and len(m) < brain_brief._MAX_OVERVIEW_CHARS + 200)
 
-# ── assembly under budget: recall goes first, then apply, never the map ────
+# ── assembly under budget: recall is cut, never the map ────────────────────
 HEAD = ["H"]
 MAP = ["## Map", "m1", "m2"]
-APPLY = ["## Apply"] + [f"• a{i}" for i in range(5)]
-RECALL = ["## Recall"] + [f"• r{i}" for i in range(5)] + ["(open one: …)"]
-full = brain_brief._assemble(HEAD, MAP, copy.copy(APPLY), copy.copy(RECALL), 10_000)
+RECALL = ["## Recall"] + [f"• r{i} {'x' * 30}" for i in range(5)] + ["(open one: …)"]
+full = brain_brief._assemble(HEAD, MAP, copy.copy(RECALL), 10_000)
 check("under budget nothing is cut", "• r4" in full and brain_brief._TRIMMED_FOOTER not in full)
-just_apply = len("\n".join(HEAD + [""] + MAP + [""] + APPLY))
-tight = brain_brief._assemble(HEAD, MAP, copy.copy(APPLY), copy.copy(RECALL), just_apply + 40)
-check("recall pointers are dropped before any apply pointer",
-      "• a4" in tight and "• r" not in tight and "## Recall" not in tight)
+tight = brain_brief._assemble(HEAD, MAP, copy.copy(RECALL), len(full) - 1)
+check("recall pointers are dropped from the end",
+      "• r0" in tight and "• r4" not in tight)
 check("a cut brief says so", tight.endswith(brain_brief._TRIMMED_FOOTER))
-tighter = brain_brief._assemble(HEAD, MAP, copy.copy(APPLY), copy.copy(RECALL), 10)
-check("the map is never cut", "m2" in tighter and "• a" not in tighter
-      and tighter.endswith(brain_brief._TRIMMED_FOOTER))
+tighter = brain_brief._assemble(HEAD, MAP, copy.copy(RECALL), 10)
+check("the map is never cut", "m2" in tighter and "• r" not in tighter
+      and "## Recall" not in tighter and tighter.endswith(brain_brief._TRIMMED_FOOTER))
 
 # ── brief + pointer cache: rendered, served, not repeated, refreshed ───────
 _stub_room(room)
@@ -324,38 +326,42 @@ _real_spawn = brain_brief._spawn_pointers
 brain_brief._spawn_pointers = lambda cwd: spawned.append(cwd)  # type: ignore[assignment]
 
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
-check("no pointer cache: no Apply/Recall, but the worker is spawned",
-      "## Apply" not in ctx and spawned == ["/repo"])
+check("no pointer cache: no Recall, but the worker is spawned",
+      "## Recall" not in ctx and spawned == ["/repo"])
 PCACHE = brain_brief._pointers_path("staging", BRAIN, "/repo")
 POINTERS = {
     "computed_at": time.time(), "head": "h1", "branch": "b", "base": "origin/main",
-    "apply": [{"id": "d1", "type": "lesson", "text": "lesson one", "as_of": "2026-09-01", "match": "x.py"},
-              {"id": "d2", "type": "procedure", "text": "proc two", "as_of": "", "match": ""}],
+    # A cache written by an older plugin still carries directive pointers.
+    "apply": [{"id": "d1", "type": "lesson", "text": "lesson one", "as_of": "2026-09-01", "match": "x.py"}],
     "recall": [{"id": "e1", "type": "episode", "text": "episode one", "match": "PR #1"},
-               {"id": "a1", "type": "artifact", "text": "artifact one", "match": "x.py"}],
+               {"id": "e2", "type": "episode", "text": "episode two", "match": "x.py"},
+               {"id": "a1", "type": "artifact", "text": "artifact one", "match": "x.py"},
+               {"id": "a2", "type": "artifact", "text": "artifact two", "match": "PR #1"}],
 }
+RECALL_IDS = {"e1", "e2", "a1", "a2"}
 brain_brief._write_json(PCACHE, POINTERS)
 spawned.clear()
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
-check("a fresh cache renders Apply", "## Apply" in ctx and "• [lesson] lesson one — 2026-09-01 · on x.py [d1]" in ctx)
-check("a fresh cache renders Recall & Consult", "## Recall & Consult" in ctx and "[artifact] artifact one" in ctx)
+check("a fresh cache renders Recall & Consult",
+      "## Recall & Consult" in ctx and "• [artifact] artifact one — on x.py [a1]" in ctx)
+check("a legacy apply list is never rendered", "## Apply" not in ctx and "[d1]" not in ctx)
 check("every rendered id joins the served list",
-      set(served_state.load_ids(served_state.STATE_DIR, "s1")) == {"d1", "d2", "e1", "a1"})
+      set(served_state.load_ids(served_state.STATE_DIR, "s1")) == RECALL_IDS)
 check("a fresh cache on the same HEAD is not recomputed", spawned == [])
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
-check("served ids are not rendered again", "## Apply" not in ctx and "## Recall" not in ctx)
+check("served ids are not rendered again", "## Recall" not in ctx)
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s2"}))
-check("another session still sees them", "[d1]" in ctx and "[a1]" in ctx)
+check("another session still sees them", "[e1]" in ctx and "[a1]" in ctx)
 brain_brief._write_json(PCACHE, {**POINTERS, "head": "h0"})
 spawned.clear(); _brief({"cwd": "/repo", "session_id": "s3"})
 check("HEAD moved: the worker is spawned", spawned == ["/repo"])
 brain_brief._write_json(PCACHE, {**POINTERS, "branch": "other"})
 spawned.clear(); ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s4"}))
 check("a cache computed for another branch is neither rendered nor kept",
-      "## Apply" not in ctx and spawned == ["/repo"])
+      "## Recall" not in ctx and spawned == ["/repo"])
 brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() - 2 * 86400})
 spawned.clear(); ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s5"}))
-check("a stale cache is neither rendered nor trusted", "## Apply" not in ctx and spawned == ["/repo"])
+check("a stale cache is neither rendered nor trusted", "## Recall" not in ctx and spawned == ["/repo"])
 brain_brief._write_json(PCACHE, POINTERS)
 
 # the real spawner: disabled by env, else a detached `pointers` child
@@ -381,30 +387,83 @@ _fake_auth.resolve_bearer = lambda *a, **k: ("https://x", "bearer")  # type: ign
 sys.modules["_memhub_auth"] = _fake_auth
 
 
-def _fake_recall_items(url, bearer, brain_id, repo, entities, served, session_id, limit, timeout):
-    recorded.update(served=list(served), session_id=session_id, limit=limit)
-    return [{"id": f"w{i}", "type": "lesson", "content": f"lesson {i}", "triggers": ["x.py"]}
-            for i in range(limit)]
+def _fake_search_items(url, bearer, brain_id, identifiers, timeout):
+    recorded.update(identifiers=list(identifiers), brain_id=brain_id)
+    return [{"id": f"w{i}", "type": "episode", "text": f"episode {i}", "match": "x.py"}
+            for i in range(3 * brain_brief._MAX_RECALL)]
 
 
-_saved = (brain_brief._recall_items, brain_brief._search_items, brain_brief._repo_name)
-brain_brief._recall_items = _fake_recall_items  # type: ignore[assignment]
-brain_brief._search_items = lambda *a, **k: []  # type: ignore[assignment]
-brain_brief._repo_name = lambda root: "r"  # type: ignore[assignment]
+_saved_search = brain_brief._search_items
+brain_brief._search_items = _fake_search_items  # type: ignore[assignment]
 served_state.add_ids(served_state.STATE_DIR, "s1", ["w0"])
 check("worker exits clean", brain_brief.cmd_pointers("/repo") == 0)
-check("the worker sends no served list and no session id",
-      recorded.get("served") == [] and recorded.get("session_id") == "")
+check("the worker searches on the branch's identifiers",
+      recorded.get("identifiers") == ["x.py"] and recorded.get("brain_id") == BRAIN)
 wcache = brain_brief._read_json(PCACHE)
 check("the cache holds twice the cap so the per-session filter still fills a block",
-      recorded.get("limit") == 2 * brain_brief._MAX_APPLY
-      and len(wcache.get("apply") or []) == 2 * brain_brief._MAX_APPLY)
+      len(wcache.get("recall") or []) == 2 * brain_brief._MAX_RECALL
+      and "apply" not in wcache)
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s1"}))
 check("a session's served ids are filtered at render time, not in the cache",
-      "[w0]" not in ctx and ctx.count("\n• ") == brain_brief._MAX_APPLY)
-brain_brief._recall_items, brain_brief._search_items, brain_brief._repo_name = _saved
+      "[w0]" not in ctx and ctx.count("\n• ") == brain_brief._MAX_RECALL)
+brain_brief._search_items = _saved_search
 del sys.modules["_memhub_auth"]
 brain_brief._write_json(PCACHE, POINTERS)
+
+# ── _search_items: the two searches it asks, and the title/abstract grep ────
+# The server returns POINTERS (no body): episodes are personal and refused
+# with an agent_brain_id, artifacts are searched inside the brain.
+search_calls: list[dict] = []
+POINTER_HITS = {
+    "episode": [
+        {"id": "ep1", "kind": "episode", "title": "Fix brain_brief.py recall",
+         "abstract": "…", "as_of": "2026-09-20", "score": 0.4},
+        {"id": "ep2", "kind": "episode", "title": "Unrelated", "abstract": "talks about recall",
+         "content": "brain_brief.py appears only in a body", "score": 0.9},
+    ],
+    "artifact": [
+        {"id": "ar1", "kind": "artifact", "title": "Recall design",
+         "abstract": "Shipped in PR #42.", "score": 0.7},
+        {"id": "ar2", "kind": "artifact", "title": "PR #420 notes", "abstract": "", "score": 0.8},
+    ],
+}
+_fake_http = types.ModuleType("mcp_http")
+
+
+def _fake_call_tool(url, bearer, name, args, timeout=None):
+    search_calls.append({"name": name, **args})
+    return types.SimpleNamespace(isError=False, structuredContent={
+        "items": POINTER_HITS[args["kind"]]})
+
+
+_fake_http.call_tool = _fake_call_tool  # type: ignore[attr-defined]
+_saved_http = sys.modules.get("mcp_http")
+sys.modules["mcp_http"] = _fake_http
+got = brain_brief._search_items("https://x", "b", BRAIN, ["brain_brief.py", "PR #42"], 5.0)
+if _saved_http is not None:
+    sys.modules["mcp_http"] = _saved_http
+else:
+    del sys.modules["mcp_http"]
+by_kind = {c["kind"]: c for c in search_calls}
+check("two searches: one per kind, singular kind values, no memory_type",
+      [c["name"] for c in search_calls] == ["search_memory", "search_memory"]
+      and set(by_kind) == {"episode", "artifact"}
+      and not any("memory_type" in c for c in search_calls))
+check("episodes are searched WITHOUT agent_brain_id (your own sessions)",
+      "agent_brain_id" not in by_kind["episode"])
+check("artifacts are searched inside the repo brain",
+      by_kind["artifact"].get("agent_brain_id") == BRAIN)
+check("no body is requested — pointers only",
+      not any(c.get("include_content") for c in search_calls))
+check("a hit is kept only when its title/abstract names an identifier",
+      [d["id"] for d in got] == ["ar1", "ep1"])
+check("a body-only mention is not a match (pointers carry no body)",
+      "ep2" not in [d["id"] for d in got])
+check("PR #42 does not match PR #420", "ar2" not in [d["id"] for d in got])
+ep1 = next(d for d in got if d["id"] == "ep1")
+check("a kept pointer carries kind, title text, as_of and the matched identifier",
+      ep1["type"] == "episode" and ep1["text"] == "Fix brain_brief.py recall"
+      and ep1["as_of"] == "2026-09-20" and ep1["match"] == "brain_brief.py")
 
 # ── the budget: one env var, 2:1, trimmed footer ───────────────────────────
 os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "300"
@@ -425,24 +484,7 @@ os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
 
 # ── the prompt hook ────────────────────────────────────────────────────────
 brain_brief.room_map.repo_root = lambda cwd=None: Path("/repo")  # type: ignore[assignment]
-brain_brief.brief_identifiers.repo_files = lambda root: {"room_map", "room_map.py"}  # type: ignore[assignment]
 brain_brief.brief_identifiers.current_branch = lambda root: "b"  # type: ignore[assignment]
-recall_calls: list[dict] = []
-PROMPT_ITEMS = [
-    {"id": "p1", "type": "lesson", "content": "lesson about room_map", "as_of": "2026-09-02",
-     "triggers": ["room_map.read_room"]},
-    {"id": "p2", "type": "lesson", "content": "second", "triggers": ["other"]},
-    {"id": "p3", "type": "procedure", "content": "third", "triggers": []},
-    {"id": "p4", "type": "lesson", "content": "fourth", "triggers": []},
-]
-
-
-def _fake_prompt_recall(brain_id, root, entities, served, session_id):
-    recall_calls.append({"entities": entities, "served": list(served)})
-    return [d for d in PROMPT_ITEMS if d["id"] not in served][:brain_brief._MAX_PROMPT]
-
-
-brain_brief._prompt_recall = _fake_prompt_recall  # type: ignore[assignment]
 
 
 def _prompt(payload: dict) -> dict:
@@ -453,46 +495,25 @@ def _prompt(payload: dict) -> dict:
     return json.loads(raw) if raw else {}
 
 
-# s1 has already seen the cache, so only the prompt's own identifiers matter
-out = _prompt({"cwd": "/repo", "session_id": "s1", "prompt": "summarise what we did yesterday"})
-check("a prompt with no identifier makes no recall and prints nothing",
-      out == {} and recall_calls == [])
+# s1 has already seen the cache, so nothing is pending for it
 out = _prompt({"cwd": "/repo", "session_id": "s1",
                "prompt": "why does room_map.read_room return None for PR #182?"})
-pctx = _ctx(out)
-check("identifiers in the prompt fire one recall on them",
-      len(recall_calls) == 1 and {"room_map.read_room", "PR #182"} <= set(recall_calls[0]["entities"]))
-check("the hook answers as UserPromptSubmit",
-      out.get("hookSpecificOutput", {}).get("hookEventName") == "UserPromptSubmit")
-check("at most three pointers", pctx.count("\n• ") + pctx.startswith("• ") <= 3 and "[p4]" not in pctx)
-check("the matched trigger is shown", "on room_map.read_room [p1]" in pctx)
-check("prompt pointers join the served list",
-      {"p1", "p2", "p3"} <= set(served_state.load_ids(served_state.STATE_DIR, "s1")))
-out = _prompt({"cwd": "/repo", "session_id": "s1", "prompt": "again: room_map.read_room"})
-check("served pointers are not repeated: only the unseen one remains",
-      "[p4]" in _ctx(out) and "[p1]" not in _ctx(out))
-out = _prompt({"cwd": "/repo", "session_id": "s1", "prompt": "again: room_map.read_room"})
-check("and once everything is served the hook is silent", out == {})
-
-LONG_ITEMS = [{"id": f"L{i}", "type": "lesson", "content": "w" * 400, "triggers": []} for i in range(3)]
-brain_brief._prompt_recall = lambda *a, **k: LONG_ITEMS  # type: ignore[assignment]
-pctx = _ctx(_prompt({"cwd": "/repo", "session_id": "s7", "prompt": "see room_map.read_room"}))
-check("the prompt block stays under 600 chars, cut from the end",
-      0 < len(pctx) <= brain_brief._PROMPT_MAX_CHARS and "[L0]" in pctx and "[L2]" not in pctx)
-brain_brief._prompt_recall = _fake_prompt_recall  # type: ignore[assignment]
+check("with nothing pending the prompt hook prints nothing, identifiers or not", out == {})
 
 # the pointer cache the brief could not deliver arrives on the first prompt — once
 out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
 check("a pending pointer cache is delivered by the prompt hook",
-      "## Apply" in _ctx(out) and "[a1]" in _ctx(out))
+      "## Recall & Consult" in _ctx(out) and "[a1]" in _ctx(out)
+      and out.get("hookSpecificOutput", {}).get("hookEventName") == "UserPromptSubmit")
+check("…without the legacy apply list", "[d1]" not in _ctx(out))
 out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
 check("…and only once per refresh", out == {})
 brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() + 1,
-                                 "apply": [{"id": "d9", "type": "lesson", "text": "new", "as_of": "", "match": ""}],
-                                 "recall": []})
+                                 "recall": [*POINTERS["recall"],
+                                            {"id": "e9", "type": "episode", "text": "new", "match": ""}]})
 out = _prompt({"cwd": "/repo", "session_id": "s8", "prompt": "no identifiers here"})
 check("a refreshed cache is delivered again, minus served ids",
-      "[d9]" in _ctx(out) and "[d1]" not in _ctx(out))
+      "[e9]" in _ctx(out) and "[e1]" not in _ctx(out))
 brain_brief._write_json(PCACHE, {**POINTERS, "computed_at": time.time() + 2, "branch": "other"})
 spawned.clear()
 out = _prompt({"cwd": "/repo", "session_id": "s9", "prompt": "no identifiers here"})
@@ -501,8 +522,10 @@ check("a pending cache for another branch is not delivered by the prompt hook, a
       and served_state.load_ids(served_state.STATE_DIR, "s9") == [])
 brain_brief._write_json(PCACHE, POINTERS)
 
-# a budget cut at SessionStart leaves the marker alone, so the prompt delivers the rest
-os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "300"
+# a budget cut at SessionStart leaves the marker alone, so the prompt delivers the rest.
+# 330 is picked to fit some but not all pointers under the head sentence
+# (320-340 does); re-pick it if the head grows.
+os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "330"
 bctx = _ctx(_brief({"cwd": "/repo", "session_id": "s10"}))
 shown_at_start = set(brain_brief._ids_in(bctx))
 check("the trimmed brief showed some but not all cached pointers",
@@ -513,7 +536,7 @@ os.environ.pop("MEMHUB_BRIEF_TOKEN_BUDGET")
 out = _prompt({"cwd": "/repo", "session_id": "s10", "prompt": "no identifiers here"})
 rest = set(brain_brief._ids_in(_ctx(out)))
 check("the first prompt delivers exactly the pointers the budget cut",
-      rest and rest.isdisjoint(shown_at_start) and shown_at_start | rest == {"d1", "d2", "e1", "a1"})
+      rest and rest.isdisjoint(shown_at_start) and shown_at_start | rest == RECALL_IDS)
 check("…and then the marker is advanced",
       served_state.load_marker(served_state.STATE_DIR, "s10", "brief").get("computed_at")
       == POINTERS["computed_at"])
@@ -532,7 +555,7 @@ probe = subprocess.run(
      "buf = io.StringIO()\n"
      "with contextlib.redirect_stdout(buf): brain_brief.cmd_brief({'cwd': '/repo', 'session_id': 'probe'})\n"
      "ctx = json.loads(buf.getvalue())['hookSpecificOutput']['additionalContext']\n"
-     "print(json.dumps([sorted(m for m in sys.modules if m in ('mcp_http', '_memhub_auth', 'urllib.request', 'http.client')), '## Apply' in ctx]))"
+     "print(json.dumps([sorted(m for m in sys.modules if m in ('mcp_http', '_memhub_auth', 'urllib.request', 'http.client')), '## Recall' in ctx]))"
      % (str(SCRIPTS), room, FAKE_GIT)],
     capture_output=True, text=True,
     env={**os.environ, "HOME": _TMP_HOME, "USERPROFILE": _TMP_HOME, "MEMHUB_BRIEF_POINTERS": "0"},

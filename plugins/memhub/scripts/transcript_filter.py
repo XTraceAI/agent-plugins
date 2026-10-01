@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import re
 
 # The wrappers the client emits around a slash command: the invocation, the
@@ -291,39 +290,14 @@ def _hard_trim_block(block, keep: int):
             "text": _elision_note(_size(block), None, HARD_MAX_RECORD_BYTES)}
 
 
-# Set on the headless `claude -p --resume <owner> --fork-session` that
-# `harness_stop.run_author` spawns. Its transcript is a COPY of the person's
-# session under a NEW session id, so shipping it lands the person's whole
-# history a second time as a separate conversation under the same title, and
-# every later pass adds another. It was measured on staging at 80 copies of one
-# session. The child is the plugin's own work, never the person's, so no path
-# may capture it.
+# Set on a `claude` process the plugin's own tooling starts — the case judge
+# (harness/judge/judge.py) today. Its session is the plugin's work, never the
+# person's, so no path may capture it: a headless `--fork-session` copy of a
+# person's session was once measured on staging at 80 copies of one session.
 HARNESS_CHILD_ENV = "MEMHUB_HARNESS_CHILD"
 
 
-def is_harness_child(environ=None, session_id: str = "") -> bool:
-    """By the environment, or by the children list the spawner writes.
-
-    The environment alone failed once: Claude Code applies settings.json `env`
-    over what a child inherits, and that is where an install opts the harness
-    in. `harness_stop.register_child` writes the child's session id BEFORE the
-    child runs, so a hook that has the payload's session_id can ask the list —
-    and the list cannot be overridden by anything."""
+def is_harness_child(environ=None) -> bool:
+    """True when the environment marks this process as the plugin's own child."""
     env = os.environ if environ is None else environ
-    if str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() in ("1", "on", "true", "yes"):
-        return True
-    if not session_id:
-        return False
-    path = Path(env.get("MEMHUB_HARNESS_DIR")
-                or (Path.home() / ".config" / "memhub-plugin" / "harness")) / "children.jsonl"
-    try:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    if str(json.loads(line).get("child")) == session_id:
-                        return True
-                except ValueError:
-                    continue
-    except OSError:
-        pass
-    return False
+    return str(env.get(HARNESS_CHILD_ENV, "")).strip().lower() in ("1", "on", "true", "yes")

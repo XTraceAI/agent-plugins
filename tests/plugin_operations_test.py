@@ -144,7 +144,6 @@ class PluginOperationsTests(unittest.TestCase):
         session = SimpleNamespace(call_tool=AsyncMock(side_effect=mcp_http.PluginUpgradeRequired("9.0.0")))
         with patch.object(ft, "STATE_DIR", Path(self.tmp.name) / "capture"), \
              patch.object(ft, "resolve_bearer", return_value=(self.url, self.bearer)), \
-             patch.object(ft, "resolve_repo_brain", AsyncMock(return_value=None)), \
              patch.object(ft, "_namespace", return_value=("/repo", "repo")), \
              patch.object(ft.mcp_http, "Session", return_value=session):
             asyncio.run(ft._flush("pending-session", str(transcript)))

@@ -25,10 +25,13 @@ Arguments: `$ARGUMENTS`
 - `--new`, or the user asking for a separate / dedicated brain → skip the
   channel and make a one-off brain (step 2b).
 
-Do exactly this. Every call below runs in ONE org: omit `org_id` for a
-single-org account; in several orgs (`list_orgs`), use the one the teammates
-are in (ask if it's unclear) and pass that `org_id` to every call — a brain
-and its people live in exactly one org.
+Do exactly this. A brain and its people live in exactly one org. Every call
+that takes an `agent_brain_id` works the org out from that id — never pass an
+`org_id` alongside one. For a single-org account that is the whole story. In
+several orgs (`list_orgs`), pick the one the teammates are in (ask if it's
+unclear) and pass its `org_id` to the calls that have no brain id yet —
+`list_teammates`, `list_agent_brains`, `create_agent_brain` — wherever the
+tool's schema offers it.
 
 1. **Resolve the teammates.** `list_teammates` (it never lists you), match
    each name/email case-insensitively. No match or several → show the
@@ -67,8 +70,10 @@ and its people live in exactly one org.
       - `--new` → `name: "Handoff: <title>"` and a one-line description
         naming who it's from, who it's for, and the topic.
 
-      Then share it with everyone in **T** via `share_agent_brain`:
-      `"contributor"` for a channel, `"viewer"` for a `--new` brain. A reused
+      Then share it with everyone in **T** in ONE call:
+      `share_agent_brain(agent_brain_id, permission, teammates=[…every
+      user_id in T…])` — `permission` is `"contributor"` for a channel,
+      `"viewer"` for a `--new` brain. Never one call per person. A reused
       channel needs no sharing — matching it proved they already have it.
 
 3. **Upload the brief** with `save_artifact` into that brain:

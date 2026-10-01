@@ -46,6 +46,12 @@ file; `--agent-main false` runs the case as a subagent:
   --silent 'bash:cat src/service.py | head -50' \
   --silent 'bash:cat src/service.py' --agent-main false
 
+For a `prompt` rule a case is the whole prompt text, harness wrappers
+included — the hook matches what UserPromptSubmit carries, unstripped:
+
+  --fires  '<task-notification>ci finished</task-notification>' \
+  --silent 'what does this loop do?'
+
 An `ordering` rule is verified as a SEQUENCE of steps joined by ` >> `, ending
 in the gated call; the case fires when that call is gated:
 
@@ -239,6 +245,10 @@ def _fires(hook_rule: dict, raw: str, fixture: dict | None = None) -> bool:
         return _ordering_fires(hook_rule, raw)
     if on == "read":
         return _read_fires(hook_rule, raw, fixture or {})
+    if on == "prompt":
+        # The case IS the prompt, wrappers and all — `::` in it is prose.
+        return bool(H.evaluate(hook_rule, hook_phase="prompt", tool="UserPromptSubmit",
+                               prompt=raw)) and H.given_ok(hook_rule, _probes(fixture or {}))
     path, content = _split_case(raw)
     if on in ("edit", "write", "write_stdlib"):
         hit = H.evaluate(hook_rule, hook_phase="pre", tool="Edit",

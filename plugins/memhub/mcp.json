@@ -5,7 +5,7 @@
       "type": "streamable-http",
       "url": "https://api.memhub.xtrace.ai/mcp-server/mcp",
       "headers": {
-        "X-MemHub-Plugin-Version": "0.88.0"
+        "X-MemHub-Plugin-Version": "0.103.0"
       }
     }
   }

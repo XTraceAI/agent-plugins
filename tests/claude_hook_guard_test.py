@@ -79,13 +79,18 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 22   # + PreToolUse (add_memory_gate.py),
+    assert len(commands) == 20   # - the three retired directive-recall
+                                 # handlers (PreToolUse ×2, PostToolUse),
+                                 # + PreToolUse (add_memory_gate.py),
                                  # + UserPromptSubmit (brain_brief.py prompt,
                                  # and rulebook_hook.py prompt — the lane that
                                  # arms a prompt-armed obligation),
                                  # + Stop (harness_stop.py, a no-op unless
-                                 # MEMHUB_HARNESS_EXTRACT; it blocks the stop,
-                                 # so its prompt lane is gone),
+                                 # MEMHUB_HARNESS_EXTRACT; it continues the
+                                 # stop, so its prompt lane is gone),
+                                 # + SessionStart (harness_stop.py session,
+                                 # behind the same flag: the standing rule the
+                                 # person is not shown),
                                  # + PostToolUse (pr_link_trigger.py); SessionEnd
                                  # carries capture AND the fire flush in ONE
                                  # handler, because they must run in that order.

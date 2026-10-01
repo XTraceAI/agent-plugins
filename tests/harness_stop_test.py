@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """Tests for the harness-tied memory sensor (`harness_stop.py`).
 
-What these protect: with the flag off nothing happens at all; with it on the
-Stop hook returns at once and takes the turn's error arcs at the boundary; a
-detached child classifies each turn exactly once; a failure and its fix are
-one moment; the child classifies the turn that stopped even when the next
-prompt has already landed; a flagged moment BLOCKS a later Stop of the main
-agent once, with its stamp, the continuation's own Stop passes, and a moment
-the child appends meanwhile is never lost; the recorded block never becomes a
-turn; the proposal is scoped to the repository the turn worked in; subagents
-never take a moment; nothing in the sensor sends `activate`. No test reaches a
-server: `server_classify` is substituted.
+What these protect (harness-tied-memory-spec §4.0–4.3.1): with the flag off
+nothing happens at all; the Stop of turn N+1 judges turn N — never the turn
+that just stopped, never a turn twice — and on a signal continues the agent
+ONCE with one short line naming the `handoff` command, which prints a
+launch prompt naming that one moment, its stamp command and turn N+1; a Stop
+that is a launch's continuation, a subagent's, or the end of a harness prompt
+(a task notification, a loop wakeup) judges nothing; an interrupted turn and
+its verbatim resend are judged once; a classifier failure blocks nothing; the
+`stamp` command prints the stamp `create_rule` needs; nothing is written but
+`stop.log`; nothing in the sensor sends `activate`. No test reaches a server:
+`server_classify` is substituted.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib
 import io
-import pathlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,16 +48,12 @@ class _Env:
         os.environ["MEMHUB_HARNESS_EXTRACT"] = "1"
         os.environ["MEMHUB_RULEBOOK_FETCH"] = "0"
         os.environ["MEMHUB_RULEBOOK_RECALL"] = "0"
-        # the hook reads MEMHUB_RULEBOOK_BASE at import
         if "rulebook_hook" in sys.modules:
             importlib.reload(sys.modules["rulebook_hook"])
         hx._HOOK_MODULE.clear()
         return self
 
     def __exit__(self, *exc):
-        for fh in hs._HELD:                    # never leak a lock into the next test
-            fh.close()
-        hs._HELD.clear()
         for k, v in self.saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -67,9 +63,15 @@ class _Env:
         self.td.cleanup()
 
 
-def _transcript(path: Path, turns):
+def _records(path: Path, turns):
+    """Transcript records for (user, asst, tools) turns. `user` may also be a
+    dict: a raw record to append as it is (a notification, an isMeta body)."""
     recs, n = [], 0
-    for user, asst, tools in turns:
+    for item in turns:
+        if isinstance(item, dict):
+            recs.append(item)
+            continue
+        user, asst, tools = item
         n += 1
         recs.append({"type": "user", "uuid": f"u{n}", "cwd": str(path.parent),
                      "message": {"content": user}})
@@ -80,661 +82,279 @@ def _transcript(path: Path, turns):
             recs.append({"type": "user", "message": {"content": [
                 {"type": "tool_result", "tool_use_id": tid, "content": out, "is_error": err}]}})
         recs.append({"type": "assistant", "message": {"content": [{"type": "text", "text": asst}]}})
-    path.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+    return recs
 
 
-def _git_repo(td: Path, name: str = "repo") -> Path:
-    repo = td / name
-    repo.mkdir()
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x", GIT_COMMITTER_NAME="t",
-               GIT_COMMITTER_EMAIL="t@x", HOME=str(td), GIT_CONFIG_NOSYSTEM="1")
-    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "x"]):
-        subprocess.run(["git", "-C", str(repo), *args], check=True, env=env, capture_output=True)
-    return repo
+def _transcript(path: Path, turns):
+    path.write_text("\n".join(json.dumps(r) for r in _records(path, turns)) + "\n",
+                    encoding="utf-8")
 
 
-def _classify(calls, reply):
-    return lambda w, hint="", repo="", timeout=0: (
-        calls.append({"window": w, "hint": hint}), (reply, 0.1))[1]
+def _moment(turn: int, **extra) -> dict:
+    m = {"source_ref": f"sess#{turn}", "turn": turn, "kind": "correction",
+         "derivable": False, "state": {"repo": "repo"},
+         "transcript": "/t/sess.jsonl", "cwd": "/w"}
+    m.update(extra)
+    return m
 
 
-def _spawns(fn):
-    seen = []
-    real = hx.subprocess.Popen
-    hx.subprocess.Popen = lambda args, **kw: seen.append((args, kw))
+@contextlib.contextmanager
+def _classifier(reply):
+    """Substitute the one server call; yields the windows it was sent."""
+    sent = []
+    real = hx.server_classify
+    hx.server_classify = lambda window, repo="", timeout=0: (sent.append(window), (reply, 0.1))[1]
     try:
-        fn()
+        yield sent
     finally:
-        hx.subprocess.Popen = real
-    return seen
+        hx.server_classify = real
+
+
+def _stop(env, tp: Path, **payload) -> dict | None:
+    """Run cmd_stop in-process; the hook output it printed, or None."""
+    body = {"session_id": "sess", "transcript_path": str(tp), "cwd": str(env.base)}
+    body.update(payload)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert hs.cmd_stop(body) == 0
+    text = out.getvalue().strip()
+    return json.loads(text) if text else None
+
+
+SIGNAL = {"signal": True, "reason": "classified", "kind": "correction", "derivable": False}
 
 
 # ---------------------------------------------------------------- the flag
 def test_with_the_flag_off_nothing_happens():
     with _Env() as env:
-        os.environ["MEMHUB_HARNESS_EXTRACT"] = "0"
         tp = env.base / "s.jsonl"
-        _transcript(tp, [("i mean staging", "ok", [])])
-        for mode in ("stop", "extract"):
-            proc = subprocess.run(
-                [sys.executable, str(SCRIPTS / "harness_stop.py"), mode,
-                 "--session", "s", "--transcript", str(tp)],
-                input=json.dumps({"session_id": "s", "transcript_path": str(tp), "cwd": str(ROOT)}),
-                capture_output=True, text=True, timeout=30,
-                env=dict(os.environ, MEMHUB_HARNESS_EXTRACT="0"))
-            assert proc.returncode == 0 and proc.stdout == "", (mode, proc.stdout)
+        _transcript(tp, [("i mean staging", "ok", []), ("thanks", "ok", [])])
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "harness_stop.py"), "stop"],
+            input=json.dumps({"session_id": "s", "transcript_path": str(tp), "cwd": str(ROOT)}),
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, MEMHUB_HARNESS_EXTRACT="0"))
+        assert proc.returncode == 0 and proc.stdout == "", proc.stdout
         assert not (env.base / "harness").exists()
     print("PASS test_with_the_flag_off_nothing_happens")
 
 
-# --------------------------------------------------------------- stop lane
-def test_stop_spawns_one_detached_child_and_returns():
+# ---------------------------------------------------------- one turn late
+def test_the_stop_after_a_turn_judges_that_turn_and_blocks_once():
     with _Env() as env:
-        tp = env.base / "s.jsonl"
-        tp.write_text("", encoding="utf-8")
-        t0 = time.time()
-        seen = _spawns(lambda: hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp),
-                                            "cwd": str(ROOT)}))
-        assert time.time() - t0 < 0.5
-        assert len(seen) == 1
-        args, kw = seen[0]
-        assert args[1].endswith("harness_stop.py") and args[2] == "extract"
-        assert args[args.index("--session") + 1] == "sess"
-        assert args[args.index("--upto") + 1] == "0", "the boundary is the size at Stop"
-        assert "--arcs" not in args, "no arcs recorded, none passed"
-        if hasattr(os, "setsid"):
-            assert kw["start_new_session"] is True
-        # a re-entered Stop, a subagent's Stop, and a missing transcript: nothing
-        for payload in ({"session_id": "sess", "transcript_path": str(tp), "stop_hook_active": True},
-                        {"session_id": "sess", "transcript_path": str(tp), "agent_id": "agent-7f"},
-                        {"session_id": "sess", "transcript_path": "/nope"},
-                        {"session_id": "", "transcript_path": str(tp)}):
-            assert _spawns(lambda: hs.cmd_stop(payload)) == [], payload
-    print("PASS test_stop_spawns_one_detached_child_and_returns")
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, [("deploy it", "deployed to prod", []),
+                         ("no, i mean staging", "redeployed to staging", []),
+                         ("thanks, now the tests", "tests pass", [])])
+        with _classifier(SIGNAL) as sent:
+            block = _stop(env, tp)
+        assert len(sent) == 1, "one classifier call per Stop"
+        assert "USER'S NEW MESSAGE: no, i mean staging" in sent[0], sent[0]
+        assert "PREVIOUS USER MESSAGE: deploy it" in sent[0], "turn N-1 is the window's context"
+        # turn N+1 is not judged yet: its message rides along only as what the
+        # person said next, and its reply is not in the window at all
+        assert sent[0].rstrip().endswith(
+            "USER'S FOLLOWING MESSAGE (what the person said next): thanks, now the tests"), sent[0]
+        assert sent[0].count("thanks, now the tests") == 1 and "tests pass" not in sent[0]
+        # model-only context, never a block: a block's reason is printed to the person
+        assert "decision" not in block and "reason" not in block, block
+        out = block["hookSpecificOutput"]
+        assert out["hookEventName"] == "Stop", out
+        # Claude Code prints a Stop hook's context to the person in full, so it
+        # is ONE line written for them and nothing else: no command, no
+        # instruction, no prompt. What the agent does with it travels at
+        # SessionStart, where it is not shown.
+        line = out["additionalContext"]
+        assert line == f"{hs.HANDOFF_PREFIX} 2, drafting it in the background.", line
+        # the verdict the line leaves out is in the log, where `handoff` reads it
+        log = (env.base / "harness" / "stop.log").read_text()
+        assert "launch sess t2: fork requested (correction) derivable=0" in log, log
+        # nothing is stored but the log
+        assert sorted(p.name for p in (env.base / "harness").iterdir()) == ["stop.log"]
+    print("PASS test_the_stop_after_a_turn_judges_that_turn_and_blocks_once")
 
 
-def _post(repo: Path, session: str, cmd: str, resp: dict, agent_id: str = ""):
-    payload = {"session_id": session, "cwd": str(repo), "tool_name": "Bash",
-               "hook_event_name": "PostToolUse", "tool_input": {"command": cmd},
-               "tool_response": resp}
-    if agent_id:
-        payload["agent_id"] = agent_id
-    proc = subprocess.run([sys.executable, str(SCRIPTS / "rulebook_hook.py"), "post"],
-                          input=json.dumps(payload), capture_output=True, text=True,
-                          timeout=30, env=dict(os.environ))
-    assert proc.returncode == 0, proc.stderr
-
-
-def test_a_failure_and_its_fix_are_one_moment_taken_at_the_boundary():
+def test_no_signal_or_a_failed_call_blocks_nothing():
     with _Env() as env:
-        repo = _git_repo(env.base)
-        import rulebook_hook as rh  # noqa: PLC0415
-        _post(repo, "arc", "pytest tests/x.py",
-              {"stdout": "", "stderr": "ModuleNotFoundError: No module named 'y'", "exit_code": 1})
-        _post(repo, "arc", "uv pip install y", {"stdout": "ok", "exit_code": 0})
-        _post(repo, "arc", "pytest tests/x.py", {"stdout": "1 passed", "exit_code": 0})
-        _post(repo, "arc", "make x", {"stdout": "", "stderr": "boom", "exit_code": 1})
-        if os.name != "nt":
-            import stat  # noqa: PLC0415
-            mode = stat.S_IMODE(os.stat(rh.arcs_path("arc")).st_mode)
-            assert mode == 0o600, f"a failed command's text is private, got {oct(mode)}"
-        # the session state the rulebook merges by delta is not where arcs live
-        assert "arcs" not in json.dumps(rh.load_state(rh.state_path("arc")))
-        tp = env.base / "s.jsonl"
-        tp.write_text("", encoding="utf-8")
-        seen = _spawns(lambda: hs.cmd_stop({"session_id": "arc", "transcript_path": str(tp)}))
-        args = seen[0][0]
-        arcs_file = Path(args[args.index("--arcs") + 1])
-        arcs = json.loads(arcs_file.read_text())
-        assert len(arcs) == 1 and arcs[0]["target"] == "pytest tests/x.py"
-        assert "ModuleNotFoundError" in arcs[0]["signature"] and arcs[0]["cost"] == 2
-        # taken once: the open failure is cleared with it, nothing pairs across turns
-        assert rh.take_error_arcs("arc") == []
-        _post(repo, "arc", "make x", {"stdout": "ok", "exit_code": 0})
-        assert rh.take_error_arcs("arc") == []
-        # a subagent's failure and fix are its own: its Stop is ignored, so the
-        # main agent's next Stop must not take them
-        _post(repo, "arc", "pytest tests/y.py", {"stdout": "", "stderr": "E boom", "exit_code": 1},
-              agent_id="agent-7f")
-        _post(repo, "arc", "pytest tests/y.py", {"stdout": "1 passed", "exit_code": 0}, agent_id="agent-7f")
-        assert rh.take_error_arcs("arc") == [], "subagent arcs never reach the main turn"
-        # the router sees the arc on a turn whose transcript shows no error
-        hits = hx.route({"n": 1, "user": "ok", "asst": "done", "tools": [], "results": []}, None, arcs=arcs)
-        assert dict(hits)["error_arc"] == "missing-module"
-        # a blocked continuation's arcs are drained at its own Stop, which spawns
-        # nothing: the next ordinary turn must not inherit them (Codex, #230)
-        _post(repo, "arc", "make y", {"stdout": "", "stderr": "E boom", "exit_code": 1})
-        _post(repo, "arc", "make y", {"stdout": "ok", "exit_code": 0})
-        assert _spawns(lambda: hs.cmd_stop({"session_id": "arc", "transcript_path": str(tp),
-                                            "stop_hook_active": True})) == []
-        assert rh.take_error_arcs("arc") == [], "the continuation's arcs were drained"
-        # with the flag off the hook records nothing
-        os.environ["MEMHUB_HARNESS_EXTRACT"] = "0"
-        _post(repo, "off", "pytest", {"stdout": "", "stderr": "E", "exit_code": 1})
-        assert not os.path.exists(rh.arcs_path("off"))
-    print("PASS test_a_failure_and_its_fix_are_one_moment_taken_at_the_boundary")
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, [("a", "b", []), ("c", "d", [])])
+        for reply in ({"signal": False, "reason": "classified"},
+                      {"signal": False, "reason": "transport_error"}):
+            with _classifier(reply) as sent:
+                assert _stop(env, tp) is None
+            assert len(sent) == 1
+        log = (env.base / "harness" / "stop.log").read_text()
+        assert "reason=transport_error" in log, "an outage is logged, never read as quiet"
+        # the window's shape is logged with each verdict: size, results, next message
+        assert " results=0 next=yes" in log and " window=" in log, log
+    print("PASS test_no_signal_or_a_failed_call_blocks_nothing")
 
 
-def test_extract_classifies_the_last_turn_once_and_consumes_its_arcs():
+def test_stops_that_do_not_end_a_persons_turn_judge_nothing():
     with _Env() as env:
-        repo = _git_repo(env.base)
-        tp = env.base / "s.jsonl"
-        _transcript(tp, [("do the thing", "done", [("Bash", {"command": "ls"}, "a", False)]),
-                         ("no, i mean on staging", "right", [("Bash", {"command": "git status"}, "clean", False)])])
-        arcs_file = hx.session_file("sess", ".arcs-1.json")
-        arcs_file.parent.mkdir(parents=True, exist_ok=True)
-        arcs_file.write_text(json.dumps([{"signature": "boom", "target": "make", "fix": "make", "cost": 6}]))
-        calls = []
-        real = hx.server_classify
-        hx.server_classify = _classify(calls, {"signal": True, "reason": "classified",
-                                               "kind": "correction", "derivable": True})
-        try:
-            assert hs.cmd_extract("sess", str(tp), str(repo), str(arcs_file)) == 0
-            # a second Stop for the same turn, or a racing child: no second call
-            assert hs.cmd_extract("sess", str(tp), str(repo)) == 0
-        finally:
-            hx.server_classify = real
-        assert len(calls) == 1 and calls[0]["hint"] == "wrong_target"
-        assert "closed error arc on 'make'" in calls[0]["window"]
-        assert not arcs_file.exists(), "the arcs file is consumed"
-        moments = hx.read_jsonl(hs.moments_path("sess"))
-        assert len(moments) == 1 and moments[0]["source_ref"] == "sess#2"
-        assert moments[0]["derivable"] is True
-        state = moments[0]["state"]
-        assert state["repo"] == "repo" and state["turn"] == 2 and state["branch"] and state["head_sha"]
-        assert hs.load_meta("sess")["last_turn"] == 2
-        # the next turn is its own claim; an outage records nothing
-        _transcript(tp, [("do the thing", "done", []), ("no, i mean on staging", "right", []),
-                         ("thanks", "np", [])])
-        hx.server_classify = _classify(calls, {"signal": False, "reason": "judge_failed"})
-        try:
-            hs.cmd_extract("sess", str(tp), str(repo))
-        finally:
-            hx.server_classify = real
-        assert len(calls) == 2 and len(hx.read_jsonl(hs.moments_path("sess"))) == 1
-        claims = list(hx.harness_dir().glob("sess.turn-*.claim"))
-        assert len(claims) == 1, "older claims are cleared"
-    print("PASS test_extract_classifies_the_last_turn_once_and_consumes_its_arcs")
+        tp = env.base / "sess.jsonl"
+        two = [("fix it", "fixed", []), ("i mean the other file", "done", [])]
+        with _classifier(SIGNAL) as sent:
+            _transcript(tp, two[:1])
+            assert _stop(env, tp) is None, "one turn has no turn before it"
+            _transcript(tp, two)
+            assert _stop(env, tp, stop_hook_active=True) is None, "the launch's continuation"
+            assert _stop(env, tp, agent_id="a1") is None, "a subagent's Stop"
+            # the fork's completion notice, then the agent's reply to it: a new
+            # Stop whose prompt is the harness's, so turn 1 is NOT judged again
+            _transcript(tp, two + [
+                {"type": "user", "uuid": "n1", "message": {"content":
+                    "<task-notification>MemHub harness fork: filed T</task-notification>"}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "noted"}]}}])
+            assert _stop(env, tp) is None
+        assert sent == [], sent
+    print("PASS test_stops_that_do_not_end_a_persons_turn_judge_nothing")
 
 
-def test_extract_takes_the_turn_that_stopped_not_the_prompt_queued_after_it():
+def test_an_interrupted_turn_and_its_resend_are_judged_once():
     with _Env() as env:
-        repo = _git_repo(env.base)
-        tp = env.base / "s.jsonl"
-        _transcript(tp, [("do the thing", "done", []),
-                         ("no, i mean on staging", "right", [("Bash", {"command": "git status"}, "clean", False)])])
-        upto = tp.stat().st_size                     # Stop fired here
-        with tp.open("a", encoding="utf-8") as fh:
-            # the stopped turn's last words flush late, then a queued prompt lands,
-            # all before the detached child opens the file
-            fh.write(json.dumps({"type": "assistant", "message": {"content": [
-                {"type": "text", "text": "late reply"}]}}) + "\n")
-            fh.write(json.dumps({"type": "user", "uuid": "u3", "cwd": str(repo),
-                                 "message": {"content": "now deploy it"}}) + "\n")
-        calls = []
-        real = hx.server_classify
-        hx.server_classify = _classify(calls, {"signal": True, "reason": "classified",
-                                               "kind": "correction"})
-        try:
-            hs.cmd_extract("sess", str(tp), str(repo), "", upto)
-            assert len(calls) == 1 and "i mean on staging" in calls[0]["window"]
-            assert "late reply" in calls[0]["window"] and "now deploy it" not in calls[0]["window"]
-            assert [m["turn"] for m in hx.read_jsonl(hs.moments_path("sess"))] == [2]
-            # the next turn's own Stop is not blocked by a claim taken for it early
-            with tp.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"type": "assistant", "message": {"content": [
-                    {"type": "text", "text": "starting on it"}]}}) + "\n")
-            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
-            assert len(calls) == 2 and "now deploy it" in calls[1]["window"]
-        finally:
-            hx.server_classify = real
-        assert hs.load_meta("sess")["last_turn"] == 3
-    print("PASS test_extract_takes_the_turn_that_stopped_not_the_prompt_queued_after_it")
+        tp = env.base / "sess.jsonl"
+        turns = [("setup", "ok", []), ("stop patching, fix it properly", "", []),
+                 ("stop patching, fix it properly", "fixed properly", [])]
+        _transcript(tp, turns)
+        with _classifier(SIGNAL) as sent:
+            assert _stop(env, tp) is None, "turn 2 is resent as turn 3"
+        assert sent == []
+        _transcript(tp, turns + [("thanks", "ok", [])])
+        with _classifier(SIGNAL) as sent:
+            block = _stop(env, tp)
+        assert block and f"{hs.HANDOFF_PREFIX} 3," in block["hookSpecificOutput"]["additionalContext"], block
+    print("PASS test_an_interrupted_turn_and_its_resend_are_judged_once")
 
 
-# ------------------------------------------------------------- the handoff
-def _ago(days: float) -> str:
-    """A stamp `days` before now. A fixed date ages past `MOMENT_TTL_S` and
-    `pending()` silently drops the moment — the fixture broke CI on 2026-09-24."""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+def test_a_skill_body_is_neither_a_turn_nor_a_prompt():
+    """Claude Code records a skill's body as an isMeta user record after the
+    Skill call. Read as the person's message it was 3% of all flags in the
+    2026-09-29 replay; read as a prompt, it would stop the next Stop judging."""
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, [("use the skill", "running", []),
+                         {"type": "user", "isMeta": True, "uuid": "m1",
+                          "message": {"content": "## Page contract \u2014 read before your first publish"}},
+                         ("no, the other one", "ok", [])])
+        turns, last = hx.read_transcript(tp)
+        assert [t["user"] for t in turns] == ["use the skill", "no, the other one"], turns
+        assert last == turns[-1]["uuid"]
+        with _classifier(SIGNAL) as sent:
+            assert _stop(env, tp) is not None
+        assert "USER'S NEW MESSAGE: use the skill" in sent[0]
+    print("PASS test_a_skill_body_is_neither_a_turn_nor_a_prompt")
 
 
-def _moment(n, kind="correction", hint="wrong_target", session="sess"):
-    return {"turn": n, "source_ref": f"{session}#{n}", "hint": hint, "kind": kind,
-            "state": {"repo": "repo", "session_id": session, "turn": n, "hook_version": "0.54.0",
-                      "at": _ago(1), "branch": "b", "head_sha": "abc",
-                      "pr_number": None, "env": "staging"}}
+def test_the_handoff_command_prints_the_fork_instruction():
+    """The command the Stop's one line names. It finds the session's transcript
+    under the host's config dir, rebuilds the moment, and prints the launch
+    instruction; it is the agent's tool, so it runs with the flag off and is
+    loud when it cannot answer."""
+    with _Env() as env:
+        proj = env.base / "claude" / "projects" / "-w"
+        proj.mkdir(parents=True)
+        tp = proj / "sess.jsonl"
+        _transcript(tp, [("deploy it", "deployed to prod", []),
+                         ("no, i mean staging", "redeployed to staging", []),
+                         ("thanks", "ok", [])])
+        run = lambda *args: subprocess.run(  # noqa: E731
+            [sys.executable, str(SCRIPTS / "harness_stop.py"), "handoff", *args],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, MEMHUB_HARNESS_EXTRACT="0", CLAUDE_CONFIG_DIR=str(env.base / "claude")))
+        ok = run("--moment", "sess#2", "--kind", "correction")
+        assert ok.returncode == 0, ok.stderr
+        reason = ok.stdout
+        assert reason.startswith(hs.BLOCK_PREFIX), reason
+        assert f"{hs.FORK_MARK}, moment sess#2" in reason, reason
+        assert "flagged as correction" in reason and "turn 3, is what happened after it" in reason, reason
+        assert f"stamp --transcript \"{tp}\" --turn 2" in reason, reason
+        assert 'says "none" or "failed", say nothing' in reason, "an unfiled rule is not news"
+        assert "author" not in reason.lower(), "how to file lives in the skill"
+        assert "may already be written down" in run("--moment", "sess#2", "--derivable").stdout
+        # with no flags — how the session rule calls it — the label comes from
+        # the `launch` line the Stop logged; with none, the prompt says "a signal"
+        assert "flagged as a signal" in run("--moment", "sess#2").stdout
+        hx.log_path("stop.log").parent.mkdir(parents=True, exist_ok=True)
+        hx.log_path("stop.log").write_text(
+            "2026-09-30 18:00:00 launch sess t2: fork requested (claim_challenge) derivable=1\n")
+        logged = run("--moment", "sess#2").stdout
+        assert "flagged as claim_challenge" in logged and "may already be written down" in logged, logged
+        for args, why in ((("--moment", "sess#9"), "no turn 9"),
+                          (("--moment", "nosuch#1"), "no transcript"),
+                          (("--moment", "sess#2; rm -rf x"), "not a moment ref")):
+            bad = run(*args)
+            assert bad.returncode == 2 and why in bad.stderr and bad.stdout == "", (args, bad)
+        # a kind that is not a plain label never reaches the prompt
+        assert "`touch x`" not in run("--moment", "sess#2", "--kind", "`touch x`").stdout
+    print("PASS test_the_handoff_command_prints_the_fork_instruction")
 
 
-def _stop(**payload):
-    """The Stop hook end to end through `main`, the child's spawn substituted."""
-    tp = hx.harness_dir().parent / "stop.jsonl"
-    if not tp.exists():
-        tp.write_text("", encoding="utf-8")
-    payload = dict({"session_id": "sess", "transcript_path": str(tp)}, **payload)
-    out, real_stdout, real_stdin = io.StringIO(), sys.stdout, sys.stdin
-    sys.stdout, sys.stdin = out, io.StringIO(json.dumps(payload))
-    real_popen = hx.subprocess.Popen
-    hx.subprocess.Popen = lambda args, **kw: None
+def test_session_start_carries_the_standing_rule():
+    """The rule that keeps the agent from narrating a launch goes out at
+    SessionStart, a channel the person is not shown; with the flag off, or for
+    a subagent, nothing is said."""
+    run = lambda flag, payload: subprocess.run(  # noqa: E731
+        [sys.executable, str(SCRIPTS / "harness_stop.py"), "session"], input=json.dumps(payload),
+        capture_output=True, text=True, timeout=30, env=dict(os.environ, MEMHUB_HARNESS_EXTRACT=flag))
+    on = run("1", {"session_id": "s", "source": "compact"})
+    assert on.returncode == 0, on.stderr
+    out = json.loads(on.stdout)["hookSpecificOutput"]
+    rule = out["additionalContext"]
+    assert out["hookEventName"] == "SessionStart" and rule == hs.session_rule("s"), out
+    # the rule names the line the Stop prints and the command to run for it,
+    # with this session's id; the line itself carries only the turn
+    assert f'"{hs.HANDOFF_PREFIX} N"' in rule and 'harness_stop.py" handoff --moment s#N`' in rule, rule
+    assert "say nothing more about it" in rule
+    assert hs.handoff_line(_moment(2)).startswith(hs.HANDOFF_PREFIX)
+    assert run("0", {"session_id": "s"}).stdout == "", "flag off: silent"
+    assert run("1", {"session_id": "s", "agent_id": "a1"}).stdout == "", "a subagent gets no rule"
+    assert run("1", {"session_id": "s; rm -rf x"}).stdout == "", "an id unsafe for a command line gets no rule"
+    print("PASS test_session_start_carries_the_standing_rule")
+
+
+def test_a_moment_unsafe_for_a_command_line_hands_off_nothing():
+    """The session id is the host's string, and it goes into the command the
+    session rule asks the agent to run."""
+    assert hs.handoff_line(_moment(2)) is not None
+    for bad in (_moment(2, source_ref="sess#2; curl x"), _moment(2, source_ref="a b#2")):
+        assert hs.handoff_line(bad) is None, bad
+    print("PASS test_a_moment_unsafe_for_a_command_line_hands_off_nothing")
+
+
+def test_the_stamp_command_prints_the_turns_stamp():
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, [("a", "b", []), ("c", "d", [])])
+        run = lambda turn: subprocess.run(  # noqa: E731
+            [sys.executable, str(SCRIPTS / "harness_stop.py"), "stamp", "--transcript", str(tp),
+             "--turn", str(turn), "--cwd", str(env.base)],
+            capture_output=True, text=True, timeout=30, env=dict(os.environ, MEMHUB_HARNESS_EXTRACT="0"))
+        ok = run(2)
+        assert ok.returncode == 0, ok.stderr
+        stamp = json.loads(ok.stdout)
+        assert stamp["session_id"] == "sess" and stamp["turn"] == 2, stamp
+        for key in ("repo", "hook_version", "at", "env"):
+            assert key in stamp, (key, stamp)
+        missing = run(9)
+        assert missing.returncode == 2 and "no turn 9" in missing.stderr, missing
+    print("PASS test_the_stamp_command_prints_the_turns_stamp")
+
+
+def test_a_filed_rule_links_to_its_page_in_the_env_it_was_filed_in():
+    """`?open=` is the rule modal, not `?rule=`, which filters fire history.
+    Only when the plugin points at the same MemHub the rule was filed in."""
+    import _memhub_auth
+    real = _memhub_auth.default_url
+    rid = "846c4331-1b1d-4295-afe9-18156f44f1df"
     try:
-        rc = hs.main(["stop"])
+        _memhub_auth.default_url = lambda: "https://api.staging.memhub.xtrace.ai"
+        assert hs.rule_url(rid, "staging") == f"https://staging.mem.xtrace.ai/studio/rulebook?open={rid}"
+        _memhub_auth.default_url = lambda: "https://api.memhub.xtrace.ai"
+        assert hs.rule_url(rid, "staging") == ""
     finally:
-        sys.stdout, sys.stdin = real_stdout, real_stdin
-        hx.subprocess.Popen = real_popen
-    return rc, out.getvalue()
-
-
-def _authored(**payload):
-    """The refs a Stop handed to a detached author pass, in order."""
-    seen = []
-    real = hx.spawn_detached
-    hx.spawn_detached = lambda argv, **kw: seen.append(list(argv))
-    try:
-        out = _stop(**payload)[1]
-    finally:
-        hx.spawn_detached = real
-    for argv in seen:
-        if argv and argv[0] == "author":
-            refs = argv[argv.index("--refs") + 1]
-            return [r for r in refs.split(",") if r], out
-    return [], out
-
-
-def _reason(out: str) -> str:
-    doc = json.loads(out)
-    assert doc["decision"] == "block", doc     # top-level, verified live on Claude Code 2.1.270
-    return doc["reason"]
-
-
-def test_a_later_stop_authors_the_moment_once():
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        # a subagent's Stop, carrying the parent session id, takes nothing; nor
-        # does the continuation's own Stop
-        assert _authored(agent_id="agent-7f")[0] == []
-        assert _authored(stop_hook_active=True)[0] == []
-        assert len(hx.read_jsonl(hs.moments_path("sess"))) == 1, "nothing taken"
-
-        refs, out = _authored()
-        assert refs == ["sess#2"], refs
-        assert out == "", "a drain says nothing to the person; only an outcome does"
-
-        # the claim is what makes it once: a second Stop while the pass holds it
-        # spawns nothing, and the pass picks up anything parked meanwhile
-        assert _authored()[0] == [], "one drain per session at a time"
-        _drain_finished("sess")
-        assert _authored()[0] == ["sess#2"], "still waiting: nothing DECIDED it yet"
-    print("PASS test_a_later_stop_authors_the_moment_once")
-
-def test_a_fast_child_never_makes_the_drain_take_the_stopping_turn():
-    """Selection happens before the extract child is spawned. A child that wins
-    the race and appends THIS turn's moment at once must not be authored by the
-    Stop that is still running (Codex, #230) — it is the next Stop's to take."""
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        tp = hx.harness_dir().parent / "race.jsonl"
-        tp.write_text("", encoding="utf-8")
-        seen, real = [], hx.spawn_detached
-
-        def spawn(argv, **kw):
-            seen.append(list(argv))
-            if argv and argv[0] != "author":
-                hx.append_jsonl(hs.moments_path("sess"), _moment(3))   # the race
-
-        hx.spawn_detached = spawn
-        try:
-            hs.cmd_stop({"session_id": "sess", "transcript_path": str(tp)})
-        finally:
-            hx.spawn_detached = real
-        authored = [a for a in seen if a and a[0] == "author"]
-        assert authored, seen
-        assert authored[0][authored[0].index("--refs") + 1] == "sess#2"
-    print("PASS test_a_fast_child_never_makes_the_drain_take_the_stopping_turn")
-
-
-def _drain_finished(session):
-    """What cmd_author's `finally` does: release the session claim AND the
-    machine-wide slot. A test that frees only the claim leaves the slot held
-    and trips the breaker on its third spawn."""
-    hs.hx.session_file(session, ".drain.claim").unlink(missing_ok=True)
-    for slot in hx.harness_dir().glob("drain.slot-*"):
-        slot.unlink(missing_ok=True)
-
-def test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes():
-    """The per-session cap and the 3-turn window are GONE with the block: they
-    rationed interruptions, and a detached pass interrupts nobody. What bounds
-    a drain now is the reviewer's budget, the TTL, and the repo."""
-    with _Env():
-        assert not hasattr(hs, "HANDOFF_CAP_PER_SESSION")
-        assert not hasattr(hs, "HANDOFF_MAX_AGE_TURNS")
-        hs.save_meta("sess", repo="repo", last_turn=99)
-        # an old moment is no longer skipped for being old in TURNS
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        assert _authored()[0] == ["sess#2"], "turn age no longer strands a moment"
-        _drain_finished("sess")
-
-        stale = _moment(3)
-        stale["state"] = dict(stale["state"], at="2020-01-01T00:00:00Z")
-        hx.append_jsonl(hs.moments_path("sess"), stale)
-        elsewhere = _moment(4)
-        elsewhere["state"] = dict(elsewhere["state"], repo="another-repo")
-        hx.append_jsonl(hs.moments_path("sess"), elsewhere)
-        refs, _ = _authored()
-        assert "sess#3" not in refs and "sess#4" not in refs, refs
-
-        # more than the reviewer's budget: taken in batches, never dropped
-        _drain_finished("sess")
-        for turn in range(10, 10 + hs.FILING_BUDGET_PER_PASS + 3):
-            hx.append_jsonl(hs.moments_path("sess"), _moment(turn))
-        refs, _ = _authored()
-        assert len(refs) == hs.FILING_BUDGET_PER_PASS, refs
-
-        assert _authored(session_id="")[0] == []
-        assert _authored(session_id="nobody")[0] == [], "no meta, no repo, no drain"
-    print("PASS test_the_ttl_and_the_repo_scope_bound_what_a_drain_takes")
-
-def test_a_moment_the_child_appends_while_a_drain_is_chosen_is_kept():
-    with _Env():
-        path = hs.moments_path("sess")
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(path, _moment(2))
-        real = hx.read_jsonl
-
-        def read_then_the_child_appends(p):
-            rows = real(p)
-            hx.append_jsonl(p, _moment(3))          # the extract child lands in the gap
-            return rows
-
-        hx.read_jsonl = read_then_the_child_appends
-        try:
-            _authored()
-        finally:
-            hx.read_jsonl = real
-        keys = [r.get("source_ref") for r in real(path) if r.get("turn") is not None]
-        assert "sess#3" in keys, "the moment that landed in the gap is still there"
-    print("PASS test_a_moment_the_child_appends_while_a_drain_is_chosen_is_kept")
-
-def test_the_line_names_where_the_turn_worked_and_leaves_the_scope_to_the_author():
-    with _Env() as env:
-        alpha, beta = _git_repo(env.base, "alpha"), _git_repo(env.base, "beta")
-        kw = {"session": "s", "cwd": str(alpha), "hook_version": "0.54.0", "env_name": "staging"}
-        # a session rooted in alpha whose turn worked only in beta
-        only_beta = {"n": 1, "tools": [{"tool": "Bash", "target": f"cd {beta} && make test"}]}
-        state = hx.stamp_state(turn=only_beta, **kw)
-        assert state["repo"] == "beta" and "touched_repos" not in state, state
-        line = hs.block_reason("s", {"turn": 1, "state": state}, "alpha")
-        assert 'worked in ["beta"]' in line, line
-        # evidence, not the scope: the author chooses scope_repos from the lesson
-        assert "scope_repos=" not in line and "choose scope_repos from the lesson" in line, line
-        # `git -C <path>` points a command at another repository as a leading `cd` does
-        for target in (f"git -C {beta} status", f"cd {alpha} && git -C ../beta log -1",
-                       f"GIT_PAGER=cat git -c core.pager=cat -C {beta} diff"):
-            got = hx.stamp_state(turn={"n": 4, "tools": [{"tool": "Bash", "target": target}]}, **kw)
-            assert got["repo"] == "beta", (target, got)
-        # a turn that worked in both names both
-        both = {"n": 2, "tools": [{"tool": "Bash", "target": f"cd {beta} && make test"},
-                                  {"tool": "Edit", "target": str(alpha / "x.py")}]}
-        state = hx.stamp_state(turn=both, **kw)
-        assert state["repo"] == "alpha" and state["touched_repos"] == ["beta", "alpha"], state
-        line = hs.block_reason("s", {"turn": 2, "state": state}, "alpha")
-        assert 'worked in ["beta", "alpha"]' in line and "scope_repos=" not in line, line
-        # an action that addresses nothing leaves the session's own repo
-        idle = {"n": 3, "tools": [{"tool": "TodoWrite", "target": ""}]}
-        assert hx.stamp_state(turn=idle, **kw)["repo"] == "alpha"
-        assert hs.block_reason("s", {"turn": 3, "state": {}}, "alpha").count('worked in ["alpha"]') == 1
-    print("PASS test_the_line_names_where_the_turn_worked_and_leaves_the_scope_to_the_author")
-
-
-def test_each_stop_reads_from_the_cursor_not_from_byte_zero():
-    with _Env() as env:
-        repo = _git_repo(env.base)
-        tp = env.base / "s.jsonl"
-        steps = [(f"step {i}", f"did {i}", [("Bash", {"command": f"echo {i}"}, "ok", False)])
-                 for i in range(1, 5)]
-        calls, starts = [], []
-        real_classify, real_read = hx.server_classify, hx.turns_from_transcript
-
-        def spy(path, start=0, before=0):
-            starts.append(start)
-            return real_read(path, start=start, before=before)
-
-        hx.server_classify = _classify(calls, {"signal": False, "reason": "classified"})
-        hx.turns_from_transcript = spy
-        try:
-            _transcript(tp, steps[:3])
-            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
-            assert starts == [0], starts
-            assert hs.load_meta("sess")["scan"]["uuid"] == "u2"
-            _transcript(tp, steps[:4])
-            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
-            assert len(starts) == 2 and starts[1] > 0, "the second Stop resumes from the cursor"
-            assert "PREVIOUS USER MESSAGE: step 3" in calls[-1]["window"]
-            assert "USER'S NEW MESSAGE: step 4" in calls[-1]["window"]
-            assert hs.load_meta("sess")["last_turn"] == 4, "numbered as a full read would"
-            # a transcript replaced under the cursor falls back to a full read
-            _transcript(tp, [("other", "x", [])] + steps[:4])
-            hs.cmd_extract("sess", str(tp), str(repo), "", tp.stat().st_size)
-            assert starts[-1] == 0 and hs.load_meta("sess")["last_turn"] == 5, starts
-        finally:
-            hx.server_classify, hx.turns_from_transcript = real_classify, real_read
-    print("PASS test_each_stop_reads_from_the_cursor_not_from_byte_zero")
-
-
-def test_the_newest_moment_is_authored_first_whatever_order_children_finished_in():
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=5)
-        newer = _moment(5)                       # turn 5's classifier answered first
-        newer["state"] = dict(newer["state"], at=_ago(1))
-        hx.append_jsonl(hs.moments_path("sess"), newer)
-        older = _moment(4)
-        older["state"] = dict(older["state"], at=_ago(2))
-        hx.append_jsonl(hs.moments_path("sess"), older)
-        refs, _ = _authored()
-        assert refs == ["sess#5", "sess#4"], refs
-    print("PASS test_the_newest_moment_is_authored_first_whatever_order_children_finished_in")
-
-def test_an_older_turns_child_never_moves_the_meta_back():
-    with _Env():
-        hs.save_meta("sess", advance_turn=5, repo="new")
-        hs.save_meta("sess", advance_turn=4, repo="old")      # the older child finishes last
-        meta = hs.load_meta("sess")
-        assert meta["last_turn"] == 5 and meta["repo"] == "new", meta
-        # the read and the write are one critical section: another child cannot enter it
-        real, tried = hs.load_meta, []
-
-        def load_while_another_child_tries(session):
-            if not tried:
-                tried.append(hs._meta_lock(session))
-            return real(session)
-
-        hs.load_meta = load_while_another_child_tries
-        try:
-            hs.save_meta("sess", advance_turn=6)
-        finally:
-            hs.load_meta = real
-        assert tried == [None], "the lock is held across the read-merge-write"
-        lock = hs._meta_lock("sess")
-        assert lock is not None, "and released after it"
-        hs._release(lock)
-        assert hs.load_meta("sess")["last_turn"] == 6
-    print("PASS test_an_older_turns_child_never_moves_the_meta_back")
-
-
-def test_the_block_reason():
-    line = hs.block_reason("sess", _moment(2), "repo")
-    assert line.startswith(hs.BLOCK_PREFIX)
-    # the privacy guards stay on the line itself: it reaches both the model and
-    # the person. "Never pass activate" moved into the skill (Codex, #244).
-    assert "/Users/" not in line and "@" not in line
-    # HOW to file lives in skills/create-rule/SKILL.md. The prompt-lane line
-    # restated it and drew five of six Codex findings on #222 (dropped whatever
-    # it did not copy, drifted from whatever it did), so none of it is here.
-    assert "create-rule skill" in line
-    for restated in ("list_rulebooks", "include_retired", "supersedes_rule_id",
-                     "anchor_recall", "--fires", "mode"):
-        assert restated not in line, restated
-    # The line is a POINTER now. Claude Code renders a blocking Stop reason to
-    # the person as "Stop hook feedback:" and there is no Stop channel that
-    # reaches only the model (Codex, #244), so every instruction that does not
-    # have to be here lives in skills/create-rule/SKILL.md instead. What stays
-    # is what only this line knows: which turn, and where the skill is.
-    assert "create-rule skill" in line
-    assert 'source_ref="sess#2"' in line and "choose scope_repos" in line
-    # The verdict lane is gone. Filed-per-block is already `handed` rows here
-    # against `session_draft` rules on the server, and whether a rule HELPS is
-    # the fire-event fold's question. Recording non-events cost seven of the
-    # fifteen findings on #244 and bought a ratio that was already free.
-    assert "verdict" not in line and "--why" not in line and "<<" not in line
-    assert "say nothing to the person about this turn" in line
-    # the manual moved out and must NOT be restated here
-    for moved in ("not already a RULE", "restating the docs", "without asking",
-                  "activate", "state=", '"hook_version"'):
-        assert moved not in line, moved
-    # 1130 -> 347. A pointer, not a manual.
-    assert len(line) < 400, len(line)
-    # ...and the skill must actually carry what the line dropped, or the two
-    # halves diverge silently and the agent gets neither.
-    skill = (pathlib.Path(__file__).resolve().parent.parent / "plugins" / "memhub"
-             / "skills" / "create-rule" / "SKILL.md").read_text(encoding="utf-8")
-    # markdown wraps; the check is about content, not where the lines break,
-    # and reflowing prose to satisfy a substring test is the wrong direction
-    skill = " ".join(skill.replace("*", "").replace("`", "").split())
-    assert "conflict is still reported to the person" not in skill
-    assert "memhub-verdict" not in skill and "--why-file" not in skill
-    for owed in ("not already a RULE", "does NOT disqualify it",
-                 "restating the docs", "ask the person nothing at all",
-                 "Never pass activate", "Step 4b.6", "Step 0 (which rulebook)",
-                 # the scope is the author's, chosen from the lesson and proven
-                 # against the repo it names, not copied from where the turn ran
-                 "scope_repos is yours to choose", "Prove a repo scope before filing",
-                 'source="session_draft"',
-                 # each exception the harness path takes must be stated, or the
-                 # agent hits a mandatory step it cannot satisfy (Codex, #244)
-
-                 # nothing on a non-filing path reaches the person (Codex, #244)
-                 "hears about the turn only when a rule was filed",
-                 "File nothing, say nothing, stop", "same_matcher",
-                 # one invariant beats enumerating every step that talks: five
-                 # rounds of this PR were the next unexempted one (Codex, #244)
-                 "nothing on this path reaches the person",
-                 "including ones added after this was written",
-                 "A live verification that runs and fails is terminal",
-                 # The silence invariant must NOT swallow machine state this
-                 # skill changed — state the person cannot fix unseen (Codex,
-                 # #244, the only P1). The INSTANCE moved in ENG-1107: the
-                 # forward test arms its candidate in a private base now, so
-                 # "a restore that fails" and "a $BOOK.pretest-* from an
-                 # INTERRUPTED earlier run" cannot arise — nothing shared is
-                 # written, so there is nothing to restore and nothing to
-                 # recover. What replaces them is the one way the isolation can
-                 # fail open: the claim not taking, which must abort the run.
-                 "The claim did not take",
-                 "abort before",
-                 "safety bug wearing the costume of quiet",
-                 # an idempotent re-import ended WITH a rule (Codex, #244)
-                 "unchanged: true is a filing, not a blocker",
-                 "source_ref is passed EXACTLY as the harness line gives it"):
-        assert owed in skill, owed
-    assert "may already be written down" in hs.block_reason("sess", dict(_moment(2), derivable=True), "repo")
-    assert "may already be written down" not in line
-    print("PASS test_the_block_reason")
-
-
-
-
-
-def test_the_person_hears_about_a_filed_rule_and_about_a_pass_that_could_not_run():
-    """The only two things this lane says. A pass that RAN and found no lesson
-    is silent — that is the quiet the design is for. A pass that could not run
-    is not: a broken pipeline that looks exactly like a quiet one is the defect
-    this lane keeps rediscovering.
-
-    The filed line names the rule and says what it catches. It does NOT say the
-    rule helped: a proposed rule is served to no agent, so it has helped nobody,
-    and claiming otherwise is an artifact asserting behaviour the system does
-    not have. Whether a rule helps is the fire ledger's question."""
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        path = hs.moments_path("sess")
-        hx.append_jsonl(path, {"outcome": "none", "detail": "already an active rule",
-                               "ref": "sess#1", "at": 1.0})
-        assert hs.report_outcomes("sess") == "", "a considered nothing is silent"
-
-        # the shape a real drain wrote on 2026-09-19
-        hx.append_jsonl(path, {"outcome": "filed", "ref": "sess#2", "at": 2.0,
-                               "env": "staging",
-                               "rule_id": "b43d6914-4cb3-4a91-84ad-cadbeb6dcfe4",
-                               "title": "Pin the MCP server when spawning claude -p",
-                               "catches": "a `claude -p` without --strict-mcp-config"})
-        said = hs.report_outcomes("sess")
-        assert "Pin the MCP server when spawning claude -p" in said, said
-        assert "--strict-mcp-config" in said, "it says what the rule catches"
-        assert "b43d6914-4cb3-4a91-84ad-cadbeb6dcfe4" in said and "staging" in said
-        assert "fires for nobody until someone activates it" in said
-        for claim in ("helped", "saved", "prevented", "improved"):
-            assert claim not in said.lower(), f"a proposed rule has not {claim} anything"
-
-        # a child that returned only an id is still a FILING; the line degrades
-        hx.append_jsonl(path, {"outcome": "filed", "ref": "sess#3", "at": 3.0,
-                               "env": "staging", "rule_id": "bare-id"})
-        bare = hs.report_outcomes("sess")
-        assert "rule bare-id" in bare, bare
-
-        # the scope the author chose rides the result line to the person
-        outcome, fields = hs.parse_result(
-            f"{hs.RESULT_PREFIX} filed rid | A pipe makes $? the pipe's exit code | "
-            "`cmd | tail; echo $?` | []")
-        assert outcome == "filed" and fields["scope"] == "[]", fields
-        assert fields["catches"] == "`cmd | tail; echo $?`", "a pipe in catches survives"
-        # an older child's three-field line still parses, with no scope
-        _, old = hs.parse_result(f"{hs.RESULT_PREFIX} filed rid | T | a `a | b` pipe")
-        assert old["catches"] == "a `a | b` pipe" and old["scope"] == "", old
-        hx.append_jsonl(path, {"outcome": "filed", "ref": "sess#5", "at": 5.0,
-                               "env": "staging", **fields})
-        assert "scope_repos: []" in hs.report_outcomes("sess")
-
-        hx.append_jsonl(path, {"outcome": "failed", "detail": "no rulebook server",
-                               "ref": "sess#4", "at": 4.0, "env": "staging"})
-        failed = hs.report_outcomes("sess")
-        assert "no rulebook server" in failed and "staging" in failed
-        assert hs.report_outcomes("sess") == "", "each outcome is said once"
-    print("PASS test_the_person_hears_about_a_filed_rule_and_about_a_pass_that_could_not_run")
-
-def test_a_recorded_block_is_not_a_turn():
-    """Claude Code records the block's reason as an isMeta `user` record
-    (`Stop hook feedback:\\n<reason>`, seen on 2.1.270). Read as a human
-    message it would renumber every later turn and hand the classifier the
-    harness talking to itself."""
-    with _Env() as env:
-        tp = env.base / "s.jsonl"
-        reason = hs.block_reason("sess", _moment(1), "repo")
-        recs = [{"type": "user", "uuid": "u1", "message": {"content": "fix the deploy"}},
-                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
-                {"type": "user", "isMeta": True, "uuid": "m1",
-                 "message": {"content": f"Stop hook feedback:\n{reason}"}},
-                # the blocked continuation: its actions and verdict are not turn 1's
-                {"type": "assistant", "message": {"content": [
-                    {"type": "tool_use", "id": "c1", "name": "Bash",
-                     "input": {"command": "python3 rulebook_verify.py --rule-file cand.json"}}]}},
-                {"type": "user", "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": "c1", "content": "E boom", "is_error": True}]}},
-                {"type": "assistant", "message": {"content": [
-                    {"type": "text", "text": "No rule from turn 1: project state"}]}},
-                {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}},
-                # a person may TYPE those words; without isMeta it is their turn (Codex, #230)
-                {"type": "user", "uuid": "u3",
-                 "message": {"content": "Stop hook feedback: why did it block me?"}}]
-        tp.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
-        turns = hx.turns_from_transcript(tp)
-        assert [t["user"] for t in turns] == ["fix the deploy", "now the tests",
-                                              "Stop hook feedback: why did it block me?"], turns
-        assert [t["n"] for t in turns] == [1, 2, 3]
-        # the stopped turn ends at the feedback record: a late extractor must not
-        # hand the classifier the harness's own flow as turn 1 (Codex, #230)
-        assert turns[0]["asst"] == "done" and turns[0]["tools"] == [] and turns[0]["results"] == [], turns[0]
-    print("PASS test_a_recorded_block_is_not_a_turn")
+        _memhub_auth.default_url = real
+    print("PASS test_a_filed_rule_links_to_its_page_in_the_env_it_was_filed_in")
 
 
 def test_the_hooks_are_wired_behind_the_guard():
@@ -745,10 +365,14 @@ def test_the_hooks_are_wired_behind_the_guard():
             for handler in group["hooks"]:
                 if "harness_stop.py" in handler["command"]:
                     wired[event] = handler
-    # one lane: the prompt lane handed 19 moments for 0 proposals and is gone
-    assert set(wired) == {"Stop"}, set(wired)
-    # synchronous: the transcript size and the error arcs it takes ARE the
-    # boundary, and an async hook's stdout could not block the stop
+    # Stop judges and hands off; SessionStart carries the standing rule the
+    # person does not see. The prompt lane handed 19 moments for 0 proposals
+    # and is gone.
+    assert set(wired) == {"Stop", "SessionStart"}, set(wired)
+    assert wired["SessionStart"]["command"].rstrip("; fi").endswith('harness_stop.py" session')
+    assert "MEMHUB_HARNESS_EXTRACT" in wired["SessionStart"]["command"], "the same flag gates both"
+    # synchronous: the classifier's verdict decides whether this Stop blocks,
+    # and an async hook's stdout could not block the stop
     assert not wired["Stop"].get("async") and wired["Stop"]["timeout"] <= 10
     assert wired["Stop"]["command"].rstrip("; fi").endswith('harness_stop.py" stop')
     for h in wired.values():
@@ -763,7 +387,7 @@ def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
     doc = json.loads((ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
     commands = [h["command"] for groups in doc["hooks"].values() for g in groups
                 for h in g["hooks"] if "harness_stop.py" in h["command"]]
-    assert len(commands) == 1
+    assert len(commands) == 2, "the Stop lane and the SessionStart lane"
     with tempfile.TemporaryDirectory() as td:
         root, ran = Path(td) / "plugin", Path(td) / "ran"
         (root / "scripts").mkdir(parents=True)
@@ -785,7 +409,7 @@ def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
                                       capture_output=True, env=env, timeout=10)
                 assert proc.returncode == 0, proc.stderr
             got = sorted(ran.read_text().split()) if ran.exists() else []
-            assert got == (["stop"] if runs else []), (value, got)
+            assert got == (["session", "stop"] if runs else []), (value, got)
             if ran.exists():
                 ran.unlink()
     print("PASS test_the_hook_command_starts_nothing_unless_the_flag_is_on")
@@ -799,6 +423,8 @@ def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
 # the shell gate matches bytes, str.strip() also drops U+00A0 and friends, and
 # a flag padded with those still reads off at the hook — the safe direction.
 _ASCII_WS = "".join(chr(i) for i in range(128) if chr(i).isspace())
+
+
 EXTRACT_FLAG_TABLE = (
     [("1", True), (" 1 ", True), ("1\n", True), ("on", True), ("ON ", True),
      ("true", True), ("yes", True), ("Yes", True), ("TRUE", True),
@@ -812,21 +438,20 @@ EXTRACT_FLAG_TABLE = (
 
 
 def test_every_extract_gate_reads_the_flag_the_same_way():
-    """`extract_enabled`, `harness_extract_on` and the Stop hook's shell `case`
-    are one switch. Each value in the table goes to all three — the shell gate
+    """`extract_enabled` and the Stop hook's shell `case` are one switch. Each value in the table goes to all three — the shell gate
     run as the REAL command string from claude-hooks.json, under every POSIX
     shell on the box, with a stub plugin root that records whether it got past
     the gate — and all of them must give the table's answer. Only
     claude-hooks.json carries a shell copy: the Codex file is generated
     without the harness lane and Cursor never wires it (asserted here)."""
-    import rulebook_hook as rh  # noqa: PLC0415
     hooks = ROOT / "plugins" / "memhub" / "hooks"
     for other in ("codex-hooks.json", "cursor-hooks.json"):
         assert "HARNESS" not in (hooks / other).read_text(encoding="utf-8"), other
     doc = json.loads((hooks / "claude-hooks.json").read_text(encoding="utf-8"))
     commands = [h["command"] for groups in doc["hooks"].values() for g in groups
                 for h in g["hooks"] if "MEMHUB_HARNESS_EXTRACT" in h["command"]]
-    assert len(commands) == 1, commands
+    # the Stop lane and the SessionStart lane: one switch, two copies of the gate
+    assert len(commands) == 2, commands
     shells = [] if os.name == "nt" else [
         s for s in ("/bin/sh", "/bin/dash", "/usr/bin/dash", "/bin/bash") if os.path.exists(s)]
     wrong = []
@@ -841,120 +466,20 @@ def test_every_extract_gate_reads_the_flag_the_same_way():
         base["CLAUDE_PLUGIN_ROOT"] = str(root)
         for value, want in EXTRACT_FLAG_TABLE:
             env = dict(base) if value is None else dict(base, MEMHUB_HARNESS_EXTRACT=value)
-            got = {"extract_enabled": hx.extract_enabled(env),
-                   "harness_extract_on": bool(rh.harness_extract_on(env))}
+            got = {"extract_enabled": hx.extract_enabled(env)}
             for shell in shells:
-                proc = subprocess.run([shell, "-c", commands[0]], input="{}", text=True,
-                                      capture_output=True, env=env, timeout=10)
-                assert proc.returncode == 0, (shell, value, proc.stderr)
-                got["hook under " + shell] = ran.exists()
-                if ran.exists():
-                    ran.unlink()
+                for n, command in enumerate(commands):
+                    proc = subprocess.run([shell, "-c", command], input="{}", text=True,
+                                          capture_output=True, env=env, timeout=10)
+                    assert proc.returncode == 0, (shell, value, proc.stderr)
+                    got["hook %d under %s" % (n, shell)] = ran.exists()
+                    if ran.exists():
+                        ran.unlink()
             wrong += [(value, gate, answer) for gate, answer in got.items() if answer != want]
     assert not wrong, "%d answers disagree with the table (value, gate, answer):\n%s" % (
         len(wrong), "\n".join(map(repr, wrong)))
     print("PASS test_every_extract_gate_reads_the_flag_the_same_way (%d values; shells: %s)"
           % (len(EXTRACT_FLAG_TABLE), ", ".join(shells) or "none"))
-
-
-def test_an_authoring_child_neither_senses_nor_drains_when_settings_re_arm_the_flag():
-    """Live on staging: an install with MEMHUB_HARNESS_EXTRACT=1 in settings.json
-    `env` saw that value override the child's EXTRACT=0. The fork's own Stop
-    classified its turns and drained the repo's moments, which spawned more
-    forks. Under the child flag the Stop does nothing and the arc sensor records
-    nothing. The same Stop without the flag must still run."""
-    with _Env():
-        ran = []
-        real = hs.cmd_stop
-        hs.cmd_stop = lambda payload: ran.append(payload.get("session_id")) or 0
-        saved = os.environ.pop("MEMHUB_HARNESS_CHILD", None)
-        try:
-            os.environ["MEMHUB_HARNESS_CHILD"] = "1"      # EXTRACT is "1" in _Env
-            assert _stop(session_id="fork-1")[0] == 0
-            assert ran == [], ran
-            os.environ.pop("MEMHUB_HARNESS_CHILD")
-            _stop(session_id="owner-1")
-            assert ran == ["owner-1"], ran
-        finally:
-            hs.cmd_stop = real
-            os.environ.pop("MEMHUB_HARNESS_CHILD", None)
-            if saved is not None:
-                os.environ["MEMHUB_HARNESS_CHILD"] = saved
-        import rulebook_hook as rh  # noqa: PLC0415
-        assert not rh.harness_extract_on({"MEMHUB_HARNESS_CHILD": "1", "MEMHUB_HARNESS_EXTRACT": "1"})
-        assert rh.harness_extract_on({"MEMHUB_HARNESS_EXTRACT": "1"})
-    print("PASS test_an_authoring_child_neither_senses_nor_drains_when_settings_re_arm_the_flag")
-
-
-def test_the_author_child_is_launched_as_a_harness_child():
-    """The flag the capture and sensor lanes read is set by `run_author`."""
-    seen = {}
-
-    def fake_run(argv, **kw):
-        seen.update(argv=argv, env=kw.get("env") or {})
-        return subprocess.CompletedProcess(argv, 0, stdout="HARNESS-RESULT: none | x\n", stderr="")
-
-    real = hs.subprocess.run
-    hs.subprocess.run = fake_run
-    try:
-        with _Env():                       # the children list lands in the temp dir
-            hs.run_author("owner", {"state": {"session_id": "owner"}, "turn": 1,
-                                    "source_ref": "owner#1", "kind": "error_arc"},
-                          "repo", Path("/nonexistent/mcp.json"))
-    finally:
-        hs.subprocess.run = real
-    assert "--fork-session" in seen["argv"]
-    assert seen["env"].get("MEMHUB_HARNESS_CHILD") == "1"
-    print("PASS test_the_author_child_is_launched_as_a_harness_child")
-
-
-def test_a_child_that_exits_non_zero_says_why():
-    """stderr first; `claude -p` prints some refusals on stdout instead."""
-    moment = {"state": {"session_id": "owner"}, "turn": 1, "source_ref": "owner#1"}
-    real = hs.subprocess.run
-    try:
-        for out, err, want in (("", "boom\nError: no auth\n", "the child exited 1: Error: no auth"),
-                               ("No conversation found with session ID: owner\n", "",
-                                "the child exited 1: No conversation found with session ID: owner"),
-                               ("", "", "the child exited 1")):
-            hs.subprocess.run = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout=out,
-                                                                                stderr=err)
-            with _Env():                   # the children list lands in the temp dir
-                outcome, fields = hs.run_author("owner", moment, "repo",
-                                                Path("/nonexistent/mcp.json"))
-            assert outcome == "failed" and fields.get("detail") == want, fields
-            assert fields.get("child"), "a failed pass still names its child"
-    finally:
-        hs.subprocess.run = real
-    print("PASS test_a_child_that_exits_non_zero_says_why")
-
-
-def test_a_decided_moment_is_recorded_and_logged_not_crashed_on():
-    """The pass's own log line once named a variable that no longer existed:
-    every drain died after its child decided, the moment was never handed, and
-    stop.log said only `could not start`. Drive `cmd_author` end to end."""
-    with _Env():
-        hs.save_meta("sess", repo="repo", last_turn=2)
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        real = hs.run_author, hs.write_child_mcp_config
-        hs.run_author = lambda *a, **k: ("none", {"detail": "nothing worth filing"})
-        # the real one resolves a credential through the MCP SDK, which the
-        # bare-Python CI lane does not have; the loop is what is under test
-        hs.write_child_mcp_config = lambda d: (d / "mcp.json", "https://mcp.test")
-        try:
-            assert hs.cmd_author("sess", ["sess#2"]) == 0
-        finally:
-            hs.run_author, hs.write_child_mcp_config = real
-        rows = hx.read_jsonl(hs.moments_path("sess"))
-        assert rows[-1].get("handed") == "sess#2", rows
-        assert rows[-1].get("outcome") == "none", rows
-        log = hx.log_path("stop.log").read_text(encoding="utf-8")
-        assert "sess#2 -> none (nothing worth filing)" in log, log
-        assert "could not start" not in log, log
-        freed = hs.take_drain_claim("sess")
-        assert freed is not None, "the pass left its session claim held"
-        freed.close()
-    print("PASS test_a_decided_moment_is_recorded_and_logged_not_crashed_on")
 
 
 def test_the_sensor_never_sends_activate():
@@ -966,65 +491,79 @@ def test_the_sensor_never_sends_activate():
     print("PASS test_the_sensor_never_sends_activate")
 
 
-def _run_author(stdout):
-    """`run_author` against a fake claude, files under a temp harness dir."""
-    seen = {}
+def test_a_recorded_block_is_not_a_turn():
+    """Claude Code records the block's reason as an isMeta `user` record
+    (`Stop hook feedback:\\n<reason>`, seen on 2.1.270). Read as a human
+    message it would renumber every later turn and hand the classifier the
+    harness talking to itself."""
+    with _Env() as env:
+        tp = env.base / "s.jsonl"
+        reason = hs.fork_reason(_moment(1), "staging", "repo")
+        recs = [{"type": "user", "uuid": "u1", "message": {"content": "fix the deploy"}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+                {"type": "user", "isMeta": True, "uuid": "m1",
+                 "message": {"content": f"Stop hook feedback:\n{reason}"}},
+                # the blocked continuation: its actions and verdict are not turn 1's
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c1", "name": "Bash",
+                     "input": {"command": "python3 rulebook_verify.py --rule-file cand.json"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "E boom", "is_error": True}]}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "No rule from turn 1: project state"}]}},
+                {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}},
+                # a person may TYPE those words; without isMeta it is their turn (Codex, #230)
+                {"type": "user", "uuid": "u3",
+                 "message": {"content": "Stop hook feedback: why did it block me?"}}]
+        tp.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        turns = hx.turns_from_transcript(tp)
+        assert [t["user"] for t in turns] == ["fix the deploy", "now the tests",
+                                              "Stop hook feedback: why did it block me?"], turns
+        assert [t["n"] for t in turns] == [1, 2, 3]
+        # the stopped turn ends at the feedback record: the next Stop must not
+        # hand the classifier the harness's own flow as turn 1 (Codex, #230)
+        assert turns[0]["asst"] == "done" and turns[0]["tools"] == [] and turns[0]["results"] == [], turns[0]
+    print("PASS test_a_recorded_block_is_not_a_turn")
 
-    def fake_run(argv, **kw):
-        seen.update(argv=argv, env=kw.get("env") or {})
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
-    real_run = hs.subprocess.run
-    hs.subprocess.run = fake_run
-    try:
-        with _Env():
-            got = hs.run_author("sess", {"state": {"session_id": "owner"}, "turn": 2,
-                                         "source_ref": "owner#2", "kind": "error_arc"},
-                                "repo", Path("/nonexistent/mcp.json"))
-    finally:
-        hs.subprocess.run = real_run
-    return got, seen
+def test_a_recorded_stop_context_ends_the_turn():
+    """The hand-off is the Stop hook's `additionalContext`, which Claude Code
+    records as an `attachment` record (hook_additional_context, hookEvent Stop;
+    probed on 2.1.286), not a user record. It ends the stopped turn exactly as
+    a block's reason did: the fork launch that follows is not the person's
+    turn. Other events' context (PreToolUse, SessionStart) lands mid-turn and
+    ends nothing."""
+    with _Env() as env:
+        tp = env.base / "s.jsonl"
+        ctx = hs.fork_reason(_moment(1), "staging", "repo")
 
+        def att(event, text):
+            return {"type": "attachment", "attachment": {
+                "type": "hook_additional_context", "content": [text],
+                "hookName": event, "hookEvent": event}}
 
-def test_what_a_pass_spent_is_read_from_the_childs_json():
-    body = json.dumps({"type": "result", "result": "thinking…\nHARNESS-RESULT: filed r1 | T | c",
-                       "usage": {"input_tokens": 2, "cache_creation_input_tokens": 300,
-                                 "cache_read_input_tokens": 4000, "output_tokens": 50},
-                       "total_cost_usd": 0.12, "num_turns": 6})
-    (outcome, fields), _ = _run_author(body)
-    assert outcome == "filed" and fields["rule_id"] == "r1" and fields["title"] == "T"
-    assert fields["spent"]["cache_read"] == 4000 and fields["spent"]["calls"] == 6
-    reply, spent = hs.read_child("HARNESS-RESULT: none plain text")
-    assert reply.startswith("HARNESS-RESULT") and spent == {}
-    print("PASS test_what_a_pass_spent_is_read_from_the_childs_json")
-
-
-
-def test_the_author_loop_survives_its_own_log_line():
-    """It named `detail` after the variable became `fields`: a NameError after
-    the FIRST moment of every drain, caught by the handler that reports "drain
-    could not start" — so a drain of eight authored one and told the person
-    the pass had failed."""
-    with tempfile.TemporaryDirectory() as td:
-        old = {k: os.environ.get(k) for k in ("MEMHUB_HARNESS_DIR",)}
-        os.environ["MEMHUB_HARNESS_DIR"] = td
-        hx.append_jsonl(hs.moments_path("sess"), _moment(1))
-        hx.append_jsonl(hs.moments_path("sess"), _moment(2))
-        hs._publish(hs.meta_path("sess"), json.dumps({"repo": "repo"}))
-        real_run, real_cfg = hs.run_author, hs.write_child_mcp_config
-        hs.run_author = lambda *a, **k: ("none", {"detail": "not a lesson"})
-        hs.write_child_mcp_config = lambda d: (Path(d) / "mcp.json", "http://x")
-        try:
-            hs.cmd_author("sess", ["sess#1", "sess#2"])
-            rows = hx.read_jsonl(hs.moments_path("sess"))   # while the dir is still td
-        finally:
-            hs.run_author, hs.write_child_mcp_config = real_run, real_cfg
-            for k, v in old.items():
-                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-        outcomes = [r for r in rows if r.get("outcome")]
-        assert [r["outcome"] for r in outcomes] == ["none", "none"], outcomes
-        assert {r["handed"] for r in outcomes} == {"sess#1", "sess#2"}
-    print("PASS test_the_author_loop_survives_its_own_log_line")
+        recs = [{"type": "user", "uuid": "u1", "message": {"content": "fix the deploy"}},
+                att("PreToolUse", "## XTrace Rulebook (team rules)"),
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c0", "name": "Bash", "input": {"command": "make deploy"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c0", "content": "ok"}]}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+                att("Stop", ctx),
+                # the continuation it asked for: the fork launch is not turn 1's
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c1", "name": "Agent",
+                     "input": {"subagent_type": "fork", "prompt": "MemHub harness fork, moment s#1"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "c1", "content": "launched"}]}},
+                {"type": "user", "uuid": "u2", "message": {"content": "now the tests"}}]
+        tp.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        turns = hx.turns_from_transcript(tp)
+        assert [t["user"] for t in turns] == ["fix the deploy", "now the tests"], turns
+        assert [t["tools"][0]["tool"] if t["tools"] else None for t in turns][:1] == ["Bash"], turns[0]
+        assert all(x["tool"] != "Agent" for x in turns[0]["tools"]), "the launch is not turn 1's"
+        assert turns[0]["asst"] == "done", turns[0]
+    print("PASS test_a_recorded_stop_context_ends_the_turn")
 
 
 if __name__ == "__main__":

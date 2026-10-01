@@ -7,8 +7,9 @@
 // <rule>` (stopped), the rule already in 20 words or fewer — rulebook_hook's
 // `disclosure_line()`, the same string the terminal shows and the agent is
 // told to echo. Nothing else counts. The `- **[<label>]** …` bullets beneath
-// it are NOT read: directive_recall.py writes lessons and procedures as
-// `- **[LESSON]** …` in the same classic answer, and a lesson that merely
+// it are NOT read: the retired directive_recall.py wrote lessons and
+// procedures as `- **[LESSON]** …` in the same classic answer (an older
+// install can still be running beside this one), and a lesson that merely
 // mentions the rulebook would be announced as a rule.
 //
 // The one fallback is a denied call's reason, and only the rulebook's own —

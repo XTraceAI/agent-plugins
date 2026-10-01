@@ -4,9 +4,9 @@
 **Why this exists.** The hooks loaded the MCP Python SDK, and paid for it on
 every invocation: measured 1.09s warm for `uv run --with 'mcp<2' python -c
 "import mcp"` against 0.07s for a bare python3. Three of the hooks that paid it
-are SYNCHRONOUS — the PreToolUse directive check has no prefilter, so every
-single file edit waited on interpreter start and dependency resolution before
-the hook had made a single network call.
+were SYNCHRONOUS — the (since retired) PreToolUse directive check had no
+prefilter, so every single file edit waited on interpreter start and dependency
+resolution before the hook had made a single network call.
 
 The SDK was there almost entirely for OAuth: `OAuthClientProvider` does PKCE,
 token storage and refresh, which is the genuinely hard part. Once the plugin

@@ -77,8 +77,8 @@ def test_capture_passes_reader_host_to_import_session() -> None:
         return types.SimpleNamespace(returncode=0)
 
     args = types.SimpleNamespace(
-        host=None, session="session-1", title=None, agent_brain_id=None,
-        no_room=True, namespace=None, url=None, conversation_id=None,
+        host=None, session="session-1", title=None,
+        namespace=None, url=None, conversation_id=None,
         dry_run=False)
     try:
         capture.subprocess.run = fake_run
@@ -95,7 +95,9 @@ def test_capture_passes_reader_host_to_import_session() -> None:
     for host, command in zip(("claude", "codex", "cursor"), captured):
         index = command.index("--source-platform")
         assert command[index + 1] == host, command
-        assert command.count("--no-room") == 1, command
+        # Imports are personal-only: no brain flag exists to forward.
+        assert "--no-room" not in command, command
+        assert "--agent-brain-id" not in command, command
     print("PASS test_capture_passes_reader_host_to_import_session")
 
 
@@ -120,8 +122,8 @@ def test_capture_claude_dry_run_never_imports() -> None:
         raise AssertionError("Claude dry-run launched the importer")
 
     args = types.SimpleNamespace(
-        host="auto", session="session-1", title=None, agent_brain_id=None,
-        no_room=False, namespace=None, url=None, conversation_id=None,
+        host="auto", session="session-1", title=None,
+        namespace=None, url=None, conversation_id=None,
         dry_run=True)
     try:
         capture._resolve = lambda _args: (
@@ -296,6 +298,112 @@ def test_import_namespace_probe_hardens_transcript_cwd() -> None:
     print("PASS test_import_namespace_probe_hardens_transcript_cwd")
 
 
+def test_capture_passes_org_id_to_import_session() -> None:
+    captured: list[list[str]] = []
+    original_resolve = capture._resolve
+    original_run = capture.subprocess.run
+
+    class Reader:
+        HOST = "claude"
+
+    def fake_run(command):
+        captured.append(command)
+        return types.SimpleNamespace(returncode=0)
+
+    try:
+        capture.subprocess.run = fake_run
+        capture._resolve = lambda _args: (
+            Reader(), Path("/tmp/session.jsonl"), "")
+        for org in ("org-1", None):
+            args = types.SimpleNamespace(
+                host=None, session="s", title=None,
+                namespace=None, url=None, org_id=org,
+                conversation_id=None, dry_run=False)
+            assert capture.cmd_import(args) == 0
+    finally:
+        capture._resolve = original_resolve
+        capture.subprocess.run = original_run
+
+    with_org, without_org = captured
+    assert with_org[with_org.index("--org-id") + 1] == "org-1", with_org
+    assert "--org-id" not in without_org, without_org
+    print("PASS test_capture_passes_org_id_to_import_session")
+
+
+def test_import_session_names_no_brain() -> None:
+    """Imports land in personal memory like capture: the brain flags are gone
+    and nothing reads the room cache."""
+    source = Path(import_session.__file__).read_text(encoding="utf-8")
+    assert "add_argument(" in source  # the scan below inspects the real parser
+    assert '"--agent-brain-id"' not in source
+    assert '"--no-room"' not in source
+    assert "agent_brain_id" not in source
+    assert not hasattr(import_session, "apply_cached_room")
+    assert not hasattr(import_session, "read_room")
+    print("PASS test_import_session_names_no_brain")
+
+
+def test_gist_lookup_browses_this_sessions_episodes() -> None:
+    """The gist poll is a browse of THIS session's episodes (kind + session_id,
+    no query, no memory_type), asks for the body, and never names a brain."""
+    import asyncio
+    import hashlib
+
+    calls: list[dict] = []
+    gist = "## GOAL\nship it"
+
+    class Session:
+        async def call_tool(self, name, arguments):
+            calls.append({"_tool": name, **arguments})
+            return object()
+
+    original = import_session.unwrap
+    try:
+        # Pointer hits carry `content` only when include_content is set. A
+        # task episode comes first; only the gist counts.
+        import_session.unwrap = lambda _res: {"items": [
+            {"id": "t1", "kind": "episode", "title": "task", **(
+                {"content": "did a thing"} if calls[-1].get("include_content") else {})},
+            {"id": "e1", "kind": "episode", "abstract": "x", **(
+                {"content": gist} if calls[-1].get("include_content") else {})}]}
+        got = asyncio.run(import_session._gist_hash(Session(), "sess-1", "o"))
+    finally:
+        import_session.unwrap = original
+    c = calls[0]
+    assert c["_tool"] == "search_memory", calls
+    assert c["kind"] == "episode" and c["session_id"] == "sess-1", calls
+    assert "query" not in c and "memory_type" not in c, calls
+    assert c["include_content"] is True, calls
+    assert c["org_id"] == "o" and "agent_brain_id" not in c
+    assert got == hashlib.sha256(gist.encode()).hexdigest()
+    print("PASS test_gist_lookup_browses_this_sessions_episodes")
+
+
+def test_gist_is_recognised_by_its_pointer_label() -> None:
+    """A pointer labelled gist counts even without a body, and its hash moves
+    when the gist folds forward (as_of/abstract change)."""
+    import asyncio
+
+    items: list[dict] = []
+
+    class Session:
+        async def call_tool(self, name, arguments):
+            return object()
+
+    original = import_session.unwrap
+    try:
+        import_session.unwrap = lambda _res: {"items": list(items)}
+        assert asyncio.run(import_session._gist_hash(Session(), "s")) is None
+        items[:] = [{"id": "g", "type": "gist", "as_of": "t1", "abstract": "a"}]
+        h1 = asyncio.run(import_session._gist_hash(Session(), "s"))
+        items[:] = [{"id": "g", "type": "gist", "as_of": "t2", "abstract": "b"}]
+        h2 = asyncio.run(import_session._gist_hash(Session(), "s"))
+    finally:
+        import_session.unwrap = original
+    assert h1 and h2 and h1 != h2
+    print("PASS test_gist_is_recognised_by_its_pointer_label")
+
+
 if __name__ == "__main__":
     test_import_request_uses_requested_platform()
     test_capture_passes_reader_host_to_import_session()
@@ -306,4 +414,8 @@ if __name__ == "__main__":
     test_capture_auto_preserves_within_host_ambiguity()
     test_packaged_import_skill_uses_unified_capture()
     test_import_namespace_probe_hardens_transcript_cwd()
+    test_capture_passes_org_id_to_import_session()
+    test_import_session_names_no_brain()
+    test_gist_lookup_browses_this_sessions_episodes()
+    test_gist_is_recognised_by_its_pointer_label()
     print("ALL PASS")

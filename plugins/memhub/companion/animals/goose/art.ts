@@ -84,7 +84,12 @@ export const EYES: Readonly<Record<Eyes, Readonly<Record<string, string>>>> = {
   stern: { '1,3': 'K', '0,2': 'K' },
 }
 export const BEAK_OPEN = { '0,1': 'O', '1,1': 'o' }
-export const BLUSH = { '1,4': 'R' }
+/**
+ * The blush stamps nothing on the head. The head is three pixels wide, and a
+ * pink pixel beside the eye at (1,3) read as a bloodshot eye, not a cheek.
+ * The goose shows it is pleased with hearts, sparkles and a hop instead.
+ */
+export const BLUSH: Readonly<Record<string, string>> = {}
 /** one solid cell on the chest */
 export const BADGE = { '4,3': 'B', '5,3': 'B' }
 

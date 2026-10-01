@@ -9,7 +9,7 @@ sessions through one command, using the per-host readers.
 
     uv run --with 'mcp<2' python capture.py import --session <ref> \
         [--host auto|claude|codex|cursor] [--conversation-id <id>] [--title "..."] \
-        [--agent-brain-id <id>] [--no-room] [--namespace <ns>] [--url <mcp-url>] \
+        [--namespace <ns>] [--org-id <id>] [--url <mcp-url>] \
         [--dry-run]
 
 ``--session`` accepts a transcript/rollout path, a bare session id, or
@@ -284,10 +284,6 @@ def cmd_import(args) -> int:
     passthrough: list[str] = []
     if args.title:
         passthrough += ["--title", args.title]
-    if args.agent_brain_id:
-        passthrough += ["--agent-brain-id", args.agent_brain_id]
-    if args.no_room:
-        passthrough.append("--no-room")
     if args.namespace is not None:
         passthrough += ["--namespace", args.namespace]
     # getattr: callers that build the namespace by hand predate the flag.
@@ -415,16 +411,12 @@ def main() -> int:
     ip.add_argument("--host", default="auto", choices=["auto", *readers.READERS])
     ip.add_argument("--conversation-id", default=None)
     ip.add_argument("--title", default=None)
-    ip.add_argument("--agent-brain-id", default=None)
-    ip.add_argument("--no-room", action="store_true",
-                    help="ignore the repo's cached room and import into "
-                         "workspace memory")
     ip.add_argument("--namespace", default=None,
                     help="repo scope for captured directives; default resolves "
                          "from the session's cwd via git remote, '' disables")
     ip.add_argument("--org-id", default=None,
-                    help="org that owns --agent-brain-id; default: the cached "
-                         "room's org, else the connection's default org")
+                    help="org whose personal memory to import into; default: "
+                         "the connection's default org")
     ip.add_argument("--url", default=None)
     ip.add_argument("--dry-run", action="store_true")
     ip.set_defaults(fn=cmd_import)

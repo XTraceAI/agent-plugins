@@ -2,29 +2,25 @@
 """Harness-tied memory, the client half: which moments of a session deserve
 the coding agent's attention.
 
-Nothing here writes a rule. At each turn's Stop — only with
-`MEMHUB_HARNESS_EXTRACT=1`; off by default — `harness_stop.py` runs that turn
-through this pipeline in a detached child:
+Nothing here writes a rule. At the Stop of turn N+1 — only with
+`MEMHUB_HARNESS_EXTRACT=1`; off by default — `harness_stop.py` runs turn N
+through this pipeline, in the hook, synchronously:
 
-    router       deterministic regexes over the turn, no model and no cost.
-                 It labels a moment (a correction, a retraction, a reuse
-                 complaint, a gate override, a closed error arc) and spares
-                 the call on a turn whose only hit is an unbacked claim. A
-                 label is a hint for the classifier, never a decision.
+    transcript   the session's .jsonl → turns. Turn N is rebuilt from the file
+                 the hook payload names; nothing is read from local state.
     window       the moment as text: the previous user message with that
                  turn's last actions and words, this user message, this turn's
                  first actions, its errors and closed error arcs, its final
                  words, and one state line. REDACTED before it leaves the
                  machine.
     classifier   ONE bounded POST to MemHub
-                 `/v1/team/rulebook/harness/classify`: is this moment worth
-                 handing to the agent, and of what kind.
-    moment       on a signal, the turn, kind, router hint and state stamp,
-                 appended to a local file for a later Stop to hand over.
+                 `/v1/team/rulebook/harness/classify`: is this moment worth a
+                 rule, and of what kind.
 
-The agent that lived the turn writes the lesson, if there is one, when a later
-Stop blocks on the moment (`harness_stop.py stop`): it runs the memhub
-create-rule skill, or says in one line why there is no rule.
+On a signal the Stop blocks once and the agent launches a background fork of
+itself that files the rule (harness-tied-memory-spec §4.3). Turn N is judged
+one turn late so the fork already holds turn N+1, the person's reaction to the
+correction.
 
 Everything is bounded and fails open: one attempt at the server, no retry, and
 every failure is "no signal" with a reason. Stdlib only, like every other
@@ -52,7 +48,9 @@ _ON = ("1", "on", "true", "yes")
 CLASSIFY_PATH = "/v1/team/rulebook/harness/classify"
 # The server bounds its judge at 20 s. One attempt, and this is the whole wait:
 # a moment the classifier never answered for is simply not handed over.
-CLASSIFY_TIMEOUT_S = float(os.environ.get("MEMHUB_HARNESS_CLASSIFY_TIMEOUT", "30"))
+# The call runs inside the Stop hook (10 s budget); staging p99 is ~9 s, so
+# about one turn in 75 goes unjudged at this bound (spec §9.8).
+CLASSIFY_TIMEOUT_S = float(os.environ.get("MEMHUB_HARNESS_CLASSIFY_TIMEOUT", "7"))
 WINDOW_MAX_CHARS = 24576      # the server refuses a longer body
 # The client failing to ask, counted apart from the server's own verdicts, so
 # an outage is never read as "nothing here".
@@ -62,23 +60,16 @@ CLIENT_REASONS = ("no_credential", "transport_error", "bad_reply")
 def extract_enabled(environ=None) -> bool:
     """The one switch for the whole sensor. Default OFF.
 
-    Opt-in because of what on costs: the sensor spends a classifier call per
-    flagged turn, and the drain behind it spends a headless authoring run per
-    moment on the PERSON'S OWN model quota, filing proposals into a shared team
-    rulebook. (Naming that command literally here trips
-    `test_nothing_in_the_client_writes_a_rule`, whose substring scan cannot
-    tell prose from code — and the guard is worth more than the sentence:
-    nothing in THIS module may author.) v0.69.0 through v0.75.x defaulted this
-    ON; it went back to opt-in so an install never starts spending that
-    without being asked. Unset, blank and unrecognised values are all off."""
+    Opt-in because of what on costs: a classifier call per human turn, and a
+    background fork per flagged turn on the PERSON'S OWN model quota, filing
+    proposals into a shared team rulebook. Unset, blank and unrecognised values
+    are all off."""
     env = os.environ if environ is None else environ
     if str(env.get(CHILD_FLAG, "")).strip().lower() in _ON:
-        # An authoring child is never sensed, whatever FLAG says. `run_author`
-        # sets FLAG=0 for it, but Claude Code applies a settings.json `env`
-        # OVER the environment a process inherits, and settings is where an
-        # install opts in with FLAG=1. So every opted-in install re-armed the
-        # lane in every child: the child's own turns were classified and
-        # drained, and one fork spawned the next.
+        # A `claude` process the plugin's own tooling starts (the case judge,
+        # harness/judge/judge.py) is never sensed, whatever FLAG says: Claude
+        # Code applies a settings.json `env` over the environment a process
+        # inherits, and settings is where an install opts in with FLAG=1.
         return False
     return str(env.get(FLAG, "")).strip().lower() in _ON
 
@@ -89,70 +80,8 @@ def harness_dir() -> Path:
                 or (Path.home() / ".config" / "memhub-plugin" / "harness"))
 
 
-def session_file(session: str, suffix: str) -> Path:
-    """A per-session file. The session id is a filename component and nothing
-    else."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(session or ""))[:80] or "nosession"
-    return harness_dir() / f"{safe}{suffix}"
-
-
 def log_path(name: str) -> Path:
     return harness_dir() / name
-
-
-def append_jsonl(path: Path, row: dict) -> None:
-    """Append one row, creating the file private (0600): a moment carries a
-    redacted slice of the session, which is still nobody else's business on a
-    shared machine."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    """Every row in a JSONL file; a broken line is skipped, never fatal."""
-    rows: list[dict] = []
-    try:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
-    except OSError:
-        pass
-    return rows
-
-
-class Trace:
-    """One line per step, to a private log. Never prompt text: the log sits
-    outside the transcript and outlives the session."""
-
-    def __init__(self, path: str = ""):
-        self.fh = None
-        if path:
-            try:
-                p = Path(path)
-                p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-                self.fh = os.fdopen(fd, "a", encoding="utf-8")
-            except OSError:
-                self.fh = None
-
-    def __call__(self, msg: str) -> None:
-        if self.fh:
-            self.fh.write(msg + "\n")
-            self.fh.flush()
-
-    def close(self) -> None:
-        if self.fh:
-            self.fh.close()
 
 
 # --------------------------------------------------------------- transcript
@@ -171,16 +100,30 @@ _HARNESS_PREFIX = (
     # session ever sensed, its one turn is the create-rule flow — the text most
     # likely to be flagged — and flagging it is how one child spawned the next.
     "MemHub harness: before you stop",
+    # The fork author's completion report (harness_stop.FORK_MARK), delivered
+    # to the parent as a task notification: the lane's own output. Usually it
+    # arrives inside a <task-notification> wrapper _SYS_BLOCK strips, but the
+    # text alone must be enough — classified, a batch could flag the batch
+    # that ran before it.
+    "MemHub harness fork",
+    # A subagent's hand-back, delivered to the parent as a user-role record.
+    # Live 2026-09-27: one was flagged, matured, and cost a fork batch a
+    # 365k-token read to conclude "none".
+    "Another Claude session sent a message:",
     "Base directory for this skill",
     "Continue from where you left off",
     "Caveat: The messages below",
     "Skill /",
     "This session is being continued from a previous conversation",
     "[Request interrupted by user",
+    "[Your previous response had no visible output",
 )
 # A blocked Stop's reason, recorded as an `isMeta` user record (verified on
 # Claude Code 2.1.270). Matched on the flag AND the text, never the text alone:
-# a person can type a prompt that starts with these words (Codex, #230).
+# a person can type a prompt that starts with these words (Codex, #230). The
+# harness now hands off through `additionalContext` (an attachment record, read
+# below); this stays for transcripts written before that, and for other
+# plugins' blocks.
 STOP_FEEDBACK_PREFIX = "Stop hook feedback:"
 # Named wrappers only. A person's prompt can begin with pasted HTML or a
 # Markdown heading, and dropping it would attribute that turn's actions to the
@@ -224,6 +167,11 @@ def _target_of(name: str, tool_input: dict) -> str:
 
 
 def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
+    """The person's turns in a transcript; see `read_transcript`."""
+    return read_transcript(path, start, before)[0]
+
+
+def read_transcript(path, start: int = 0, before: int = 0) -> tuple[list[dict], str]:
     """A Claude Code .jsonl → turns. A turn is one human message plus
     everything the agent did before the next one; tool results arrive as
     `user` records and belong to the turn in progress. Each turn carries
@@ -232,8 +180,15 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
 
     `start` seeks to a byte where a human message begins and `before` is how
     many turns precede it, so a reader resuming from a cursor numbers turns
-    exactly as a full read would."""
+    exactly as a full read would.
+
+    Also returns the uuid of the LAST prompt of any kind: the person's, a loop
+    wakeup, a task notification. A Stop is the end of the turn that prompt
+    started, so the caller judges only when it is the last person turn's
+    uuid; otherwise a Stop after a background fork's notice would judge the
+    person's previous turn a second time."""
     turns: list[dict] = []
+    last_prompt = ""
     cur: dict | None = None
     names: dict[str, str] = {}
     inputs: dict[str, dict] = {}
@@ -252,6 +207,16 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                 continue
             kind = rec.get("type")
             content = (rec.get("message") or {}).get("content")
+            att = rec.get("attachment") if kind == "attachment" else None
+            if (isinstance(att, dict) and att.get("type") == "hook_additional_context"
+                    and att.get("hookEvent") == "Stop"):
+                # A Stop hook's `additionalContext` — ours is the fork hand-off
+                # — recorded as an attachment, not a user record (probed on
+                # 2.1.286). Like a block's reason, it ends the stopped turn:
+                # what follows is the continuation it asked for, not the
+                # person's. Only Stop: other events' context lands mid-turn.
+                cur = None
+                continue
             if kind == "user":
                 if isinstance(content, list) and any(
                         isinstance(b, dict) and b.get("type") == "tool_result"
@@ -265,6 +230,7 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                         body = body if isinstance(body, str) else _text_of(body)
                         tid = b.get("tool_use_id")
                         cur["results"].append({
+                            "id": tid or "",
                             "tool": names.get(tid, "?"),
                             "target": _target_of(names.get(tid, ""), inputs.get(tid, {})),
                             "error": bool(b.get("is_error")),
@@ -279,6 +245,13 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                     # the classifier the harness's own output (Codex, #230).
                     cur = None
                     continue
+                if rec.get("isMeta"):
+                    # Text the harness injected mid-turn: a skill body after
+                    # a Skill call, a command's expansion. Not a prompt and
+                    # not the person — in the 2026-09-29 replay, skill bodies
+                    # read as the person's message were 3% of all flags.
+                    continue
+                last_prompt = rec.get("uuid", "")
                 if is_harness_text(txt):
                     continue
                 cur = {"n": before + len(turns) + 1, "user": txt, "tools": [], "results": [],
@@ -296,57 +269,14 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
                         names[b.get("id")] = nm
                         inputs[b.get("id")] = inp
                         cur["tools"].append({"tool": nm, "brief": _brief(nm, inp),
-                                             "target": _target_of(nm, inp)})
+                                             "target": _target_of(nm, inp),
+                                             "id": b.get("id") or ""})
                     elif b.get("type") == "text" and b.get("text", "").strip():
                         cur["asst"] = b["text"]
-    return turns
+    return turns, last_prompt
 
 
-# ------------------------------------------------------------------ router
-RETRACT = re.compile(
-    r"\b(i was wrong|my mistake|correction:|turns out|let me correct"
-    r"|i re-?checked,? and|actually,? (it|that|the)\b.{0,40}\bnot\b)\b", re.I)
-CLAIM = re.compile(
-    r"\b(fixed|merged|deployed|verified|all (tests )?pass(ed|ing)?"
-    r"|is live|works now|ready to merge)\b", re.I)
-RECEIPT = re.compile(
-    r"gh pr (view|checks)|pytest|uv run|git (log|status|diff)|curl "
-    r"|REAL_EXIT|exit code|npm test|pnpm test", re.I)
-RULEREQ = re.compile(
-    r"\b(create|add|make) (a |an )?(rule|lesson)\b"
-    r"|\bnever\b.{0,60}\balways\b|\balways\b.{0,60}\bnever\b"
-    r"|\bfrom now on\b|\bevery time\b.{0,40}\b(you|u)\b", re.I)
-REUSE = re.compile(
-    r"\b(we already have|already exists|don'?t we already"
-    r"|i thought we already|why (are u|are you|did u|did you) (re)?building)\b",
-    re.I)
-OVERRIDE = re.compile(r"RULEBOOK_OVERRIDE=", re.I)
-WRONG_TARGET = re.compile(
-    r"\b(i mean|i meant|not (that|the) (repo|branch|env|brain|one)"
-    r"|check staging|on staging|it'?s (on |in )?(staging|prod))\b", re.I)
-
-# An error whose cause is a trap in this environment rather than a typo. A trap
-# repeats for the next person; a typo does not.
-TRAPS = [
-    (r"ModuleNotFoundError|No module named", "missing-module"),
-    (r"command not found: (timeout|rg|pg_isready|psql|gtimeout)", "missing-binary"),
-    (r"unexpected keyword argument", "kwarg-drift"),
-    (r"Blocked by the XTrace team rulebook", "gate-block"),
-    (r"MissingGreenlet|greenlet_spawn", "async-context"),
-    (r"relation \"[^\"]+\" does not exist", "schema-drift"),
-    (r"could not translate host name|connection refused", "wrong-endpoint"),
-]
-# A closed arc that took this many tool calls is routed whatever its error
-# said: a trap that cost five calls is a trap even if this list has no name
-# for it.
-ARC_COST_ROUTES = 5
-
-# Counted, and not sent. A claim with no receipt is the agent's own words, not
-# an action a rule could match, so it is not a moment to hand over. This spares
-# the classifier call on a turn whose only hit is one.
-NOT_AUTHORED = {"claim_no_receipt"}
-
-
+# -------------------------------------------------------------- error arcs
 def error_arcs(turn: dict) -> list[dict]:
     """Closed error arcs: a tool error on target T, then a later success on
     the same T in the same turn. The pair is the content; a failure that never
@@ -366,79 +296,51 @@ def error_arcs(turn: dict) -> list[dict]:
     return arcs
 
 
-def route(turn: dict, prev: dict | None,
-          arcs: list[dict] | None = None) -> list[tuple[str, str]]:
-    """Reasons this turn may hold a lesson. Empty means ask the classifier
-    with no hint. `arcs` are the closed error arcs the rulebook hook paired
-    live; they join the ones the transcript shows."""
-    hits: list[tuple[str, str]] = []
-    asst = turn.get("asst") or ""
-    user = turn.get("user") or ""
-    tools = [t.get("brief", "") for t in turn.get("tools", [])]
-
-    m = RETRACT.search(asst)
-    if m:
-        hits.append(("retraction", m.group(0)))
-    m = CLAIM.search(asst)
-    if m and not any(RECEIPT.search(t) for t in tools[-8:]):
-        hits.append(("claim_no_receipt", m.group(0)))
-    if RULEREQ.search(user):
-        hits.append(("standing_rule_request", user[:80]))
-    if REUSE.search(user):
-        hits.append(("reuse_correction", user[:80]))
-    if WRONG_TARGET.search(user):
-        hits.append(("wrong_target", user[:80]))
-    if any(OVERRIDE.search(t) for t in tools):
-        hits.append(("gate_override", ""))
-    seen = set()
-    for arc in error_arcs(turn) + list(arcs or []):
-        key = (arc.get("target") or "")[:200]
-        if key in seen:
-            continue
-        name = ""
-        for rx, trap in TRAPS:
-            if re.search(rx, arc.get("signature") or ""):
-                name = trap
-                break
-        if not name and (arc.get("cost") or 0) >= ARC_COST_ROUTES:
-            name = f"cost-{arc.get('cost')}"
-        if name:
-            seen.add(key)
-            hits.append(("error_arc", name))
-    return hits
-
-
-def router_hint(hits: list[tuple[str, str]]) -> str:
-    """The label the classifier sees: the first hit that is not a bare claim."""
-    for kind, _ in hits:
-        if kind not in NOT_AUTHORED:
-            return kind
-    return ""
-
-
 # ------------------------------------------------------------------ window
+def _actions(turn: dict, last: bool) -> list[str]:
+    """Up to 12 of the turn's tool calls, each with whether it succeeded and
+    the first lines of what it returned: the judge needs the result to tell a
+    doubted claim the agent had checked from one it had not (2026-09-30 bench:
+    this and the following message cut false fires ~30% at the same recall)."""
+    results = {r.get("id"): r for r in turn.get("results", []) if r.get("id")}
+    out = []
+    for c in turn.get("tools", []):
+        line = "  - " + (c.get("brief") or "")
+        r = results.get(c.get("id")) if c.get("id") else None
+        if r is not None:
+            body = "\n".join((r.get("text") or "").strip().splitlines()[:3])[:240]
+            line += f"\n    -> {'ERROR' if r.get('error') else 'ok'}: " + body.replace("\n", "\n       ")
+        out.append(line)
+    out = out[-12:] if last else out[:12]
+    return out or ["  (none)"]
+
+
 def build_window(turn: dict, prev: dict | None, state: dict,
-                 arcs: list[dict] | None = None) -> str:
-    """The moment as text. Tool output is in it and is untrusted, which is
-    why it is redacted before it is sent and why whatever the agent later
-    proposes is a proposal a person reads."""
+                 earlier: list[dict] | None = None, following: str | None = None) -> str:
+    """The moment as text: the person's message, what the agent did around it
+    and what each action returned, and — at the Stop of the turn after — what
+    the person said next. Tool output is in it and is untrusted, which is why
+    it is redacted before it is sent and why whatever the agent later proposes
+    is a proposal a person reads. Worst case about 19k characters; the server
+    takes 24,576."""
     L = [f"STATE: {json.dumps(state, default=str)}"]
+    if earlier:
+        L.append("EARLIER USER MESSAGES (oldest first):")
+        L += [f"  - {(e.get('user') or '')[:400]}" for e in earlier[-2:]]
     if prev:
-        L.append(f"PREVIOUS USER MESSAGE: {(prev.get('user') or '')[:600]}")
-        acts = [t.get("brief", "") for t in prev.get("tools", [])][-4:]
-        L.append("AGENT'S ACTIONS IN PREVIOUS TURN (last 4):")
-        L += ["  - " + a for a in acts] or ["  (none)"]
-        L.append(f"AGENT'S LAST WORDS IN PREVIOUS TURN: {(prev.get('asst') or '')[-500:]}")
+        L.append(f"PREVIOUS USER MESSAGE: {(prev.get('user') or '')[:900]}")
+        L.append("AGENT'S ACTIONS IN PREVIOUS TURN (each with its result):")
+        L += _actions(prev, last=True)
+        L.append(f"AGENT'S REPLY IN PREVIOUS TURN: {(prev.get('asst') or '')[-3000:]}")
     L.append(f"USER'S NEW MESSAGE: {(turn.get('user') or '')[:900]}")
-    acts = [t.get("brief", "") for t in turn.get("tools", [])][:6]
-    L.append("AGENT'S ACTIONS IN THIS TURN (first 6):")
-    L += ["  - " + a for a in acts] or ["  (none)"]
-    for e in [r for r in turn.get("results", []) if r.get("error")][:3]:
-        L.append(f"  ! error from {e.get('tool')}: {(e.get('text') or '')[:250]}")
-    for arc in (error_arcs(turn) + list(arcs or []))[:2]:
+    L.append("AGENT'S ACTIONS IN THIS TURN (each with its result):")
+    L += _actions(turn, last=False)
+    for arc in error_arcs(turn)[:2]:
         L.append(f"  ~ closed error arc on {arc['target'][:80]!r}: "
                  f"{(arc.get('signature') or '')[:150]}")
-    L.append(f"AGENT'S FINAL WORDS THIS TURN: {(turn.get('asst') or '')[-700:]}")
+    L.append(f"AGENT'S FINAL WORDS THIS TURN: {(turn.get('asst') or '')[-1500:]}")
+    if following is not None:
+        L.append(f"USER'S FOLLOWING MESSAGE (what the person said next): {following[:900]}")
     return "\n".join(L)
 
 
@@ -488,7 +390,7 @@ def _api():
     return pak.api_base(url), bearer, mcp_http
 
 
-def server_classify(window: str, hint: str = "", repo: str = "",
+def server_classify(window: str, repo: str = "",
                     timeout: float = 0) -> tuple[dict, float]:
     """ONE bounded POST. Returns ({signal, reason, kind?, derivable?}, seconds).
 
@@ -497,8 +399,6 @@ def server_classify(window: str, hint: str = "", repo: str = "",
     detached best-effort child."""
     t0 = time.time()
     body = {"window": window[:WINDOW_MAX_CHARS]}
-    if hint:
-        body["hint"] = hint[:64]
     if repo:
         body["repo"] = repo[:200]
     try:
@@ -664,82 +564,3 @@ def plugin_version() -> str:
         return json.loads(manifest.read_text(encoding="utf-8")).get("version", "0.0.0")
     except (OSError, ValueError):
         return "0.0.0"
-
-
-# -------------------------------------------------------------------- turn
-def new_stats() -> dict:
-    return {"router_hits": 0, "turns_spared": 0, "turns_sent": 0, "moments": 0,
-            "reason": "", "transport_errors": 0, "seconds": 0.0}
-
-
-def extract_turn(turn: dict, prev: dict | None, *, session: str, cwd: str,
-                 repo: str, env_name: str, stats: dict, trace, out_path: Path,
-                 arcs: list[dict] | None = None, hook_version: str = "",
-                 timeout: float = 0) -> dict | None:
-    """One turn through router → window → classifier → moment. Returns the
-    moment appended to `out_path`, or None."""
-    hits = route(turn, prev, arcs)
-    stats["router_hits"] += len(hits)
-    trace(f"turn {turn.get('n')} | router: {[k for k, _ in hits] or '-'}")
-    hint = router_hint(hits)
-    if hits and not hint:
-        stats["turns_spared"] += 1
-        trace("   not sent: the only hit is a claim with no receipt")
-        return None
-
-    state = stamp_state(session=session, turn=turn, cwd=cwd,
-                        hook_version=hook_version or plugin_version(),
-                        env_name=env_name, default_repo=repo)
-    window = redact_window(build_window(turn, prev, state, arcs))
-    t0 = time.time()
-    reply, dt = server_classify(window, hint, repo=state.get("repo", ""), timeout=timeout)
-    stats["seconds"] = round(time.time() - t0, 1)
-    stats["turns_sent"] += 1
-    reason = str(reply.get("reason") or "")
-    stats["reason"] = reason
-    if reason in CLIENT_REASONS:
-        stats["transport_errors"] += 1
-    if not reply.get("signal"):
-        trace(f"   classifier ({dt}s): no signal [{reason}]")
-        return None
-    kind = reply.get("kind")
-    moment = {"turn": turn.get("n"), "source_ref": f"{session}#{turn.get('n')}",
-              "hint": hint, "kind": kind, "derivable": reply.get("derivable"),
-              "state": state}
-    append_jsonl(out_path, moment)
-    stats["moments"] += 1
-    trace(f"   classifier ({dt}s): signal [{kind}], moment recorded")
-    return moment
-
-
-# ------------------------------------------------------------------- spawn
-def spawn_detached(argv: list[str], script: Path, log_name: str,
-                   pass_fds: tuple = ()) -> int:
-    """Run `script argv` fully detached: the caller is a hook that must return
-    at once, and the child must survive the session ending. `pass_fds` are
-    inherited — the author lane hands its lock fds down this way."""
-    args = [sys.executable, str(script)] + list(argv)
-    log_file = log_path(log_name)
-    try:
-        log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        log = os.fdopen(fd, "a", encoding="utf-8")
-    except OSError:
-        log = subprocess.DEVNULL
-    try:
-        kwargs = {"stdin": subprocess.DEVNULL, "stdout": log, "stderr": log,
-                  "close_fds": True}
-        if pass_fds:
-            # POSIX only: the author lane passes none on Windows, where an
-            # inherited handle carries no lock (harness_stop.take_lease).
-            kwargs["pass_fds"] = tuple(pass_fds)
-        if os.name == "nt":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0))
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen(args, **kwargs)
-    except OSError:
-        return 0        # fail open and silent, like every hook path
-    return 0

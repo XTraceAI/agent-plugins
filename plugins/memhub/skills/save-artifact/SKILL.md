@@ -29,8 +29,8 @@ artifact — re-upload under the same `--name` into the same brain and the
 server chains it onto the lineage's head — never publish a parallel one.
 Retrieval is semantic, so an un-retracted stale claim can outrank its own
 correction and mislead the next agent. Before uploading something that
-restates or corrects existing knowledge, `search_memory` (`memory_type:
-"artifacts"`) for the artifact it supersedes and reuse its exact name; if a
+restates or corrects existing knowledge, `search_memory` (`kind:
+"artifact"`) for the artifact it supersedes and reuse its exact name; if a
 prior conclusion is now wrong, say so explicitly in the new version rather
 than leaving both to compete. `--parent-id` exists for explicit chaining but
 must be the CURRENT latest version's id (the server rejects an older one as
@@ -58,9 +58,8 @@ Do exactly this:
    repo goes to personal memory unless you pass `--agent-brain-id`.
 
    Optional flags when relevant: `--agent-brain-id <id>` to override the
-   destination brain — with `--org-id <org>` when that brain is outside your
-   default org (`list_orgs`; without it the save fails "Agent brain not
-   found"), `--no-room` to save into personal workspace memory
+   destination brain (its org is worked out from the id; `--org-id <org>` is
+   accepted but no longer needed), `--no-room` to save into personal workspace memory
    instead, `--rationale "..."` to note why this version supersedes the last,
    `--parent-id <id>` only with the current head's id.
 

@@ -9,9 +9,8 @@ basename fragments per branch: the rulebook fetched a book for a repo called
 `gate-ttl`, and `scope_repos: ["xmem"]` — matched by exact string on the server
 (crud.team_memory_rules._rule_in_repo) — reached none of them.
 
-The capture path settled this already; `directive_recall._git_remote_basename`
-carries the rule in its docstring ("a directory basename is NEVER a scope
-name"). This module is that policy with a file-read fallback, so the rulebook
+The capture path settled this already: a directory basename is NEVER a scope
+name. This module is that policy with a file-read fallback, so the rulebook
 hook — which runs on every tool call and resolves the repo before it knows
 whether it has any work to do — need not pay for a subprocess to be correct.
 

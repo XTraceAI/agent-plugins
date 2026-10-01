@@ -60,18 +60,20 @@ export const FEET: Readonly<Record<Feet, string>> = {
  * Flippers, as [column, row, colour] in STAND's coordinates. Each fills both
  * rows of a cell, or only the lower one: never the upper row alone.
  */
-export type LeftFlipper = 'down' | 'out' | 'pocket' | 'phone' | 'ear'
+export type LeftFlipper = 'down' | 'out' | 'up' | 'pocket' | 'phone' | 'ear'
 export const LEFT_FLIPPER: Readonly<Record<LeftFlipper, readonly (readonly [number, number, string])[]>> = {
   down: [[1, 6, 'K'], [1, 7, 'K']],
   out: [[1, 4, 'K'], [1, 5, 'K'], [0, 5, 'K']],
+  up: [[1, 4, 'K'], [1, 5, 'K'], [0, 2, 'K'], [0, 3, 'K']],
   pocket: [[1, 6, 'K'], [1, 7, 'K'], [3, 6, 'K'], [3, 7, 'K']],
   phone: [[1, 4, 'K'], [1, 5, 'K'], [0, 4, 'H'], [0, 5, 'H']],
   ear: [[1, 4, 'K'], [1, 5, 'K'], [1, 2, 'H'], [1, 3, 'H']],
 }
-export type RightFlipper = 'down' | 'out' | 'point'
+export type RightFlipper = 'down' | 'out' | 'up' | 'point'
 export const RIGHT_FLIPPER: Readonly<Record<RightFlipper, readonly (readonly [number, number, string])[]>> = {
   down: [[8, 6, 'K'], [8, 7, 'K']],
   out: [[8, 4, 'K'], [8, 5, 'K'], [9, 5, 'K']],
+  up: [[8, 4, 'K'], [8, 5, 'K'], [9, 2, 'K'], [9, 3, 'K']],
   point: [[8, 5, 'K'], [9, 5, 'K']],
 }
 

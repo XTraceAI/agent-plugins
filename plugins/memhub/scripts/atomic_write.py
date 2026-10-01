@@ -4,8 +4,8 @@
 **Why this is one function and not three copies.** Every durable thing this
 plugin keeps — the OAuth token cache, the access key, the per-session capture
 cursor — is written by more than one process: the per-turn flush, the SessionEnd
-backstop (which does not take the per-turn flock), and the PreToolUse directive
-check that fires on every file edit. All three needed the same care, so all
+backstop (which does not take the per-turn flock), and the PreToolUse hooks
+that fire on tool calls. All three needed the same care, so all
 three grew their own copy of it, and the copies drifted: a review round found
 the same non-atomic write in one file, and the same bug was sitting in the other
 two under slightly different spellings.

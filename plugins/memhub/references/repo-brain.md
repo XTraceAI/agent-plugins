@@ -113,14 +113,15 @@ not be forced into a repo shape.
 Creating a brain is the last resort, never the first move.
 
 1. Derive the name (§1).
-2. `list_agent_brains` → look for an **exact-name match**. Reuse that
-   `agent_brain_id` if found — a teammate may have created the room, and
-   theirs is the right one.
+2. `list_agent_brains(repo="<org>/<name>")` — the §1 name without the
+   `Repo: ` prefix; it looks across every org you are in — then keep only an
+   **exact-name match**. Reuse that `agent_brain_id` if found — a teammate
+   may have created the room, and theirs is the right one.
 3. *Optional*, when a person is in the loop to judge a near-match: run
-   `search_brains` with the repo or topic in natural language — an existing
-   brain may hold this subject under a different name. The skills that
-   resolve a repo room (onboard, pr-babysit) skip it: the exact name is the
-   dedup that matters.
+   `list_agent_brains(query="…")` with the repo or topic in natural language
+   — it ranks brains, and an existing one may hold this subject under a
+   different name. The skills that resolve a repo room (onboard, pr-babysit)
+   skip it: the exact name is the dedup that matters.
 4. No exact match: `create_agent_brain` with `name: "Repo: <org>/<name>"`,
    `category: "repo"`, a description (§5), and **`repo: "<org>/<name>"`** —
    the §1 name without the `Repo: ` prefix. Omit `workspace_id`. `repo` ties
@@ -157,16 +158,14 @@ subject make the right one harder to find for every future search.
 Once §3 gives you an id, **persist it** so later writers don't redo the lookup:
 
 ```sh
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" --org-id "<ORG_ID>"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" [--org-id "<ORG_ID>"]
 ```
 
-`--org-id` is the org that owns the brain — the `org_id` you passed to
-`list_agent_brains` / `create_agent_brain`, or the default org's `org_id` from
-`list_orgs` when you passed none (the response's `scope` carries only
-`org_name`). Single-org accounts can omit it; multi-org accounts must not,
-because a brain lives in exactly one org and the caller's default org follows
-whatever was last selected in the MemHub app. An entry cached without it is
-re-probed (rate-limited) until the org is known.
+`--org-id` is the org that owns the brain, when you know it — the brain row
+or `create_agent_brain`'s answer names it. It is optional: the server works a
+brain's org out from its id, so an id cached without its org still routes.
+An entry cached without it is re-probed (rate-limited, once a day) in case
+the org can be recorded.
 
 That writes `~/.config/memhub-plugin/rooms.json` — the plugin's per-user state
 dir, alongside the OAuth token cache. **Never inside the repo.** A brain id is
@@ -185,21 +184,23 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" name   # the §1 name
 ```
 
-Why this exists: the AUTOMATIC capture paths — the per-turn Stop flush, the
-SessionEnd hook and the commit/PR flush — run with no model in the loop. Before
-the cache they passed only `namespace` and their memories landed in **personal
-memory, never in the room**. Today the hooks resolve the room themselves on a
-cache miss (`brain_resolve.resolve_repo_brain` does the exact-name lookup and
-caches the answer), so capture only falls back to personal memory when no brain
-of the repo's exact name exists on this backend. The cache is what makes that
-resolution a once-per-repo cost, records the org that owns the room
-(`set --org-id`, needed for writes outside the caller's default org), and
-collapses five skills' worth of independent re-derivation into one answer,
-which is the drift §1 warns about.
+Who reads it: the ARTIFACT writers. `save_artifact.py` and the `.md`
+auto-capture at the end of a turn resolve the room themselves on a cache miss
+(`brain_resolve.resolve_repo_brain` asks `list_agent_brains(repo=…)`, keeps
+the exact-name match, and caches the answer), and a write the backend answers "Agent brain not found" for evicts
+the entry so the next one resolves again. `save_artifact.py` reads the cache
+when `--agent-brain-id` is not passed (`--no-room` opts out), so a plain
+invocation lands in the room. The cache makes that resolution a once-per-repo
+cost, records the org that owns the room when it is known (`set --org-id`),
+and collapses five skills' worth of
+independent re-derivation into one answer, which is the drift §1 warns about.
 
-`import_session.py` and `save_artifact.py` read it automatically when
-`--agent-brain-id` is not passed (`--no-room` opts out), so a plain invocation
-lands in the room.
+Who never reads it: session capture. The per-turn Stop flush, the SessionEnd
+hook, the commit/PR flush, the Codex and Cursor hooks and `capture.py import`
+send every session to the author's **personal memory, never to a brain** —
+the room included. A session is the author's, and the server pins a session to
+the first brain any flush names, so a single routed flush would pull its whole
+memory into the room. Team-visible knowledge reaches the room as artifacts.
 
 Because the key is the room NAME (derived from the remote), every worktree and
 subdirectory of a repo shares one entry automatically, with no dependence on
@@ -216,8 +217,8 @@ description is effectively invisible when picking from a list.
 Write one line answering **what questions this brain can answer**. Name the
 subject and the kind of content.
 
-- Good — "Shared room for the xmem repo: specs, PR review records, and the
-  task episodes of the sessions that built it."
+- Good — "Shared room for the xmem repo: specs, design docs and PR review
+  records."
 - Useless — "xmem stuff", "notes", or an empty description.
 
 ## 6. Say where things landed

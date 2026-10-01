@@ -50,8 +50,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
-from room_map import env_for_url, read_room, repo_root  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
+from room_map import env_for_url, forget_room, read_room, repo_root  # noqa: E402
 
 
 def _bundle(paths, entrypoint):
@@ -239,9 +239,9 @@ async def main() -> int:
     # override.
     #
     # The cache is read first; on a miss the room is resolved from the server
-    # over the session opened below (the same `resolve_repo_brain` the capture
-    # hooks use), so a hand-saved artifact lands in the repo room whenever one
-    # exists — not only after something else happened to cache it.
+    # over the session opened below (the same `resolve_repo_brain` the `.md`
+    # auto-capture uses), so a hand-saved artifact lands in the repo room
+    # whenever one exists — not only after something else happened to cache it.
     room = None
     room_cwd: Path | None = None
     want_room = not args.agent_brain_id and not args.no_room
@@ -275,7 +275,7 @@ async def main() -> int:
             session = mcp_http.PolicySession(session, url, headers)
             if want_room and room is None and room_cwd is not None:
                 # Cache miss inside a repo: ask the server, the same exact-name
-                # lookup the capture hooks do. room_cwd is None only when the
+                # lookup the `.md` auto-capture does. room_cwd is None only when the
                 # file is outside any repo — never resolve from the process
                 # cwd, that would file it into an unrelated repo's room. A
                 # lookup failure is not a reason to lose the save: fall back
@@ -290,7 +290,7 @@ async def main() -> int:
                 # The org that OWNS the room. A brain resolves inside exactly
                 # one org, so its id without the org fails with "Agent brain
                 # not found" whenever the room is outside the caller's default
-                # org — the same reason the capture flushes send it.
+                # org.
                 if room.get("org_id"):
                     call_args["org_id"] = room["org_id"]
             if call_args.get("agent_brain_id"):
@@ -299,6 +299,19 @@ async def main() -> int:
             print("-" * 56)
             res = await session.call_tool("save_artifact", arguments=call_args)
             out = unwrap(res)
+            if room and getattr(res, "isError", False) and is_missing_brain(
+                    [getattr(b, "text", "") for b in getattr(res, "content", []) or []]):
+                # The cached room is not a brain this backend has — deleted, or
+                # an id cached from the other backend. `resolve_repo_brain`
+                # hands a cached id back on every failed re-resolution, so
+                # without this every later save re-sends the same dead id.
+                # Session capture used to evict it as a side effect; sessions
+                # never name a brain now, so the artifact writers own it.
+                # Only a room that came from the cache or resolver: an explicit
+                # --agent-brain-id is the caller's, never ours to forget.
+                forget_room(room_cwd, env)
+                print("room     : the cached room does not exist on this backend — "
+                      "dropped from the cache; re-run to resolve the room again")
     print(json.dumps(out, indent=2))
     # A refusal (required tags, quota, a stale parent) arrives as a normal
     # CallToolResult with isError set — `unwrap` cannot tell it from a saved

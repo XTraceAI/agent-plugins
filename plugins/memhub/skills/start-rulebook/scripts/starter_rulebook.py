@@ -15,9 +15,13 @@ Three steps, each a subcommand, each writing a file the next one reads:
           candidates.json (create_rule bodies + their cases) and dropped.json
           (every rule left out, with the signal it was missing). A rule whose
           signal is absent is DROPPED, never filed with a guessed value.
+          Each body carries the rule judge's fields too — `when`, `do`, `why`
+          and, where the catalog names an exclusion, `when_not` — with their
+          slots filled like the statement's.
   verify  run every seeded candidate through `rulebook_verify.verify` — the
           live hook's own engine — against the cases the catalog ships, and
-          write verified.json. Exit 1 if any candidate misbehaves.
+          write verified.json. Exit 1 if any candidate misbehaves, or if one
+          of its judge fields is missing, unfilled, or over the server's cap.
 
   starter_rulebook.py all --repo . --out starter-out
 
@@ -49,7 +53,11 @@ CMD = r"(?:^|[;&]\s*|\|\s+)"
 # Written without a quantified group: the hook's load lint drops those.
 # `/usr/bin/git` is the same program: a path in front of it is not a way round every git rule.
 GIT = CMD + r"(?:sudo\s+)?(?:\S*/)?git\s+(?:-[cC]\s*\S+\s+)?"
-RX_MAX = 2000        # the hook's `_RX_MAX` since 0.88.0; the server floors a pattern over 400 at that version
+RX_MAX = 400
+# What the server's rule judge reads when a rule's pattern matches (rule-judge-spec §2): the situation
+# the rule is for, the situations it is not for, what it asks, and why. create_rule refuses a field
+# over its cap, it does not truncate — so the caps are held here, before anything is filed.
+WHEN_MAX, DO_MAX, WHY_MAX, WHEN_NOT_MAX, WHEN_NOT_ENTRIES = 300, 400, 400, 200, 8
 # Appended to a command pattern to make it a RECEIPT: the command, but not an invocation that exits 0
 # having done none of the work — `pytest --version`, `eslint --help`, `pytest --collect-only`.
 _RAN_NOTHING = (r"\b(?![^|;&]*\s(?:--version|-V|--help|-h|--collect-only|--co|--fixtures|--markers|--setup-plan"
@@ -96,7 +104,7 @@ def _alt(parts) -> str:
 
 def _fit(prefix: str, extras: list[str], suffix: str = "") -> str:
     """Append alternatives while the whole pattern stays loadable. The hook
-    drops a rule whose pattern passes `RX_MAX` characters, silently, so a long
+    drops a rule whose pattern passes 400 characters, silently, so a long
     repo-derived list is cut here rather than shipped dead."""
     rx = prefix
     for e in extras:
@@ -589,7 +597,10 @@ def _fill(node, slots: dict):
 
 
 _BODY_KEYS = ("title", "statement", "delivery", "mode", "matcher", "ordering", "anchors",
-              "scope_paths", "scope_exclude_paths", "min_hook_version")
+              "scope_paths", "scope_exclude_paths", "min_hook_version", "when", "when_not", "do")
+# The catalog is XTrace's writing, so MemHub shows these rules as XTrace's (ENG-1166). A label
+# only: the teammate who files one still owns it. Not a catalog field, so no entry can change it.
+AUTHOR = "xtrace"
 
 # dropped.json is read out to the client, so a missing slot is named in their words.
 _SLOT_WORDS = {"test_cmd_rx": "recognised test command", "lint_cmd_rx": "linter or formatter",
@@ -605,6 +616,22 @@ _SLOT_WORDS = {"test_cmd_rx": "recognised test command", "lint_cmd_rx": "linter 
                "src_diff_rx": "clear source root", "tests_diff_rx": "test directory",
                "default_branch_rx": "known default branch (origin/HEAD is not set)",
                "default_branch_esc": "known default branch (origin/HEAD is not set)"}
+
+
+def _why_for_judge(why: str) -> str:
+    """The catalog's `why`, whole when it fits the server's cap. A longer one keeps its leading
+    sentences — the reason comes first, the notes on what the pattern leaves out after it — and
+    one whose first sentence alone is too long is left off: an absent `why` is accepted, a long
+    one is refused."""
+    why = why.strip()
+    if len(why) <= WHY_MAX:
+        return why
+    kept = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", why):
+        if len(kept) + len(sentence) + 1 > WHY_MAX:
+            break
+        kept = (kept + " " + sentence).strip()
+    return kept
 
 
 def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, list]:
@@ -635,10 +662,18 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
             statement = filled["statement"].rstrip()
         body = {k: filled[k] for k in _BODY_KEYS if filled.get(k) is not None}
         body["statement"] = statement
+        if not body.get("when_not"):
+            body.pop("when_not", None)              # optional, and empty for most rules
+        # The same `why` the statement ends in, as its own field: the judge reads `when` / `do` /
+        # `why` in place of the statement, so the two must say the same thing.
+        why = _why_for_judge(filled["why"])
+        if why:
+            body["why"] = why
         if body.get("delivery") != "agent_hook":
             body.pop("mode", None)                  # notes and anchors cannot block: the server refuses mode="gate" there, and advise is the default
         body["scope_repos"] = [slots["repo"]] if scope_repo else []
         body["source"] = "authored"
+        body["author"] = AUTHOR
         # The server keys a re-file on the ref before `#` (a hex `@sha` stripped) plus the title, so the
         # catalog version rides AFTER the `#`: a dated base would twin every rule on each catalog update.
         body["source_ref"] = "starter-rulebook#%s|catalog %s" % (filled["id"], catalog["version"])
@@ -700,6 +735,22 @@ def verify(candidates: list) -> tuple[list, bool]:
                 testable = False                    # a note or an anchor: the server judges relevance
             if testable and not fires:
                 ok, lines = False, lines + ["FIRES  FAIL  the catalog ships no --fires case for this rule"]
+            # The judge's fields, after seeding: a slot value can push one past its cap, and
+            # create_rule refuses a long field outright. A rule with no `when` or no `do` would be
+            # judged on its statement alone, which the catalog never intends.
+            ctx_bad = ["no `%s`" % k for k in ("when", "do") if not str(body.get(k) or "").strip()]
+            ctx_bad += ["`%s` is over %d characters after seeding" % (k, cap)
+                        for k, cap in (("when", WHEN_MAX), ("do", DO_MAX), ("why", WHY_MAX))
+                        if len(str(body.get(k) or "")) > cap]
+            not_for = body.get("when_not") or []
+            if len(not_for) > WHEN_NOT_ENTRIES:
+                ctx_bad.append("`when_not` has over %d entries" % WHEN_NOT_ENTRIES)
+            if any(not isinstance(x, str) or not x.strip() or len(x) > WHEN_NOT_MAX for x in not_for):
+                ctx_bad.append("a `when_not` entry is empty or over %d characters after seeding" % WHEN_NOT_MAX)
+            ctx_bad += ["`%s` still holds an unfilled {{slot}}" % k for k in ("when", "do", "why", "when_not")
+                        if "{{" in json.dumps(body.get(k) or "")]
+            if ctx_bad:
+                ok, lines = False, lines + ["JUDGE  FAIL  %s" % b for b in ctx_bad]
             long_rx = [k for blk in (body.get("matcher"), body.get("ordering")) if blk
                        for k, v in blk.items() if k.endswith("_rx") and len(str(v)) > RX_MAX]
             if long_rx:

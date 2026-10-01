@@ -5,7 +5,7 @@ import type { Animal, Build, Glyph, Painted, Tone } from '../../animal'
 import { PAL } from './art'
 import { renderCanvas } from './scene'
 import { H, W } from './scene-consts'
-import { BUBBLE_AT, type Frame, POSES, cycle, enter, leave, look, rise, sleep, speak, wake } from './script'
+import { BUBBLE_AT, type Frame, POSES, cycle, enter, leave, look, pet, rise, sleep, speak, wake } from './script'
 
 const build: Build<Frame> = {
   pixelSize: 1,
@@ -20,6 +20,7 @@ const build: Build<Frame> = {
     rise,
     speak: (text: string, _n: number, tone: Tone) => speak(text, tone),
     leave,
+    pet,
   },
 
   render(st: Frame, tick: number): Painted {
@@ -29,7 +30,7 @@ const build: Build<Frame> = {
       canvas: renderCanvas(st, tick),
       glyphs,
       bubble: st.said
-        ? { text: st.said, shown: st.shown, tag: 'rule', tone: st.tone }
+        ? { text: st.said, shown: st.shown, tag: st.tone === 'proposed' ? 'new rule' : 'rule', tone: st.tone }
         : null,
     }
   },
@@ -40,5 +41,6 @@ const build: Build<Frame> = {
 
 export const penguin: Animal = {
   name: 'Penguin',
+  title: 'Penelope the Penguin',
   builds: [build],
 }

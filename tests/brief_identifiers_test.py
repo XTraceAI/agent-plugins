@@ -1,9 +1,7 @@
-"""Self-test for the identifier extractor behind the brief and the prompt hook.
+"""Self-test for the git identifier extractor behind the brief.
 
-The contract under test: only IDENTIFIERS come out — paths, symbols that exist
-in the repo, ``PR #N`` / ``ENG-N``, quoted error strings — and never words. A
-prompt about "what we did yesterday" yields nothing, so the hook that consumes
-this stays silent and free on it.
+The contract under test: only IDENTIFIERS come out — paths and ``PR #N`` /
+``ENG-N`` references — and never words.
 
 The git half runs against a throwaway repository built here, so the checks
 are hermetic: no dependence on this checkout's branch or history.
@@ -36,66 +34,6 @@ def check(label: str, cond: bool) -> None:
         _failures.append(label)
 
 
-REPO_TOKENS = {
-    "plugins/memhub/scripts/brain_brief.py", "brain_brief.py", "brain_brief",
-    "plugins/memhub/scripts/room_map.py", "room_map.py", "room_map",
-    "tests/brain_brief_test.py", "brain_brief_test.py", "brain_brief_test",
-    "plugins", "memhub", "scripts", "tests", "README.md", "readme",
-}
-
-
-def test_paths_symbols_refs_errors() -> None:
-    found = bi.from_prompt(
-        "Fix plugins/memhub/scripts/brain_brief.py so room_map.read_room copes with "
-        "PR #182 and ENG-1010; the error was \"Agent brain not found\" and "
-        "`ModuleNotFoundError: No module named mcp` showed up too.",
-        REPO_TOKENS,
-    )
-    check("a repo-relative path is a path",
-          "plugins/memhub/scripts/brain_brief.py" in found["paths"])
-    check("Module.name is a symbol when the module is in the repo",
-          "room_map.read_room" in found["symbols"])
-    check("PR #N is a ref", "PR #182" in found["refs"])
-    check("ENG-N is a ref", "ENG-1010" in found["refs"])
-    check("a quoted failure message is an error string",
-          "Agent brain not found" in found["errors"])
-    check("a backticked *Error line is an error string",
-          any(e.startswith("ModuleNotFoundError") for e in found["errors"]))
-
-
-def test_bare_basename_needs_the_repo() -> None:
-    found = bi.from_prompt("look at brain_brief.py and at wibble.py", REPO_TOKENS)
-    check("a bare basename that IS a repo file is a path", "brain_brief.py" in found["paths"])
-    check("a bare basename that is NOT a repo file is dropped", "wibble.py" not in found["paths"])
-    found = bi.from_prompt("add sub/new_file.py under scripts/newdir", REPO_TOKENS)
-    check("a slashed token with an extension is a path", "sub/new_file.py" in found["paths"])
-    check("a slashed token through a repo directory is a path", "scripts/newdir" in found["paths"])
-    check("the path's own stem is not reported again as a symbol",
-          "brain_brief" not in found["symbols"])
-
-
-def test_snake_case_must_occur_in_the_repo() -> None:
-    found = bi.from_prompt("call brain_brief_test then update_config and do_it", REPO_TOKENS)
-    check("a snake_case token in the repo is a symbol", "brain_brief_test" in found["symbols"])
-    check("a snake_case token absent from the repo is not", "update_config" not in found["symbols"])
-    check("a short snake token is not", "do_it" not in found["symbols"])
-
-
-def test_negatives_yield_nothing() -> None:
-    for prompt in (
-        "please summarise what we did yesterday",
-        "Why is the build slow? Think about it.",
-        "see https://github.com/XTraceAI/agent-plugins/pull/9999 for context",
-        "version 1.2.3 is out",
-        "\"this is a long quoted sentence with nothing wrong in it\"",
-        "support client/server mode and input/output formats, choose yes/no",
-    ):
-        found = bi.from_prompt(prompt, REPO_TOKENS)
-        check(f"nothing in: {prompt[:48]!r}",
-              not any(found[k] for k in ("paths", "symbols", "refs", "errors")))
-    check("entities_for of nothing is nothing", bi.entities_for([], []) == [])
-
-
 def test_refs_canonical_forms() -> None:
     check("(#179) in a commit subject is PR #179",
           bi.refs_in("fix(md-capture): captured too (v0.49.1) (#179)") == ["PR #179"])
@@ -103,19 +41,6 @@ def test_refs_canonical_forms() -> None:
           "ENG-1010" in bi.refs_in("fm-feat/eng-1010-facets"))
     check("refs are deduped in order",
           bi.refs_in("PR #5 then #5 then #6") == ["PR #5", "PR #6"])
-
-
-def test_entities_are_relative_path_plus_basename() -> None:
-    ents = bi.entities_for(["plugins/memhub/scripts/brain_brief.py"], ["PR #1"],
-                           ["room_map.read_room"], ["Agent brain not found"])
-    check("full relative path is an entity", "plugins/memhub/scripts/brain_brief.py" in ents)
-    check("basename is an entity", "brain_brief.py" in ents)
-    check("refs, symbols and errors follow", ents[-3:] == ["PR #1", "room_map.read_room",
-                                                           "Agent brain not found"])
-    many = bi.entities_for([f"dir/f{i}.py" for i in range(400)], ["PR #7"], ["room_map"])
-    check("the entity list is capped under the server's limit", len(many) <= bi.MAX_ENTITIES)
-    check("refs and symbols keep their slots when paths would fill the cap",
-          "PR #7" in many and "room_map" in many and "dir/f0.py" in many)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -149,9 +74,6 @@ def test_from_git_reads_branch_commits_and_diff() -> None:
     check("outside a repo everything is empty",
           bi.from_git(_TMP_HOME) == {"root": "", "branch": "", "head": "", "base": "",
                                      "paths": [], "refs": []})
-    toks = bi.repo_files(repo)
-    check("repo_files carries paths, basenames and stems",
-          {"sub/b.py", "b.py", "a.py"} <= toks and "a" not in toks)
 
 
 if __name__ == "__main__":

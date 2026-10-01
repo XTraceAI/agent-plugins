@@ -2,87 +2,58 @@
 """The harness-tied memory sensor. FLAGGED OFF by default.
 
 Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on (1/on/true/yes).
-With it on, each turn is classified and what survives is authored OFF the
-person's thread:
+With it on, every Stop judges the PREVIOUS human turn, synchronously, and on a
+signal asks the agent to launch one background fork that files the rule:
 
-  Stop(turn N)  `stop`    takes the turn's closed error arcs from the rulebook
-                          hook, spawns a detached `extract` child, and returns.
-                          The child builds the redacted window, asks the
-                          classifier, and on a signal records the MOMENT (turn,
-                          kind, router hint, state stamp).
-                          The same Stop also spawns a detached `author` pass
-                          for whatever is already waiting, and says one line
-                          about what a FINISHED pass left (§ report_outcomes).
-  detached      `author`  one `claude -p` per moment, under the plugin's OWN
-                          MCP server and credential, filing through the
-                          create-rule skill. Nothing it does touches the
-                          person's session. It resumes the owner with
-                          `--resume <owner> --fork-session`, leaves no
-                          transcript, and its outcome row records what the
-                          pass `spent`.
+  Stop(turn N+1)  `stop`   rebuilds turn N from the transcript the hook payload
+                           names, asks the classifier (harness_extract), and on
+                           a signal continues the agent ONCE with one short
+                           line, written for the person, naming the `handoff`
+                           command.
+  SessionStart    `session` gives the agent the standing rule, unseen by the
+                           person: the `handoff` command to run for that line,
+                           and to say nothing unless a rule is filed.
+  agent           `handoff` prints the instruction to launch a fork with
+                           `fork_launch_prompt`, for the moment the line named.
+  fork            `stamp`  the fork runs this read-only command for the state
+                           stamp `create_rule` requires, then files through the
+                           create-rule skill's Harness-draft path.
 
-Why detached rather than blocking the stop, which is what shipped before: the
-block was itself a fix. A line injected at the next prompt reached the agent 19
-times in five real sessions and produced 0 `create_rule` calls, because a line
-stapled to the person's live request loses to the request. Blocking fixed the
-attention problem and paid for it with the person's turn and context window.
-A detached pass keeps what the block bought — nothing competes for the agent's
-attention, because it is a different agent — and drops what it cost.
+Why one turn late (harness-tied-memory-spec §4.3.1): the classifier's window
+ends with the agent's response to the person's message; it cannot hold the
+person's NEXT message, which is what says whether a correction held. Judged at
+the Stop of N+1, the fork launched there already has it in context. Measured
+2026-09-29 on 148 flags: the next message reversed 2% and refined 8%. The cost
+is the session's last turn, which no Stop follows — about 7% of flags.
 
-What the person sees: ONE line, when a rule was filed, or when a pass could not
-RUN. A pass that ran and found no lesson says nothing. Silence is allowed to
-mean "nothing worth filing" and nothing else — a broken pipeline that looks
-exactly like a quiet one is the defect this lane keeps rediscovering.
+Nothing is stored. The transcript the host keeps is the only state: no moments
+file, no cursor, no claims, no launch ledger. A Stop that is not the end of a
+person's turn (a fork launch's continuation, a background task's notice, a loop
+wakeup) judges nothing, so no turn is judged twice.
 
-Selection reads by REPO across every `*.moments.jsonl`, not by session id. A
-session can never hand its own last moment (that classifier child is still
-running when its Stop fires), and one that ends mid-work leaves the rest; read
-per-session, those are lost, because nothing opens those files again. Measured
-before this change, across 25 local sessions: 167 moments flagged, 86 handed,
-**81 never handed**.
+What the person sees: one short line per flagged turn ("MemHub: possible team
+rule spotted in turn N, drafting it in the background."), the collapsed
+`handoff` and fork tool calls, and
+the fork's `filed <title>` line when a rule was filed. Claude Code prints
+whatever a Stop hook uses to continue the agent — a `decision: block` reason
+under "Stop hook error", `additionalContext` as "Stop hook feedback" — so the
+hook says as little as it can and the fork prompt travels in a command's
+output. A `none` or `failed` result stays in the transcript and `stop.log`.
 
-Whatever a pass decides, a proposal lands `proposed` and a person activates it:
-nothing here fires or activates a rule.
-
-Files, under $MEMHUB_HARNESS_DIR (default ~/.config/memhub-plugin/harness),
-all created private:
-
-  <session>.moments.jsonl    flagged moments, then one row per outcome
-                             (`handed` only once a pass DECIDED — a failed
-                             pass leaves the moment for a later drain, because
-                             a watermark past work nobody did is the silent
-                             version of this lane's bug). Append-only: several
-                             lanes write it at once.
-  <session>.meta.json        last extracted turn, repo, cwd, transcript cursor
-  <session>.meta.json.lock   serializes the meta file's read-merge-write
-  <session>.turn-*.claim     the turn an extract child already took
-  <session>.drain.claim      lock: the author pass holding this session
-  drain.slot-N               lock: one of MAX_LIVE_DRAINS passes machine-wide
-  stop.log / extract.log / author.log   one line per step, never prompt text
-
-What turning it on costs the person, and why it is opt-in (v0.69.0 through
-v0.75.x defaulted it on): one classifier call per flagged turn against the
-MemHub backend, and one `claude -p` per moment the drain authors — that second
-one spends THEIR model quota, not the server's, and it carries the owner's
-whole context into every call of its loop. One machine's dogfood
-ran 32 such children in two hours.
-
-Every path fails open and silent: a broken sensor must never touch the tool
-call or the session. Stdlib only.
+Nothing here fires or activates a rule: a filing lands `proposed` and a person
+activates it. Every path fails open and silent — a broken sensor must never
+touch the session. `stop.log` under $MEMHUB_HARNESS_DIR (default
+~/.config/memhub-plugin/harness) is the one file, one line per Stop, never
+prompt text. Stdlib only.
 """
 from __future__ import annotations
 
 import argparse
-import datetime as _dt
-import hashlib
 import json
 import os
-import shutil
-import subprocess
+import re
 import sys
-import tempfile
 import time
-import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -91,37 +62,33 @@ if str(HERE) not in sys.path:
 
 import harness_extract as hx  # noqa: E402
 
-#: Two bounds used to live here — at most 8 blocked stops per session, and
-#: never a moment more than 3 turns old. Both were right for a design that
-#: INTERRUPTS: they capped what one hand-off cost the person, because every
-#: hand-off blocked their stop. Measured across 25 local sessions, they were
-#: also where the input went: 167 moments flagged, 86 handed, **81 never
-#: handed** — one session flagged 33 and handed exactly 8. Nothing ever read
-#: those files again, so each bound doubled as a deletion.
-#:
-#: They are gone with the block. Authoring is detached now, so an extra moment
-#: costs the person nothing and there is nothing to ration. The intent the cap
-#: really carried — do not drop 33 rules into a reviewer's queue — belongs at
-#: the FILING step and lives there instead (spec §4.3.4); rationing at hand-off
-#: conflated "do not interrupt the person" with "do not flood the reviewer".
-FILING_BUDGET_PER_PASS = 8   # rules one drain may propose; a reviewer's bound
-#: Past this a moment is dropped rather than authored: a lesson about a branch
-#: two weeks gone is not worth a review round. Dropped WITH a log line — silent
-#: dropping is this lane's whole bug.
-MOMENT_TTL_S = 14 * 24 * 3600
-#: The per-session claim and the machine-wide slots are OS advisory locks
-#: (`portable_lock`), held on an open file for the whole pass and handed to
-#: the detached child by fd. A holder that dies loses its lock to the kernel,
-#: so there is no staleness to guess at and nothing to unlink — the three
-#: shapes before this (count-then-claim, stat-then-unlink, token-checked
-#: release) each left a race for a burst of Stops to find (Codex, #275).
-#: Across the whole machine, this many author passes may run at once. This is
-#: the circuit breaker for the recursion in `children_path`'s docstring and for
-#: whatever the next one looks like: a loop that spawns faster than this stops
-#: here, whatever its cause.
-MAX_LIVE_DRAINS = 2
-#: An author child cannot itself author. `1` in the child; unset elsewhere.
-DEPTH_FLAG = "MEMHUB_HARNESS_DEPTH"
+#: What the fork's prompt and its last line begin with; the transcript reader
+#: skips a turn that is only this fork's completion report.
+FORK_MARK = "MemHub harness fork"
+#: What `handoff` prints for the continued agent. Never in the Stop hook's own
+#: output, which the person sees.
+BLOCK_PREFIX = "MemHub harness: before you stop"
+#: What the Stop hook's one line begins with — the only harness text shown,
+#: and written for the person. `session_rule` names it, so the two move together.
+HANDOFF_PREFIX = "MemHub: possible team rule spotted in turn"
+
+
+def session_rule(session: str) -> str:
+    """The standing rule the agent gets at SessionStart, a channel Claude Code
+    does not show the person. It carries everything the Stop's line leaves out:
+    the command to run for a flagged turn, and the instruction to keep quiet."""
+    script = str(Path(__file__).resolve())
+    return (
+        f"MemHub harness: when a Stop hook line says \"{HANDOFF_PREFIX} N\", run "
+        f"`python3 \"{script}\" handoff --moment {session}#N` with that N and follow its "
+        f"output. That line has already told the person, so say nothing more about it, and "
+        f"nothing about a fork that files no rule; if a fork files a rule, tell the person "
+        f"that one line."
+    )
+
+
+_MOMENT_REF = re.compile(r"^[A-Za-z0-9_.:-]{1,128}#\d{1,6}$")
+_KIND = re.compile(r"^[a-z_]{1,40}$")
 
 
 # --------------------------------------------------------------- plumbing
@@ -136,80 +103,6 @@ def _log(msg: str) -> None:
         pass
 
 
-def meta_path(session: str) -> Path:
-    return hx.session_file(session, ".meta.json")
-
-
-def moments_path(session: str) -> Path:
-    return hx.session_file(session, ".moments.jsonl")
-
-
-def load_meta(session: str) -> dict:
-    try:
-        got = json.loads(meta_path(session).read_text(encoding="utf-8"))
-        return got if isinstance(got, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _publish(path: Path, text: str) -> None:
-    """Atomic and 0600, through `atomic_write.publish` beside this file."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        import atomic_write  # noqa: PLC0415
-        atomic_write.publish(path, text)
-    except Exception:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-
-
-def _meta_lock(session: str):
-    """The rulebook hook's session-state lock, taken on this session's meta
-    file. None past its short wait or with no hook: it fails open."""
-    rh = hx._hook()
-    if rh is None or not hasattr(rh, "_state_lock"):
-        return None
-    try:
-        path = meta_path(session)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return rh._state_lock(str(path))
-    except Exception:
-        return None
-
-
-def _release(lock) -> None:
-    if lock is None:
-        return
-    try:
-        hx._hook().portable_lock.unlock(lock.fileno())
-    except Exception:
-        pass
-    lock.close()
-
-
-def save_meta(session: str, *, advance_turn: int | None = None, **fields) -> dict:
-    """Merge `fields` into the session's meta, the read and the write under one
-    lock. With `advance_turn` the write is a turn's: it moves `last_turn`
-    forward, and a child for an OLDER turn than the one recorded (two children
-    overlap on a slow classifier) changes nothing."""
-    lock = _meta_lock(session)
-    try:
-        meta = load_meta(session)
-        if advance_turn is not None:
-            if advance_turn < int(meta.get("last_turn") or 0):
-                return meta
-            fields["last_turn"] = advance_turn
-        meta.update(fields)
-        meta["session_id"] = session
-        _publish(meta_path(session), json.dumps(meta, indent=1, default=str))
-        return meta
-    finally:
-        _release(lock)
-
-
 def env_name() -> str:
     """Which MemHub the stamp's `env` names, derived from the plugin's own
     backend URL rather than configured a second time."""
@@ -219,6 +112,24 @@ def env_name() -> str:
     except Exception:
         return "unknown"
     return "staging" if "staging" in host else "production"
+
+
+def rule_url(rule_id: str, env: str) -> str:
+    """The Studio page that opens this rule (`/studio/rulebook?open=<id>`), or ""
+    when the plugin's backend is not the one the rule was filed against — a
+    link into the other environment would open a rule that is not there."""
+    try:
+        from urllib.parse import urlsplit  # noqa: PLC0415
+        from _memhub_auth import default_url  # noqa: PLC0415
+        # The API -> web app pairing login already keys its guide link on.
+        from plugin_onboarding import _ORIGINS  # noqa: PLC0415
+        parsed = urlsplit(default_url())
+    except Exception:
+        return ""
+    origin = _ORIGINS.get(f"{parsed.scheme}://{parsed.netloc}")
+    if not origin or not rule_id or env_name() != env:
+        return ""
+    return f"{origin}/studio/rulebook?open={rule_id}"
 
 
 def repo_of(cwd: str) -> str:
@@ -241,327 +152,19 @@ def _read_payload() -> dict:
 
 def _is_subagent(payload: dict) -> bool:
     """A subagent's hook call carries a top-level `agent_id`. Its turns are not
-    the person's, and its prompts must not take the main agent's moment."""
+    the person's — the harness fork's own Stop is one of these."""
     return bool(str(payload.get("agent_id") or "").strip())
 
 
-# ------------------------------------------------------------ the children
-def children_path() -> Path:
-    """`children.jsonl`: every session id this lane ever launched as an author.
-
-    The recursion this exists for (v0.74.0–v0.76.0): `run_author` handed the
-    child `MEMHUB_HARNESS_EXTRACT=0`, and Claude Code applied the install's
-    settings.json `env` — where opting IN is `MEMHUB_HARNESS_EXTRACT=1` — over
-    it. So the child was sensed like a person's session; its own turn, which is
-    the create-rule flow, is exactly what the classifier flags; and its Stop
-    drained that moment by forking the child. Each generation spawned the next
-    until the machine ran out of something.
-
-    `extract_enabled` now refuses on `MEMHUB_HARNESS_CHILD` (7113985) — but
-    that is one more environment variable, and an environment variable is what
-    failed. This file is not the environment: the id is chosen by the spawner
-    (`--session-id`), written here BEFORE the child exists, and every lane
-    refuses a session on this list — its Stop is not sensed, it cannot spawn
-    an author, and a moment it stamped is never drained. Append-only, private,
-    one line per child, never pruned."""
-    return hx.harness_dir() / "children.jsonl"
-
-
-def register_child(child: str, owner: str, ref: str) -> None:
-    hx.append_jsonl(children_path(), {"child": child, "owner": owner, "ref": ref,
-                                      "at": time.time()})
-
-
-def is_registered_child(session: str) -> bool:
-    if not session:
-        return False
-    try:
-        return any(str(r.get("child")) == session for r in hx.read_jsonl(children_path()))
-    except OSError:
-        return False
-
-
-def registered_children() -> set[str]:
-    try:
-        return {str(r.get("child")) for r in hx.read_jsonl(children_path()) if r.get("child")}
-    except OSError:
-        return set()
-
-
-def author_depth(environ=None) -> int:
-    raw = (environ if environ is not None else os.environ).get(DEPTH_FLAG, "")
-    try:
-        return int(str(raw).strip() or 0)
-    except ValueError:
-        return 1          # unreadable means "not a person's session"; refuse
-
-
-def _portable_lock():
-    try:
-        import portable_lock  # noqa: PLC0415
-        return portable_lock
-    except Exception:
-        return None
-
-
-#: How long a Windows author pass waits for the leases the hook released to
-#: it (see take_lease). Bounded here rather than by the lock call, because
-#: POSIX flock's blocking mode has no budget at all.
-LEASE_WAIT_S = 60.0
-
-
-def take_lease(path: Path, wait_s: float = 0.0):
-    """An exclusive advisory lock on `path`, or None if someone holds it.
-
-    Returns the open file: the lock lives exactly as long as some process
-    keeps that file description open. On POSIX the Stop hook takes it, hands
-    the fd to the author child it spawns, and exits; the child closes it in
-    its `finally` — or dies, and the kernel closes it. Nobody decides whether
-    a holder is dead, and nobody unlinks anything.
-
-    On Windows a byte-range lock belongs to the PROCESS that took it and an
-    inherited handle carries nothing (Codex, #275), so there the hook takes
-    the leases only to decide, releases them after the spawn, and the child
-    takes them again by path — retrying for up to `wait_s` — before it
-    authors anything. If a sibling Stop won that window
-    the child gives the pass up rather than author unlocked."""
-    pl = _portable_lock()
-    if pl is None:
-        return None
-    try:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fh = open(path, "a+", encoding="utf-8")   # noqa: SIM115 — the lock IS the handle
-    except OSError:
-        return None
-    deadline = time.monotonic() + wait_s
-    while True:
-        try:
-            pl.lock_exclusive(fh.fileno(), blocking=False)
-            break
-        except OSError:
-            if time.monotonic() >= deadline:
-                fh.close()
-                return None
-            time.sleep(0.25)
-    try:
-        os.set_inheritable(fh.fileno(), True)      # the child inherits the lock
-        fh.seek(0); fh.truncate()
-        fh.write(f"{os.getpid()} {time.time():.0f}\n"); fh.flush()
-    except OSError:
-        pass
-    return fh
-
-
-def take_drain_slot():
-    """One of MAX_LIVE_DRAINS machine-wide slots, or None. The slot IS the
-    count: no process can hold one that another holds."""
-    for i in range(MAX_LIVE_DRAINS):
-        got = take_lease(hx.harness_dir() / f"drain.slot-{i}")
-        if got is not None:
-            return got
-    return None
-
-
-def live_drains() -> int:
-    """Slots held right now; for the log line, never for a decision."""
-    n = 0
-    for i in range(MAX_LIVE_DRAINS):
-        probe = take_lease(hx.harness_dir() / f"drain.slot-{i}")
-        if probe is None:
-            n += 1
-        else:
-            probe.close()
-    return n
-
-
-#: Leases this process holds. The Stop hook keeps them here until it exits,
-#: so nothing garbage-collects (and so releases) a lease before the child it
-#: was handed to has started.
-_HELD: list = []
-
-
-# --------------------------------------------------------------- stop lane
-def cmd_stop(payload: dict) -> int:
-    """Millisecond budget: two small file reads, one spawn, no transcript and
-    no network. The hook is SYNCHRONOUS, so what it records is the turn's
-    boundary: Claude Code appends no queued prompt and runs no next-turn tool
-    hook until it returns. (The shell gate in claude-hooks.json keeps it free
-    with the flag off.)
-
-    The child is bounded by the transcript's size taken here, so whatever the
-    blocked continuation appends is not this turn's. The handoff is chosen
-    BEFORE the child exists, so it can only ever hand an earlier turn."""
-    session = str(payload.get("session_id") or "").strip()
-    transcript = str(payload.get("transcript_path") or "").strip()
-    cwd = str(payload.get("cwd") or "").strip()
-    if not session or not transcript or not os.path.isfile(transcript):
-        return 0
-    if _is_subagent(payload):
-        return 0
-    if is_registered_child(session) or author_depth() > 0:
-        # An author child's Stop. Not sensed and not drained, whatever the
-        # environment says — see `children_path`.
-        _log(f"stop {session[:8]}: an author child; nothing sensed")
-        return 0
-    if payload.get("stop_hook_active"):
-        # The blocked continuation's own Stop: no extraction and no second
-        # block, but its error arcs (the create-rule flow runs commands) are
-        # drained here, or the next ordinary turn would inherit them and be
-        # classified on failures it never had (Codex, #230).
-        rh = hx._hook()
-        if rh is not None and hasattr(rh, "take_error_arcs"):
-            try:
-                rh.take_error_arcs(session)
-            except Exception:
-                pass
-        return 0
-    args = ["extract", "--session", session, "--transcript", transcript, "--cwd", cwd]
-    # The transcript's size NOW is the turn boundary, taken inside the
-    # synchronous hook. A queued prompt can be appended before the detached
-    # child opens the file, and the child must still classify the turn that
-    # stopped, not the one that just began.
-    try:
-        args += ["--upto", str(os.path.getsize(transcript))]
-    except OSError:
-        pass
-    # The turn's error arcs are taken HERE, at the boundary, not by the child:
-    # by the time a detached child gets to them the next turn may have added
-    # its own.
-    rh = hx._hook()
-    if rh is not None and hasattr(rh, "take_error_arcs"):
-        try:
-            arcs = rh.take_error_arcs(session)
-        except Exception:
-            arcs = []
-        if arcs:
-            arcs_path = hx.session_file(session, f".arcs-{time.time_ns()}.json")
-            try:
-                _publish(arcs_path, json.dumps(arcs))
-                args += ["--arcs", str(arcs_path)]
-            except Exception:
-                pass
-    # Choose the handoff before spawning: a child that wins the race could
-    # otherwise append THIS turn's moment first, and the block would hand the
-    # turn that is stopping (Codex, #230). Selection only reads the moments file
-    # and appends a `handed` row; the boundary above is already taken.
-    # What a finished drain left for the person — the only thing this lane
-    # ever says to them, and it happens at a Stop because a detached child has
-    # no channel of its own.
-    said = report_outcomes(session)
-    if said:
-        print(json.dumps({"systemMessage": said}))
-    rc = hand_off(session)
-    hx.spawn_detached(args, script=Path(__file__).resolve(), log_name="stop.log")
-    return rc
-
-
-def _claim_turn(session: str, marker: str) -> bool:
-    """Exactly one child takes a turn. Two Stops for one turn, or two children
-    racing on a slow classifier, would otherwise both spend a call on it."""
-    digest = hashlib.sha1(marker.encode("utf-8")).hexdigest()[:12]
-    claim = hx.session_file(session, f".turn-{digest}.claim")
-    try:
-        claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return False
-    except OSError:
-        return True             # fail open: an unwritable claim does not stop the sensor
-    os.close(fd)
-    prefix = hx.session_file(session, ".turn-").name
-    for old in claim.parent.glob(f"{prefix}*.claim"):
-        if old != claim:
-            try:
-                old.unlink()
-            except OSError:
-                pass
-    return True
-
-
-def read_turns(transcript: str, cursor, upto: int = -1) -> list[dict]:
-    """The transcript's turns up to byte `upto`. A long session must not be
-    rescanned from byte zero at every Stop, so each child leaves a cursor at the
-    start of the turn before the one it extracted, and the next reads from
-    there: the two turns a window needs, and the new one. A cursor that no
-    longer lands on the human message it recorded (a rewritten or replaced
-    transcript), or that leaves fewer than two turns, falls back to a full
-    read."""
-    def bounded(turns: list[dict]) -> list[dict]:
-        return [t for t in turns if upto < 0 or int(t.get("offset") or 0) < upto]
-
-    try:
-        start = int(cursor.get("offset") or 0)
-        before = int(cursor.get("before") or 0)
-        uuid = str(cursor.get("uuid") or "")
-    except (AttributeError, TypeError, ValueError):
-        start, before, uuid = 0, 0, ""
-    if start > 0 and uuid and (upto < 0 or start < upto):
-        part = bounded(hx.turns_from_transcript(transcript, start=start, before=before))
-        if len(part) >= 2 and part[0].get("offset") == start and part[0].get("uuid") == uuid:
-            return part
-    return bounded(hx.turns_from_transcript(transcript))
-
-
-def cmd_extract(session: str, transcript: str, cwd: str, arcs_file: str = "",
-                upto: int = -1) -> int:
-    """The child: the turn in progress at byte `upto` (the transcript's size
-    when Stop fired), once. Its records flushed after Stop still belong to it;
-    a turn whose human message starts at or past `upto` does not. With no
-    boundary, the last turn."""
-    arcs: list = []
-    if arcs_file:
-        try:
-            got = json.loads(Path(arcs_file).read_text(encoding="utf-8"))
-            arcs = got if isinstance(got, list) else []
-        except (OSError, ValueError):
-            arcs = []
-        try:
-            Path(arcs_file).unlink()
-        except OSError:
-            pass
-    try:
-        turns = read_turns(transcript, load_meta(session).get("scan"), upto)
-    except (OSError, ValueError) as exc:
-        _log(f"extract {session[:8]}: cannot read transcript: {type(exc).__name__}")
-        return 0
-    if not turns:
-        return 0
-    last, prev = turns[-1], (turns[-2] if len(turns) > 1 else None)
-    if not _claim_turn(session, f"{last.get('n')}:{last.get('uuid', '')}"):
-        return 0
-    cwd = cwd or last.get("cwd") or ""
-    repo = repo_of(cwd)
-    stats = hx.new_stats()
-    trace = hx.Trace(str(hx.log_path("extract.log")))
-    try:
-        hx.extract_turn(last, prev, session=session, cwd=cwd, repo=repo,
-                        env_name=env_name(), stats=stats, trace=trace,
-                        out_path=moments_path(session), arcs=arcs)
-    finally:
-        trace.close()
-    scan = ({"offset": prev.get("offset"), "before": int(prev.get("n") or 1) - 1,
-             "uuid": prev.get("uuid")} if prev and prev.get("uuid") else None)
-    save_meta(session, advance_turn=int(last.get("n") or 0), repo=repo, cwd=cwd,
-              last_stop_at=time.time(), scan=scan)
-    _log(f"extract {session[:8]} t{last.get('n')}: sent={stats['turns_sent']} "
-         f"moment={stats['moments']} reason={stats['reason'] or '-'} arcs={len(arcs)}")
-    return 0
-
-
-# ------------------------------------------------------------- prompt lane
-def turn_repos(moment: dict, fallback_repo: str = "") -> list[str]:
+def turn_repos(state: dict, fallback_repo: str = "") -> list[str]:
     """The repositories the turn's actions worked in, else the stamp's repo,
     else the session's.
 
-    Evidence for the author, NOT the rule's scope. This used to be handed over
-    as `scope_repos` verbatim, and the author could only cut it — so a lesson
-    was scoped to wherever the session happened to be rather than to what it is
-    about. Of 17 rules filed by 2026-09-23, five were mis-scoped that way: shell
-    lessons (`$?` after a pipe) bound to MemHub-Backend only, and rules
-    anchored on `harness_stop.py` constants scoped to a repo where those names
-    do not exist, so they could never fire. Only the author has read the
-    lesson, so the author chooses (create-rule SKILL.md, Harness-draft)."""
-    state = moment.get("state") or {}
+    Evidence for the author, NOT the rule's scope. Handed over as `scope_repos`
+    verbatim, it scoped lessons to wherever the session happened to be rather
+    than to what they are about: of 17 rules filed by 2026-09-23, five were
+    mis-scoped that way. Only the author has read the lesson, so the author
+    chooses (create-rule SKILL.md, Harness-draft)."""
     touched = [r for r in (state.get("touched_repos") or []) if isinstance(r, str) and r]
     if touched:
         return touched
@@ -569,658 +172,280 @@ def turn_repos(moment: dict, fallback_repo: str = "") -> list[str]:
     return [repo] if repo else []
 
 
-BLOCK_PREFIX = "MemHub harness: before you stop"
+def _stamp(session: str, turn: dict, cwd: str) -> dict:
+    return hx.stamp_state(session=session, turn=turn, cwd=turn.get("cwd") or cwd,
+                          hook_version=hx.plugin_version(), env_name=env_name(),
+                          default_repo=repo_of(cwd))
 
 
-def block_reason(session: str, moment: dict, repo: str = "") -> str:
-    """What the blocked agent reads. One job: point at the skill, with the
-    provenance only this line has. `repo` is the session's, used only when the
-    moment's own stamp names none.
+# ------------------------------------------------------------------- judge
+def judge_previous_turn(session: str, transcript: str, cwd: str) -> dict | None:
+    """Turn N at the Stop of turn N+1: the moment on a signal, else None.
 
-    The TEST it states is "not already a RULE", not "not already written
-    down". Those were collapsed, and the collapse cost real lessons: a live
-    e2e hit a trap documented at CONTRIBUTING.md:123 and declined to file it —
-    yet the documentation is what had just failed to prevent the trap. Prose
-    nobody reads has no enforcement and no fire count; that is what a rule
-    adds, and `source='claude_md_import'` on 18 of the book's rules is the
-    same conversion done by hand. What still disqualifies a moment is being a
-    twin of an existing rule, or being narration of docs that nothing tripped
-    over — the `TEAM_DIRECTIVE_CAPTURE` failure of 2026-09-14.
+    Judges only when this Stop ends a PERSON'S turn, i.e. the transcript's last
+    prompt is the last person turn. After a fork launch's continuation, a
+    background task's notice or a loop wakeup, the last prompt is the
+    harness's, and judging would take turn N a second time. An interrupted
+    turn resent verbatim is judged once, as the resend: this Stop skips turn N
+    when turn N+1 repeats it, and the next Stop takes N+1."""
+    turns, last_prompt = hx.read_transcript(transcript)
+    if len(turns) < 2 or turns[-1].get("uuid") != last_prompt:
+        return None
+    turn, after = turns[-2], turns[-1]
+    n = turn.get("n")
+    if (after.get("user") or "").strip() == (turn.get("user") or "").strip():
+        _log(f"judge {session[:8]} t{n}: skipped, resent as t{after.get('n')}")
+        return None
+    prev = turns[-3] if len(turns) >= 3 else None
+    state = _stamp(session, turn, cwd)
+    window = hx.redact_window(hx.build_window(turn, prev, state, earlier=turns[-5:-3],
+                                              following=after.get("user") or ""))
+    reply, secs = hx.server_classify(window, repo=state.get("repo", ""))
+    _log(f"judge {session[:8]} t{n}: signal={bool(reply.get('signal'))} "
+         f"reason={reply.get('reason')} kind={reply.get('kind')} {secs}s "
+         f"window={len(window)}c results={window.count(chr(10) + '    -> ')} "
+         f"next={'yes' if (after.get('user') or '').strip() else 'no'}")
+    if not reply.get("signal"):
+        return None
+    return {"source_ref": f"{session}#{n}", "turn": n, "kind": reply.get("kind"),
+            "derivable": bool(reply.get("derivable")), "state": state,
+            "transcript": transcript, "cwd": cwd}
 
-    HOW to file a rule — the rulebook question, the twin check, the engine
-    shapes, advise vs gate, the proof — lives in `skills/create-rule/SKILL.md`
-    and is not restated here. The line that restated it drew five of six Codex
-    findings on #222: whatever it did not copy the harness path silently
-    dropped, and whatever it did copy drifted from the skill.
 
-    The STAMP is NOT carried any more. `reason` is documented as feedback for
-    the model, but the host also renders it to the person behind a "Stop hook
-    feedback:" prefix, and ~400 characters of `state={...}` JSON is the bulk of
-    what they were reading. The stamp lives in the session's moments file,
-    which the skill reads; this line names the file instead of quoting it.
-    The server still refuses a `session_draft` without `repo`, `session_id`,
-    `turn`, `hook_version` and `at` — the skill supplies them from there."""
-    turn = moment.get("turn")
+# ------------------------------------------------------------------ launch
+def fork_launch_prompt(moment: dict, env: str, repo: str = "") -> str:
+    """The Agent tool input the blocked agent hands its fork.
+
+    The auto-mode permission classifier judges the person's messages, CLAUDE.md
+    and the TOOL INPUTS the agent sends — never a hook's output. A bare "read
+    <file> and follow it" was, to it, an order to obey an unseen file
+    ('Auto-Mode Bypass'; probed 2026-09-28). So this input says who launched
+    the fork, on whose install, for which turn, what it may do and what it must
+    not, in full. How to file lives in the create-rule skill and is not
+    restated: the line that restated it drew five of six Codex findings on
+    #222. The stamp is not inlined either — the fork prints it with the
+    read-only `stamp` command, so no JSON reaches the person's screen."""
+    turn = moment["turn"]
+    ref = moment["source_ref"]
     kind = moment.get("kind") or "a signal"
-    worked_in = turn_repos(moment, repo)
-    hint = f" (router: {moment['hint']})" if moment.get("hint") else ""
-    derivable = (" The classifier thinks it may already be written down, so check "
+    derivable = (" The classifier thinks it may already be written down, so check that "
                  "first.") if moment.get("derivable") else ""
-    ref = moment.get("source_ref") or session
+    script = str(Path(__file__).resolve())
+    stamp_cmd = (f'python3 "{script}" stamp --transcript "{moment["transcript"]}" '
+                 f'--turn {turn} --cwd "{moment["cwd"]}"')
+    worked_in = json.dumps(turn_repos(moment.get("state") or {}, repo))
     return (
-        f"{BLOCK_PREFIX}: turn {turn} was flagged as {kind}{hint}.{derivable} Run the "
-        f"memhub create-rule skill on source_ref=\"{ref}\". The turn worked in "
-        f"{json.dumps(worked_in)}; choose scope_repos from the lesson, not from that. "
-        f"Its Harness-draft section says how. "
-        f"If it is not a lesson, or you cannot file it, say nothing to the person "
-        f"about this turn."
+        f"{FORK_MARK}, moment {ref}: you were launched by the MemHub plugin's Stop hook, "
+        f"installed by the person running this session, to write at most one team rule "
+        f"from turn {turn} of this session, which its classifier flagged as {kind}."
+        f"{derivable} The person's next message, turn {turn + 1}, is what happened after "
+        f"it: if that message reversed or abandoned the correction, file nothing. "
+        f"Otherwise run the memhub create-rule skill's Harness-draft path on "
+        f"source_ref=\"{ref}\", with the state stamp this read-only command prints: "
+        f"{stamp_cmd}. The turn worked in {worked_in}; choose scope_repos from the lesson, "
+        f"not from that. Step 4b (the live forward test) cannot run inside a fork, so "
+        f"treat its precondition as missing exactly as Step 4b.6 says. File the rule as "
+        f"`proposed` to the {env} rulebook; activate nothing, ask nothing, touch no "
+        f"settings or credentials. End with exactly one line: \"{FORK_MARK}: filed "
+        f"<title>\", \"{FORK_MARK}: none, <one short reason>\" or \"{FORK_MARK}: failed, "
+        f"<why it could not file>\"."
     )
 
 
-def _moment_key(moment: dict) -> str:
-    return str(moment.get("source_ref") or f"turn-{moment.get('turn')}")
+def handoff_line(moment: dict) -> str | None:
+    """The Stop hook's `additionalContext`: ONE line, written for the person and
+    nothing else, because Claude Code prints a Stop hook's context to them in
+    full ("Stop hook feedback", seen on 2.1.286 — the hooks reference says
+    otherwise, and a headless probe cannot show it).
 
+    What the agent does with it is `session_rule`, delivered at SessionStart
+    where the person does not see it: the command, and the instruction to keep
+    quiet. Measured 2026-09-30, 8 hand-offs each, forks launched 8 of 8 every
+    time — the agent told the person about the launch 8 times with the rule
+    only in `handoff`'s output, 8 times with the single word "Silently" here,
+    and 0 times with the rule given at SessionStart.
 
-def _repo_of(moment: dict) -> str:
-    return str((moment.get("state") or {}).get("repo") or "")
-
-
-def _stamped_at(moment: dict) -> float:
-    """Wall-clock seconds from the moment's state stamp, 0.0 when unreadable.
-
-    Turn numbers are per-session, so they can neither order nor age a moment
-    that came out of another session's file; the stamp is the only comparable
-    clock, and every moment already carries one."""
-    raw = str((moment.get("state") or {}).get("at") or "")
-    if not raw:
-        return 0.0
-    try:
-        return _dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
-
-
-def pending(session: str, repo: str, now: float) -> list[tuple[Path, dict]]:
-    """Every un-drained moment for THIS repo, across every session's file.
-
-    Reading one file — its own — is what made the bounds above into deletions,
-    and it is also the only reason a session's LAST moment was unreachable:
-    that moment's classifier child is still running when its Stop fires, so no
-    Stop of that session can ever take it. Whatever else changes, selection has
-    to be able to see another session's file."""
-    out: list[tuple[Path, dict]] = []
-    kids = registered_children()
-    try:
-        files = sorted(moments_path(session).parent.glob("*.moments.jsonl"))
-    except OSError:
-        return out
-    for path in files:
-        try:
-            rows = hx.read_jsonl(path)
-        except OSError:
-            continue
-        done = {str(r["handed"]) for r in rows if r.get("handed")}
-        expired = 0
-        for m in rows:
-            if m.get("handed") or not isinstance(m.get("turn"), int):
-                continue
-            if _moment_key(m) in done or _repo_of(m) != repo:
-                continue
-            if str((m.get("state") or {}).get("session_id") or "") in kids:
-                # Stamped inside an author child: the loop's own output, left
-                # behind by an install that had no registry yet.
-                continue
-            stamped = _stamped_at(m)
-            if stamped and now - stamped > MOMENT_TTL_S:
-                expired += 1
-                continue
-            out.append((path, m))
-        if expired:
-            _log(f"drain {session[:8]}: {expired} moment(s) past the TTL in "
-                 f"{path.name[:8]}")
-    # Newest stamp first, then the later turn: two moments from one session
-    # share a stamp often enough that sorting on the stamp alone would leave
-    # the order to however the file happened to list them.
-    out.sort(key=lambda pm: (_stamped_at(pm[1]), int(pm[1].get("turn") or 0)),
-             reverse=True)
-    return out
-
-
-def take_drain_claim(session: str):
-    """`<session>.drain.claim` as a lease — one drain per session at a time."""
-    return take_lease(hx.session_file(session, ".drain.claim"))
-
-
-def hand_off(session: str) -> int:
-    """At Stop: spawn a detached child to author what is waiting, and RETURN.
-
-    This used to block the stop and make the live agent do the authoring. The
-    block was chosen over a line injected at the next prompt for a measured
-    reason — that lane reached the agent 19 times in five sessions and produced
-    0 `create_rule` calls, because a line stapled to the person's live request
-    loses to the request. Detaching keeps what the block bought (nothing
-    competes for the agent's attention, because it is a different agent) and
-    drops what it cost (the person's turn, and their context window).
-
-    Only appends here: the extract child writes to these files at any time and
-    a read-then-replace would delete a moment landing in between."""
-    meta = load_meta(session)
-    repo = str(meta.get("repo") or "")
-    if not repo:
-        # Meta is written by the extract CHILD, so a session's first Stop does
-        # not know its repo yet and its second does. Deriving it here means
-        # running `git` inside a synchronous hook whose budget is two file
-        # reads and a spawn.
-        return 0
-    now = time.time()
-    waiting = pending(session, repo, now)
-    if not waiting:
-        return 0
-    claim = take_drain_claim(session)
-    if claim is None:
-        # A drain is already running for this session. It reads the files when
-        # it gets there, so anything parked meanwhile is its problem, not this
-        # Stop's — nothing is dropped by declining here.
-        return 0
-    slot = take_drain_slot()
-    if slot is None:
-        # Said out loud, because a breaker that trips silently is a lane that
-        # went quiet for no reason anyone can see. The moments stay for a
-        # later Stop.
-        claim.close()
-        _log(f"drain {session[:8]}: {live_drains()} pass(es) already running "
-             f"on this machine (cap {MAX_LIVE_DRAINS}); {len(waiting)} left waiting")
-        return 0
-    batch = waiting[:FILING_BUDGET_PER_PASS]
-    refs = [_moment_key(m) for _, m in batch]
-    if os.name == "nt":
-        # The child re-locks by path; see take_lease. Released right after
-        # the spawn, not before: a Stop that decided must not hold what the
-        # child is about to take, and a Stop that has not decided must not
-        # see the slot free.
-        hx.spawn_detached(["author", "--session", session, "--refs", ",".join(refs),
-                           "--lease-paths", os.pathsep.join((claim.name, slot.name))],
-                          script=Path(__file__).resolve(), log_name="author.log")
-        claim.close()
-        slot.close()
-    else:
-        _HELD.extend((claim, slot))
-        fds = (claim.fileno(), slot.fileno())
-        hx.spawn_detached(["author", "--session", session, "--refs", ",".join(refs),
-                           "--lease-fds", ",".join(map(str, fds))],
-                          script=Path(__file__).resolve(), log_name="author.log",
-                          pass_fds=fds)
-    _log(f"drain {session[:8]}: spawned for {len(batch)} of {len(waiting)} waiting")
-    return 0
-
-
-# ------------------------------------------------------------- author lane
-MCP_SERVER_NAME = "memhub"
-#: What the child may call. Anything not named here is refused outright in a
-#: headless run, with nobody to grant it — which reads exactly like "no access"
-#: and cost a whole debugging round to tell apart.
-CHILD_TOOLS = ("Bash", "Read", "Glob", "Grep", "Skill", "Agent",
-               f"mcp__{MCP_SERVER_NAME}__create_rule",
-               f"mcp__{MCP_SERVER_NAME}__list_rules",
-               f"mcp__{MCP_SERVER_NAME}__list_rulebooks",
-               # `list_orgs` is not optional. Without it the first live run
-               # could not tell "this org has no rulebook" from "I was refused",
-               # and reported the refusal as the reason — a diagnosis the person
-               # then cannot act on.
-               f"mcp__{MCP_SERVER_NAME}__list_orgs",
-               # Step 0 rule 3 falls back to the repo's own book and creates it
-               # when absent. Without these the child is refused at exactly the
-               # step the skill sends it to — the same way a missing `list_orgs`
-               # turned "this org has no rulebook" into "I was refused".
-               # `list_teammates` is how it finds its own id, which an ORG ADMIN
-               # must pass to `create_rulebook` or the new book binds nobody.
-               f"mcp__{MCP_SERVER_NAME}__create_rulebook",
-               f"mcp__{MCP_SERVER_NAME}__list_teammates")
-RESULT_PREFIX = "HARNESS-RESULT:"
-AUTHOR_TIMEOUT_S = 900
-
-
-def claude_bin() -> str:
-    return shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-
-
-def write_child_mcp_config(directory: Path) -> tuple[Path, str]:
-    """The plugin's OWN server and credential, written where the child reads it.
-
-    A headless child does NOT inherit the plugin's MCP server; it inherits the
-    person's claude.ai connectors. Measured 2026-09-18: those pointed at
-    PRODUCTION while the plugin's own credential is staging's, so a drain that
-    simply used what it found would file team rules into an environment nobody
-    named. `--strict-mcp-config` alongside this is what stops that happening by
-    accident rather than by policy."""
-    from _memhub_auth import resolve_url_and_auth  # noqa: PLC0415
-    url, headers, _ = resolve_url_and_auth(interactive=False)
-    cfg = {"mcpServers": {MCP_SERVER_NAME: {
-        "type": "http", "url": url,
-        "headers": {"Authorization": headers["Authorization"]}}}}
-    path = directory / "mcp.json"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh)
-    return path, url
-
-
-#: The sentence every author prompt has carried since the detached lane
-#: shipped (v0.66.0). It is how a child from BEFORE the children list is told
-#: apart: its transcript holds a human-role message saying this, and no
-#: person's does.
-CHILD_MARK = "You are a detached pass"
-
-
-def transcript_of(session: str) -> Path | None:
-    """The session's .jsonl under ~/.claude/projects, or None."""
-    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-    try:
-        hits = sorted(root.glob(f"*/{session}.jsonl"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
+    None when the ref is not one `handoff` would accept."""
+    if not _MOMENT_REF.match(str(moment.get("source_ref") or "")):
         return None
-    return hits[0] if hits else None
+    return f"{HANDOFF_PREFIX} {moment['turn']}, drafting it in the background."
 
 
-def is_legacy_child(session: str) -> bool:
-    """Was this session an author child of a release that kept no list?
+def fork_reason(moment: dict, env: str, repo: str = "") -> str:
+    """What the continued agent reads from the `handoff` command. It carries
+    the launch prompt verbatim (the classifier reads THAT, in the Agent tool
+    input).
 
-    v0.74.0–v0.76.0 wrote no `children.jsonl`, so the moments those children
-    stamped are on disk with nothing marking them (Codex, #275). Their
-    transcripts ARE marked: a fork's hand-off is a human-role record that
-    says CHILD_MARK. This reads the whole transcript, so it runs in the
-    detached author pass — never in the Stop hook — and its answer is
-    written to the list so it is asked once per session."""
-    path = transcript_of(session)
-    if path is None:
-        return False
-    try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if CHILD_MARK not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if rec.get("type") != "user":
-                    continue
-                text = hx._text_of((rec.get("message") or {}).get("content"))
-                if CHILD_MARK in text and text.lstrip().startswith(BLOCK_PREFIX):
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def quarantine_legacy(path: Path, ref: str, moment: dict, by: str) -> bool:
-    """A moment stamped inside an author child: marked handed with outcome
-    `quarantined`, never authored. True when quarantined.
-
-    Two ways in. A pre-list child is found by its transcript and listed now.
-    A child ALREADY on the list is quarantined too, because the pass reads its
-    batch once, before this loop: the first of a legacy child's moments lists
-    the child, and its second must not then read "listed, so not legacy" and
-    be authored — nor may a moment another drain listed after this pass's
-    snapshot (Codex, public #275, on 4484558)."""
-    owner = str((moment.get("state") or {}).get("session_id") or "")
-    if not owner:
-        return False
-    if is_registered_child(owner):
-        detail = "stamped inside an author child"
-    elif is_legacy_child(owner):
-        register_child(owner, "", f"legacy:{ref}")
-        detail = "stamped inside an author child of a release that kept no children list"
-    else:
-        return False
-    hx.append_jsonl(path, {"outcome": "quarantined", "ref": ref, "handed": ref,
-                           "detail": detail, "by": by, "at": time.time()})
-    _log(f"author {by[:8]}: {ref} -> quarantined (child {owner[:8]})")
-    return True
-
-
-def author_prompt(session: str, moment: dict, repo: str) -> str:
-    """What the child is asked.
-
-    The body is `block_reason` — the same handoff the blocking Stop spent five
-    review rounds getting right, carrying `source_ref`, the repos the turn
-    worked in, the pointer to the skill's Harness-draft section and the
-    derivable hint. This
-    lane adds only what is true of a DETACHED reader: nobody can answer a
-    question, and the result has to come back on a line a program can read."""
+    The fork's completion notice reaches this agent as a new turn the host
+    starts on its own; the plugin cannot suppress it. So this also says what
+    to do then: relay a `filed` result in one line, and let `none` or `failed`
+    pass in silence — a rule that did not get written is not news the person
+    asked for, and the full report stays in the transcript."""
+    launch = fork_launch_prompt(moment, env, repo)
     return (
-        block_reason(session, moment, repo)
-        + f"\n\n{CHILD_MARK}: there is no one to answer a question, so "
-        "follow the Harness-draft section's arithmetic and ask nothing. If it is "
-        "not a lesson, file nothing.\n\n"
-        + result_contract())
+        f"{BLOCK_PREFIX}: turn {moment['turn']} was flagged. Launch ONE background fork "
+        f"of yourself with the Agent tool (subagent_type \"fork\") and give it exactly "
+        f"this prompt, verbatim: <<<{launch}>>> Say nothing to the person about it and do "
+        f"nothing else this turn. When the fork's completion notice arrives: if its last "
+        f"line says \"filed\", tell the person that one line; if it says \"none\" or "
+        f"\"failed\", say nothing about it and end that turn with no text."
+    )
 
 
-def result_contract() -> str:
-    """The line a program reads. Its own definition, so the prompt that asks
-    for it and `parse_result` that reads it cannot drift apart."""
-    return (
-        f"End your reply with one line and nothing after it:\n"
-        f"  {RESULT_PREFIX} filed <rule_id> | <the rule's title> | <what it catches, "
-        "in one short clause — the trigger in the words a person would use, e.g. "
-        "'a `claude -p` without --strict-mcp-config'> | <the scope_repos you filed, "
-        "as JSON, e.g. [] or [\"MemHub-Backend\"]>\n"
-        f"  {RESULT_PREFIX} none <one short reason>\n"
-        f"  {RESULT_PREFIX} failed <one short reason>   (use this only if you COULD "
-        "NOT file — no rulebook server, a refused tool, an expired credential — "
-        "and never for 'there was no lesson')")
-
-
-def parse_result(stdout: str) -> tuple[str, dict]:
-    """(outcome, fields) from the child's last contract line, or ('failed', …).
-
-    A filed rule carries `rule_id`, `title` and `catches`, pipe-separated —
-    because a bare id tells the person nothing about what they are being asked
-    to review, and the hook that shows it has no budget to look one up.
-
-    An unparseable answer is a FAILURE, never a quiet 'none'. Reading it as
-    'nothing here' is the defect this whole lane exists to stop: a broken
-    pipeline that looks exactly like a quiet one."""
-    for line in reversed((stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith(RESULT_PREFIX):
-            rest = line[len(RESULT_PREFIX):].strip().split(None, 1)
-            head = (rest[0] if rest else "").lower()
-            detail = rest[1].strip() if len(rest) > 1 else ""
-            if head == "filed":
-                parts = [x.strip() for x in detail.split("|")]
-                # The scope is the LAST field and a JSON list; `catches` is
-                # prose about shell commands and may itself hold a pipe, so it
-                # is whatever lies between — split on `|` alone it came apart.
-                scope = ""
-                if len(parts) > 3 and parts[-1].startswith("["):
-                    scope = parts.pop()
-                # A title is what makes the line readable, but a child that
-                # gives only an id is still a FILING — degrade the rendering,
-                # never the outcome.
-                return head, {"rule_id": parts[0] if parts else "",
-                              "title": parts[1] if len(parts) > 1 else "",
-                              "catches": " | ".join(parts[2:]),
-                              "scope": scope}
-            if head in ("none", "failed"):
-                return head, {"detail": detail}
-            break
-    return "failed", {"detail": "the child gave no result line"}
-
-
-def read_child(stdout: str) -> tuple[str, dict]:
-    """(the child's reply, what it spent) from `--output-format json`.
-
-    What a pass cost used to be recorded nowhere, so the only way to learn it
-    was to read the forks' transcripts afterwards. Plain text — an older CLI,
-    or a test double — is the reply with nothing spent; never an error."""
-    try:
-        got = json.loads(stdout)
-    except ValueError:
-        return stdout or "", {}
-    if isinstance(got, list):
-        got = next((g for g in reversed(got)
-                    if isinstance(g, dict) and g.get("type") == "result"), {})
-    if not isinstance(got, dict) or "result" not in got:
-        return stdout or "", {}
-    use = got.get("usage") or {}
-    spent = {"in": use.get("input_tokens"),
-             "cache_write": use.get("cache_creation_input_tokens"),
-             "cache_read": use.get("cache_read_input_tokens"),
-             "out": use.get("output_tokens"),
-             "cost_usd": got.get("total_cost_usd"),
-             "calls": got.get("num_turns"),
-             "ms": got.get("duration_ms")}
-    return str(got.get("result") or ""), {k: v for k, v in spent.items() if v is not None}
-
-
-def child_env(scratch: str) -> dict:
-    return dict(os.environ,
-                # Its capture and harness lanes stay silent: a forked
-                # transcript is a copy of the person's, and must neither
-                # ship as a second conversation nor be sensed again. The
-                # two lanes read this, not EXTRACT below, because a
-                # settings.json `env` overrides what the child inherits.
-                # Its rulebook hook still runs, for the forward test.
-                MEMHUB_HARNESS_CHILD="1",
-                MEMHUB_HARNESS_EXTRACT="0",
-                **{DEPTH_FLAG: "1"},
-                # its forward test arms a candidate in ITS OWN base
-                MEMHUB_RULEBOOK_BASE=os.path.join(scratch, "rulebook"))
-
-
-def child_argv(prompt: str, mcp_cfg: Path, *, resume: str = "", session_id: str = "",
-               tools: tuple[str, ...] = CHILD_TOOLS) -> list[str]:
-    argv = [claude_bin(), "-p", prompt]
-    if resume:
-        argv += ["--resume", resume, "--fork-session"]
-    if session_id:
-        # Chosen here so it can be on the children list before the child
-        # runs. Verified on Claude Code 2.1.278 with and without --resume.
-        argv += ["--session-id", session_id]
-    return argv + ["--output-format", "json",
-                   # No transcript on disk. The child is the plugin's own work:
-                   # captured, it shipped the person's history a second time
-                   # under a new id (80 copies of one session on staging);
-                   # sensed, it forked itself. Every hook that could do either
-                   # needs a transcript_path that exists, so with none written
-                   # there is nothing to capture, sense or resume — whatever
-                   # the child's environment says. Verified on 2.1.278 with and
-                   # without --resume --fork-session.
-                   "--no-session-persistence",
-                   "--mcp-config", str(mcp_cfg), "--strict-mcp-config",
-                   "--permission-mode", "acceptEdits",
-                   "--allowedTools", ",".join(tools)]
-
-
-def run_child(argv: list[str], *, cwd: str | None = None) -> tuple[str, dict, str]:
-    """(reply, spent, why it failed). `why` is "" when the child ran."""
-    with tempfile.TemporaryDirectory(prefix="memhub-drain-") as scratch:
-        try:
-            proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=AUTHOR_TIMEOUT_S, env=child_env(scratch),
-                                  # never the leases: `claude` outlives nothing here,
-                                  # but an inherited lock fd would hold the slot
-                                  # for as long as it ran
-                                  stdin=subprocess.DEVNULL, cwd=cwd, close_fds=True)
-        except FileNotFoundError:
-            return "", {}, "no claude CLI on PATH"
-        except subprocess.TimeoutExpired:
-            return "", {}, f"the child did not finish in {AUTHOR_TIMEOUT_S}s"
-        except OSError as exc:
-            return "", {}, f"the child would not start ({exc.__class__.__name__})"
-    reply, spent = read_child(proc.stdout)
-    if proc.returncode != 0:
-        # its last stderr line is the only reason a person reading stop.log gets;
-        # `claude -p` prints some refusals (a session it cannot resume) on
-        # stdout, which is JSON now, so its `result` is read, not the raw line
-        said = ""
-        for stream in (proc.stderr, reply or proc.stdout):
-            said = next((l.strip() for l in reversed((stream or "").splitlines()) if l.strip()), "")
-            if said:
-                break
-        return reply, spent, (f"the child exited {proc.returncode}"
-                              + (f": {said[:200]}" if said else ""))
-    return reply, spent, ""
-
-
-def run_author(session: str, moment: dict, repo: str, mcp_cfg: Path) -> tuple[str, dict]:
-    """One moment, one child. The outcome row names the `child` and what the
-    pass `spent`, failed passes included — a pass that burned a full context
-    and then died is the cost most worth seeing."""
-    owner = str((moment.get("state") or {}).get("session_id") or "")
-    if not owner:
-        return "failed", {"detail": "the moment carries no session id to resume"}
-    child = str(uuid.uuid4())
-    argv = child_argv(author_prompt(session, moment, repo), mcp_cfg,
-                      resume=owner, session_id=child)
-    # On the list BEFORE it exists: its first Stop must already find it there.
-    register_child(child, owner, str(moment.get("source_ref") or ""))
-    reply, spent, why = run_child(argv)
-    extra = {"child": child, **({"spent": spent} if spent else {})}
-    if why:
-        return "failed", {"detail": why, **extra}
-    outcome, fields = parse_result(reply)
-    return outcome, {**fields, **extra}
-
-
-def cmd_author(session: str, refs: list[str], lease_fds: tuple = (),
-               lease_paths: tuple = ()) -> int:
-    """The detached pass. One `claude -p` per moment, then the outcome written
-    back beside the moment it came from.
-
-    `handed` is appended ONLY for a moment that was actually decided. A failed
-    pass leaves it untouched so a later drain retries it: a watermark that
-    advances past work nobody did is the silent, unrecoverable version of this
-    lane's bug."""
-    held: list = []
-    try:
-        for lease in lease_paths:              # Windows: the locks are taken here
-            got = take_lease(Path(lease), wait_s=LEASE_WAIT_S)
-            if got is None:
-                # A sibling won the window between the hook's release and
-                # this. Authoring without the lease would void the cap; the
-                # moments are untouched and the next Stop drains them.
-                _log(f"author {session[:8]}: could not take {Path(lease).name}; "
-                     f"left for a later drain")
-                return 0
-            held.append(got)
-        meta = load_meta(session)
-        repo = str(meta.get("repo") or "")
-        wanted = [r for r in refs if r]
-        now = time.time()
-        waiting = {_moment_key(m): (path, m) for path, m in pending(session, repo, now)}
-        try:
-            with tempfile.TemporaryDirectory(prefix="memhub-mcp-") as cfg_dir:
-                mcp_cfg, url = write_child_mcp_config(Path(cfg_dir))
-                env = env_name()
-                _log(f"author {session[:8]}: {len(wanted)} moment(s) against {url} ({env})")
-                for ref in wanted:
-                    got = waiting.get(ref)
-                    if got is None:            # drained by someone else meanwhile
-                        continue
-                    path, moment = got
-                    if quarantine_legacy(path, ref, moment, session):
-                        continue
-                    outcome, fields = run_author(session, moment, repo, mcp_cfg)
-                    row = {"outcome": outcome, "ref": ref, **fields,
-                           # WHICH MemHub. The first live run filed against
-                           # production because `resolve_url_and_auth` hands
-                           # back the plugin's default and nothing said so out
-                           # loud; a failure the person cannot place is a
-                           # failure they cannot fix.
-                           "env": env, "by": session, "at": time.time()}
-                    if outcome != "failed":
-                        row["handed"] = ref     # decided; never retried
-                    hx.append_jsonl(path, row)
-                    # A filing carries no `detail`, so logging only that printed
-                    # "filed ()" — the one outcome worth reading, with no id.
-                    said = fields.get("detail") or " ".join(
-                        str(fields.get(k) or "") for k in ("rule_id", "title", "scope")).strip()
-                    _log(f"author {session[:8]}: {ref} -> {outcome} ({str(said)[:200]})")
-        except Exception as exc:               # noqa: BLE001
-            # Never a quiet nothing: the pass could not run, and the next Stop
-            # says so on the health channel.
-            hx.append_jsonl(moments_path(session),
-                            {"outcome": "failed", "detail": f"drain could not start ({exc})",
-                             "by": session, "at": time.time()})
-            _log(f"author {session[:8]}: could not start — {exc}")
-    finally:
-        for fh in held:
-            fh.close()
-        for fd in lease_fds:                    # the locks go with the fds
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+# ---------------------------------------------------------------- commands
+def cmd_stop(payload: dict) -> int:
+    session = str(payload.get("session_id") or "")
+    transcript = str(payload.get("transcript_path") or "")
+    cwd = str(payload.get("cwd") or "")
+    if not session or not transcript or not os.path.isfile(transcript):
+        return 0
+    if _is_subagent(payload) or payload.get("stop_hook_active"):
+        # A subagent's Stop is not the person's; `stop_hook_active` is the
+        # continuation this hook asked for, i.e. the fork launch itself.
+        return 0
+    moment = judge_previous_turn(session, transcript, cwd)
+    if moment is None:
+        return 0
+    line = handoff_line(moment)
+    if line is None:
+        _log(f"launch {session[:8]} t{moment['turn']}: skipped, unusable moment ref")
+        return 0
+    # `additionalContext`, not `decision: block`: both continue the agent (and
+    # both set `stop_hook_active` on the continuation, probed on 2.1.286), and
+    # Claude Code prints both to the person in full — so this carries one line,
+    # and the fork prompt comes from the `handoff` command it names.
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "Stop", "additionalContext": line}}))
+    _log(f"launch {session[:8]} t{moment['turn']}: fork requested ({moment.get('kind')}) "
+         f"derivable={int(bool(moment.get('derivable')))}")
     return 0
 
 
-def unreported(session: str) -> list[dict]:
-    """Outcomes this session has not yet shown the person."""
-    rows = hx.read_jsonl(moments_path(session)) if moments_path(session).is_file() else []
-    said = {str(r["reported"]) for r in rows if r.get("reported")}
-    return [r for r in rows
-            if r.get("outcome") and f"{r.get('ref')}@{r.get('at')}" not in said]
+def cmd_session(payload: dict) -> int:
+    """SessionStart: hand the agent `session_rule`. Every source — startup,
+    resume, clear and compact — so a compacted or resumed session gets it
+    again, with its current id. A session that has lost the rule launches no
+    fork: the Stop's line alone names no command, and the moment is lost."""
+    session = str(payload.get("session_id") or "")
+    if _is_subagent(payload) or not _MOMENT_REF.match(f"{session}#1"):
+        return 0
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart", "additionalContext": session_rule(session)}}))
+    return 0
 
 
-def report_outcomes(session: str) -> str:
-    """The person's lines, and the ONLY thing this lane says to them.
-
-    A filed rule is named and its trigger said in a person's words, because a
-    bare id asks someone to review something without telling them what it is.
-    What is NOT said: any claim that the rule helped. It has fired for nobody —
-    a proposed rule is served to no agent — and whether a rule helps is the
-    fire ledger's question, answered later and per rule, not here.
-
-    A pass that could not RUN is named too. A pass that ran and found no lesson
-    says nothing: that is the quiet the design is for, and it stays readable in
-    the moments file for anyone who asks."""
-    lines = []
-    for row in unreported(session):
-        env = row.get("env") or "an unnamed environment"
-        if row.get("outcome") == "filed":
-            title = (row.get("title") or "").strip()
-            head = f'"{title}"' if title else f"rule {row.get('rule_id') or '?'}"
-            lines.append(f"MemHub filed a rule for review — {head}")
-            if row.get("catches"):
-                lines.append(f"   catches: {row['catches']}")
-            if row.get("scope"):
-                lines.append(f"   scope_repos: {row['scope']}")
-            if title and row.get("rule_id"):
-                lines.append(f"   {row['rule_id']} in {env}")
-            lines.append("   it fires for nobody until someone activates it")
-        elif row.get("outcome") == "failed":
-            lines.append("MemHub: could not review a flagged moment against "
-                         f"{env} — {row.get('detail')}")
-        hx.append_jsonl(moments_path(session),
-                        {"reported": f"{row.get('ref')}@{row.get('at')}"})
-    return "\n".join(lines)
+def _find_transcript(session: str) -> str | None:
+    """The session's transcript under the host's config dir. The `handoff`
+    command takes a moment ref, not a path, so the line the person sees stays
+    short; the newest match wins should a session id ever repeat."""
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "projects"
+    found = sorted(root.glob(f"*/{session}.jsonl"), key=lambda p: p.stat().st_mtime)
+    return str(found[-1]) if found else None
 
 
-# ------------------------------------------------------------------- main
+_LAUNCH_LINE = re.compile(r" launch (\S+) t(\d+): fork requested \(([a-z_]{1,40}|None)\) derivable=([01])$")
+
+
+def _logged_verdict(session: str, turn: int) -> tuple[str, bool]:
+    """The classifier's label for a moment, from the `launch` line the Stop
+    logged for it. The Stop's visible line carries the turn and nothing else,
+    and nothing else is stored; without the line the prompt says "a signal"."""
+    try:
+        lines = hx.log_path("stop.log").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "", False
+    for line in reversed(lines[-400:]):
+        m = _LAUNCH_LINE.search(line)
+        if m and m.group(1) == session[:8] and int(m.group(2)) == turn:
+            return ("" if m.group(3) == "None" else m.group(3)), m.group(4) == "1"
+    return "", False
+
+
+def cmd_handoff(ref: str, kind: str, derivable: bool) -> int:
+    """Print what the continued agent does for the moment `ref`: launch one fork
+    with `fork_launch_prompt`. The agent's own call, like `stamp`: read-only,
+    not gated on the flag, and loud when it cannot answer."""
+    if not _MOMENT_REF.match(ref or ""):
+        print(f"not a moment ref: {ref!r}", file=sys.stderr)
+        return 2
+    session, _, turn_s = ref.rpartition("#")
+    if not kind and not derivable:
+        kind, derivable = _logged_verdict(session, int(turn_s))
+    transcript = _find_transcript(session)
+    if transcript is None:
+        print(f"no transcript for session {session}", file=sys.stderr)
+        return 2
+    for turn in hx.turns_from_transcript(transcript):
+        if turn.get("n") == int(turn_s):
+            cwd = turn.get("cwd") or os.getcwd()
+            moment = {"source_ref": ref, "turn": int(turn_s), "kind": kind or None,
+                      "derivable": derivable, "state": _stamp(session, turn, cwd),
+                      "transcript": transcript, "cwd": cwd}
+            print(fork_reason(moment, env_name(), repo_of(cwd)))
+            return 0
+    print(f"no turn {turn_s} in {transcript}", file=sys.stderr)
+    return 2
+
+
+def cmd_stamp(transcript: str, turn_n: int, cwd: str) -> int:
+    """Print the state stamp for turn `turn_n` of a transcript, for the fork.
+    Read-only: the transcript and git, nothing written."""
+    session = Path(transcript).stem
+    for turn in hx.turns_from_transcript(transcript):
+        if turn.get("n") == turn_n:
+            print(json.dumps(_stamp(session, turn, cwd)))
+            return 0
+    print(f"no turn {turn_n} in {transcript}", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("mode", choices=("stop", "extract", "author"))
-    p.add_argument("--lease-fds", default="")
-    p.add_argument("--lease-paths", default="")
-    p.add_argument("--refs", default="")
-    p.add_argument("--session", default="")
+    p.add_argument("mode", choices=("stop", "session", "stamp", "handoff"))
     p.add_argument("--transcript", default="")
+    p.add_argument("--turn", type=int, default=0)
     p.add_argument("--cwd", default="")
-    p.add_argument("--arcs", default="")
-    p.add_argument("--upto", type=int, default=-1)
-    p.add_argument("--ref", default="")
+    p.add_argument("--moment", default="", help="handoff: <session_id>#<turn>")
+    p.add_argument("--kind", default="", help="handoff: the classifier's label")
+    p.add_argument("--derivable", action="store_true")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode == "stamp":
+        # The fork's own call: it stands whatever the flag says now, so a
+        # person who turns the sensor off mid-fork does not strand the filing.
+        return cmd_stamp(args.transcript, args.turn, args.cwd)
+    if args.mode == "handoff":
+        # The continued agent's call, asked for by a Stop that already judged.
+        kind = args.kind if _KIND.match(args.kind or "") else ""
+        return cmd_handoff(args.moment, kind, args.derivable)
     if not hx.extract_enabled():
-        if args.mode == "stop":
-            try:
-                sys.stdin.read()          # drain the hook payload, say nothing
-            except Exception:
-                pass
+        try:
+            sys.stdin.read()          # drain the hook payload, say nothing
+        except Exception:
+            pass
         return 0
-    if args.mode == "stop":
-        return cmd_stop(_read_payload())
-    if args.mode == "extract" and args.session:
-        return cmd_extract(args.session, args.transcript, args.cwd, args.arcs, args.upto)
-    if args.mode == "author" and args.session:
-        return cmd_author(args.session, [r for r in args.refs.split(",") if r],
-                          lease_fds=tuple(int(x) for x in args.lease_fds.split(",") if x),
-                          lease_paths=tuple(x for x in args.lease_paths.split(os.pathsep) if x))
-    return 0
+    if args.mode == "session":
+        return cmd_session(_read_payload())
+    return cmd_stop(_read_payload())
 
 
 if __name__ == "__main__":
+    # A hook must never fail the host, so a Stop swallows everything and exits
+    # 0. `stamp` and `handoff` are the fork's and the agent's tools, not hooks:
+    # their errors are loud.
+    loud = len(sys.argv) > 1 and sys.argv[1] in ("stamp", "handoff")
     try:
         rc = main()
+    except SystemExit:
+        if loud:
+            raise
+        rc = 0
     except BaseException:                 # noqa: BLE001 — silent, exit 0
-        if os.environ.get("MEMHUB_HARNESS_DEBUG"):
+        if loud or os.environ.get("MEMHUB_HARNESS_DEBUG"):
             import traceback
             traceback.print_exc()
-        rc = 0
+        rc = 2 if loud else 0
     sys.exit(rc or 0)

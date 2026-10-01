@@ -1,58 +1,54 @@
 #!/usr/bin/env python3
-"""Orient a session on the repo's agent brain — map, apply, recall & consult.
+"""Orient a session on the repo's agent brain — map, recall & consult.
 
-**Why this exists.** The plugin routes every WRITE to the repo's brain
-(``flush_turn``, ``flush_session``, ``save_artifact`` all resolve the room from
-``rooms.json``). Nothing said so, and reads defaulted elsewhere, so the one
+**Why this exists.** The plugin routes every ARTIFACT write to the repo's brain
+(``save_artifact`` and the ``.md`` auto-capture resolve the room from
+``rooms.json``); sessions go to the author's personal memory. Nothing said so, and reads defaulted elsewhere, so the one
 question that matters at the start of a session — *what does this project
 already know that bears on what I am about to do?* — had no cheap answer.
 
-This hook answers it in three checkpoints (navigation spec §4, "Session
+This hook answers it in two checkpoints (navigation spec §4, "Session
 start"), under one budget, keyed on **identifiers, never on similarity**:
 
 1. **Map** — what the brain holds: the five-line top of the compiled
    overview's Index (counts + drill commands) and a short clip of its prose.
-2. **Apply** — lessons / procedures whose triggers intersect the files this
-   branch touches (``git diff --name-only origin/<default>`` ∪ the last 20
-   commits' paths), via ``recall_directives(entities=…)``.
-3. **Recall & Consult** — the episodes and artifacts that *name* the same
-   identifiers (paths, PR / ENG numbers). Search is asked with the identifier
-   strings, and a hit survives only if it contains one of them as an exact
+2. **Recall & Consult** — the brain's artifacts and your own sessions that
+   *name* what this branch touches: its PR / ENG numbers and the basenames of
+   the files in ``git diff --name-only origin/<default>`` ∪ the last 20
+   commits' paths. Search is asked with the identifier strings, and a hit
+   survives only if its title or abstract contains one of them as an exact
    token. Nothing is kept for being "about" the branch.
 
+Team rules are not rendered here: ``rulebook_hook.py`` owns that channel.
 Per-prompt semantic injection is deliberately absent: Tencent's teamai-cli
 retired that channel as noisy and low-hit-rate (the repo brain holds the
-research note). The ambient channel that survived is identifier-keyed, and
-that is the only one here.
+research note).
 
 **Four subcommands, because they have different constraints.**
 
 ``brief`` runs on ``SessionStart``, SYNCHRONOUS, blocking the first prompt.
 It is stdlib-only and makes NO network call: the map comes from the overview
-cache, apply/recall from the pointer cache, and it spawns ``pointers`` in a
+cache, recall from the pointer cache, and it spawns ``pointers`` in a
 detached child to refresh that cache. Why a cache and not one live call: the
-host drops a hook's whole output past its 5 s timeout, and apply + recall are
-three round trips (one recall, two searches) that cannot be bounded to 2 s
+host drops a hook's whole output past its 5 s timeout, and recall is two
+round trips (episode and artifact searches) that cannot be bounded to 2 s
 from inside a stdlib process without also risking the map — the part that
 must never be lost. The detached child has no deadline pressure; what it
 writes is read by the first prompt's hook, so the cost is one turn of latency,
 never a session.
 
-``pointers`` is that child: git → identifiers → recall + search → cache.
+``pointers`` is that child: git → identifiers → search → cache.
 
-``prompt`` runs on ``UserPromptSubmit``: extracts identifiers from the prompt
-(paths, repo symbols, PR / ENG numbers, quoted error strings), fires ONE recall
-on them with a hard timeout, and renders at most three pointers. It also
-delivers the pointer cache the brief could not — once per refresh. A prompt
-with no identifier costs nothing and prints nothing.
+``prompt`` runs on ``UserPromptSubmit`` and makes no network call: it
+delivers the pointer cache the brief could not (it landed after SessionStart
+printed, or the budget cut part of it) — once per refresh. With nothing
+pending it prints nothing.
 
 ``refresh`` runs on ``Stop`` (async): fetches ``get_brain_overview`` into the
 overview cache, throttled to 6 h since the digest moves on the order of days.
 
 **Nothing repeated.** Every id rendered — by any of these — joins the
-session's served list (shared with ``directive_recall``'s ``already_fired``),
-is filtered client-side from later renders, and is sent as ``already_fired``
-to the tools that accept it.
+session's served list and is filtered client-side from later renders.
 
 **On speaking to the user.** ``systemMessage`` fires only when the resolved
 brain CHANGES; the agent-facing ``additionalContext`` is emitted every session.
@@ -100,13 +96,9 @@ _MAX_INDEX_LINES = 5
 _POINTERS_MAX_AGE_S = 24 * 3600
 _POINTERS_REFRESH_S = 15 * 60
 
-_MAX_APPLY = 5
 _MAX_RECALL = 5
-_MAX_PROMPT = 3
-_PROMPT_MAX_CHARS = 600
 _POINTER_TEXT_CHARS = 160
 _SEARCH_TOP_K = 20
-_RECALL_TIMEOUT_S = 2.5     # prompt hook: synchronous, before the model sees the prompt
 _TIMEOUT_S = 20.0           # detached worker / Stop refresh
 
 _TRIMMED_FOOTER = "… trimmed to budget"
@@ -249,14 +241,15 @@ def _render_map(brain_id: str, overview: str) -> list[str]:
         if len(index_lines) > _MAX_INDEX_LINES:
             lines.append("… (full Index: get_brain_overview)")
     elif counts:
-        facts, episodes, artifacts = counts
-        q = f'search_memory(query=…, agent_brain_id="{brain_id[:8]}…", memory_type='
+        # Only artifacts live in a brain now: sessions (episodes) are personal
+        # and never searchable by agent_brain_id, and facts are not a kind
+        # search_memory takes. The footer still carries all three counts.
+        _facts, _episodes, artifacts = counts
         lines += [
-            f"brain ({facts} facts · {episodes} episodes · {artifacts} artifacts)",
-            f'├── Facts      {facts:>7}  → {q}"facts")',
-            f'├── Episodes   {episodes:>7}  → {q}"episodes")',
-            f'└── Artifacts  {artifacts:>7}  → {q}"artifacts"); open one: get_artifact(id)',
-            "full digest: get_brain_overview · situated lessons: recall_directives(entities=[…])",
+            f"brain ({artifacts} artifacts)",
+            f'└── Artifacts  {artifacts:>7}  → search_memory(query=…, '
+            f'agent_brain_id="{brain_id[:8]}…", kind="artifact"); open one: read_memory(id)',
+            "full digest: get_brain_overview",
         ]
     clipped = _clip(prose)
     if clipped:
@@ -297,16 +290,6 @@ def _dedupe_text(items: list[dict], key: str = "text") -> list[dict]:
     return out
 
 
-def _matched_trigger(d: dict, entities: list[str]) -> str:
-    """The declared trigger that concretely hit one of ``entities`` — the
-    "why fired" the agent can validate in one glance; "" when none does."""
-    for t in d.get("triggers") or []:
-        if isinstance(t, str) and any(_token_hit(t, e) or _token_hit(e, t)
-                                      for e in entities):
-            return t
-    return ""
-
-
 def _pointer(item: dict, kind: str = "") -> str:
     text = _first_line(item.get("text") or item.get("content") or "")
     tail = []
@@ -321,33 +304,24 @@ def _pointer(item: dict, kind: str = "") -> str:
     return f"• {prefix}{text}{suffix} [{item.get('id', '')}]"
 
 
-def _apply_lines(items: list[dict], title: str) -> list[str]:
-    if not items:
-        return []
-    return [f"## Apply — {title}"] + [
-        _pointer(d, str(d.get("type") or "").lower()) for d in items
-    ]
-
-
 def _recall_lines(items: list[dict]) -> list[str]:
     if not items:
         return []
     return ["## Recall & Consult — episodes/artifacts naming this branch's identifiers"] + [
         _pointer(d, str(d.get("type") or "").lower()) for d in items
-    ] + ["(open one: get_artifact(id) for an artifact; search_memory for the rest)"]
+    ] + ["(open one: read_memory(id) — an artifact or a session)"]
 
 
-def _assemble(head: list[str], map_lines: list[str], apply: list[str],
-              recall: list[str], limit: int) -> str:
+def _assemble(head: list[str], map_lines: list[str], recall: list[str],
+              limit: int) -> str:
     """Join the sections under ``limit`` chars. Recall pointers are dropped
-    first (from the end), then apply pointers; the head and map never are.
-    A heading left with nothing under it goes too, and a footer says so
-    whenever anything was cut."""
+    (from the end); the head and map never are. A heading left with nothing
+    under it goes too, and a footer says so whenever anything was cut."""
     cut = False
 
     def render() -> str:
         parts = [*head]
-        for section in (map_lines, apply, recall):
+        for section in (map_lines, recall):
             if section:
                 parts.append("")
                 parts.extend(section)
@@ -355,7 +329,7 @@ def _assemble(head: list[str], map_lines: list[str], apply: list[str],
             parts.append(_TRIMMED_FOOTER)
         return "\n".join(parts)
 
-    for section in (recall, apply):
+    for section in (recall,):
         while section and len(render()) > limit:
             pointers = [i for i, ln in enumerate(section) if ln.startswith("• ")]
             if pointers:
@@ -435,16 +409,13 @@ def _mark_delivered(session_id: str, cache: dict, offered: list[str], context: s
                                  {"computed_at": cache.get("computed_at")})
 
 
-def _cached_pointer_sections(cache: dict, session_id: str) -> tuple[list[str], list[str]]:
-    """``(apply_lines, recall_lines)`` from a pointer cache, minus what this
-    session has already seen. The cache is shared by every session of the
-    checkout, so this is where the per-session filter lives."""
-    served = _served(session_id)
-    apply = _unserved(list(cache.get("apply") or []), served, _MAX_APPLY)
-    recall = _unserved(list(cache.get("recall") or []),
-                       served + [str(d.get("id")) for d in apply], _MAX_RECALL)
-    return (_apply_lines(apply, "lessons/procedures on what this branch touches"),
-            _recall_lines(recall))
+def _cached_pointer_section(cache: dict, session_id: str) -> list[str]:
+    """The recall lines from a pointer cache, minus what this session has
+    already seen. The cache is shared by every session of the checkout, so
+    this is where the per-session filter lives. An ``apply`` list a cache
+    written by an older plugin still carries is ignored."""
+    recall = _unserved(list(cache.get("recall") or []), _served(session_id), _MAX_RECALL)
+    return _recall_lines(recall)
 
 
 # ── brief: SessionStart, stdlib only, no network ───────────────────────────
@@ -464,10 +435,11 @@ def cmd_brief(payload: dict) -> int:
     session_id = _session_id(payload)
 
     writes = (
-        "Per-turn capture is OFF (MEMHUB_TURN_FLUSH=0), so nothing is being "
-        "written there this session."
+        "Per-turn capture is OFF (MEMHUB_TURN_FLUSH=0), so this session is not "
+        "being captured."
         if _capture_is_off() else
-        "Sessions in this repo are captured into it automatically."
+        "Sessions are captured into your personal memory, never into this "
+        "brain; team knowledge reaches it as artifacts."
     )
     head = [
         f"MemHub: this repo's agent brain is **{name}** (`{brain_id}`, {env}).",
@@ -480,20 +452,19 @@ def cmd_brief(payload: dict) -> int:
     cached = _read_json(_cache_path(env, brain_id))
     map_lines = _render_map(brain_id, str(cached.get("overview") or ""))
 
-    # Apply / Recall: from the pointer cache, refreshed by a detached child.
-    apply: list[str] = []
+    # Recall: from the pointer cache, refreshed by a detached child.
     recall: list[str] = []
     cache: dict = {}
     git = brief_identifiers.from_git(cwd)
     if git.get("root"):
         cache = _read_json(_pointers_path(env, brain_id, git["root"]))
         if cache and _pointers_usable(cache, git.get("branch")):
-            apply, recall = _cached_pointer_sections(cache, session_id)
+            recall = _cached_pointer_section(cache, session_id)
         if _pointers_need_refresh(cache, git):
             _spawn_pointers(cwd)
 
-    offered = _ids_in("\n".join(apply + recall))
-    context = _assemble(head, map_lines, apply, recall, brief_budget.brief_chars())
+    offered = _ids_in("\n".join(recall))
+    context = _assemble(head, map_lines, recall, brief_budget.brief_chars())
     _mark_served(session_id, _ids_in(context))   # only what survived the budget
     if cache:
         _mark_delivered(session_id, cache, offered, context)
@@ -544,30 +515,6 @@ def _tool_payload(res) -> dict | None:
     return out if isinstance(out, dict) else None
 
 
-def _recall_items(url: str, bearer: str, brain_id: str, repo: str,
-                  entities: list[str], served: list[str], session_id: str,
-                  limit: int, timeout: float) -> list[dict] | None:
-    """``recall_directives`` on explicit entities; ``None`` when the call
-    itself failed (distinct from "asked, nothing matched")."""
-    import mcp_http
-    args: dict = {"entities": entities, "limit": limit, "agent_brain_id": brain_id}
-    if repo:
-        args["repo"] = repo
-    if served:
-        args["already_fired"] = served[-served_state.MAX_IDS:]
-    if session_id:
-        args["session_id"] = session_id
-    try:
-        res = mcp_http.call_tool(url, bearer, "recall_directives", args, timeout=timeout)
-    except Exception:  # noqa: BLE001 — transport failure is a failed recall
-        return None
-    out = _tool_payload(res)
-    if out is None:
-        return None
-    items = out.get("items")
-    return [d for d in items if isinstance(d, dict)] if isinstance(items, list) else []
-
-
 def _token_hit(identifier: str, text: str) -> bool:
     """Exact, boundary-aware containment — a grep, not a similarity."""
     ident = identifier.strip()
@@ -580,25 +527,35 @@ def _token_hit(identifier: str, text: str) -> bool:
                      text, re.I) is not None
 
 
+def _pointer_text(item: dict) -> str:
+    """What a search pointer says about itself: title and abstract. Pointer
+    hits carry no body (``include_content`` is left off on purpose — the
+    detached worker fetches up to 40 hits and bodies would multiply that)."""
+    return "\n".join(str(item.get(k) or "") for k in ("title", "abstract") if item.get(k))
+
+
 def _search_items(url: str, bearer: str, brain_id: str, identifiers: list[str],
                   timeout: float) -> list[dict]:
-    """Episodes and artifacts that NAME one of ``identifiers``.
+    """Artifacts in the repo brain and the caller's own sessions that NAME one
+    of ``identifiers``.
 
+    Two searches, because the kinds live in different places: artifacts
+    inside the brain (``kind="artifact"`` + ``agent_brain_id``), sessions in
+    the caller's personal memory (``kind="episode"`` with NO
+    ``agent_brain_id`` — the server refuses episodes scoped to a brain).
     Search is asked with the identifier strings; a hit is kept only when its
-    content contains one of them as an exact token (the backend has no
-    ``subject`` filter yet and its hits carry no title, so the body is what
-    can be grepped). Everything else is rejected, however well it scored.
+    title or abstract contains one of them as an exact token. Everything else
+    is rejected, however well it scored.
     """
     import mcp_http
     if not identifiers:
         return []
     query = " ".join(identifiers[:8])
     kept: list[dict] = []
-    for mtype in ("episodes", "artifacts"):
+    for kind, scope in (("episode", {}), ("artifact", {"agent_brain_id": brain_id})):
         try:
             res = mcp_http.call_tool(url, bearer, "search_memory", {
-                "query": query, "memory_type": mtype, "top_k": _SEARCH_TOP_K,
-                "agent_brain_id": brain_id,
+                "query": query, "kind": kind, "top_k": _SEARCH_TOP_K, **scope,
             }, timeout=timeout)
         except Exception:  # noqa: BLE001
             continue
@@ -606,27 +563,20 @@ def _search_items(url: str, bearer: str, brain_id: str, identifiers: list[str],
         for item in (out or {}).get("items") or []:
             if not isinstance(item, dict):
                 continue
-            content = str(item.get("content") or "")
-            match = next((i for i in identifiers if _token_hit(i, content)), "")
+            text = _pointer_text(item)
+            match = next((i for i in identifiers if _token_hit(i, text)), "")
             if not match:
                 continue
             kept.append({
                 "id": str(item.get("id") or ""),
-                "type": str(item.get("type") or mtype.rstrip("s")),
-                "text": _first_line(content),
+                "type": str(item.get("kind") or kind),
+                "text": _first_line(item.get("title") or item.get("abstract") or ""),
+                "as_of": str(item.get("as_of") or ""),
                 "match": match,
                 "score": item.get("score"),
             })
     kept.sort(key=lambda d: -(d["score"] if isinstance(d.get("score"), (int, float)) else 0.0))
     return kept
-
-
-def _repo_name(root: str) -> str:
-    try:
-        import repo_identity
-        return str(repo_identity.repo_name(root) or "")
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 # ── pointers: detached worker, network ─────────────────────────────────────
@@ -644,11 +594,12 @@ def cmd_pointers(cwd: str) -> int:
     record: dict = {
         "computed_at": time.time(), "head": git["head"], "branch": git["branch"],
         "base": git["base"], "identifiers": {"paths": git["paths"][:20], "refs": git["refs"]},
-        "apply": [], "recall": [],
+        "recall": [],
     }
-    entities = brief_identifiers.entities_for(git["paths"], git["refs"])
-    if not entities:
-        _write_json(path, record)   # nothing to fire on; do not respawn every session
+    basenames = [p.rsplit("/", 1)[-1] for p in git["paths"]]
+    recall_ids = brief_identifiers._dedupe(git["refs"] + basenames)[:16]
+    if not recall_ids:
+        _write_json(path, record)   # nothing to search on; do not respawn every session
         return 0
 
     from _memhub_auth import resolve_bearer
@@ -662,123 +613,52 @@ def cmd_pointers(cwd: str) -> int:
         return 0
 
     # NO session filters here. The cache is shared by every session of this
-    # checkout (keyed env + brain + root), so a served list or a self-echo
-    # session_id baked in would hide pointers from the NEXT session. Both are
-    # applied at render time, per session; the cache holds twice the cap so
-    # that filter still leaves a full block.
-    apply = _recall_items(url, bearer, brain_id, _repo_name(git["root"]), entities,
-                          [], "", _MAX_APPLY * 2, _TIMEOUT_S)
-    if apply is None:
-        record["error"] = "recall failed"
-    else:
-        record["apply"] = _dedupe_text([
-            {"id": str(d.get("id") or ""), "type": d.get("type"),
-             "text": _first_line(d.get("content") or ""),
-             "as_of": d.get("as_of") or "",
-             "match": _matched_trigger(d, entities)}
-            for d in apply if str(d.get("id") or "").strip()
-        ])[:_MAX_APPLY * 2]
-    basenames = [p.rsplit("/", 1)[-1] for p in git["paths"]]
-    recall_ids = brief_identifiers._dedupe(git["refs"] + basenames)[:16]
-    apply_ids = {d["id"] for d in record["apply"]}
+    # checkout (keyed env + brain + root), so a served list baked in would
+    # hide pointers from the NEXT session. It is applied at render time, per
+    # session; the cache holds twice the cap so that filter still leaves a
+    # full block.
     record["recall"] = _dedupe_text([
         d for d in _search_items(url, bearer, brain_id, recall_ids, _TIMEOUT_S)
-        if d["id"] and d["id"] not in apply_ids
+        if d["id"]
     ])[:_MAX_RECALL * 2]
     _write_json(path, record)
     return 0
 
 
-# ── prompt: UserPromptSubmit, one bounded recall on the prompt's identifiers ─
-
-def _prompt_recall(brain_id: str, root: str, entities: list[str],
-                   served: list[str], session_id: str) -> list[dict]:
-    """The directives that fire on the prompt's identifiers — one call, hard
-    timeout, fail-open. Empty on any failure."""
-    from _memhub_auth import resolve_bearer
-    try:
-        # No refresh: two blocking urllib calls cannot be time-bounded from
-        # here (see directive_recall); a stale token is one missed lookup,
-        # not a stalled prompt.
-        url, bearer = resolve_bearer(refresh=False)
-    except Exception:  # noqa: BLE001
-        return []
-    if not bearer:
-        return []
-    items = _recall_items(url, bearer, brain_id, _repo_name(root) if root else "",
-                          entities, served, session_id, _MAX_PROMPT, _RECALL_TIMEOUT_S)
-    return _unserved(items or [], served, _MAX_PROMPT)
-
-
-def _prompt_section(hits: list[dict], entities: list[str]) -> tuple[list[str], list[str]]:
-    """``(lines, ids)`` for the prompt's own Apply block: at most
-    ``_MAX_PROMPT`` pointers and ``_PROMPT_MAX_CHARS`` characters, cut from
-    the end, ids reported only for pointers that survived."""
-    if not hits:
-        return [], []
-    heading = "## Apply — on identifiers in this prompt"
-    lines, ids = [heading], []
-    for d in _dedupe_text(hits, "content")[:_MAX_PROMPT]:
-        line = _pointer({"id": str(d.get("id") or ""), "text": d.get("content") or "",
-                         "as_of": d.get("as_of") or "",
-                         "match": _matched_trigger(d, entities)},
-                        str(d.get("type") or "").lower())
-        if len("\n".join(lines + [line])) > _PROMPT_MAX_CHARS:
-            break
-        lines.append(line)
-        ids.append(str(d.get("id") or ""))
-    return (lines, ids) if ids else ([], [])
-
+# ── prompt: UserPromptSubmit, deliver what the brief could not ────────────
 
 def cmd_prompt(payload: dict) -> int:
     cwd = _cwd_from(payload)
     room = room_map.read_room(cwd)
     if not room:
         return 0
+    root = room_map.repo_root(cwd)
+    if root is None:
+        return 0
     env = room_map.current_env()
     brain_id = room["brain_id"]
     session_id = _session_id(payload)
-    prompt = str(payload.get("prompt") or "")
-    root = room_map.repo_root(cwd)
 
-    apply: list[str] = []
-    recall: list[str] = []
-    pending: dict = {}
     # The pointer cache the brief could not deliver (it landed after
     # SessionStart printed, or the budget cut part of it) — rendered until
     # every pointer has been, and only when it was computed for the branch
     # the checkout is on NOW: a `git switch` since the brief must not inject
-    # the old branch's lessons.
-    if root is not None:
-        cache = _read_json(_pointers_path(env, brain_id, str(root)))
-        branch = brief_identifiers.current_branch(root)
-        marker = served_state.load_marker(served_state.STATE_DIR, session_id, "brief")
-        if cache and cache.get("computed_at") != marker.get("computed_at"):
-            if _pointers_usable(cache, branch or None):
-                apply, recall = _cached_pointer_sections(cache, session_id)
-                pending = cache
-            elif branch and cache.get("branch") != branch:
-                _spawn_pointers(cwd)
-    pending_ids = _ids_in("\n".join(apply + recall))
-
-    prompt_lines: list[str] = []
-    found = brief_identifiers.from_prompt(
-        prompt, brief_identifiers.repo_files(root) if root is not None else set())
-    entities = brief_identifiers.entities_for(
-        found["paths"], found["refs"], found["symbols"], found["errors"])
-    if entities:
-        hits = _prompt_recall(brain_id, str(root) if root else "", entities,
-                              _served(session_id) + pending_ids, session_id)
-        prompt_lines, _ = _prompt_section(hits, entities)
-
-    if not (apply or recall or prompt_lines):
+    # the old branch's pointers.
+    recall: list[str] = []
+    cache = _read_json(_pointers_path(env, brain_id, str(root)))
+    branch = brief_identifiers.current_branch(root)
+    marker = served_state.load_marker(served_state.STATE_DIR, session_id, "brief")
+    if cache and cache.get("computed_at") != marker.get("computed_at"):
+        if _pointers_usable(cache, branch or None):
+            recall = _cached_pointer_section(cache, session_id)
+        elif branch and cache.get("branch") != branch:
+            _spawn_pointers(cwd)
+    if not recall:
         return 0
-    context = _assemble([], [], apply, recall, brief_budget.brief_chars())
-    if prompt_lines:
-        context = (context + "\n\n" if context else "") + "\n".join(prompt_lines)
+    pending_ids = _ids_in("\n".join(recall))
+    context = _assemble([], [], recall, brief_budget.brief_chars())
     _mark_served(session_id, _ids_in(context))   # only what survived
-    if pending:
-        _mark_delivered(session_id, pending, pending_ids, context)
+    _mark_delivered(session_id, cache, pending_ids, context)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
         "additionalContext": context,

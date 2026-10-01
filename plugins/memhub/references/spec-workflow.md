@@ -35,12 +35,10 @@ work, check, and maintenance; do not create separate configuration for each skil
    specs. Cite the two sources separately and surface conflicts. Do not claim
    Git hook/audit/remediation parity for a Brain-only source.
 6. Discover supported tools and their schemas before calling them. Resolve the
-   granted repo's bound brain through server repo resolution: `recall_directives`
-   with `repo=<org>/<name>` and a one-line `task` changes nothing and lists the
-   resolved brain in `scope.brains`; otherwise match the exact brain name
-   `Repo: <org>/<name>`. If `scope.brains` lists more than one brain, name
-   each (id and name) and ask which one governs instead of picking one; a local
-   room cache entry is not a tiebreaker.
+   granted repo's bound brain by its exact name `Repo: <org>/<name>`
+   (`list_agent_brains(repo="<org>/<name>")`, then the exact-name match). If more than one brain matches, name each (id and
+   name) and ask which one governs instead of picking one; a local room cache
+   entry is not a tiebreaker.
    Do not create a brain from a cached name or widen sharing. Missing auth,
    source access, or revision support is a specific capability gap. Do not
    invent endpoints or substitute personal credentials for cloud permissions.

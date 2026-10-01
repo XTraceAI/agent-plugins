@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Use when the user asks to set up, repair, or verify the installed MemHub host integration, especially Codex automatic capture, PreToolUse directive recall, hook installation, or capture health. Installs the Codex user-hooks compatibility bridge idempotently while preserving unrelated hooks, then checks plugin authentication and reports the one required trust step.
+description: Use when the user asks to set up, repair, or verify the installed MemHub host integration, especially Codex automatic capture, PreToolUse team rules, hook installation, or capture health. Installs the Codex user-hooks compatibility bridge idempotently while preserving unrelated hooks, then checks plugin authentication and reports the one required trust step.
 allowed-tools: Bash
 ---
 
@@ -28,7 +28,7 @@ instead of the command's explicit `workdir`. Use a shell-quoted absolute
 `cd <repo> && ...` prefix for repository shell calls, or start the task in the
 repository. The plugin cannot reconstruct an omitted working directory. This
 workaround enables command rules; session-start rules still require starting in
-the repository. Do not claim full parity from a successful directive recall.
+the repository.
 
 Install the bridge:
 
@@ -44,18 +44,16 @@ trampoline that follows plugin version upgrades. It enables:
 - `SessionStart`: rulebook posture rules and any plugin-upgrade notice, the
   repo brain brief, and a capture-health warning — the same three scripts
   Claude Code runs at session start;
-- `PreToolUse`: the rulebook hook (which can deny the call) and situated
-  directive recall before mutating shell and edit calls;
-- `PostToolUse`: the rulebook hook, reactive recall on failures,
-  artifact-link reminders, and PR-link recording after GitHub-touching shell
+- `PreToolUse`: the rulebook hook (which can deny the call);
+- `PostToolUse`: the rulebook hook, artifact-link reminders, and PR-link recording after GitHub-touching shell
   calls (GitHub MCP calls only through the bundled plugin hooks — the bridge's
   matcher stays narrow so upgrading it needs no re-trust);
 - `PostToolUse` + `Stop`: incremental session capture.
 
 After installation, report installation and trust as separate states. Codex
 deliberately does not let a plugin approve command hooks, and the setup script
-cannot inspect or change that approval. Do not claim capture or directive
-recall is active until the user confirms the review is done.
+cannot inspect or change that approval. Do not claim capture or team rules
+are active until the user confirms the review is done.
 
 Give these precise review instructions:
 

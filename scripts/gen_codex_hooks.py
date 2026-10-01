@@ -3,12 +3,12 @@
 
 Codex clones Claude's hook contract, but hook trust is per command definition.
 The Codex file therefore folds MemHub's behaviors into one dispatcher per event
-instead of exposing every directive, artifact, and capture subprocess as its
+instead of exposing every rulebook, artifact, and capture subprocess as its
 own approval. Capture still routes through ``codex_flush.py`` inside the bridge
 because Codex sessions are rollout files, not Claude transcripts.
 
 Generated, checked in, and pinned by tests/codex_hooks_parity_test.py — the
-generator is the single place the Claude→Codex delta lives, so a directive
+generator is the single place the Claude→Codex delta lives, so a
 hook edited in claude-hooks.json cannot silently drift out of the Codex file
 (the parity test fails until this is re-run).
 
@@ -78,7 +78,7 @@ CLAUDE_ONLY_CAPTURE = (
 def generate(claude_hooks: dict) -> dict:
     """The Codex hooks document derived from the Claude one."""
     source = json.dumps(claude_hooks)
-    for required in ("directive_recall.py", "artifact_sync_reminder.py"):
+    for required in ("rulebook_hook.py", "artifact_sync_reminder.py"):
         if required not in source:
             raise ValueError(f"Claude hooks no longer expose {required}")
 
@@ -106,7 +106,7 @@ def generate(claude_hooks: dict) -> dict:
         "PreToolUse": [{
             "matcher": _ALL_TOOLS,
             "hooks": [handler(
-                "PreToolUse", 8, "MemHub: checking for relevant directives"
+                "PreToolUse", 8, "MemHub: checking team rules"
             )],
         }],
         "PostToolUse": [{
