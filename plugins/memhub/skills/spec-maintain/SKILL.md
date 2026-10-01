@@ -162,8 +162,8 @@ spec's frontmatter from its content. Open pointer results before citing them;
 report absent or retired mirrors accurately. Read relevant `spec_audit` reports for verdicts, recorded
 head, checked/omitted coverage, and remediation PR links. They are in
 `report_brain_id` from `get_spec_workflow`, which is often NOT the repo brain:
-search that brain (`search_memory(agent_brain_id=<report_brain_id>, memory_type="artifacts")`),
-or open `last_audit.artifact_id` directly with `get_artifact`. Finding none in the
+search that brain (`search_memory(agent_brain_id=<report_brain_id>, kind="artifact")`),
+or open `last_audit.artifact_id` directly with `read_memory`. Finding none in the
 repo brain does not mean there are none. Brain mode reports
 versions and retrieval access to the selected governing documents, not Git mirror
 health. Do not change brain membership or create another brain to repair access.

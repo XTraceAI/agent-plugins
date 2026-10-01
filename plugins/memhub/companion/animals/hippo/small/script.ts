@@ -12,12 +12,15 @@
 // cutting them on any frame is safe.
 
 import type { Tone } from '../../../animal'
+import type { RGB } from '../../../pixels'
 import type { Eyes, Mouth, SquidPose } from './art'
 import { SQUID_Y } from './art'
-import { DOZE, GONE, LOW, LURK, PEEK, RISEN, type SpawnKind, SX } from './scene'
+import { DOZE, GONE, HY, LOW, LURK, PEEK, RISEN, type SpawnKind, SX } from './scene'
 
 export type Z = readonly [x: number, y: number, ch: 'z' | 'Z']
 export type Squid = readonly [x: number, y: number, pose: SquidPose]
+/** A character over the pixels in a colour of its own: a `!`, a `?`, a heart. */
+export type Mark = readonly [x: number, y: number, ch: string, color: RGB]
 
 export type Frame = {
   lift: number
@@ -31,6 +34,7 @@ export type Frame = {
   shown: number
   tone: Tone
   spawn: SpawnKind | null
+  marks: readonly Mark[]
 }
 
 /** The bubble's anchor: column 5, row 10, in canvas pixels. */
@@ -40,7 +44,7 @@ export const BUBBLE_AT = { column: SX, row: 10 }
 export function S(kw: Partial<Frame> = {}): Frame {
   return {
     lift: GONE, dx: 0, eyes: 'open', mouth: 'shut', ears: false,
-    zs: [], squid: null, said: null, shown: 0, tone: 'advice', spawn: null,
+    zs: [], squid: null, said: null, shown: 0, tone: 'advice', spawn: null, marks: [],
     ...kw,
   }
 }
@@ -150,12 +154,53 @@ function* intercept(): Generator<Frame> {
   yield* hold(S(base), 4)
 }
 
-/** Type it out, then hold it long enough to read. Ends where it started. */
+const GOLD: RGB = [240, 200, 60]
+const PINK: RGB = [240, 124, 150]
+/** The head's middle column, and the row just over it at the speaking lift. */
+const HEAD_X = SX + 6
+const OVER_HEAD = HY - RISEN - 2
+/** Frames a proposal stays up once typed: long enough to read it and reach for a button. */
+const ASK_FRAMES = 160
+
+/**
+ * The proposal prelude. Something new has surfaced: the hippo looks both
+ * ways, then a gold `!` pops over its head in a burst of bubbles while its
+ * ears wiggle. Starts and ends on the speaking position.
+ */
+function* present(tone: Tone): Generator<Frame> {
+  const T = { lift: RISEN, tone }
+  yield* hold(S({ ...T, eyes: 'right' }), 4)
+  yield* hold(S({ ...T, eyes: 'left' }), 4)
+  for (let i = 0; i < 8; i++) {
+    yield S({
+      ...T, ears: Math.floor(i / 2) % 2 === 1, marks: [[HEAD_X, OVER_HEAD, '!', GOLD]],
+      spawn: i === 0 ? 'bubbles' : null,
+    })
+  }
+  yield* hold(S(T), 2)
+}
+
+/** The asking hold: a gold `?` bobbing over the head, the odd blink and glance. */
+function* ask(base: Partial<Frame>, text: string): Generator<Frame> {
+  for (let g = 0; g < ASK_FRAMES; g++) {
+    const eyes: Eyes = g % 60 === 50 || g % 60 === 51 ? 'shut' : g % 120 >= 80 && g % 120 < 92 ? 'left' : 'open'
+    const bob = Math.floor(g / 10) % 2 ? OVER_HEAD - 2 : OVER_HEAD
+    yield S({ ...base, eyes, said: text, shown: text.length, marks: [[HEAD_X, bob, '?', GOLD]] })
+  }
+}
+
+/**
+ * Type it out, then hold it long enough to read. Ends where it started.
+ * `blocked` has the squid bitten first; `proposed` is presented with a `!`
+ * and held longer with a `?`, asking for an answer.
+ */
 export function* speak(text: string, tone: Tone = 'advice'): Generator<Frame> {
   const base = { lift: RISEN, tone }
   yield S(base) // neutral, and where it ends up again
   if (tone === 'blocked') {
     yield* intercept() // the bite says it first
+  } else if (tone === 'proposed') {
+    yield* present(tone)
   }
   let k = 0.0
   let f = 0
@@ -163,6 +208,11 @@ export function* speak(text: string, tone: Tone = 'advice'): Generator<Frame> {
     k += 1.6
     f += 1
     yield S({ ...base, said: text, shown: Math.trunc(k), mouth: f % 2 ? 'open' : 'shut' })
+  }
+  if (tone === 'proposed') {
+    yield* ask(base, text)
+    yield S({ ...base, said: text, shown: text.length })
+    return
   }
   for (let g = 0; g < 60; g++) {
     // 3 seconds to read it
@@ -172,6 +222,25 @@ export function* speak(text: string, tone: Tone = 'advice'): Generator<Frame> {
     })
   }
   yield* hold(S({ ...base, said: text, shown: text.length }), 2)
+}
+
+/**
+ * A click: the ears wiggle, the mouth opens, and a pink heart rises off the
+ * nostrils in a few bubbles; then a pleased squint. Starts and ends on look's
+ * first frame, so the director can cut it in and out of `look`.
+ */
+export function* pet(): Generator<Frame> {
+  const rest = S({ lift: DOZE })
+  yield rest
+  for (let i = 0; i < 12; i++) {
+    yield S({
+      lift: DOZE, eyes: 'shut', ears: Math.floor(i / 3) % 2 === 0, mouth: i >= 3 && i < 9 ? 'open' : 'shut',
+      marks: [[SX + 3, HY - DOZE - 2 - 2 * Math.floor(i / 4), '♥', PINK]], spawn: i === 0 ? 'bubbles' : null,
+    })
+  }
+  yield* hold(S({ lift: DOZE, eyes: 'shut' }), 8)
+  yield* hold(rest, 8)
+  yield rest
 }
 
 /** The speaking position → offscreen, ready for `enter` again. */
@@ -187,6 +256,7 @@ export function* leave(): Generator<Frame> {
 export const SAMPLE: Readonly<Record<Tone, string>> = {
   advice: 'Rule fired: run only the touched test suites',
   blocked: 'Blocked: never force-push to a shared branch',
+  proposed: 'New rule↗ proposed, not active yet: Pin the MCP server when spawning claude -p',
 }
 
 /** hippo_band.py's own preview loop: the ring, for `/hippo demo`. */
@@ -201,6 +271,7 @@ export function* cycle(): Generator<Frame> {
     yield* rise()
     yield* speak(SAMPLE.advice)
     yield* speak(SAMPLE.blocked, 'blocked')
+    yield* speak(SAMPLE.proposed, 'proposed')
     yield* leave()
   }
 }
@@ -209,4 +280,6 @@ export const POSES: Readonly<Record<string, () => Generator<Frame>>> = {
   enter, sleep, wake, look, rise, leave,
   speak: () => speak(SAMPLE.advice),
   blocked: () => speak(SAMPLE.blocked, 'blocked'),
+  propose: () => speak(SAMPLE.proposed, 'proposed'),
+  pet,
 }

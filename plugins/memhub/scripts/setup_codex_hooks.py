@@ -20,7 +20,7 @@ RUNNER_SOURCE = SCRIPT_DIR / "codex_hook_bridge.py"
 _RUNNER_NAME = "memhub_hook_bridge.py"
 _LEGACY_MARKERS = (
     "codex_flush.py",
-    "directive_recall.py",
+    "directive_recall.py",  # retired, but still names an older plugin's bridge
     "artifact_sync_reminder.py",
 )
 

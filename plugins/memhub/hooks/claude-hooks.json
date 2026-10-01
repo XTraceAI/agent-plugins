@@ -2,28 +2,6 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit)$",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 8,
-            "statusMessage": "MemHub: checking for relevant directives",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 8,
-            "statusMessage": "MemHub: checking for relevant directives",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PreToolUse && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
-          }
-        ]
-      },
-      {
         "matcher": "^(Bash|Edit|MultiEdit|Write|NotebookEdit|Read)$",
         "hooks": [
           {
@@ -46,17 +24,6 @@
       }
     ],
     "PostToolUse": [
-      {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|Bash)$",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 8,
-            "statusMessage": "MemHub: checking directives for this failure",
-            "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/reactive_prefilter.py\"; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/directive_recall.py\"; fi"
-          }
-        ]
-      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -148,6 +115,15 @@
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py\" session; fi"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "IN=$(cat); HX=${MEMHUB_HARNESS_EXTRACT:-}; HX=${HX#\"${HX%%[! \t\n\u000b\f\r\u001c\u001d\u001e\u001f]*}\"}; HX=${HX%\"${HX##*[! \t\n\u000b\f\r\u001c\u001d\u001e\u001f]}\"}; case \"$HX\" in 1|[Oo][Nn]|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) ;; *) exit 0 ;; esac; if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore SessionStart; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/harness_stop.py\" session; fi"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -156,7 +132,7 @@
           {
             "type": "command",
             "timeout": 8,
-            "statusMessage": "MemHub: checking memory for identifiers in this prompt",
+            "statusMessage": "MemHub: delivering pending branch memory pointers",
             "command": "IN=$(cat); if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore UserPromptSubmit; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/brain_brief.py\" prompt; fi"
           }
         ]

@@ -1,9 +1,10 @@
 // What the companion announces from one classic PreToolUse / PostToolUse
 // answer. The fixtures are the hooks' real output, not a paraphrase of it:
-// DIRECTIVES is directive_recall._render(), the Rulebook block's disclosure
+// DIRECTIVES is what the retired directive_recall._render() wrote (an older
+// install can still write it beside this one), the Rulebook block's disclosure
 // lines are rulebook_hook.disclosure_line() and disclosure_instruction(), and
-// DENY is the shape of the hook's permissionDecisionReason. When either hook
-// changes what it writes, regenerate these from it.
+// DENY is the shape of the hook's permissionDecisionReason. When the rulebook
+// hook changes what it writes, regenerate these from it.
 
 import { describe, expect, test } from 'claude-code/testing'
 

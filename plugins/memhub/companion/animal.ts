@@ -5,8 +5,14 @@
 
 import type { Canvas, RGB } from './pixels'
 
-/** Why the animal is speaking; the bubble's colour follows it. */
-export type Tone = 'advice' | 'blocked'
+/**
+ * Why the animal is speaking; the bubble's colour follows it. `proposed` is a
+ * new rule waiting to be activated or rejected: every animal presents it with
+ * a prelude of its own and holds it at least 8 s with the `proposed` tone, so
+ * the Activate / Reject / Later buttons can sit inside its bubble. An animal
+ * with no prelude still says it in the `proposed` tone, never as `advice`.
+ */
+export type Tone = 'advice' | 'blocked' | 'proposed'
 
 /** One character drawn over the pixels, at canvas pixel (x, y). */
 export type Glyph = { x: number; y: number; ch: string; color: RGB }
@@ -31,13 +37,13 @@ export type Painted = {
 }
 
 /**
- * The seven poses the director asks for, each a generator of the animal's own
+ * The poses the director asks for, each a generator of the animal's own
  * frame type. Four are finite and play whole; `sleep` and `look` are endless
- * and the director cuts them off; `speak` ends on its own.
+ * and the director cuts them off; `speak` and `pet` end on their own.
  *
  * The director only ever walks this ring:
  *
- *   enter → sleep ⇄ (wake → look) → rise → speak+ → leave → enter
+ *   enter → sleep ⇄ (wake → look ⇄ pet) → rise → speak+ → leave → enter
  *
  * so every finite pose must end where the next one begins.
  */
@@ -63,6 +69,12 @@ export type Poses<F> = {
   speak(text: string, n: number, tone: Tone): Generator<F>
   /** The speaking position → offscreen, ready for `enter` again. */
   leave(): Generator<F>
+  /**
+   * Awake → awake: what a click on the animal does. 20–40 frames, starting
+   * and ending on the first frame `look` yields. Without it the director
+   * floats hearts over `look` instead.
+   */
+  pet?(): Generator<F>
 }
 
 /**

@@ -246,9 +246,56 @@ function* blockedScript(text: string): Generator<Frame> {
   yield F(said)
 }
 
-/** speaking position → the same position. Types out, holds 44 frames. */
+/** The head's middle column at rest, and the row just over it. */
+const HEAD_X = PX + 4
+const OVER_HEAD = FOOT - 10
+/** Frames a proposal stays up once typed: long enough to read it and reach for a button. */
+const ASK_FRAMES = 160
+
+/**
+ * A new rule to present: the penguin looks both ways, throws both flippers
+ * up under a gold `!` and hops from foot to foot, then says it in the
+ * speaking position and holds it with a `?` bobbing overhead, asking for an
+ * answer. Starts and ends on the speaking position.
+ */
+function* proposedScript(text: string): Generator<Frame> {
+  const on = { tone: 'proposed' as const }
+  yield F(on)
+  yield* hold(F({ ...on, eyes: 'right' }), 4)
+  yield* hold(F({ ...on, eyes: 'left' }), 4)
+  for (let i = 0; i < 8; i++) {
+    const feet: Feet = i < 6 ? (Math.floor(i / 3) % 2 ? 'b' : 'a') : 'stand'
+    yield S({ ...on, lf: 'up', rf: 'up', feet, glyphs: [[HEAD_X, OVER_HEAD, '!', 'O']] })
+  }
+  yield* hold(F(on), 2)
+  yield* typed(text, 'proposed')
+  const said = { said: text, shown: text.length, tone: 'proposed' as const }
+  for (let g = 0; g < ASK_FRAMES; g++) {
+    const eyes: Eyes = g % 60 === 50 || g % 60 === 51 ? 'shut' : g % 120 >= 80 && g % 120 < 92 ? 'left' : 'open'
+    const bob = Math.floor(g / 10) % 2 ? OVER_HEAD - 2 : OVER_HEAD
+    yield F({ ...said, eyes, glyphs: [[HEAD_X, bob, '?', 'O']] })
+  }
+  yield F(said)
+}
+
+/** speaking position → the same position. Types out, holds 44 frames; a proposal, longer. */
 export function* speak(text: string, tone: Tone = 'advice'): Generator<Frame> {
-  yield* tone === 'blocked' ? blockedScript(text) : adviceScript(text)
+  yield* tone === 'blocked' ? blockedScript(text) : tone === 'proposed' ? proposedScript(text) : adviceScript(text)
+}
+
+/**
+ * A click: a happy squint and a flutter of both flippers while a pink heart
+ * rises over the head. Starts and ends on look's first frame, standing.
+ */
+export function* pet(): Generator<Frame> {
+  yield S()
+  for (let i = 0; i < 12; i++) {
+    const flap = Math.floor(i / 3) % 2 === 0 ? ('out' as const) : ('down' as const)
+    yield S({ eyes: 'shut', lf: flap, rf: flap, glyphs: [[HEAD_X, OVER_HEAD - 2 * Math.floor(i / 6), '♥', 'P']] })
+  }
+  yield* hold(S({ eyes: 'shut' }), 8)
+  yield* hold(S(), 8)
+  yield S()
 }
 
 /** The speaking position → offscreen, left, ready for `enter` again. */
@@ -263,6 +310,7 @@ export function* leave(): Generator<Frame> {
 export const SAMPLE: Readonly<Record<Tone, string>> = {
   advice: 'Rule fired: run only the touched test suites',
   blocked: 'Blocked: never force-push to a shared branch',
+  proposed: 'New rule↗ proposed, not active yet: Pin the MCP server when spawning claude -p',
 }
 
 /** The ring the mod walks, for `/penguin demo`. */
@@ -277,6 +325,7 @@ export function* cycle(): Generator<Frame> {
     yield* rise()
     yield* speak(SAMPLE.advice)
     yield* speak(SAMPLE.blocked, 'blocked')
+    yield* speak(SAMPLE.proposed, 'proposed')
     yield* leave()
   }
 }
@@ -285,4 +334,6 @@ export const POSES: Readonly<Record<string, () => Generator<Frame>>> = {
   enter, sleep, wake, look, rise, leave,
   speak: () => speak(SAMPLE.advice),
   blocked: () => speak(SAMPLE.blocked, 'blocked'),
+  propose: () => speak(SAMPLE.proposed, 'proposed'),
+  pet,
 }

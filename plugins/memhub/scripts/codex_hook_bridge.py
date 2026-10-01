@@ -25,8 +25,6 @@ _KNOWN_INSTALLS = (
 _VERSION_PART = re.compile(r"\d+|[A-Za-z]+")
 _EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
 _SHELL_TOOLS = {"Bash", "shell", "local_shell", "exec_command", "shell_command"}
-_GATE_TIMEOUT_S = 1
-_RECALL_TIMEOUT_S = 6
 _ARTIFACT_TIMEOUT_S = 7
 _PR_LINK_TIMEOUT_S = 15
 # SessionStart runs three children in parallel under one 8 s handler budget.
@@ -191,41 +189,6 @@ def _relay(result: subprocess.CompletedProcess) -> None:
         sys.stdout.buffer.write(result.stdout)
 
 
-def _directive_result(
-    root: Path, payload: bytes, reactive: bool
-) -> subprocess.CompletedProcess | None:
-    try:
-        hook = json.loads(payload or b"{}")
-    except (TypeError, ValueError):
-        return
-
-    if reactive:
-        gate = _run(
-            root, "reactive_prefilter.py", payload, timeout=_GATE_TIMEOUT_S
-        )
-        if gate.returncode != 0:
-            return
-    elif hook.get("tool_name") in _SHELL_TOOLS:
-        gate = _run(
-            root, "directive_prefilter.py", payload, timeout=_GATE_TIMEOUT_S
-        )
-        if gate.returncode != 0:
-            return
-
-    # --host codex: the self-echo filter matches the conversation id capture
-    # uploaded (`codex-<uuid>`), not the bare hook session id (ENG-1075).
-    return _run(
-        root, "directive_recall.py", payload, "--host", "codex",
-        timeout=_RECALL_TIMEOUT_S,
-    )
-
-
-def _directive(root: Path, payload: bytes, reactive: bool) -> None:
-    result = _directive_result(root, payload, reactive)
-    if result is not None:
-        _relay(result)
-
-
 # Claude's manifest keeps the PR-link check behind a shell `case` byte filter,
 # so an ordinary shell call never starts a python process. Codex multiplexes
 # ONE PostToolUse handler, so there is nowhere in the manifest to put that —
@@ -315,8 +278,7 @@ def _fail_open_job(job):
 
 def _dispatch_post(root: Path, payload: bytes, hook: dict) -> None:
     tool = hook.get("tool_name")
-    jobs = [lambda: _directive_result(root, payload, reactive=True),
-            lambda: _rulebook_result(root, payload, "post")]
+    jobs = [lambda: _rulebook_result(root, payload, "post")]
     if tool in _EDIT_TOOLS:
         jobs.append(lambda: _artifact_sync_result(root, payload))
     # The MCP branch needs no byte scan — the tool NAME is the filter.
@@ -415,13 +377,11 @@ def _dispatch(root: Path, payload: bytes, event: str) -> None:
             results = list(executor.map(_fail_open_job, jobs))
         _merge_results(results, event)
     elif event == "PreToolUse":
-        jobs = [
-            lambda: _rulebook_result(root, payload, "pre"),
-            lambda: _directive_result(root, payload, reactive=False),
-        ]
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(_fail_open_job, jobs))
-        _merge_results(results, event)
+        # The rulebook is the only PreToolUse lane. It still goes through
+        # _fail_open_job + _merge_results so a crash or an unparseable
+        # document is dropped rather than relayed.
+        _merge_results([_fail_open_job(
+            lambda: _rulebook_result(root, payload, "pre"))], event)
     elif event == "PostToolUse":
         _dispatch_post(root, payload, hook)
     elif event == "Stop":
@@ -515,10 +475,13 @@ def main() -> int:
             return 0
         if action == "dispatch" and len(sys.argv) > 2:
             _dispatch(root, payload, sys.argv[2])
-        elif action == "directive-pre":
-            _directive(root, payload, reactive=False)
-        elif action == "directive-post":
-            _directive(root, payload, reactive=True)
+        elif action in ("directive-pre", "directive-post"):
+            # Retired: directive recall (lessons/procedures on tool calls) is
+            # gone; team rules are the only tool-call memory. Kept as a no-op
+            # because user-level bridges installed by an older
+            # setup_codex_hooks.py may still invoke these actions, and a hook
+            # must fail open, never error.
+            pass
         elif action == "artifact-sync":
             _artifact_sync(root, payload)
         elif action == "flush" and len(sys.argv) > 2:

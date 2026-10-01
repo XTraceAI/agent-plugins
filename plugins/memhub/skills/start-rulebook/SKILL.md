@@ -190,10 +190,13 @@ Mark the recommended one from what you can see, and say why in one clause:
   recommend **1**, and say that 2 and 3 would find nothing yet ("come back in
   a couple of weeks — I'll have sessions to learn from");
 - sessions exist and the rulebook is empty → recommend **3**;
-- the rulebook already holds starter rules → recommend **2**. `list_rules`
-  returns no `source_ref`, and a starter rule's `source` is plain `authored`,
-  so tell them by title: any row titled like a `catalog.json` rule (`Stop
-  irreversible git operations`, `Never read secrets`, …).
+- the rulebook already holds starter rules → recommend **2**. A starter rule
+  is a `list_rules` row titled like a `catalog.json` rule (`Stop
+  irreversible git operations`, `Never read secrets`, …), `source`
+  `authored`. One filed since rules had authors also carries `author.key`
+  `"xtrace"` (older ones `author: null`) — but `"xtrace"` alone does not make
+  a row a starter rule: the harness's own rules and MemHub's built-in spec
+  reminder carry it too. `list_rules` returns no `source_ref`.
 
 Skip the question only when they already answered it: `--starter` / `--mine`,
 or their own words ("just the defaults" → 1; "mine our sessions", "turn our
@@ -242,7 +245,12 @@ leaves:
   migrations, dev server, generated files, the largest files, `.gitignore`
   exclusions and secrets, protected paths, CI and production workflows, infra.
 - `candidates.json` — one `create_rule` body per seeded rule (`body`), with
-  `category`, `designed_mode`, `seeded_from`, `evidence`, `cases`.
+  `category`, `designed_mode`, `seeded_from`, `evidence`, `cases`. Each body
+  carries `when`, `do`, `why` (and `when_not` where the catalog names an
+  exclusion): what MemHub's rule judge reads once the rule's check has
+  matched, to decide whether the agent is really in the rule's situation.
+  They are the catalog's own sentences with this repo's values filled in, the
+  same way the statement is.
 - `dropped.json` — every catalog rule left out and why, in the client's words
   ("this repo has no migrations directory"). **Dropping is the feature:** a
   rule about alembic in a repo without it is day-one noise. A rule whose
@@ -414,6 +422,9 @@ lanes first (table above), and write a `create_rule` body into a JSON list:
               "command_not_rx": "python3?\\s+-c\\b|\\brulebook\\b", "warn_once_per": "session"},
   "claude_md": {"heading": "Loading environment variables", "text": "`source .env` will mis-parse it and leak secrets into stderr. Always load it via python-dotenv."},
   "did": "Claude sourced .env", "what": "Claude is warned at `source .env` and pointed to python-dotenv",
+  "when": "Claude is about to load a .env file into the shell by sourcing it.",
+  "do": "Load it via python-dotenv; never source it.",
+  "why": "Sourcing .env mis-parses it and leaks secrets into stderr.",
   "quote_rx": "\\.env|secret|dotenv",
   "scope_repos": ["<repo>"], "source": "claude_md_import",
   "source_ref": "CLAUDE.md@<sha>#loading-environment-variables"}]
@@ -422,6 +433,19 @@ lanes first (table above), and write a `create_rule` body into a JSON list:
 - `claude_md` is the origin sentence itself — pass it, don't make the
   script guess. `did` = what Claude did (past tense); `what` = what changes
   with the rule on; `quote_rx` = which user corrections count as on-topic.
+- `when`, `do`, `why` — and `when_not`, a list, only when the sentence itself
+  names an exception — are what MemHub's rule judge reads once the check has
+  matched, to decide whether Claude is really in the rule's situation. They
+  come from the same origin sentence as `did` and `what`, and say nothing it
+  does not: `when` is the SITUATION, one sentence about what Claude is doing
+  or about to do (at most 300 characters) — never the check's own words
+  ("the command contains `source`" is the pattern restated); `do` is what the
+  sentence asks (400); `why` is its stated reason (400), left out when it
+  gives none. Leave `why` out and the script uses the row's own reason line.
+  A body with no `when` is still accepted: the report says so on that row,
+  and the rule is judged on its statement alone. **Never narrow a pattern to
+  make up for it** — the check stays as broad as the command shape, and
+  `when` / `when_not` carry the situation.
 - `source_ref = "<path relative to repo root>@<sha>#<heading-slug>"`. The
   identity of a CLAUDE.md rule is **(path, title)**: a re-run with the same
   path and title and identical content is a server no-op (`unchanged`), and
@@ -487,7 +511,12 @@ lanes first): a `git` / `pytest` / `sed` form → `matcher`; an error
 signature → `matcher {event: output}`; an identifier (a repo name,
 `arxiv.org`, `README.md`) → `anchors`; none of those → a session-start
 note, written by hand with the session count and the user's words as its
-origin. Add the checkable ones to the same candidates list.
+origin. Add the checkable ones to the same candidates list, each with its
+`when` / `do` / `why` as in step 2 — here they come from the cluster's
+friction details: `when` is what Claude was doing in those sessions, `do` is
+what the details say it should have done, `why` is what it cost. A
+`when_not` only if the sessions themselves show a case the rule must leave
+alone.
 
 ## 4. Second pass — everything replayed, one report
 
@@ -531,8 +560,10 @@ The report, in order:
   kind with their details, which are the next candidates (give each a
   shape, or accept it as a one-off).
 - **PROPOSED RULES**, grouped by when they fire. Every row is the same five
-  lines: `Why:` (origin), `Cost:`, `With it on:`, `→` decision, and one
-  `evidence:` line with the machine tokens. A "do X before Y" matcher whose
+  lines — `Why:` (origin), `Cost:`, `With it on:`, `→` decision, and one
+  `evidence:` line with the machine tokens — plus `Applies when:`, the
+  situation the rule is for (its `when`, and any `not when:`), or a note that
+  none was given and the rule will be judged on its statement alone. A "do X before Y" matcher whose
   fires were mostly in sessions that had already done X is moved to session
   start with its numbers. A session-armed ordering (`armed_by_events:
   ["session"]`, e.g. fetch before reading `origin/*`) is replayed AND armed by
@@ -564,7 +595,10 @@ and `Makefile.suggested` (targets for workflows used in ≥5 sessions).
 Built-in hypotheses live in `RULE_CANDS`, `OUTPUT_CANDS`, `ORDERING_CANDS`,
 `SKILL_INTENTS`, `HOOK_CANDS` at the top of each section; each carries
 `did`, `what`, `claude_md_rx` (explicit — the script never guesses an
-origin) and `quote_rx`.
+origin) and `quote_rx`, and each rule hypothesis its `when` / `do` (and
+`when_not`), restating its `did` / `what`. Every rule row in
+`proposals.json` carries them as `context: {when, do, why, when_not}`; the
+row's own `why` stays the report's reason line.
 
 ## 5. Verify, check conflicts, show the table, file
 
@@ -599,7 +633,9 @@ origin) and `quote_rx`.
    apply against the BOOK too, in both directions: a starter rule about to be
    filed whose counterpart is already in the book from an earlier mined run
    (or a mined built-in whose starter counterpart is already there — a row
-   titled like a `catalog.json` rule; `list_rules` carries no `source_ref`)
+   titled like a `catalog.json` rule, whether its author is `"xtrace"` or
+   null; `"xtrace"` alone is not a starter rule; `list_rules` carries no
+   `source_ref`)
    is a `duplicate` the script will not flag — look for those titles in the
    `list_rules` reply yourself.
    Keep what is in the book and add the new evidence to the report, unless the
@@ -623,14 +659,31 @@ origin) and `quote_rx`.
      are capped at 400 chars server-side), `scope_repos`, `source`
      (`claude_md_import` for declared, `authored` for observed and asserted),
      `source_ref` (an asserted standard's ref names the asserter's session),
-     and `supersedes_rule_id` where step 2 said so. Everything lands
+     the row's `context` — pass each of `when`, `do`, `why`, `when_not` it
+     holds as the `create_rule` field of that name, unchanged (an empty
+     `context` passes none, and the rule is judged on its statement) —
+     and `supersedes_rule_id` where step 2 said so. A rule filed with
+     `supersedes_rule_id` inherits whichever of the four it does not name
+     from the rule it replaces, so a row whose situation changed must carry
+     its own `when`. No `author`: the person
+     approving these rules is their author. Everything lands
      `proposed`, advise — never pass `activate` from this skill, not even on
      a book that binds only the user.
    - **Starter rules**: pass the candidate's `body` from `candidates.json` as
      it is (`source: "authored"`, `source_ref: starter-rulebook#<id>|catalog
      <version>` — the server keys a re-file on the part before `#` plus the
      title, so keep titles stable: that is what makes a re-run after a catalog
-     update supersede instead of twin), plus `rulebook_id`.
+     update supersede instead of twin), plus `rulebook_id`. The body carries
+     `author: "xtrace"` — keep it: MemHub then shows the rule as written by
+     XTrace, while the person filing it still owns it and answers for it. It
+     also carries the rule's `when`, `do`, `why` and any `when_not` — pass
+     them as they are; they were checked against the server's length caps
+     when the rule verified (S1). An
+     identical re-file of a starter rule filed before authors existed comes
+     back `unchanged` with its author still null; leave it — never supersede
+     a rule just to stamp it. A starter rule is filed only from here, from
+     `candidates.json` — never from its row in the replay's proposals (that
+     row is titled by id and has no author), even in **Both**.
      `mode` is the one field you set: per the S2 answer and the replay's
      downward override; omit it on `session_context` / `anchor_recall` rows
      (a note or anchor cannot block, so the server refuses `gate` there and
@@ -667,6 +720,10 @@ things they need, in this order, before any table:
 
 1. **What you have now** — "N rules proposed in *<rulebook>*, which reaches
    <you / your N teammates>": how many starter, how many from their own work.
+   Say the starter rules show in MemHub as written by XTrace, and that they
+   own them — but only for the ones whose `create_rule` reply carried
+   `author` `xtrace` (a server without authors, or an `unchanged` re-file of
+   an older rule, answers `null`: those show as theirs).
 2. **Nothing is on yet, and how to turn it on** — proposals do nothing until
    someone activates them in MemHub; suggest switching on the reminders in one
    pass and any blocking rule one at a time. For a blocking starter rule say
@@ -712,6 +769,14 @@ or any case flips). When you change a pattern:
 - no quantified group containing `+`, `*` or `|` (`(\s+-\S+)*`) — the hook's
   load lint drops the whole rule, silently;
 - `scope_paths` are `fnmatch` globs: `alembic/versions/*`, not the directory;
+- every rule says its situation: `when` (at most 300 characters) and `do`
+  (400), and `when_not` (at most 8 entries of 200) only for an exclusion its
+  own `silent` cases or `why` name. They restate the `statement` and `why` —
+  no incident the catalog does not already give — and they describe what the
+  agent is doing, never the pattern (`{{slots}}` fill as in the statement).
+  The seeder files the rule's `why` as the reason; one over 400 characters
+  keeps its leading sentences. When a pattern fires in the wrong situation,
+  add a `when_not`; do not narrow the pattern;
 - ship a `fires` case in chained form and a `silent` case for the
   complied-with form, and replay the change over a real corpus before trusting
   it. Every entry in `cut` and half the `command_not_rx` values came from a

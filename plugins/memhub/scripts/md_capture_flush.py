@@ -24,8 +24,15 @@ the ``auto-captured`` tag and a rationale naming the session. Re-saving the
 same ``name`` versions it (server behaviour), so an agent or human publishing
 the file later with ``save_artifact.py`` supersedes the draft in place rather
 than sitting beside it — the failure the artifact-sync reminder exists for.
-Git-authored specs are excluded from automatic memory capture.
-The backend owns their mirrors; capturing a draft would create a second lineage.
+Spec files (``docs/specs/*.md``) are captured like any markdown. Whether one
+is STORED is the server's call, because only the server knows whether the
+repo's brain already mirrors that file from git: when it does, ``save_artifact``
+answers ``action: "mirror_owns_file"`` and writes nothing (the mirror refreshes
+it on every merge), and a later mirror adopts a capture it finds as that file's
+lineage — one lineage per spec file either way. A repo with no mirror (no
+GitHub App grant, no bound brain, Repository Specs off) gets its specs captured.
+Until 0.99.0 the plugin skipped ``spec_dir`` in every repo, so specs of
+unmirrored repos reached no brain at all.
 
 Name = frontmatter ``title:`` > first ``# H1`` > filename stem. The agent keeps
 titles stable across rewrites (the Artifact tool asks it to), so the name is
@@ -56,11 +63,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_http
 from _memhub_auth import resolve_url_and_auth  # noqa: E402
-from spec_owns import safe_spec_dir, DEFAULT_SPEC_DIR  # noqa: E402
-from brain_resolve import resolve_repo_brain  # noqa: E402
+from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from md_capture import MAX_BYTES, MIN_BYTES, frontmatter, is_candidate, load_state, save_state  # noqa: E402
 from redact import redact_text  # noqa: E402
-from room_map import env_for_url, git_env, git_readonly, read_room, repo_root  # noqa: E402
+from room_map import env_for_url, forget_room, git_env, git_readonly, read_room, repo_root  # noqa: E402
 
 TAG = "auto-captured"
 MAX_PER_TURN = 5          # a turn that rewrote 40 .md files is a migration, not deliverables
@@ -316,15 +322,15 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                 s = mcp_http.PolicySession(s, url, headers)
                 for raw, p, text, d in todo:
                     pending.pop(raw, None)
+                    # Reset per item, BEFORE the guarded body: the eviction in
+                    # the handler below must never act on the previous file's
+                    # room when this item fails before resolving its own.
+                    room = None
                     # The whole per-item body is guarded, not just the save:
                     # a malformed room file or odd content must skip ONE item
                     # (which stays dirty), never the rest of the turn.
                     try:
                         root = repo_root(p.parent)
-                        if root is not None and _hand_saved(root, p):
-                            _log(f"skip {p.name}: git-authored spec; the server owns its mirror")
-                            processed.add(raw)
-                            continue
                         name = derive_name(p, text, root)
                         body = redact_text(text)
                         call_args: dict = {
@@ -335,19 +341,17 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                             "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
                                          f"re-save with save_artifact.py to publish",
                         }
-                        room = None
                         if root is not None:
                             # Cache first; on a miss, resolve from the server
-                            # over the session already open (same as the
-                            # transcript capture hooks) so an auto-captured
-                            # spec lands in the repo room when one exists.
+                            # over the session already open (the same lookup
+                            # save_artifact.py does) so an auto-captured spec
+                            # lands in the repo room when one exists.
                             room = read_room(p.parent, env) or \
                                 await resolve_repo_brain(s, p.parent, env)
                         if room:
                             call_args["agent_brain_id"] = room["brain_id"]
-                            # The room's org rides along, as in the capture
-                            # flushes: a brain id alone resolves only inside
-                            # the caller's default org.
+                            # The room's org rides along: a brain id alone
+                            # resolves only inside the caller's default org.
                             if room.get("org_id"):
                                 call_args["org_id"] = room["org_id"]
                         out = await asyncio.wait_for(_save(s, call_args), timeout=TIMEOUT_S)
@@ -357,6 +361,13 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                         # update is required; this is not a content failure.
                         break
                     except Exception as e:  # noqa: BLE001 — stays in dirty, retried next Stop
+                        # A cached room the backend disowns is evicted, so the
+                        # next Stop resolves the room again instead of
+                        # re-sending the dead id until MAX_ATTEMPTS gives up on
+                        # the file. Session capture used to do this as a side
+                        # effect; sessions never name a brain now.
+                        if room and isinstance(e, SaveRejected) and is_missing_brain(str(e)):
+                            forget_room(p.parent, env)
                         _bump(attempts, raw, processed, f"{type(e).__name__}: {str(e)[:120]}",
                               gaveup, d)
                         continue
@@ -365,6 +376,13 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                     saved[raw] = d
                     processed.add(raw)
                     attempts.pop(raw, None)
+                    if out.get("action") == "mirror_owns_file":
+                        # Handled, not failed: the brain's git mirror stores
+                        # this file, so it is recorded like a save and never
+                        # retried until its content changes.
+                        _log(f"skip '{name}': the brain mirrors it from git "
+                             f"(mirror id={out.get('id') or out.get('artifact_id')})")
+                        continue
                     _log(f"saved '{name}' ({len(body):,} chars"
                          f"{', git sweep' if raw in swept else ''}) → "
                          f"{room['name'] if room else 'personal memory'} "
@@ -385,19 +403,6 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
         # non-candidates drop out, successes record their digest, everything
         # else remains dirty for the next Stop.
         _persist(session_id, processed, saved, _changed(attempts0, attempts), gaveup)
-
-
-def _hand_saved(root: Path, p: Path) -> bool:
-    """Git-authored specs are mirrored by the backend, never auto-uploaded."""
-    try:
-        relative = p.relative_to(root).as_posix()
-        directories = {DEFAULT_SPEC_DIR, safe_spec_dir(os.environ.get("MEMHUB_SPEC_DIR", DEFAULT_SPEC_DIR))}
-        # The directory is authoritative even while frontmatter is being edited,
-        # oversized, malformed, or retired. Do not create a competing auto-capture.
-        return p.suffix.lower() == ".md" and any(
-            directory and relative.startswith(directory + "/") for directory in directories)
-    except (OSError, ValueError):
-        return False
 
 
 def _bump(attempts: dict, raw: str, processed: set, why: str,

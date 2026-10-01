@@ -90,7 +90,8 @@ How a fire reaches people (spec §5.3):
 What leaves the machine, exactly:
   * fetch  — the repo name (the origin remote's basename, else the directory's),
              nothing else.
-  * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps.
+  * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps,
+             and the judge's score and verdict when a fire was judged.
              The matched `excerpt` is written to the LOCAL ledger and is
              stripped before the POST.
   * recall — the anchor lane, and the one exception: the server's relevance
@@ -98,6 +99,22 @@ What leaves the machine, exactly:
              command line (heredoc bodies dropped, credential shapes redacted,
              truncated to 400 chars). Redaction is a denylist, not a guarantee.
              `MEMHUB_RULEBOOK_RECALL=0` turns this lane off and keeps the rest.
+  * judge  — the second lane that sends CONTENT, and it sends more. When a
+             matcher or anchor rule fires on a call, `POST /judge` asks whether
+             the rule fits the turn, and carries: the person's message for the
+             current turn (≤ 2000 chars), the stripped turn (the agent's text
+             blocks, each tool call as one line, the first 300 chars of each
+             result — no thinking, no system reminders), the call itself (the
+             command line as recall sends it, or the file path, ≤ 600 chars)
+             and the fired rule ids. All of it passes the same denylists the
+             harness window uses (MemHub keys, home directories, e-mail
+             addresses, command-line credentials) — a floor, not a guarantee.
+             The server judges only for an org whose `rule_judge` flag is on.
+             For any other org it answers `disabled` — the request was still
+             sent — and the hook then asks no more than once per ten minutes
+             per machine, not once per matched call. One verdict per rule per
+             turn is cached in the session state.
+             `MEMHUB_RULEBOOK_JUDGE=0` turns this lane off and keeps the rest.
 
 Usage (wired in hooks.json): printf %s "$IN" | python3 rulebook_hook.py {session|pre|post}
 
@@ -990,11 +1007,19 @@ def read_edit_body(path, is_new=True):
 
 
 # ── matcher engine: pure ────────────────────────────────────────────────────
-def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text=""):
+def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text="", prompt=""):
     """True if `rule` fires on this event. No I/O, no dedup. Ordering rules are not matchers (see
     OrderingEngine)."""
     on = rule.get("on")
     try:
+        if hook_phase == "prompt" and on == "prompt" and prompt:
+            # The RAW prompt, harness wrappers included: a `/loop` wake-up or a
+            # `<task-notification>` is exactly what a prompt rule is written
+            # about, so nothing here strips them the way `harness_prompt`
+            # does for arming.
+            if not re.search(rule["rx"], prompt, re.I | re.M):
+                return False
+            return not (rule.get("not_rx") and re.search(rule["not_rx"], prompt, re.I | re.M))
         if hook_phase == "pre" and on == "bash" and tool == "Bash" and cmd:
             # Rules ABOUT payloads (`body_rx`): rx still names the shell shape
             # (`python - <<`), body_rx says what the payload must be about — so
@@ -1095,17 +1120,29 @@ class OrderingEngine:
         if portable_lock is None:
             # Matcher gates need no shared state; only ordering gates fail open.
             return None
-        lock = open(self.path + ".lock", "a+", encoding="utf-8")
         deadline = time.monotonic() + LOCK_WAIT_S
+        replaced = 0
         while True:
+            lock = open(self.path + ".lock", "a+", encoding="utf-8")
             try:
                 portable_lock.lock_exclusive(lock.fileno(), blocking=False)
-                return lock
             except OSError:
+                lock.close()
                 if time.monotonic() >= deadline:
-                    lock.close()
                     return None
                 time.sleep(0.005)
+                continue
+            if portable_lock.still_at(lock.fileno(), self.path + ".lock") \
+                    or (replaced >= 2 and time.monotonic() >= deadline):
+                # Keep what we hold once it still mismatches after two
+                # reopens past the deadline: the sweep deletes a lock file
+                # once, so only a filesystem whose inode numbers are not
+                # stable gets here, and it would otherwise spin.
+                return lock
+            # state_sweep.py deleted this lock file after we opened it: reopen.
+            replaced += 1
+            portable_lock.unlock(lock.fileno())
+            lock.close()
 
     def _read(self):
         try:
@@ -1650,24 +1687,73 @@ class Probes:
         else: against `origin/main`, a PR onto a long-lived `staging` measures
         the whole staging-vs-main delta instead of the branch, so a
         `diff_lines_gt` rule fires on every PR in that repo no matter how small.
+        The named base fixed that for `gh pr create --base staging`; a plain
+        `git push` names nothing, and in such a repo it fired `spec-owns-
+        untouched` on every push, listing files the branch never touched (they
+        were staging's delta over main — MemHub-Backend #1436, six pushes, six
+        false fires). So when nothing explicit says which branch this one
+        merges into, the guess is the NEAREST of the usual candidates: the one
+        with the fewest commits between its merge-base and HEAD. A branch cut
+        from `staging` is nearer to `staging` than to `main` (staging contains
+        main, so its merge-base is at or after main's); a branch cut from
+        `main` in a repo whose `staging` is a stale release branch is nearer
+        to `main`. Ties keep the old order (remote default first).
+
+        One candidate is never the guess, for the reason `_named_base`
+        refuses a named own-branch: a NON-default branch that already
+        CONTAINS this one — an integration branch the feature was merged into
+        to deploy it, or the branch's own remote copy when the branch is
+        itself named like a base. Merge-base == HEAD measures zero and would
+        read a 5,000-line branch as empty. Skipped, the guess moves on (to
+        the default, which over-measures in such a repo — the failure
+        direction that fires a reminder, not the one that hides a gate). The
+        DEFAULT containing HEAD is different: that is a session on the
+        default branch itself, a branch with no commits of its own yet (only
+        working-tree edits), or one already merged, and there the empty
+        committed diff is the truth — every `given.repo` probe then measures
+        the working tree, as it always has (the spec-untouched cases work on
+        `main` with an empty origin and depend on exactly this).
         """
         def compute():
             env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
             named = self._named_base()
-            cands = ([env] if env else [])
+            explicit = ([env] if env else [])
             # `--base staging` names a branch, not a ref: try the remote's copy
             # before the local one, which may be stale or absent.
-            cands += [f"origin/{named}", named] if named else []
-            cands += [r for r in [self._remote_head()] if r]
-            cands += ["origin/main", "origin/master", "origin/develop",
-                      "main", "master", "develop"]
-            for cand in cands:
-                if self._git("rev-parse", "--verify", "-q", cand + "^{commit}") is None:
+            explicit += [f"origin/{named}", named] if named else []
+            for cand in explicit:
+                mb = self._merge_base(cand)
+                if mb:
+                    return mb
+            head = (self._git("rev-parse", "HEAD") or "").strip()
+            usual = [r for r in [self._remote_head()] if r]
+            usual += ["origin/main", "origin/master", "origin/develop", "origin/staging",
+                      "main", "master", "develop", "staging"]
+            nearest, best, default = None, None, None
+            for cand in usual:
+                mb = self._merge_base(cand)
+                if not mb:
                     continue
-                mb = self._git("merge-base", cand, "HEAD")
-                return mb.strip() if mb and mb.strip() else None
-            return None
+                if default is None:
+                    default = cand  # the first usual branch that resolves
+                if mb == head and cand != default:
+                    continue
+                out = self._git("rev-list", "--count", f"{mb}..HEAD")
+                try:
+                    n = int((out or "").strip())
+                except ValueError:
+                    continue
+                if best is None or n < best:
+                    nearest, best = mb, n
+            return nearest
         return self._get("base", compute)
+
+    def _merge_base(self, cand):
+        """`merge-base(cand, HEAD)` when `cand` resolves to a commit, else None."""
+        if self._git("rev-parse", "--verify", "-q", cand + "^{commit}") is None:
+            return None
+        mb = self._git("merge-base", cand, "HEAD")
+        return mb.strip() if mb and mb.strip() else None
 
     def diff_paths(self):
         """Paths the branch has changed against its base, working tree
@@ -1890,6 +1976,7 @@ def _atomic_json(path, obj):
 _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot keys
     "command_rx": "rx", "command_not_rx": "not_rx", "content_not_rx": "content_not_rx",
     "warn_once_per": "fire_scope", "result_rx": "rx",
+    "prompt_rx": "rx", "prompt_not_rx": "not_rx",
 }
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
@@ -1903,6 +1990,7 @@ _MATCHER_KNOWN = frozenset({
     "event", "command_rx", "command_not_rx", "content_rx", "content_not_rx",
     "path_rx", "path_not_rx", "match_heredoc_body", "body_rx", "warn_once_per",
     "converted_rx", "predicts_rx", "min_chars", "result_rx",
+    "prompt_rx", "prompt_not_rx",   # event "prompt" (0.99.0): the UserPromptSubmit lane
     "given",            # rides inside the matcher block; linted by `given_norm` below
 })
 
@@ -1914,6 +2002,10 @@ def matcher_unsupported(m):
     if not isinstance(m, dict):
         return ""
     return next((k for k in m if k not in _MATCHER_KNOWN), "")
+_PROMPT_ONLY_KEYS = frozenset({"prompt_rx", "prompt_not_rx"})
+# what a prompt rule reads besides its own patterns; every other matcher key
+# is about a tool call, which a prompt is not
+_PROMPT_SHARED_KEYS = frozenset({"warn_once_per", "given", "predicts_rx"})
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
                                  "on", "repo_scope", "_scope_repos", "_scope_paths",
@@ -1924,13 +2016,7 @@ _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_versio
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
             "content_rx", "content_not_rx", "exclude_rx", "converted_rx")
-# Length is a bound on what one rule can cost to compile and store, NOT the
-# backtracking guard — `_RX_NESTED` below is. A 60-character pattern can stall
-# and a 1,500-character alternation of literal paths cannot, so the bound is
-# wide enough for the second. It was 400 before 0.88.0: a hook older than that
-# drops any rule carrying a longer pattern, which is why the server floors such
-# a rule at `min_hook_version` 0.88.0.
-_RX_MAX = 2000
+_RX_MAX = 400
 # (a+)+, (\d+)+$, (a|a)+, (.*), .*.* — the classic backtracking shapes. A
 # denylist, not a proof: stdlib `re` has no timeout, and a bounded matcher
 # (worker + wall clock) is the Phase 2 answer named in §5.1.
@@ -1939,17 +2025,14 @@ _RX_NESTED = re.compile(r"\([^()]*[+*|][^()]*\)\s*[+*{]|\(\.\*\)|(\.\*){2,}")
 
 def rx_ok(pat):
     """Load-time lint for a pattern that came off the wire (§5.1 fallback):
-    must compile, stay under `_RX_MAX`, and avoid the nested-quantifier shapes that
+    must compile, stay short, and avoid the nested-quantifier shapes that
     backtrack catastrophically. A rejected pattern drops the RULE, never the
     hook — a server book can advise, it cannot stall a tool call."""
     if not isinstance(pat, str) or len(pat) > _RX_MAX or _RX_NESTED.search(pat):
         return False
     try:
         re.compile(pat)
-    except Exception:
-        # Not only `re.error`: a deeply nested pattern raises RecursionError
-        # and `a{99999999999}` raises OverflowError. Whatever the parser
-        # objects to, the answer is the same — this pattern does not load.
+    except re.error:
         return False
     return True
 
@@ -2261,6 +2344,11 @@ def to_hook_rule(row):
                 continue
             if k == "result_rx" and "content_rx" in m:
                 continue              # content_rx is the schema key; result_rx is a legacy alias
+            # `prompt_rx` and `command_rx` land on the same `rx`: each event
+            # reads only its own, so a row carrying both cannot let dict order
+            # decide which pattern the rule matches.
+            if (k in _PROMPT_ONLY_KEYS) != (r["on"] == "prompt") and k not in _PROMPT_SHARED_KEYS:
+                continue
             dest = keys.get(k, k)
             if dest in _RESERVED_RULE_KEYS:   # a matcher key can never overwrite the row's own fields
                 continue
@@ -2268,6 +2356,16 @@ def to_hook_rule(row):
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
+        if r["on"] == "prompt":
+            # A prompt rule with no pattern would fire on every prompt — a
+            # session note wearing the wrong delivery. Say which prompts, or
+            # the rule is not one. And it only advises: the prompt has already
+            # been sent, so there is no call to refuse. That is the event's
+            # nature, not skew, so it is no `_degraded` ("update the plugin
+            # to let this rule gate" would be a promise no version keeps).
+            if not r.get("rx"):
+                return None
+            r["mode"] = "advise"
         raw_given = r.get("given")
         if "given" in r and not _norm_given(r):
             return None
@@ -2619,6 +2717,261 @@ def recall_anchor_rules(repo, tool, handles, already_fired):
         return []
 
 
+# ── the rule judge (rule-judge-spec §3, §5) ────────────────────────────────
+#
+# A pattern says a rule MIGHT apply; it matches words, not situations. After
+# the fire pass the hook asks the server whether each matched rule fits the
+# turn in hand, and the answer is recorded on the rule's fire row. Whether the
+# answer also changes what is shown is the server's call, per reply: `enforce`
+# false (shadow) changes nothing here.
+#
+# This is the second lane that sends content, and it sends more than recall:
+# the person's message and the stripped turn. Everything goes through
+# `judge_redact` first, and `MEMHUB_RULEBOOK_JUDGE=0` turns the lane off.
+JUDGE_TIMEOUT_S = _timeout(1.5)    # inside the hook budget; past it nothing is judged
+JUDGE_MAX_RULES = 10               # the server refuses a longer `rules`
+JUDGE_BACKOFF_S = 600              # an org with the judge off is asked this often, not per call
+JUDGE_CALL_CHARS = 600
+JUDGE_MATCHED_CHARS = 200
+JUDGE_ID_CHARS = 200               # repo / session_id / turn_id, the server's bound
+JUDGE_VERDICTS = frozenset({"fit", "no_fit", "timeout", "failed", "no_rule", "disabled"})
+# Matcher rules and anchor rules. Not `ordering` (an obligation the state
+# machine armed is not a pattern's guess), and the session and prompt lanes
+# never reach the fire pass that calls this.
+_JUDGED_ON = frozenset({"bash", "edit", "read", "result", "anchor"})
+
+
+def judge_redact(text):
+    """Every text the judge lane sends goes through this: `redact.py`'s MemHub
+    keys and its identity pass (home directories, e-mail addresses), then the
+    command-line credential shapes of `redact_secrets` — the three denylists
+    the harness window already uses, in the same order. Raises if `redact.py`
+    cannot be imported; the lane then sends nothing."""
+    if not text:
+        return ""
+    import redact  # noqa: PLC0415 — beside this file
+    return redact_secrets(redact.redact_identities(redact.redact_text(text)))
+
+
+def judgeable(rule):
+    """Is this fire one the judge is asked about? A matcher or anchor rule the
+    server can load — its id is a UUID, which a local or test rule's is not."""
+    if rule.get("on") not in _JUDGED_ON:
+        return False
+    try:
+        uuid.UUID(str(rule.get("id")))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def judge_matched_on(rule, ev, handle, root):
+    """What matched, in words, for one fired rule. An anchor rule: the anchors
+    of the rule that appear in `handle` (the command or path of the call). A
+    matcher rule: its event, as the server names it, and the file when the
+    event that fired it was an edit or a read of one. Not yet redacted."""
+    if rule.get("on") == "anchor":
+        low = (handle or "").lower()
+        hit = [a for a in rule.get("anchors") or [] if isinstance(a, str) and a.lower() in low]
+        return "anchor '%s'" % ", ".join(hit) if hit else "anchor"
+    out = "%s pattern" % ("output" if rule.get("on") == "result" else rule.get("on"))
+    path = (ev or {}).get("fp") or ""
+    if path and (ev or {}).get("tool") in EDIT_TOOLS + READ_TOOLS:
+        if root and path.startswith(root.rstrip("/") + "/"):
+            path = os.path.relpath(path, root)
+        out += f" in {path}"
+    return out
+
+
+def _judge_backoff_path():
+    return os.path.join(_base(), "judge.json")
+
+
+def judge_backed_off():
+    """True while a recent reply said the judge is off for this org (or the
+    server has no `/judge` at all). Shared by every session on the machine."""
+    try:
+        with open(_judge_backoff_path(), encoding="utf-8") as f:
+            until = json.load(f).get("judge_disabled_until")
+        return isinstance(until, (int, float)) and time.time() < until
+    except Exception:
+        return False
+
+
+def _judge_back_off():
+    try:
+        _atomic_json(_judge_backoff_path(),
+                     {"judge_disabled_until": time.time() + JUDGE_BACKOFF_S})
+    except Exception:
+        pass
+
+
+def ask_judge(body):
+    """POST /judge. Returns `({rule_id: {"verdict", "show", "p_fit"}}, enforce)`
+    for the requested rules the reply answered, or None on ANY client failure —
+    no credential, timeout, a non-200, a reply off the contract — in which case
+    nothing was judged and the caller shows and blocks exactly as it would
+    have. A reply whose verdicts are all `disabled`, and a 404 from a server
+    that predates the route, start the `JUDGE_BACKOFF_S` backoff; the 404
+    returns None without a breadcrumb, since nothing is broken. Never raises."""
+    try:
+        api = _api()
+        if not api:
+            return None
+        base, bearer, http = api
+        try:
+            reply = http.rest(f"{base}{API_PATH}/judge", bearer, "POST", body=body,
+                              timeout=JUDGE_TIMEOUT_S)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                _judge_back_off()
+                return None
+            raise
+        data = reply.data
+        if reply.status != 200 or not isinstance(data, dict) \
+                or not isinstance(data.get("enforce"), bool) \
+                or not isinstance(data.get("verdicts"), list):
+            raise ValueError(f"HTTP {reply.status}: unexpected reply shape")
+        asked = {r["rule_id"] for r in body["rules"]}
+        out = {}
+        for v in data["verdicts"]:
+            # One malformed verdict makes the reply untrustworthy as a whole. A
+            # score outside [0, 1] matters twice: `POST /fires` rejects the row.
+            p = v.get("p_fit") if isinstance(v, dict) else None
+            if not isinstance(v, dict) or v.get("verdict") not in JUDGE_VERDICTS \
+                    or not isinstance(v.get("show"), bool) \
+                    or not (p is None or (isinstance(p, (int, float)) and not isinstance(p, bool)
+                                          and 0 <= p <= 1)):
+                raise ValueError("unexpected verdict shape")
+            rid = str(v.get("rule_id"))
+            if rid in asked:
+                out[rid] = {"verdict": v["verdict"], "show": v["show"], "p_fit": p}
+        _breadcrumb_clear("judge")
+        if out and all(v["verdict"] == "disabled" for v in out.values()):
+            _judge_back_off()
+        return out, data["enforce"]
+    except Exception as exc:
+        _breadcrumb("judge", exc)
+        return None
+
+
+def judge_fires(st, data, *, repo, session, tool, cmd, fp, root, fired_now, fired_on):
+    """Ask whether each judgeable rule in `fired_now` fits the current turn.
+
+    Returns `(verdicts, held, fresh)`: `verdicts` is {rule_id: {"verdict",
+    "p_fit"}} for every fire that has a judgement (to record on its row);
+    `held` is the set of rule ids to hold back — `show` false under a reply
+    with `enforce` true, never otherwise; `fresh` is the subset of `held`
+    whose verdict arrived on THIS call rather than from the turn's cache.
+
+    One verdict per rule per turn: answers are kept in `st["judge"]` as
+    {turn_id: {rule_id: {"verdict", "show", "p_fit"}}}, only for the current
+    turn, and a rule found there is not sent again. `show` is stored as
+    acted on (true for every rule of a shadow reply). `disabled` is not
+    cached — the backoff file covers it — and nothing is cached when the turn
+    has no id. At most `JUDGE_MAX_RULES` uncached rules are sent; the rest,
+    and every rule of a failed call, are simply absent from `verdicts`.
+    Never raises: any failure is "nothing judged"."""
+    try:
+        if os.environ.get("MEMHUB_RULEBOOK_JUDGE", "1") == "0":
+            return {}, set(), set()
+        todo = [r for r in fired_now if judgeable(r)]
+        if not todo:
+            return {}, set(), set()
+        import rule_judge_turn  # noqa: PLC0415 — beside this file
+        turn = rule_judge_turn.read_turn(data.get("transcript_path"), redact=judge_redact)
+        turn_id = str(turn.get("turn_id") or "")[:JUDGE_ID_CHARS]
+        cache = st.get("judge") if isinstance(st.get("judge"), dict) else {}
+        known = cache.get(turn_id) if turn_id else None
+        known = dict(known) if isinstance(known, dict) else {}
+        ask = [r for r in todo if str(r["id"]) not in known][:JUDGE_MAX_RULES]
+        answered = {}
+        if ask and not judge_backed_off():
+            handle = shell_only(cmd) if tool == "Bash" and cmd else fp
+            body = {
+                "repo": str(repo or "")[:JUDGE_ID_CHARS],
+                "session_id": str(session or "")[:JUDGE_ID_CHARS],
+                "turn_id": turn_id,
+                "person_request": turn.get("person_request") or "",
+                "turn": turn.get("turn") or [],
+                "call": {"tool": str(tool or "")[:200],
+                         "text": judge_redact(handle)[:JUDGE_CALL_CHARS]},
+                "rules": [{"rule_id": str(r["id"]),
+                           "matched_on": judge_redact(judge_matched_on(
+                               r, fired_on.get(r["id"]), handle, root))[:JUDGE_MATCHED_CHARS]}
+                          for r in ask],
+            }
+            reply = ask_judge(body)
+            if reply is not None:
+                got, enforce = reply
+                # Shadow: the answer is recorded and acted on as "show".
+                answered = {rid: dict(v, show=v["show"] or not enforce) for rid, v in got.items()}
+        verdicts, held, fresh = {}, set(), set()
+        for r in todo:
+            rid = str(r["id"])
+            v = answered.get(rid) or known.get(rid)
+            if not isinstance(v, dict) or v.get("verdict") not in JUDGE_VERDICTS:
+                continue
+            verdicts[r["id"]] = {"verdict": v["verdict"], "p_fit": v.get("p_fit")}
+            if v.get("show") is False:
+                held.add(r["id"])
+                if rid in answered:
+                    fresh.add(r["id"])
+        if turn_id:
+            known.update({rid: v for rid, v in answered.items() if v["verdict"] != "disabled"})
+            st["judge"] = {turn_id: known}
+        return verdicts, held, fresh
+    except Exception as exc:
+        _breadcrumb("judge", exc)
+        return {}, set(), set()
+
+
+def unfire(st, rule, key, before, *, reset_raw):
+    """Undo the per-session marks the fire pass wrote for `rule` on this call,
+    so a rule the judge held back can fire again in a later turn. `before` is
+    the state as it was when the fire pass started; `key` is the rule's
+    `dedup_keys` entry.
+
+      st["fired"]         the one dedup mark this call appended (the anchor
+                          lane's rule id, or the matcher lane's key) — without
+                          this the rule is spent for the session by a fire
+                          nobody was shown.
+      st["counts"]        a `counter:N` rule's hit, put back, so the next
+                          match reaches N again rather than passing it.
+      st["spec_pending"]  the entry a `spec_untouched` fire filed, put back
+                          as it was: nobody was asked to touch those specs.
+      st["raw"]           with `reset_raw`, zeroed — the suppressed row this
+                          call writes carries the count, exactly as a shown
+                          fire's row does. Without it (a repeat the turn's
+                          cache answered, which writes no row) the match stays
+                          counted for the rule's next row.
+    """
+    rid = rule["id"]
+    if key is not None and st["fired"].count(key) > before["fired"].count(key):
+        for i in range(len(st["fired"]) - 1, -1, -1):
+            if st["fired"][i] == key:
+                del st["fired"][i]
+                break
+    if rid in before["counts"]:
+        st["counts"][rid] = before["counts"][rid]
+    else:
+        st["counts"].pop(rid, None)
+    for k in [k for k in st["spec_pending"] if k not in before["spec_pending"]
+              or st["spec_pending"][k] != before["spec_pending"][k]]:
+        try:
+            mine = json.loads(k)[0] == rid
+        except Exception:
+            mine = False
+        if not mine:
+            continue
+        if k in before["spec_pending"]:
+            st["spec_pending"][k] = before["spec_pending"][k]
+        else:
+            del st["spec_pending"][k]
+    if reset_raw:
+        st["raw"][rid] = 0
+
+
 def spawn_fetch(repo):
     """Refresh the book in a DETACHED child so SessionStart returns at once."""
     import subprocess
@@ -2633,9 +2986,13 @@ def spawn_fetch(repo):
 # events this hook posts, and a hook that sent one would only be honoured at
 # the lowest precedence as a legacy verdict. `override_reason` stays — on a
 # GATE row it is the excuse given on the blocked call, the row's own record.
+# `judge_score` / `judge_verdict` (rule-judge-spec §4) are on a row only when
+# the judge answered for that fire; see `wire_row`.
 WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "worktree",
              "repo", "branch", "tool", "hook_phase", "mode", "dedup_key",
-             "raw_matches_before_fire", "fired_at", "source_message_id", "override_reason")
+             "raw_matches_before_fire", "fired_at", "source_message_id", "override_reason",
+             "judge_score", "judge_verdict")
+_JUDGE_WIRE_KEYS = ("judge_score", "judge_verdict")
 
 # What the hook observed AFTER a fire (rule-fire-events-spec §2). Facts, never
 # verdicts: `receipt` (an ordering rule's green run in this checkout),
@@ -2682,8 +3039,15 @@ def wire_row(row):
 
     `host` is local-only, like `rulebook_id`: it is not a wire field, it is
     how this projection knows which namespace the session id belongs in.
+
+    The two judge keys are sent only on a row whose fire was judged (it has a
+    `judge_verdict`). A fire nobody judged posts the row shape it always did,
+    which a server older than the judge columns also accepts.
     """
     out = {k: row.get(k) for k in WIRE_KEYS}
+    if row.get("judge_verdict") is None:
+        for k in _JUDGE_WIRE_KEYS:
+            out.pop(k, None)
     out["session_id"] = wire_session_id(out.get("session_id"), row.get("host"))
     return out
 
@@ -3252,20 +3616,32 @@ def _state_lock(p):
     LOCK_WAIT_S (the hook fails open — a plain write, today's behaviour)."""
     if portable_lock is None:
         return None
-    try:
-        lock = open(p + ".lock", "a+", encoding="utf-8")
-    except Exception:
-        return None
     deadline = time.monotonic() + LOCK_WAIT_S
+    replaced = 0
     while True:
         try:
+            lock = open(p + ".lock", "a+", encoding="utf-8")
+        except Exception:
+            return None
+        try:
             portable_lock.lock_exclusive(lock.fileno(), blocking=False)
-            return lock
         except OSError:
+            lock.close()
             if time.monotonic() >= deadline:
-                lock.close()
                 return None
             time.sleep(0.005)
+            continue
+        if portable_lock.still_at(lock.fileno(), p + ".lock") \
+                or (replaced >= 2 and time.monotonic() >= deadline):
+            # Keep what we hold once it still mismatches after two reopens
+            # past the deadline: the sweep deletes a lock file once, so only a
+            # filesystem whose inode numbers are not stable gets here, and it
+            # would otherwise spin.
+            return lock
+        # state_sweep.py deleted this lock file after we opened it: reopen.
+        replaced += 1
+        portable_lock.unlock(lock.fileno())
+        lock.close()
 
 
 def _write_json_atomic(p, st):
@@ -3438,116 +3814,6 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
         armed.append(rid)
     save_state(sp, st, before=before)
     return armed
-
-
-# ── error-arc pairing, for the harness-tied memory sensor ──────────────────
-#
-# A tool error on a command and a later success on the same command are ONE
-# moment, what broke and what fixed it, not two. The post lane already sees
-# every Bash result, so it pairs them here into a per-session file that the
-# Stop sensor (`harness_stop.py`) takes at the end of the turn. The arcs live
-# in their own file on purpose: the session state is merged by delta under a
-# lock for the arming keys only, so a second whole-file writer there could
-# drop another call's arc. Behind the harness flag, which defaults OFF: unless
-# it is explicitly on nothing here is read or written.
-HARNESS_FLAG = "MEMHUB_HARNESS_EXTRACT"
-ARCS_OPEN_MAX = 20            # distinct failing commands tracked per session
-ARCS_CLOSED_MAX = 20          # closed arcs waiting for the Stop sensor
-
-
-def harness_extract_on(environ=None):
-    """Default OFF, matching `harness_extract.extract_enabled` — the two gates
-    are one switch and must not disagree about what it says."""
-    env = os.environ if environ is None else environ
-    on = ("1", "on", "true", "yes")
-    if str(env.get("MEMHUB_HARNESS_CHILD", "")).strip().lower() in on:
-        return False          # an authoring child is never sensed (see extract_enabled)
-    return str(env.get(HARNESS_FLAG, "")).strip().lower() in on
-
-
-def arcs_path(session_id):
-    return state_path(session_id)[:-len(".json")] + ".arcs.json"
-
-
-def _update_arcs(session_id, change):
-    """Read, change and write the arcs file under its own lock; returns what
-    `change` returns. Fails open, like every other path in this hook."""
-    p = arcs_path(session_id)
-    lock = _state_lock(p)
-    try:
-        try:
-            with open(p, encoding="utf-8") as f:
-                arcs = json.load(f)
-        except Exception:
-            arcs = {}
-        if not isinstance(arcs, dict):
-            arcs = {}
-        out = change(arcs)
-        # Private (0600): a failed command's text can carry a credential, and
-        # the rename keeps the temp file's mode.
-        tmp = f"{p}.{os.getpid()}.tmp"
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(arcs, f)
-        os.replace(tmp, p)
-        return out
-    except Exception:
-        return None
-    finally:
-        if lock is not None:
-            try:
-                portable_lock.unlock(lock.fileno())
-            except Exception:
-                pass
-            lock.close()
-
-
-def pair_error_arc(session_id, cmd, resp):
-    """Record a Bash failure on `cmd`, or close the arc a later success on the
-    same command completes. `cost` is the number of Bash results between the
-    two; a costly arc is worth a look whatever its error said."""
-    key = shell_only(cmd or "").strip()[:200]
-    if not key:
-        return
-    ok = bash_ok(resp)
-    signature = result_text(resp)[:200]
-
-    def change(arcs):
-        n = arcs["calls"] = int(arcs.get("calls") or 0) + 1
-        opened = arcs.setdefault("open", {})
-        closed = arcs.setdefault("closed", [])
-        if ok:
-            first = opened.pop(key, None)
-            if isinstance(first, dict):
-                closed.append({"signature": first.get("signature", ""), "target": key,
-                               "fix": key, "cost": n - int(first.get("call") or n),
-                               "at": _now()})
-                del closed[:-ARCS_CLOSED_MAX]
-        elif key not in opened:
-            opened[key] = {"signature": signature, "call": n}
-            for stale in list(opened)[:-ARCS_OPEN_MAX]:
-                opened.pop(stale, None)
-
-    _update_arcs(session_id, change)
-
-
-def take_error_arcs(session_id):
-    """The closed arcs since the last take, with the open failures cleared so
-    nothing pairs across turns. Never raises; no file is no arcs."""
-    if not os.path.exists(arcs_path(session_id)):
-        return []
-
-    def change(arcs):
-        closed = [a for a in (arcs.get("closed") or []) if isinstance(a, dict)]
-        arcs.clear()
-        return closed
-
-    got = _update_arcs(session_id, change)
-    return got if isinstance(got, list) else []
 
 
 def result_text(resp):
@@ -4026,7 +4292,7 @@ def agent_id_of(data):
 
 
 def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_keys=None,
-              override_reasons=None, fired_at=None):
+              override_reasons=None, fired_at=None, judge=None):
     """One ledger row per (rule, fire) — spec §3.2. Identifiers, not payloads:
     `excerpt` stays in this LOCAL file and never crosses the wire without
     org opt-in. `override_reasons` is {rule_id: why} for the GATES this call
@@ -4036,6 +4302,9 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     it is here so a local reader can tell which book a fire came from.
     `fired_at` lets a caller stamp a fire and the event that answers it on
     the same call (a same-call dismissal) with one instant.
+    `judge` is {rule_id: {"verdict", "p_fit"}} from `judge_fires`: a rule in it
+    gets `judge_verdict` and `judge_score` (the score may be null) on its row;
+    a rule not in it gets neither key.
     Returns {rule_id: fire_id} so events can point back."""
     if portable_lock is None:
         # Enforcement still runs, but do not create telemetry that cannot drain.
@@ -4047,6 +4316,9 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
             for r in rules:
                 fid = str(uuid.uuid4())
                 ids[r["id"]] = fid
+                verdict = (judge or {}).get(r["id"])
+                judged = {"judge_score": verdict.get("p_fit"),
+                          "judge_verdict": verdict.get("verdict")} if verdict else {}
                 f.write(json.dumps({
                     "fire_id": fid, "rule_id": r["id"],
                     "rulebook_id": r.get("_rulebook_id"),
@@ -4065,6 +4337,7 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "fired_at": fired_at or _now(),
                     "override_reason": (override_reasons or {}).get(r["id"]),
                     "excerpt": excerpt[:160],
+                    **judged,
                 }) + "\n")
     except Exception:
         pass
@@ -4351,6 +4624,84 @@ def _host_arg(argv=None):
     return "claude"
 
 
+def prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text):
+    """Fire the `prompt` matcher rules this UserPromptSubmit matches — the one
+    moment a wake-up (a `/loop` tick, a `<task-notification>`) reaches the
+    hook at all, since what the agent does next is plain text and a tool this
+    hook never sees. Advise only (`to_hook_rule` forces it): the prompt is
+    already sent, so there is nothing to refuse. Same envelope, dedup and
+    ledger as the pre lane, with `hook_phase: prompt` and the event as the
+    tool, so the server folds these fires like any other."""
+    # A prompt carries no path, so path scope reads it as a Bash call does:
+    # an include-scoped rule never fires, an exclude-only one may.
+    live = [r for r in rules if r.get("on") == "prompt" and r.get("status", "active") == "active"
+            and scope_ok(r, repo, gitdir) and path_in_scope(r, "", root)]
+    if not live:
+        return
+    ctx = dict(ctx, tool="UserPromptSubmit")
+    sp = state_path(session)
+    st = load_state(sp)
+    before = snapshot_arming(st)
+    probes = Probes(root, branch, transcript_path=data.get("transcript_path"),
+                    agent_id=ctx["agent_id"])
+    fired, dedup_keys = [], {}
+    for r in live:
+        rid = r["id"]
+        scope = r.get("fire_scope", "session")
+        key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
+        matched = evaluate(r, hook_phase="prompt", tool="UserPromptSubmit", prompt=text) \
+            and given_ok(r, probes)
+        if scope != "call" and key in st["fired"]:
+            if matched:
+                st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
+            continue
+        if not matched:
+            continue
+        st["raw"][rid] = st["raw"].get(rid, 0) + 1
+        if scope != "call":
+            st["fired"].append(key)
+        dedup_keys[rid] = key
+        fired.append(r)
+    if not fired:
+        save_state(sp, st, before=before)
+        return
+    fired.sort(key=book_rank)
+    shown, cut = fired[:MAX_ADVISE], fired[MAX_ADVISE:]
+    lines = [f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
+    user_lines, disclosures = [], []
+    for r in shown:
+        label = r.get("_label") or r["id"]
+        lines.append(f"- **[{label}]** {r['text']}{_why(r)}")
+        stale_key = f"_degraded:{r['id']}"
+        if r.get("_degraded") and stale_key not in st["fired"]:
+            st["fired"].append(stale_key)
+            lines.append(f"  _(advice only — {r['_degraded']}. Update the "
+                         f"{BRAND} plugin to let this rule gate.)_")
+        line = disclosure_line(r)
+        disclosures.append(line)
+        user_lines.extend([line, f"   {BRAND} ▸ [{label}] {r['text']}"])
+    lines.append(ADVISE_FEEDBACK_HINT)
+    lines.append(disclosure_instruction(disclosures))
+    try:
+        emit("UserPromptSubmit", "\n".join(lines), user_line="\n".join(user_lines))
+    except Exception:
+        pass
+    fired_at = _now()
+    raw = {r["id"]: st["raw"].get(r["id"]) for r in fired}
+    # The excerpt is local-only, and a prompt is the person's words: record
+    # which wrapper matched, not what they wrote around it.
+    for r in shown:
+        m = re.search(r["rx"], text, re.I | re.M)
+        log_fires(ctx, [r], hook_phase="prompt", mode="advise", excerpt=m.group(0) if m else "",
+                  raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at)
+    for r in cut:
+        log_fires(ctx, [r], hook_phase="prompt", mode="suppressed", excerpt="",
+                  raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at)
+    for r in shown:
+        st["raw"][r["id"]] = 0
+    save_state(sp, st, before=before)
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "pre"
     codex_pre = mode == "codex-pre"
@@ -4429,6 +4780,16 @@ def main():
                        "host": _host_arg()}, kind,
                       at=turn_end_at(session, started, data.get("transcript_path")))
         flush_fires(final=final)
+        # Once a day, delete the plugin's local state nothing will read again
+        # (state_sweep.py). Only on the real install: an overridden base is a
+        # test, or create-rule's private forward-test base, and neither may
+        # reach into ~/.config/memhub-plugin.
+        if not os.environ.get("MEMHUB_RULEBOOK_BASE"):
+            try:
+                import state_sweep  # noqa: PLC0415 — beside this file
+                state_sweep.maybe_sweep()
+            except Exception:
+                pass
         return 0
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -4478,9 +4839,11 @@ def main():
            "source_message_id": message_id_of(data), "worktree": worktree_key(root),
            "host": _host_arg()}
     if mode == "prompt":
-        # UserPromptSubmit. It arms and says nothing: anything printed here is
-        # injected above the person's own words, and an arming is not news —
-        # the fire at the gated command is.
+        # UserPromptSubmit. It arms ordering rules silently: anything printed
+        # here is injected above the person's own words, and an arming is not
+        # news — the fire at the gated command is. The one thing it SAYS is a
+        # `prompt` matcher rule (0.99.0), whose whole point is to speak at
+        # this moment — below, after the arming.
         #
         # The book is refreshed FIRST, on the same terms the session lane
         # uses. A prompt is the only chance a prompt-armed rule gets: evaluate
@@ -4493,6 +4856,12 @@ def main():
         if text and not harness_prompt(text):
             rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
             arm_obligations(rules, repo, gitdir, session, "prompt", prompt=text)
+        elif text:
+            # A wake-up is not worth making the session wait for the server:
+            # it recurs, and the detached refresh reaches the next one.
+            maybe_refresh(repo, fetched_at)
+        if text:
+            prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text)
         return 0
     # Repo facts answer about the tree the COMMAND runs in; which rules bind
     # you is still the session's repo, and stays keyed on it.
@@ -4582,13 +4951,6 @@ def main():
                     if mode == "pre" and (tool in EDIT_TOOLS or patched) else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
-    # A subagent's arcs are its own: its Stop is ignored by harness_stop.py, so
-    # recording them under the session would hand them to the main agent's turn.
-    if resp is not None and cmd and not ctx["agent_id"] and harness_extract_on():
-        try:
-            pair_error_arc(session, cmd, resp)     # taken by harness_stop.py at Stop
-        except Exception:
-            pass
     ordering = None
     dedup_keys = {}
 
@@ -4701,6 +5063,11 @@ def main():
     dismissals = {}
     if mode == "pre" and override_label is not None:
         dismissals[override_label] = override_reason
+
+    # What the fire pass below is about to mark, as it stands now — so a rule
+    # the judge holds back can have exactly its own marks undone (`unfire`).
+    marks = {"fired": list(st["fired"]), "counts": dict(st["counts"]),
+             "spec_pending": dict(st["spec_pending"])}
 
     # Anchor rules (§4.7): one server call per tool call, only when the book has
     # an active anchor rule in scope and the call carries a handle. The server
@@ -4841,6 +5208,41 @@ def main():
     for rid in converted_hits:
         log_event(ctx, "converted", rule_id=rid,
                   at=_just_before(fired_at) if rid in fired_ids else fired_at)
+
+    def _excerpt(r):
+        """Local-only (never on the wire). A fire from a Bash-written file
+        records the file, prefixed so a reader can count how many edits
+        arrive through Bash versus the Write tool."""
+        ev = fired_on.get(r["id"])
+        if ev and ev.get("via") == "bash":
+            return f"bash-edit {ev['fp']}"
+        if ev and ev.get("via") == "bash-read":
+            return f"bash-read {ev['fp']}"
+        return cmd or fp or ""
+
+    # The rule judge (rule-judge-spec §5): does each matched rule fit this
+    # turn? Every judged fire carries the answer on its row. Only a reply with
+    # `enforce` on can put a rule in `held`, and a held rule leaves `fired_now`
+    # HERE — before the gates are picked, before the advisory cap is spent and
+    # before any disclosure line is built — so it is not shown, blocks
+    # nothing and takes nobody's slot. Its fire is still recorded, as
+    # `suppressed` with the verdict, once per turn: that row is how a rule the
+    # judge wrongly hid gets found. A repeat match later in the same turn is
+    # answered from the turn's cache and writes no second row.
+    #
+    # A held rule's dedup is ROLLED BACK (`unfire`): the fire pass has already
+    # marked it spent for the session, and a rule that did not fit this turn
+    # must be able to fire in the next one. Shadow, a failed call, the lane
+    # switched off: `held` is empty and nothing below this block changes.
+    judged, held, fresh = judge_fires(st, data, repo=repo, session=session, tool=tool, cmd=cmd,
+                                      fp=fp, root=root, fired_now=fired_now, fired_on=fired_on)
+    for r in [r for r in fired_now if r["id"] in held]:
+        if r["id"] in fresh:
+            log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
+                      raw_counts={r["id"]: st["raw"].get(r["id"])}, dedup_keys=dedup_keys,
+                      fired_at=fired_at, judge=judged)
+        unfire(st, r, dedup_keys.get(r["id"]), marks, reset_raw=r["id"] in fresh)
+    fired_now = [r for r in fired_now if r["id"] not in held]
 
     def _dismiss(dismissals):
         """Post a `dismissed` event per rule the override names; returns the
@@ -5100,30 +5502,20 @@ def main():
         pass
     raw = {r["id"]: st["raw"].get(r["id"]) for r in fired_now}
 
-    def _excerpt(r):
-        """Local-only (never on the wire). A fire from a Bash-written file
-        records the file, prefixed so a reader can count how many edits
-        arrive through Bash versus the Write tool."""
-        ev = fired_on.get(r["id"])
-        if ev and ev.get("via") == "bash":
-            return f"bash-edit {ev['fp']}"
-        if ev and ev.get("via") == "bash-read":
-            return f"bash-read {ev['fp']}"
-        return cmd or fp or ""
-
     ids = {}
     for r in (r for r in shown if r["id"] not in gate_ids):
         # An advise row carries no reason: a same-call dismissal is the event
         # below, and the row's outcome columns are the server's to write.
         ids.update(log_fires(ctx, [r], hook_phase=mode, mode="advise", excerpt=_excerpt(r),
-                             raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at))
+                             raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at,
+                             judge=judged))
     if gates:      # a blocked call and an overridden one are both delivered gate fires
         ids.update(log_fires(ctx, gates, hook_phase=mode, mode="gate", excerpt=cmd or fp or "",
                              raw_counts=raw, dedup_keys=dedup_keys,
-                             override_reasons=overridden, fired_at=fired_at))
+                             override_reasons=overridden, fired_at=fired_at, judge=judged))
     for r in cut:   # the per-call cap has a cost; make it visible, never silent
         log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
-                  raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at)
+                  raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at, judge=judged)
     for r in shown:
         st["raw"][r["id"]] = 0
         if ids.get(r["id"]) and r["id"] in same_call:

@@ -128,9 +128,9 @@ that relies on it still needs a stored key for the tools.
 ## After a successful first login
 
 If this was a first-time setup, mention that `/memhub:onboard` creates and
-seeds the repo's team brain. Once the host has loaded and approved the capture hooks, they route to a
-brain named `Repo: <org>/<name>` on their own if one exists — but a repo with
-no such brain yet saves to personal memory until onboard creates it. Do not
+seeds the repo's team brain. Once the host has loaded and approved the capture hooks, sessions are
+captured into the user's personal memory — never into a brain — while saved
+artifacts and specs go to the repo's brain once onboard creates it. Do not
 run it unprompted.
 
 The `next steps` line links to the guide for the initiating host. After a new

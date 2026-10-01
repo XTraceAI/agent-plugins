@@ -1,17 +1,17 @@
 """Per-session list of memory ids already shown to the agent.
 
-One list per Claude Code session, shared by every hook that injects memory:
-``directive_recall`` (its ``already_fired``), the session-start brief and the
-prompt hook. An id that any of them rendered is not rendered again by any of
-the others, and is sent back to the server as ``already_fired`` where the tool
-accepts it — the "nothing repeated" item of the navigation spec (§1.5).
+One list per Claude Code session, shared by the hooks that inject memory
+pointers: the session-start brief and the prompt hook (both
+``brain_brief.py``). An id that either rendered is not rendered again by the
+other — the "nothing repeated" item of the navigation spec (§1.5).
 
 Stdlib only, deliberately: the brief runs on the synchronous SessionStart path
 and must not pay for a transport module to read a list of strings.
 
 The file layout predates this module (``~/.claude/.memhub/directive_fired/
-<session>.json``, a JSON list) and is kept as is so a plugin upgrade mid-week
-neither loses the running sessions' state nor doubles it.
+<session>.json``, a JSON list — named for the retired directive-recall hook
+that first kept it) and is kept as is so a plugin upgrade mid-week neither
+loses the running sessions' state nor doubles it.
 """
 from __future__ import annotations
 

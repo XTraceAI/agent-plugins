@@ -21,7 +21,7 @@
           {
             "type": "command",
             "timeout": 8,
-            "statusMessage": "MemHub: checking for relevant directives",
+            "statusMessage": "MemHub: checking team rules",
             "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch PreToolUse",
             "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch PreToolUse"
           }

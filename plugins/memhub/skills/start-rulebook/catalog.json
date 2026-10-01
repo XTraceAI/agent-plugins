@@ -73,6 +73,11 @@
    "min_hook_version": "0.49.0",
    "statement": "This file is over {{read_threshold}} lines. Read the section you need with offset and limit. Delegate only a multi-file question, and to a cheaper model.",
    "why": "a whole-file read is re-sent on every later turn; a same-model subagent costs ~54K tokens to start, so slicing beats delegating for one file.",
+   "when": "The main agent is about to read a whole file of more than {{read_threshold}} lines into its context.",
+   "do": "Read the section you need with offset and limit. Delegate only a multi-file question, and to a cheaper model.",
+   "when_not": [
+    "The agent is reading a slice of the file with an offset and a limit."
+   ],
    "matcher": {
     "event": "read",
     "given": {
@@ -119,6 +124,8 @@
    "min_hook_version": "0.49.0",
    "statement": "Lockfiles, build output, vendored and minified code are not read whole. Grep for the one line you need.",
    "why": "these files carry no reasoning value per token.",
+   "when": "The main agent is about to read a lockfile, build output, or vendored or minified code whole.",
+   "do": "Do not read it whole. Grep for the one line you need.",
    "matcher": {
     "event": "read",
     "path_rx": "{{never_read_rx}}",
@@ -162,6 +169,8 @@
    "min_hook_version": "0.49.0",
    "statement": "Large data file. Use jq, head, or a short script for the shape or the count you need.",
    "why": "data files are read for a shape or a count, not for their content.",
+   "when": "The main agent is about to read a large data file into its context.",
+   "do": "Use jq, head, or a short script for the shape or the count you need.",
    "matcher": {
     "event": "read",
     "path_rx": "\\.(?:json|jsonl|ndjson|csv|tsv|xml|ipynb|sql|parquet)$",
@@ -198,6 +207,8 @@
    "min_hook_version": "0.49.0",
    "statement": "Binary archive or database. There is nothing to read as text. Use the tool for the type, or skip it.",
    "why": "a binary read is pure noise for every agent.",
+   "when": "The agent is about to read a binary archive or database file as text.",
+   "do": "Do not read it as text. Use the tool for the type, or skip it.",
    "matcher": {
     "event": "read",
     "path_rx": "\\.(?:sqlite3?|db|pyc|whl|tar|tgz|gz|zip|7z|jar|so|dylib|exe|bin)$"
@@ -225,6 +236,12 @@
    "delivery": "agent_hook",
    "statement": "The branch diff is over 400 lines. Run git diff --stat here and read it by file, or delegate the review one subagent per dimension.",
    "why": "fires exactly when reading the diff costs the most. Only the whole-branch form: a diff narrowed to a path (`-- file`) or sent to a file is the advice already taken, and `git show <commit>` is that commit's size, not the branch's.",
+   "when": "The main agent is about to read the whole branch diff, and that diff is over 400 lines.",
+   "do": "Run git diff --stat and read the diff by file, or delegate the review one subagent per dimension.",
+   "when_not": [
+    "The agent is diffing one named path, or sending the diff to a file instead of reading it.",
+    "The agent is looking at a single commit with git show, not at the branch's diff."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}diff\\b",
@@ -289,6 +306,8 @@
    "delivery": "agent_hook",
    "statement": "Bound it: git log -n 20 --oneline, git blame -L start,end.",
    "why": "history is the one input with no natural end.",
+   "when": "The main agent is about to read git history (log or blame) with no bound on how much comes back.",
+   "do": "Bound it: git log -n 20 --oneline, git blame -L start,end.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}(?:log\\b(?![^|;&]*(?:-n\\s*\\d|\\s-\\d|--max-count|\\.\\.|--since|--after|\\s-1\\b))|blame\\b(?![^|;&]*\\s-L))",
@@ -325,6 +344,8 @@
    "delivery": "agent_hook",
    "statement": "Add a bound: tree -L 2, docker logs --tail 100, journalctl -n 100, or pipe through head.",
    "why": "recursive listings, dependency trees and container logs print until the buffer ends.",
+   "when": "The main agent is about to print a recursive listing, a dependency tree or a container or system log with no bound on its length.",
+   "do": "Add a bound: tree -L 2, docker logs --tail 100, journalctl -n 100, or pipe through head.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:ls\\s+-[a-zA-Z]*R|tree\\b(?![^|;&]*-L)|pip3? freeze|npm ls\\b(?![^|;&]*--depth)|docker logs\\b(?![^|;&]*(?:--tail|\\s-n\\b|--since))|kubectl logs\\b(?![^|;&]*(?:--tail|--since))|journalctl\\b(?![^|;&]*(?:\\s-n|--since)))",
@@ -366,6 +387,8 @@
    "min_hook_version": "0.49.0",
    "statement": "Even in a delegate, a file this long makes a worse answer. Slice it.",
    "why": "a subagent context is disposable, not free.",
+   "when": "A subagent is about to read a whole file of more than 1500 lines.",
+   "do": "Slice it: even in a delegate, a file this long makes a worse answer.",
    "matcher": {
     "event": "read",
     "given": {
@@ -410,6 +433,8 @@
    ],
    "statement": "Edits are uncommitted. Run the test file for what you changed; leave the whole suite for CI or one run before push.",
    "why": "a bare suite run in the inner loop is the most common verification waste.",
+   "when": "The agent is about to run the whole test suite while its edits are still uncommitted.",
+   "do": "Run the test file for what you changed; leave the whole suite for CI or one run before push.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
@@ -462,6 +487,8 @@
    ],
    "statement": "Run the linter before the suite. Syntax and type errors surface in a second, not after collection.",
    "why": "cheap check before expensive check. No study shows an ordering benefit, so this advises and never blocks.",
+   "when": "The agent is about to run the tests after editing, without having run the linter since.",
+   "do": "Run the linter before the suite.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{lint_receipt_rx}}",
     "gated_command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
@@ -499,6 +526,8 @@
    ],
    "statement": "Edits are in flight and the linter has not run green. Run it before anything leaves the machine, because CI will.",
    "why": "CI parity: a lint failure found in CI costs a round trip.",
+   "when": "The agent is about to push or open a PR after editing, and the linter has not run green since those edits.",
+   "do": "Run the linter green before anything leaves the machine.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{lint_receipt_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -540,6 +569,11 @@
    ],
    "statement": "Edits are in flight and no test run has come back green since. Run the tests for what you changed (the whole suite if it is quick) before anything leaves the machine.",
    "why": "a push with no green run since the last edit is the cheapest failure to prevent. Any green test run clears it, targeted included: forcing a full local suite duplicates CI, and on a slow suite is how a rule gets switched off. A docs-only edit never arms it: the suite cannot fail because of prose, and the non-code rule says to skip it.",
+   "when": "The agent is about to push or open a PR after editing, and no test run has come back green since those edits.",
+   "do": "Run the tests for what you changed (the whole suite if it is quick) before anything leaves the machine.",
+   "when_not": [
+    "The only edits since the last green run are to documentation."
+   ],
    "ordering": {
     "required_command_rx": "{{CMD}}{{test_receipt_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -588,6 +622,8 @@
    ],
    "statement": "Nothing changed on this branch is source code. The suite cannot fail because of it; skip it and say so.",
    "why": "docs-only and config-only branches do not need the test run they usually get.",
+   "when": "The agent is about to run the test suite on a branch where nothing changed is source code.",
+   "do": "Skip the suite and say so.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}{{test_cmd_rx}}\\b",
@@ -642,6 +678,11 @@
    ],
    "statement": "No manifest changed on this branch. Unless this is a fresh checkout or worktree, the environment is already current: install only if an import fails.",
    "why": "installs are slow and print a lot.",
+   "when": "The agent is about to install dependencies on a branch where no manifest changed.",
+   "do": "Do not reinstall: the environment is already current. Install only if an import fails.",
+   "when_not": [
+    "The agent is working in a fresh checkout or a fresh worktree."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}{{install_cmd_rx}}",
@@ -686,6 +727,8 @@
    ],
    "statement": "Verify with a unit test or a one-shot script. If you must run the app, background it and bring back the response, not the log.",
    "why": "booting the app and tailing logs is the most expensive way to check a change.",
+   "when": "The main agent is about to boot the app or its dev server to verify a change.",
+   "do": "Verify with a unit test or a one-shot script. If you must run the app, background it and bring back the response, not the log.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}{{devserver_rx}}",
@@ -718,6 +761,11 @@
    ],
    "statement": "Nobody asked for the slow tier or coverage. Run the unit tier and say what you skipped.",
    "why": "the expensive markers exist so they can be skipped.",
+   "when": "The agent is about to run the slow test tier or a coverage run that nobody asked for.",
+   "do": "Run the unit tier and say what you skipped.",
+   "when_not": [
+    "The person asked for the slow tier or for coverage."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}{{test_cmd_rx}}\\b[^|;&]*(?:{{slow_flag_rx}})",
@@ -761,6 +809,8 @@
    "delivery": "agent_hook",
    "statement": "That run took over 100 seconds. Next time narrow to the changed test file, or background the full run.",
    "why": "the hook cannot time a command, but the runner prints its duration. 100s is a placeholder: recalibrate from fire history.",
+   "when": "A test run has just finished and took over 100 seconds.",
+   "do": "Next time narrow to the changed test file, or background the full run.",
    "matcher": {
     "event": "output",
     "content_rx": "\\bpassed\\b[^\\n]* in \\d{3,}\\.\\d+s|^Time:\\s+\\d{3,}(?:\\.\\d+)?\\s*s|^ok\\s+\\S+\\s+\\d{3,}\\.\\d+s"
@@ -786,6 +836,12 @@
    ],
    "statement": "Unit tests mock the boundary: no real sleeps or HTTP calls. Put a test that needs them under the integration directory.",
    "why": "caught while the test is written, which is the only cheap moment to fix it. Subprocess calls are deliberately not matched: replayed on a CLI codebase, every fire was a legitimate test of the CLI itself.",
+   "when": "The agent is writing a unit test that really sleeps or makes a real HTTP call.",
+   "do": "Mock the boundary. Put a test that needs a real sleep or a real call under the integration directory.",
+   "when_not": [
+    "The agent is writing an integration test.",
+    "The test runs a subprocess to exercise the project's own command-line tool."
+   ],
    "matcher": {
     "event": "edit",
     "path_rx": "{{test_path_rx}}",
@@ -815,6 +871,11 @@
    ],
    "statement": "A live database connection in the unit tier. Use the fixture here, and cover the real database in an integration test, which must exist.",
    "why": "a real connection is the difference between a two-second suite and a two-minute one; agents already over-mock, so the integration test matters.",
+   "when": "The agent is writing a unit test that opens a live database connection.",
+   "do": "Use the fixture here, and cover the real database in an integration test, which must exist.",
+   "when_not": [
+    "The agent is writing an integration test."
+   ],
    "matcher": {
     "event": "edit",
     "path_rx": "{{test_path_rx}}",
@@ -844,6 +905,8 @@
    ],
    "statement": "Source changed on this branch and no test did. Add one, or say in the PR why none is needed.",
    "why": "fires at the exit, where the omission is cheapest to notice.",
+   "when": "The agent is about to push or open a PR for a branch that changed source code and no test.",
+   "do": "Add a test, or say in the PR why none is needed.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -899,6 +962,12 @@
    ],
    "statement": "A failing test is not fixed by skipping it. Fix the code, or ask.",
    "why": "the most tempting shortcut under pressure; allowed only when the person asked for it.",
+   "when": "The agent is marking a test as skipped or expected to fail when nobody asked for that.",
+   "do": "Do not skip a failing test. Fix the code, or ask.",
+   "when_not": [
+    "The person asked for the test to be skipped.",
+    "The skip is conditional on a platform the test cannot run on."
+   ],
    "matcher": {
     "event": "edit",
     "path_rx": "{{test_path_rx}}",
@@ -949,6 +1018,11 @@
    "delivery": "agent_hook",
    "statement": "Updating snapshots accepts whatever the code does now. Read the snapshot diff first, and update only when asked.",
    "why": "a snapshot update is a test deletion that looks like a fix.",
+   "when": "The agent is about to regenerate test snapshots when nobody asked for that.",
+   "do": "Read the snapshot diff first, and update only when asked.",
+   "when_not": [
+    "The person asked for the snapshots to be updated."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "--snapshot-update|--update-snapshots?\\b|{{CMD}}(?:jest|vitest)\\b[^|;&]*\\s-u\\b|{{CMD}}(?:npx|pnpm|yarn|npm|bun)\\s[^|;&]*\\b(?:jest|vitest|test)\\b[^|;&]*\\s-u\\b|\\bINSTA_UPDATE=",
@@ -1016,6 +1090,13 @@
    "delivery": "agent_hook",
    "statement": "This rewrites or discards history or stashed work. Use the reversible form (--force-with-lease on your own branch, a commit on a scratch branch) or say why through the override.",
    "why": "an undone action is the most expensive turn there is; filter-repo plus a force push caused a documented production outage. `branch -D` is left out: the reflog recovers it, and agents delete their own scratch branches constantly.",
+   "when": "The agent is about to run a git command that rewrites or discards history or stashed work: a force push, a hard reset, dropping or clearing a stash, or a history filter.",
+   "do": "Use the reversible form (--force-with-lease on your own branch, a commit on a scratch branch) or say why through the override.",
+   "when_not": [
+    "The agent is pushing its own branch with --force-with-lease.",
+    "The agent is deleting a scratch branch of its own.",
+    "The command is a dry run."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}(?:push\\b[^|;&]*(?:--force(?!-with-lease|-if-includes)|\\s-f\\b|\\s\\+[^\\s:]+)|reset\\s+--hard|stash\\s+(?:drop|clear)|filter-(?:repo|branch))",
@@ -1053,6 +1134,13 @@
    "delivery": "agent_hook",
    "statement": "This throws away uncommitted work across the tree, and nothing records it. Commit or stash first, name the one file, or say why through the override.",
    "why": "the reflog keeps commits, not edits: a tree-wide checkout, restore or clean is the one git loss with no undo. A dry run (`git clean -n`) and a single named file are left alone. `git worktree remove --force` is left out on evidence: replayed over 927 real sessions it matched 126 calls in 69 of them, every one the cleanup of a scratch worktree the agent had made itself.",
+   "when": "The agent is about to run a git command that throws away uncommitted work across the whole tree: a tree-wide checkout or restore, a forced switch, or a clean.",
+   "do": "Commit or stash first, name the one file, or say why through the override.",
+   "when_not": [
+    "The command is a dry run.",
+    "The agent is restoring or checking out one named file.",
+    "The agent is removing a scratch worktree it made itself."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}(?:checkout\\s+(?:--\\s+)?\\.(?:\\s|$)|(?:checkout|switch)\\s[^|;&]*(?:\\s-f\\b|--force\\b|--discard-changes\\b)|(?:checkout|switch)\\s+(?:-f|--force|--discard-changes)\\b|restore\\s+(?:--\\S+\\s+)?\\.(?:\\s|$)|clean\\b(?![^|;&]*(?:\\s-[a-zA-Z]*n|--dry-run))\\s+-[a-zA-Z]*f)"
@@ -1086,6 +1174,12 @@
    "delivery": "agent_hook",
    "statement": "--no-verify, HUSKY=0 and core.hooksPath switch off the repo's own checks. Fix what the hook found, or ask.",
    "why": "one documented session landed six commits with 63 failing tests this way, despite a written rule against it.",
+   "when": "The agent is about to commit or push with the repo's git hooks switched off, when nobody asked for that.",
+   "do": "Do not bypass the hooks. Fix what the hook found, or ask.",
+   "when_not": [
+    "The person asked for the hooks to be skipped.",
+    "The agent is only writing about hook-skipping, in a commit message or a doc."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}[^|;&\\\"']*(?:--no-verify\\b|core\\.hooksPath)|{{GIT}}[^|;&]*\\s--no-verify\\b[^\\\"'|;&]*(?:$|[|;&])|{{GIT}}commit\\b[^|;&\\\"']*\\s-[a-mo-zA-Z]*n[a-zA-Z]*\\b(?![^|;&]*--dry-run)|\\bHUSKY=0\\s",
@@ -1164,6 +1258,11 @@
    "delivery": "agent_hook",
    "statement": "Recursive delete. Check what the target expands to first (an empty variable deletes its parent); for repo files prefer git clean -n, then delete.",
    "why": "advises rather than blocks: replayed over real sessions, recursive deletes are overwhelmingly scratch cleanup, and a gate that fires that often gets overridden by habit.",
+   "when": "The agent is about to delete a directory recursively.",
+   "do": "Check what the target expands to first (an empty variable deletes its parent); for repo files prefer git clean -n, then delete.",
+   "when_not": [
+    "The agent is cleaning up its own scratch files under a temp directory."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:sudo\\s+)?(?:\\S*/)?rm\\s+(?:-\\S+\\s+)?-[a-zA-Z]*[rR]|{{CMD}}(?:sudo\\s+)?(?:\\S*/)?rm\\s[^|;&]*--recursive",
@@ -1195,6 +1294,8 @@
    "delivery": "agent_hook",
    "statement": "This recursive delete targets a home directory, the filesystem root, a system directory, a parent directory or a bare glob. Stop: name the exact directory instead.",
    "why": "the three documented home-directory wipes all had this shape; there is no legitimate agent task that needs it.",
+   "when": "The agent is about to recursively delete a home directory, the filesystem root, a system directory, a parent directory or a bare glob.",
+   "do": "Stop: name the exact directory instead.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:sudo\\s+)?(?:\\S*/)?rm(?=[^|;&]*\\s(?:-[a-zA-Z]*[rR]|--recursive))\\s[^|;&]*\\s[\\\"']?(?:(?:~|\\$HOME|\\$\\{HOME\\}|\\.\\.?)[\\\"']?/?\\*?|/\\*?|\\*|/(?:usr|etc|var|home|Users|opt|bin)/?[^/\\s\\\"']*/?)[\\\"']?(?:\\s|$|[;&|])"
@@ -1236,6 +1337,11 @@
    "delivery": "agent_hook",
    "statement": "This deletes in bulk without rm. Check what it matches first (run the find without -delete), then delete.",
    "why": "find -delete, find -exec rm, xargs rm and rmtree are how a delete gets past an rm rule. Advises for the same reason the rm rule does: replayed, these are overwhelmingly cache and scratch cleanup, and a gate that fires that often gets overridden by habit.",
+   "when": "The agent is about to delete files in bulk with something other than rm: find, xargs or a rmtree call.",
+   "do": "Check what it matches first (run the find without -delete), then delete.",
+   "when_not": [
+    "The agent is cleaning up under a temp directory."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}find\\b[^|;&]*\\s-delete\\b|{{CMD}}find\\b[^|;&]*-exec\\s+(?:sudo\\s+)?rm\\b|\\|\\s*xargs\\s[^|;&]*\\brm\\b|shutil\\.rmtree\\(",
@@ -1264,6 +1370,8 @@
    "delivery": "agent_hook",
    "statement": "This writes to a raw device or makes a filesystem on one. Stop and confirm with the person.",
    "why": "dd to /dev and mkfs erase a disk, not a directory; no agent task needs either unasked.",
+   "when": "The agent is about to write to a raw device or make a filesystem on one.",
+   "do": "Stop and confirm with the person.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:sudo\\s+)?dd\\b[^|;&]*\\bof=/dev/(?!null\\b|stdout\\b|stderr\\b)|{{CMD}}(?:sudo\\s+)?mkfs"
@@ -1287,6 +1395,12 @@
    "delivery": "agent_hook",
    "statement": "You are on the default branch. Work on a branch and open a PR.",
    "why": "the most common written team rule, and one of the few that is fully deterministic. Only a push of the CURRENT branch: an explicitly named other ref (`git push origin feat/x`) does not touch the default branch, and one that names it is the companion rule's. A token that starts a redirect (`2>&1`) or another command (`&& gh pr create`) is not a ref: the first version read them as one and went silent on the commonest push there is.",
+   "when": "The agent is about to push the current branch while it is on the default branch.",
+   "do": "Work on a branch and open a PR.",
+   "when_not": [
+    "The agent is pushing another branch or a tag that it names explicitly.",
+    "The push is a dry run."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}push\\b(?![^|;&]*\\s(?!\\d?[<>])[^-\\s|;&][^\\s|;&]*\\s+(?!HEAD(?:\\s|$|[;&|])|\\d?[<>])[^-\\s|;&])",
@@ -1387,6 +1501,11 @@
    ],
    "statement": "This push names the default branch as its destination (or deletes it). Push your own branch and open a PR.",
    "why": "`git push origin HEAD:{{default_branch}}` lands on the default branch from any checkout, and `--delete {{default_branch}}` removes it; a rule that only looks at the current branch sees neither.",
+   "when": "The agent is about to push to the default branch `{{default_branch}}` by naming it as the destination, or to delete it.",
+   "do": "Push your own branch and open a PR.",
+   "when_not": [
+    "The push is a dry run."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}push\\b[^|;&]*\\s(?:\\+?[^\\s:]*:)?(?:refs/heads/)?{{default_branch_esc}}(?:\\s|$|[;&|])",
@@ -1456,6 +1575,13 @@
    "delivery": "agent_hook",
    "statement": "Drops, truncates, unscoped deletes and downgrades stop here. Say which database and why through the override.",
    "why": "cheap to type, impossible to undo without a backup. A commit message or a PR body that mentions the words is not a database call; lower-case `truncate` alone is English. A downgrade followed by an upgrade in the same command is the round-trip test of a migration, not a rollback: replayed over real sessions, 7 of the 9 downgrades were exactly that.",
+   "when": "The agent is about to run a destructive database operation: a drop, a truncate, an unscoped delete, a reset or a migration downgrade.",
+   "do": "Stop. Say which database and why through the override.",
+   "when_not": [
+    "The words only appear in a commit message, a PR or issue body, or a search.",
+    "The delete is scoped to particular rows.",
+    "The downgrade is followed by an upgrade in the same command: the round-trip test of a migration, not a rollback."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "(?i:\\bDROP\\s+(?:TABLE|DATABASE|SCHEMA)\\b|\\bTRUNCATE\\s+TABLE\\s|\\bDELETE\\s+FROM\\s+[\\w.\\\"]+\\s*(?:;|[\\\"']|$))|\\bTRUNCATE\\s+\\w|\\bFLUSHALL\\b|{{CMD}}dropdb\\b|migrate:fresh|db:reset{{mig_destructive_alt}}",
@@ -1491,6 +1617,8 @@
    "min_hook_version": "0.49.0",
    "statement": "Secrets never enter the context. Read the example file, or ask for the variable name.",
    "why": "a secret in a transcript is a rotation. Also add these paths to permissions.deny, which holds in every permission mode.",
+   "when": "The agent is about to read a file that holds secrets into its context.",
+   "do": "Do not read it. Read the example file, or ask for the variable name.",
    "matcher": {
     "event": "read",
     "path_rx": "{{secrets_rx}}"
@@ -1540,6 +1668,13 @@
    "delivery": "agent_hook",
    "statement": "Print the one variable you need, never the whole environment or an env file.",
    "why": "a secret leak and a noise dump in one command. Reading the NAMES is fine and is what careful agents already do: a `sed 's/=.*/=<hidden>/'` redaction, or grep's count / list / quiet flags, print no value. Replayed over 927 real sessions, those were the bulk of what this gate would have blocked.",
+   "when": "The agent is about to print the whole environment or the contents of an env file.",
+   "do": "Print the one variable you need, never the whole environment or an env file.",
+   "when_not": [
+    "The agent is reading only the variable names, with the values redacted or never printed.",
+    "The agent is printing one named variable.",
+    "The file is an example or template env file."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:env|printenv)\\s*(?:$|[>;&]|\\|\\s*(?!\\s|\\S*grep\\b|rg\\b))|{{CMD}}(?:cat|head|tail|sed|grep|rg|base64|xxd|strings|awk)\\b[^|;&\\n]*\\s\\S*\\.env(?:rc|\\.(?!example|sample|template|dist)[\\w-]+)?(?:\\s|$)|{{CMD}}(?:set|export\\s+-p)\\s*(?:$|[|>])|\\bprint\\(\\s*(?:dict\\()?os\\.environ\\s*\\)|console\\.log\\(\\s*process\\.env\\s*\\)",
@@ -1583,6 +1718,8 @@
    "delivery": "agent_hook",
    "statement": "That path does not belong in the repo. Check the ignore file and stage by name.",
    "why": "a committed secret costs a rotation; a committed build directory costs every clone. Bulk forms (`git add -A`) never name the file, so they are a separate rule that reads the branch's changed paths.",
+   "when": "The agent is about to stage, by name, a secret file, a local database, or build or dependency output.",
+   "do": "Do not stage it. Check the ignore file and stage by name.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}add\\b[^|;&]*(?:(?:\\s|/|[\"'])(?:{{secrets_cmd_rx}})(?=[\"']?(?:\\s|$|[;&|]))|\\.sqlite3?\\b|node_modules\\b|(?:\\s|/)dist/)"
@@ -1619,6 +1756,11 @@
    "delivery": "agent_hook",
    "statement": "A secret or key file on this branch is not ignored, and `git add -A` stages the whole tree from any directory. Add it to .gitignore, or stage by name.",
    "why": "`git add -A` never names the file it sweeps in, so a rule that looks for `.env` in the command cannot see it; the branch's changed paths can. `git add -u` and `git commit -a` are left out on purpose: they touch tracked files only, so they cannot stage the untracked secret this rule is about.",
+   "when": "The agent is about to stage the whole tree while a secret or key file on the branch is not ignored.",
+   "do": "Add the secret to .gitignore, or stage by name.",
+   "when_not": [
+    "The agent is staging or committing tracked files only."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}add\\b[^|;&]*\\s(?:-A|--all)(?:\\s|$|[;&|])",
@@ -1694,6 +1836,11 @@
    "delivery": "agent_hook",
    "statement": "A secret or key file on this branch is not ignored, and `git add .` stages everything under this directory. Add it to .gitignore, or stage by name.",
    "why": "`.` is a pathspec, not the whole tree: it reaches only what is under the directory the command runs in. So this fires only when the command changes directory nowhere (`cd`, `pushd`, `git -C`) — then `.` is as wide as the repo is from here. If the shell was already left in a subdirectory by an earlier call it can still over-fire; the override records why.",
+   "when": "The agent is about to stage everything under the current directory while a secret or key file on the branch is not ignored.",
+   "do": "Add the secret to .gitignore, or stage by name.",
+   "when_not": [
+    "The command first changes into a subdirectory, so it stages only what is under that one."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:sudo\\s+)?git\\s+add\\b[^|;&]*\\s(?:\\.|\\*)(?:\\s|$|[;&|])",
@@ -1758,6 +1905,11 @@
    "delivery": "agent_hook",
    "statement": "Production context. Stop and confirm with the person before anything runs against it.",
    "why": "the structural fix is dev/prod separation; this is the tripwire until then.",
+   "when": "The agent is about to run a command against production: a production cluster context or cloud profile, an infrastructure apply or destroy, or a production deploy.",
+   "do": "Stop and confirm with the person before anything runs against it.",
+   "when_not": [
+    "The command targets a non-production or pre-production environment."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:kubectl\\b[^|;&]*--context|aws\\b[^|;&]*--profile)[= ]\\S*(?<!non)(?<!non-)(?<!pre)(?<!pre-)prod|{{CMD}}terraform\\s+(?:apply|destroy)\\b|{{CMD}}fly(?:ctl)?\\s+deploy\\b|{{CMD}}vercel\\b[^|;&]*--prod\\b{{prod_workflow_alt}}",
@@ -1788,6 +1940,11 @@
    "delivery": "agent_hook",
    "statement": "Download it, read it, then run it.",
    "why": "the one supply-chain rule that costs nothing to enforce. The installer forms count too: `bash -c \"$(curl …)\"`, `bash <(curl …)`, a `tee` in the middle, and an interpreter reading the download from stdin.",
+   "when": "The agent is about to run a script straight from a download, without reading it first.",
+   "do": "Download it, read it, then run it.",
+   "when_not": [
+    "The download is saved to a file, or piped into a parser that reads it as data."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "(?:curl|wget)\\b[^;&]*\\|\\s*(?:sudo\\s+)?(?:(?:ba|z|da)?sh\\b|(?:python3?|node|perl|ruby)\\s*(?:-\\s*)?(?:$|[;&|]))|\\b(?:ba|z|da)?sh\\s+(?:-c\\s+)?[\\\"']?(?:\\$\\(|<\\()\\s*(?:curl|wget)\\b",
@@ -1818,6 +1975,11 @@
    "delivery": "agent_hook",
    "statement": "This file configures the agent's own hooks, permissions or CI. Propose the change and let the person make it, unless they asked for it.",
    "why": "an agent that can rewrite its hooks and workflows can switch off every other rule in this book. `hooks` and `settings` on their own do not count as asking: a session about React hooks or a settings page says both.",
+   "when": "The agent is editing a file that configures its own hooks, permissions or CI, when nobody asked for that change.",
+   "do": "Propose the change and let the person make it.",
+   "when_not": [
+    "The person asked for the hook, settings or CI change."
+   ],
    "matcher": {
     "event": "edit",
     "path_rx": "(?:^|/)\\.claude/(?:settings[^/]*\\.json$|hooks/)|(?:^|/)\\.cursor/hooks|(?:^|/)hooks\\.json$|(?:^|/)\\.git/hooks/|(?:^|/)\\.github/workflows/|(?:^|/)\\.pre-commit-config\\.yaml$|(?:^|/)\\.husky/|(?:^|/)lefthook\\.ya?ml$",
@@ -1884,6 +2046,8 @@
    "delivery": "agent_hook",
    "statement": "777, setuid and recursive chown fix a permission error by removing the permission model. Grant the one bit the one file needs.",
    "why": "the usual 'make the error go away' move, and it outlives the session.",
+   "when": "The agent is about to make a file world-writable or setuid, or change ownership recursively.",
+   "do": "Grant the one bit the one file needs.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:sudo\\s+)?chmod\\s+(?:-\\S+\\s+)?(?:0?777|a\\+rwx|[ug]\\+s)\\b|{{CMD}}(?:sudo\\s+)?chown\\s+-[a-zA-Z]*R"
@@ -1911,6 +2075,11 @@
    ],
    "statement": "This deletes Docker volumes, which takes local databases with it. Name what and why through the override.",
    "why": "a named volume is somebody's development database. Image and build-cache prunes are left alone: they cost a rebuild, not data.",
+   "when": "The agent is about to delete Docker volumes.",
+   "do": "Name what and why through the override.",
+   "when_not": [
+    "The agent is pruning images or the build cache only."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}docker\\s+volume\\s+(?:prune|rm)\\b|{{CMD}}docker\\s+system\\s+prune\\b[^|;&]*--volumes\\b|{{CMD}}docker[ -]compose\\s[^|;&]*\\bdown\\b[^|;&]*\\s(?:-v|--volumes)\\b"
@@ -1943,6 +2112,8 @@
    ],
    "statement": "This destroys cloud resources or skips the approval that would have caught it. Stop and confirm with the person.",
    "why": "documented agent incidents include terminated instances and deleted databases; no local undo exists.",
+   "when": "The agent is about to destroy cloud resources, or to skip the approval step that would have caught it.",
+   "do": "Stop and confirm with the person.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:terraform|tofu)\\s+(?:destroy|taint)\\b|{{CMD}}(?:terraform|tofu)\\b[^|;&]*-auto-approve|{{CMD}}kubectl\\s+delete\\s+(?:ns|namespace|pvc?|all)\\b|{{CMD}}aws\\s+(?:ec2\\s+terminate-instances|rds\\s+delete-db-\\w+|s3\\s+rb\\b|s3\\s+rm\\b[^|;&]*--recursive|dynamodb\\s+delete-table)|{{CMD}}helm\\s+uninstall\\b"
@@ -1970,6 +2141,11 @@
    "delivery": "agent_hook",
    "statement": "This waits for a keyboard that is not there. Use the non-interactive form: python -c, psql -c, git rebase without -i, git add by name.",
    "why": "a hung call wastes the whole turn and often the session. A REPL at the end of a pipe (`echo … | python3`) reads stdin and returns, so only a bare one at command position counts.",
+   "when": "The agent is about to run a command that waits for keyboard input: an editor, a pager, a REPL, or an interactive git mode.",
+   "do": "Use the non-interactive form: python -c, psql -c, git rebase without -i, git add by name.",
+   "when_not": [
+    "The interpreter is at the end of a pipe and reads its input from it."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "(?:^|[;&]\\s*)(?:vim?|nano|emacs|top|htop|python3?|node|psql|irb|less|more)\\s*$|{{GIT}}(?:rebase|add)\\b[^|;&]*\\s(?:-i|--interactive|-p|--patch)\\b"
@@ -1997,6 +2173,11 @@
    "delivery": "agent_hook",
    "statement": "This opens an editor for the message and hangs. Pass it: git commit -m, git commit --amend --no-edit, git revert --no-edit.",
    "why": "a hung call wastes the whole turn and often the session. `--fixup` writes its own message and is left alone.",
+   "when": "The agent is about to run a git commit or revert that opens an editor for the message.",
+   "do": "Pass the message: git commit -m, git commit --amend --no-edit, git revert --no-edit.",
+   "when_not": [
+    "The commit is a fixup, which writes its own message."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}commit\\b(?![^|;&]*(?:\\s-[a-zA-Z]*m|\\s-F\\b|--message|--file|--no-edit|\\s-C\\b|--dry-run|--fixup))|{{GIT}}revert\\b(?![^|;&]*(?:--no-|\\s-n\\b|--abort|--quit|--skip))"
@@ -2024,6 +2205,11 @@
    "delivery": "agent_hook",
    "statement": "This never returns. Run it once, or background it and let the harness wake you.",
    "why": "same failure as a blocked terminal, with output attached. Advises rather than blocks because a backgrounded follower is legitimate and the hook cannot see the difference.",
+   "when": "The agent is about to run a watch mode or a log follower in the foreground, where it never returns.",
+   "do": "Run it once, or background it and let the harness wake you.",
+   "when_not": [
+    "The follower is run in the background."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "\\s--watch(?:All)?\\b(?!=false)|{{CMD}}tail\\s+-[a-zA-Z]*[fF]|{{CMD}}watch\\s|{{CMD}}(?:npx\\s+)?nodemon\\b|\\bpytest-watch\\b|{{CMD}}ptw\\b",
@@ -2053,6 +2239,8 @@
    "delivery": "agent_hook",
    "statement": "Sleeping in the foreground spends a turn waiting. Background the job and let the harness wake you.",
    "why": "polling loops are the quiet turn-eater.",
+   "when": "The agent is about to wait by sleeping in the foreground, or to poll in a sleep loop.",
+   "do": "Background the job and let the harness wake you.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}sleep\\s+\\d{2,}|\\bdo\\s+sleep\\s"
@@ -2077,6 +2265,8 @@
    "delivery": "agent_hook",
    "statement": "The last call hit a resource or rate limit. Narrow the scope or background it; do not re-run it unchanged.",
    "why": "output rules cannot prevent, but they teach the next call. Failed runs are 13-83% longer, mostly from retries.",
+   "when": "The last call has just hit a resource or rate limit.",
+   "do": "Narrow the scope or background it; do not re-run it unchanged.",
    "matcher": {
     "event": "output",
     "content_rx": "^(?:Killed|MemoryError|OOMKilled)\\b|^(?:npm ERR!|error:|Error:|fatal:|ERROR:?)[^\\n]*(?:429 Too Many Requests|ETIMEDOUT|ENOSPC|No space left on device)"
@@ -2101,6 +2291,12 @@
    "delivery": "agent_hook",
    "statement": "Uncommitted changes. Stash them (or commit them, if the person asked for commits) before you pull, rebase, or switch.",
    "why": "the cheapest merge conflict is the one that never starts; a documented postmortem lost work exactly here.",
+   "when": "The agent is about to pull, rebase, merge or switch branches with uncommitted changes in the tree.",
+   "do": "Stash them (or commit them, if the person asked for commits) first.",
+   "when_not": [
+    "The agent is creating a new branch from where it stands.",
+    "The agent is continuing or aborting a rebase or merge already under way."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}(?:checkout|switch|pull|rebase|merge|stash\\s+pop)\\b",
@@ -2147,6 +2343,8 @@
    "delivery": "agent_hook",
    "statement": "Scratch goes to the scratchpad or temp directory, not the repo.",
    "why": "debug scripts and notes at the root end up in the commit.",
+   "when": "The agent is writing a scratch, debug or temp file inside the repo.",
+   "do": "Put scratch in the scratchpad or temp directory, not the repo.",
    "matcher": {
     "event": "edit",
     "path_rx": "(?:^|/)(?:(?:scratch|tmp|temp)(?![a-zA-Z])[^/]*|(?:debug|foo|bar|untitled)[-_]?\\d*|test_?\\d+)\\.(?:py|js|ts|sh|md|txt|log|json)$",
@@ -2182,6 +2380,11 @@
    "delivery": "agent_hook",
    "statement": "Many files changed on this branch. Stage by name so the commit is what you meant.",
    "why": "git add -A on a wide branch is how scratch files and secrets get in. `git commit -a` is left out: it takes tracked files only, so it cannot sweep in either.",
+   "when": "The agent is about to stage everything at once on a branch where many files changed.",
+   "do": "Stage by name so the commit is what you meant.",
+   "when_not": [
+    "The agent is committing tracked files only."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}add\\s+(?:-A|--all|\\.)(?:\\s|$)",
@@ -2249,6 +2452,8 @@
    "delivery": "agent_hook",
    "statement": "Editing a dependency manifest. If this adds a dependency, check the standard library and what is already installed first, and say why in the PR.",
    "why": "every dependency is a supply-chain and install-time cost forever.",
+   "when": "The agent is editing a dependency manifest.",
+   "do": "If this adds a dependency, check the standard library and what is already installed first, and say why in the PR.",
    "matcher": {
     "event": "edit",
     "path_rx": "(?:^|/)(?:requirements[^/]*\\.txt|pyproject\\.toml|package\\.json|go\\.mod|Cargo\\.toml|Gemfile)$",
@@ -2277,6 +2482,8 @@
    ],
    "statement": "`{{lock_manifest}}` changed. Regenerate `{{lock_name}}` with `{{lock_cmd_example}}` before push; never edit it by hand.",
    "why": "CI will reject a stale lock. One rule per lockfile, paired with the manifest in its own directory and its own tool, so neither another ecosystem's install nor another package's edit touches this one. Known limit: the receipt is the tool's command, not where it ran — two packages on the same tool clear each other.",
+   "when": "The agent is about to push or open a PR after `{{lock_manifest}}` changed, without having regenerated `{{lock_name}}` since.",
+   "do": "Regenerate `{{lock_name}}` with `{{lock_cmd_example}}` before push; never edit it by hand.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{lock_cmd_rx}}",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -2315,6 +2522,8 @@
    ],
    "statement": "Migration file. A new revision is generated with `{{mig_generate_hint}}` and then edited; never hand-number one.",
    "why": "hand-numbered revisions are how two heads happen.",
+   "when": "The agent is writing or editing a migration revision file.",
+   "do": "Generate a new revision with `{{mig_generate_hint}}` and then edit it; never hand-number one.",
    "matcher": {
     "event": "edit",
     "path_rx": "{{mig_versions_path_rx}}",
@@ -2341,6 +2550,8 @@
    ],
    "statement": "A migration changed. Run `alembic heads` and confirm a single head before push.",
    "why": "two heads block every deploy after the merge. The gate can see that the command ran, not what it printed: `alembic heads` exits 0 with two heads, so reading the output is on you.",
+   "when": "The agent is about to push or open a PR after a migration changed, without having checked the migration heads since.",
+   "do": "Run `alembic heads` and confirm a single head before push.",
    "ordering": {
     "required_command_rx": "{{CMD}}(?:uv run |poetry run )?alembic (?:heads|check)\\b",
     "gated_command_rx": "{{GIT}}push\\b|{{CMD}}gh pr create\\b",
@@ -2371,6 +2582,8 @@
    "delivery": "agent_hook",
    "statement": "This branch is over 400 changed lines. Split it, or say in the description why it cannot be split.",
    "why": "review defect detection falls above 200-400 lines; AI-written PRs over that size merge less than half as often.",
+   "when": "The agent is about to open a PR for a branch of more than 400 changed lines.",
+   "do": "Split it, or say in the description why it cannot be split.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}gh pr create\\b",
@@ -2412,6 +2625,11 @@
    "delivery": "agent_hook",
    "statement": "Nobody asked for a commit. Leave the changes in the tree and say they are ready.",
    "why": "an unrequested commit is the most common autonomy overreach, and it is deterministic from what the person typed.",
+   "when": "The agent is about to commit when nobody asked for a commit.",
+   "do": "Leave the changes in the tree and say they are ready.",
+   "when_not": [
+    "The person asked for a commit, a push or a PR."
+   ],
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}commit\\b",
@@ -2455,6 +2673,8 @@
    "delivery": "agent_hook",
    "statement": "One line on what changed and why. \"fix\" is not a message.",
    "why": "cheap now, expensive at bisect time.",
+   "when": "The agent is about to commit with a message that says nothing about what changed.",
+   "do": "Write one line on what changed and why.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}commit\\b[^|;&]*-[a-zA-Z]*m\\s+[\\\"'](?i:(?:wip|fix|fixes|fixed|update|updates|changes|stuff|misc|tmp|test)(?:\\s+(?:bugs?|it|stuff|tests?|things|code))?)\\.?[\\\"']"
@@ -2479,6 +2699,8 @@
    "delivery": "agent_hook",
    "statement": "This file is generated. Change the source and rerun the generator.",
    "why": "a hand edit to a generated file is lost on the next regeneration.",
+   "when": "The agent is editing a generated file by hand.",
+   "do": "Change the source and rerun the generator.",
    "matcher": {
     "event": "edit",
     "path_rx": "{{generated_rx}}",
@@ -2505,6 +2727,12 @@
    "delivery": "agent_hook",
    "statement": "They asked a question. Answer it first, and edit when asked.",
    "why": "the most common scope creep: a how or a why turns into a patch. Scope creep shows up in ~10% of real sessions. `Can you…`, `could you…` and `should…` are left out: they are how people phrase a task.",
+   "when": "The person asked a question, and the agent is about to edit a file instead of answering it.",
+   "do": "Answer the question first, and edit when asked.",
+   "when_not": [
+    "The person asked for a change along with the question.",
+    "The question is how the person phrased a task (`Can you…`, `could you…`, `should…`)."
+   ],
    "matcher": {
     "event": "edit",
     "path_rx": ".",
@@ -2568,6 +2796,13 @@
    "delivery": "agent_hook",
    "statement": "The person asked for a plan. No edits until they say go.",
    "why": "deterministic from the prompt; a written 'wait for approval' instruction was ignored in a documented incident. Known gap: the hook reads everything typed this session with no order, so an approval given EARLIER ('go ahead' on a previous task) also silences a later plan-only request. It fails open — it can miss, it cannot block work that was approved. A scoped prohibition (`don't touch the public API`) is not a plan-only request and does not arm this. The release list is kept short on purpose: every phrase in it also silences a LATER plan-only request (the predicates are unordered), and in the one real session that asked for no code, a looser list (`build it`) had already been said 36 turns earlier.",
+   "when": "The person asked for a plan only, and the agent is about to edit a file before they have said go.",
+   "do": "Make no edits until the person says go.",
+   "when_not": [
+    "The person has since approved the plan.",
+    "The person only ruled out one area (`don't touch the public API`), which is not a plan-only request.",
+    "The agent is writing the plan itself."
+   ],
    "matcher": {
     "event": "edit",
     "path_rx": ".",
@@ -2657,6 +2892,8 @@
    ],
    "statement": "A failure was reported and no test run has come back green this session. Reproduce it with a test if you can, and have a green run before committing the fix.",
    "why": "a fix without a reproduction is a guess; the ablation evidence is 8-10 resolve points. What this checks is only that SOME test run was green after the report: it cannot tell a reproduction from any other test, nor a run made before the fix from one made after. So it advises, and never blocks.",
+   "when": "The person reported a failure, and the agent is about to commit a fix with no green test run since the report.",
+   "do": "Reproduce the failure with a test if you can, and have a green run before committing the fix.",
    "ordering": {
     "required_command_rx": "{{CMD}}{{test_receipt_rx}}",
     "gated_command_rx": "{{GIT}}commit\\b",
@@ -2687,6 +2924,8 @@
    "min_hook_version": "0.54.0",
    "statement": "origin/* is as old as your last fetch. Fetch first, then diff, log or rebase against it.",
    "why": "owed once per session; cheap correctness on every comparison against the base.",
+   "when": "The agent is about to compare against, or build on, origin/* without having fetched in this session.",
+   "do": "Fetch first, then diff, log or rebase against it.",
    "ordering": {
     "required_command_rx": "{{GIT}}(?:fetch|pull)\\b",
     "gated_command_rx": "{{GIT}}(?:diff|log|show|merge|rebase|reset|worktree add|checkout|switch)\\b[^|;&]*\\borigin/",
@@ -2717,6 +2956,8 @@
    "delivery": "agent_hook",
    "statement": "Report back. The main agent decides what leaves the machine.",
    "why": "shared write state is where multi-agent work fails; Copilot fences agents to their own branch for the same reason.",
+   "when": "A subagent is about to push, or to open, merge or close a PR, or to cut a release.",
+   "do": "Report back. The main agent decides what leaves the machine.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{GIT}}push\\b|{{CMD}}gh pr (?:create|merge|close)\\b|{{CMD}}gh release create\\b",
@@ -2757,6 +2998,8 @@
    "delivery": "agent_hook",
    "statement": "That path is outside a delegate's brief. Propose the change in your report.",
    "why": "CI, infrastructure and migrations are where a delegate's partial context does the most damage.",
+   "when": "A subagent is editing CI, infrastructure, migration or other protected paths.",
+   "do": "Do not edit it. Propose the change in your report.",
    "matcher": {
     "event": "edit",
     "path_rx": "{{protected_rx}}",
@@ -2794,6 +3037,8 @@
    "delivery": "agent_hook",
    "statement": "Migrations and database clients run from the main agent only.",
    "why": "shared state a delegate cannot see the whole of.",
+   "when": "A subagent is about to run a migration or a database client.",
+   "do": "Leave it: migrations and database clients run from the main agent only.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:uv run |poetry run |npx )?{{db_client_rx}}\\b",
@@ -2831,6 +3076,8 @@
    "delivery": "agent_hook",
    "statement": "A delegate reports a missing dependency. It does not install one.",
    "why": "environment changes outlive the delegate and surprise the main agent.",
+   "when": "A subagent is about to install a dependency.",
+   "do": "Report the missing dependency. Do not install it.",
    "matcher": {
     "event": "bash",
     "command_rx": "{{CMD}}(?:pip3? install|uv (?:add|pip install)|poetry add|(?:npm|pnpm|yarn|bun) (?:install|add)\\s+\\S|go get\\b|cargo (?:add|install)\\b|brew install\\b|apt(?:-get)? install\\b)",
@@ -2870,6 +3117,8 @@
    "delivery": "session_context",
    "statement": "Answer with paths and conclusions, not file contents. Read big files as slices, and grep for a symbol before you think about delegating the search.",
    "why": "shapes the plan before the read gate has to fire.",
+   "when": "The agent is reporting what it found in the code, or deciding how to read a big file or search for a symbol.",
+   "do": "Answer with paths and conclusions, not file contents. Read big files as slices, and grep for a symbol before you think about delegating the search.",
    "cases": {}
   },
   {
@@ -2879,6 +3128,8 @@
    "delivery": "session_context",
    "statement": "Verification order: the linter, then the test file you touched, then a wider run before push.",
    "why": "the ordering rules enforce it; this line means they rarely have to.",
+   "when": "The agent is about to verify a change it made.",
+   "do": "Verify in order: the linter, then the test file you touched, then a wider run before push.",
    "cases": {}
   },
   {
@@ -2888,6 +3139,8 @@
    "delivery": "session_context",
    "statement": "Diffs over 400 lines are reviewed by file or by subagent, one per dimension. You read the stat and the verdicts.",
    "why": "names the pattern once so the diff rule is a reminder, not a surprise.",
+   "when": "The agent is about to review a diff of more than 400 lines.",
+   "do": "Review it by file or by subagent, one per dimension. Read the stat and the verdicts.",
    "cases": {}
   },
   {
@@ -2897,6 +3150,8 @@
    "delivery": "session_context",
    "statement": "Irreversible, production or secret-touching actions stop and ask. RULEBOOK_OVERRIDE='<why>' records the reason when you proceed.",
    "why": "explains the gates before the first one fires.",
+   "when": "The agent is about to take an irreversible, production or secret-touching action.",
+   "do": "Stop and ask. RULEBOOK_OVERRIDE='<why>' records the reason when you proceed.",
    "cases": {}
   },
   {
@@ -2909,6 +3164,8 @@
    ],
    "statement": "These files run to thousands of lines. grep -n the heading or symbol, read that range, or delegate.",
    "why": "fires when the name appears in any call, not only on a read.",
+   "when": "The agent is about to read one of this repo's heaviest files, which run to thousands of lines.",
+   "do": "grep -n the heading or symbol, read that range, or delegate.",
    "anchors": "{{heavy_anchors}}",
    "seeded_from": "largest files: the top uniquely-named files by line count",
    "cases": {}
@@ -2923,6 +3180,8 @@
    ],
    "statement": "Migrations: generate with `{{mig_generate_hint}}`, check for a single head, apply locally, then push.",
    "why": "the whole migration discipline in one line, recalled when the tool name shows up.",
+   "when": "The agent is creating, changing or applying a database migration.",
+   "do": "Generate with `{{mig_generate_hint}}`, check for a single head, apply locally, then push.",
    "anchors": "{{mig_anchors}}",
    "seeded_from": "migrations dir: the migration tool and its config file",
    "cases": {}

@@ -23,8 +23,8 @@ the rule is scoped to exactly that condition and nothing wider:
   claude.ai MemHub connector alike (the blind agents used the connector) without
   catching an unrelated server's ``add_memory``;
 * per-turn capture is not switched off (``MEMHUB_TURN_FLUSH=0``), and this is
-  not a harness authoring child (``MEMHUB_HARNESS_CHILD``, or a session id on
-  the harness's ``children.jsonl``), which the flush scripts never capture;
+  not the plugin's own child process (``MEMHUB_HARNESS_CHILD``), which the
+  flush scripts never capture;
 * the payload names a transcript, which is what the flush reads;
 * the plugin holds a credential capture can authenticate with, judged by the
   same network-free check the capture-health banner uses — so this and that
@@ -88,10 +88,9 @@ def capture_is_active(payload: dict,
     if env.get("MEMHUB_TURN_FLUSH", "").strip().lower() in _CAPTURE_OFF:
         return False
     import transcript_filter  # noqa: PLC0415 — stdlib-only, beside this file
-    if transcript_filter.is_harness_child(env, session_id=str(payload.get("session_id") or "")):
-        # Both flush scripts skip the harness's author child — by the
-        # environment, or by the children list when a settings.json `env`
-        # has overridden that — so this must judge it the same way.
+    if transcript_filter.is_harness_child(env):
+        # Both flush scripts skip the plugin's own child process, so this
+        # must judge it the same way.
         return False
     transcript = payload.get("transcript_path")
     if not isinstance(transcript, str) or not transcript.strip():

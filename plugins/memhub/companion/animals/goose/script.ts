@@ -34,6 +34,11 @@ export type Frame = {
 export const BUBBLE_AT = { column: 5, row: 10 }
 /** Frames the finished message stays up (>= 40). */
 const HOLD_FRAMES = 44
+/** Frames a proposal stays up: long enough to read it and reach for a button. */
+const ASK_FRAMES = 8 * FPS
+/** Where the standing goose's head is, and the row above it for a mark. */
+const HEAD_X = GX + 3
+const ABOVE_HEAD = GY - 2
 /** One watching cycle in this many carries the glance; the rest only blink. */
 const GLANCE_EVERY = 4
 /** Frames offscreen before it walks back on — two seconds of empty grass. */
@@ -205,16 +210,52 @@ function* hunt(tone: Tone = 'blocked'): Generator<Frame> {
   yield S(T)
 }
 
+/** Two gold sparkles either side of the head, trading places each beat. */
+function sparkles(beat: number): Overlay[] {
+  return beat % 2
+    ? [[HEAD_X - 3, ABOVE_HEAD, '*', 'Y'], [HEAD_X + 4, GY, '+', 'Y']]
+    : [[HEAD_X - 2, GY, '+', 'Y'], [HEAD_X + 3, ABOVE_HEAD, '*', 'Y']]
+}
+
+/**
+ * The proposal prelude. Something new has arrived: the goose looks both ways,
+ * a gold `!` pops over its head, and it hops twice on the spot in a flurry of
+ * sparkles, blushing — a gift it cannot wait to hand over. Ends on the
+ * speaking position, so `speak` can type from there.
+ */
+function* present(tone: Tone = 'proposed'): Generator<Frame> {
+  const T: Partial<Frame> = { tone, badge: true }
+  yield* hold(S({ ...T, eyes: 'right' }), 4)
+  yield* hold(S({ ...T, eyes: 'left' }), 4)
+  yield* hold(S({ ...T, blush: true, overlays: [[HEAD_X, ABOVE_HEAD, '!', 'Y']] }), 8)
+  for (let beat = 0; beat < 4; beat++) {
+    yield* hold(S({ ...T, body: beat % 2 ? 'flapD' : 'flapU', blush: true, overlays: sparkles(beat) }), 3)
+  }
+  yield* hold(S({ ...T, blush: true }), 3)
+}
+
+/** The asking hold: a `?` bobbing over the head, the odd blink and glance. */
+function* ask(base: Partial<Frame>, text: string): Generator<Frame> {
+  for (let g = 0; g < ASK_FRAMES; g++) {
+    const bob = Math.floor(g / 10) % 2 ? ABOVE_HEAD - 2 : ABOVE_HEAD
+    const eyes: Eyes = g % 60 === 50 || g % 60 === 51 ? 'shut' : g % 120 >= 80 && g % 120 < 92 ? 'left' : 'open'
+    yield S({ ...base, eyes, blush: true, said: text, shown: text.length, overlays: [[HEAD_X, bob, '?', 'Y']] })
+  }
+}
+
 /**
  * Type it out, then hold it long enough to read. Starts and ends on the same
  * neutral frame. `advice` keeps a steady eye; `blocked` stages the hunt
- * first, then says it with a stern brow.
+ * first, then says it with a stern brow; `proposed` presents it with a hop
+ * and a blush, then holds it longer with a `?`, asking for an answer.
  */
 export function* speak(text: string, tone: Tone = 'advice'): Generator<Frame> {
   const base: Partial<Frame> = { badge: true, tone }
   const talk: Eyes = tone === 'blocked' ? 'stern' : 'open'
   if (tone === 'blocked') {
     yield* hunt(tone)
+  } else if (tone === 'proposed') {
+    yield* present(tone)
   } else {
     yield S({ ...base, said: text, shown: 0 })
   }
@@ -223,13 +264,37 @@ export function* speak(text: string, tone: Tone = 'advice'): Generator<Frame> {
   while (k < text.length) {
     k = Math.min(text.length, k + 1.6)
     f += 1
-    yield S({ ...base, eyes: talk, beak: f % 2 ? 'open' : 'shut', said: text, shown: Math.trunc(k) })
+    yield S({ ...base, eyes: talk, beak: f % 2 ? 'open' : 'shut', blush: tone === 'proposed', said: text, shown: Math.trunc(k) })
+  }
+  if (tone === 'proposed') {
+    yield* ask(base, text)
+    yield S({ ...base, said: text, shown: text.length })
+    return
   }
   for (let g = 0; g < HOLD_FRAMES; g++) {
     const eyes: Eyes = g === 30 || g === 31 ? 'shut' : g < 30 ? talk : 'open'
     yield S({ ...base, eyes, said: text, shown: text.length })
   }
   yield S({ ...base, said: text, shown: text.length })
+}
+
+/**
+ * A click: a happy honk and two flaps, blushing, while two pink hearts float
+ * up off the head; then a pleased squint. Starts and ends on look's first
+ * frame, standing, so the director can cut it in and out of `look`.
+ */
+export function* pet(): Generator<Frame> {
+  const hearts = (k: number): Overlay[] =>
+    [[HEAD_X - 2, ABOVE_HEAD - 2 * k, '♥', 'R'], [HEAD_X + 3, ABOVE_HEAD - 2 * k, '♥', 'R']]
+  yield S()
+  for (let beat = 0; beat < 4; beat++) {
+    const up = beat % 2 === 0
+    yield* hold(S({ body: up ? 'flapU' : 'flapD', beak: up ? 'open' : 'shut', blush: true, overlays: hearts(beat >> 1) }), 3)
+  }
+  yield* hold(S({ blush: true, overlays: hearts(1) }), 6)
+  yield* hold(S({ blush: true }), 6)
+  yield* hold(S({ eyes: 'shut', blush: true }), 4)
+  yield S()
 }
 
 /**
@@ -246,6 +311,7 @@ export function* leave(): Generator<Frame> {
 export const SAMPLE: Readonly<Record<Tone, string>> = {
   advice: 'Rule fired: run only the touched test suites',
   blocked: 'Blocked: never force-push to a shared branch',
+  proposed: 'New rule↗ proposed, not active yet: Pin the MCP server when spawning claude -p',
 }
 
 /** The ring the mod walks, for `/goose demo`. */
@@ -260,6 +326,7 @@ export function* cycle(): Generator<Frame> {
     yield* rise()
     yield* speak(SAMPLE.advice)
     yield* speak(SAMPLE.blocked, 'blocked')
+    yield* speak(SAMPLE.proposed, 'proposed')
     yield* leave()
   }
 }
@@ -268,4 +335,6 @@ export const POSES: Readonly<Record<string, () => Generator<Frame>>> = {
   enter, sleep, wake, look, rise, leave,
   speak: () => speak(SAMPLE.advice),
   hunt: () => speak(SAMPLE.blocked, 'blocked'),
+  propose: () => speak(SAMPLE.proposed, 'proposed'),
+  pet,
 }

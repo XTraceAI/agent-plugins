@@ -34,18 +34,22 @@ function buildOf(pixelSize: number, { scene, script }: Parts): Build<smallScript
       rise: script.rise,
       speak: (text: string, _n: number, tone: Tone) => script.speak(text, tone),
       leave: script.leave,
+      pet: script.pet,
     },
     render(st, tick): Painted {
       if (st.spawn) {
         particles = particles.concat(scene.spawn(st.spawn, tick))
       }
       particles = scene.stepParticles(particles)
-      const glyphs: Glyph[] = st.zs.map(([x, y, ch]) => ({ x, y, ch, color: Z_COLOR }))
+      const glyphs: Glyph[] = [
+        ...st.zs.map(([x, y, ch]) => ({ x, y, ch, color: Z_COLOR })),
+        ...st.marks.map(([x, y, ch, color]) => ({ x, y, ch, color })),
+      ]
       return {
         canvas: scene.renderCanvas(st, tick, particles),
         glyphs,
         bubble: st.said
-          ? { text: st.said, shown: st.shown, tag: 'rule', tone: st.tone }
+          ? { text: st.said, shown: st.shown, tag: st.tone === 'proposed' ? 'new rule' : 'rule', tone: st.tone }
           : null,
       }
     },

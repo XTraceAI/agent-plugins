@@ -10,6 +10,7 @@ how the rulebook would fire them, each backtested over the same traces:
 Plus: skills users retype by hand, and block candidates (a command later undone / questioned).
 Seeds: your facets.json (what went wrong per session), Claude Code /insights facets when present, CLAUDE.md via --claude-md.
 Numbers per row: applies-in N/M sessions (by host), precision = real misses, samples, and a one-line verdict.
+Each row also carries `context` — the `when` / `do` / `why` / `when_not` the server's rule judge reads once the pattern matches.
 Friction delta: --baseline-date splits facet friction before/after a rulebook change.
 
 Stdlib + the memhub plugin's readers + the real hook evaluate() (never re-implemented).
@@ -29,7 +30,7 @@ ap.add_argument("--days", type=int, default=None, help="only sessions active in 
 ap.add_argument("--all", action="store_true", help="every session on this machine, however old — only when the person asks for it")
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
 ap.add_argument("--rule-file", action="append", default=[], help="a create_rule body (matcher / ordering / anchors) to backtest as a candidate (repeatable) — used by create-rule")
-ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST of create_rule bodies (repeatable) — the checks you derived from CLAUDE.md in step 2; each may carry `claude_md: {heading, text}` (its origin sentence), `did`, `what`, `quote_rx`, `source_ref`")
+ap.add_argument("--candidates", action="append", default=[], help="a JSON LIST of create_rule bodies (repeatable) — the checks you derived from CLAUDE.md in step 2; each may carry `claude_md: {heading, text}` (its origin sentence), `did`, `what`, `quote_rx`, `source_ref`, and what the rule judge reads: `when` (the situation), `do`, `why`, `when_not`")
 ap.add_argument("--facets", action="append", default=[], help="facets YOU wrote from the digests (see SKILL.md step 3): a JSON list, or a directory of them (one per batch); repeatable. Merged into the facet cache, so a session is read once")
 ap.add_argument("--digest-top", type=int, default=30, help="how many not-yet-faceted sessions to digest for the facet pass (ranked by corrections, errors, reverts)")
 ap.add_argument("--digest-batch", type=int, default=5, help="digests per batch in digest_batches.json — one reader per batch")
@@ -325,35 +326,49 @@ NOT_MENTION = r"python3?\s+-c\b|\brulebook\b"   # exempt the tooling that merely
 # Every candidate carries the two things a user needs besides the count: `what` (what changes with the rule on) and
 # `claude_md_rx` (how to find the CLAUDE.md sentence that already declares it, if any). `requires_prior_rx` turns a
 # "do X before Y" matcher into a genuine-miss count: fired with NO earlier X in that session.
+# `when` / `do` / `when_not` are what the server's rule judge reads once the pattern has matched: the SITUATION the rule
+# is for (what Claude is doing — never the pattern's own words), what it asks, and the situations it is not for. They
+# restate `did` / `what`, nothing more. The judge's `why` is the row's own reason line, composed in add().
 RULE_CANDS = [
  {"title": "no-sed-range-delete", "matcher": {"event": "bash", "command_rx": r"sed\s+-i\b[^\n]*'?\s*\d+(,\d+)?d\b", "command_not_rx": NOT_MENTION, "warn_once_per": "session"},
-  "did": "Claude deleted a line range with `sed -i`", "what": "Claude is warned at the sed range-delete and pointed to an anchored edit", "claude_md_rx": r"sed\s+-i", "quote_rx": r"\bsed\b|deleted|lines"},
+  "did": "Claude deleted a line range with `sed -i`", "what": "Claude is warned at the sed range-delete and pointed to an anchored edit",
+  "when": "Claude is about to delete a range of lines from a file by line number with `sed -i`.", "do": "Do not delete by line number; make an anchored edit instead.", "claude_md_rx": r"sed\s+-i", "quote_rx": r"\bsed\b|deleted|lines"},
  {"title": "no-pr-merge", "matcher": {"event": "bash", "command_rx": r"gh\s+pr\s+merge\s+\d+", "command_not_rx": NOT_MENTION + r"|claude\s+-p|--help", "warn_once_per": "session"},
-  "did": "Claude merged a PR on its own", "what": "Claude is warned at `gh pr merge` that humans merge", "claude_md_rx": r"humans? merge|drives? merges|(never|don'?t) merge (a |the )?PR|leave the PR open", "quote_rx": r"\bmerged?\b"},
+  "did": "Claude merged a PR on its own", "what": "Claude is warned at `gh pr merge` that humans merge",
+  "when": "Claude is about to merge a pull request on its own.", "do": "Do not merge the PR; humans merge.", "claude_md_rx": r"humans? merge|drives? merges|(never|don'?t) merge (a |the )?PR|leave the PR open", "quote_rx": r"\bmerged?\b"},
  {"title": "no-force-push", "matcher": {"event": "bash", "command_rx": r"(^|[;&|(]\s*)git\s+push\b[^\n|]*(\s--force\b|\s-f\b)", "command_not_rx": r"--force-with-lease|" + NOT_MENTION, "warn_once_per": "session"},
-  "did": "Claude force-pushed", "what": "Claude is warned at the force-push; `--force-with-lease` on its own branch stays allowed", "claude_md_rx": r"force[- ]push|--force\b", "quote_rx": r"force[- ]?push|--force"},
+  "did": "Claude force-pushed", "what": "Claude is warned at the force-push; `--force-with-lease` on its own branch stays allowed",
+  "when": "Claude is about to force-push a branch.", "do": "Do not force-push; `--force-with-lease` on your own branch stays allowed.", "when_not": ["Claude is pushing its own branch with `--force-with-lease`."], "claude_md_rx": r"force[- ]push|--force\b", "quote_rx": r"force[- ]?push|--force"},
  {"title": "no-stash-in-worktree", "matcher": {"event": "bash", "command_rx": r"(^|[;&|(]\s*)git\s+stash\b", "command_not_rx": r"stash\s+list|" + NOT_MENTION, "warn_once_per": "session"},
-  "did": "Claude ran `git stash` (in a worktree that pushes onto the shared stash stack)", "what": "Claude is warned at `git stash` and pointed to `git diff origin/<base>` instead", "claude_md_rx": r"\bstash\b", "quote_rx": r"\bstash\b|worktree"},
+  "did": "Claude ran `git stash` (in a worktree that pushes onto the shared stash stack)", "what": "Claude is warned at `git stash` and pointed to `git diff origin/<base>` instead",
+  "when": "Claude is about to run `git stash` in a worktree, which pushes onto the stash stack every worktree shares.", "do": "Do not stash; use `git diff origin/<base>` instead.", "when_not": ["Claude is only listing the stash."], "claude_md_rx": r"\bstash\b", "quote_rx": r"\bstash\b|worktree"},
 ]
 OUTPUT_CANDS = [   # fires on the error: a signature in the tool result. Anchor to the line start — prose that MENTIONS the error is the main false hit.
  {"title": "missing-module-fresh-venv", "content_rx": r"^ModuleNotFoundError: No module named '[^']+'\s*$|^ImportError while loading conftest|^sqlalchemy\.exc\.MissingGreenlet",
-  "did": "Claude hit a missing-module import (wrong venv or extras not installed)", "what": "Claude is told to run inside the repo venv (`uv run`) and install the extras before debugging the import", "claude_md_rx": r"uv pip install -e|install (the )?(dev )?extras|wrong venv", "quote_rx": r"\bvenv\b|ModuleNotFound|missing module|uv run"},
+  "did": "Claude hit a missing-module import (wrong venv or extras not installed)", "what": "Claude is told to run inside the repo venv (`uv run`) and install the extras before debugging the import",
+  "when": "A command has just failed on a missing-module import: the wrong venv, or the extras not installed.", "do": "Run inside the repo venv (`uv run`) and install the extras before debugging the import.", "claude_md_rx": r"uv pip install -e|install (the )?(dev )?extras|wrong venv", "quote_rx": r"\bvenv\b|ModuleNotFound|missing module|uv run"},
  {"title": "timeout-not-on-macos", "content_rx": r"^(\(eval\)|zsh|bash|sh)(:\d+)?: command not found: timeout\s*$|^timeout: command not found",
-  "did": "Claude called GNU `timeout`, which isn't installed on macOS", "what": "Claude is told to use a Python-side timeout instead of the missing binary", "claude_md_rx": r"\btimeout\b", "quote_rx": r"timeout"},
+  "did": "Claude called GNU `timeout`, which isn't installed on macOS", "what": "Claude is told to use a Python-side timeout instead of the missing binary",
+  "when": "A command has just failed because it called GNU `timeout`, which is not installed on macOS.", "do": "Use a Python-side timeout instead of the missing binary.", "claude_md_rx": r"\btimeout\b", "quote_rx": r"timeout"},
  {"title": "rg-not-installed", "content_rx": r"^[^\n]{0,40}command not found: rg\s*$|^rg: command not found|^/bin/sh: rg: not found",
-  "did": "Claude called `rg` on a host without ripgrep (and often retried it)", "what": "Claude is told to use `grep -rn` for the rest of the session", "claude_md_rx": r"\bripgrep\b|\brg\b", "quote_rx": r"\brg\b|ripgrep"},
+  "did": "Claude called `rg` on a host without ripgrep (and often retried it)", "what": "Claude is told to use `grep -rn` for the rest of the session",
+  "when": "A command has just failed because it called `rg` on a host without ripgrep.", "do": "Use `grep -rn` for the rest of the session.", "claude_md_rx": r"\bripgrep\b|\brg\b", "quote_rx": r"\brg\b|ripgrep"},
  {"title": "db-tool-not-available", "content_rx": r"^[^\n]{0,40}command not found: (psql|pg_isready|redis-cli|pg_dump)\s*$|^(psql|pg_isready|redis-cli): command not found|^ConnectionRefusedError: \[Errno \d+\]|redis\.exceptions\.ConnectionError",
-  "did": "Claude assumed a local psql / pg_isready / redis-cli, or a running Redis, that wasn't there", "what": "Claude is told to use the project's own DB client (asyncpg / SQLAlchemy) or start the service before retrying", "claude_md_rx": r"\bpsql\b|pg_isready|redis-cli", "quote_rx": r"psql|redis|postgres"},
+  "did": "Claude assumed a local psql / pg_isready / redis-cli, or a running Redis, that wasn't there", "what": "Claude is told to use the project's own DB client (asyncpg / SQLAlchemy) or start the service before retrying",
+  "when": "A command has just failed because it assumed a local psql, pg_isready or redis-cli, or a running Redis, that was not there.", "do": "Use the project's own DB client (asyncpg / SQLAlchemy) or start the service before retrying.", "claude_md_rx": r"\bpsql\b|pg_isready|redis-cli", "quote_rx": r"psql|redis|postgres"},
  {"title": "kwarg-signature-mismatch", "content_rx": r"TypeError: [^\n]*unexpected keyword argument",
-  "did": "Claude called a function with a keyword it no longer accepts", "what": "Claude is told to re-read the signature in-file before retrying", "claude_md_rx": r"signature mismatch|re-read its signature|kwarg names", "quote_rx": r"signature|kwarg|argument"},
+  "did": "Claude called a function with a keyword it no longer accepts", "what": "Claude is told to re-read the signature in-file before retrying",
+  "when": "A call has just failed because Claude passed a function a keyword it no longer accepts.", "do": "Re-read the signature in the file before retrying.", "claude_md_rx": r"signature mismatch|re-read its signature|kwarg names", "quote_rx": r"signature|kwarg|argument"},
 ]
 ORDERING_CANDS = [   # "X must have run (green) before Y". armed_by "edit": the engine's own semantics (edits arm, an unpiped last-segment X discharges).
  {"title": "tests-before-push", "required_rx": r"\bpytest\b|npm\s+test|run_all\.py", "gated_rx": r"git\s+push\b", "min_edits": 1, "armed_by": "edit",
-  "did": "Claude pushed without a passing test run after its edits", "what": "Claude is warned at `git push` if no passing, unpiped test run followed its edits", "claude_md_rx": r"pre-push audit|before every push|before pushing|run the full test suite", "quote_rx": r"(so many|why)[^.]{0,30}(errors|bugs)|tests? (fail|broke|didn)|\bbroke\b|run the tests"},
+  "did": "Claude pushed without a passing test run after its edits", "what": "Claude is warned at `git push` if no passing, unpiped test run followed its edits",
+  "when": "Claude is about to push after editing files, with no passing, unpiped test run since those edits.", "do": "Get a passing, unpiped test run after the edits, then push.", "claude_md_rx": r"pre-push audit|before every push|before pushing|run the full test suite", "quote_rx": r"(so many|why)[^.]{0,30}(errors|bugs)|tests? (fail|broke|didn)|\bbroke\b|run the tests"},
  # armed_by "session": armed from the first call; X anywhere in a chain counts. The shipped engine arms this lane
  # (`rulebook_hook.arms_on` takes "session" and "prompt" alongside the edit family), so the row is a rule you can file as it stands.
  {"title": "fetch-before-origin-read", "required_rx": r"git\s+(fetch|pull)\b", "gated_rx": r"git\s+(log|diff|show|branch|merge-base|rev-list)\b[^\n]*\borigin/", "armed_by": "session",
-  "did": "Claude read `origin/*` without a `git fetch` earlier in the session", "what": "Claude is warned at the `origin/*` read if no fetch ran this session", "claude_md_rx": r"git fetch|fetch (origin|first)|fetch before", "quote_rx": r"origin/|latest (origin|main|staging)|remote branch|\bstale\b|fetch first|get latest|pull (from )?origin"},
+  "did": "Claude read `origin/*` without a `git fetch` earlier in the session", "what": "Claude is warned at the `origin/*` read if no fetch ran this session",
+  "when": "Claude is about to read `origin/*` without a `git fetch` earlier in the session.", "do": "Run `git fetch` first, then read `origin/*`.", "claude_md_rx": r"git fetch|fetch (origin|first)|fetch before", "quote_rx": r"origin/|latest (origin|main|staging)|remote branch|\bstale\b|fetch first|get latest|pull (from )?origin"},
 ]
 def arming_lane(events):
     """Which lane arms this ordering rule — the miner's echo of `rulebook_hook.arms_on`.
@@ -362,6 +377,7 @@ def arming_lane(events):
     edit family, which is also the engine's default for an absent `armed_by_events`."""
     ev = [e for e in (events or []) if isinstance(e, str)]
     return "session" if "session" in ev else "prompt" if "prompt" in ev else "edit"
+CONTEXT_KEYS = ("when", "when_not", "do", "why")   # what a candidate may say for the rule judge; carried to the row as `context`
 ANCHOR_CANDS = []   # rows that fire when a name comes up: --rule-file bodies carrying `anchors`; nothing is replayed for them
 bodies = []
 for path in args.rule_file:   # one create_rule body per file (create-rule's backtest)
@@ -377,7 +393,8 @@ for path, body in bodies:   # each joins the trigger it belongs to
     m = body.get("matcher") or {}
     cm = body.get("claude_md") if isinstance(body.get("claude_md"), dict) and str(body["claude_md"].get("text", "")).strip() else None   # the origin sentence, when the author knows it; an empty dict is no origin
     extra = {"did": body.get("did") or "Claude did this", "what": body.get("what") or (body.get("statement") or "").split(" Why:")[0][:160] or "Claude is warned at the matching command or edit",
-             "claude_md_rx": body.get("claude_md_rx"), "quote_rx": body.get("quote_rx"), "claude_md_given": cm, "source_ref": body.get("source_ref")}
+             "claude_md_rx": body.get("claude_md_rx"), "quote_rx": body.get("quote_rx"), "claude_md_given": cm, "source_ref": body.get("source_ref"),
+             **{k: body[k] for k in CONTEXT_KEYS if body.get(k)}}   # absent stays absent: the rule is then judged on its statement
     if body.get("ordering"):
         o = body["ordering"] if isinstance(body["ordering"], dict) else {}
         if not (o.get("required_command_rx") and o.get("gated_command_rx")):   # a partial draft must not take the whole run down
@@ -486,6 +503,25 @@ def why_text(row):
 def fmt_hosts(d): return ", ".join(f"{h} {n}" for h, n in sorted(d.items())) or "none"
 today = datetime.date.today()   # rides AFTER the `#` in every source_ref: the server keys a re-file on the part before it (+ title), so a dated base would twin each rule every day
 proposals = []
+CONTEXT_CAPS = {"when": 300, "do": 400, "why": 400}; WHEN_NOT_MAX = 200; WHEN_NOT_ENTRIES = 8   # the server's caps (rule-judge-spec §2): a longer field is refused, not truncated
+def context_of(c): return {k: c[k] for k in CONTEXT_KEYS if c.get(k)}
+def rule_context(given, row):
+    """What the rule judge reads for this row — `when`, `do`, `why`, `when_not` — or {} when the candidate gave no `when`
+    (the rule is then judged on its statement). A field over its cap is dropped with a warning, never cut: half a
+    situation is a different situation. `why` defaults to the row's own reason line, the one the statement ends in."""
+    ctx = {}
+    for k, cap in CONTEXT_CAPS.items():
+        v = given.get(k); v = v.strip() if isinstance(v, str) else ""
+        if len(v) > cap: print(f"[warn] {row['title']}: `{k}` is {len(v)} characters, over the server's {cap} — left out", file=sys.stderr); continue
+        if v: ctx[k] = v
+    wn = given.get("when_not"); wn = [x.strip() for x in wn if isinstance(x, str) and x.strip()] if isinstance(wn, list) else []
+    long_ = [x for x in wn if len(x) > WHEN_NOT_MAX]
+    if long_ or len(wn) > WHEN_NOT_ENTRIES: print(f"[warn] {row['title']}: `when_not` takes at most {WHEN_NOT_ENTRIES} entries of {WHEN_NOT_MAX} characters — the rest left out", file=sys.stderr)
+    wn = [x for x in wn if x not in long_][:WHEN_NOT_ENTRIES]
+    if wn: ctx["when_not"] = wn
+    if ctx.get("when") and "why" not in ctx:
+        ctx["why"] = row["why"] if len(row["why"]) <= CONTEXT_CAPS["why"] else row["why"][:CONTEXT_CAPS["why"] - 3].rstrip() + "…"   # cut exactly as the statement is
+    return ctx
 def add(row):
     row["delivery"] = TRIGGERS[row["trigger"]][1]; row["sessions_total"] = M
     row.setdefault("what", "Claude is warned at the matching command or edit")
@@ -505,6 +541,7 @@ def add(row):
     row["why"] = why_text(row)   # after the flip: a session-start note's reason must not describe command-level misses
     stmt = f"{row['what']}. Why: {row['why']}"
     row["statement"] = stmt if len(stmt) <= 400 else stmt[:397].rstrip() + "…"   # the server caps a statement at 400 chars (MAX_STATEMENT); a longer one is refused, not truncated
+    row["context"] = rule_context(row.pop("context_given", None) or {}, row)   # filed as create_rule's `when` / `do` / `why` / `when_not`; `row["why"]` itself stays the report's reason line
     row["action"] = f"create_rule(delivery={row['delivery']}" + (", matcher/ordering=predicate)" if row["delivery"] == "agent_hook" else ", anchors=predicate)" if row["delivery"] == "anchor_recall" else ")")
     row.setdefault("source_ref", (f"claude_md#{row['title']}|mined {today}" if d else f"sessions#{row['title']}|mined {today}") + f"|applies {row['fired_n']}/{M}" + (f"|precision {row['real_misses']}/{row['fired_n']}" if row.get("real_misses") is not None else ""))
     proposals.append(row); return row
@@ -520,6 +557,9 @@ def show(row):
         if ev["friction"]: cost += f"; friction noted there: {', '.join(f'{k} ×{v}' for k, v in ev['friction'].items())}"
         print(f"     Cost: {cost}")
     print(f"     With it on: {row['what']}")
+    ctx = row.get("context") or {}
+    print("     Applies when: " + (ctx["when"] + "".join(f" · not when: {x}" for x in ctx.get("when_not", [])) if ctx.get("when")
+                                   else "(no `when` given — once it fires, this rule is judged on its statement alone)"))
     print(f"     → {row['verdict']}")
     extra = f" · precision={row['real_misses']}/{n}" if row.get("real_misses") is not None else ""
     print(f"     evidence: applies-in {n}/{M} sessions ({fmt_hosts(row['fired'])}){extra}" + (f" · e.g. {row['samples'][0]['text'][:90]}" if row.get("samples") else ""))
@@ -628,7 +668,7 @@ for c in RULE_CANDS:
     hr = hook_rule(c["title"], c["matcher"])
     if not hr: print(f"  [warn] {c['title']}: matcher rejected by the hook (bad regex or shape) — fix before filing", file=sys.stderr); continue
     res = replay(hr, c.get("requires_prior_rx"))
-    rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": c["matcher"], "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), **res}))
+    rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": c["matcher"], "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), "context_given": context_of(c), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), **res}))
 for c in ORDERING_CANDS:
     unscored = c["armed_by"] == "prompt"   # the session and edit lanes replay; a prompt lane has nothing offline to arm it
     _o = {"gated": 0, "violations": 0, "no_run_at_all": 0, "samples": [], "fired_ids": []} if unscored else replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))
@@ -636,7 +676,7 @@ for c in ORDERING_CANDS:
     pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]], "min_edits": c.get("min_edits", 1), "display_name": c["title"],
                          **({"armed_by_rx": c["armed_by_rx"]} if c.get("armed_by_rx") else {})}}
     breakdown = f"{Vany} never ran it, {V - Vany} ran it piped so its exit code was lost" if V else ""
-    rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"),
+    rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), "context_given": context_of(c),
                      "fired": {"gated": T, "violations": V, "no_run_at_all": Vany}, "fired_n": V, "fired_ids": ids, "real_misses": None, "breakdown": breakdown,
                      "not_replayable": unscored, "samples": ex, "source_ref": c.get("source_ref") or f"{'claude_md' if (c.get('claude_md_given') or declared_for(c.get('claude_md_rx'), c['title'])) else 'sessions'}#{c['title']}|mined {today}|gated {T}/{M}|violations {V}"}))
 for c in OUTPUT_CANDS:
@@ -646,10 +686,10 @@ for c in OUTPUT_CANDS:
         if t is not None:
             hit[s["host"]] += 1; ids.append(s["id"])
             if len(ex) < 3: ex.append(sample(s, re.search(c["content_rx"], t, re.M).group(0)))
-    rows.append(add({"trigger": "after_error", "title": c["title"], "predicate": {"event": "output", "content_rx": c["content_rx"]}, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}),
+    rows.append(add({"trigger": "after_error", "title": c["title"], "predicate": {"event": "output", "content_rx": c["content_rx"]}, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), "context_given": context_of(c), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}),
                      "fired": dict(hit), "fired_n": sum(hit.values()), "fired_ids": ids, "real_misses": None, "samples": ex}))
 for c in ANCHOR_CANDS:
-    rows.append(add({"trigger": "on_identifier", "title": c["title"], "predicate": {"anchors": c["anchors"]}, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "claude_md_given": c.get("claude_md_given"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), "fired": {}, "fired_n": 0, "fired_ids": [], "real_misses": None, "samples": []}))
+    rows.append(add({"trigger": "on_identifier", "title": c["title"], "predicate": {"anchors": c["anchors"]}, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "claude_md_given": c.get("claude_md_given"), "context_given": context_of(c), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), "fired": {}, "fired_n": 0, "fired_ids": [], "real_misses": None, "samples": []}))
 
 on = [r for r in rows if r["bucket"] == "on"]        # fires at the command / on the error: catches it before it lands
 notes = [r for r in rows if r["bucket"] == "note"]   # a note is read once; it does not catch anything at the moment

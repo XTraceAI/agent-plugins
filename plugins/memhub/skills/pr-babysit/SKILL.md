@@ -26,18 +26,19 @@ already resolved.
    cached entry when the repo is already cached — take its `brain_id` (the
    room) and `org_id` (the org that owns it, when recorded; keep it as
    `ORG_ID`) and skip the lookup. Otherwise: name `Repo: <org>/<name>` from
-   `git remote get-url origin` (host and `.git` stripped), match it EXACTLY in
-   `list_agent_brains` — a teammate may have created it; use theirs. No match →
+   `git remote get-url origin` (host and `.git` stripped), ask
+   `list_agent_brains(repo="<org>/<name>")` (it looks across every org you are
+   in) and take the row whose name matches EXACTLY — a teammate may have
+   created it; use theirs. No match →
    `create_agent_brain` with `category: "repo"`, a description, and
    `repo: "<org>/<name>"` (omit `workspace_id`); its "already exists" and
    "requires an org admin" answers are handled as in
    `references/repo-brain.md` §3. A brain you create is private to you — say
    so in the final report, since teammates will not see the review record
    until it is shared. Either way, persist what you resolved with
-   `room_map.py set --brain-id <id> --org-id <org-id>` (the org id is the one
-   you passed to `list_agent_brains`, or the default org's from `list_orgs` —
-   the response's `scope` carries only `org_name`) so later passes and the
-   capture hooks route without repeating this lookup. Edge cases (SSH remotes,
+   `room_map.py set --brain-id <id>` (add `--org-id <org-id>` when the brain
+   row or `create_agent_brain`'s answer names its org) so later passes and
+   the artifact writers route without repeating this lookup. Edge cases (SSH remotes,
    no remote, worktrees, not a git repo) and the create-time rules — resolve
    before create, required description, report where it landed — are in
    `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md`.
@@ -110,28 +111,18 @@ step's whole value, and it is a page of text.
    so a later babysit of the same PR supersedes the earlier one instead of
    competing with it in retrieval.
 
-   `save_artifact` failing with the brain not found usually means the
-   WRONG-ORG lookup, not a stale id — CLI/MCP calls resolve the caller's
-   default org, which follows the org last selected in the MemHub app, and
-   a repo room in another org is invisible from it. Recover ONCE: read the
-   org from `room_map.py show --json` (`org_id`) and retry `save_artifact`
-   with it. No `org_id` cached → `list_orgs`, then re-run the step-2 lookup
-   with `list_agent_brains(org_id=…)` in each of the OTHER orgs (a plain
-   re-run searches the default org again and finds nothing new); on a match,
-   re-cache it with `--org-id` and retry. Still failing → report the error in
-   step 4 rather than retrying.
+   `save_artifact` failing with the brain not found means the cached id is
+   stale — the server resolves a brain's org from its id, so it is no longer
+   a wrong-org lookup. Recover ONCE: re-run the step-2
+   `list_agent_brains(repo="<org>/<name>")` lookup; on a match with a
+   different id, re-cache it with `room_map.py set` and retry. Still failing
+   → report the error in step 4 rather than retrying.
 3. **Never import the transcript.** Per-turn capture already ships this
-   session as it happens — the transcript to the user's personal Sessions
-   view (a session is never brain content), its task episodes to the room its
-   `cwd` resolves to. Importing it again re-uploads megabytes for the
-   watermark to discard.
-
-   The one gap: capture routes by the session's `cwd`, this babysit routes by
-   the PR's repo, so if you babysat a PR in repo B from a checkout of repo A,
-   B's room gets the artifact but not the reasoning trail. An import cannot
-   fix that — the first room a session feeds keeps its memory — so do not
-   try. Say so in the report (step 4), naming the room the session's memory
-   DID land in.
+   session as it happens, into the user's personal memory — never into a
+   brain, the repo's room included. Importing it again re-uploads megabytes
+   for the watermark to discard, and lands in the same personal memory.
+   The review record above is what reaches the room: that artifact, not the
+   session, is how the team sees this PR's outcome.
 4. Add one short top-level outcome note IN THE REPORT to the user: PR url
    and title, branch, findings per bot with accepted/rejected counts, and
    any repo-specific gotcha or bot false-positive tendency observed.

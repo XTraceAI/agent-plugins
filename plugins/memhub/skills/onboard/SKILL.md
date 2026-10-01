@@ -21,9 +21,10 @@ order, and then stop:
    rules come from. This skill names it and ends.
 
 What this skill does **not** do: import a session. Sessions are captured
-automatically from the next turn on (§4), and the server does not mine rules
-or facts out of them — a session yields its transcript (the Sessions view) and
-task episodes, nothing else. Rules are authored through the Rulebook. So there
+automatically from the next turn on (§4), into the user's personal memory —
+never into this brain — and the server does not mine rules or facts out of
+them: a session yields its transcript (the Sessions view) and task episodes,
+nothing else. Rules are authored through the Rulebook. So there
 is no "seed session" to pick and no recall to prove; do not add either back.
 
 Arguments: `$ARGUMENTS` — optional folders or files to add. Given → still run
@@ -57,7 +58,8 @@ authenticates the memhub MCP tools, so no `/mcp` login is needed there. See
 ## 1. Resolve the repo room (the durable boundary)
 - Derive the room name from the repo: `Repo: <org>/<name>` from
   `git remote get-url origin` (host + `.git` stripped).
-- `list_agent_brains` → **exact-name match**. Reuse the existing id if found (a
+- `list_agent_brains(repo="<org>/<name>")` (it looks across every org you are
+  in) → keep only an **exact-name match**. Reuse the existing id if found (a
   teammate may have created it). **Only** `create_agent_brain` when there is no
   exact match — do NOT mint a second room for a repo that already has one, and
   give it a real one-line description, `category: "repo"` (what declares this
@@ -70,25 +72,21 @@ authenticates the memhub MCP tools, so no `/mcp` login is needed there. See
   the full create-time rules are in
   `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
   above doesn't apply cleanly.
-- Record the `agent_brain_id`; call it `ROOM`. Also note the org the brain
-  lives in: the `org_id` you passed to `list_agent_brains` / `create_agent_brain`,
-  or — if you passed none — the default org's `org_id` from `list_orgs` (the
-  response's `scope` only carries `org_name`, not the id). Accounts in a single
-  org can skip this.
-- **Cache it — so capture routes to this room from the very next turn:**
+- Record the `agent_brain_id`; call it `ROOM`. Note the org it lives in as
+  `ORG_ID` when the brain row or `create_agent_brain`'s answer names one — it
+  is optional: every call that takes `ROOM` works the org out from the id.
+- **Cache it — so artifact saves route to this room from the very next turn:**
 
   ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" --org-id "<ORG_ID>"
+  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" [--org-id "<ORG_ID>"]
   ```
 
-  The capture paths — the per-turn `Stop` flush, the commit/PR flush, and the
-  `SessionEnd` backstop — also resolve the room themselves on a cache miss
-  (exact-name lookup, then cached), so they only fall back to personal memory
-  when no brain of this exact name exists yet. Caching here is still what
-  makes the FIRST capture after onboarding route without a lookup, and
-  `--org-id` is what lets captures reach a room outside the caller's default
-  org (a brain lives in exactly one org; without it the write fails with
-  "Agent brain not found" in multi-org accounts, and the entry gets re-probed).
+  The artifact writers — `/memhub:save-artifact` and the `.md` auto-capture
+  at the end of a turn — also resolve the room themselves on a cache miss
+  (exact-name lookup, then cached). Caching here is still what makes the
+  FIRST save after onboarding route without a lookup. The session capture
+  hooks never read this cache:
+  sessions go to personal memory.
   It writes to `~/.config/memhub-plugin/rooms.json` — the user's own config,
   never the repo — and covers every worktree of this repo. Teammates run
   `/memhub:onboard` once themselves.
@@ -99,10 +97,7 @@ Every repo keeps its knowledge somewhere different — `docs/`, `design/`,
 `rfcs/`, a `handbook/`, READMEs beside each service — so **assume no layout**.
 A script finds the documents and scores them; the important ones go in without a question.
 
-**Look first.** `get_brain_overview(ROOM, org_id=ORG_ID)` and read `index_markdown`
-(pass the `org_id` recorded in §1 on every brain call in this skill — a brain
-resolves inside one org, and without it a room outside your default org reads
-as "not found" or, worse, as empty). A brain a
+**Look first.** `get_brain_overview(ROOM)` and read `index_markdown`. A brain a
 teammate already onboarded lists its artifacts there — say what it holds, and
 below offer only what is missing. Re-uploading is harmless (the same name
 versions the artifact, and identical content is deduplicated server-side) but
@@ -202,7 +197,7 @@ and move on. Do not pad the brain to have something to show; it fills from real
 work (§4).
 
 ## 3. Show what the brain holds now
-`get_brain_overview(ROOM, org_id=ORG_ID)` again and show `index_markdown` — it is rendered
+`get_brain_overview(ROOM)` again and show `index_markdown` — it is rendered
 from the rows themselves, so the artifacts you just saved appear at once:
 *"Here's what your repo's brain holds."* The `overview` prose summary is
 compiled asynchronously and may still be `null`; that is normal right after a
@@ -210,8 +205,9 @@ first upload — say it will appear on its own, and never report this step as
 empty when `index_markdown` rendered.
 
 Then prove it is reachable the way an agent will reach it: one
-`search_memory(query="<a topic from one uploaded doc>", memory_type="artifacts",
-agent_brain_id=ROOM, org_id=ORG_ID)` and show the hit. No hit on a doc you just saved usually
+`search_memory(query="<a topic from one uploaded doc>", kind="artifact",
+agent_brain_id=ROOM)` and show the hit — a pointer (title and abstract), which
+is all that step needs. No hit on a doc you just saved usually
 means indexing has not caught up — say that, don't retry in a loop.
 
 ## 4. Say what happens from here, and end on the Rulebook
@@ -221,7 +217,7 @@ Report plainly, with real values: the room (created or reused), the docs saved
 **What is now automatic** — nothing for the user to run:
 - every session in this repo is captured turn by turn into MemHub's Sessions
   view (transcript, tools used, the PRs it opened), and its task episodes land
-  in this brain;
+  in the author's personal memory — never in this brain;
 - a substantial `.md` the agent writes or edits (a report, a design doc — past
   ~6 KB) is saved to this brain as a draft artifact when the turn ends, under
   the same name rule as §2, so an edit to a doc saved above versions it. The
