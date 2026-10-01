@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugins/memhub/scripts'))
 import mcp_http
@@ -44,7 +45,7 @@ class CaptureIntegrationTest(unittest.TestCase):
         result = reply("Not saved: your organization has used its monthly compute budget")
         session = SimpleNamespace(call_tool=AsyncMock(return_value=result))
         with patch.object(flush_session, '_breadcrumb') as crumb, patch.object(flush_session, '_log'):
-            ok, _ = asyncio.run(flush_session._send(session, {'conversation_id': 'test'}, None, None, None, 0, 1))
+            ok = asyncio.run(flush_session._send(session, {'conversation_id': 'test'}, None, None, 0, 1))
         self.assertFalse(ok)
         self.assertEqual(crumb.call_args.args[1], 'compute_budget_exhausted')
 
@@ -67,8 +68,15 @@ class CaptureIntegrationTest(unittest.TestCase):
             capture.capture_context(b'{"conversation_id":"test"}')
         argv = run.call_args.args[0]
         root = argv[argv.index('--plugin-root') + 1]
+        # The expected host is whatever THIS install declares, read straight
+        # from the root's own .mcp.json: internal ships the staging plugin and
+        # the release ships the production one, and the invariant under test is
+        # that health resolves the root it was handed, not an ambient default.
+        url = json.loads((Path(root) / '.mcp.json').read_text())['mcpServers']['memhub']['url']
+        expected = urlsplit(url).hostname
+        self.assertIn('memhub.xtrace.ai', expected)
         with patch.object(capture_health, '_PLUGIN_ROOT_ARG', root), patch.dict('os.environ', {}, clear=True):
-            self.assertEqual(capture_health._env_host(), 'api.memhub.xtrace.ai')
+            self.assertEqual(capture_health._env_host(), expected)
 
     def test_cursor_failure_breadcrumb_reaches_health_and_success_clears_it(self):
         import cursor_flush as flush

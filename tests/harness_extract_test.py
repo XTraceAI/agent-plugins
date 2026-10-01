@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """Tests for the harness-tied memory client half (`harness_extract.py`).
 
-What these protect: the router tells a person's turn from the harness's own
-text; the window is redacted before it is sent; the classifier gets one
-bounded call and every failure is "no signal" with a reason; a signal becomes
-a stamped moment in a private file; nothing writes a rule. No test reaches a
-server: `_api` is substituted.
+What these protect: the transcript reader tells a person's turn from the
+harness's own text; the window is redacted before it is sent; the classifier
+gets one bounded call and every failure is "no signal" with a reason; nothing
+writes a rule. No test reaches a server: `_api` is substituted.
 """
 from __future__ import annotations
 
 import json
-import os
-import stat
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -37,12 +33,9 @@ def _result(name, target, error, text):
     return {"tool": name, "target": target, "error": error, "text": text}
 
 
-class _Trace(list):
-    def __call__(self, msg):
-        self.append(msg)
 
 
-# ------------------------------------------------------------------ router
+# -------------------------------------------------------------- transcript
 def test_harness_text_is_not_a_persons_turn_but_pasted_markup_is():
     assert hx.is_harness_text("This session is being continued from a previous "
                               "conversation that ran out of context. i mean staging")
@@ -50,6 +43,9 @@ def test_harness_text_is_not_a_persons_turn_but_pasted_markup_is():
     assert hx.is_harness_text("Base directory for this skill: /tmp/x")
     assert hx.is_harness_text("<local-command-caveat>Caveat</local-command-caveat>")
     assert hx.is_harness_text("[Request interrupted by user for tool use]")
+    assert hx.is_harness_text("Another Claude session sent a message:\n<agent-message from=\"a6a5\">"
+                              "[Subagent hand-back] The text below is the final report")
+    assert hx.is_harness_text("MemHub harness fork: 3 filed, 1 none, 0 failed")
     assert hx.is_harness_text("")
     # a person's prompt may begin with a heading or pasted markup
     assert not hx.is_harness_text("# Plan\nfix the flag test")
@@ -76,56 +72,65 @@ def test_a_markdown_prompt_keeps_its_own_actions():
     print("PASS test_a_markdown_prompt_keeps_its_own_actions")
 
 
-def test_router_kinds_fire_on_their_shape():
-    assert "reuse_correction" in dict(hx.route(_turn(user="don't we already have a helper?"), None))
-    assert "retraction" in dict(hx.route(_turn(asst="I was wrong — it never merged."), None))
-    with_receipt = _turn(asst="Fixed and all tests pass.", tools=[_tool("Bash", "uv run pytest")])
-    assert "claim_no_receipt" not in dict(hx.route(with_receipt, None))
-    without = _turn(asst="Fixed and all tests pass.", tools=[_tool("Bash", "echo hi")])
-    hits = hx.route(without, None)
-    assert "claim_no_receipt" in dict(hits) and hx.router_hint(hits) == ""
-    both = hx.route(_turn(user="i mean staging", asst="Fixed.", tools=[_tool("Bash", "ls")]), None)
-    assert hx.router_hint(both) == "wrong_target"
-    print("PASS test_router_kinds_fire_on_their_shape")
 
 
-def test_error_arcs_close_and_a_costly_one_routes():
+def test_error_arcs_close_on_a_later_success():
     unclosed = _turn(results=[_result("Bash", "pytest x", True, "boom")])
     assert hx.error_arcs(unclosed) == []
     closed = _turn(results=[_result("Bash", "pytest x", True, "ModuleNotFoundError: No module named 'y'"),
                             _result("Bash", "pytest x", False, "ok")])
     arcs = hx.error_arcs(closed)
     assert len(arcs) == 1 and arcs[0]["cost"] == 1
-    assert dict(hx.route(closed, None))["error_arc"] == "missing-module"
-    quiet = _turn(results=[_result("Bash", "make x", True, "new error"),
-                           _result("Bash", "make x", False, "ok")])
-    assert "error_arc" not in dict(hx.route(quiet, None))
-    live = [{"signature": "new error", "target": "make x", "fix": "make x", "cost": 6}]
-    hits = hx.route(quiet, None, arcs=live)
-    assert dict(hits)["error_arc"] == "cost-6"
-    assert sum(1 for k, _ in hits if k == "error_arc") == 1, "one arc, one hit"
-    print("PASS test_error_arcs_close_and_a_costly_one_routes")
+    assert arcs[0]["signature"].startswith("ModuleNotFoundError")
+    print("PASS test_error_arcs_close_on_a_later_success")
 
 
 # ------------------------------------------------------------------ window
 def test_the_window_carries_its_slots_and_is_redacted():
-    prev = _turn(1, user="do the thing", asst="done", tools=[_tool("Bash", f"cmd{i}") for i in range(6)])
+    prev = _turn(1, user="do the thing", asst="done",
+                 tools=[dict(_tool("Bash", f"cmd{i}"), id=f"p{i}") for i in range(14)],
+                 results=[dict(_result("Bash", "cmd13", False, "13 passed\nline2\nline3\nline4"), id="p13")])
     cur = _turn(2, user="no, on staging — see /Users/colleague/dev/x and mail x@y.io",
                 asst="ran it with --token=abcdef123456 done",
-                tools=[_tool("Bash", f"new{i}") for i in range(9)],
-                results=[_result("Bash", "new0", True, "user_email=dana@example.com home=/home/dana"),
-                         _result("Bash", "new0", False, "ok")])
-    win = hx.build_window(cur, prev, {"repo": "R"})
+                tools=[dict(_tool("Bash", f"new{i}"), id=f"n{i}") for i in range(14)],
+                results=[dict(_result("Bash", "new0", True, "user_email=dana@example.com home=/home/dana"), id="n0"),
+                         dict(_result("Bash", "new0", False, "ok"), id="n1")])
+    older = [_turn(-1, user="first ask"), _turn(0, user="second ask")]
+    win = hx.build_window(cur, prev, {"repo": "R"}, earlier=older, following="ok, merge it")
+    assert "EARLIER USER MESSAGES" in win and "first ask" in win and "second ask" in win
     assert "PREVIOUS USER MESSAGE: do the thing" in win
-    assert "cmd2" in win and "cmd1" not in win
-    assert "new5" in win and "new6" not in win
+    # the previous turn keeps its LAST 12 actions, this turn its FIRST 12
+    assert "Bash: cmd2\n" in win and "Bash: cmd13\n" in win
+    assert "Bash: cmd0\n" not in win and "Bash: cmd1\n" not in win
+    assert "new11" in win and "new12" not in win
+    # a result rides with the call it answers, matched by id: success, error, first 3 lines only
+    assert "-> ok: 13 passed" in win and "line3" in win and "line4" not in win
+    assert "-> ERROR: user_email" in win
     assert "closed error arc" in win and "STATE:" in win
+    assert win.rstrip().endswith("USER'S FOLLOWING MESSAGE (what the person said next): ok, merge it")
+    assert "FOLLOWING MESSAGE" not in hx.build_window(cur, prev, {"repo": "R"})
     red = hx.redact_window(win)
     for leak in ("colleague", "x@y.io", "dana@example.com", "/home/dana", "abcdef123456"):
         assert leak not in red, leak
     assert "~/dev/x" in red and "<email>" in red
     assert hx.redact_window("") == ""
     print("PASS test_the_window_carries_its_slots_and_is_redacted")
+
+
+def test_the_largest_window_fits_the_server_limit():
+    """Every slot at its cap still fits: the client cuts from the end, and the
+    end is the following message."""
+    big = "x" * 5000
+    def turn(n, tag):
+        return _turn(n, user=big, asst=big,
+                     tools=[{"tool": "Bash", "brief": "Bash: " + "y" * 300, "target": f"t{i}", "id": f"{tag}{i}"}
+                            for i in range(30)],
+                     results=[{"tool": "Bash", "target": f"t{i}", "error": True, "text": big, "id": f"{tag}{i}"}
+                              for i in range(30)])
+    win = hx.build_window(turn(2, "c"), turn(1, "p"), {"repo": "R" * 200},
+                          earlier=[turn(-1, "a"), turn(0, "b")], following=big)
+    assert len(win) < hx.WINDOW_MAX_CHARS, len(win)
+    print("PASS test_the_largest_window_fits_the_server_limit")
 
 
 # -------------------------------------------------------------- classifier
@@ -155,14 +160,14 @@ def test_the_classifier_gets_one_bounded_post_and_never_raises():
     http = _Http(answer=_Reply({"signal": False, "reason": "classified"}))
     real = _with_api(http)
     try:
-        reply, _ = hx.server_classify("W", hint="wrong_target", repo="R", timeout=7)
+        reply, _ = hx.server_classify("W", repo="R", timeout=7)
     finally:
         hx._api = real
     assert reply["signal"] is False and reply["reason"] == "classified"
     assert len(http.calls) == 1
     call = http.calls[0]
     assert call["method"] == "POST" and call["url"] == "https://h/v1/team/rulebook/harness/classify"
-    assert call["body"] == {"window": "W", "hint": "wrong_target", "repo": "R"}
+    assert call["body"] == {"window": "W", "repo": "R"}
     assert call["timeout"] == 7
     for http, expected in (
         (_Http(raise_exc=RuntimeError("503")), "transport_error"),
@@ -192,57 +197,10 @@ def test_the_classifier_gets_one_bounded_post_and_never_raises():
     print("PASS test_the_classifier_gets_one_bounded_post_and_never_raises")
 
 
-def _run(td, turn, prev, http):
-    out = Path(td) / "m.jsonl"
-    stats, trace = hx.new_stats(), _Trace()
-    real = _with_api(http)
-    try:
-        got = hx.extract_turn(turn, prev, session="sess", cwd="", repo="R", env_name="staging",
-                              stats=stats, trace=trace, out_path=out, hook_version="0.54.0")
-    finally:
-        hx._api = real
-    return got, stats, trace, out
 
 
-def test_a_signal_becomes_a_private_stamped_moment():
-    with tempfile.TemporaryDirectory() as td:
-        http = _Http(answer=_Reply({"signal": True, "reason": "classified",
-                                    "kind": "correction", "derivable": True}))
-        prev = _turn(1, user="do it", asst="done")
-        turn = _turn(2, user="no, i mean staging — ping dana@example.com", asst="ok")
-        got, stats, trace, out = _run(td, turn, prev, http)
-        assert got and stats["moments"] == 1 and stats["turns_sent"] == 1
-        assert http.calls[0]["body"]["hint"] == "wrong_target"
-        assert "dana@example.com" not in http.calls[0]["body"]["window"]
-        rows = hx.read_jsonl(out)
-        assert len(rows) == 1
-        m = rows[0]
-        assert (m["turn"], m["source_ref"], m["kind"], m["hint"], m["derivable"]) == (
-            2, "sess#2", "correction", "wrong_target", True)
-        for key in ("repo", "session_id", "turn", "hook_version", "at"):
-            assert m["state"].get(key) not in (None, ""), key
-        assert m["state"]["repo"] == "R" and m["state"]["session_id"] == "sess"
-        assert "window" not in m, "the moment does not keep a copy of the session"
-        if os.name != "nt":
-            assert stat.S_IMODE(out.stat().st_mode) == 0o600
-        # the trace names steps, never the prompt
-        assert not any("staging" in line or "dana" in line for line in trace)
-    print("PASS test_a_signal_becomes_a_private_stamped_moment")
 
 
-def test_no_signal_an_outage_and_a_bare_claim_write_nothing():
-    with tempfile.TemporaryDirectory() as td:
-        quiet = _Http(answer=_Reply({"signal": False, "reason": "classified"}))
-        got, stats, _, out = _run(td, _turn(1, user="thanks"), None, quiet)
-        assert got is None and stats["reason"] == "classified" and not out.exists()
-        down = _Http(raise_exc=OSError("connection refused"))
-        got, stats, _, out = _run(td, _turn(1, user="i mean staging"), None, down)
-        assert got is None and stats["transport_errors"] == 1 and not out.exists()
-        claim_only = _Http(answer=_Reply({"signal": True, "reason": "classified", "kind": "x"}))
-        got, stats, _, out = _run(td, _turn(1, user="ok", asst="Deployed.",
-                                            tools=[_tool("Bash", "ls")]), None, claim_only)
-        assert got is None and stats["turns_spared"] == 1 and claim_only.calls == []
-    print("PASS test_no_signal_an_outage_and_a_bare_claim_write_nothing")
 
 
 # ------------------------------------------------------------------- stamp
@@ -264,22 +222,6 @@ def test_the_stamp_never_guesses_a_repo_and_names_a_cross_repo_turn():
 
 
 # ------------------------------------------------------------------- files
-def test_session_files_are_confined_and_broken_lines_are_skipped():
-    with tempfile.TemporaryDirectory() as td:
-        os.environ["MEMHUB_HARNESS_DIR"] = td
-        try:
-            assert hx.session_file("abc", ".meta.json") == Path(td) / "abc.meta.json"
-            assert hx.session_file("../../etc", ".x").parent == Path(td)
-            target = hx.session_file("abc", ".moments.jsonl")
-            hx.append_jsonl(target, {"turn": 1})
-            with target.open("a") as fh:
-                fh.write("{broken\n")
-            hx.append_jsonl(target, {"turn": 2})
-            assert [r["turn"] for r in hx.read_jsonl(target)] == [1, 2]
-            assert hx.read_jsonl(Path(td) / "missing.jsonl") == []
-        finally:
-            del os.environ["MEMHUB_HARNESS_DIR"]
-    print("PASS test_session_files_are_confined_and_broken_lines_are_skipped")
 
 
 def test_the_flag_is_off_by_default_and_only_an_on_spelling_starts_it():
@@ -300,10 +242,10 @@ def test_the_flag_is_off_by_default_and_only_an_on_spelling_starts_it():
 
 
 def test_an_authoring_child_is_never_sensed_whatever_the_flag_says():
-    """`run_author` sets EXTRACT=0 for its child, but Claude Code applies a
-    settings.json `env` over what a process inherits. So an install that opted
-    in with EXTRACT=1 there re-armed the sensor in every child, and forks
-    spawned forks. The child flag is the switch that setting cannot reach."""
+    """The case judge starts `claude` with MEMHUB_HARNESS_CHILD=1, and Claude
+    Code applies a settings.json `env` over what a process inherits — so an
+    install that opted in with EXTRACT=1 there would sense the judge's own
+    session. The child flag is the switch that setting cannot reach."""
     for flag in ("1", "true", "yes"):
         for extract in ("", "1", "on"):
             env = {"MEMHUB_HARNESS_CHILD": flag, "MEMHUB_HARNESS_EXTRACT": extract}
@@ -313,24 +255,6 @@ def test_an_authoring_child_is_never_sensed_whatever_the_flag_says():
     print("PASS test_an_authoring_child_is_never_sensed_whatever_the_flag_says")
 
 
-def test_spawn_detaches_and_returns():
-    seen = {}
-    real = hx.subprocess.Popen
-    hx.subprocess.Popen = lambda args, **kw: seen.update(args=args, kw=kw)
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            os.environ["MEMHUB_HARNESS_DIR"] = td
-            try:
-                assert hx.spawn_detached(["extract", "--session", "s"],
-                                         script=Path("/x/harness_stop.py"), log_name="stop.log") == 0
-            finally:
-                del os.environ["MEMHUB_HARNESS_DIR"]
-    finally:
-        hx.subprocess.Popen = real
-    assert seen["args"][1:] == ["/x/harness_stop.py", "extract", "--session", "s"]
-    if os.name != "nt":
-        assert seen["kw"]["start_new_session"] is True
-    print("PASS test_spawn_detaches_and_returns")
 
 
 def test_nothing_in_the_client_writes_a_rule():

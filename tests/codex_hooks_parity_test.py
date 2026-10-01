@@ -2,7 +2,7 @@
 """codex-hooks.json must be exactly what the generator produces.
 
 The Codex hooks file is GENERATED from claude-hooks.json (scripts/
-gen_codex_hooks.py) so the directive/artifact hooks can never drift between
+gen_codex_hooks.py) so the rulebook/artifact hooks can never drift between
 hosts. This pins the check-in to the generator's output — edit
 claude-hooks.json or the generator, re-run it, commit both.
 
