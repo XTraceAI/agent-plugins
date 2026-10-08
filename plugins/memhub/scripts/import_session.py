@@ -16,13 +16,14 @@ Mirrors the SessionEnd hook's contract exactly:
   room included. Team-visible knowledge goes in as artifacts.
 
 Auth = the PLUGIN's own credential (shared `_memhub_auth`), never the /mcp
-connector's: $MEMHUB_TOKEN if set (CI escape hatch), else the personal access
-key `login.py` mints (`~/.config/memhub-plugin/pak-<host>.json`), else the
+connector's: an explicit token if set (the `memhub_token` plugin option, or
+$MEMHUB_TOKEN where the build honors it: CI escape hatch), else the personal
+access key `login.py` mints (`~/.config/memhub-plugin/pak-<host>.json`), else the
 cached plugin OAuth token, else a one-time browser approval. Being connected
 in /mcp does not satisfy it. No memhub-cli required.
 
-Usage (mcp SDK pulled ephemerally by uv):
-    uv run --with 'mcp<2' python import_session.py --session <session-id-or-path>
+Usage (stdlib python3, nothing to install):
+    python3 import_session.py --session <session-id-or-path>
         [--conversation-id <id>] [--source-platform claude|codex|cursor]
         [--title "..."] [--url <mcp-url>]
 
@@ -38,12 +39,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_http
-from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_auth import open_session, resolve_url_and_auth  # noqa: E402
 import pr_provenance  # noqa: E402
 from room_map import git_env, git_readonly  # noqa: E402
 from session_title import (  # noqa: E402
@@ -93,7 +91,7 @@ def load_transcript(path: Path) -> tuple[list[dict], int]:
     non-UTF-8 default (cp950, cp1252, …) an ordinary em-dash in the transcript
     raises UnicodeDecodeError and every import on that machine dies. And since
     Claude Code is the primary caller, the user has no workaround: the
-    permission classifier refuses both `PYTHONUTF8=1 uv run …` and `-X utf8`.
+    permission classifier refuses both `PYTHONUTF8=1 python3 …` and `-X utf8`.
     ``errors="replace"`` extends the tolerant contract above to the decode
     step: one bad byte must not lose the whole session, only the char it hit.
     """
@@ -427,47 +425,45 @@ async def main() -> int:
               "disjoint and sent sequentially — the gist folds forward "
               "after each)")
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            s = mcp_http.PolicySession(s, url, headers)
-            prev_gist_hash = await _gist_hash(s, conv_id, args.org_id)
-            for i, sl in enumerate(slices, 1):
-                call_args = import_call_args(
-                    sl, conv_id, args.source_platform, provenance)
-                if args.org_id:
-                    call_args["org_id"] = args.org_id
-                if title:
-                    call_args["title"] = title
-                if namespace:
-                    # Older servers ignore unknown arguments; newer ones
-                    # stamp the directive scope from it. Safe either way.
-                    call_args["namespace"] = namespace
-                if len(slices) > 1:
-                    print(f"--- slice {i}/{len(slices)}: {len(sl)} records ---")
-                res = await s.call_tool("import_conversation", arguments=call_args)
-                payload = unwrap(res)
-                print(json.dumps(payload, indent=2))
-                err = call_error(res, payload)
-                if err:
-                    # No success epilogue — a headless caller must see this
-                    # as a failed save, not "Queued".
-                    label = (f"slice {i}/{len(slices)}" if len(slices) > 1
-                             else "import")
-                    print(f"ERROR: {label} failed: {err}", file=sys.stderr)
-                    if i > 1:
-                        print(f"NOTE: slices 1..{i - 1} were already queued; "
-                              "re-running after fixing the error is safe "
-                              "(the server watermark skips them).",
-                              file=sys.stderr)
-                    return 1
-                if i < len(slices):
-                    print(f"waiting for slice {i} extraction "
-                          "(gist appear/fold-forward) before next slice ...")
-                    prev_gist_hash = await _wait_gist_change(
-                        s, prev_gist_hash, conv_id,
-                        timeout=args.slice_timeout, org_id=args.org_id,
-                    )
+    s = await open_session(url, headers, auth,
+                           timeout=mcp_http.SDK_READ_TIMEOUT_S)
+    prev_gist_hash = await _gist_hash(s, conv_id, args.org_id)
+    for i, sl in enumerate(slices, 1):
+        call_args = import_call_args(
+            sl, conv_id, args.source_platform, provenance)
+        if args.org_id:
+            call_args["org_id"] = args.org_id
+        if title:
+            call_args["title"] = title
+        if namespace:
+            # Older servers ignore unknown arguments; newer ones
+            # stamp the directive scope from it. Safe either way.
+            call_args["namespace"] = namespace
+        if len(slices) > 1:
+            print(f"--- slice {i}/{len(slices)}: {len(sl)} records ---")
+        res = await s.call_tool("import_conversation", arguments=call_args)
+        payload = unwrap(res)
+        print(json.dumps(payload, indent=2))
+        err = call_error(res, payload)
+        if err:
+            # No success epilogue — a headless caller must see this
+            # as a failed save, not "Queued".
+            label = (f"slice {i}/{len(slices)}" if len(slices) > 1
+                     else "import")
+            print(f"ERROR: {label} failed: {err}", file=sys.stderr)
+            if i > 1:
+                print(f"NOTE: slices 1..{i - 1} were already queued; "
+                      "re-running after fixing the error is safe "
+                      "(the server watermark skips them).",
+                      file=sys.stderr)
+            return 1
+        if i < len(slices):
+            print(f"waiting for slice {i} extraction "
+                  "(gist appear/fold-forward) before next slice ...")
+            prev_gist_hash = await _wait_gist_change(
+                s, prev_gist_hash, conv_id,
+                timeout=args.slice_timeout, org_id=args.org_id,
+            )
     print("-" * 56)
     print("Queued. Extraction runs in the background (minutes for large "
           "sessions); the session's task episodes + its gist appear in "

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Activate or reject one proposed Rulebook rule (stdlib only).
 
-The companion's Activate / Reject buttons run this: the animal announces a rule
-the harness proposed, and the person answers it where they are instead of in
-Studio. It is Studio's own move over REST — ``PATCH /v1/team/rulebook/rules/
+/memhub:onboard runs this (`decide(rule_id, "activate")`) to switch on the
+starter rules a person picks; it is also the CLI for answering a proposed rule
+from a terminal. The companion's Activate / Reject buttons send the same PATCH
+themselves through `$.http.fetch` (companion/feed.ts) and no longer run it. It
+is Studio's own move over REST — ``PATCH /v1/team/rulebook/rules/
 {rule_id}`` with ``{"status": "active"}`` or ``{"status": "dismissed"}``, the
 only two ways out of ``proposed`` — sent with the plugin's personal access key,
 which that route accepts as it accepts a Studio session.
@@ -23,7 +25,10 @@ still waiting: `{"proposed": [{"title", "rule_id", "env"}]}`, newest first.
 The server is the only record of a filing (harness-tied-memory-spec §3.4a), so
 this asks it — every `proposed` rule XTrace authored in the org, kept when its
 `source_ref` names this session (`<session_id>#<turn>`). A backend that does
-not return `source_ref` yet answers an empty list.
+not return `source_ref` yet answers an empty list. When the server could not
+be asked (no key, a transport error, an odd reply) the list is empty AND
+carries `"error"`: the companion drops a waiting rule the server no longer
+lists, so "could not ask" must not read as "nothing is waiting".
 
 `url` answers where the rule opens in MemHub Studio — harness_stop.rule_url(),
 the link the Stop notice ends with, so the animal links the same page — and
@@ -107,25 +112,27 @@ def decide(rule_id: str, action: str, env: str = "") -> dict:
 def proposed(session: str) -> dict:
     """The rules the harness filed from `session` that are still `proposed`.
     Never raises: no credential, a transport error or an odd reply is an empty
-    list, because the companion asks at every Stop and silence is the right
-    answer to "nothing to announce"."""
+    list with an `error` — nothing to announce, but not proof that nothing is
+    waiting, so the companion keeps the asks it already shows."""
     if not session:
         return {"proposed": []}
     try:
         url, base, headers = _api()
         if not str(headers.get("Authorization", "")).startswith("Bearer "):
             # decide()'s rule: only the stored access key, never a login flow
-            return {"proposed": []}
+            return {"proposed": [], "error": "no_key"}
         req = urllib.request.Request(
             f"{base}/v1/team/rulebook/rules?status=eq.proposed&author=eq.xtrace"
             "&order=created_at.desc", headers=headers)
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
             payload = json.loads(resp.read() or b"{}")
-    except Exception:
-        return {"proposed": []}
+    except Exception as exc:
+        return {"proposed": [], "error": type(exc).__name__}
     data = payload.get("data") if isinstance(payload, dict) else None
     rules = data.get("rules") if isinstance(data, dict) else None
-    mine = [r for r in (rules or []) if isinstance(r, dict)
+    if not isinstance(rules, list):
+        return {"proposed": [], "error": "unexpected reply"}
+    mine = [r for r in rules if isinstance(r, dict)
             and str(r.get("source_ref") or "").startswith(f"{session}#")]
     return {"proposed": [{"title": str(r.get("title") or ""), "rule_id": str(r.get("rule_id") or ""),
                           "env": env_of(url)} for r in mine]}

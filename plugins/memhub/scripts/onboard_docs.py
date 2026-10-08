@@ -10,13 +10,15 @@ The skill shows the folders to the user and uploads what they pick.
   scan   [--root DIR] [--out FILE]   list candidates by folder; write the full
                                      list as JSON (the manifest ``upload`` takes)
   upload --manifest FILE [--only-folder F ...] [--path P ...] [--min-score N]
-                                     save each selected entry via save_artifact.py
+         [--topic T]                 save each selected entry via save_artifact.py;
+                                     an entry's own "topic" (written into the
+                                     manifest by the agent) wins over --topic
 
 Names and types come from ``md_capture_flush.derive_name`` / ``derive_type`` —
 the functions automatic capture uses — so a document uploaded here and later
 edited by an agent is ONE artifact lineage, not two.
 
-Stdlib only; ``upload`` shells out to ``save_artifact.py`` (which needs ``uv``),
+Stdlib only; ``upload`` runs ``save_artifact.py`` under the same interpreter,
 one file at a time, and reports every failure by path instead of stopping.
 """
 from __future__ import annotations
@@ -161,7 +163,7 @@ def _score(rel: Path, title: str, text: str, linked: bool) -> tuple[int, list[st
     return score, why
 
 
-def scan(root: Path) -> dict:
+def scan(root: Path, min_bytes: int = MIN_BYTES) -> dict:
     root = root.resolve()
     spec_dir = safe_spec_dir(os.environ.get("MEMHUB_SPEC_DIR", DEFAULT_SPEC_DIR)) or DEFAULT_SPEC_DIR
     linked = _readme_links(root)
@@ -189,7 +191,7 @@ def scan(root: Path) -> dict:
         except OSError:
             continue
         reason = _skip_reason(rel)
-        if reason is None and size < MIN_BYTES:
+        if reason is None and size < min_bytes:
             reason = "stub"
         if reason is None and size > MAX_BYTES:
             reason = "too large"
@@ -296,7 +298,9 @@ def cmd_upload(args) -> int:
     print(f"uploading {len(chosen)} document(s) from {root}")
     if args.dry_run:
         for d in chosen:
-            print(f"  [dry-run] {d['path']}  →  {d['name']}  ({d['type']})")
+            topic = (d.get("topic") or args.topic or "").strip()
+            print(f"  [dry-run] {d['path']}  →  {d['name']}  ({d['type']})"
+                  + (f"  topic: {topic}" if topic else ""))
         return 0
     failed: list[tuple[str, str]] = []
     for n, d in enumerate(chosen, 1):
@@ -307,9 +311,12 @@ def cmd_upload(args) -> int:
             failed.append((d["path"], "is a symlink; not uploaded"))
             print(f"  [{n}/{len(chosen)}] FAILED  {d['path']}: is a symlink; not uploaded")
             continue
-        cmd = ["uv", "run", "--with", "mcp<2", "python", str(_SAVE_ARTIFACT),
+        cmd = [sys.executable, str(_SAVE_ARTIFACT),
                "--file", str(root / d["path"]), "--name", d["name"],
                "--type", d["type"], "--tags", tags]
+        topic = (d.get("topic") or args.topic or "").strip()
+        if topic:
+            cmd += ["--topic", topic]
         if args.url:
             cmd += ["--url", args.url]
         try:
@@ -359,6 +366,8 @@ def main() -> int:
     up.add_argument("--min-score", type=int, default=0,
                     help="within the chosen folders, skip documents scoring below this")
     up.add_argument("--tags", default=None, help="tags for every upload (default: type + folder)")
+    up.add_argument("--topic", default=None,
+                    help="brain topic for entries whose manifest row has no \"topic\"")
     up.add_argument("--url", default=None)
     up.add_argument("--dry-run", action="store_true")
     up.set_defaults(func=cmd_upload)

@@ -1,7 +1,7 @@
 ---
 name: spec
 description: Use for MemHub spec-driven development — bootstrap specs locally or in MemHub cloud, find requirements before coding, check a working diff, resolve drift, create or revise specs, or diagnose the repository's spec setup. Supports Git-authored specs and explicitly selected governing Brain documents.
-argument-hint: <work|init|revise|bootstrap|check|resolve|status|setup> [file|topic] [--local|--cloud]
+argument-hint: "<work|init|revise|bootstrap|check|resolve|status|setup> [file|topic] [--local|--cloud]"
 ---
 
 # Repository specs

@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks to save, store, or upload a file/document/spec to MemHub or team memory as an artifact (e.g. "save this spec to memhub", "store this doc as an artifact", "version this design doc in memhub"). Uploads the file's bytes via a terminal script — never call save_artifact directly or re-emit file contents.
-argument-hint: <file-path> [artifact name]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags
+argument-hint: "<file-path> [artifact name]"
+allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" *), mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags'
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -44,11 +44,13 @@ Do exactly this:
    `plan`, `runbook`, or `document` (default). These are the types the brain's
    Index groups by; anything else folds into Documents — so an ADR goes in as
    `design_doc`, not `adr`, to land under Design.
-3. Run the upload via Bash — substitute the real values, keep it one command:
+3. Run the upload via Bash — substitute the real values, keep it ONE command
+   on ONE line (no `\` line breaks: a command split across lines does not
+   match this skill's pre-approved `save_artifact.py` call, so it stops for an
+   approval nobody may be there to give):
 
    ```bash
-   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
-     --file "<path>" --name "<name>" --type "<type>"
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" --file "<path>" --name "<name>" --type "<type>" --tags "<a,b>" --topic "<topic>"
    ```
 
    A file inside a git repo routes to that repo's room automatically — from
@@ -72,16 +74,23 @@ Do exactly this:
    and re-run rather than inventing a new word. `list_tags` shows that
    vocabulary up front if you'd rather choose before the first try.
 
+   **Pass `--topic` when saving into a brain** — the chapter of the brain the
+   document belongs under, which is what its table of contents is built from.
+   In this order: an existing topic of the brain when one fits, even loosely;
+   a new one only for a subject none covers, broad enough that others will
+   land there; else `unsorted`. A brain with topics on refuses a NEW artifact
+   without one and lists its topics in the refusal — choose from them and
+   re-run. A new version keeps its topic when `--topic` is omitted. How to see
+   the topics and what the server does with the answer:
+   `${CLAUDE_PLUGIN_ROOT}/references/topics.md`.
+
 4. **A rendered deliverable — an HTML page, a chart PNG, a PDF — goes through
    `--attach`, not `--file`.** `--file` reads UTF-8 text; a deliverable is
    bytes, and they are base64-encoded by the script so they never pass through
    your context either:
 
    ```bash
-   uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
-     --attach "<rendered file>" [--attach "<another>"] \
-     [--entrypoint "<the file to render first>"] \
-     [--file "<a short text summary>"] --name "<name>" --type document
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" --attach "<rendered file>" [--attach "<another>"] [--entrypoint "<the file to render first>"] [--file "<a short text summary>"] --name "<name>" --type document
    ```
 
    `--attach` is repeatable, and the bundle keeps the structure **below the

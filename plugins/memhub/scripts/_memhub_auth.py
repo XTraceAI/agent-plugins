@@ -4,7 +4,7 @@
 Auth0 client (the ``clientId`` in the plugin's ``.mcp.json``), which makes them
 easy to assume are interchangeable — they are not. Claude Code keeps the /mcp
 connector's tokens in its own credential store; every token here is written by
-exactly one place, ``_FileTokenStorage`` below, into
+exactly one place, ``OAuthFlow.authorize`` below (and its refresh shim), into
 ``~/.config/memhub-plugin/tokens-<host>.json``.
 
 The consequence is the whole reason ``/memhub:login`` exists: a user who
@@ -16,26 +16,36 @@ this token except a FOREGROUND run of a plugin script, so provisioning it must
 be something the user is told to do, not something they stumble into.
 
 Resolution order:
-1. ``$MEMHUB_TOKEN`` — explicit bearer for CI / headless runs.
-2. OAuth (PKCE, public client) against the MemHub MCP server, using the same
+1. An explicit bearer (``explicit_token``): the plugin's ``memhub_token``
+   userConfig option, which Claude Code hands its hooks as
+   ``$CLAUDE_PLUGIN_OPTION_MEMHUB_TOKEN``, else ``$MEMHUB_TOKEN`` (read only
+   by ``_memhub_env_token``, which the directory build omits) — CI /
+   headless runs.
+2. A stored personal access key (``pak``), minted by ``/memhub:login``.
+3. OAuth (PKCE, public client) against the MemHub MCP server, using the same
    ``clientId`` / ``callbackPort`` the plugin's ``.mcp.json`` declares for the
    /mcp connector. First run opens the browser once (exactly like
    authenticating in /mcp); tokens are cached at
    ``~/.config/memhub-plugin/tokens-<host>.json`` (0600). A stale access
    token is refreshed proactively by ``_refresh_cached_token_if_stale``
-   (below) before the SDK runs — see that function for why the SDK's own
-   ``OAuthClientProvider`` refresh can't be relied on from a cold process.
+   (below) before anything is sent — see that function for why the refresh
+   the MCP SDK used to own could not be relied on from a cold process.
 
-Usage — the HOOKS take the stdlib path and never load the SDK:
+Usage — the HOOKS take the non-interactive path:
 
     from _memhub_auth import resolve_bearer
     url, bearer = resolve_bearer()          # None when nothing is usable
     mcp_http.call_tool(url, bearer, ...)
 
-Only the interactive browser flow still needs the SDK, via
-``resolve_url_and_auth`` / ``build_oauth``, and only ``login.py`` calls it.
+FOREGROUND scripts that may open a browser take the interactive one:
 
-Self-check:  uv run --with 'mcp<2' python _memhub_auth.py
+    url, headers, auth = resolve_url_and_auth(url)
+    session = await open_session(url, headers, auth)
+    await session.call_tool("save_artifact", arguments={...})
+
+Everything here is stdlib: the browser flow is ``mcp_http.oauth_authorize``.
+
+Self-check:  python3 _memhub_auth.py
 """
 from __future__ import annotations
 
@@ -54,20 +64,58 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-# The mcp SDK is imported LAZILY, inside `build_oauth`, and nowhere else.
-#
-# It is needed for exactly one thing: the interactive browser flow, whose PKCE
-# and token-exchange machinery is genuinely worth not hand-rolling. Everything
-# else here — reading a cached token, refreshing it, resolving a bearer — is
-# stdlib already.
-#
-# Keeping it out of module scope is what lets the hooks import this file under a
-# bare python3. Measured, that is 0.07s against 1.09s for `uv run --with
-# 'mcp<2'`, and three of the hooks paying that cost were SYNCHRONOUS — the
-# (since retired) PreToolUse directive check had no prefilter, so it was a
-# second of latency on every single file edit.
+# `mcp_http` (and with it the browser flow) is imported LAZILY, inside the
+# functions that send something. Hooks import this file on every invocation,
+# several of them synchronously, and most only need a bearer string.
 
-_CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
+# $MEMHUB_CONFIG_DIR moves the credentials (token cache, access key) so a
+# harness can sign in fresh without touching this machine's real key.
+_CACHE_DIR = Path(os.environ.get("MEMHUB_CONFIG_DIR")
+                  or Path.home() / ".config" / "memhub-plugin")
+
+# The ``memhub_token`` userConfig option in ``.claude-plugin/plugin.json``.
+# Claude Code keeps the value (sensitive) in its secure store and exports it to
+# HOOK processes only, as ``CLAUDE_PLUGIN_OPTION_<KEY>`` uppercased — not to
+# the MCP ``headersHelper``, not to commands run through the Bash tool, and not
+# on Codex or Cursor, all of which therefore fall through to the next source.
+_USER_CONFIG_TOKEN_ENV = "CLAUDE_PLUGIN_OPTION_MEMHUB_TOKEN"
+
+
+def explicit_token() -> tuple[str, str] | None:
+    """``(token, source)`` for a bearer the user supplied outside /memhub:login.
+
+    The userConfig option first, then ``$MEMHUB_TOKEN``; both outrank the stored
+    access key, exactly as ``$MEMHUB_TOKEN`` alone always has. An option left
+    empty is unset, not an empty credential. ``source`` names which one won, for
+    the status lines that must say which credential is in use.
+
+    ``$MEMHUB_TOKEN`` is read by ``_memhub_env_token`` and nowhere else. The
+    Claude plugin directory build omits that module — a listed plugin may not
+    pick a credential up from the user's environment — and there the import
+    fails and only the option applies. Every other build ships it.
+    """
+    token = os.environ.get(_USER_CONFIG_TOKEN_ENV, "").strip()
+    if token:
+        return token, "plugin option memhub_token"
+    try:
+        from _memhub_env_token import env_token  # noqa: PLC0415 — absent in the directory build
+    except ImportError:
+        return None
+    return env_token()
+
+
+def _headless_hint() -> str:
+    """The explicit credential a headless user can set on THIS build.
+
+    ``$MEMHUB_TOKEN`` where ``_memhub_env_token`` ships; the ``memhub_token``
+    plugin option in the directory build, which ignores the variable — naming
+    it there would send the user to a setting that does nothing.
+    """
+    try:
+        import _memhub_env_token  # noqa: F401, PLC0415 — absent in the directory build
+    except ImportError:
+        return "the memhub_token plugin option"
+    return "$MEMHUB_TOKEN"
 
 
 def _plugin_root() -> Path:
@@ -180,106 +228,102 @@ def token_cache_path(url: str) -> Path:
     return _CACHE_DIR / f"tokens-{urlparse(url).netloc.replace(':', '_')}.json"
 
 
-def _file_token_storage(url: str, client_id: str, redirect_uri: str):
-    """The SDK's ``TokenStorage`` over our cache file.
-
-    Defined INSIDE a function because it subclasses an SDK type, and a
-    subclass at module scope would force the import that this module exists to
-    avoid — the whole point being that a hook can import this file under a bare
-    python3. It is only ever constructed by ``build_oauth``, which already has
-    the SDK loaded.
-    """
-    from mcp.client.auth import TokenStorage
-    from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-
-    class _FileTokenStorage(TokenStorage):
-        """Token cache keyed by server host; client info seeded statically from
-        .mcp.json so the SDK skips dynamic client registration (the Auth0 app is
-        a pre-registered public client — same one /mcp uses)."""
-
-        def __init__(self):
-            self._path = token_cache_path(url)
-
-        async def get_tokens(self):
-            try:
-                return OAuthToken.model_validate_json(
-                    self._path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                return None
-
-        async def set_tokens(self, tokens) -> None:
-            # Same writer as every other credential here. Written-then-chmod'd
-            # left the token at the process umask — 0644 by default — for a
-            # window, and non-atomically, so a hook reading concurrently could
-            # catch it half-written and conclude there was no credential.
-            import atomic_write  # noqa: PLC0415 — stdlib, beside this file
-
-            atomic_write.publish(self._path, tokens.model_dump_json())
-
-        async def get_client_info(self):
-            return OAuthClientInformationFull(
-                client_id=client_id,
-                redirect_uris=[redirect_uri],
-                token_endpoint_auth_method="none",
-                grant_types=["authorization_code", "refresh_token"],
-                response_types=["code"],
-            )
-
-        async def set_client_info(self, info) -> None:
-            return None  # static public client — nothing to persist
-
-    return _FileTokenStorage()
-
-
 class NonInteractiveAuthRequired(RuntimeError):
     """Raised instead of opening a browser when interactive=False.
 
-    Background hooks must never pop a browser at the user — they catch this
+    Background callers must never pop a browser at the user — they catch this
     and degrade quietly. With ``_refresh_cached_token_if_stale`` running
-    first, a cached token with a live refresh token is renewed before the
-    SDK runs, so this is only reached when there is no usable cached token
-    at all (never authenticated, or the refresh token itself is dead).
+    first, a cached token with a live refresh token is renewed before anything
+    is sent, so this is only reached when there is no usable cached token at
+    all (never authenticated, or the refresh token itself is dead).
     """
 
 
-def build_oauth(url: str, interactive: bool = True):
-    """The SDK's OAuth provider — the ONE place the mcp package is required.
+class OAuthFlow:
+    """The plugin's OAuth client — what the SDK's ``OAuthClientProvider`` was.
 
-    Only ``login.py`` reaches here now. The hooks resolve a static bearer
-    instead (see ``resolve_bearer``) and never load the SDK at all.
+    A pre-registered public client (``.mcp.json``'s ``clientId`` /
+    ``callbackPort``, the same one /mcp uses), so there is no dynamic
+    registration and nothing to persist but the token. ``bearer()`` hands back
+    the cached token or runs the browser flow; ``authorize()`` always runs it
+    and is what a 401 on a cached token triggers, as the SDK's did.
     """
-    from mcp.client.auth import OAuthClientProvider
-    from mcp.shared.auth import OAuthClientMetadata
 
-    cfg = _plugin_mcp_config()
-    oauth_cfg = cfg.get("oauth", {})
-    client_id = oauth_cfg.get("clientId")
-    port = int(oauth_cfg.get("callbackPort", 8765))
-    if not client_id:
-        raise RuntimeError(".mcp.json has no oauth.clientId")
-    redirect_uri = f"http://localhost:{port}/callback"
+    def __init__(self, url: str, interactive: bool = True):
+        cfg = _plugin_mcp_config()
+        oauth_cfg = cfg.get("oauth", {})
+        self.client_id = oauth_cfg.get("clientId")
+        self.port = int(oauth_cfg.get("callbackPort", 8765))
+        if not self.client_id:
+            raise RuntimeError(".mcp.json has no oauth.clientId")
+        self.url = url
+        self.interactive = interactive
+        self.redirect_uri = f"http://localhost:{self.port}/callback"
 
-    async def redirect_handler(auth_url: str) -> None:
-        if not interactive:
+    async def redirect_handler(self, auth_url: str) -> None:
+        if not self.interactive:
             raise NonInteractiveAuthRequired(
                 "no cached OAuth token and interactive auth is disabled"
             )
         print(f"Opening browser to authenticate (same flow as /mcp)...\n  {auth_url}")
         webbrowser.open(auth_url)
 
-    return OAuthClientProvider(
-        server_url=url,
-        client_metadata=OAuthClientMetadata(
-            client_name="MemHub Claude Plugin scripts",
-            redirect_uris=[redirect_uri],
-            grant_types=["authorization_code", "refresh_token"],
-            response_types=["code"],
-            token_endpoint_auth_method="none",
-        ),
-        storage=_file_token_storage(url, client_id, redirect_uri),
-        redirect_handler=redirect_handler,
-        callback_handler=_make_callback_handler(port),
-    )
+    async def authorize(self, www_authenticate: str | None = None) -> str:
+        """Run the browser flow, cache the token, return its access token."""
+        if not self.interactive:
+            # Before any network: discovery would only end at the same refusal.
+            raise NonInteractiveAuthRequired(
+                "no cached OAuth token and interactive auth is disabled"
+            )
+        import atomic_write  # noqa: PLC0415 — stdlib, beside this file
+        import mcp_http  # noqa: PLC0415
+
+        token = None
+        # The device code first: it needs no localhost callback, so a busy
+        # callback port (an /mcp sign-in mid-flow, a second login), a container
+        # or an SSH session cannot break it. The browser flow stays as the
+        # fallback for a server that does not offer the grant.
+        if os.environ.get("MEMHUB_LOGIN_FLOW", "").strip().lower() != "browser":
+            discovery = mcp_http.discover_oauth(
+                self.url, www_authenticate or mcp_http.auth_challenge(self.url))
+            try:
+                token = await mcp_http.oauth_device_authorize(
+                    self.url, self.client_id, _show_device_code,
+                    discovery=discovery,
+                    approval_timeout=float(os.environ.get("MEMHUB_OAUTH_TIMEOUT", "300")))
+            except mcp_http.DeviceFlowUnavailable:
+                token = None
+        if token is None:
+            token = await mcp_http.oauth_authorize(
+                self.url, self.client_id, self.redirect_uri,
+                self.redirect_handler, _make_callback_handler(self.port),
+                www_authenticate=www_authenticate)
+        # Same writer as every other credential here: atomic and created 0600,
+        # so a hook reading concurrently never catches it half-written.
+        atomic_write.publish(token_cache_path(self.url),
+                             mcp_http.oauth_token_json(token))
+        return token["access_token"]
+
+    async def bearer(self) -> str:
+        """The cached access token, else a fresh one from the browser flow."""
+        return _cached_access_token(self.url) or await self.authorize()
+
+
+def _show_device_code(page: str | None, user_code: str) -> None:
+    """Open the approval page with the code filled in, and print the code.
+
+    The page asks the person to confirm the code matches; the printed line is
+    what they compare it with, and what they type on another device when this
+    one has no browser."""
+    print(f"Sign in to MemHub: confirm the code {user_code} in your browser.\n  {page}",
+          flush=True)
+    if page:
+        webbrowser.open(page)
+
+
+def build_oauth(url: str, interactive: bool = True) -> OAuthFlow:
+    """The OAuth client for ``url`` (see ``OAuthFlow``)."""
+    return OAuthFlow(url, interactive=interactive)
 
 
 def _make_callback_handler(port: int):
@@ -314,7 +358,7 @@ def _make_callback_handler(port: int):
                 result["error"] = error
                 if completion is not None:
                     completion.callback_received = True
-                # Unblock the SDK for state validation, PKCE exchange and storage.
+                # Unblock the flow for state validation, PKCE exchange and storage.
                 # Hold the browser response until the foreground command verifies
                 # the credential. Closing the listening socket does not close this
                 # accepted request socket.
@@ -392,7 +436,7 @@ def _make_callback_handler(port: int):
                         f"OAuth approval timed out after {int(approval_timeout)}s "
                         "(no browser redirect received; override via "
                         "$MEMHUB_OAUTH_TIMEOUT). Re-run and complete the browser "
-                        "approval, or set $MEMHUB_TOKEN for headless use."
+                        f"approval, or set {_headless_hint()} for headless use."
                     )
                 await asyncio.sleep(0.2)
         finally:
@@ -438,8 +482,8 @@ def _auth_token_endpoint() -> str | None:
     """The auth server's real ``token_endpoint`` (Auth0), discovered from the
     ``oauth.authServerMetadataUrl`` in the plugin's ``.mcp.json``.
 
-    This is the endpoint the SDK *fails* to reach on a cold refresh (it has no
-    discovered ``oauth_metadata`` yet, so it POSTs the refresh to
+    This is the endpoint the MCP SDK *failed* to reach on a cold refresh (it had no
+    discovered ``oauth_metadata`` yet, so it POSTed the refresh to
     ``<resource-server>/token`` instead). We resolve it ourselves.
     """
     try:
@@ -477,15 +521,16 @@ def _auth_token_endpoint() -> str | None:
                   "until this is resolved.", file=sys.stderr)
             return None
         return endpoint
-    except Exception:  # noqa: BLE001 — best-effort; caller falls back to SDK
+    except Exception:  # noqa: BLE001 — best-effort; caller falls back to OAuthFlow
         return None
 
 
 def _refresh_cached_token_if_stale(url: str) -> None:
-    """Renew a stale cached access token BEFORE the SDK runs. No-op on success
-    paths that don't need it; never raises.
+    """Renew a stale cached access token BEFORE anything is sent. No-op on
+    success paths that don't need it; never raises.
 
-    Why this exists — the MCP SDK's ``OAuthClientProvider`` cannot refresh a
+    Why this exists — the MCP SDK's ``OAuthClientProvider``, which the
+    foreground scripts used until they moved to ``OAuthFlow``, could not refresh a
     *reloaded* token from a cold process (as every commit/PR hook is), for two
     compounding reasons:
 
@@ -505,11 +550,13 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     token is inside its short lifetime, then silently stops until the next
     interactive ``/mcp`` or terminal-script auth re-seeds it. So we do the
     refresh here — against the *correct* auth-server ``token_endpoint`` — and
-    write the fresh token back, leaving the SDK a valid token to send.
+    write the fresh token back, leaving a valid token to send.
+
+    ``OAuthFlow`` has no refresh of its own, so this is still the only one.
 
     Best-effort throughout: a missing cache, no refresh token, undiscoverable
-    endpoint, or a failed refresh all fall through to the SDK's own flow
-    (which opens a browser when interactive, or degrades quietly when not).
+    endpoint, or a failed refresh all fall through to ``OAuthFlow`` (which
+    opens a browser when interactive, or degrades quietly when not).
     """
     path = token_cache_path(url)
     try:
@@ -529,7 +576,7 @@ def _refresh_cached_token_if_stale(url: str) -> None:
     access_token = cached.get("access_token") or ""
     exp = _access_token_expiry(access_token)
     if exp is not None and time.time() < exp - _REFRESH_SKEW_S:
-        return  # still valid per its own exp — let the SDK use it as-is
+        return  # still valid per its own exp — use it as-is
 
     token_endpoint = _auth_token_endpoint()
     client_id = _plugin_mcp_config().get("oauth", {}).get("clientId")
@@ -560,8 +607,8 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         return
 
     # Carry the new fields onto the existing cache shape only — don't introduce
-    # keys (e.g. id_token) the SDK's OAuthToken model wasn't already validating
-    # here. Auth0 omits refresh_token when rotation is off; keep the old one.
+    # keys (e.g. id_token) the cache's token shape (``mcp_http.oauth_token``)
+    # does not carry. Auth0 omits refresh_token when rotation is off; keep the old one.
     updated = dict(cached)
     # Type-checked before merging. These fields are echoed straight back onto
     # the wire as a bearer, and a malformed response — a dict where a string
@@ -630,13 +677,13 @@ def _cached_access_token(url: str) -> str | None:
 
 def resolve_bearer(url: str | None = None,
                    refresh: bool = True) -> tuple[str, str | None]:
-    """``(url, bearer)`` for a NON-INTERACTIVE caller — stdlib only, no SDK.
+    """``(url, bearer)`` for a NON-INTERACTIVE caller.
 
-    This is what every hook uses now. It returns the same credential the SDK
-    would have ended up putting on the wire, without loading the SDK to get
-    there:
+    This is what every hook uses. It returns the same credential a foreground
+    ``open_session`` would put on the wire, without ever opening a browser:
 
-    1. ``$MEMHUB_TOKEN`` — explicit bearer, CI/headless;
+    1. ``explicit_token()`` — the ``memhub_token`` plugin option, else
+       ``$MEMHUB_TOKEN``; an explicit bearer, CI/headless;
     2. a stored personal access key — the normal path once /memhub:login has
        run, and a static string with no lifecycle to manage;
     3. the cached OAuth access token, refreshed first if stale. Worth keeping
@@ -651,9 +698,9 @@ def resolve_bearer(url: str | None = None,
     """
     url = url or default_url()
 
-    token = os.environ.get("MEMHUB_TOKEN", "").strip()
-    if token:
-        return url, token
+    explicit = explicit_token()
+    if explicit:
+        return url, explicit[0]
 
     secret = _stored_pak_secret(url)
     if secret is not None:
@@ -717,24 +764,29 @@ def _stored_pak_secret(url: str) -> str | None:
 
 
 def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
-    """Return (url, headers, auth) for streamablehttp_client.
+    """Return ``(url, headers, auth)`` for ``open_session``.
 
-    $MEMHUB_TOKEN (if set) wins as a plain bearer header — CI/headless escape
-    hatch. Otherwise an OAuthClientProvider that reuses the cached token,
-    refreshes it, or runs the one-time browser flow. With interactive=False
-    (background hooks) the browser flow raises NonInteractiveAuthRequired
-    instead of opening a tab; cached/refreshed tokens still work.
+    An explicit token (``explicit_token``: the ``memhub_token`` plugin option,
+    else $MEMHUB_TOKEN) wins as a plain bearer header — CI/headless escape
+    hatch. Otherwise an ``OAuthFlow`` that reuses the cached token or runs the
+    one-time browser flow. With interactive=False (background callers) the
+    browser flow raises NonInteractiveAuthRequired instead of opening a tab;
+    cached/refreshed tokens still work.
 
-    Before handing off to the SDK we proactively renew a stale cached token
-    (see ``_refresh_cached_token_if_stale``) — the SDK cannot do this itself
-    from a cold process, which silently broke the commit/PR flush hooks.
+    ``headers`` carries ``Authorization`` only for a static bearer (explicit
+    token or stored key), so a caller that must not use the OAuth cache — as
+    ``rule_decide`` must not — can tell them apart by it alone.
+
+    Before handing back an ``OAuthFlow`` we proactively renew a stale cached
+    token (see ``_refresh_cached_token_if_stale``) — nothing else can do this
+    from a cold process, which once silently broke the commit/PR flush hooks.
     """
     from plugin_version import request_headers
 
     url = url or default_url()
-    token = os.environ.get("MEMHUB_TOKEN", "").strip()
-    if token:
-        return url, {"Authorization": f"Bearer {token}", **request_headers()}, None
+    explicit = explicit_token()
+    if explicit:
+        return url, {"Authorization": f"Bearer {explicit[0]}", **request_headers()}, None
 
     # A stored personal access key, minted by /memhub:login. Preferred over the
     # OAuth cache because it is a STATIC bearer: no expiry inside a session, no
@@ -754,18 +806,85 @@ def resolve_url_and_auth(url: str | None = None, interactive: bool = True):
     return url, request_headers(), build_oauth(url, interactive=interactive)
 
 
-if __name__ == "__main__":
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+class AuthedSession:
+    """``mcp_http.Session`` plus the SDK's one OAuth recovery.
 
+    ``call_tool`` / ``list_tools`` run over the stdlib transport. When the
+    bearer came from ``OAuthFlow`` and the server answers 401 — a cached token
+    revoked, or issued by the other tenant — the browser flow runs and the call
+    is retried ONCE, which is what the SDK's ``OAuthClientProvider`` did. A
+    static bearer (explicit token, stored key) has no such recovery: its 401 is
+    the caller's failure, as it always was.
+    """
+
+    def __init__(self, url: str, bearer: str, flow: OAuthFlow | None,
+                 timeout: float):
+        self.url = url
+        self.bearer = bearer
+        self._flow = flow
+        self._timeout = timeout
+
+    async def _with_reauth(self, op):
+        import mcp_http  # noqa: PLC0415
+
+        try:
+            return await op(self.bearer)
+        except mcp_http.McpError as exc:
+            if self._flow is None or exc.status != 401:
+                raise
+        self.bearer = await self._flow.authorize()
+        return await op(self.bearer)
+
+    async def call_tool(self, name: str, arguments: dict | None = None,
+                        timeout: float | None = None):
+        import mcp_http  # noqa: PLC0415
+
+        return await self._with_reauth(
+            lambda bearer: mcp_http.Session(self.url, bearer, self._timeout)
+            .call_tool(name, arguments, timeout))
+
+    async def list_tools(self) -> list[dict]:
+        """Tool descriptors (one page, as the SDK's ``list_tools`` returned)."""
+        import mcp_http  # noqa: PLC0415
+
+        return await self._with_reauth(
+            lambda bearer: asyncio.to_thread(
+                mcp_http.list_tools, self.url, bearer, self._timeout))
+
+
+async def open_session(url: str, headers: dict, auth: OAuthFlow | None,
+                       timeout: float | None = None) -> AuthedSession:
+    """A session for ``resolve_url_and_auth``'s result — where the SDK's
+    ``streamablehttp_client`` + ``ClientSession`` used to be opened.
+
+    The bearer is resolved here: the static one in ``headers``, or the OAuth
+    token (cached, else from the browser flow — or NonInteractiveAuthRequired).
+    ``timeout`` defaults to the SDK's 300s read timeout, not the hooks' 60s: a
+    large save or import legitimately takes longer than a hook would wait.
+    """
+    import mcp_http  # noqa: PLC0415
+
+    value = str((headers or {}).get("Authorization", ""))
+    if value.startswith("Bearer ") and value[len("Bearer "):]:
+        bearer, flow = value[len("Bearer "):], None
+    elif auth is not None:
+        bearer, flow = await auth.bearer(), auth
+    else:
+        raise RuntimeError("no MemHub credential to open a session with")
+    return AuthedSession(url, bearer, flow,
+                         mcp_http.SDK_READ_TIMEOUT_S if timeout is None else timeout)
+
+
+if __name__ == "__main__":
     async def _check():
         url, headers, auth = resolve_url_and_auth()
         print(f"endpoint : {url}")
-        print(f"mode     : {'bearer ($MEMHUB_TOKEN)' if headers else 'oauth (plugin client)'}")
-        async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-            async with ClientSession(r, w) as s:
-                await s.initialize()
-                tools = await s.list_tools()
-                print(f"AUTH OK — server exposes {len(tools.tools)} tools")
+        explicit = explicit_token()
+        mode = (f"bearer ({explicit[1]})" if explicit
+                else "stored access key" if auth is None else "oauth (plugin client)")
+        print(f"mode     : {mode}")
+        session = await open_session(url, headers, auth)
+        tools = await session.list_tools()
+        print(f"AUTH OK — server exposes {len(tools)} tools")
 
     raise SystemExit(asyncio.run(_check()))

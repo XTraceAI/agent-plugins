@@ -103,7 +103,13 @@ const bubbleHeight = (msg: string) => bubbleLines('', '', msg, 0, BUB_ACCENT).le
 
 /** The most text lines fitBubble leaves, and so the tallest a bubble gets. */
 const MAX_TEXT_LINES = 4
-const TALLEST_BUBBLE = MAX_TEXT_LINES + 6
+/**
+ * The desktop's cap: its band is a card above the prompt, and room kept for a
+ * fourth line showed as empty card over every shorter bubble.
+ */
+export const DESKTOP_TEXT_LINES = 3
+/** A bubble's height in rows, for so many lines of text. */
+const tallestFor = (maxLines: number) => maxLines + 6
 
 // East Asian wide ranges, emoji-presentation symbols and variation selectors:
 // a Raster cell holds one width-1 BMP character or the whole tree is refused.
@@ -113,16 +119,16 @@ const WIDE = /[\u1100-\u115f\u2600-\u27bf\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff
  * Text a bubble can show: printable width-1 BMP characters only, and at most
  * MAX_TEXT_LINES wrapped lines, the last cut with an ellipsis.
  */
-export function fitBubble(text: string): string {
+export function fitBubble(text: string, maxLines = MAX_TEXT_LINES): string {
   const clean = [...text.replace(WIDE, '')]
     .filter(ch => ch.codePointAt(0)! <= 0xffff && ch >= ' ' && ch !== '\u007f')
     .join('')
     .replace(/\s+/g, ' ')
     .trim()
   const lines = wrap(clean, BUB_W - 4)
-  if (lines.length <= MAX_TEXT_LINES) return clean
-  const kept = lines.slice(0, MAX_TEXT_LINES)
-  kept[MAX_TEXT_LINES - 1] = kept[MAX_TEXT_LINES - 1]!.slice(0, BUB_W - 5) + '…'
+  if (lines.length <= maxLines) return clean
+  const kept = lines.slice(0, maxLines)
+  kept[maxLines - 1] = kept[maxLines - 1]!.slice(0, BUB_W - 5) + '…'
   return kept.join(' ')
 }
 
@@ -163,6 +169,8 @@ function fit(
   s: number,
   isTrimmed: boolean,
   mustFit: boolean,
+  maxLines: number,
+  spare: number,
 ): Layout | null {
   const cropTop = isTrimmed ? (build.trim?.top ?? 0) : 0
   const cropBottom = isTrimmed ? (build.trim?.bottom ?? 0) : 0
@@ -179,14 +187,14 @@ function fit(
   // the bubble's right edge meets the animal's bubble column, as compose() draws it
   const besideWidth = cw + 2 + BUB_W - build.bubbleAt.column * s
   if (bodyColumns >= besideWidth) {
-    const row0 = reserve(Math.max(0, TALLEST_BUBBLE - Math.floor(((build.bubbleAt.row - cropTop) * s) / 2)))
+    const row0 = reserve(Math.max(0, tallestFor(maxLines) - 1 + spare - Math.floor(((build.bubbleAt.row - cropTop) * s) / 2)))
     const columns = Math.min(bodyColumns, besideWidth)
     return { s, columns, rows: row0 + ch, col0: columns - cw - 2, row0, isBeside: true, ...crop }
   }
   if (bodyColumns < cw) return null
   // too narrow to sit beside: the bubble hangs over the animal's head, on
   // rows reserved above it (the terminal version had the screen above)
-  const row0 = reserve(Math.max(0, TALLEST_BUBBLE - aboveBottom(build, s, cropTop)))
+  const row0 = reserve(Math.max(0, tallestFor(maxLines) - aboveBottom(build, s, cropTop)))
   const columns = Math.min(bodyColumns, Math.max(cw + 2, BUB_W + 1))
   return {
     s, columns, rows: row0 + ch, col0: Math.max(0, columns - cw - 2), row0,
@@ -195,6 +203,11 @@ function fit(
 }
 
 /**
+ * `maxLines` is the most text lines a bubble may say, which sizes the rows
+ * kept above the animal for it; `spare` is how many rows more are kept over
+ * the tallest bubble hung beside it — one on the terminal, as it always was,
+ * none on the desktop's card, where it showed as an empty band.
+ *
  * The size the animal's art was drawn for, or the largest smaller one the
  * band has room for; `/<animal> scale <n>` overrides it either way. The whole
  * canvas is kept: trimming happens only where even one cell a pixel is taller
@@ -205,18 +218,20 @@ export function layoutOf(
   bodyColumns: number,
   maxRows: number,
   scale?: number,
+  maxLines = MAX_TEXT_LINES,
+  spare = 1,
 ): Layout | null {
   const wanted = scale ?? build.pixelSize
   for (let s = wanted; s >= 1; s--) {
     const laid =
-      fit(build, bodyColumns, maxRows, s, false, true) ??
-      fit(build, bodyColumns, maxRows, s, true, true)
+      fit(build, bodyColumns, maxRows, s, false, true, maxLines, spare) ??
+      fit(build, bodyColumns, maxRows, s, true, true, maxLines, spare)
     // an asked-for size is theirs to have, even where the band must scroll
     if (laid || scale !== undefined) {
-      return laid ?? fit(build, bodyColumns, maxRows, s, false, false)
+      return laid ?? fit(build, bodyColumns, maxRows, s, false, false, maxLines, spare)
     }
   }
-  return fit(build, bodyColumns, maxRows, 1, false, false)
+  return fit(build, bodyColumns, maxRows, 1, false, false, maxLines, spare)
 }
 
 export function compose(painted: Painted, build: Build, title: string, lay: Layout): Buf {
@@ -370,4 +385,71 @@ export function encode(buf: Buf): string {
     view.setUint32(i * 12 + 8, rgb(bg), true)
   })
   return base64(new Uint8Array(view.buffer))
+}
+
+/**
+ * A cell's size in CSS pixels where the band is drawn as an SVG (the desktop,
+ * whose Raster draws nothing): two square pixels a cell, as in the terminal.
+ */
+export const CELL_W = 8
+export const CELL_H = 16
+const FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+
+const hex = (c: RGB) => `#${((c[0] << 16) | (c[1] << 8) | c[2]).toString(16).padStart(6, '0')}`
+const escapeXml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const same = (a: RGB | null, b: RGB | null) => a === b || (!!a && !!b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2])
+const isBlock = (ch: string) => ch === ' ' || ch === '▄' || ch === '▀'
+
+/** A cell's upper and lower pixel, as compose() encoded them; null is clear. */
+function halvesOf([ch, fg, bg]: Cell): [RGB | null, RGB | null] {
+  if (ch === '▄') return [bg, fg]
+  if (ch === '▀') return [fg, bg]
+  return [bg, bg]
+}
+
+/**
+ * The same cells compose() lays out, as one SVG: each pixel row's runs of one
+ * colour a rect, each run of text a `<text>` stretched to its cells, so the
+ * bubble's words and borders land where the terminal draws them.
+ */
+export function svgOf(buf: Buf): string {
+  const rows = buf.length
+  const columns = buf[0]?.length ?? 0
+  const half = CELL_H / 2
+  const out: string[] = []
+  buf.forEach((line, r) => {
+    for (const h of [0, 1] as const) {
+      let c = 0
+      while (c < columns) {
+        const color = halvesOf(line[c]!)[h]
+        let end = c + 1
+        if (color) {
+          while (end < columns && same(halvesOf(line[end]!)[h], color)) end++
+          out.push(`<rect x="${c * CELL_W}" y="${r * CELL_H + h * half}" width="${(end - c) * CELL_W}" height="${half}" fill="${hex(color)}"/>`)
+        }
+        c = end
+      }
+    }
+    let c = 0
+    while (c < columns) {
+      const [ch, fg] = line[c]!
+      if (isBlock(ch)) {
+        c++
+        continue
+      }
+      // a run is the cells up to the next block cell or colour change, the
+      // spaces between words included, so a line of the bubble is one text
+      let end = c + 1
+      while (end < columns && same(line[end]![1], fg) && (!isBlock(line[end]![0]) || line[end]![0] === ' ')) end++
+      while (end > c + 1 && line[end - 1]![0] === ' ') end--
+      const text = line.slice(c, end).map(cell => cell[0]).join('')
+      out.push(
+        `<text x="${c * CELL_W}" y="${r * CELL_H + CELL_H * 0.75}" textLength="${(end - c) * CELL_W}" lengthAdjust="spacingAndGlyphs" fill="${hex(fg ?? BUB_TEXT)}">${escapeXml(text)}</text>`,
+      )
+      c = end
+    }
+  })
+  const width = columns * CELL_W
+  const height = rows * CELL_H
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" shape-rendering="crispEdges" font-family="${FONT}" font-size="13" xml:space="preserve">${out.join('')}</svg>`
 }

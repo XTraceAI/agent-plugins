@@ -24,8 +24,10 @@ Four things about how Claude Code runs it, each measured, shape the code:
 * **It runs once per connect**, not per request, with a 10s timeout — so the
   check costs one request per connect and must finish well inside that.
 * **Credential env vars are scrubbed** for plugin helpers, so
-  ``$MEMHUB_TOKEN`` never reaches this process; only the stored access key
-  and the plugin's own OAuth cache do.
+  ``$MEMHUB_TOKEN`` never reaches this process, and Claude Code gives a
+  helper no userConfig values either, so neither does the ``memhub_token``
+  plugin option; only the stored access key and the plugin's own OAuth cache
+  do.
 * **The header goes to the URL in ``.mcp.json``** (``$CLAUDE_CODE_MCP_SERVER_URL``),
   whatever ``$MEMHUB_MCP_BASE_URL`` says. So the key is chosen from that
   config, never from the override, and nothing is printed for any other host —

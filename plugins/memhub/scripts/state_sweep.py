@@ -13,6 +13,9 @@ goes only once nothing has written it for its age below (`MAX_AGE_DAYS` unless
 it says otherwise); a lock file whose data file is gone, and an arcs file,
 go at any age:
 
+  rulebook/[<backend>/]state/…       the install's own directory and the
+                                     unkeyed one installs shared before
+                                     state was keyed by backend
   rulebook/state/<session>.json      per-session dedup and armings, kept
                                      `RULEBOOK_AGE_DAYS`: session-armed rules
                                      are armed only at SessionStart, so a
@@ -27,15 +30,20 @@ go at any age:
                                      which capture_health reads for its
                                      next-session failure banner
   mdcapture/memhub-md-capture-*.json markdown-capture bookkeeping
+  mdcapture/memhub-md-capture-*.activity
+                                     its activity marker (mtime only)
   overview/pointers/*.json           a cache, refetched on use
   rulebook/state/*.arcs.json         no writer since plugin 0.95.0: any age
+  harness/offsets/<session>.json     the harness Stop's transcript read offset;
+                                     losing one costs one full read, nothing else
 
 A lock file goes only while the sweep holds its lock, and only when the file
 it guards is gone: every locker re-checks after acquiring that it locked the
 file now at the path (`portable_lock.still_at`), so deleting one cannot let
 two holders in. codexflush/ and cursorflush/ are left alone — Cursor's state
 pins first-seen timestamps that a later import re-applies — and so is the
-rulebook's fire ledger, which the flush lane uploads and never re-reads.
+rulebook's fire ledger, which the flush lane uploads and rotates itself, under
+its own locks (`rulebook_ledger.rotate`).
 
 Fails open and silent, like every hook path. `--dry-run` prints what it would
 delete; `--force` ignores the once-a-day marker.
@@ -73,8 +81,25 @@ def state_root() -> Path:
                 or (Path.home() / ".config" / "memhub-plugin"))
 
 
-def rulebook_root() -> Path:
-    return Path(os.environ.get("MEMHUB_RULEBOOK_BASE") or (state_root() / "rulebook"))
+def rulebook_roots() -> list[Path]:
+    """Every rulebook state directory this install may have left files in:
+    its own, keyed by backend (rulebook_paths.py), and the unkeyed one every
+    install shared before that, whose old session files nothing else will
+    ever clean up. `$MEMHUB_RULEBOOK_BASE` names exactly one."""
+    override = os.environ.get("MEMHUB_RULEBOOK_BASE")
+    if override:
+        return [Path(override)]
+    shared = state_root() / "rulebook"
+    try:
+        import rulebook_paths  # noqa: PLC0415 — beside this file
+        key = rulebook_paths.backend_key()
+    except Exception:
+        key = ""
+    return [shared / key, shared] if key else [shared]
+
+
+def harness_root() -> Path:
+    return Path(os.environ.get("MEMHUB_HARNESS_DIR") or (state_root() / "harness"))
 
 
 def _age_days(path: Path, now: float) -> float:
@@ -117,21 +142,21 @@ def sweep(now: float | None = None, dry: bool = False) -> list[Path]:
     """Delete what is past its age; returns the paths it removed."""
     now = time.time() if now is None else now
     gone: list[Path] = []
-    state = rulebook_root() / "state"
-
-    # rulebook/state: sessions, checkouts, the error-arc files 0.95.0 stopped writing
-    for data in sorted(state.glob("*.json")) if state.is_dir() else []:
-        if data.name.endswith(".arcs.json"):
-            _unlink(data, dry, gone)
-            continue
-        if _age_days(data, now) > RULEBOOK_AGE_DAYS:
-            _unlink(data, dry, gone)
-    # a lock whose file is gone guards nothing
-    removed = set(gone)
-    for lock in sorted(state.glob("*.lock")) if state.is_dir() else []:
-        guarded = lock.with_suffix("")
-        if guarded in removed or not guarded.exists():
-            _unlink_lock(lock, dry, gone)
+    for root in rulebook_roots():
+        state = root / "state"
+        # rulebook/state: sessions, checkouts, the error-arc files 0.95.0 stopped writing
+        for data in sorted(state.glob("*.json")) if state.is_dir() else []:
+            if data.name.endswith(".arcs.json"):
+                _unlink(data, dry, gone)
+                continue
+            if _age_days(data, now) > RULEBOOK_AGE_DAYS:
+                _unlink(data, dry, gone)
+        # a lock whose file is gone guards nothing
+        removed = set(gone)
+        for lock in sorted(state.glob("*.lock")) if state.is_dir() else []:
+            guarded = lock.with_suffix("")
+            if guarded in removed or not guarded.exists():
+                _unlink_lock(lock, dry, gone)
 
     # turnflush: whole sessions, never the newest cursors capture_health reads
     tf = state_root() / "turnflush"
@@ -157,10 +182,16 @@ def sweep(now: float | None = None, dry: bool = False) -> list[Path]:
                     _unlink_lock(f, dry, gone)
 
     # markdown capture bookkeeping and the pointer cache
-    for pattern in ("mdcapture/memhub-md-capture-*.json", "overview/pointers/*.json"):
+    for pattern in ("mdcapture/memhub-md-capture-*.json",
+                    "mdcapture/memhub-md-capture-*.activity",
+                    "overview/pointers/*.json"):
         for p in state_root().glob(pattern):
             if _age_days(p, now) > MAX_AGE_DAYS:
                 _unlink(p, dry, gone)
+    # the harness Stop's per-session read offsets
+    for p in harness_root().glob("offsets/*.json"):
+        if _age_days(p, now) > MAX_AGE_DAYS:
+            _unlink(p, dry, gone)
     return gone
 
 

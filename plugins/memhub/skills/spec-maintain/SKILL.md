@@ -1,7 +1,7 @@
 ---
 name: spec-maintain
 description: Use to bootstrap repository specs locally or in MemHub cloud, create or revise a spec, resolve drift into a reviewable change, or diagnose spec workflow readiness. Also handles /memhub:spec init, revise, bootstrap, resolve, status, and setup. Reads Git or explicitly selected Brain sources without treating generated mirrors as authoritative.
-argument-hint: <init|revise|bootstrap|resolve|status|setup> [file|topic] [--local|--cloud]
+argument-hint: "<init|revise|bootstrap|resolve|status|setup> [file|topic] [--local|--cloud]"
 ---
 
 # Maintain specs

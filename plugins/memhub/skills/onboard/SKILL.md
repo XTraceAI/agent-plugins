@@ -1,7 +1,7 @@
 ---
-description: Use when a new user wants to set up MemHub for their repo, or asks to "onboard", "get started", "set up my brain", or "connect this repo to MemHub". Logs the plugin in, creates or reuses the repo's agent brain, scans the repo for its own markdown documents wherever it keeps them (specs, designs, ADRs, runbooks, guides — no directory layout assumed), saves the ones that look important to the brain as artifacts without asking (folders or files given as arguments override the choice), shows the brain's Index, and ends with an optional hint that `/memhub:start-rulebook` creates the team's rulebook.
-argument-hint: [folder-or-file ...]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub-staging_memhub__list_orgs
+description: Use when someone wants MemHub working where they are — a first setup, or a check or repair later (e.g. "onboard", "get started", "set up memhub", "set up my brain", "connect this repo to MemHub", "capture stopped working", "my sessions aren't being saved", "verify capture", "check memhub is working", "remove memhub's hooks"). One command signs in, sets up this machine's hooks, checks capture health, creates or reuses the repo's brain with its docs, offers up to five universal safety rules with one answer, and on Codex asks for the one hook approval only the person can give. Every step is skipped when already done; --status only reports, --remove takes the machine hooks out.
+argument-hint: "[--status | --remove]"
+allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/login.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_claude_fork.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_codex_hooks.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture_health.py"), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture_health.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" *), Bash(git rev-parse --show-toplevel), Bash(git ls-files), Read, Edit(//tmp/memhub-repo-overview.md), AskUserQuestion'
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code
@@ -10,274 +10,170 @@ from `$PLUGIN_ROOT` when that is set, otherwise (e.g. on Cursor) to this
 plugin's root — the ancestor directory of this skill file that contains
 `.claude-plugin/` — with `export CLAUDE_PLUGIN_ROOT="<plugin-root>"`.
 
-Onboard a new user onto MemHub for the repo they're in. Three things, in this
-order, and then stop:
+Make MemHub work for this person, here. Run the steps in order; each is safe
+to repeat and skipped when already done. Give each one status line, relaying
+what its script printed, never something stronger. Do not call the memhub MCP
+tools in this skill: on a first run they are not connected yet, and nothing
+here needs them. `<host>` below is the host you are actually
+running in: `claude-code`, `codex` or `cursor`.
 
-1. **Connect** — the plugin's own login, and the repo's brain (its "room").
-2. **Stock the brain with what the repo already knows** — its design docs,
-   saved as artifacts. A brain that holds the team's specs is useful to the
-   next agent today; an empty one is not.
-3. **Point at the Rulebook** — `/memhub:start-rulebook` is where the team's
-   rules come from. This skill names it and ends.
+Arguments: `$ARGUMENTS`
 
-What this skill does **not** do: import a session. Sessions are captured
-automatically from the next turn on (§4), into the user's personal memory —
-never into this brain — and the server does not mine rules or facts out of
-them: a session yields its transcript (the Sessions view) and task episodes,
-nothing else. Rules are authored through the Rulebook. So there
-is no "seed session" to pick and no recall to prove; do not add either back.
+- `--status`: run only each step's read-only check (named in the step), then
+  the summary. Change nothing, sign nobody in, ask no question.
+- `--remove`: run the one line for this host, relay it, and stop. It does not
+  sign out or touch any brain; Cursor has nothing to remove.
+  - Codex: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_codex_hooks.py" remove`
+  - Claude Code: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_claude_fork.py" remove`
 
-Arguments: `$ARGUMENTS` — optional folders or files to add. Given → still run
-the scan in §2 (it builds the manifest the upload needs) and upload exactly
-those with `--only-folder` / `--path`.
+## 1. Sign in
 
-Do exactly this:
-
-## 0. Authenticate the plugin itself (before anything else)
-
-```bash
-uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/login.py" --status
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/login.py" --status --host <host>
 ```
 
-`uv: command not found` → the plugin's scripts and hooks all need `uv`; send
-the user to https://docs.astral.sh/uv/ to install it, then start over. Not
-logged in → run `/memhub:login` (no `--status`) and let it finish before
-continuing. Everything below needs it: the uploads in §2 send as this user,
-and the capture hooks cannot run without it.
+A `status` line reading `OK` → "✓ Signed in", go on. Otherwise (and not
+`--status`) run the same command without `--status`. Before it finishes, tell
+the person: "If a sign-in code appears, open the link, check the code matches,
+and approve." If sign-in fails, give its one-line reason and stop; running
+this command again picks up where it left off.
 
-This is **not** the `/mcp` connector's login. They share an Auth0 client but
-store tokens in different places, so "connected in `/mcp`" and "my sessions are
-being captured" are independent facts — never treat the first as evidence of the
-second. What the hooks actually use is a **personal access key** (`mhk_…`) that
-`/memhub:login` mints and stores at `~/.config/memhub-plugin/pak-<host>.json`: a
-static bearer, because a hook is a cold background process that can never open a
-browser to refresh an expiring token. On Claude Code that same key also
-authenticates the memhub MCP tools, so no `/mcp` login is needed there. See
-`/memhub:login` for the full story.
+## 2. This machine's hooks
 
-## 1. Resolve the repo room (the durable boundary)
-- Derive the room name from the repo: `Repo: <org>/<name>` from
-  `git remote get-url origin` (host + `.git` stripped).
-- `list_agent_brains(repo="<org>/<name>")` (it looks across every org you are
-  in) → keep only an **exact-name match**. Reuse the existing id if found (a
-  teammate may have created it). **Only** `create_agent_brain` when there is no
-  exact match — do NOT mint a second room for a repo that already has one, and
-  give it a real one-line description, `category: "repo"` (what declares this
-  brain a code repository's room rather than leaving it uncategorised), and
-  `repo: "<org>/<name>"`, which ties it to the repository server-side. That
-  call can answer "Repo brain already exists: … (<id>)" (reuse that id) or
-  "…requires an org admin" (retry without `repo`) — the exact handling is
-  `references/repo-brain.md` §3; follow it.
-- Edge cases (SSH remotes, no remote, worktrees, **not a git repo at all**) and
-  the full create-time rules are in
-  `${CLAUDE_PLUGIN_ROOT}/references/repo-brain.md` — read it if the common path
-  above doesn't apply cleanly.
-- Record the `agent_brain_id`; call it `ROOM`. Note the org it lives in as
-  `ORG_ID` when the brain row or `create_agent_brain`'s answer names one — it
-  is optional: every call that takes `ROOM` works the org out from the id.
-- **Cache it — so artifact saves route to this room from the very next turn:**
+**Codex.** MemHub's handlers have to be in the user hook file, which a plugin
+cannot write for itself:
 
-  ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set --brain-id "<ROOM>" [--org-id "<ORG_ID>"]
-  ```
-
-  The artifact writers — `/memhub:save-artifact` and the `.md` auto-capture
-  at the end of a turn — also resolve the room themselves on a cache miss
-  (exact-name lookup, then cached). Caching here is still what makes the
-  FIRST save after onboarding route without a lookup. The session capture
-  hooks never read this cache:
-  sessions go to personal memory.
-  It writes to `~/.config/memhub-plugin/rooms.json` — the user's own config,
-  never the repo — and covers every worktree of this repo. Teammates run
-  `/memhub:onboard` once themselves.
-
-## 2. Stock the brain — the repo's own documents, as artifacts
-
-Every repo keeps its knowledge somewhere different — `docs/`, `design/`,
-`rfcs/`, a `handbook/`, READMEs beside each service — so **assume no layout**.
-A script finds the documents and scores them; the important ones go in without a question.
-
-**Look first.** `get_brain_overview(ROOM)` and read `index_markdown`. A brain a
-teammate already onboarded lists its artifacts there — say what it holds, and
-below offer only what is missing. Re-uploading is harmless (the same name
-versions the artifact, and identical content is deduplicated server-side) but
-it is noise; don't.
-
-**Scan** (stdlib, no network, reads nothing outside the repo):
-
-```bash
-MANIFEST="$(mktemp "${TMPDIR:-/tmp}/memhub-onboard-docs.XXXXXX")"; echo "manifest: $MANIFEST"
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard_docs.py" scan --out "$MANIFEST"
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_codex_hooks.py" install
 ```
 
-It lists every tracked markdown document (`.md` / `.mdx` / `.markdown`; every
-one on disk when the directory is not a git repo), **grouped by folder**, with
-a score per document from its own name and content — spec / design / ADR / RFC
-/ runbook wording, a link from the root README, real structure, real length.
-It prints what it left out and why: vendored and generated trees, licences and
-changelogs, stubs, and **agent instruction files** (`CLAUDE.md`, `AGENTS.md`,
-`.claude/` …) — those are excluded on purpose, because
-`/memhub:start-rulebook` turns them into rules that fire at the moment they
-matter, where an artifact copy would only be read once, like the file is.
-Symlinked documents, and anything whose real path is outside the repo, are
-left out too — a link is how a file from somewhere else would get into a shared
-brain. The full list is in the `--out` manifest; read it when the printed top
-rows of a folder don't tell you what the folder is.
+It merges four MemHub handlers (session start, before and after a tool call,
+turn end) into `~/.codex/hooks.json` (`$CODEX_HOME` when set), keeps every
+unrelated hook, backs up a file it changes, and changes nothing when already
+current. Say `installed` or `already current`. Read-only check:
+`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_codex_hooks.py" status`. Install one MemHub plugin, production or
+staging, never both.
 
-If the scan exits with `ERROR` — inside a git repo it refuses to continue when
-git will not list the tracked files (dubious ownership, a timeout) — **stop and
-report it.** Do not list files yourself instead: everything found is uploaded
-without a question, and "tracked only" is what keeps private notes out.
+**Claude Code.** Only matters when MemHub's rule drafting is on (the
+default; `MEMHUB_HARNESS_EXTRACT=0` turns it off): a draft runs in a background fork of the
+session, which the terminal has by default but the desktop app, the Agent SDK
+and `claude -p` lack unless `CLAUDE_CODE_FORK_SUBAGENT=1` is set.
 
-**Upload them — do not ask first.** The user ran onboarding to get their
-repo's knowledge into its brain, and the brain needs the specs there for
-anything downstream that checks code against them (spec drift, PR review). A
-question here is a step a new user cannot answer well — they do not yet know
-what the brain is for. So decide from the scan and go:
-
-- **In:** every document the scan scored as important (score ≥ 3) — specs,
-  designs, ADRs, RFCs, runbooks, guides, the root README — from every folder.
-  There is no cap: a repo with sixty real specs gets sixty artifacts.
-- **Out, automatically:** shelved folders (`archive/`, `retired/`,
-  `deprecated/` … — the scan already scores them below the bar), and
-  everything the scan skipped.
-- **Out, by one check you make:** a folder the scan marked `[spec dir: may
-  already be mirrored]` **when the Index you read above already lists those
-  specs** — a repo on the Git spec workflow (`/memhub:spec`) has that directory
-  mirrored into the brain by the backend, and a hand upload would be a second,
-  competing copy. Pass it as `--exclude-folder`. If the Index lists none of
-  them, the folder goes in like any other — those specs are exactly what the
-  brain is missing.
-- **Out, by reading:** a document that plainly carries credentials (an `.env`
-  block, a token). Files are uploaded as they are, nothing is redacted, and
-  this brain is shared with the team — `--exclude` it and say so in the report.
-
-One command; it saves each document through `save_artifact.py`, continues past
-a failure, and exits non-zero naming every file that failed:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard_docs.py" upload \
-  --manifest "<the manifest path the scan printed>" --min-score 3 \
-  [--exclude-folder "<mirrored spec dir>"] [--exclude "<file with credentials>"]
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_claude_fork.py" install
 ```
 
-The user can still steer it, before or after:
+It adds only `"CLAUDE_CODE_FORK_SUBAGENT": "1"` under `env` in
+`~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when set),
+backs the file up first, and writes nothing when drafting is off or the key is
+already there. Relay:
 
-- folders or files given as arguments to this skill → upload exactly those:
-  `--only-folder "<folder>"` / `--path "<file>"` instead of `--min-score 3` (a
-  named path is uploaded whatever it scores; `--only-folder .` is the repo
-  root's own documents);
-- "everything" → drop `--min-score`;
-- `--dry-run` prints the exact list and sends nothing — use it when they ask
-  what would go in;
-- a document the scan did not list (another format — `.rst`, `.txt`, a PDF)
-  is not in the manifest: save it with `/memhub:save-artifact` instead.
+- `set`: tell the person to **restart Claude Code**; the setting is read when
+  a session starts.
+- `already set` / `not needed`: nothing to do, one line.
+- `LEFT OFF`: they set it off themselves. Leave it; say rule drafts will not
+  run outside the terminal until it is `1`.
+- `ERROR`: the file could not be read and was left untouched. Give the one
+  line to add under `env` by hand.
 
-Do NOT pass a brain id. Each save routes to the room cached in §1 — that cache
-entry is also what carries the room's org, which a bare brain id would lack
-("Agent brain not found" in a multi-org account). Names and types are taken
-from the manifest, which derives them with the same rule automatic capture
-uses (§4), so a later edit of an uploaded file versions that artifact instead
-of starting a second one. Tags default to the document's type plus its folder;
-if the org requires tags from its own vocabulary the save is refused with that
-vocabulary in the error — re-run the failed files with `--path … --tags
-"<words it offered>"`.
+If a permission prompt or auto mode refuses the command, do not retry it or
+write the file another way: give the same one line and report the fork agent
+as not enabled. Read-only check:
+`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_claude_fork.py" status`.
 
-The scripts target the plugin's default endpoint — **production** when
-installed as `memhub`, staging when installed as `memhub-staging`. Do NOT pass
-`--url` to cross between them: the OAuth client and tenant still come from the
-*installed* plugin's `.mcp.json`, so a prod install pointed at staging fails to
-authenticate. (Staging is XTrace-internal; see CONTRIBUTING.md.)
+**Cursor.** Nothing to install; Cursor loads the plugin's hooks itself.
 
-Report the result as the script printed it: `saved N of M`, and each failed
-path with its error line. Never round a partial upload up to "done".
+## 3. Health
 
-**Nothing worth adding** (a young repo, or nothing but a stub README) → say so
-and move on. Do not pad the brain to have something to show; it fills from real
-work (§4).
+```
+echo '{}' | python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture_health.py"
+```
 
-## 3. Show what the brain holds now
-`get_brain_overview(ROOM)` again and show `index_markdown` — it is rendered
-from the rows themselves, so the artifacts you just saved appear at once:
-*"Here's what your repo's brain holds."* The `overview` prose summary is
-compiled asynchronously and may still be `null`; that is normal right after a
-first upload — say it will appear on its own, and never report this step as
-empty when `index_markdown` rendered.
+On Codex append `--host codex --plugin-root "${CLAUDE_PLUGIN_ROOT}"`, or it
+judges the wrong host. Keep the `echo '{}' |`: without it the script waits on
+the keyboard. No output
+is healthy ("✓ Capture healthy"); otherwise relay the warning closely enough
+that the person knows the remedy. This step is already read-only.
 
-Then prove it is reachable the way an agent will reach it: one
-`search_memory(query="<a topic from one uploaded doc>", kind="artifact",
-agent_brain_id=ROOM)` and show the hit — a pointer (title and abstract), which
-is all that step needs. No hit on a doc you just saved usually
-means indexing has not caught up — say that, don't retry in a loop.
+## 4. This repo
 
-## 4. Say what happens from here, and end on the Rulebook
-Report plainly, with real values: the room (created or reused), the docs saved
-(count, and any that failed), and that the Index rendered.
+Run `git rev-parse --show-toplevel`. Outside a git repo say "This repo:
+skipped (not a git repository)"; with `--status` say "This repo: not checked
+by --status". Either way go to §5.
 
-**What is now automatic** — nothing for the user to run:
-- every session in this repo is captured turn by turn into MemHub's Sessions
-  view (transcript, tools used, the PRs it opened), and its task episodes land
-  in the author's personal memory — never in this brain;
-- a substantial `.md` the agent writes or edits (a report, a design doc — past
-  ~6 KB) is saved to this brain as a draft artifact when the turn ends, under
-  the same name rule as §2, so an edit to a doc saved above versions it. The
-  exception is the folder the scan marked as the spec dir, if there was one:
-  automatic capture never touches it (it belongs to the Git spec workflow), so
-  a spec uploaded from there stays as it is until someone re-saves it with
-  `/memhub:save-artifact` or sets up `/memhub:spec`. Only say this when the
-  user actually uploaded from that folder.
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard.py" run --host <host>
+```
 
-**Tell them to restart Claude Code**, and what they will see when they do: every
-session in this repo now opens with a line naming the brain, and the agent
-receives the brain's map as context before the first prompt. That is also the
-fastest way to confirm §1 took, since the brief only appears once a room
-resolves. From then on `/memhub:search-memory` searches this brain alongside
-personal memory.
+It prints `✓` lines as it goes; show them as they are. A `✗` line ends this
+step: show it and go to §5.
 
-**Tell them what they can do now** — a short list, in their words, not a
-manual. Each line is something that works from this repo as of this moment:
+**Overview.** Run `git ls-files` on its own and read the README (if any) with
+the Read tool. Write an overview of at most 250 words: what the repo is, its
+stack, its layout (top-level folders and what each holds), and how to run and
+test it. Write only what you read. Save it in two steps, each exactly as shown
+and on one line (a combined or line-broken command does not match this skill's
+pre-approved calls, and a headless run has nobody to approve it):
 
-- *Hand work to a teammate* — "hand this off to Alice" (`/memhub:handoff-session
-  <teammate>`): writes a handoff brief into the handoff channel you share with
-  them (one brain per set of people, reused every time), so they pick up with
-  your context instead of a Slack summary.
-- *Share this repo's brain* — "share this brain with Bob" or "…with the
-  platform workspace": the agent does it through MemHub's sharing tools.
-  **If §1 CREATED the brain, lead with this one and say why:** a new brain is
-  private to the person who made it — being in the same workspace grants
-  nothing (the one exception: a brain bound to a granted GitHub repo, when the
-  org has turned on derived repo access) — so until it is shared, teammates
-  cannot see the docs just added,
-  and a teammate who runs `/memhub:onboard` in this repo will not find it and
-  will create a second, empty brain for the same repo. Once it is shared, their
-  onboarding finds it by name and joins it. If §1 REUSED a teammate's brain,
-  skip the warning — it is already shared with them.
-- *Ask what the team knows* — "what do we know about retries?", "is there a
-  spec for billing?" (`/memhub:search-memory`): searches this brain's docs and
-  episodes alongside your own memory.
-- *Keep a document* — "save this spec to MemHub" (`/memhub:save-artifact
-  <file>`): versions it in this brain under the same name.
+1. Write the overview to `/tmp/memhub-repo-overview.md` with the Write tool.
+2. `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" --file /tmp/memhub-repo-overview.md --name "Repo overview" --type document --topic docs --tags overview`
 
-On Claude Code, sharing and search run on the same plugin key as §0, so if
-either says it is not authenticated the fix is `/memhub:login`. Cursor and
-Codex are the exception: their memhub tools use the host's own MCP sign-in
-(Cursor's connector UI, `codex mcp login`), so that is the fix there.
+If it fails, go on: the docs are already saved.
 
-**End with a hint about the Rulebook — optional, one or two lines, and do not
-start it.** Onboarding is finished at this point; the Rulebook is something to
-try next *if they want it*, not a remaining step. The brain is what the agent
-can *look up*; the Rulebook is what it is *told at the moment it matters*
-("you're about to force-push"). Say something like: *"You're set up. If you'd
-like to try rules next, `/memhub:start-rulebook` creates a rulebook for your
-team and proposes its first rules — the starter set takes about a minute, and
-nothing it files turns on until you say so."* A hint, not a step: the rulebook
-skill opens with questions of its own, and it is run once per team rather than
-once per person — so say it and stop, even if they seem keen. This skill
-cannot see whether a rulebook already exists (it has no rulebook tools on
-purpose), which is why the line says "first rules" and lets
-`/memhub:start-rulebook` notice an existing book itself.
+**The one question.** The script's last line starts `RULES:`. `RULES: none`
+→ done. Otherwise ask once, with AskUserQuestion where you have it (otherwise
+as a plain question), listing the rules the script printed:
 
-Plain-English output throughout. If a step fails on authentication, send the
-user to `/memhub:login`, not to `/mcp` — the hooks and the scripts here use the
-plugin's own credential, and a connected `/mcp` says nothing about whether they
-have one.
+- question: "Turn on these starter rules? They stop your agent from running these commands, for you only."
+- option 1: "Turn them on (Recommended)"
+- option 2: "Not now" — the rules wait in Studio, off.
+
+Then run exactly one:
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard.py" rules --activate
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/onboard.py" rules --propose
+```
+
+## 5. Codex only: approve the hooks
+
+Codex runs a user hook only once the person trusts it; no plugin can do that
+for them. Run §2's read-only Codex check; `trust: confirmed …` means
+MemHub's hooks have run since the install: say so and skip the rest.
+
+Otherwise (and not `--status`) ask as a short plain-text question, since Codex
+has no question UI:
+
+"One step only you can do: restart Codex, choose **Review hooks** (or open
+`/hooks`), and trust only the MemHub handlers whose source is
+`~/.codex/hooks.json` and whose command contains `memhub_hook_bridge.py`.
+Never choose **Trust all**. Done, or later?"
+
+- done: MemHub confirms it the first time its hooks run (`--status` shows it).
+- later: capture and team rules stay off on Codex until then; running this
+  command again re-checks.
+
+Handlers beyond MemHub's four are not from this plugin. Never call capture or
+team rules active on Codex before trust is confirmed. In a Codex task with no
+project, hooks may not see a command's working directory: run repo commands
+as `cd <absolute repo path> && …`, or start the task in the repo.
+
+## 6. Summary
+
+One line per step: Signed in · Hooks · Health · This repo · Codex approval
+(Codex only). When every step was already done, say plainly that nothing
+changed. After a §4 that finished, add:
+
+- What the brain holds now (the docs, plus the overview), and the rules that
+  are on or waiting in Studio (the link the script printed).
+- Claude Code only: "The animal above your prompt is the MemHub companion. It
+  speaks up when a team rule fires or blocks a command, and when MemHub
+  proposes a new rule for you to accept."
+- "MemHub's tools are ready from your next session. Sessions from now on are
+  saved to your memory."
+- Next: share the brain with a teammate from Studio, and run
+  `/memhub:start-rulebook` in a week or so to turn your own habits into rules.
+
+Write each command the way this plugin names it: `/memhub-staging:…` when the
+installed plugin is memhub-staging. Never mention `/mcp`, access keys, tokens,
+or log files unless the person asks.

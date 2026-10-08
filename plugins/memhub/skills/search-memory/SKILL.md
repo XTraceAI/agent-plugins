@@ -1,7 +1,7 @@
 ---
 description: Use when the user asks what the team knows, decided, discussed, or saved about a topic, or wants to check MemHub/team memory (e.g. "what do we know about X", "did we decide on Y", "search memhub for Z", "is there a spec for W"). Read-only — walks a brain's overview, searches artifacts, sessions and documents, and opens what it finds.
-argument-hint: <what to look for>
-allowed-tools: mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__read_memory, mcp__plugin_memhub-staging_memhub__read_memory, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__list_sessions, mcp__plugin_memhub-staging_memhub__list_sessions, Bash
+argument-hint: "<what to look for>"
+allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show *), mcp__plugin_memhub_memhub__get_brain_overview, mcp__plugin_memhub-staging_memhub__get_brain_overview, mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__read_memory, mcp__plugin_memhub-staging_memhub__read_memory, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags, mcp__plugin_memhub_memhub__list_sessions, mcp__plugin_memhub-staging_memhub__list_sessions'
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code and
@@ -77,7 +77,7 @@ open one**. Never answer from a rung that only points at the answer.
 3. **Open the one you picked with `read_memory(id)`.** A pointer carries no
    body. The kind comes from the id — the same call opens an artifact (with
    its version header), a document chunk, an episode, or a whole session by
-   session id; pass `agent_brain_id` when the id came from a brain search. For
+   session id; include `agent_brain_id` when the id came from a brain search. For
    a long artifact call it once bare for the OUTLINE (one line per section
    with a `section_id`), then again with `section_id=…` for the one section
    that answers the question; that is normally a tenth of the tokens of the

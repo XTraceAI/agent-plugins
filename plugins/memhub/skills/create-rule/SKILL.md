@@ -1,268 +1,62 @@
 ---
 description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
-argument-hint: [--rulebook "<name or id>"] [the rule, in your own words]
-allowed-tools: Bash, Read, Write, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook
+argument-hint: '[--scope org|personal|workspace] [--workspace "<name>"] [the rule, in your own words]'
+allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_paths.py"), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" *), Bash(git remote get-url origin), Write(//tmp/*.json), Edit(//tmp/*.json), Edit(//tmp/*/pretest-base/**), Edit(//var/folders/**/pretest-base/**), Read, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks'
 ---
 
 You are creating a **Rulebook rule**: a human-authored, team-owned rule stored
-in MemHub, fetched once per session by the coding agent of everyone the rule's
-**rulebook** binds, and measured on every fire. Rules are data, not prose in a
+in MemHub, fetched once per session by the coding agent of everyone in the
+rule's **scope** (who it applies to), and measured on every fire. Rules are data, not prose in a
 doc — and a rule with a loose check fires on innocent commands more often than
 not, so the check is where the care goes.
 
 There is no local rule file. The write path is the memhub **`create_rule`**
-MCP tool; the rule reaches the rulebook's members once a reviewer activates it
-(on a book that binds only its creator, that reviewer is the user themselves).
+MCP tool; the rule reaches the people in its scope once a reviewer activates
+it (an org admin; for a rule that applies to just the user, the user
+themselves).
 
 Arguments: `$ARGUMENTS`
-- `--rulebook "<name or id>"` (optional) → the rulebook to write into
-  (`rulebook_id` on `create_rule`). Omit and step 0 resolves it.
-  `--brain "<name>"` is still accepted and means the same thing — a rulebook
-  used to be a brain and people still type it — but say "rulebook" back.
+- `--scope org|personal|workspace` (+ `--workspace "<name>"`) → who the rule
+  applies to; omit and step 0 decides.
+- `--rulebook "<id>"` (deprecated) → passed through as `rulebook_id`. One that
+  is not an id is ignored ("rulebooks are scopes now").
 - Remaining text = the rule in the user's words. If absent, ask for it — one
   sentence, ideally already conditional ("when X, do/never Y").
 
 ## Handed a turn by the harness
 
-MemHub's harness judges each of the person's turns at the Stop after it, and on
-a flag the agent launches a background fork of itself whose prompt begins
-`MemHub harness fork, moment <session_id>#<turn>`. If that is you, you are here
-because turn N was flagged, not because the user asked for a rule, and two
-things differ:
+If your prompt begins `MemHub harness fork, moment <session_id>#<turn>`, you
+are on the **Harness-draft path**: Read `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/harness.md` **before step 0** and follow it — it
+changes step 0, step 4b and step 5, and nothing on that path reaches the person
+except the fork's one final line. Everyone else: skip this section.
 
-**This section, not the fork prompt, is the harness path.** The prompt is also
-shown to the person (inside `Stop hook feedback:`), so it stays a pointer and
-everything it would otherwise carry lives here.
+## 0. Who it applies to — decide it first
 
-**You hold turn N+1 too — read it first.** The person's next message is what
-happened after the flagged turn. If it reversed, abandoned or replaced the
-correction, there is no lesson in turn N: end with the `none` line.
+Every rule goes into one **scope**, and the scope is who it applies to:
 
-**The invariant, before the details: nothing on this path reaches the person
-except the fork's one final line.** Every step of this skill that
-shows, asks, offers or reports — §4b.1's prompt preview, §4b's cleanup report,
-the revision offer when a forward test finds nothing, the conflict choices,
-the step-5 confirmation — is suppressed here, including ones added after this
-was written. Where a step says to stop and ask, stop silently instead. The
-enumerations below say what to DO at each such point; this says what the
-person sees, which is nothing until there is a rule.
+| `scope` | applies to |
+|---|---|
+| `org` (**the default**) | everyone in the organisation |
+| `personal` | just the user |
+| `workspace` | the people in one workspace — **only when the user asks for it** |
 
-**One exception, and it is not about the rule: the rulebook cache.** The
-invariant covers disclosures about the CANDIDATE; it does not cover machine
-state this skill changed. Since §4b.3 arms the candidate in a private base and
-never writes the shared book, there is now only one such notice, and it is
-spoken even though nothing was filed:
+Call `list_rulebooks` and read its `scopes` block (`org` / `personal` with
+`label` and `applies_to`, `supports_workspaces`, `workspaces[]`); do not
+enumerate books. Then, in order:
 
-- **The claim did not take** — `book-path` still answers with the shared book
-  after you wrote the redirect. Say so, name the file, and **abort before
-  arming anything**. Carrying on would mean doctoring the book every other
-  session on the machine reads, which is what the claim exists to prevent.
+1. `--scope` given → use it (`--workspace` names the workspace).
+2. The user's own words say "just me", "only me", "for myself" or
+   "personal" → `personal`.
+3. The user names a workspace or teamspace that matches a
+   `scopes.workspaces[].name` (case-insensitive) and `supports_workspaces` is
+   true → `workspace`, with that `workspace_id`.
+4. **Otherwise use `org`.** Do not ask, and never offer the workspace scope
+   unprompted.
 
-(There used to be a second notice: a failed restore, or a `$BOOK.pretest-*`
-left by an interrupted run, either of which meant an unreviewed candidate was
-armed in the shared cache. Neither can happen now — nothing shared is written,
-so there is nothing to restore and nothing to recover. If you are reading this
-skill against an older plugin, that recovery still matters; against this one it
-is gone rather than merely unlikely.)
-
-Silence about the claim failing is a safety bug wearing the costume of quiet.
-
-- **The test.** A lesson is one that would change what an agent DOES next time,
-  is not already a RULE, is not project state, and will still be true next
-  month. Already written in CLAUDE.md or the docs does NOT disqualify it: if
-  this turn tripped over it anyway, the prose was not enough — file it and cite
-  where it is written. Skip only when nothing went wrong and you would merely
-  be restating the docs.
-- **No lesson** → file nothing and end with the fork prompt's `none` line.
-  Nothing is recorded: how often a flag produces a rule is `stop.log`'s
-  launches against `session_draft` rules on the server, and whether a rule
-  HELPS is the fire-event fold's question, not this one's.
-- **A lesson** → run this flow with it as the user's words, and **ask the
-  person nothing at all**. A `session_draft` lands `proposed` and fires for
-  nobody until a reviewer activates it, so every confirmation this skill asks
-  for elsewhere is already held by whoever reviews the book. Concretely, on
-  this path:
-  - **Step 0 (which rulebook)** does not ask, and never guesses. In order:
-
-    1. Exactly one `bound` book → file there.
-    2. Exactly one `bound` book with `scope: all_org` among several → file
-       there.
-    3. **Otherwise — several `all_org` books bound, or no book bound at all —
-       the repo's own book**, named `Rulebook: <repo>` exactly as the stamp's
-       `state.repo` spells the repo. Use the bound one with that name if it exists; if none
-       does, `create_rulebook` it with `scope: "explicit"`.
-
-    Rule 3 replaced "anything else → file nothing". That clause read as
-    fail-closed and was not: the arithmetic is prose, a model applies it, and
-    on an org with TWO bound `all_org` books it refused once and picked a book
-    every other time. Silently non-deterministic about which team's rulebook
-    gets written to is worse than either answer — a per-repo book is one the
-    configuration can always produce, so there is nothing left to resolve.
-
-    **Read `member_count` off the create reply before filing into a new book.**
-    `create_rulebook` seeds an `explicit` book with you — *unless you are an
-    organisation admin*, who is seeded only by naming themselves in
-    `member_user_ids`. An admin who takes the default therefore gets a book
-    binding NOBODY, and "a book that binds nobody serves its rules to no
-    session": the rule files, the reply says success, and it reaches no one.
-    So pass your own id in `member_user_ids` when you know it, and either way
-    treat `member_count: 0` as a FAILURE — report that the book was created but
-    binds nobody and needs a member, rather than filing into a void.
-
-    A book created here is `explicit` and small on purpose. `all_org` is an
-    admin act that binds everyone in the organisation, now and in future, and
-    nobody can leave it — not a thing to do on a path that asks nobody
-    anything.
-  - **Step 4b.6** (no git checkout, no Agent tool) does not ask. Say the
-    precondition was missing, file with the pattern proven only against the
-    verifier's synthetic cases, and note that in the report.
-  - **Step 5** does not ask. File, then end with the fork prompt's `filed`
-    line naming the rule.
-  - **A conflict that the mandatory policy says not to file, is not filed** —
-    and on this path it is not reported either: `cross_book` (a rule in a book
-    `supersedes_rule_id` cannot reach), or `same_matcher` on an active rule
-    that is not this one. File nothing, say nothing, stop.
-  - **A live verification that runs and fails is terminal.** The forward test
-    firing on zero candidate rows is not a conflict and not a missing
-    precondition: the pattern is unproven, so file nothing, say nothing, and
-    stop. Do not offer to revise it — that offer is the interruption this path
-    exists to avoid, and an unproven matcher is worse than no rule.
-  - **Never pass `activate`.** Never put a person's name, home directory or
-    e-mail in a rule.
-  - **`unchanged: true` is a filing, not a blocker.** That reply means the rule
-    is already in the book — a retry after a lost response, or identical
-    content re-filed. The moment ended WITH a rule, so tell the person as you
-    would for any filing.
-  - **A twin refusal is also already filed.** A `session_draft` whose
-    statement is near-identical to a rule already `proposed` in the book is
-    refused with `A proposed rule in this rulebook already says this: "<title>"
-    (twin_rule_id <id>)…`. The lesson is in the review queue under that id —
-    someone's earlier turn filed it. Do not re-file, do not supersede it, say
-    nothing to the person, and end with the `none` line.
-  - **A dismissed-twin refusal is a reviewer's "no".** The same draft is
-    refused with `A reviewer already declined this lesson in this rulebook:
-    "<title>" (twin_rule_id <id>)…` when its statement is near-identical to a
-    rule someone dismissed. Nothing was written and nothing is waiting in
-    review. Do not re-file, do not reword the statement to get past the
-    check, do not name the dismissed rule as `supersedes_rule_id` (it cannot
-    be superseded), say nothing to the person, and end with the `none` line.
-    This is not a cannot-file: the server worked, so never the `failed` line.
-  - **A draft refused as `stamped by plugin hook <v>; drafts need <min> or
-    newer`** cannot be filed from this stamp — the hook that wrote it predates
-    the draft contract. Treat it as cannot-file: file nothing and end with the
-    `failed` line.
-
-- **`scope_repos` is yours to choose, from what the lesson is about.** The
-  fork prompt says where the turn WORKED; that is evidence, not the scope.
-  Scoping to the session's repo is what bound a `$?`-after-a-pipe lesson to
-  MemHub-Backend only, and scoped rules anchored on `harness_stop.py` constants
-  to a repo where those names do not exist, so they could never fire. Choose:
-  - **`[]` (every repo)** when the rule names nothing that lives in one repo —
-    shell, git, the sandbox, a CLI's flags, how to read a tool's error.
-  - **`["<repo>"]`** when the rule names a file, symbol, config key, table or
-    command that lives in that repo. It may be a repo the turn never touched —
-    a lesson learned in MemHub-Backend about the plugin belongs to the plugin's
-    repo.
-  - **Several** only when each one holds what the rule names. Never widen to
-    `state.touched_repos` just because the turn visited them: those then fire
-    on unrelated work.
-
-  **Prove a repo scope before filing.** For each repo you name, find its
-  checkout (`git remote get-url origin` basename, the name the hook matches)
-  and grep it for the rule's anchors or the paths its trigger names. If none of
-  them is there, the rule can never fire in that repo — re-scope it, and if no
-  repo holds them, file nothing. No checkout of that repo on this machine →
-  file it anyway and say the scope was not checked in the report.
-
-  **Which book (Step 0 rule 3) is still the stamp's repo** (`state.repo`), even
-  when you chose `[]` — a scope says where the rule fires, the book says whose
-  review queue it lands in.
-- **`source_ref` is passed EXACTLY as the fork prompt gives it.** The generic
-  steps append `|applies N/M|precision P` to a `source_ref`; on this path they
-  do not. That value is half of the server's `(rulebook, source_ref, title)`
-  re-import identity, so a retry carrying different evidence counts files a
-  second row instead of matching the first. Put those numbers in the report to
-  the person instead.
-- **The stamp** is what the fork prompt's read-only
-  `harness_stop.py stamp --transcript … --turn N --cwd …` command prints. Run it
-  once and pass its JSON verbatim as `state` in step 5 with
-  `source="session_draft"`, that `source_ref` and `author="xtrace"` — MemHub
-  refuses a `session_draft` without its `state`. The author is XTrace because
-  the harness wrote this rule and no person asked for it; it is a label only,
-  and the session's person still owns the rule.
-- **The harness draft's `create_rule` call carries these and nothing else:**
-  `rulebook_id`, `title`, `statement`, `when`, `do`, `why`, the one engine
-  (`matcher`, `ordering` or `anchors`), `delivery`, `mode`, `scope_repos`,
-  `source="session_draft"`, `source_ref`, `state` and `author="xtrace"` —
-  plus `supersedes_rule_id` when step 2 found one, and `when_not` only when
-  the turn itself named a situation the lesson does not cover. The tool also
-  offers `category` and `evidence`;
-  both are for a person's or a backtest's judgement, and this path has
-  neither, so leave them out: a guessed category or a malformed evidence
-  object is refused.
-- **`when`, `do` and `why` are written here without asking**, by step 1's
-  rules, from turn N and the person's reaction to it: `when` is what the agent
-  was doing when it went wrong, `do` is what the person's correction asked
-  for, `why` is what went wrong in this turn. Step 5's preview of them is
-  suppressed like every other; the reviewer reads them in MemHub. A draft
-  filed without them is judged on its statement alone.
-- **A refusal is fixed in place, never rebuilt.** When `create_rule` refuses a
-  field (a category, a matcher key, a scope), retry the SAME call with only
-  that field changed. `source`, `source_ref`, `state` and `author` stay as they
-  were: a retry that drops them files a rule nobody can trace to this turn,
-  shown as the person's own.
-
-`mode: "gate"` still needs the user's own words asking for a block (step 3).
-
-## 0. Which rulebook — resolve it first
-
-A **rulebook** is a container with its own membership: whoever is a member has
-their agent bound by its rules. One person can be in several (an org-wide book
-plus their team's), and a rule is filed into exactly one. So the destination is
-a decision, not a default — settle it before drafting anything.
-
-Call `list_rulebooks`. Each row has `rulebook_id`, `name`, `scope`
-(`all_org` | `explicit`), `member_count`, `rule_count`, `bound` (does it govern
-me?) and `is_admin`. Then:
-
-- `--rulebook` given → match it against `rulebook_id` first, then `name`
-  (case-insensitive). No match → show the list and ask; never file into a
-  book the user did not name.
-- Omitted, exactly one book → use it, and say which one in step 6.
-- Omitted, several books → **ask** with AskUserQuestion, one option per book
-  labelled with its name and who it binds ("org-wide" / "N members"). Do not
-  guess: filing into the wrong book binds the wrong people. (This mirrors the
-  server, which refuses to guess too: `You can see more than one rulebook …`.)
-- **No books at all** (an empty list, or a write refused with `You don't have
-  a rulebook yet`) →
-  nothing is auto-provisioned. Offer to create one: propose
-  `create_rulebook(name: "Rulebook: <repo>", scope: "explicit")` — the same
-  name the harness path gives a repo's own book, so both find it — a book that
-  binds only the user, which is the only shape a non-admin may create — and
-  ask. On yes, create it and file into it. On no, stop and report; there is
-  nowhere to put the rule.
-
-Never call `create_rulebook` with `scope: "all_org"`, and never name another
-user in `member_user_ids`. Both are org-admin acts (`rulebook_scope_needs_admin`
-/ `rulebook_members_need_admin`), and widening who a rulebook binds is a
-governance decision this skill does not make. Membership changes are not MCP
-tools at all — they are done in MemHub.
-
-**When the create is refused.** Only the English sentence reaches you — the
-tool forwards the message, never a reason code — so match on the wording.
-`create_rulebook` validates the creator as an active org member, so it can
-answer `<name> isn't in this organisation, so they can't be put in a rulebook`
-naming *the user themselves* — even though you named nobody. That is not a bug
-to retry: their org membership is inactive, and no rulebook can be created
-until someone fixes it in MemHub. Say that plainly and stop. (`That rulebook
-name is too long — keep it under N characters` — shorten it and retry once.)
-
-**Older backend:** if `list_rulebooks` / `create_rulebook` are not present, or
-`create_rule` rejects `rulebook_id`, the server predates rulebook containers.
-File with no destination — omit `rulebook_id` and let the server put the rule
-where it used to — and say so in step 6; the rest of this skill is unchanged.
-Do NOT reach for `agent_brain_id`: `create_rule` has no such parameter any
-more, so passing it turns a degraded-but-working file into a failed one.
+A named workspace that is not listed, or no `supports_workspaces`, is said
+once and the rule goes to `org`. No `scopes` block (an older server) → file
+without `scope`. Show the chosen scope's `label` and `applies_to` in the
+step-5 preview, so the user can change it.
 
 ## The flow — every step is mandatory
 
@@ -272,13 +66,18 @@ Get to a **when-X-then-Y** sentence with a **why**. A conditional shape is what
 makes a rule actionable; a bare observation is not a rule. If the user gave a
 war story, extract the conditional from it and confirm your reading.
 
-**Then write the sentence down as its parts.** The rule is filed twice over:
-as a `statement` (step 3), which is what the agent is shown, and as four
-fields the server's **rule judge** reads. A pattern says a rule *might* apply;
-when it matches a call, the judge reads the turn and these fields and scores
-whether the agent is really in the rule's situation, so that a fire out of
-place can be held back. The fields come from the same sentence as the statement:
-**the two say the same thing, nothing in one that the other lacks.**
+The example carried through every step below is a real rule:
+
+> Never force-push (-f, --force, --force-with-lease) to main, master or
+> staging: it rewrites history teammates have pulled. Rebase onto a fresh
+> origin branch and open a PR instead. Force-pushing your own feature branch
+> is fine.
+
+**Then write the sentence down as its parts.** The agent is shown the
+`statement` (step 3); the server's **rule judge** reads four fields to decide,
+when the pattern matches, whether the agent is really in the rule's situation.
+Both come from the same sentence: **the two say the same thing,
+nothing in one that the other lacks.**
 
 | field | what it holds | at most |
 |---|---|---|
@@ -290,39 +89,48 @@ place can be held back. The fields come from the same sentence as the statement:
 - **`when` is a situation, never trigger vocabulary.** It describes what is
   happening in the turn, in words that would still be true if the command
   were spelled differently.
-  - Good: *"The agent is about to report a repo as not cloned."*
-  - Bad: *"The command mentions agent-plugins."* That is the pattern restated;
-    the pattern already matched, so it tells the judge nothing.
+  - Good: *"The agent is about to rewrite the history of a branch other
+    people build on."*
+  - Bad: *"The command contains git push --force."* That is the pattern
+    restated; the pattern already matched, so it tells the judge nothing.
 - **`when_not` only for exclusions the person or the evidence actually
   named** — "except on my own branch", a step-1b sample that was plainly
   innocent. Otherwise omit it: it is usually empty when a rule is filed, and
   it is where confirmed misfires get written later. Each entry is a situation
-  too (*"The agent is only locating a repo it already knows exists."*), never
-  *"not when the command contains ls"*.
+  too, never a pattern: the example's statement names one exemption, so it
+  gets *"The agent is updating its own feature branch after a rebase."* —
+  not *"not when the branch starts with feat/"*.
 - **`do` and `why` are the sentence's own halves**, not a second draft of
   them. If the person gave no reason and no incident, leave `why` out rather
-  than invent one.
+  than invent one. The example: `do` *"Push to a feature branch and open a PR;
+  never force-push main, master or staging."*, `why` *"A force-push rewrites
+  history teammates have already pulled."*
 
 ### 1b. Evidence: how often would it have applied?
 
 A rule is worth the team's attention in proportion to how often the
-situation actually occurs. Write the candidate `create_rule` body to a file
-and replay it over the local transcripts (Claude Code, Codex, Cursor):
+situation actually occurs. Once step 3 has a matcher, write the candidate
+`create_rule` body to `/tmp/cand.json` (step 4 shows it) and replay it over
+the local transcripts (Claude Code, Codex, Cursor) — about a minute:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" \
   --rule-file /tmp/cand.json --out /tmp/mine
 ```
 
-Read the candidate's line: `applies-in N/M sessions` (by host) and 3 sample
-commands. For a "do X before Y" rule add `"requires_prior_rx": "<X>"` to the
-body — the line then shows `precision = fired-with-no-prior-X / fired`;
-below ~50 % the matcher would nag people who already complied, so use the
-`ordering` shape (step 3) or make it `session_context`. Carry the numbers
-into `source_ref` in step 5 (`…|applies N/M|precision P`). If N is 0 across
+It prints the whole start-rulebook report; find your title under PROPOSED
+RULES and read its `evidence:` line — `applies-in N/M sessions` (by host) and
+one sample (more in `/tmp/mine/proposals.json`). For a "do X before Y" rule
+add `"requires_prior_rx": "<X>"` to the body — the line then shows
+`precision = fired-with-no-prior-X / fired`; below ~50 % the matcher would nag
+people who already complied, so use the `ordering` shape (step 3) or make it
+`session_context`. The row's `rule_evidence` is step 5's `evidence` (Read
+`${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/labels.md`). If N is 0 across
 all hosts, say so to the user before filing — it may still be right
-(insurance for a new teammate) but it is not lift. For deriving many rules
-at once from sessions, use `/memhub:start-rulebook` instead.
+(insurance for a new teammate) but it is not lift. The example scores
+`applies-in 0/855`: insurance; the rule it replaces scores 66/855, nagging
+force-pushes to people's own branches. For many rules from sessions, use
+`/memhub:start-rulebook`.
 
 ### 2. Duplicate check — by eye now, deterministically in step 5
 
@@ -331,154 +139,102 @@ Call the memhub `list_rules` tool with **no `rulebook_id`** and
 user can see in every state, and read the new rule against every title and
 statement. Same subject → plan to replace the existing rule
 instead of adding a twin: note its `rule_id` for `supersedes_rule_id` in step 5.
-Without a `source_ref` the server does no title matching — you decide what a
-rule replaces. With one, its re-import key is (book, `source_ref` with its
-`@sha` and `#…` stripped, normalised title): re-filing under the same document and title
-lands as a supersede of that rule (or `unchanged` if nothing differs), so a
-`source_ref` is not free text to vary between attempts. Keep the
+The server never picks what a rule replaces by title — you decide, with
+`supersedes_rule_id`. It does refuse a rule whose title or trigger equals a
+live rule's in the same book (step 5), and it answers an identical retry
+`unchanged`. With a `source_ref`, the re-import key is (book, `source`,
+`source_ref` minus its `@<sha>` and `#…`, normalised title): re-filing under
+the same document and title supersedes that rule (or answers `unchanged`), so
+a `source_ref` is not free text to vary between attempts. Keep the
 `list_rules` reply: step 5 runs the deterministic check over it.
 
 `include_retired=True` matters: a rule someone already dismissed is exactly the
-twin you must not re-file, and the default view hides retired rules. `limit` is
+twin you must not re-file, the default view hides retired rules, and step 5's
+script skips them too — this read is the only check that sees them. `limit` is
 200 at most — if the reply says `has_more`, ask again with `offset` and
 concatenate `rules` before running the check, or the comparison silently misses
 whatever fell off the first page.
-
-A twin in **another** rulebook is a different problem: `supersedes_rule_id`
-only retires a rule inside one book, so nothing you file can absorb it, and
-both rules reach the same call if both books bind the user. Say so and let
-them decide — step 5 flags these as `cross_book`.
 
 ### 3. Draft the rule — one delivery, one engine block
 
 | the rule is… | `delivery` | engine block |
 |---|---|---|
 | a Bash command with a checkable form | `agent_hook` | `matcher: {event: "bash", command_rx, command_not_rx?, warn_once_per}` |
-| an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that wrote the file (heredoc, `write_text()`, `sed -i`) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?}` |
+| an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that wrote the file (heredoc, `write_text()`, `sed -i`; that one is seen only after the write, so it can advise but never gate) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?, content_not_rx?}` — `content_not_rx` exempts the complied-with form |
 | a failing or noteworthy tool output | `agent_hook` | `matcher: {event: "output", content_rx, command_rx?, content_not_rx?}` |
 | a file about to be read into the agent's context — the Read tool, OR a `cat`/`head`/`tail`/`less`/`more`/`sed` on a path in a Bash command (not piped, not redirected; `cd`-relative paths resolve) | `agent_hook` | `matcher: {event: "read", path_rx?, path_not_rx?, command_not_rx?, given: {file: {lines_gt}, agent: {main}}}` — needs `path_rx` or `given.file`, or it fires on every file |
-| "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, min_edits, display_name}` |
+| "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, path_rx?, min_edits, display_name}` — `path_rx` limits which edits arm it |
 | "run X once a session, before Y" — X is not owed to an edit, it is owed to the session (`git fetch` before reading `origin/*`) | `agent_hook` | the same `ordering` block with `armed_by_events: ["session"]`: armed at session start, discharged by one green X, and re-armed for the next session |
 | "when the person asks about Z, do X before answering" (probe staging before answering a staging question) | `agent_hook` | the same `ordering` block with `armed_by_events: ["prompt"]` **and** `armed_by_rx` — the pattern the prompt must match. Without `armed_by_rx` the rule arms on nothing; only what a person TYPED arms it, never a slash command's body or a loop wake-up |
 | when a wake-up or background notification arrives — a `/loop` tick, a monitor event, a `<task-notification>` — and the rule is about what the agent says next | `agent_hook` | `matcher: {event: "prompt", prompt_rx, prompt_not_rx?, warn_once_per}` + `min_hook_version: "0.99.0"`. Matched against the RAW prompt, harness wrappers included (`<command-message>loop</command-message>`, `<task-notification>`, `<<autonomous-loop`). **Advise only** — the prompt is already sent, so there is nothing to block and the server refuses `mode: "gate"`. `given` takes `agent` and `repo` only |
-| applies when a file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — the server decides relevance per call |
-| worldview with no trigger at all | `session_context` | none — at most 15 such rules per repo scope are shown at session start; prefer a checkable shape when one exists, because advice shown in-flight is acted on far more often than advice shown at session start |
+| applies when a file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — matched whole, case-sensitive, in the command or path (so never `spec`, `pytest` or text with spaces); the judge decides fit |
+| worldview with no trigger at all | `session_context` | none — at session start the hook shows at most 15 such notes in about 3,300 characters, shared across every book that binds the person (at 400-character statements that is about 8); prefer a checkable shape when one exists, because advice shown in-flight is acted on far more often than advice shown at session start |
 
-Plus on every rule: `title` (short, imperative; the server allows up to 200
-chars but aim for under 60), `statement` (the advisory line and the nuance a
-reviewer needs: sanctioned forms, exemptions — at most 400 characters, or the
-server refuses it), `scope_repos` (`["<repo>"]` or
-`[]` for all — `<repo>` is the repo's name, `basename $(git remote get-url
-origin)` without `.git`, NEVER the directory you are in: in a worktree that
-is the branch name, and the hook matches `scope_repos` against the repo name
-(case-insensitively, but otherwise whole), so the rule would bind nobody), `scope_paths` / `scope_exclude_paths` (globs — they constrain
-edit rules by file path; a Bash call carries no path, so an include-scoped
-rule never fires on one). And step 1's `when`, `do`, `why` — plus `when_not`
-when an exclusion was named — which change nothing about when the pattern
-matches and are never shown to the agent.
+Plus on every rule:
+- `title` — short, imperative, under 60 characters (200 max).
+- `statement` — the line shown when it fires, with sanctioned forms and
+  exemptions; 400 characters max.
+- `scope_repos` — `[]` for every repo, or `["<repo>"]` where `<repo>` is
+  `basename $(git remote get-url origin)` without `.git`. **Never the
+  directory name**: in a worktree that is the branch, and the rule binds nobody.
+- `scope_paths` / `scope_exclude_paths` — globs for edit rules; a Bash call
+  carries no path, so an include-scoped rule never fires on one.
+- step 1's `when` / `do` / `why` / `when_not` — read by the judge, never shown
+  to the agent, no effect on the pattern.
+- `categories` — zero or more; see labels.md (step 1b).
 
-**A rule that needs a newer hook.** If the rule uses a key an older installed
-hook would not understand, pass `min_hook_version: "<major.minor.patch>"`.
-Where the installed hook is older it runs the rule as ADVICE, never as a gate,
-and says so once per session naming the version it wanted — instead of
-ignoring the condition and firing as if it held. A key the hook does not know
-degrades the same way even without the field, so `min_hook_version` is how you
-make the message say what is actually missing.
+**A rule that needs a newer hook.** The server sets `min_hook_version` for
+you where the rule's shape implies one (0.54.0 for a session- or prompt-armed
+ordering, 0.88.0 for a pattern over 400 characters, 0.99.0 for a prompt
+matcher) and refuses an explicit value below that floor. Pass it yourself only
+for another newer key. Where the installed hook is older it runs the rule as
+ADVICE, never as a gate, and says so once per session — instead of ignoring the
+condition and firing as if it held. A key the hook does not know degrades the
+same way.
 
-**Advise, or stop the command?** A rule advises by default: its sentence is
-shown and the call goes through. Pass `mode: "gate"` and the rule DENIES a
-matching command before it runs — the person can still run that exact command
-by prefixing `RULEBOOK_OVERRIDE='<why>'`, and their reason is recorded with the
-fire. A blocked edit has no command to prefix: it goes through with a
-`rulebook-override[<rule>]: <why>` marker in the content being written, naming
-the rule (an unnamed marker excuses nothing), and the marker stays in the diff. Advice has the same channel, one call later: an agent that reads an
-advisory and goes on without it says why on its next command as
-`RULEBOOK_OVERRIDE='[<label>] <why>'`, naming the rule, and the reason lands on
-that rule's fire. A rule with a `converted_rx` also records "not followed" on
-its own: a fire whose conversion has not been seen two turns later is closed
-`converted=false`, so a rule nobody acts on shows it instead of showing
-nothing. The hook only reports what it saw — the command that converted, the
-override that set a rule aside, each turn ending — and the server decides the
-outcome from those facts (the earliest one after the fire wins).
+**Advise, or stop the command?** A rule advises by default. `mode: "gate"`
+denies the matching call — only when the user's own words ask for a block
+("stop me", "don't let me"), and it **stops everyone the rule applies to**.
+Before drafting a gate, or a `given` block (branch, diff, what the user said,
+file size, main agent vs subagent), Read
+`${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/gate-and-given.md`.
 
-**Also say what the rule PREVENTS.** `predicts_rx` is a pattern over tool
-output naming the failure this rule exists to stop — the traceback, the
-`rejected` line, the 409. It changes nothing about when the rule fires; it is
-what lets a fire be scored as a catch rather than counted as a nag, and it is
-far easier to write now, while the war story that produced the rule is in
-front of you, than at review time. Write it wherever the failure has a
-recognisable line; skip it for a rule whose violation produces no output.
-
-Ask for it when the user's own words ask for it — "block", "stop me", "don't
-let me", "never let it happen again" — and never on your own initiative. Two
-things bound it:
-
-- **Only a call the hook sees BEFORE it runs can be stopped.** A `bash`
-  matcher, an `edit` matcher (matched against the content about to be
-  written), a `read` matcher (the Read tool's call, or the Bash command that
-  would print the file) or an `ordering` can block. `output` fires after the
-  command already ran, and notes and anchors are advice by construction —
-  the server refuses `gate` on those. A blocked Read has no prefix to carry
-  a reason: the deny tells the agent to read narrower (`offset`/`limit`),
-  delegate to a subagent, or run `RULEBOOK_OVERRIDE='<why>' cat <path>` in
-  Bash, which records the override like any other.
-- **It stops every teammate the book binds, not just the author.** Say that
-  before filing, in those words. A blocking rule with a loose `command_rx` is
-  the worst failure this skill can ship: it stops work, and the person it stops
-  did not write it.
-
-Filing it is not arming it — see step 5. `mode` is the rule's own field, so a
-blocking rule needs the same `command_not_rx` exemptions and the same
-`--fires` / `--silent` proof as any other; if anything, prove it harder.
-
-**`given` — facts the call must also satisfy.** A matcher rule may carry a
-`given` block inside its `matcher`; the regex is checked first, then these,
-and the hook answers them from read-only git and the local transcript, once
-per call. A fact it cannot establish never satisfies a predicate, so the rule
-stays silent rather than firing on a guess.
-
-| the rule says… | `given` |
-|---|---|
-| never push to main | `{"repo": {"branch_rx": "^(main|master)$"}}` on a `git push` matcher |
-| a PR that changes source needs a test | `{"repo": {"diff_paths_rx": "^src/", "diff_paths_none_rx": "(^|/)tests?/"}}` on a `gh pr create` matcher |
-| keep PRs under 500 lines | `{"repo": {"diff_lines_gt": 500}}` |
-| don't commit unless asked | `{"user": {"not_said_rx": "\\b(commit|push|ship)\\b"}}` on a `git commit` matcher |
-| don't pull a whole big file into the main context — delegate it | `{"file": {"lines_gt": 350}, "agent": {"main": true}}` on a `read` matcher (a subagent's reads pass: delegation is the way past the rule) |
-| subagents may not push | `{"agent": {"main": false}}` on a `git push` matcher |
-
-`repo` keys: `branch_rx`, `branch_not_rx`, `diff_lines_gt`, `diff_files_gt`,
-`diff_paths_rx`, `diff_paths_none_rx` (the branch's changes against its base,
-working tree and untracked files included), `dirty`. `user` keys: `said_rx`,
-`not_said_rx` (what the person typed this session — never a tool result or
-injected context). `file` keys (read rules only): `lines_gt`, `bytes_gt` —
-what the call would pull into the context, so a Read with `offset`/`limit`
-or a `head -50` counts only those lines. `agent` keys (any event): `main`
-(`true` = the main agent, `false` = a subagent). An unknown key drops the rule at load, exactly as a bad
-pattern does. A backend that predates `given` refuses it at `create_rule`;
-verify locally (step 4) and file once the backend accepts it.
+**Also say what the rule PREVENTS.** `predicts_rx` (a `matcher` key) is a
+pattern over tool output naming the failure the rule exists to stop — the
+example's `\(forced update\)`, a traceback, a 409. It lets a fire be scored as
+a catch instead of a nag; write it now, while the war story is in front of you.
+Skip it when the violation prints nothing.
 
 **Matcher-authoring rules:**
 - Bash rules match the **pre-heredoc segment only** by default — heredoc bodies
   are data (python source, commit messages) and are the main false-fire class.
-  Set `match_heredoc_body: true` **together with** `body_rx` only if the rule
-  targets what a heredoc says.
-- Patterns must be **shape-specific**: match the violating *form* (`git push
-  [-f|--force]`), never a keyword that also appears in innocent content.
+  For a rule about what a heredoc SAYS, add `body_rx`: `command_rx` then names
+  the shell form (`python3 - <<`) and `body_rx` must match the body.
+- Patterns must be **shape-specific**: match the violating *form*, never a
+  keyword that also appears in innocent content. The example matches `git
+  push`, then (by lookahead) `-f`/`--force` in the same command, then a
+  protected branch as the target — so a force-push to a feature branch and a
+  plain push to staging both stay silent.
 - Every known-legitimate exemption goes in `command_not_rx` now, not after it
-  fires. Give bash rules a `command_not_rx` that exempts commands which merely
-  mention the pattern (`python -c`, `grep`).
+  fires. Exempt the trigger **inside a quoted span** (`grep "git push …"`,
+  `-m "…"`, `--allowedTools 'Bash(git push…)'`), not by the command's first
+  word: an exemption keyed on `grep`/`echo` also silences `echo start; <the
+  real violation>`. Keep `;&|` out of the quoted span, or the exemption
+  swallows a real command chained after a quoted one.
 - Default `warn_once_per: "session"` — a rule that nags every call gets ignored.
-  `turn` is for rules where each occurrence matters (e.g. force-push).
+  `turn` means **every matching call** (no dedup at all) — only for rules
+  where each occurrence matters (force-push). `file` behaves as `session`.
 - **Never anchor a `command_rx` with `^`.** Real commands arrive chained and
   prefixed: `cd .. && gh pr create`, `cd sub; npm test`, `(cd pkg && git push)`,
   `env CI=1 pytest`. A pattern anchored at the start of the string matches none
   of them, and the rule then fires for some people and not others with nothing
   to show why — the worst failure a rule has, because it looks like the rule
-  working. Match at **command position** instead: `(?:^|[;&|(]\s*)` before your
-  trigger, or simply no anchor at all plus a `command_not_rx` for the
-  mention-in-argument cases you are protecting against. This is the mirror
-  image of the SILENT guidance in step 4: that guards the false positive, this
-  guards the false negative.
+  working. Don't try to anchor at command position either — a prefix like
+  `(?:^|[;&|(]\s*)` still misses `env CI=1 git push` and fires inside
+  `Bash(git push:*)`. Use a word boundary (`\bgit\s+push\b`) and let the
+  quoted-span `command_not_rx` handle mentions. This is the mirror image of the
+  SILENT guidance in step 4: that guards the false positive, this guards the
+  false negative.
 - **The pattern stays broad; the judge decides fit.** Everything above is
   about a pattern that matches the wrong **shape** — a `grep` that mentions
   the command, a heredoc body, a quoted argument — and narrowing is still the
@@ -495,102 +251,68 @@ A rule that matches the command you had in mind can still be wrong in three
 ways that only show up once the whole team has it. Run the candidate through
 the engine that will actually run it:
 
-```bash
-cat > /tmp/cand.json <<'JSON'
-{"title": "...", "statement": "...", "when": "...", "do": "...", "why": "...",
+Write the candidate with the Write tool to `/tmp/cand.json` — this is the
+whole running example, exactly as step 5 will file it:
+
+```json
+{
+ "title": "Don't force-push main, master or staging",
+ "statement": "Never force-push (-f, --force, --force-with-lease) to main, master or staging: it rewrites history teammates have pulled. Rebase onto a fresh origin branch and open a PR instead. Force-pushing your own feature branch is fine.",
+ "when": "The agent is about to rewrite the history of a branch other people build on.",
+ "do": "Push to a feature branch and open a PR; never force-push main, master or staging.",
+ "why": "A force-push rewrites history teammates have already pulled; the team's standing rule is that humans drive merges and shared history.",
+ "when_not": [
+  "The agent is updating its own feature branch after a rebase."
+ ],
  "delivery": "agent_hook",
- "matcher": {"event": "bash", "command_rx": "...", "command_not_rx": "..."}}
-JSON
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires 'the real command that should trigger it' \
-  --silent 'the same situation once someone has complied'
+ "matcher": {
+  "event": "bash",
+  "command_rx": "\\bgit\\s+push\\b(?=[^;&|\\n]*\\s(?:-f|--force)\\b)[^;&|\\n]*\\s\\+?(?:\\S+:)?(?:refs/heads/)?(?:main|master|staging)(?=\\s|$|[;&|)])",
+  "command_not_rx": "'[^';&|]*\\bgit\\s+push\\b[^']*'|\"[^\";&|]*\\bgit\\s+push\\b[^\"]*\"",
+  "warn_once_per": "turn",
+  "predicts_rx": "\\(forced update\\)"
+ },
+ "scope_repos": []
+}
 ```
+
+Then give it every case that matters — the plain violation, a **chained**
+one, the **complied-with** form, and the mentions:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
+  --fires  'git push --force origin staging' \
+  --fires  'cd ../MemHub-Backend && git push -f origin HEAD:main' \
+  --fires  'echo "start"; git push -f origin main; echo "done"' \
+  --silent 'git push --force-with-lease origin feat/retry-budget' \
+  --silent 'git push origin staging' \
+  --silent 'grep -rn "git push --force origin staging" docs/' \
+  --silent "python3 -c 'print(\"git push -f origin main\")'" \
+  --silent 'git commit -m "docs: never git push --force origin main"' \
+  --silent "claude --allowedTools 'Bash(git push -f origin main:*)'"
+```
+
+Every line reads `ok` and it exits 0.
+
+The `echo "start"; …` case is there because a first draft of the quoted-span
+exemption let `;` inside the span and swallowed that real push. Say what the
+rule still misses: a bare `git push -f` while *on* staging names no branch —
+that needs `given.repo.branch_rx` (gate-and-given.md).
 
 (`when` / `do` / `why` / `when_not` ride along in the body so the same file
 is what step 5 files; the verifier and the replay test the pattern and do not
 read them.)
 
-For a `read` rule a case is the Read tool (`read:<path>`, narrowed with
-`@<offset>,<limit>`) or a shell command run through the hook's own parser
-(`bash:<command>`, relative paths against `--cwd`); `--file-lines N` stands
-in for every named file's length so no real file is needed, and
-`--agent-main false` runs a case as a subagent:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --file-lines 900 --cwd /repo \
-  --fires  'read:/repo/src/service.py' \
-  --fires  'bash:cd /repo && cat src/service.py' \
-  --silent 'read:/repo/src/service.py@1,200' \
-  --silent 'bash:cat src/service.py | head -50' \
-  --silent 'bash:grep -n foo src/service.py'
-```
-
-For an `edit` / `write` rule a case is `path::content`:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires '/repo/src/db.py::conn = connect(url, verify=False)' \
-  --silent '/repo/src/db.py::conn = connect(url)'
-```
-
-A rule with a `given` block needs the facts it asks about — the fixture IS the
-repo; no git runs and no transcript is read. Give them for every case
-(`--branch`, `--diff-path` (repeatable), `--diff-lines`, `--dirty`,
-`--user-said` (repeatable)) or per case as objects in a `--cases` file:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires 'git push origin HEAD' --branch main
-cat > /tmp/cases.json <<'JSON'
-{"fires":  [{"case": "gh pr create --fill", "diff_paths": ["src/a.py"]}],
- "silent": [{"case": "gh pr create --fill", "diff_paths": ["src/a.py", "tests/test_a.py"]}]}
-JSON
-```
-
-An `ordering` rule is verified as a sequence of steps joined by ` >> `
-(`edit:<path>`, `ok:<cmd>` a green receipt, `red:<cmd>` a red one, `session`
-the SessionStart arming, `prompt:<what the person typed>` the
-UserPromptSubmit arming, and last `gate:<cmd>`); the case fires when that
-final call is gated. Use the arming step your rule's `armed_by_events` names
-— a case that never arms the rule can never fire:
-
-```bash
-# armed_by_events: ["edit", "write"]
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires  'edit:src/a.py >> gate:git push' \
-  --fires  'edit:src/a.py >> red:pytest tests >> gate:git push' \
-  --silent 'edit:src/a.py >> ok:pytest tests >> gate:git push'
-
-# armed_by_events: ["session"]
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires  'session >> gate:git log origin/main' \
-  --silent 'session >> ok:git fetch -q >> gate:git log origin/main'
-
-# armed_by_events: ["prompt"] + armed_by_rx
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires  'prompt:is the staging brain 404ing? >> gate:gh pr comment 7 --body ok' \
-  --silent 'prompt:how is production? >> gate:gh pr comment 7 --body ok' \
-  --silent 'prompt:check staging >> ok:curl -s https://staging/health >> gate:gh pr comment 7 --body ok'
-```
-
-A `prompt:` whose text does not match `armed_by_rx` arms nothing, so it is
-the natural `--silent` case: it proves the rule stays quiet when nobody
-raised the subject.
-
-An `event: "prompt"` matcher rule (not an ordering rule) takes the whole
-prompt as its case, wrappers and all — no `prompt:` step, no `>>`:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand.json \
-  --fires  '<task-notification><status>completed</status></task-notification>' \
-  --silent 'what is the loop doing?'
-```
+Other shapes take other case syntax — a `read` rule (`read:<path>`,
+`bash:<command>`, `--file-lines`), an `edit` rule (`path::content`), a `given`
+block (`--branch`, `--diff-path`, `--user-said`, `--cases`), an `ordering`
+rule (steps joined by ` >> `, armed by `session` / `prompt:` / `edit:`), an
+`event: "output"` rule (`command::output`), an `event: "prompt"` matcher. For any of those, Read `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/verify-recipes.md` for the exact form.
 
 It exits non-zero until every case behaves. **Do not file a rule while it
 exits non-zero, and show the table to the user.** What each line means:
 
-- **LOAD** — whether the hook would load the rule at all. A pattern over 400
+- **LOAD** — whether the hook would load the rule at all. A pattern over 2000
   characters, one that does not compile, or one that backtracks is dropped
   *silently* on every teammate's machine: the rule exists, is active, and
   never fires. This line is the only warning you get.
@@ -598,332 +320,63 @@ exits non-zero, and show the table to the user.** What each line means:
   nothing has shown the rule can trigger.
 - **SILENT** — your `--silent` cases, plus two generated for you: `grep` and
   `python -c` quoting the rule's own trigger. They are generated only when
-  `command_rx` reduces to a plain literal; a structural pattern (groups,
-  alternation, classes) gets none, and the verifier says so — then write those
-  two yourself. Add one more yourself: the
-  trigger inside a quoted argument (`--allowedTools 'Bash(git push:*)'`,
-  `echo "…"`, a commit message) — measured live, this mention-in-args form
-  is the largest false-fire class after `grep`. Searching for a rule's trigger
-  is how people investigate it, and firing there is the largest false-fire
-  class we have measured. If those two fail, add a `command_not_rx`.
+  `command_rx` reduces to a plain literal of at least 4 characters; anything
+  else gets none, and the verifier says so — then write those two yourself.
+  Add one more yourself: the trigger inside a quoted argument
+  (`--allowedTools 'Bash(git push:*)'`, `echo "…"`, a commit message) — after
+  `grep`, the largest false-fire class we have measured. If any of these fire,
+  add a `command_not_rx`.
 
 **Always give at least one `--fires` case in CHAINED form** — `--fires 'cd .. &&
 <your trigger>'` alongside your plain case. A rule whose chained form does not
 fire is not ready to file, and the anchor that broke it (step 3) is invisible
 in a table that only ever tested the bare command.
 
-**Always give at least one `--silent` case for the complied-with form** — the
-code *after* someone does what the rule asks. This is the check authors skip
-and the one that matters most: a rule that keeps firing once you have fixed
-the problem cannot tell a violation from a fix, so people learn to ignore it.
-If you cannot write a `--silent` case that the rule passes, the rule is not
-expressible as a pattern — make it `anchor_recall` or a `session_context`
-note instead of shipping a nag.
+**Always give at least one `--silent` case for the complied-with form** — in
+the example, the force-push to a feature branch. A rule that still fires after
+someone complied cannot tell a violation from a fix, and people learn to
+ignore it. If no such case passes, the rule is not a pattern — make it
+`anchor_recall` or a `session_context` note.
 
 ### 4b. Prove it fires in a LIVE session — mandatory
 
-`rulebook_verify.py` proves the pattern matches the strings you thought of. It
-cannot prove the rule fires in a real session, at a moment that helps — and the
-most common way a pattern is wrong in practice is a false negative nobody
-writes a case for. So before filing, run the rule against a real agent doing
-real work.
+`rulebook_verify.py` proves the pattern matches the strings you thought of; it
+cannot prove the rule fires in a real session. **The rule is not filed until
+this step has produced a fire** — if the user asks to skip it, tell them what
+it would have proven and run it. Before starting, Read `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/live-test.md` and follow it in
+full: a sub-agent in its own `isolation: "worktree"` checkout runs a fake
+feature against the candidate, armed in a private book claimed for that
+worktree — never in the shared book every other session reads.
 
-**The rule is not filed until this step has produced a fire.** There is no
-"skip the live test": if the user asks to skip it, tell them what it would have
-proven and run it. The one exception is §4b.6 — an environment that cannot run
-it at all.
-
-**4b.1 Write the fake feature prompt.** Compose a short, realistic task that
-should trip the rule with near-certainty and is doable in a couple of tool
-calls — a demo, not a project. Show it to the user before running it. It must
-never touch anything outside the scratch worktree, and it must **not** be
-phrased as "trigger the rule": a prompt that names the rule tests the
-sub-agent's obedience, not the rule's pattern.
-
-**4b.2 The scratch worktree is the sub-agent's own — `isolation: "worktree"`.**
-
-Do not `git worktree add` a scratch checkout yourself and tell the sub-agent
-to "work inside" it. The claim in §4b.3 is keyed on the **cwd the hook
-payload carries** (`set_active_base(cwd)` in `rulebook_hook.py`), and an
-Agent-tool sub-agent inherits the SESSION's cwd — the directory your terminal
-is in — no matter which paths its commands name. A sub-agent editing files in
-a worktree you made by hand runs every call from your cwd, reads the shared
-book, and the private ledger ends the test with **zero rows for every rule**,
-which reads exactly like "the candidate did not fire". Measured 2026-09-28: a
-sub-agent that wrote the target file through `python3 - <<'PY' …
-write_text()` by absolute path produced nothing under the claim; the same edit
-from an isolated worktree fired the candidate on the first call.
-
-Spawn the sub-agent with the Agent tool's `isolation: "worktree"` instead. It
-gets its own checkout at
-
-```
-<repo>/.claude/worktrees/agent-<agent id>     on branch  worktree-agent-<agent id>
-```
-
-and that path IS its cwd, so a claim over the parent directory
-`<repo>/.claude/worktrees` reaches it. Real layout, real remote, real repo
-identity — repo- and path-scoped rules match without any faking, and the path
-is inside the sub-agent's sandbox write allowlist (a `mktemp -d` worktree
-created outside the sandbox is not: the write fails `EPERM` and the sub-agent
-cannot legitimately get past that). **Never run the sub-agent in the user's own
-working tree.**
-
-**The isolated worktree is cut from the main checkout's HEAD, which may be
-stale or carry local commits.** The fake feature's anchors (the constant, the
-file, the path the rule names) may not exist there. Make the sub-agent's first
-call bring its own scratch branch to the shipping tree — `git fetch -q origin
-&& git reset -q --hard origin/<base>` — and print the anchor. That reset is
-confined to the sub-agent's branch; it never touches the user's checkout.
-
-**It is on a branch, never detached.** A detached worktree makes the hook report
-the branch as `detached`, so **every `given.repo.branch_rx` / `branch_not_rx`
-predicate silently fails** — including the documented "never push to main"
-rule. Step 4b is mandatory, so that reads as "the rule never fired" and blocks
-filing a perfectly good rule. Verified: detached → `given_ok` returns False for
-`branch_rx: "^(main|master)$"`; on a named branch it evaluates normally.
-
-**When the rule asks about the branch, name the branch to match.** Read the
-candidate's `given.repo.branch_rx`; the isolated branch is `worktree-agent-…`,
-so have the sub-agent's first call also `git checkout -b <matching-name>`
-inside its own worktree. If the pattern demands a name that is already checked
-out — `^(main|master)$` is the common case, and git refuses a second worktree
-on it — you cannot exercise that predicate here: say so, report the branch
-predicate as **unexercised**, and treat the run as §4b.6 (ask before filing)
-rather than reporting a failed rule. Never delete the `given` block to make
-the test pass: a fire the rule would not produce in production is a worse
-answer than no fire.
-
-**4b.3 Arm the candidate in a book that is YOURS.** The candidate is not filed
-yet and a proposed rule never fires, so the test has to arm it in a book the
-hook really reads. It does **not** arm it in the shared one. That file is a
-single book per repo, read by every session on this machine working in that
-repo, on every `PreToolUse` — so doctoring it hands an unfiled, unreviewed rule
-to your colleagues' sessions and to your own other terminals, and two tests
-that interleave leave one armed with no backup left to find it by.
-
-Instead, claim a private base for the calls made from the sub-agent's isolated
-worktree. Its exact path is not known until the Agent tool creates it, so the
-claim covers the parent directory every isolated worktree of this repo lands
-in — write it **before** spawning the sub-agent:
-
-```bash
-BASE="${MEMHUB_RULEBOOK_BASE:-$HOME/.config/memhub-plugin/rulebook}"
-PRIV="$(mktemp -d)/pretest-base"
-mkdir -p "$PRIV/book" "$PRIV/ledger" "$PRIV/state"
-cp -R "$BASE/book/." "$PRIV/book/"          # start from the real rules
-PREFIX="<repo root>/.claude/worktrees"       # where isolation: "worktree" puts the sub-agent
-ls "$PREFIX" 2>/dev/null                     # any sibling isolated worktree live right now?
-
-# the claim: calls whose cwd is under $PREFIX read $PRIV, nothing else does
-python3 - "$BASE" "$PRIV" "$PREFIX" <<'EOF'
-import json, os, sys
-base, priv, wt = sys.argv[1:4]
-p = os.path.join(base, "pretest-redirect.json")
-fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as f:
-    json.dump({"base": priv, "cwd_prefix": wt, "pid": os.getpid()}, f)
-EOF
-
-# where the sub-agent's calls will actually read from — check before arming
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>" "$PREFIX/probe"
-# and where YOUR calls still read from — must stay the shared book
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>" "<repo root>"
-```
-
-The first `book-path` must print a path under `$PRIV`; the second must print
-the shared book. If the first prints the shared book, the claim did not take
-(a stale or unreadable redirect reads as *no redirect*, by design) — **stop,
-and do not arm anything**. Ask the hook rather than recomputing the hash, here
-as before.
-
-**What the parent-directory claim reaches.** For the minutes it is armed,
-another session's isolated sub-agent in the same repo would read the private
-book too. That book is the real rules plus one advise-or-gate candidate, so
-nothing is taken from anyone, and its fires would land in your private ledger
-where the id filter below excludes them — but if `ls "$PREFIX"` showed a live
-sibling, say so in the report. `<repo root>/.claude/worktrees` is the Agent
-tool's location; if a spawned sub-agent reports a different path, re-claim
-with that parent and re-run rather than trusting a test the claim never saw.
-
-Then write the candidate into the book **under `$PRIV`**, appended to `rules` —
-never replacing the list, so the real rules stay armed and the sub-agent runs
-under the same posture a real session has. Normalise the appended copy:
-
-- `id`: `candidate-<8 hex>` — unique, and identifiable if a row ever leaks to
-  the ledger;
-- `_label`: the candidate's title, so disclosure renders as it will in
-  production;
-- `status`: `active`;
-- **`mode`: the mode the rule will ship with.** A gate candidate stays a gate.
-  Earlier versions of this step forced advise mode here, because a gate armed in
-  the SHARED book could refuse the person's own next command — but the claim
-  above is what removes that hazard, and forcing advise would throw away the
-  one thing a live test can show that `rulebook_verify`'s table cannot: what
-  the rule does to a real call, made by a real agent, in a real session. A
-  gate that fires is the evidence the author needs before asking anyone to
-  activate it for the team.
-
-  The hook confines this rather than weakening it: a `candidate-` row read
-  from the shared base is **dropped**, so the gate reaches the sub-agent under
-  your claim and reaches nobody at all outside it. Report what the sub-agent
-  actually hit — a refusal is a result, not a failure.
-
-**The background re-fetch cannot touch the private book.** `maybe_refresh`
-runs on every PreToolUse and spawns a refresh once the book is a minute old
-(`REFRESH_AFTER_S`). Under your claim it reads the private book's
-`fetched_at` and stamps `<private book>.refresh`, but the detached child it
-spawns fetches with no cwd and so refreshes the **shared** book — never the
-private one. The candidate cannot be deleted mid-test by a re-fetch. Still
-write `fetched_at` as **now**: it keeps the sub-agent's first minute from
-spawning a pointless fetch of the shared book.
-
-**No cached book for this repo** (nothing fetched yet, or no rulebook binds the
-user here) → `cp -R` copies nothing and you simply write the private book
-yourself, containing exactly the candidate plus a `fetched_at` of now. Nothing
-is displaced, because nothing was there and nothing shared is touched either
-way — this is not the §4b.6 escape.
-
-**4b.4 Run the sub-agent.** Run it with the Agent tool, `isolation:
-"worktree"`, on the fake feature prompt. The prompt tells it: its current
-working directory is its own isolated worktree and it stays there (relative
-paths, no `cd` out, no commit, no push, sandbox on); its first call is the
-`git fetch -q origin && git reset -q --hard origin/<base>` from §4b.2 plus a
-print of the anchor; then the feature; then a `git diff --stat`; and it
-reports the exact commands it ran and any hook text it saw, verbatim. The
-Agent tool's completion notice names the worktree path and branch it created —
-keep both for cleanup, and check the path is under `$PREFIX`.
-
-No ledger bracketing is needed any more. The sub-agent's fires land in
-`$PRIV/ledger/fires.jsonl` and nothing else writes there, so **every row in
-that file is evidence**. The old byte-offset window existed because the shared
-ledger also carried your own setup commands and, worse, concurrent sessions'
-fires — a rule whose matcher covered `cp`, `git`, `python3` or `rm` could pass
-a test nothing exercised. A private ledger removes the problem rather than
-narrowing the window around it.
-
-**4b.5 Release the claim — always, immediately after the sub-agent returns**,
-success or failure. Keep the evidence first — the evaluation below reads it:
-
-```bash
-EVID=$(mktemp -d)                        # the evidence outlives the private base
-cp "$PRIV/ledger/fires.jsonl" "$EVID/fires.jsonl" 2>/dev/null || : > "$EVID/fires.jsonl"
-cp "$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path "<repo>" "$PREFIX/probe")" \
-   "$EVID/book.json"                    # is the candidate still there?
-rm -f "$BASE/pretest-redirect.json"     # release first: the claim is what steers
-rm -rf "$PRIV"                          # then the private base — a literal path, never a $(…)
-```
-
-Release the claim **before** deleting the base, in that order: while the
-redirect still points at a base that no longer exists it reads as *no
-redirect*, which is the safe direction — a call falls back to the real book
-rather than to a missing one.
-
-There is nothing to restore and nothing to verify by hashing. The shared book
-was never written, so it cannot have been left doctored; that is the whole
-point of the claim, and it is what replaces the old backup-and-copy-back dance
-(`$BOOK.pretest-<pid>` / `$BOOK.pretest-absent`) along with its two markers
-that meant opposite things.
-
-**An interrupted run now heals itself**, which it did not before. A Ctrl-C
-leaves a redirect file and a temp base behind; the redirect stops steering
-anything after an hour (`REDIRECT_MAX_AGE_S`), and until then it only ever
-affects calls made from an isolated worktree under the claimed prefix — the
-abandoned sub-agent's, or a sibling's, which then reads the real rules plus
-one candidate for at most that hour. No unfiled rule is left armed for the
-user's own terminal or for any session outside that prefix, at any point — so
-there is no pre-run recovery scan to do and nothing to report.
-
-If you *do* find a `pretest-redirect.json` from an earlier run while setting
-up, just overwrite it: one claim at a time, and the newest one owns the file.
-
-**Evaluate: the ledger first (fact), the transcript second (judgment).**
-
-Read `$EVID/fires.jsonl` (the private ledger, kept in §4b.5) — all of it — and keep the rows with
-`rule_id == "candidate-<hex>"` **that also belong to the sub-agent**: the
-row's `session_id` must be this session's, and its `agent_id`
-must be the sub-agent's rather than the parent's.
-
-**Why the id check, even now that the ledger is private.** The claim keeps
-your own terminal and every session outside the prefix out, so the old hazard
-— a teammate's terminal, or your own second window, loading the candidate from
-the shared book and firing it inside your measurement window — cannot happen
-any more. What the id check still catches: a sibling session's isolated
-sub-agent under the same prefix during your window, and a row the parent
-somehow caused. Filtering on `rule_id` alone would report a pass the fake
-feature never earned. A candidate row carrying another session's ids, or the
-parent's rather than the sub-agent's, was not caused by the sub-agent
-and proves nothing. Report per row: `hook_phase` (pre/post),
-`tool`, `mode`, `fired_at`, `excerpt`.
-
-| Ledger result | Meaning | What you do |
-|---|---|---|
-| ≥1 candidate row | fired | continue to the transcript check |
-| 0 rows for EVERY rule, the real ones included | the claim never reached the sub-agent — its calls read the shared book | not a verdict on the pattern. Check the worktree path in the Agent tool's completion notice against `$PREFIX`; re-claim with the right parent and re-run once |
-| 0 candidate rows, candidate still in `$EVID/book.json` | did not fire | **do not file.** Report it as a real failure: the pattern passes the verifier's synthetic cases but not a real session. Offer to revise the pattern and re-run. First rule out §4b.2's branch trap — a `given.repo.branch_rx` that the scratch worktree's branch cannot satisfy fails the same way a bad pattern does |
-| 0 rows, candidate **gone** from `$EVID/book.json` | inconclusive — something rewrote the private book mid-test | re-run once; if it recurs, report the environment problem and do not file |
-
-Then read the sub-agent's returned output (an Agent-tool sub-agent's turns are
-sidechain records of THIS session, not a separate session file, so `capture.py`
-cannot be used here) and judge:
-
-- did the fire land where it could actually change what the agent did, or after
-  the fact;
-- did the sub-agent disclose it as `📏 Rule fired: …` — this is also the
-  end-to-end check on fire disclosure;
-- did the fire change the behaviour, or did the agent acknowledge and proceed.
-
-State these as **observations with the evidence quoted**, and be explicit that
-they are a judgment where the ledger result is a fact.
-
-**Report and clean up.** Name: the fake feature used, the worktree path (now
-removed), the ledger rows, the transcript judgment, and — always — the caveat
-*this proves the rule fires, not that it is worth firing*. Add *the branch
-predicate was not exercised* when it applies (§4b.2).
-
-Cleanup is mandatory and happens even on failure: release the claim (§4b.5, if
-not already), `git worktree remove --force <repo root>/.claude/worktrees/agent-<id>`
-and `git branch -D worktree-agent-<id>` — the Agent tool auto-cleans an
-isolated worktree only when it is unchanged, and a test that fired always
-changed it — then `git worktree prune` and `rm -rf` the evidence dir. There is
-no book to restore — the shared one was never written.
-
-**One artifact of the test to expect, not to chase:** a candidate that
-supersedes an active rule carries that rule's title as its `_label`, so if the
-sub-agent answers the fire with `RULEBOOK_OVERRIDE='[<label>] …'`, the hook
-reports the label as fitting two rules and records nothing. In production only
-one of the two is armed, and the override resolves.
-
-**4b.6 The one thing that is not a failure.** If the step cannot be **run at
-all** — the repo is not a git checkout, the Agent tool cannot create an
-isolated worktree (a bare repo, no `HEAD`, a filesystem that refuses it), or
-the Agent tool or its `isolation: "worktree"` option is unavailable in this
-host — then say which precondition was missing in one sentence, say that
-the pattern is therefore proven only against the verifier's synthetic cases,
-and **ask** whether to file anyway. Nothing is filed without a yes. A
-sub-agent that ran and tripped nothing is NOT this case: that is a failing
-test, and it blocks. Cleanup still runs.
+If the step cannot be run at all (no git checkout, no isolated worktree, no
+Agent tool), live-test.md §4b.6 says what to do — ask before filing.
 
 ### 5. Conflict check, confirm, then file
 
-Before showing the rule, check it against the book — the server files a
-colliding title or matcher as a silent second proposed rule unless you name what it
-replaces, so this is the only place it gets caught. Call `list_rules` (every
-status, no `rulebook_id`), save the reply, write the candidate `create_rule`
-body to a file, and run:
+Before showing the rule, check it against the book. The server refuses a
+rule whose title or trigger equals a live rule's in the same book (`This
+rulebook already has a rule with the same title|trigger: …`) unless you name
+that rule in `supersedes_rule_id`; it does not catch a near-identical
+statement, a twin in another book, or a dismissed one. Catch all of them here,
+before the person approves. Save step 2's `list_rules` reply (every page) to
+a file and run, with the step-4 candidate:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
   --candidates <candidate.json> --existing <list_rules.json> --repo "<repo>" \
-  --rulebook-id <the step-0 rulebook_id>
+  --rulebook-id <scopes.<scope>.rulebook_id from step 0>
 ```
 
-Omit `--rulebook-id` entirely on an older backend, where step 0 resolved no
-id — passing the flag with nothing after it is an argparse error and you get
-no report at all.
+For a workspace, the id is that workspace's `rulebook_id`. When it is `null`
+(nothing has been filed into that scope yet), pass `--new-scope` instead of
+`--rulebook-id`: every hit is then in another scope, which is right — there
+is nothing in this one yet.
 
+The human summary is the **last** lines of the output, after the JSON.
 `same_title` / `same_matcher` (an **active** rule fires on the same call) /
-`anchors_overlap` are deterministic; then read the `judge_by_statement` list
+`anchors_overlap` are deterministic — and "no deterministic hit" is not "no
+conflict": the example's real twin (the rule it replaces, with a different
+pattern) shows up only in the `judge_by_statement` list. Read that list
 it prints and mark the candidate `duplicate`, `contradicts` or `distinct`
 against each (the script prints the exact `supersedes_rule_id` value under
 each hit). `duplicate` (or a `same_title` / `same_matcher` hit you judge to
@@ -934,15 +387,15 @@ file; tell the user. `contradicts` → file it (it lands `proposed`) WITHOUT
 `supersedes_rule_id`, but name the rule it fights in the report; a reviewer
 retires one side before activating the other.
 
-A hit marked **`cross_book`** is in a rulebook you are not filing into.
-`supersedes_rule_id` cannot reach it — whatever you file, both rules stay live
-and both fire on the same call. Do not file over it silently: name the book and
-the rule to the user and let them choose (retire one side in MemHub, narrow one
-rule's `scope_repos` / `scope_paths`, or file anyway and accept the double
-fire).
+A hit marked **`cross_book`** is in another scope than the one you are
+filing into. `supersedes_rule_id` cannot reach it — whatever you file, both
+rules stay live and anyone both scopes reach gets both on the same call. Do
+not file over it silently: name the scope (its label) and the rule to the user
+and let them choose (retire one side in MemHub, narrow one rule's
+`scope_repos` / `scope_paths`, or file anyway and accept the double fire).
 
-Show the user: the rule sentence, the delivery + engine block, the sample
-commands it does and doesn't match, and the conflict verdict. Under the
+Show the user: who it applies to (step 0), the rule sentence, the delivery + engine block, `Categories: <list>`,
+the sample commands it does and doesn't match, and the conflict verdict. Under the
 sentence, show what the judge will read, as the person will approve it:
 
 ```
@@ -956,38 +409,43 @@ Read it against the statement before you show it: a situation, an exemption
 or a reason that appears in one and not the other is a drafting error — fix
 it, do not file both versions.
 
-**A `session_draft` handed over by the harness skips that approval** — it files
-straight away and tells the person afterwards in one line. The draft lands
-`proposed` and fires for nobody until a reviewer activates it, so the approval
-asked for here is already held by whoever reviews the book; asking again
-mid-turn is the interruption the Stop block exists to avoid. A `cross_book`
-conflict does NOT reach the person on this path either: it files nothing and
-says nothing. The person hears about the turn only when a rule was filed.
-
 On approval — or immediately, for a harness draft — call the memhub
 **`create_rule`** tool with `title`, `statement`, `when`, `do`, `why`
 (left out only when step 1 found none), `when_not` when an exclusion was
 named, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
-`user correction, session <id>`, with the step-1b numbers appended:
-`|applies N/M|precision P`), `supersedes_rule_id` when it replaces a
+`user correction, session <id>`), `categories` and `evidence` as labels.md
+says (a harness draft sends neither),
+`supersedes_rule_id` when it replaces a
 rule, `mode: "gate"` if the user asked for a rule that stops the command, and
-`rulebook_id` from step 0. No `author` when a person asked for the rule
+`scope` from step 0 (plus `workspace_id` for a workspace) — never a guessed
+`rulebook_id`; only a `--rulebook <id>` the user passed goes through as one.
+A replacement (`supersedes_rule_id`) stays in the scope of the rule it
+replaces, so send it without `scope`. No `author` when a person asked for the rule
 (`nomination` included): they wrote it, and an unset author reads as the
 owner — only a harness draft passes `author="xtrace"`. Read the reply:
 
-- `unchanged: true` → identical content is already in the book (a retried
-  call with the same `source_ref` path and title); nothing written.
-  Only the `@sha` and `#…` tail is ignored in that match. A `source_ref` with
-  no `#` keeps its `|applies N/M` suffix in the key, so re-filing the same rule
-  with fresher counts (`user correction, session <id>|applies 1/40` after
-  `…|applies 0/39`) is NOT unchanged: it lands as a second `proposed` row with
-  no `supersedes_rule_id` (verified on staging). On a retry, reuse the first
-  filing's `source_ref` byte for byte, or name its `rule_id` in
-  `supersedes_rule_id` — the step-5 `same_title` hit gives it to you.
+- `unchanged: true` → the rule is already in the book (a retried call);
+  nothing new is filed, though differing `when` / `do` / `why` / `when_not`
+  and `evidence` are written onto the existing row. On a retry, reuse the
+  first filing's `source_ref` byte for byte (only an `@<sha>` and a `#…` tail
+  are ignored), or name its `rule_id` in `supersedes_rule_id`.
+- **Refused as a duplicate** (`This rulebook already has a rule with the same
+  title|trigger: "<title>" (rule_id <id>, <status>)`) → nothing was written.
+  If it is the same rule, file again with `supersedes_rule_id: <id>`; if it is
+  a different rule, retitle it (same title) or tell the user (same trigger).
 - `status: "proposed"` + `supersedes_rule_id` → filed as a replacement for
   the rule you named; it retires that rule when a reviewer activates it.
 - `status: "proposed"` with no `supersedes_rule_id` → new, awaiting review.
+- `category_invalid` / `evidence_invalid` → labels.md, *Refused*.
+- A scope refusal (`This organisation's plan doesn't include workspaces…`,
+  `That workspace is locked…`, `No workspace with that id…`, `That's the
+  organisation's main workspace…`) → nothing was written. Tell the user in
+  one line and file again with `scope: "org"`. `A replacement stays in the
+  same scope…` → file it again without `scope`. `A personal rulebook only
+  takes its owner's own rules…` → the rule you meant to replace is someone
+  else's personal rule: tell the user, and file it only as a new rule (no
+  `supersedes_rule_id`) if they want one.
 
 **A rule that replaces another inherits what it does not name.** With
 `supersedes_rule_id`, any of `when` / `when_not` / `do` / `why` you leave out
@@ -995,27 +453,23 @@ is copied from the rule being replaced — which is what you want for a
 pattern-only fix, and wrong the moment the situation itself changed. If the
 new rule is for a wider, narrower or different situation, re-state `when` —
 and `when_not`, as the whole list it should now be — rather than inheriting
-the old one. An identical re-file that differs only in
-these fields updates them on the existing rule and still answers
-`unchanged: true`.
+the old one. A blank or omitted field never clears a stored one, so a
+replacement cannot remove a `when_not` entry by leaving it out — re-state the
+list without it.
 
 The server never answers `draft` — a call without `activate` lands
 `proposed`. Relay the reply's `message` to the user: it is the server's own
 sentence for what just happened.
 
 **New rules always land for review — never pass `activate`.** That holds even
-on a book that binds only the user, where the server would let them arm their
-own rule: the point of the review step is that somebody reads the rule after
+for a `personal` rule, which the user may activate themselves and the server
+would let them arm: the point of the review step is that somebody reads the rule after
 the excitement of writing it.
 
-**A blocking rule is filed the same way, and blocks nothing until it is
-turned on.** `mode: "gate"` is stored on the rule and travels with it through
-review; it is the reviewer turning the rule on that puts the block in front of
-anyone. So filing one is safe, and the reply says as much — read the `mode`
-back and report what it says rather than promising the user their command is
-blocked from now on. If the server refuses the mode, the rule is not on a
-command (see step 3): file it advising and tell the user which shape would
-block.
+**A gate blocks nothing until it is activated.** Read `mode` back off the
+reply and report it; never tell the user their command is blocked from now
+on. If the server refuses the mode, file it advising and say which shape
+would block.
 
 If the rule is better as a plain suggestion than a check — the user doesn't
 want to write a detector — file it the same way with
@@ -1026,18 +480,20 @@ Not `agent_hook`: with no `matcher` or `ordering` the server refuses it as
 
 ### 6. Report
 
-Tell the user: which **rulebook** it went into and who that book binds
-("org-wide" or "N members" — that is the set of people this rule will reach);
-that it is filed `proposed` and awaiting review — naming the rule it
-replaces by title when it supersedes one; and what happens next: the rule's owner or an admin activates it in
-MemHub (a `proposed` rule retires the one it replaces), every **member of that
-rulebook** picks it up on their next session, and its firing history accrues in
-MemHub as the evidence that later decides whether to keep, narrow, or retire
-it. Name any `cross_book` collision here too, under **Conflicts to resolve**.
+Name the audience from the reply — `label`, `applies_to` and `scope` — never a
+rulebook's stored name. For the example: *"Filed `proposed` for Everyone in
+Acme (everyone in Acme (12 people)), replacing 'No force-push to staging or
+main'. It takes effect when an org admin activates it."* That is: who the rule
+applies to (the set of people it will reach); that it is filed `proposed` and
+awaiting review — naming the rule it replaces by title when it supersedes one;
+and what happens next: **an org admin** activates it (**you**, when `scope` is
+`personal`: "It takes effect when you activate it."), everyone it applies to
+picks it up on their next session, and its firing history accrues in MemHub
+as the evidence that later decides whether to keep, narrow, or retire it.
+Relay `message` verbatim as well — it already ends with who the rule applies
+to. Name any `cross_book` collision here too, under **Conflicts to resolve**.
 
-If the rule was filed to stop the command, say so in the same breath as who it
-reaches: once it is turned on, that command stops for everyone the book binds,
-and each of them can still run it by putting `RULEBOOK_OVERRIDE='<why>'` in
+For a gate, add: once activated it stops that command for everyone it applies
+to, and each of them can still run it with `RULEBOOK_OVERRIDE='<why>'` in
 front (an edit gate takes a `rulebook-override[<rule>]: <why>` marker in the
-content instead). Do not report a blocking rule as already blocking — it is waiting for
-the same review as any other.
+content instead).

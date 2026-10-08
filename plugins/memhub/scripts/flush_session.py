@@ -30,9 +30,10 @@ must never disturb the user's session).
 
 Auth = the plugin's OWN token cache (shared `_memhub_auth`), which is a
 different store from the /mcp connector's despite sharing an Auth0 client:
-$MEMHUB_TOKEN if set (CI escape hatch), else the cached plugin OAuth token,
-refreshed automatically. interactive=False — a background hook must never
-pop a browser, so with no cached token it degrades quietly (run
+$MEMHUB_TOKEN if set and this build reads it (CI escape hatch), else the
+cached plugin OAuth token, refreshed automatically. interactive=False — a
+background hook must never pop a browser, so with no cached token it degrades
+quietly (run
 /memhub:login once to seed the cache).
 Endpoint: $MEMHUB_MCP_BASE_URL(+_SERVER_PATH) > the plugin's .mcp.json
 mcpServers.*.url > a default derived from the plugin install path (prod for
@@ -272,8 +273,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         # credential at all, was the one condition it reported least. Every
         # other failure on this path leaves a trace; this one has to as well.
         _breadcrumb(session_id, "auth", "no usable credential")
-        # Same contract the SDK's NonInteractiveAuthRequired had: a background
-        # hook degrades quietly rather than popping a browser at the user.
+        # NonInteractiveAuthRequired's contract: a background hook degrades
+        # quietly rather than popping a browser at the user.
         raise NonInteractiveAuthRequired(
             "no usable credential (key, token or cached login)")
 
@@ -459,11 +460,25 @@ async def _send(session, arguments, title, namespace,
     return False
 
 
+def _env_token_hint() -> str:
+    """`` (or set MEMHUB_TOKEN)`` where this build reads that variable, else "".
+
+    The Claude plugin directory build ships no ``_memhub_env_token``, so there
+    the variable is ignored and the hint would send the user to a dead end.
+    """
+    try:
+        import _memhub_env_token  # noqa: F401,PLC0415 — absent in the directory build
+    except ImportError:
+        return ""
+    return " (or set MEMHUB_TOKEN)"
+
+
 def _auth_required(e: BaseException) -> bool:
     """True if NonInteractiveAuthRequired is anywhere in the exception tree.
 
-    The MCP client runs auth inside anyio task groups, so the raise from our
-    redirect_handler can surface wrapped in ExceptionGroups or as a __cause__.
+    Raised on our own stack today, but it can still arrive chained as a
+    __cause__/__context__ (or inside an ExceptionGroup), so walk the tree
+    rather than trust the outermost type.
     """
     seen: set[int] = set()
     stack: list[BaseException] = [e]
@@ -513,10 +528,9 @@ def main() -> int:
         started = time.monotonic()
         asyncio.run(asyncio.wait_for(
             _flush(session_id, transcript_path), timeout=timeout_s))
-    # BaseException, not Exception: when anyio's task group mixes a
-    # CancelledError into the group (e.g. the auth failure cancelling sibling
-    # tasks), the result is a BaseExceptionGroup — a BaseException — which
-    # would skip an Exception handler and kill the hook with a traceback.
+    # BaseException, not Exception: a CancelledError (a BaseException since
+    # 3.8) or a KeyboardInterrupt would skip an Exception handler and kill the
+    # hook with a traceback.
     # This is a fire-and-forget background hook: exit 0 quietly, always.
     except BaseException as e:  # noqa: BLE001 — never fail the hook
         # Told apart by ELAPSED TIME, not by type. Since 3.11 ``socket.timeout``
@@ -535,8 +549,8 @@ def main() -> int:
                  f"{session_id} to finish (it resumes from the server's "
                  "watermark).")
         elif _auth_required(e):
-            _log(f"no cached OAuth token; run {skill_command('login')} "
-                 "(or set MEMHUB_TOKEN) to enable commit flush — skipping")
+            _log(f"no cached OAuth token; run {skill_command('login')}"
+                 f"{_env_token_hint()} to enable commit flush — skipping")
         else:
             _log(f"skipped ({type(e).__name__}: {e})")
     return 0

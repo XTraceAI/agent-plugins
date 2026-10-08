@@ -1,7 +1,7 @@
 ---
 name: spec-check
 description: Use to freshly check working-tree or pull-request changes against Git ownership specs or governing Brain requirements, investigate spec drift, or verify a proposed spec correction. Also handles /memhub:spec check. Produces cited findings and explicit coverage; does not modify code or specs by default.
-argument-hint: [file|topic|PR] [--base <ref>]
+argument-hint: "[file|topic|PR] [--base <ref>]"
 ---
 
 # Check specs

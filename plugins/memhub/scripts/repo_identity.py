@@ -30,18 +30,23 @@ _CACHE: dict[str, str] = {}
 
 
 def _remote_basename(directory):
-    """`origin`'s URL basename, or "". Half a second is the whole budget: a
-    hook that fires on every tool call cannot wait on a slow filesystem or a
-    credential prompt, and step 2 is standing by."""
+    """`origin`'s URL basename, "" when git answered that there is no origin,
+    or None when git did not answer that question: missing, timed out, or any
+    other failure (not a repository, dubious ownership, a broken config).
+    Half a second is the whole budget: a hook that fires on every tool call
+    cannot wait on a slow filesystem or a credential prompt, and step 2 is
+    standing by."""
     try:
         out = subprocess.run(["git", "-C", directory, "remote", "get-url", "origin"],
                              capture_output=True, text=True, timeout=0.5)
     except (OSError, subprocess.SubprocessError):
-        return ""          # git missing, or timed out — the file read decides
+        return None        # git missing, or timed out — the file read decides
     url = out.stdout.strip()
-    if out.returncode != 0 or not url:
-        return ""
-    return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    if out.returncode == 0:
+        return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if url else ""
+    # "error: No such remote 'origin'" — exit 2 on current git, 128 on older
+    # ones, so the message decides, not the code.
+    return "" if "no such remote" in out.stderr.lower() else None
 
 
 def _main_worktree_basename(gitdir):
@@ -77,9 +82,20 @@ def repo_name(directory, gitdir="", fallback=""):
     key = (directory, gitdir)
     if key in _CACHE:
         return _CACHE[key]
-    name = (_remote_basename(directory)
+    name = resolve(directory, gitdir, fallback)[0]
+    _CACHE[key] = name
+    return name
+
+
+def resolve(directory, gitdir="", fallback=""):
+    """(name, settled): `repo_name`'s answer, unmemoized, and whether git
+    itself answered step 1 (a URL, or "no such remote"). An unsettled name
+    (git missing, past its half second, or failing some other way) is a
+    guess the next call may improve on, so a caller that persists names
+    across processes must not keep it."""
+    remote = _remote_basename(directory)
+    name = (remote
             or _main_worktree_basename(gitdir)
             or fallback
             or os.path.basename(directory.rstrip("/")))
-    _CACHE[key] = name
-    return name
+    return name, remote is not None

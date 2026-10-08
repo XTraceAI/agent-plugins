@@ -1,7 +1,7 @@
 ---
 description: Use when a PR should be babysat to green — poll its review bots (Cursor bugbot, OpenAI Codex) and CI, fix the real findings, push, and when clean save a PR review record to the repo's MemHub room (e.g. "babysit this PR", "watch PR 14 and fix the bot findings", or, on Claude Code only, auto-armed by the memhub hook right after `gh pr create` — Codex and Cursor do not run that hook, so there it is started by hand). Designed as the body of a self-paced /loop — one poll→fix→push pass per invocation; the final pass writes the memory and ends the loop.
-argument-hint: [pr-number-or-url]
-allowed-tools: mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash, Read, Edit, Write, Glob, Grep
+argument-hint: "[pr-number-or-url]"
+allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" show *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/room_map.py" set *), Bash(git remote get-url origin), Bash(git rev-parse --path-format=absolute --git-common-dir), Bash(gh pr view *), Bash(gh api repos/*/comments --paginate), Bash(gh api repos/*/reviews --paginate), Bash(gh api repos/*/replies -f body=*), Bash(git pull), Bash(git add *), Bash(git commit *), Bash(git push), Edit(./**), mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Read, Glob, Grep'
 ---
 
 **Plugin root:** commands below use `${CLAUDE_PLUGIN_ROOT}`. Claude Code
@@ -103,9 +103,18 @@ step's whole value, and it is a page of text.
 2. **Save it** into the repo's room with `save_artifact`:
    `name: "PR review record — <owner>/<repo>#<n>"`,
    `content: <the record from step 1>`, `artifact_type: "document"`,
-   `tags: ["pr-review", "<repo>"]`,
-   `agent_brain_id: <repo-room-id-from-step-2>`, and `org_id: <ORG_ID>` when
-   step 2 has one.
+   `tags: ["pr-review", "<repo>"]`, `topic: <the subject area the PR
+   changed>`, `agent_brain_id: <repo-room-id-from-step-2>`, and
+   `org_id: <ORG_ID>` when step 2 has one.
+
+   `topic` is the brain chapter the record belongs under — the area of the
+   code the PR changed (`billing`, `rulebook`), never `pr_review` (that is
+   what the record IS, and the server refuses it as a topic). Use an existing
+   topic of the brain when one fits even loosely; a new one only for an area
+   none covers; else `"unsorted"`. If the save is refused for a missing or
+   unusable topic, the refusal lists the brain's topics — pick one and save
+   again. A later re-save of the same record keeps its topic.
+   (`${CLAUDE_PLUGIN_ROOT}/references/topics.md`)
 
    The stable `name` is load-bearing: saving it again VERSIONS the record,
    so a later babysit of the same PR supersedes the earlier one instead of

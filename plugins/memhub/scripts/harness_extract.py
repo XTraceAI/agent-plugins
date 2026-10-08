@@ -2,12 +2,14 @@
 """Harness-tied memory, the client half: which moments of a session deserve
 the coding agent's attention.
 
-Nothing here writes a rule. At the Stop of turn N+1 — only with
-`MEMHUB_HARNESS_EXTRACT=1`; off by default — `harness_stop.py` runs turn N
+Nothing here writes a rule. At the Stop of turn N+1 — on by default;
+`MEMHUB_HARNESS_EXTRACT=0` turns it off — `harness_stop.py` runs turn N
 through this pipeline, in the hook, synchronously:
 
     transcript   the session's .jsonl → turns. Turn N is rebuilt from the file
-                 the hook payload names; nothing is read from local state.
+                 the hook payload names; the only local state is where to
+                 start reading it (`harness_stop.read_turns`), checked
+                 against the file on every use.
     window       the moment as text: the previous user message with that
                  turn's last actions and words, this user message, this turn's
                  first actions, its errors and closed error arcs, its final
@@ -44,6 +46,14 @@ HERE = Path(__file__).resolve().parent
 FLAG = "MEMHUB_HARNESS_EXTRACT"
 CHILD_FLAG = "MEMHUB_HARNESS_CHILD"   # set by harness_stop.run_author
 _ON = ("1", "on", "true", "yes")
+_FLAG_WS = " \t\n\v\f\r\x1c\x1d\x1e\x1f"   # as hook_entry._FLAG_WS
+#: The `harnessDrafting` userConfig option (.claude-plugin/plugin.json), which
+#: Claude Code hands its hooks as `CLAUDE_PLUGIN_OPTION_<KEY>` uppercased. On by
+#: default; set false it turns the sensor off for this install, whatever FLAG
+#: says, so no Stop judges a turn or asks for a drafting fork
+#: (hook_entry.harness_enabled reads it the same way).
+OPT_OUT = "CLAUDE_PLUGIN_OPTION_HARNESSDRAFTING"
+_OFF = ("0", "off", "false", "no")
 
 CLASSIFY_PATH = "/v1/team/rulebook/harness/classify"
 # The server bounds its judge at 20 s. One attempt, and this is the whole wait:
@@ -58,20 +68,33 @@ CLIENT_REASONS = ("no_credential", "transport_error", "bad_reply")
 
 
 def extract_enabled(environ=None) -> bool:
-    """The one switch for the whole sensor. Default OFF.
+    """The one switch for the whole sensor. Default ON, and off for an
+    install whose `harnessDrafting` option is false (`drafting_opted_out`).
 
-    Opt-in because of what on costs: a classifier call per human turn, and a
-    background fork per flagged turn on the PERSON'S OWN model quota, filing
-    proposals into a shared team rulebook. Unset, blank and unrecognised values
-    are all off."""
+    Unset or blank keeps the default; an on spelling is on. An off spelling,
+    and anything unrecognised, is off: on costs a classifier call per human
+    turn and a background fork per flagged turn on the PERSON'S OWN model
+    quota, so a value someone typed and got wrong must not start the spend.
+    Trimmed of the same ten ASCII whitespace characters as
+    `hook_entry.harness_enabled`, so the two gates never disagree."""
     env = os.environ if environ is None else environ
     if str(env.get(CHILD_FLAG, "")).strip().lower() in _ON:
         # A `claude` process the plugin's own tooling starts (the case judge,
         # harness/judge/judge.py) is never sensed, whatever FLAG says: Claude
         # Code applies a settings.json `env` over the environment a process
-        # inherits, and settings is where an install opts in with FLAG=1.
+        # inherits, and settings is where an install sets FLAG.
         return False
-    return str(env.get(FLAG, "")).strip().lower() in _ON
+    if drafting_opted_out(env):
+        return False
+    value = str(env.get(FLAG, "")).strip(_FLAG_WS)
+    return value == "" or (value.isascii() and value.lower() in _ON)
+
+
+def drafting_opted_out(environ=None) -> bool:
+    """The person set `harnessDrafting` to false. Only an explicit off value
+    counts: unset (an older Claude Code, a terminal run) keeps the default."""
+    env = os.environ if environ is None else environ
+    return str(env.get(OPT_OUT, "")).strip().lower() in _OFF
 
 
 # ------------------------------------------------------------------- files

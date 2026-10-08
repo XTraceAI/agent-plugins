@@ -1,6 +1,0 @@
-{
-  "description": "The MemHub companion above the prompt: one animal a session (/goose, /hippo, /penguin, /shiba, and any other in animals/), picked from the session id unless one is pinned (`/<animal> always`; `random`, `never` and `include` shape the pick), asleep while idle, looking around while Claude answers or you type, up announcing each MemHub rule that fires — crossly when one blocks a call — and, whichever animal it is, hopping up with a new rule the harness proposed, asking Activate / Reject / Later on buttons inside its bubble (1, 2, 3). Clicking the ♥ beside it pets it, and a proposal's rule↗ opens that rule in MemHub Studio.",
-  "modules": [
-    "./register.ts"
-  ]
-}

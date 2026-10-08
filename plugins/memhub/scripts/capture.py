@@ -7,7 +7,7 @@ sessions through one command, using the per-host readers.
     python3 capture.py current [--host auto|claude|codex|cursor] [--cwd PATH] \
         [--max-age-s 1800] [--json]
 
-    uv run --with 'mcp<2' python capture.py import --session <ref> \
+    python3 capture.py import --session <ref> \
         [--host auto|claude|codex|cursor] [--conversation-id <id>] [--title "..."] \
         [--namespace <ns>] [--org-id <id>] [--url <mcp-url>] \
         [--dry-run]
@@ -32,12 +32,11 @@ the session's own working directory rather than trusting "newest .jsonl by
 mtime", and it REFUSES rather than guesses: two live sessions in one worktree
 is real, and picking the newer one would silently link the wrong one.
 
-The mcp SDK pin (``uv run --with 'mcp<2'``) matches every other invocation
-site: mcp 2.x renamed streamablehttp_client, breaking import_session.py's
-transport. ``list`` and ``current`` are stdlib-only and run under bare
-python3. Automatic capture deliberately keeps per-host flush entry points
-because each host has different trigger and watermark semantics; this command
-unifies listing and manual import, where the behavior is genuinely shared.
+Every subcommand is stdlib-only and runs under bare python3; ``import`` runs
+``import_session.py`` with the same interpreter that runs this script.
+Automatic capture deliberately keeps per-host flush entry points because each
+host has different trigger and watermark semantics; this command unifies
+listing and manual import, where the behavior is genuinely shared.
 """
 from __future__ import annotations
 
@@ -293,7 +292,7 @@ def cmd_import(args) -> int:
         passthrough += ["--url", args.url]
 
     def run_import(transcript: Path, conv_id: str | None) -> int:
-        cmd = ["uv", "run", "--with", "mcp<2", "python", str(_IMPORT_SESSION),
+        cmd = [sys.executable, str(_IMPORT_SESSION),
                "--session", str(transcript),
                "--source-platform", r.HOST]
         if conv_id:

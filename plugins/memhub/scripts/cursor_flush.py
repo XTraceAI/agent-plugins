@@ -40,7 +40,7 @@ Invoked by the portable Cursor launcher, which answers the hook's permission
 contract immediately and re-runs this script detached - a slow server must
 never hold up the user's shell command.
 
-Runs under bare python3 (stdlib + sibling modules only — no mcp SDK), same
+Runs under bare python3 (stdlib + sibling modules only), same
 discipline as flush_turn.
 """
 from __future__ import annotations

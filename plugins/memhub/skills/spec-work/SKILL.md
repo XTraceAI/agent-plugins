@@ -1,7 +1,7 @@
 ---
 name: spec-work
 description: Use when implementing a feature against repository specs, finding requirements before coding, or turning a Git or Brain spec into an implementation plan and acceptance checks. Also handles /memhub:spec work. Do not use merely because an unrelated document is called a spec.
-argument-hint: <feature|task|files>
+argument-hint: "<feature|task|files>"
 ---
 
 # Work with specs
