@@ -203,6 +203,8 @@ def main():
             report.update(ok=False, error="MEMHUB_PROD_E2E_TOKEN is not provisioned; sessions were NOT deleted")
             report["sessions"] = [dict(s, outcome="skipped") for s in sessions]
         else:
+            # mcp_http imports its siblings (plugin_version) by bare name.
+            sys.path.insert(0, str(ROOT / "plugins/memhub/scripts"))
             http = compat.load_module("cleanup_http", ROOT / "plugins/memhub/scripts/mcp_http.py")
             for session in sessions:
                 result = cleanup_session(http.rest, token, session)

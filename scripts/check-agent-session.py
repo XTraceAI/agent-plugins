@@ -331,8 +331,15 @@ def event_diagnostics(events):
 
 
 def ledger(root):
-    path = root / "home/.config/memhub-plugin/rulebook/ledger/fires.jsonl"
-    return json_lines(path.read_text()) if path.is_file() else []
+    """Every fire row the hook recorded. Since rulebook state is keyed by the
+    backend host (rulebook_paths.base: `rulebook/<host>/ledger/`), the ledger
+    lives under that key; the unkeyed `rulebook/ledger/` is the pre-key path."""
+    base = root / "home/.config/memhub-plugin/rulebook"
+    rows = []
+    for path in [base / "ledger/fires.jsonl", *sorted(base.glob("*/ledger/fires.jsonl"))]:
+        if path.is_file():
+            rows.extend(json_lines(path.read_text()))
+    return rows
 
 
 def identity_of(event, host):
