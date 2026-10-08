@@ -10,7 +10,7 @@ that is a launch's continuation, a subagent's, or the end of a harness prompt
 (a task notification, a loop wakeup) judges nothing; an interrupted turn and
 its verbatim resend are judged once; a classifier failure blocks nothing; the
 `stamp` command prints the stamp `create_rule` needs; nothing is written but
-`stop.log`; nothing in the sensor sends `activate`. No test reaches a server:
+`stop.log` and a per-session read offset, which changes no turn and no window; nothing in the sensor sends `activate`. No test reaches a server:
 `server_classify` is substituted.
 """
 from __future__ import annotations
@@ -20,6 +20,7 @@ import importlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import harness_extract as hx  # noqa: E402
 import harness_stop as hs  # noqa: E402
+import hook_entry  # noqa: E402
 
 
 class _Env:
@@ -110,8 +112,14 @@ def _classifier(reply):
         hx.server_classify = real
 
 
-def _stop(env, tp: Path, **payload) -> dict | None:
-    """Run cmd_stop in-process; the hook output it printed, or None."""
+def _stop(env, tp: Path, *, other_sensor_ran: bool = False, **payload) -> dict | None:
+    """Run cmd_stop in-process; the hook output it printed, or None.
+
+    Each call is a fresh machine unless `other_sensor_ran`: the one-per-machine
+    judgement claims (`judged/`) of earlier calls are forgotten, so a test that
+    replays one Stop sees it judged again."""
+    if not other_sensor_ran:
+        shutil.rmtree(env.base / "harness" / "judged", ignore_errors=True)
     body = {"session_id": "sess", "transcript_path": str(tp), "cwd": str(env.base)}
     body.update(payload)
     out = io.StringIO()
@@ -169,8 +177,11 @@ def test_the_stop_after_a_turn_judges_that_turn_and_blocks_once():
         # the verdict the line leaves out is in the log, where `handoff` reads it
         log = (env.base / "harness" / "stop.log").read_text()
         assert "launch sess t2: fork requested (correction) derivable=0" in log, log
-        # nothing is stored but the log
-        assert sorted(p.name for p in (env.base / "harness").iterdir()) == ["stop.log"]
+        # nothing is stored but the log, the session's read offset and the
+        # judged turn's claim
+        assert sorted(p.name for p in (env.base / "harness").iterdir()) == ["judged", "offsets", "stop.log"]
+        assert [p.name for p in (env.base / "harness" / "offsets").iterdir()] == ["sess.json"]
+        assert [p.name for p in (env.base / "harness" / "judged" / "sess").iterdir()] == ["2"]
     print("PASS test_the_stop_after_a_turn_judges_that_turn_and_blocks_once")
 
 
@@ -246,6 +257,72 @@ def test_a_skill_body_is_neither_a_turn_nor_a_prompt():
     print("PASS test_a_skill_body_is_neither_a_turn_nor_a_prompt")
 
 
+def test_a_lesson_in_the_following_message_hands_over_that_turn_once():
+    """The judge says the lesson is in the person's following message (`at`):
+    the turn handed to the fork is N+1, the one this Stop ends, and the next
+    Stop — judging N+1 as `new` — does not hand it over again (spec §10.8)."""
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        turns = [("deploy it", "deployed to prod", []),
+                 ("ok, do it", "done", []),
+                 ("no, i mean staging", "redeployed to staging", [])]
+        _transcript(tp, turns)
+        with _classifier(dict(SIGNAL, at="following")) as sent:
+            block = _stop(env, tp)
+        assert "USER'S NEW MESSAGE: ok, do it" in sent[0], "turn 2 is the one judged"
+        line = block["hookSpecificOutput"]["additionalContext"]
+        assert line == f"{hs.HANDOFF_PREFIX} 3, drafting it in the background.", line
+        log = (env.base / "harness" / "stop.log").read_text()
+        assert "judge sess t2: signal=True" in log and "at=following" in log, log
+        assert "launch sess t3: fork requested (correction) derivable=0" in log, log
+        # the person goes on; the next Stop judges turn 3 and finds the same lesson
+        _transcript(tp, turns + [("thanks", "ok", [])])
+        with _classifier(dict(SIGNAL, at="new")) as sent:
+            again = _stop(env, tp)
+        assert "USER'S NEW MESSAGE: no, i mean staging" in sent[0], sent[0]
+        assert again is None, again
+        log = (env.base / "harness" / "stop.log").read_text()
+        assert "launch sess t3: skipped, already handed over" in log, log
+        assert log.count("fork requested") == 1, log
+    print("PASS test_a_lesson_in_the_following_message_hands_over_that_turn_once")
+
+
+def test_a_reply_without_at_reads_as_the_judged_turn():
+    """A server that predates `at` answers without it: the judged turn is the
+    moment, exactly as before. An unknown value reads the same way."""
+    for reply in (SIGNAL, dict(SIGNAL, at="sideways")):
+        with _Env() as env:
+            tp = env.base / "sess.jsonl"
+            _transcript(tp, [("deploy it", "deployed to prod", []),
+                             ("no, i mean staging", "redeployed", []),
+                             ("thanks", "ok", [])])
+            with _classifier(reply):
+                block = _stop(env, tp)
+            assert block["hookSpecificOutput"]["additionalContext"].startswith(
+                f"{hs.HANDOFF_PREFIX} 2,"), (reply, block)
+    print("PASS test_a_reply_without_at_reads_as_the_judged_turn")
+
+
+def test_a_fork_for_the_last_turn_is_not_told_of_a_next_message():
+    """A turn handed over on `at=following` is the one the Stop just ended: the
+    person has said nothing after it, and the fork's prompt says so instead of
+    pointing at a message that does not exist."""
+    with _Env() as env:
+        proj = env.base / "claude" / "projects" / "-w"
+        proj.mkdir(parents=True)
+        tp = proj / "sess.jsonl"
+        _transcript(tp, [("deploy it", "deployed to prod", []),
+                         ("no, i mean staging", "redeployed to staging", [])])
+        out = subprocess.run(
+            [sys.executable, str(SCRIPTS / "harness_stop.py"), "handoff", "--moment", "sess#2",
+             "--kind", "correction"], capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, MEMHUB_HARNESS_EXTRACT="0", CLAUDE_CONFIG_DIR=str(env.base / "claude")))
+        assert out.returncode == 0, out.stderr
+        assert "has said nothing after turn 2 yet" in out.stdout, out.stdout
+        assert "turn 3, is what happened" not in out.stdout, out.stdout
+    print("PASS test_a_fork_for_the_last_turn_is_not_told_of_a_next_message")
+
+
 def test_the_handoff_command_prints_the_fork_instruction():
     """The command the Stop's one line names. It finds the session's transcript
     under the host's config dir, rebuilds the moment, and prints the launch
@@ -297,11 +374,12 @@ def test_session_start_carries_the_standing_rule():
     run = lambda flag, payload: subprocess.run(  # noqa: E731
         [sys.executable, str(SCRIPTS / "harness_stop.py"), "session"], input=json.dumps(payload),
         capture_output=True, text=True, timeout=30, env=dict(os.environ, MEMHUB_HARNESS_EXTRACT=flag))
-    on = run("1", {"session_id": "s", "source": "compact"})
-    assert on.returncode == 0, on.stderr
-    out = json.loads(on.stdout)["hookSpecificOutput"]
-    rule = out["additionalContext"]
-    assert out["hookEventName"] == "SessionStart" and rule == hs.session_rule("s"), out
+    for source in ("startup", "clear", "resume", "compact"):
+        on = run("1", {"session_id": "s", "source": source})
+        assert on.returncode == 0, on.stderr
+        out = json.loads(on.stdout)["hookSpecificOutput"]
+        rule = out["additionalContext"]
+        assert out["hookEventName"] == "SessionStart" and rule == hs.session_rule("s"), (source, out)
     # the rule names the line the Stop prints and the command to run for it,
     # with this session's id; the line itself carries only the turn
     assert f'"{hs.HANDOFF_PREFIX} N"' in rule and 'harness_stop.py" handoff --moment s#N`' in rule, rule
@@ -311,6 +389,61 @@ def test_session_start_carries_the_standing_rule():
     assert run("1", {"session_id": "s", "agent_id": "a1"}).stdout == "", "a subagent gets no rule"
     assert run("1", {"session_id": "s; rm -rf x"}).stdout == "", "an id unsafe for a command line gets no rule"
     print("PASS test_session_start_carries_the_standing_rule")
+
+
+def test_one_turn_is_judged_once_per_machine():
+    """A machine with both installs (memhub and memhub) runs two Stops
+    over one transcript: the first to claim the turn judges it, the other asks
+    no classifier and hands off nothing."""
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, [("deploy it", "deployed to prod", []),
+                         ("no, i mean staging", "redeployed to staging", []),
+                         ("thanks", "ok", [])])
+        with _classifier(SIGNAL) as sent:
+            first = _stop(env, tp)
+            second = _stop(env, tp, other_sensor_ran=True)
+        assert first is not None and second is None, second
+        assert len(sent) == 1, "one classifier call for the turn on the machine"
+        log = (env.base / "harness" / "stop.log").read_text()
+        assert log.count("judge sess t2: skipped, judged by another sensor") == 1, log
+        assert log.count("fork requested") == 1, log
+        # a directory that cannot be written judges anyway: a sensor never fails closed
+        os.environ["MEMHUB_HARNESS_DIR"] = "/dev/null/harness"
+        try:
+            assert hs._claim_judgement("sess", 2) is True
+        finally:
+            os.environ["MEMHUB_HARNESS_DIR"] = str(env.base / "harness")
+    print("PASS test_one_turn_is_judged_once_per_machine")
+
+
+def test_a_session_started_before_the_rule_moved_back_gets_the_line():
+    """A session started on 0.118.0-0.120.3 was told the standing rule at its
+    first prompt, under a `told/` marker, and only when the mod did not serve
+    the harness. Those markers mean nothing now: every flagged turn gets the
+    line, told marker or not, and the subcommands only those releases called
+    (`prompt`, the mod's `judge` and `relay`) are gone and answer nothing on
+    stdout."""
+    for marker in (True, False):
+        with _Env() as env:
+            tp = env.base / "sess.jsonl"
+            _transcript(tp, [("deploy it", "deployed to prod", []),
+                             ("no, i mean staging", "redeployed to staging", []),
+                             ("thanks", "ok", [])])
+            if marker:
+                stale = env.base / "harness" / "told" / "staging-sess"
+                stale.parent.mkdir(parents=True)
+                stale.touch()
+            with _classifier(SIGNAL):
+                out = _stop(env, tp)
+            assert out["hookSpecificOutput"]["additionalContext"].startswith(
+                f"{hs.HANDOFF_PREFIX} 2,"), (marker, out)
+    with _Env():
+        for argv in (["prompt"], ["judge", "--json"], ["relay", "--moment", "sess#2"]):
+            proc = subprocess.run([sys.executable, str(SCRIPTS / "harness_stop.py"), *argv],
+                                  input="{}", capture_output=True, text=True, timeout=30)
+            assert proc.returncode == 0 and proc.stdout == "", (argv, proc)
+    print("PASS test_a_session_started_before_the_rule_moved_back_gets_the_line")
 
 
 def test_a_moment_unsafe_for_a_command_line_hands_off_nothing():
@@ -357,26 +490,49 @@ def test_a_filed_rule_links_to_its_page_in_the_env_it_was_filed_in():
     print("PASS test_a_filed_rule_links_to_its_page_in_the_env_it_was_filed_in")
 
 
-def test_the_hooks_are_wired_behind_the_guard():
+_ENTRY = 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py" '
+
+
+def _harness_handlers():
+    """{event: (handler, route)} for the hooks whose route runs harness_stop.py."""
     doc = json.loads((ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
     wired = {}
     for event, groups in doc["hooks"].items():
         for group in groups:
             for handler in group["hooks"]:
-                if "harness_stop.py" in handler["command"]:
-                    wired[event] = handler
+                assert handler["command"].startswith(_ENTRY), handler["command"]
+                route = hook_entry.ROUTES[tuple(handler["command"][len(_ENTRY):].split(" "))]
+                if any(lane.run[0] == "harness_stop.py" for lane in route.lanes):
+                    wired[event] = (handler, route)
+    return wired
+
+
+def _stub_root(td, harness_stop_src):
+    """A plugin root holding the real dispatcher, a guard that passes
+    everything, and the given harness_stop.py."""
+    root = Path(td) / "plugin"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "hook_entry.py").write_bytes((SCRIPTS / "hook_entry.py").read_bytes())
+    (root / "scripts" / "claude_hook_guard.py").write_text("def route(*_args):\n    return True\n")
+    (root / "scripts" / "harness_stop.py").write_text(harness_stop_src)
+    return root
+
+
+def test_the_hooks_are_wired_behind_the_guard():
+    wired = _harness_handlers()
     # Stop judges and hands off; SessionStart carries the standing rule the
     # person does not see. The prompt lane handed 19 moments for 0 proposals
     # and is gone.
     assert set(wired) == {"Stop", "SessionStart"}, set(wired)
-    assert wired["SessionStart"]["command"].rstrip("; fi").endswith('harness_stop.py" session')
-    assert "MEMHUB_HARNESS_EXTRACT" in wired["SessionStart"]["command"], "the same flag gates both"
+    assert [lane.run for lane in wired["SessionStart"][1].lanes] == [("harness_stop.py", "session")]
+    assert all(route.harness for _, route in wired.values()), "the same flag gates both"
     # synchronous: the classifier's verdict decides whether this Stop blocks,
     # and an async hook's stdout could not block the stop
-    assert not wired["Stop"].get("async") and wired["Stop"]["timeout"] <= 10
-    assert wired["Stop"]["command"].rstrip("; fi").endswith('harness_stop.py" stop')
-    for h in wired.values():
-        assert 'claude_hook_guard.py" ignore' in h["command"]
+    handler = wired["Stop"][0]
+    assert not handler.get("async") and handler["timeout"] <= 10
+    assert [lane.run for lane in wired["Stop"][1].lanes] == [("harness_stop.py", "stop")]
+    for _, route in wired.values():
+        assert [lane.guard for lane in route.lanes] == ["ignore"]
     print("PASS test_the_hooks_are_wired_behind_the_guard")
 
 
@@ -384,21 +540,16 @@ def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
     if os.name == "nt":
         print("SKIP test_the_hook_command_starts_nothing_unless_the_flag_is_on (POSIX hook command)")
         return
-    doc = json.loads((ROOT / "plugins" / "memhub" / "hooks" / "claude-hooks.json").read_text(encoding="utf-8"))
-    commands = [h["command"] for groups in doc["hooks"].values() for g in groups
-                for h in g["hooks"] if "harness_stop.py" in h["command"]]
+    commands = [handler["command"] for handler, _ in _harness_handlers().values()]
     assert len(commands) == 2, "the Stop lane and the SessionStart lane"
     with tempfile.TemporaryDirectory() as td:
-        root, ran = Path(td) / "plugin", Path(td) / "ran"
-        (root / "scripts").mkdir(parents=True)
-        (root / "scripts" / "claude_hook_guard.py").write_text("import sys\nsys.stdin.read()\n")
-        (root / "scripts" / "harness_stop.py").write_text(
-            "import sys\nsys.stdin.read()\nopen(%r, 'a').write(sys.argv[1] + ' ')\n" % str(ran))
-        # Default OFF: only an explicit on spelling runs. Unset, blank and
-        # unrecognised all stop here, before python starts — on costs the
-        # person a classifier call per flagged turn and an authoring run per
-        # moment on their own quota, so a typo must not start it.
-        for value, runs in (("", False), ("anything-else", False),
+        ran = Path(td) / "ran"
+        root = _stub_root(td, "import sys\nsys.stdin.read()\nopen(%r, 'a').write(sys.argv[1] + ' ')\n" % str(ran))
+        # Default ON: blank runs, as does an on spelling. An off spelling and
+        # anything unrecognised stop here, before harness_stop starts — on
+        # costs the person a classifier call per flagged turn and an authoring
+        # run per moment on their own quota, so a typo must not start it.
+        for value, runs in (("", True), ("anything-else", False),
                             ("0", False), ("off", False), ("no", False),
                             ("OFF", False), ("False", False), ("NO", False),
                             ("1", True), ("on", True), ("TRUE", True), ("Yes", True)):
@@ -420,8 +571,8 @@ def test_the_hook_command_starts_nothing_unless_the_flag_is_on():
 # \x1c-\x1f), so each one pads a value here: the Stop hook's shell gate used
 # to compare the raw value, and `" 1 "` meant on in Python and off in the hook
 # (public #270's Codex review). Non-ASCII whitespace is deliberately absent:
-# the shell gate matches bytes, str.strip() also drops U+00A0 and friends, and
-# a flag padded with those still reads off at the hook — the safe direction.
+# both gates trim only these ten (str.strip() would also drop U+00A0 and
+# friends), so a flag padded with those reads as unrecognised, which is off.
 _ASCII_WS = "".join(chr(i) for i in range(128) if chr(i).isspace())
 
 
@@ -429,44 +580,43 @@ EXTRACT_FLAG_TABLE = (
     [("1", True), (" 1 ", True), ("1\n", True), ("on", True), ("ON ", True),
      ("true", True), ("yes", True), ("Yes", True), ("TRUE", True),
      ("\ton\r\n", True), ("\x1c1\x1f", True), ("\v yes \f", True),
-     ("", False), ("0", False), ("off", False), ("no", False), ("onn", False),
-     ("2", False), (" ", False), ("\n", False), ("1 1", False), ("o n", False),
-     (" 0 ", False), ("anything-else", False), (None, False)]
+     ("", True), (" ", True), ("\n", True), (None, True),
+     ("0", False), ("off", False), ("no", False), ("onn", False),
+     ("2", False), ("1 1", False), ("o n", False), ("\xa01", False),
+     (" 0 ", False), ("anything-else", False)]
+    + [(ws + "0" + ws, False) for ws in _ASCII_WS]
     + [(ws + "1" + ws, True) for ws in _ASCII_WS]
     + [(ws + "on", True) for ws in _ASCII_WS]
     + [("true" + ws, True) for ws in _ASCII_WS])
 
 
 def test_every_extract_gate_reads_the_flag_the_same_way():
-    """`extract_enabled` and the Stop hook's shell `case` are one switch. Each value in the table goes to all three — the shell gate
-    run as the REAL command string from claude-hooks.json, under every POSIX
-    shell on the box, with a stub plugin root that records whether it got past
-    the gate — and all of them must give the table's answer. Only
-    claude-hooks.json carries a shell copy: the Codex file is generated
-    without the harness lane and Cursor never wires it (asserted here)."""
+    """`extract_enabled` and the hooks' gate in hook_entry.py are one switch.
+    Each value in the table goes to every copy — `hook_entry.harness_enabled`
+    directly, and the REAL command strings from claude-hooks.json under every
+    POSIX shell on the box, with a stub plugin root that records whether it
+    got past the gate — and all of them must give the table's answer. Only
+    the Claude hooks carry a copy: the Codex file is generated without the
+    harness lane and Cursor never wires it (asserted here)."""
     hooks = ROOT / "plugins" / "memhub" / "hooks"
     for other in ("codex-hooks.json", "cursor-hooks.json"):
         assert "HARNESS" not in (hooks / other).read_text(encoding="utf-8"), other
-    doc = json.loads((hooks / "claude-hooks.json").read_text(encoding="utf-8"))
-    commands = [h["command"] for groups in doc["hooks"].values() for g in groups
-                for h in g["hooks"] if "MEMHUB_HARNESS_EXTRACT" in h["command"]]
-    # the Stop lane and the SessionStart lane: one switch, two copies of the gate
+    commands = [handler["command"] for handler, _ in _harness_handlers().values()]
+    # the Stop lane and the SessionStart lane: one switch behind both
     assert len(commands) == 2, commands
     shells = [] if os.name == "nt" else [
         s for s in ("/bin/sh", "/bin/dash", "/usr/bin/dash", "/bin/bash") if os.path.exists(s)]
     wrong = []
     with tempfile.TemporaryDirectory() as td:
-        root, ran = Path(td) / "plugin", Path(td) / "ran"
-        (root / "scripts").mkdir(parents=True)
-        (root / "scripts" / "claude_hook_guard.py").write_text("import sys\nsys.stdin.read()\n")
-        (root / "scripts" / "harness_stop.py").write_text(
-            "import sys\nsys.stdin.read()\nopen(%r, 'a').write('x')\n" % str(ran))
+        ran = Path(td) / "ran"
+        root = _stub_root(td, "import sys\nsys.stdin.read()\nopen(%r, 'a').write('x')\n" % str(ran))
         base = {k: v for k, v in os.environ.items()
                 if k not in ("MEMHUB_HARNESS_EXTRACT", "MEMHUB_HARNESS_CHILD")}
         base["CLAUDE_PLUGIN_ROOT"] = str(root)
         for value, want in EXTRACT_FLAG_TABLE:
             env = dict(base) if value is None else dict(base, MEMHUB_HARNESS_EXTRACT=value)
-            got = {"extract_enabled": hx.extract_enabled(env)}
+            got = {"extract_enabled": hx.extract_enabled(env),
+                   "hook_entry.harness_enabled": hook_entry.harness_enabled(env)}
             for shell in shells:
                 for n, command in enumerate(commands):
                     proc = subprocess.run([shell, "-c", command], input="{}", text=True,
@@ -564,6 +714,82 @@ def test_a_recorded_stop_context_ends_the_turn():
         assert all(x["tool"] != "Agent" for x in turns[0]["tools"]), "the launch is not turn 1's"
         assert turns[0]["asst"] == "done", turns[0]
     print("PASS test_a_recorded_stop_context_ends_the_turn")
+
+
+# ------------------------------------------------------------- read offset
+def _growing_session():
+    """Nine turns with tools, errors and a closed error arc, so a window
+    carries every part a full read would build."""
+    out = []
+    for i in range(1, 10):
+        tools = [("Bash", {"command": f"make t{i}"}, f"boom {i}", True),
+                 ("Bash", {"command": f"make t{i}"}, f"ok {i}", False)] if i % 2 else \
+                [("Edit", {"file_path": f"/w/f{i}.py"}, "edited", False)]
+        out.append((f"message {i}: no, use staging {i}", f"reply {i}", tools))
+    return out
+
+
+def _windows_without_stamp_time(sent):
+    import re as _re
+    return [_re.sub(r'"at": "[^"]*"', '"at": ""', w) for w in sent]
+
+
+def test_an_offset_read_builds_the_same_turns_and_window_as_a_full_read():
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        turns = _growing_session()
+        offsets = env.base / "harness" / "offsets" / "sess.json"
+        for k in range(2, len(turns) + 1):
+            _transcript(tp, turns[:k])            # the session grows, append-only
+            full, full_last = hx.read_transcript(tp)
+            with _classifier({"signal": False, "reason": "classified"}) as resumed:
+                _stop(env, tp)
+            saved = json.loads(offsets.read_text())
+            # the offset never passes a turn the next window may need: the
+            # newest turn (judged at the next Stop) and its four lead-in turns
+            assert saved["offset"] <= full[-min(hs.LEAD_TURNS, len(full))]["offset"], (k, saved)
+            assert saved["offset"] <= full[-1]["offset"], (k, saved)
+            part, part_last = hs.read_turns("sess", str(tp))
+            assert part_last == full_last, k
+            assert part == full[-len(part):], f"turn {k}: resumed turns differ from a full read"
+            assert len(part) >= min(hs.LEAD_TURNS, len(full)), (k, len(part))
+            assert part[-1]["n"] == k, "numbering counts from the session start"
+            offsets.unlink()                      # the same Stop, from a full read
+            with _classifier({"signal": False, "reason": "classified"}) as fresh:
+                _stop(env, tp)
+            assert _windows_without_stamp_time(resumed) == _windows_without_stamp_time(fresh), k
+        # the last read really did start mid-file
+        saved = json.loads(offsets.read_text())
+        assert saved["offset"] > 0 and saved["before"] == len(turns) - hs.LEAD_TURNS, saved
+    print("PASS test_an_offset_read_builds_the_same_turns_and_window_as_a_full_read")
+
+
+def test_a_shrunk_or_rewritten_transcript_reads_from_the_start():
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, _growing_session())
+        with _classifier({"signal": False, "reason": "classified"}):
+            _stop(env, tp)
+        offsets = env.base / "harness" / "offsets" / "sess.json"
+        assert json.loads(offsets.read_text())["offset"] > 0
+        # a shorter, different transcript under the same path
+        _transcript(tp, [("deploy it", "deployed to prod", []),
+                         ("no, i mean staging", "redeployed", []),
+                         ("thanks", "ok", [])])
+        with _classifier(SIGNAL) as sent:
+            block = _stop(env, tp)
+        assert block and f"{hs.HANDOFF_PREFIX} 2," in block["hookSpecificOutput"]["additionalContext"], block
+        assert "USER'S NEW MESSAGE: no, i mean staging" in sent[0], sent[0]
+        # a same-size rewrite whose bytes at the offset are another record:
+        # the saved turn is not where it was, so the read starts over
+        _transcript(tp, _growing_session())
+        with _classifier({"signal": False, "reason": "classified"}):
+            _stop(env, tp)
+        rec = json.loads(offsets.read_text())
+        offsets.write_text(json.dumps(dict(rec, uuid="someone-else")))
+        turns, _ = hs.read_turns("sess", str(tp))
+        assert turns[0]["n"] == 1 and len(turns) == 9, "a mismatched offset is a full read"
+    print("PASS test_a_shrunk_or_rewritten_transcript_reads_from_the_start")
 
 
 if __name__ == "__main__":

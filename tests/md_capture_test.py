@@ -40,7 +40,7 @@ try:
     have_flush = True
 except ModuleNotFoundError:
     have_flush = False
-    print("note: mcp SDK not installed — flush-side checks skipped (run via uv run --with 'mcp<2')")
+    print("note: md_capture_flush not importable — flush-side checks skipped")
 
 BIG = 9_000   # the smallest real spec in the backtest was 9,156 bytes
 SMALL = 5_800 # the largest PR-body draft was 5,760 bytes
@@ -251,19 +251,43 @@ with tempfile.TemporaryDirectory() as td:
         check(not _rejects(_R('{"artifact_id":"a1","name":"x"}')), "_save: real success → returns")
         check(_rejects(_R('{"id":"a1","error":"quota: saved partial"}')), "_save: error field beside an id → still rejected")
         check(not _rejects(_R('{"id":"a1","name":"x","action":"created","tags":[],"tag_report":{},"scope":{}}')), "_save: the server's exact success shape → returns")
-        class _S:
-            async def initialize(self): pass
-        class _Ctx:
-            def __init__(self, *a, **k): pass
-            async def __aenter__(self): return (None, None, None)
-            async def __aexit__(self, *a): return False
-        class _CS:
-            def __init__(self, *a, **k): pass
-            async def __aenter__(self): return _S()
-            async def __aexit__(self, *a): return False
-        import types, sys as _sys
+
+        # The same, through the REAL stdlib transport: only the HTTP layer is
+        # faked, so the result objects are mcp_http's own, not SDK look-alikes.
+        # The SimpleNamespace fakes above carried `type="text"` like the SDK's
+        # blocks; mcp_http's did not, so _save dropped every block and the live
+        # harness (0.106.0) saw every save as "no artifact id in reply: {}" and
+        # a dead room's "Agent brain not found" arrive with no text at all.
+        import mcp_http
+        real_request = mcp_http.request
+        def _wire(result):
+            mcp_http.request = lambda *a, **k: result
+            return mcp_http.Session("https://example.invalid/mcp", "bearer")
+        def _blk(text):
+            return {"type": "text", "text": text}
+        try:
+            ok_reply = '{"id":"a1","name":"x","action":"created","tags":[],"tag_report":{},"scope":{}}'
+            try:
+                out = asyncio.run(real_save(_wire({"content": [_blk(ok_reply)], "isError": False}), {}))
+            except f.SaveRejected as e:
+                out = {"rejected": str(e)}
+            check(out.get("id") == "a1", f"_save over mcp_http: a real success reply returns its id: {out}")
+            try:
+                asyncio.run(real_save(_wire({"content": [_blk(
+                    "Error executing tool save_artifact: Agent brain not found")], "isError": True}), {}))
+                msg = ""
+            except f.SaveRejected as e:
+                msg = str(e)
+            check(f.is_missing_brain(msg),
+                  f"_save over mcp_http: the server's 'Agent brain not found' text survives into the rejection: {msg!r}")
+            res = mcp_http.call_tool("https://example.invalid/mcp", "b", "save_artifact", {})
+            check(all(getattr(b, "type", None) == "text" for b in res.content),
+                  "mcp_http blocks carry the SDK's .type")
+        finally:
+            mcp_http.request = real_request
+        import types
         f._save = fake_save
-        f.resolve_url_and_auth = lambda *a, **k: ("http://x", {}, None)
+        f.resolve_bearer = lambda *a, **k: ("http://x", "test-bearer")
         f.env_for_url = lambda u: "test"
         def flaky_root(parent):
             # the 3rd item's repo lookup blows up (derivation, not save): must
@@ -274,10 +298,6 @@ with tempfile.TemporaryDirectory() as td:
             return None
         f.read_room = lambda *a, **k: None
         f.repo_root = flaky_root
-        mcp_mod = types.ModuleType("mcp"); cli = types.ModuleType("mcp.client")
-        sess = types.ModuleType("mcp.client.session"); sess.ClientSession = _CS
-        sh = types.ModuleType("mcp.client.streamable_http"); sh.streamablehttp_client = _Ctx
-        _sys.modules.update({"mcp": mcp_mod, "mcp.client": cli, "mcp.client.session": sess, "mcp.client.streamable_http": sh})
         asyncio.run(f.flush(sid3))
         st = mc.load_state(sid3)
         # 6 candidates, cap 5 → the smallest (spec0) is capped out; of the 5 attempted,
@@ -336,15 +356,15 @@ with tempfile.TemporaryDirectory() as td:
         st = mc.load_state(sid4)
         check(st["dirty"] == [] and st.get("attempts") == {}, f"unchanged-since-save clears its stale counter: {st.get('attempts')}")
 
-        # connection-level failure (SDK import / initialize) counts against every
-        # candidate that never got its turn, so an unreachable server is bounded too
+        # connection-level failure (credential / unreachable server) counts against
+        # every candidate that never got its turn, so an unreachable server is bounded too
         sid5 = "sess-md-flush-conn"
         c1 = root / "c1-spec.md"; c1.write_text("# C1\n" + "a" * 7000, encoding="utf-8")
         c2 = root / "c2-spec.md"; c2.write_text("# C2\n" + "b" * 7000, encoding="utf-8")
         mc.save_state(sid5, {"dirty": [str(c1), str(c2)], "saved": {}, "attempts": {}})
         def _boom(*a, **k):
             raise ConnectionError("server unreachable")
-        prev_ctx = sh.streamablehttp_client; sh.streamablehttp_client = _boom
+        prev_rb = f.resolve_bearer; f.resolve_bearer = _boom
         for i in range(1, f.MAX_ATTEMPTS + 1):
             asyncio.run(f.flush(sid5))
             st = mc.load_state(sid5)
@@ -353,7 +373,62 @@ with tempfile.TemporaryDirectory() as td:
                       f"conn pass {i}: both dirty, both counted: {st['attempts']}")
             else:
                 check(st["dirty"] == [] and st["attempts"] == {}, f"conn pass {i}: both given up, counters cleared")
-        sh.streamablehttp_client = prev_ctx
+        f.resolve_bearer = prev_rb
+
+        # No credential at all: same connection-level bump, nothing sent.
+        mc.save_state(sid5, {"dirty": [str(c1)], "saved": {}, "attempts": {}})
+        f.resolve_bearer = lambda *a, **k: ("http://x", None)
+        n_before = calls["n"]
+        asyncio.run(f.flush(sid5))
+        st = mc.load_state(sid5)
+        check(st["dirty"] == [str(c1)] and st["attempts"] == {str(c1): 1} and calls["n"] == n_before,
+              f"no credential → counted once, nothing sent: {st['attempts']}")
+        f.resolve_bearer = prev_rb
+
+        # The stdlib transport has no handshake: an unreachable server or a
+        # refused credential first surfaces on the SAVE. That ends the pass the
+        # way a failed initialize did — every candidate counted once, the rest
+        # never attempted — while an item-specific refusal skips only its item.
+        import urllib.error
+        unreachable = f.mcp_http.McpError("tools/call failed: refused")
+        unreachable.__cause__ = urllib.error.URLError("refused")
+        for label, exc in [("unreachable", unreachable),
+                           ("401", f.mcp_http.McpError("tools/call failed (401): x", 401)),
+                           ("429", f.mcp_http.McpRateLimited("rate limited", None))]:
+            mc.save_state(sid5, {"dirty": [str(c1), str(c2)], "saved": {}, "attempts": {}})
+            tries = {"n": 0}
+            async def conn_fail(session, call_args, exc=exc):
+                tries["n"] += 1; raise exc
+            f._save = conn_fail
+            asyncio.run(f.flush(sid5))
+            st = mc.load_state(sid5)
+            check(tries["n"] == 1 and st["attempts"] == {str(c1): 1, str(c2): 1},
+                  f"{label} on the first save → pass ends, both counted once: tries={tries['n']} {st['attempts']}")
+        mc.save_state(sid5, {"dirty": [str(c1), str(c2)], "saved": {}, "attempts": {}})
+        tries = {"n": 0}
+        async def item_fail(session, call_args):
+            # Chained the way mcp_http.request raises it: HTTPError is an
+            # OSError, so an unchained 413 would not exercise the exclusion.
+            tries["n"] += 1
+            http = urllib.error.HTTPError("http://x", 413, "too big", None, None)
+            raise f.mcp_http.McpError("tools/call failed (413): too big", 413) from http
+        f._save = item_fail
+        asyncio.run(f.flush(sid5))
+        check(tries["n"] == 2, f"item-specific HTTP refusal (413) does not abort the rest: tries={tries['n']}")
+        f._save = fake_save
+
+        # The flush's session is the stdlib one, carrying the resolved bearer.
+        seen_sess: list = []
+        async def sess_save(session, call_args):
+            seen_sess.append(session); return {"artifact_id": "aid"}
+        f._save = sess_save
+        c1.write_text("# C1\n" + "n" * 7000, encoding="utf-8")
+        mc.save_state(sid5, {"dirty": [str(c1)], "saved": {}, "attempts": {}})
+        asyncio.run(f.flush(sid5))
+        check(len(seen_sess) == 1 and isinstance(seen_sess[0], f.mcp_http.Session)
+              and seen_sess[0]._bearer == "test-bearer" and seen_sess[0]._url == "http://x",
+              "flush saves over mcp_http.Session with the resolved url and bearer")
+        f._save = fake_save
 
         # a recorded path swapped for a symlink since the edit is not read through
         sid6 = "sess-md-flush-symlink"
@@ -419,6 +494,27 @@ with tempfile.TemporaryDirectory() as td:
         f._save = refuse_other
         asyncio.run(f.flush(sid7))
         check(forgot == [], "any other refusal keeps the cached room")
+
+        # End to end over the real _save and mcp_http.call_tool (HTTP faked):
+        # what capture/dead-room-falls-back and the capture cases run live.
+        f._save = real_save
+        real_request = mcp_http.request
+        try:
+            mcp_http.request = lambda *a, **k: {"content": [{"type": "text", "text":
+                "Error executing tool save_artifact: Agent brain not found"}], "isError": True}
+            r7.write_text("# R7\n" + "w" * 7000, encoding="utf-8")
+            mc.save_state(sid7, {"dirty": [str(r7)], "saved": {}, "attempts": {}})
+            asyncio.run(f.flush(sid7))
+            check(forgot == [r7.parent], f"real transport: 'Agent brain not found' evicts the dead room: {forgot}")
+            forgot.clear()
+            mcp_http.request = lambda *a, **k: {"content": [{"type": "text", "text":
+                '{"id":"a9","name":"R7","action":"created","tags":["auto-captured"],"tag_report":{},"scope":{}}'}]}
+            asyncio.run(f.flush(sid7))
+            st = mc.load_state(sid7)
+            check(str(r7) in st.get("saved", {}) and st["dirty"] == [] and not st.get("attempts"),
+                  f"real transport: a successful save is recorded, not retried: {st}")
+        finally:
+            mcp_http.request = real_request
         f._save = capture_save
 
         # Spec files are captured like any markdown; the SERVER decides whether
@@ -578,6 +674,80 @@ with tempfile.TemporaryDirectory() as td:
         check(stb["dirty"] == [canonical_spec] and stb["cwds"] == [str(repo)], "a later Write still records its path alongside")
         check(mc.load_state("sess-md-bash-mode").get("since", 0) <= time.time() - mc.SINCE_GRACE_S + 5,
               "the stamp is backdated by the grace window (a spec the first command wrote is not stale)")
+
+        # ---- Stop prefilter: skip the flush only when it has nothing to do ----
+        # Real hook contract (subprocess, same HOME as the collector); the
+        # flush runs in-process and writes the `sweep` record it reads.
+        print("Stop prefilter (md_capture_prefilter.py)")
+        PRE = SCRIPTS / "md_capture_prefilter.py"
+        def pre(sid: str, cwd: str) -> int:
+            return subprocess.run([sys.executable, str(PRE)],
+                                  input=json.dumps({"session_id": sid, "cwd": cwd}),
+                                  capture_output=True, text=True, env=env).returncode
+        def backdate_activity(sid: str, by: float = 30.0) -> None:
+            a = mc.activity_path(sid); t = time.time() - by; os.utime(a, (t, t))
+        git("add", "-A"); git("commit", "-q", "-m", "prefilter base")   # nothing dirty in git
+        sidp = "sess-md-prefilter"
+        check(pre(sidp, str(repo)) == 1, "no state for the session → skip (the flush would return at once)")
+        asyncio.run(f.flush(sidp, str(repo)))
+        check(not mc.state_path(sidp).exists(), "a flush with no stamp and nothing dirty writes no state")
+        run({"session_id": sidp, "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        check(mc.activity_path(sidp).exists(), "the collector touches the activity marker on a Bash call")
+        check(pre(sidp, str(repo)) == 0, "stamp set, no sweep recorded yet → run")
+        seen_args.clear()
+        asyncio.run(f.flush(sidp, str(repo)))
+        sw = mc.load_state(sidp).get("sweep") or {}
+        check(sw.get("idle") is True and sw.get("cwd") == str(repo) and seen_args == [],
+              f"a sweep that finds nothing records an idle pass: {sw}")
+        check(pre(sidp, str(repo)) == 0, "a Bash call in the same moment as the sweep → run (mtime slack)")
+        backdate_activity(sidp)
+        check(pre(sidp, str(repo)) == 1, "nothing dirty, idle sweep, no watched call since → skip")
+        check(pre(sidp, str(repo / "docs")) == 0, "another Stop cwd than the idle pass swept → run")
+        import md_capture_prefilter as mp
+        check(mp.decide({"session_id": sidp, "cwd": str(repo)}, now=sw["at"] + mp.IDLE_TTL_S + 1) == 0,
+              "an idle record older than IDLE_TTL_S → run")
+        st = mc.load_state(sidp); st["dirty"] = [str(repo / "docs" / "x.md")]; mc.save_state(sidp, st)
+        check(pre(sidp, str(repo)) == 0, "a dirty path → run, whatever the sweep said")
+        st["dirty"] = []; mc.save_state(sidp, st)
+        # a Bash call writes a spec after the idle sweep: the next Stop must run and save it
+        run({"session_id": sidp, "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": "python3 w.py"}})
+        later = repo / "docs" / "after-idle-spec.md"; later.write_text("# After idle\n" + "a" * 7000, encoding="utf-8")
+        check(pre(sidp, str(repo)) == 0, "a watched tool call after the idle sweep → run")
+        seen_args.clear()
+        asyncio.run(f.flush(sidp, str(repo)))
+        check([a["name"] for a in seen_args] == ["After idle (docs/after-idle-spec.md)"],
+              f"…and that Stop's sweep saves the Bash-written spec: {[a['name'] for a in seen_args]}")
+        check((mc.load_state(sidp).get("sweep") or {}).get("idle") is True,
+              "saved and unchanged swept paths are final outcomes → idle again")
+        # outstanding work keeps the next Stop running: a failed save …
+        failing = repo / "docs" / "failing-spec.md"; failing.write_text("# Failing\n" + "f" * 7000, encoding="utf-8")
+        async def fail_once(session, call_args):
+            raise f.SaveRejected("quota")
+        f._save = fail_once
+        asyncio.run(f.flush(sidp, str(repo)))
+        f._save = capture_save
+        backdate_activity(sidp)
+        check((mc.load_state(sidp).get("sweep") or {}).get("idle") is False and pre(sidp, str(repo)) == 0,
+              "a swept path whose save failed (retry pending) → not idle → run")
+        asyncio.run(f.flush(sidp, str(repo)))   # saves it; idle again
+        backdate_activity(sidp)
+        check(pre(sidp, str(repo)) == 1, "retried and saved → idle → skip")
+        # … and a git status that failed says nothing about what is there
+        real_sweep_one = f._sweep_one
+        f._sweep_one = lambda root, since: None
+        asyncio.run(f.flush(sidp, str(repo)))
+        f._sweep_one = real_sweep_one
+        backdate_activity(sidp)
+        check((mc.load_state(sidp).get("sweep") or {}).get("idle") is False and pre(sidp, str(repo)) == 0,
+              "a failed git status → not idle → run")
+        # an older overlapping pass finishing last does not overwrite a newer verdict
+        newer = (mc.load_state(sidp).get("sweep") or {})["at"]
+        f._persist(sidp, set(), {}, sweep={"at": newer - 5, "idle": True, "cwd": str(repo)})
+        check((mc.load_state(sidp).get("sweep") or {}).get("at") == newer, "the newest pass's sweep record wins")
+        # garbage stdin and a missing session id skip, as the flush would do nothing
+        r = subprocess.run([sys.executable, str(PRE)], input="not json", capture_output=True, text=True, env=env)
+        check(r.returncode == 1 and r.stdout == "", "garbage stdin → skip, silent")
+        check(mp.decide({"cwd": str(repo)}) == 1 and mp.decide([1]) == 1, "no session id → skip")
 
         mc.VETO_PARTS = vp; f.VETO_PARTS = vp
         mc.WINDOWS_TEMP_ROOTS = wtr

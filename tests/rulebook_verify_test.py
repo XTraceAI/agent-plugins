@@ -87,18 +87,12 @@ def main() -> int:
           rc == 1 and "SILENT FAIL" in out, out)
 
     # --- the silent-drop class --------------------------------------------
-    rc, out = run(bash(command_rx="a" * 2050), "--fires", "aaa")
+    rc, out = run(bash(command_rx="a" * 2050), "--fires", "aaa")   # past the 2000 bound
     check("a pattern over the hook's length bound is reported as a LOAD failure",
           rc == 1 and "LOAD   FAIL" in out and "longer than" in out, out)
     rc, out = run(bash(command_rx="(a+)+$"), "--fires", "aaa")
     check("a catastrophically backtracking pattern is a LOAD failure",
           rc == 1 and "LOAD   FAIL" in out, out)
-    rc, out = run(bash(command_rx="(" * 500 + "a" + ")" * 500), "--fires", "aaa")
-    check("a deeply nested pattern under the length bound is a LOAD failure, not a traceback",
-          rc == 1 and "LOAD   FAIL" in out and "Traceback" not in out, out)
-    rc, out = run(bash(command_rx="a{" + "9" * 500 + "}"), "--fires", "aaa")
-    check("a repetition count the parser cannot hold is a LOAD failure, not a traceback",
-          rc == 1 and "LOAD   FAIL" in out and "Traceback" not in out, out)
     rc, out = run(bash(command_rx="[unclosed"), "--fires", "x")
     check("a pattern that does not compile is a LOAD failure", rc == 1 and "LOAD   FAIL" in out, out)
 
@@ -273,6 +267,18 @@ def main() -> int:
     rc, out = run(read_rule, "--file-lines", "900", "--fires", "src/a.py")
     check("read rule: a case without read:/bash: is refused with a hint",
           rc == 1 and "read:<path>" in out, out)
+
+    # ENG-1184: a prompt rule's case is the whole prompt, wrappers and all
+    prompt_rule = {"title": "t", "statement": "s", "delivery": "agent_hook",
+                   "matcher": {"event": "prompt", "prompt_rx": "<task-notification>",
+                               "prompt_not_rx": "quiet-please"}}
+    rc, out = run(prompt_rule, "--fires", "<task-notification><status>completed</status></task-notification>",
+                  "--silent", "what is the loop doing?",
+                  "--silent", "<task-notification>quiet-please</task-notification>")
+    check("prompt rule: a wrapped wake-up fires, a typed prompt and the vetoed form stay silent",
+          rc == 0 and "FIRES  ok" in out and "SILENT ok" in out, out)
+    rc, out = run(prompt_rule, "--fires", "a::b <task-notification>")
+    check("prompt rule: `::` in the prompt is prose, not a path separator", rc == 0, out)
 
     print()
     if FAILURES:

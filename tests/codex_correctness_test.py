@@ -476,7 +476,7 @@ def test_the_unresolved_reason_has_its_own_remedy():
     text = health._message("codex", None,
                            ("plugin_root_unresolved", time.time()))
     assert "login --status" not in text, text
-    assert "memhub:setup" in text, text
+    assert ":onboard" in text and "memhub" in text, text
 
 
 def test_the_marketplace_scan_is_still_ordered_and_unpooled():
