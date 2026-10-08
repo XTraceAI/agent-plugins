@@ -8,6 +8,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "plugins" / "memhub" / "skills" / "start-rulebook" / "scripts" / "mine_sessions.py"
 
+sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+import rulebook_paths  # noqa: E402
+
+
+def _book_dir(home) -> Path:
+    """Where this install caches its books under `home`: the rulebook's state
+    is keyed by the backend in the plugin's .mcp.json (rulebook_paths.py)."""
+    return Path(home) / ".config" / "memhub-plugin" / "rulebook" / rulebook_paths.backend_key() / "book"
+
+
 def _run(*extra, home):
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS")}
     env["HOME"] = home
@@ -37,10 +47,13 @@ def main() -> int:
         prompt_ord = Path(home) / "prompt.json"; prompt_ord.write_text(json.dumps({"title": "probe-prompt-ordering", "ordering": {"required_command_rx": "curl\\s+-s\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["prompt"], "armed_by_rx": "staging"}}))
         bare_prompt = Path(home) / "bare-prompt.json"; bare_prompt.write_text(json.dumps({"title": "probe-bare-prompt", "ordering": {"required_command_rx": "curl\\b", "gated_command_rx": "git\\s+push\\b", "armed_by_events": ["prompt"]}}))
         cands = Path(home) / "cands.json"; cands.write_text(json.dumps([
-            {"title": "declared-probe", "matcher": {"event": "bash", "command_rx": "never-happens-xyz\\b"}, "claude_md": {"heading": "Rules", "text": "Never pipe pytest into tail when deciding pass/fail."}, "source_ref": "CLAUDE.md@abc#rules", "did": "Claude did the declared thing", "what": "Claude is warned"},
+            {"title": "declared-probe", "matcher": {"event": "bash", "command_rx": "never-happens-xyz\\b"}, "claude_md": {"heading": "Rules", "text": "Never pipe pytest into tail when deciding pass/fail."}, "source_ref": "CLAUDE.md@abc#rules", "did": "Claude did the declared thing", "what": "Claude is warned",
+             "when": "Claude is about to decide pass or fail from a piped pytest run.", "do": "Run pytest unpiped.", "why": "A pipe hides the exit code.",
+             "when_not": ["Claude is only counting tests.", "x" * 201]},
+            {"title": "long-when-probe", "matcher": {"event": "bash", "command_rx": "never-happens-long\\b"}, "when": "w" * 301, "do": "Do the short thing."},
             {"title": "empty-origin-probe", "matcher": {"event": "bash", "command_rx": "never-happens-abc\\b"}, "claude_md": {}},
             "not-a-dict"]))
-        book = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; book.mkdir(parents=True)
+        book = _book_dir(home); book.mkdir(parents=True)
         (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
                                                             {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
         p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--rule-file", str(prompt_ord), "--rule-file", str(bare_prompt), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
@@ -72,10 +85,44 @@ def main() -> int:
         decl = next((r for r in rows if r.get("title") == "declared-probe"), None)
         ok = decl is not None and decl.get("bucket") == "declared_unbroken" and decl.get("origin") == "claude_md" and decl["claude_md"]["text"].startswith("Never pipe pytest") and decl["source_ref"] == "CLAUDE.md@abc#rules" and decl["verdict"].startswith("Declared in CLAUDE.md") and "DECLARED IN CLAUDE.MD, NOT BROKEN HERE" in p.stdout
         print(("ok  " if ok else "FAIL"), "--candidates list: a body carrying its CLAUDE.md sentence is origin=claude_md, keeps its source_ref, and lands in the declared-not-broken section"); fails += not ok
+        import re as _re
+        def _key_base(ref):   # the server's reimport.source_ref_base: strip a hex @sha, cut at '#'
+            return _re.sub(r"@[0-9a-fA-F]{7,64}(?=#|$)", "", ref or "", count=1).split("#", 1)[0].strip()
+        minted = [r for r in rows if r.get("source_ref") and r.get("title") != "declared-probe"]
+        ok = bool(minted) and all(_key_base(r["source_ref"]) in ("sessions", "claude_md") for r in minted) and all("|mined " in r["source_ref"] for r in minted)
+        print(("ok  " if ok else "FAIL"), "a minted source_ref keeps the run date after '#': the server's re-file key base is undated, so re-running tomorrow is not a twin"); fails += not ok
+        if not ok: print([r.get("source_ref") for r in minted])
         emp = next((r for r in rows if r.get("title") == "empty-origin-probe"), None)
         ok = emp is not None and emp.get("origin") == "sessions" and emp.get("claude_md") is None and emp.get("bucket") == "skip"
         print(("ok  " if ok else "FAIL"), "an empty claude_md dict is no origin: the row stays origin=sessions and is skipped, not filed as declared"); fails += not ok
         if not ok: print(decl, p.stdout[-600:])
+        # The rule judge's fields (rule-judge-spec §2): every rule row carries `context`, and a row that drops what its
+        # candidate said arrives at the server empty and is judged on its statement alone.
+        rule_rows = [r for r in rows if r.get("lane") not in ("hook", "skill", "workflow", "claude_md")]
+        builtin = [r for r in rule_rows if r["title"] in ("no-sed-range-delete", "no-pr-merge", "no-force-push", "no-stash-in-worktree", "missing-module-fresh-venv", "timeout-not-on-macos",
+                                                           "rg-not-installed", "db-tool-not-available", "kwarg-signature-mismatch", "tests-before-push", "fetch-before-origin-read")]
+        ok = len(builtin) == 11 and all(isinstance(r.get("context"), dict) for r in rule_rows) and all(r["context"].get("when") and r["context"].get("do") and r["context"].get("why") for r in builtin)
+        print(("ok  " if ok else "FAIL"), "every built-in proposal carries when / do / why for the rule judge"); fails += not ok
+        if not ok: print([(r["title"], r.get("context")) for r in builtin])
+        def _fits(c): return len(c.get("when", "")) <= 300 and len(c.get("do", "")) <= 400 and len(c.get("why", "")) <= 400 and len(c.get("when_not", [])) <= 8 and all(len(x) <= 200 for x in c.get("when_not", []))
+        ok = all(_fits(r["context"]) for r in rule_rows) and all(len(r["statement"]) <= 400 for r in rule_rows)
+        print(("ok  " if ok else "FAIL"), "no judge field of any proposal is over the server's cap (when 300, do / why 400, when_not 8 × 200)"); fails += not ok
+        force = next((r for r in rule_rows if r["title"] == "no-force-push"), {})
+        ok = force.get("context", {}).get("why") == force.get("why") and force["context"]["why"] in force["statement"] and force["context"].get("when_not") == ["Claude is pushing its own branch with `--force-with-lease`."]
+        print(("ok  " if ok else "FAIL"), "a built-in's judge `why` is the row's own reason line — the one its statement ends in"); fails += not ok
+        ctx = (decl or {}).get("context") or {}
+        ok = (ctx.get("when", "").startswith("Claude is about to decide") and ctx.get("do") == "Run pytest unpiped." and ctx.get("why") == "A pipe hides the exit code."
+              and ctx.get("when_not") == ["Claude is only counting tests."] and "`when_not` takes at most" in p.stderr)
+        print(("ok  " if ok else "FAIL"), "a candidate's when / do / why / when_not reach proposals.json as given; a when_not entry over 200 characters is left out, loudly"); fails += not ok
+        if not ok: print(ctx, p.stderr[-400:])
+        probe_ctx = (probe or {}).get("context")
+        ok = probe_ctx == {} and "(no `when` given" in p.stdout and "Applies when: Claude is about to force-push a branch." in p.stdout
+        print(("ok  " if ok else "FAIL"), "a candidate without them is still accepted: no context, and the report says it will be judged on its statement"); fails += not ok
+        if not ok: print(probe_ctx)
+        longw = next((r for r in rows if r.get("title") == "long-when-probe"), None)
+        ok = longw is not None and longw.get("context") == {"do": "Do the short thing."} and "long-when-probe: `when` is 301 characters" in p.stderr
+        print(("ok  " if ok else "FAIL"), "a `when` over 300 characters is left out with a warning, never cut — and no `why` is invented for a row with no situation"); fails += not ok
+        if not ok: print(longw and longw.get("context"), p.stderr[-400:])
         ok = "ordering needs required_command_rx" in p.stderr and "partial-ordering" not in p.stdout and "ok-rule" in p.stdout
         print(("ok  " if ok else "FAIL"), "partial ordering body → [warn] + skipped; cache row without title skipped; non-numeric version tolerated"); fails += not ok
         if not ok: print(p.stdout[-600:], p.stderr[-400:])
@@ -111,7 +158,7 @@ def main() -> int:
                 {"type": "tool_result", "tool_use_id": "t2", "content": "ModuleNotFoundError: No module named 'foo'"}]}},
             _a([{"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "git push"}}]),
         ]))
-        bdir = Path(home) / ".config" / "memhub-plugin" / "rulebook" / "book"; bdir.mkdir(parents=True)
+        bdir = _book_dir(home); bdir.mkdir(parents=True)
         def _book(name, rules):
             h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
             (bdir / f"{name}-{h}.json").write_text(json.dumps({"rules": rules}))

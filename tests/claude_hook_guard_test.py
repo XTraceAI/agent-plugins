@@ -17,6 +17,7 @@ sys.path.insert(0, str(PLUGIN / "scripts"))
 
 import claude_hook_guard as guard  # noqa: E402
 import cursor_capture as capture  # noqa: E402
+import hook_entry  # noqa: E402
 
 FIXTURE = json.loads(
     (ROOT / "tests" / "fixtures" / "cursor_hook_payload.json")
@@ -79,9 +80,11 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 20   # - the three retired directive-recall
+    assert len(commands) == 21   # - the three retired directive-recall
                                  # handlers (PreToolUse ×2, PostToolUse),
-                                 # + PreToolUse (add_memory_gate.py),
+                                 # + PreToolUse (add_memory_gate.py, and
+                                 # create_rule_origin.py — the session a rule
+                                 # is filed from),
                                  # + UserPromptSubmit (brain_brief.py prompt,
                                  # and rulebook_hook.py prompt — the lane that
                                  # arms a prompt-armed obligation),
@@ -94,9 +97,19 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
                                  # + PostToolUse (pr_link_trigger.py); SessionEnd
                                  # carries capture AND the fire flush in ONE
                                  # handler, because they must run in that order.
-    assert all("claude_hook_guard.py" in command for _, command in commands)
-    capture_events = [event for event, command in commands
-                      if "claude_hook_guard.py\" capture " in command]
+    # Each command names one hook_entry.py route, and every lane of every
+    # route passes claude_hook_guard before its script starts.
+    prefix = 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py" '
+    routes = []
+    for event, command in commands:
+        assert command.startswith(prefix), command
+        route = tuple(command[len(prefix):].split(" "))
+        assert route[0] == event and route in hook_entry.ROUTES, command
+        routes.append(hook_entry.ROUTES[route])
+    assert all(lane.guard in {"ignore", "capture"}
+               for route in routes for lane in route.lanes)
+    capture_events = [event for (event, _), route in zip(commands, routes)
+                      if any(lane.guard == "capture" for lane in route.lanes)]
     assert capture_events == ["Stop", "SessionEnd"]
     print("PASS test_every_claude_handler_is_guarded_and_only_boundaries_capture")
 
@@ -142,7 +155,7 @@ def test_missing_cursor_launcher_never_disables_claude_hooks():
 
 def test_exact_imported_stop_hook_never_runs_claude_flusher():
     if os.name == "nt":
-        # claude-hooks.json uses POSIX shell syntax; Windows host launch is a
+        # the hook command is run under bash here; Windows host launch is a
         # separate host-level smoke, while classification/routing above remain
         # native-Windows coverage.
         print("SKIP test_exact_imported_stop_hook_never_runs_claude_flusher "
@@ -197,7 +210,11 @@ def test_session_end_flushes_fires_after_capture_and_regardless_of_it():
         with tempfile.TemporaryDirectory() as td:
             scripts = Path(td) / "plugin" / "scripts"
             scripts.mkdir(parents=True)
-            (scripts / "claude_hook_guard.py").write_text("raise SystemExit(0)\n")
+            # The dispatcher calls the guard in-process; this one passes all.
+            (scripts / "hook_entry.py").write_bytes(
+                (PLUGIN / "scripts" / "hook_entry.py").read_bytes())
+            (scripts / "claude_hook_guard.py").write_text(
+                "def route(*_args):\n    return True\n")
             (scripts / "flush_session.py").write_text(
                 "import os, sys\n"
                 "open(os.environ['ORDER'], 'a').write('capture\\n')\n"

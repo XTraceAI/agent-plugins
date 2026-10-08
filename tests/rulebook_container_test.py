@@ -26,6 +26,11 @@ What must hold here:
 * `rulebook_conflicts.py` names the book on every hit and marks a hit outside
   the destination book `cross_book`, because `supersedes_rule_id` cannot
   reach it.
+* one rulebook per scope (rulebook-scopes spec §9.6): a scope book's `kind`
+  and `label` ride along like the other facts, the roster names a scope by
+  its label ("Everyone in Acme", "Just you") and never by its stored name,
+  and a legacy book — or an older backend that sends no label — still reads
+  by name.
 
 Run: python3 rulebook_container_test.py  (stdlib only, no network, tmpdir only).
 """
@@ -99,6 +104,13 @@ def server_rule(rid, rx, text, bk, **extra):
 def strip_books(rows: list) -> list:
     """The same book as an unmigrated backend would serve it."""
     return [{k: v for k, v in r.items() if k not in ("rulebook_id", "rulebook")} for r in rows]
+
+
+def scope_book(rid, kind, label, members):
+    name = {"org": "org", "workspace": "workspace:ws-1", "personal": "personal:u-1"}[kind]
+    out = book(rid, name, "all_org" if kind == "org" else "explicit", members)
+    out["rulebook"].update(kind=kind, label=label)
+    return out
 
 
 ORG = book("bk-org", "XTrace org policy", "all_org", 12)
@@ -206,6 +218,72 @@ def test_book_rank() -> None:
               hook.to_hook_rule({"rule_id": "e", "statement": "t", "delivery": "agent_hook",
                                  "matcher": {"event": "bash", "command_rx": "x"}})))
     check("no facts is not mistaken for all_org", hook.book_rank(none_) != hook.book_rank(org))
+
+
+S_ORG = scope_book("sc-org", "org", "Everyone in Acme", 12)
+S_WS = scope_book("sc-ws", "workspace", "Platform workspace", 4)
+S_ME = scope_book("sc-me", "personal", "Just you", 1)
+
+
+def test_scope_facts() -> None:
+    r = hook.to_hook_rule(server_rule("s1", "x", "t", S_WS))
+    check("a scope book's kind and label ride along",
+          r["_book_kind"] == "workspace" and r["_book_label"] == "Platform workspace"
+          and r["_book_name"] == "workspace:ws-1", json.dumps(r))
+    legacy = hook.to_hook_rule(server_rule("s2", "x", "t", TEAM))
+    check("a legacy book carries no kind or label",
+          "_book_kind" not in legacy and "_book_label" not in legacy)
+    junk = hook.to_hook_rule(server_rule("s3", "x", "t", {
+        "rulebook_id": "sc-x", "rulebook": {"rulebook_id": "sc-x", "kind": "team",
+                                            "label": "Bad\x1b[2J\nlabel"}}))
+    check("an unknown kind is dropped and a label is one clean line",
+          "_book_kind" not in junk and junk["_book_label"].startswith("Bad")
+          and not re.search(r"[\x00-\x1f\x7f]", junk["_book_label"]), json.dumps(junk))
+    hostile = hook.to_hook_rule({"rule_id": "s4", "on": "bash", "rx": "a", "text": "t",
+                                 "_book_kind": "org", "_book_label": "forged"})
+    check("a row cannot spell the scope keys itself",
+          "_book_kind" not in hostile and "_book_label" not in hostile)
+    check("book_rank ignores the kind (precedence is unchanged)",
+          hook.book_rank(hook.to_hook_rule(server_rule("s5", "x", "t", S_ORG)))
+          == hook.book_rank(hook.to_hook_rule(server_rule("s6", "x", "t", ORG))))
+
+    carried = [hook.to_hook_rule(server_rule(f"c{i}", "x", "t", bk))
+               for i, bk in enumerate((S_ME, S_WS, S_WS, S_ORG, TEAM))]
+    check("the roster names scopes by label, widest first; legacy books by name",
+          hook.books_line(carried)
+          == "- _From Everyone in Acme (1 rule) · Platform workspace (4 members, 2 rules) · "
+             "Backend Rulebook (3 members, 1 rule) · Just you (1 rule)._",
+          hook.books_line(carried))
+    old_backend = [hook.to_hook_rule(server_rule(f"o{i}", "x", "t", bk))
+                   for i, bk in enumerate((ORG, TEAM))]
+    check("…and a backend without labels still gets the name roster",
+          hook.books_line(old_backend)
+          == "- _From XTrace org policy (org-wide, 1 rule) · Backend Rulebook (3 members, 1 rule)._",
+          hook.books_line(old_backend))
+
+    cand = [{"title": "Never force-push", "delivery": "agent_hook",
+             "matcher": {"event": "bash", "command_rx": "git push --force"}}]
+    existing = [dict({"rule_id": "e1", "title": "Never force-push", "status": "active",
+                      "statement": "s"}, **S_ME)]
+    rep = rc_mod.find_conflicts(cand, existing, None, target_rulebook_id="sc-org")
+    hit = rep["candidates"][0]["hits"][0]
+    summary = rc_mod._summary(rep)
+    check("a conflict hit carries its scope label",
+          hit["rulebook"].get("label") == "Just you" and hit["cross_book"] is True, json.dumps(hit))
+    check("…and the summary names the other scope by label, not its stored name",
+          "in another scope (Just you)" in summary and "personal:u-1" not in summary, summary)
+    # The MCP `list_rules` reply (what `--existing` is) carries the scope flat:
+    # `rulebook_id` + `scope_label`, no nested `rulebook` block.
+    flat = [{"rule_id": "e2", "title": "Never force-push", "status": "active",
+             "statement": "s", "rulebook_id": "sc-me", "scope_kind": "personal",
+             "scope_label": "Just you"}]
+    fhit = rc_mod.find_conflicts(cand, flat, None, target_rulebook_id="sc-org")["candidates"][0]["hits"][0]
+    check("a list_rules row's flat scope_label names its scope",
+          fhit["rulebook"].get("label") == "Just you" and fhit["cross_book"] is True, json.dumps(fhit))
+    fresh = rc_mod.find_conflicts(cand, existing, None, new_scope=True)
+    check("a destination scope with no book yet makes every hit another scope's",
+          fresh["candidates"][0]["hits"][0]["cross_book"] is True
+          and "create_rule supersedes_rule_id=" not in rc_mod._summary(fresh))
 
 
 def test_wire_shape_has_no_book_dimension() -> None:
@@ -372,26 +450,16 @@ def test_delivery_lanes() -> None:
               repr(ctx(out_old)))
 
         # --- an anchor rule is not displaced by a wider book ----------------
-        # It fired because the SERVER's judge said this call, not because a
-        # regex matched; two org-wide regexes must not spend its slot, and it
-        # is marked spent for the session either way.
+        # It fires at most once per session and is marked spent as soon as it
+        # matches; two org-wide regexes must not spend its slot. Matched
+        # locally (ENG-1203) — the real hook, no stub, no network.
         anchored = [dict({"rule_id": "anch", "title": "Anchor advisory", "statement": "Anchor advisory",
                           "status": "active", "delivery": "anchor_recall", "version": 1,
                           "anchors": ["deploy-now"]}, **PAIR),
                     server_rule("org-a", "deploy-now", "Org A", ORG),
                     server_rule("org-b", "deploy-now", "Org B", ORG)]
         seed_book(td, "xmem", anchored)
-        stub = os.path.join(td, "stub_hook.py")
-        shutil.copy2(os.path.join(SCRIPTS, "portable_lock.py"), td)
-        with open(HOOK, encoding="utf-8") as f, open(stub, "w", encoding="utf-8") as g:
-            g.write(f.read().replace(          # keep the anchor without a network call
-                "def recall_anchor_rules(repo, tool, handles, already_fired):",
-                "def recall_anchor_rules(repo, tool, handles, already_fired):\n"
-                "    return [{'rule_id': 'anch', 'title': 'Anchor advisory',\n"
-                "             'statement': 'Anchor advisory', 'version': 1,\n"
-                "             'anchors': ['deploy-now']}]\n"
-                "def _recall_unused(repo, tool, handles, already_fired):", 1))
-        pr = subprocess.run([sys.executable, stub, "pre"],
+        pr = subprocess.run([sys.executable, HOOK, "pre"],
                             input=json.dumps({"cwd": repo, "session_id": "s-anch",
                                               "tool_name": "Bash",
                                               "tool_input": {"command": "deploy-now"}}),
@@ -405,29 +473,7 @@ def test_delivery_lanes() -> None:
         check("…and the wider book still outranks the narrower behind it",
               shown_labels == ["Anchor advisory", "Org A"], repr(shown_labels))
 
-        # --- an anchor rule the cached book has never seen still fires ------
-        # The server matched it, judged it relevant and scoped it to this repo.
-        # Dropping it because our book predates it is exactly how a rule
-        # activated a minute ago stayed silent until the next fetch.
-        unseen = os.path.join(td, "stub_hook_unseen.py")
-        with open(HOOK, encoding="utf-8") as f, open(unseen, "w", encoding="utf-8") as g:
-            g.write(f.read().replace(
-                "def recall_anchor_rules(repo, tool, handles, already_fired):",
-                "def recall_anchor_rules(repo, tool, handles, already_fired):\n"
-                "    return [{'rule_id': 'brand-new', 'title': 'Brand new',\n"
-                "             'statement': 'Brand new anchor', 'version': 3,\n"
-                "             'anchors': ['deploy-now']}]\n"
-                "def _recall_unused(repo, tool, handles, already_fired):", 1))
-        ur = subprocess.run([sys.executable, unseen, "pre"],
-                            input=json.dumps({"cwd": repo, "session_id": "s-unseen",
-                                              "tool_name": "Bash",
-                                              "tool_input": {"command": "deploy-now"}}),
-                            capture_output=True, text=True,
-                            env=dict(os.environ, **dict(env, MEMHUB_RULEBOOK_RECALL="1")), timeout=30)
-        check("an anchor rule the cached book has never seen still fires",
-              "Brand new anchor" in ctx(ur.stdout), repr(ctx(ur.stdout)))
-
-        # --- session start: one budget across books, widest first ----------
+        # --- session start: one budget across books, the books take turns --
         posture = []
         for i, bk in ((1, PAIR), (2, TEAM), (3, ORG)):
             for j in range(hook.MAX_POSTURE):
@@ -440,13 +486,28 @@ def test_delivery_lanes() -> None:
         shown = [l for l in stext.splitlines() if l.startswith("- note ")]
         check("the posture budget is ONE budget across books",
               len(shown) <= hook.MAX_POSTURE, f"{len(shown)} lines")
-        check("the widest book spends it first",
-              all(l.startswith("- note 3-") for l in shown), "\n".join(shown))
-        # Every slot went to the widest book, so the other two contribute
-        # nothing to this session — and a roster that named them would be
-        # telling the agent it holds notes it does not hold.
+        # Each book's first note, then each book's second: the wider book first
+        # in every round, so an org-wide book with more notes than the budget
+        # holds can no longer leave a narrower book nothing (posture_order).
+        check("the books take turns, wider book first in each round",
+              shown[:3] == ["- note 3-0", "- note 2-0", "- note 1-0"], "\n".join(shown))
+        check("…so every book gets an equal share of a full budget",
+              [sum(l.startswith(f"- note {i}-") for l in shown) for i in (3, 2, 1)] == [5, 5, 5],
+              "\n".join(shown))
+        # More books than MAX_POSTURE slots: the narrowest book's turn never
+        # comes, so it contributes nothing to this session — and a roster that
+        # named it would be telling the agent it holds notes it does not hold.
+        many = [dict({"rule_id": f"m{k}", "title": f"m{k}", "statement": f"many {k}",
+                      "status": "active", "delivery": "session_context", "version": 1},
+                     **book(f"bk-m{k}", f"Book {k}", "explicit", 100 + k))
+                for k in range(hook.MAX_POSTURE)]
+        many.append(dict({"rule_id": "pair-last", "title": "pair", "statement": "pair note",
+                          "status": "active", "delivery": "session_context", "version": 1}, **PAIR))
+        seed_book(td, "xmem", many)
+        _, out_h = run("session", {"cwd": repo, "session_id": "s-many"}, env)
+        htext = ctx(out_h)
         check("a book whose notes were all cut is not credited",
-              "- _From " not in stext and "Pairing notes" not in stext, stext)
+              "many 0" in htext and "pair note" not in htext and "Pairing notes" not in htext, htext)
 
         # …but a book that contributes an ARMED rule is carried, and named.
         mixed = [dict({"rule_id": "on-1", "title": "Org note", "statement": "org note",

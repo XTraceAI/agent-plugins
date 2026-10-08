@@ -363,7 +363,7 @@ With the variable unset, the default, none of this runs.
 
 ## Skills
 
-Seventeen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Sixteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.

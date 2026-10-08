@@ -224,21 +224,21 @@ def test_the_stamp_never_guesses_a_repo_and_names_a_cross_repo_turn():
 # ------------------------------------------------------------------- files
 
 
-def test_the_flag_is_off_by_default_and_only_an_on_spelling_starts_it():
-    """Default OFF. v0.69.0 through v0.75.x defaulted it on; it is opt-in again
-    because on costs the person a classifier call per flagged turn and a
-    `claude -p` per authored moment, on THEIR quota.
+def test_the_flag_is_on_by_default_and_only_an_explicit_value_stops_it():
+    """Default ON again (it was v0.69.0 through v0.75.x, then opt-in until
+    0.120.x): the harness ships to everyone.
 
-    So the empty string is back on the off side — an unset or blank variable is
-    an install that never chose — and so is anything unrecognised: a typo must
-    not start the spend."""
-    assert not hx.extract_enabled({}), "unset is off"
-    for off in ("", "0", "off", "false", "no", "OFF", "False", " 0 ", "NO",
-                "anything-unrecognised"):
+    An unset or blank variable is an install that never chose, so it is on.
+    Anything set and unrecognised stays off: on costs the person a classifier
+    call per turn and a fork per flagged turn on THEIR quota, so a value
+    someone typed meaning off must not start the spend."""
+    assert hx.extract_enabled({}), "unset is on"
+    for off in ("0", "off", "false", "no", "OFF", "False", " 0 ", "NO",
+                "anything-unrecognised", "\xa01"):
         assert not hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": off}), off
-    for on in ("1", "on", "true", "YES", " 1 ", "True"):
+    for on in ("", " ", "1", "on", "true", "YES", " 1 ", "True"):
         assert hx.extract_enabled({"MEMHUB_HARNESS_EXTRACT": on}), on
-    print("PASS test_the_flag_is_off_by_default_and_only_an_on_spelling_starts_it")
+    print("PASS test_the_flag_is_on_by_default_and_only_an_explicit_value_stops_it")
 
 
 def test_an_authoring_child_is_never_sensed_whatever_the_flag_says():

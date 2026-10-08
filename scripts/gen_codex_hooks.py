@@ -77,8 +77,10 @@ CLAUDE_ONLY_CAPTURE = (
 
 def generate(claude_hooks: dict) -> dict:
     """The Codex hooks document derived from the Claude one."""
+    # Claude names a handler by its script's stem, as an argument to
+    # scripts/hook_entry.py, so the stem without ".py" is what to look for.
     source = json.dumps(claude_hooks)
-    for required in ("rulebook_hook.py", "artifact_sync_reminder.py"):
+    for required in ("rulebook_hook", "artifact_sync_reminder"):
         if required not in source:
             raise ValueError(f"Claude hooks no longer expose {required}")
 

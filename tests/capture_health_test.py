@@ -37,12 +37,40 @@ os.environ["USERPROFILE"] = _TMP_HOME
 os.environ.pop("MEMHUB_TOKEN", None)
 os.environ.pop("MEMHUB_TURN_FLUSH", None)
 os.environ.pop("MEMHUB_MCP_BASE_URL", None)
+# A repo on this "machine" is onboarded, so the not-set-up hint stays out of
+# every health assertion; test_onboard_nudge points room_map elsewhere to see it.
+_ROOMS = Path(_TMP_HOME) / "rooms.json"
+_ROOMS.write_text(json.dumps({"version": 1, "repos": {"/repo|production": {"brain_id": "b"}}}),
+                  encoding="utf-8")
+os.environ["MEMHUB_ROOMS_FILE"] = str(_ROOMS)
+
+# Seed the release-check cache as ALREADY CHECKED, so this suite never reaches
+# the network. `plugin_updates.available_message` GETs raw.githubusercontent.com
+# for the marketplace's current release; without this, "healthy prints nothing"
+# asserts against whatever public happens to advertise right now, and fails on
+# any branch behind it — which every sync PR is, by construction. It failed
+# exactly that way on internal at 0.74.0 once public reached 0.76.0.
+#
+# The shape is the module's own: a `checked_at` inside the hour with no
+# `version` is what it writes when the fetch fails, and it means "nothing newer
+# is known", so no notice is produced. Seeding it is using the documented
+# contract, not stubbing around it.
+_RELEASES = Path(_TMP_HOME) / ".config" / "memhub-plugin" / "releases"
+_RELEASES.mkdir(parents=True, exist_ok=True)
+for _host in ("claude-code", "codex", "cursor"):
+    (_RELEASES / f"{_host}.json").write_text(
+        json.dumps({"checked_at": time.time()}), encoding="utf-8")
+
 
 # The tests live outside the plugin so they are not shipped to users;
 # the code under test is still in the plugin's scripts dir.
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "memhub" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import capture_health as ch  # noqa: E402
+from _memhub_auth import skill_command  # noqa: E402
+
+# The command the messages must name on this install: /memhub:login here.
+LOGIN = skill_command("login")
 
 HOST = "api.memhub.xtrace.ai"
 
@@ -198,7 +226,7 @@ def test_stored_key_outranks_the_oauth_cache() -> None:
     for state in ("key_expired", "key_expiring"):
         msg = ch._message(HOST, state, None)
         check(f"{state} names the fix",
-              bool(msg and "/memhub:login" in msg), True)
+              bool(msg and LOGIN in msg), True)
 
     pak.forget(ch._mcp_url_for(HOST))
     check("no key -> falls back to the OAuth cache",
@@ -287,12 +315,13 @@ def test_messages() -> None:
 
     msg = ch._message(HOST, "unrenewable", None)
     check("unrenewable names the fix",
-          bool(msg and "/memhub:login" in msg), True)
+          bool(msg and LOGIN in msg), True)
     check("unrenewable names the host", bool(msg and HOST in msg), True)
 
     msg = ch._message(HOST, "never", None)
-    check("never-authed names the fix",
-          bool(msg and "/memhub:login" in msg), True)
+    check("never-authed names the fix (onboard: sign in and set the repo up)",
+          bool(msg and skill_command("onboard") in msg), True)
+    check("never-authed does not send anyone to /mcp", "/mcp" in (msg or ""), False)
 
     msg = ch._message(HOST, "no_refresh", None)
     check("no_refresh warns before it breaks", bool(msg), True)
@@ -306,7 +335,7 @@ def test_messages() -> None:
     # re-login, identical state, banner. Advice that cannot work is worse than
     # no advice, because it spends the user's trust proving it.
     check("no_refresh does not tell them to re-login",
-          "/memhub:login" not in (msg or ""), True)
+          LOGIN not in (msg or ""), True)
     check("no_refresh names the remedy that can actually work",
           bool(msg and "Offline Access" in msg and "mhk_" in msg), True)
 
@@ -341,7 +370,7 @@ def test_messages() -> None:
     check("unconfirmed PR URL explains automatic retry",
           bool(msg and "retry the URL automatically" in msg), True)
     check("unconfirmed PR URL does not suggest login",
-          bool(msg and "/memhub:login" not in msg), True)
+          bool(msg and LOGIN not in msg), True)
 
 
 def test_debounce() -> None:
@@ -541,15 +570,10 @@ def test_rulebook_health() -> None:
     check("a flush failure is reported", (ch._rulebook_problem() or ("",))[0], "flush")
     _clear_rulebook()
 
-    # Recall has no book of its own; a stale blip must not outlive the lane's
-    # recovery. The hook clears the crumb on its next 200 — see the client
-    # test — and a book confirmed since is the second witness.
+    # Recall is gone (anchor rules are matched locally): a crumb an older hook
+    # left under that name is not a lane any more and must not warn.
     _rulebook_crumb("recall", ago_min=5)
-    check("a recent recall failure is reported",
-          (ch._rulebook_problem() or ("",))[0], "recall")
-    _rulebook_book(fetched_ago_min=1)
-    check("a book confirmed after a recall blip retracts it",
-          ch._rulebook_problem(), None)
+    check("a leftover recall crumb is ignored", ch._rulebook_problem(), None)
     _clear_rulebook()
     _rulebook_crumb("nonsense", ago_min=5)
     check("an unknown lane is ignored", ch._rulebook_problem(), None)
@@ -560,28 +584,21 @@ def test_rulebook_health() -> None:
     # Wording: names the consequence, and capture outranks it.
     msg = ch._message(HOST, None, None, ("auth", time.time() - 300))
     check("the auth wording says rules are not arriving", "rules are not reaching" in msg, True)
-    check("the auth wording names the fix", "/memhub:login" in msg, True)
+    check("the auth wording names the fix", LOGIN in msg, True)
     msg = ch._message(HOST, None, None, ("fetch", time.time() - 300))
     check("the fetch wording says the copy is cached", "cached copy" in msg, True)
     msg = ch._message(HOST, None, None, ("flush", time.time() - 300))
     check("the flush wording says rules still show", "showing normally" in msg, True)
 
-    # A recall timeout is not a credential problem, and the banner that shipped
-    # for it told people to go check their login. Nothing about that is true.
-    msg = ch._message(HOST, None, None, ("recall", time.time() - 300))
-    check("the recall wording does not send the user to login",
-          "/memhub:login" in msg, False)
-    check("the recall wording says the cached rules still show",
-          "rules are showing" in msg, True)
     msg = ch._message(HOST, None, None,
                       ("auth", time.time() - 300))
-    check("an auth-shaped recall refusal still names the fix",
-          "/memhub:login" in msg, True)
+    check("an auth-shaped refusal still names the fix",
+          LOGIN in msg, True)
     both = ch._message(HOST, "never", None, ("fetch", time.time() - 300))
-    check("a capture problem outranks a rulebook one", "capture is not authenticated" in both, True)
+    check("a capture problem outranks a rulebook one", "isn't signed in on this machine" in both, True)
 
-    # The guard, not another wording case. `recall` shipped with no branch of
-    # its own and fell through to a line that named no cause and offered a fix
+    # The guard, not another wording case. A lane (`recall`, since removed)
+    # once shipped with no branch of its own and fell through to a line that named no cause and offered a fix
     # that could not work — the failure this whole file exists to prevent, and
     # the one a fourth lane would repeat for free. Every declared lane must say
     # something of its own; adding one to LANES fails here until it does.
@@ -598,8 +615,7 @@ def test_rulebook_health() -> None:
     # And the retraction side: a lane with no way to be retracted warns until
     # the staleness window closes, which is the same bug wearing a hat.
     for lane, evidence in (("fetch", lambda: _rulebook_book(fetched_ago_min=1)),
-                           ("flush", lambda: _rulebook_sent(flushed_ago_min=1)),
-                           ("recall", lambda: _rulebook_book(fetched_ago_min=1))):
+                           ("flush", lambda: _rulebook_sent(flushed_ago_min=1))):
         _clear_rulebook()
         _rulebook_crumb(lane, ago_min=5)
         check(f"lane {lane!r} is reported before its evidence",
@@ -610,12 +626,81 @@ def test_rulebook_health() -> None:
     _clear_rulebook()
 
 
+def test_compat_check_once_per_session() -> None:
+    """SessionStart fires again on resume and /clear. The compatibility GET is
+    made once per session id, not on every SessionStart: capture_health has to
+    hand `startup_message` the session, or its once-per-session marker is never
+    consulted. Counted at `plugin_compatibility.check`, the one function that
+    reaches the network, with the credential resolved locally."""
+    print("\ncompatibility check once per session")
+    import io
+    from unittest import mock
+    import _memhub_auth
+    import plugin_compatibility
+    _reset()
+    _write_token(exp=time.time() + 3600, refresh=True)   # healthy: the hook stays silent
+    calls: list = []
+
+    def fake_check(url, bearer, **kw):
+        calls.append((url, bearer))
+        return None  # supported: no upgrade required
+
+    def start(session_id: str) -> None:
+        argv, stdin = sys.argv, sys.stdin
+        sys.argv = ["capture_health.py"]
+        sys.stdin = io.StringIO(json.dumps({"session_id": session_id}))
+        try:
+            with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_ROOT": str(_plugin_root())}), \
+                    mock.patch.object(_memhub_auth, "resolve_bearer",
+                                      return_value=(f"https://{HOST}/mcp-server/mcp", "test-bearer")), \
+                    mock.patch.object(plugin_compatibility, "check", side_effect=fake_check):
+                ch.main()
+        finally:
+            sys.argv, sys.stdin = argv, stdin
+
+    start("compat-once")
+    check("first SessionStart checks compatibility", len(calls), 1)
+    start("compat-once")
+    check("second SessionStart in the same session makes no network call", len(calls), 1)
+    start("compat-other")
+    check("a different session checks again", len(calls), 2)
+    start("")
+    start("")
+    check("no session id: no marker to key on, checks every time", len(calls), 4)
+
+
+def test_onboard_nudge() -> None:
+    """Signed in, never onboarded: told about onboard for 3 sessions, then not
+    again; and never once any repo on this machine has a brain."""
+    print("\nonboard nudge")
+    import room_map
+    nudge_file = ch.CACHE_DIR / "onboard_nudge.json"
+    rooms, real_rooms = Path(_TMP_HOME) / "rooms-nudge.json", room_map.ROOMS_PATH
+    room_map.ROOMS_PATH = rooms
+    try:
+        nudge_file.unlink(missing_ok=True)
+        rooms.unlink(missing_ok=True)
+        shown = [ch._onboard_nudge(f"s{i}") for i in range(1, 5)]
+        check("named for the first 3 sessions",
+              [bool(m and "onboard" in m) for m in shown], [True, True, True, False])
+        check("the same session again still names it (resume, /clear)",
+              bool(ch._onboard_nudge("s2")), True)
+        check("no session id, no hint", ch._onboard_nudge(""), None)
+        nudge_file.unlink()
+        rooms.write_text(json.dumps({"version": 1, "repos": {"/r|staging": {"brain_id": "b"}}}),
+                         encoding="utf-8")
+        check("silent once any repo is onboarded", ch._onboard_nudge("s9"), None)
+    finally:
+        room_map.ROOMS_PATH = real_rooms
+        nudge_file.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     for test in (test_token_states, test_stored_key_outranks_the_oauth_cache,
                  test_breadcrumbs, test_messages,
                  test_debounce, test_rulebook_health, test_end_to_end,
-                 test_codex_host_reads_codex_flush_state, test_never_raises):
+                 test_codex_host_reads_codex_flush_state, test_never_raises,
+                 test_compat_check_once_per_session, test_onboard_nudge):
         test()
     if failures:
         print("\nFAILED:")
@@ -645,8 +730,5 @@ if __name__ == "__main__":
     got = ch._rulebook_problem()
     check("a flush success BEFORE the error does not retract it", got and got[0], "flush")
     _clear_rulebook()
-    _rulebook_crumb("recall", ago_min=30)
-    _rulebook_book(fetched_ago_min=5)
-    check("recall rides the fetch path: a later confirmed book retracts it", ch._rulebook_problem(), None)
-    _clear_rulebook()
+
 

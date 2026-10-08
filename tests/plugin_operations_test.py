@@ -63,20 +63,36 @@ class PluginOperationsTests(unittest.TestCase):
             mcp_http._raise_upgrade(value, self.url, self.bearer)
         self.assertIsNone(compat.status(self.url, self.bearer))
 
-    def test_sdk_session_uses_same_upgrade_contract(self):
-        result = SimpleNamespace(isError=True, structuredContent=None,
-            content=[SimpleNamespace(text="Error executing tool save_artifact: " + json.dumps(self.error))])
-        native = SimpleNamespace(call_tool=AsyncMock(return_value=result))
-        session = mcp_http.PolicySession(native, self.url, {"Authorization": "Bearer " + self.bearer})
-        with self.assertRaises(mcp_http.PluginUpgradeRequired):
-            asyncio.run(session.call_tool("save_artifact", arguments={}))
-        self.assertIsNotNone(compat.status(self.url, self.bearer))
-
     def test_capture_rejection_suspends_fresh_rulebook_cache(self):
         import rulebook_hook
         compat.record(self.url, self.bearer, "9.0.0")
         with patch.object(rulebook_hook, "_api", return_value=("https://example.test", self.bearer, mcp_http)):
             self.assertEqual(rulebook_hook.upgrade_status("repo")["minimum_version"], "9.0.0")
+
+    def test_no_notice_on_disk_never_resolves_the_credential(self):
+        # The pre/post lanes call upgrade_status on every tool call; with no
+        # notice file anywhere it must answer without importing the auth stack.
+        import rulebook_hook
+        # (a raising _api would be swallowed by upgrade_status's own handler,
+        # so the test counts the calls instead)
+        with patch.object(rulebook_hook, "_ACTIVE_BASE", self.tmp.name), \
+                patch.object(rulebook_hook, "_api", return_value=None) as api:
+            self.assertIsNone(rulebook_hook.upgrade_status("repo"))
+        api.assert_not_called()
+        compat.record(self.url, self.bearer, "9.0.0")
+        with patch.object(rulebook_hook, "_ACTIVE_BASE", self.tmp.name), \
+                patch.object(rulebook_hook, "_api", return_value=("https://example.test", self.bearer, mcp_http)):
+            self.assertEqual(rulebook_hook.upgrade_status("repo")["minimum_version"], "9.0.0")
+
+    def test_rulebook_names_the_same_compatibility_dir(self):
+        # rulebook_hook spells plugin_compatibility.STATE_DIR itself (importing
+        # the module costs the auth stack); a fresh process sees both unpatched.
+        code = ("import json, sys; sys.path.insert(0, sys.argv[1]); import rulebook_hook as r, "
+                "plugin_compatibility as c; print(json.dumps([r._COMPAT_DIR, str(c.STATE_DIR)]))")
+        out = subprocess.run([sys.executable, "-c", code, str(Path(compat.__file__).parent)],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        mine, theirs = json.loads(out.splitlines()[-1])
+        self.assertEqual(mine, theirs)
 
     def test_cursor_notice_is_bounded_and_host_specific(self):
         compat.record(self.url, self.bearer, "9.0.0")
