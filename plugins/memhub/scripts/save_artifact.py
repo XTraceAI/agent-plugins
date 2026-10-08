@@ -13,24 +13,31 @@ own `assets/…`. `--file`/`--stdin` stays the searchable text (give one so the
 deliverable is findable).
 
 Auth = the PLUGIN's own credential (shared `_memhub_auth`), never the /mcp
-connector's: $MEMHUB_TOKEN if set (CI escape hatch), else the personal access
-key `login.py` mints (`~/.config/memhub-plugin/pak-<host>.json`), else the
+connector's: an explicit token if set (the `memhub_token` plugin option, or
+$MEMHUB_TOKEN where the build honors it: CI escape hatch), else the personal
+access key `login.py` mints (`~/.config/memhub-plugin/pak-<host>.json`), else the
 cached plugin OAuth token, else a one-time browser approval. Being connected
 in /mcp does not satisfy it. No memhub-cli required.
 
-Run (mcp SDK pulled ephemerally by uv):
-    uv run --with 'mcp<2' python scripts/save_artifact.py \
+Run (stdlib python3, nothing to install):
+    python3 scripts/save_artifact.py \
         --file spec.md --name "Retry Policy Spec" --type spec \
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
-        [--tags a,b]
+        [--tags a,b] [--topic billing]
+
+    `--topic` is the brain chapter the document goes under — an existing topic
+    of the brain when one fits even loosely, a new one only for a subject none
+    covers, else "unsorted". A brain with topics on refuses a NEW artifact
+    without one and lists its topics in the refusal; a new version keeps its
+    topic when `--topic` is omitted. Outside a brain it is an ordinary tag.
 
     # a rendered DELIVERABLE (HTML page, chart PNG, PDF) — bytes, not text:
-    uv run --with 'mcp<2' python scripts/save_artifact.py \
+    python3 scripts/save_artifact.py \
         --attach report.html --attach chart.png --entrypoint report.html \
         --file summary.md --name "Q3 retry report" --type document
 
     # or pipe terminal output straight in:
-    pytest -q | uv run --with 'mcp<2' python scripts/save_artifact.py \
+    pytest -q | python3 scripts/save_artifact.py \
         --stdin --name "test run 2026-06-09" --type runbook
 
 Endpoint resolution (so the script hits the SAME server the plugin connector
@@ -49,7 +56,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_http
-from _memhub_auth import resolve_url_and_auth  # noqa: E402
+from _memhub_auth import open_session, resolve_url_and_auth  # noqa: E402
 from brain_resolve import is_missing_brain, resolve_repo_brain  # noqa: E402
 from room_map import env_for_url, forget_room, read_room, repo_root  # noqa: E402
 
@@ -159,13 +166,11 @@ async def main() -> int:
     ap.add_argument("--parent-id", default=None, help="version an existing artifact by id")
     ap.add_argument("--rationale", default=None, help="why this version supersedes the last")
     ap.add_argument("--tags", default=None, help="comma-separated tags")
+    ap.add_argument("--topic", default=None,
+                    help="the brain topic it goes under: an existing one, a new "
+                         "one, or 'unsorted' (see the module docstring)")
     ap.add_argument("--url", default=None)
     args = ap.parse_args()
-
-    # The mcp SDK is imported AFTER argparse, not at module scope, so `--help`
-    # (and the test suite) work under a bare python3 without `uv run --with`.
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
 
     if not args.stdin and args.file is None and not args.attach:
         print("ERROR: give --file, --stdin, or at least one --attach", file=sys.stderr)
@@ -222,6 +227,10 @@ async def main() -> int:
         call_args["rationale"] = args.rationale
     if args.tags:
         call_args["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    # Only when given: a backend without the argument then sees the call it
+    # always saw.
+    if args.topic and args.topic.strip():
+        call_args["topic"] = args.topic.strip()
 
     url, headers, auth = resolve_url_and_auth(args.url)
 
@@ -269,51 +278,48 @@ async def main() -> int:
     print(f"name     : {args.name}   type={args.type}")
     print(f"endpoint : {url}")
 
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            session = mcp_http.PolicySession(session, url, headers)
-            if want_room and room is None and room_cwd is not None:
-                # Cache miss inside a repo: ask the server, the same exact-name
-                # lookup the `.md` auto-capture does. room_cwd is None only when the
-                # file is outside any repo — never resolve from the process
-                # cwd, that would file it into an unrelated repo's room. A
-                # lookup failure is not a reason to lose the save: fall back
-                # to personal memory and say so.
-                try:
-                    room = await resolve_repo_brain(session, room_cwd, env)
-                except Exception as exc:  # noqa: BLE001 — degrade, never abort the save
-                    print(f"room     : lookup failed ({exc.__class__.__name__}); saving to personal memory")
-                    room = None
-            if room:
-                call_args["agent_brain_id"] = room["brain_id"]
-                # The org that OWNS the room. A brain resolves inside exactly
-                # one org, so its id without the org fails with "Agent brain
-                # not found" whenever the room is outside the caller's default
-                # org.
-                if room.get("org_id"):
-                    call_args["org_id"] = room["org_id"]
-            if call_args.get("agent_brain_id"):
-                origin = f' (repo room "{room.get("name", "?")}")' if room else ""
-                print(f"brain    : {call_args['agent_brain_id']}{origin}")
-            print("-" * 56)
-            res = await session.call_tool("save_artifact", arguments=call_args)
-            out = unwrap(res)
-            if room and getattr(res, "isError", False) and is_missing_brain(
-                    [getattr(b, "text", "") for b in getattr(res, "content", []) or []]):
-                # The cached room is not a brain this backend has — deleted, or
-                # an id cached from the other backend. `resolve_repo_brain`
-                # hands a cached id back on every failed re-resolution, so
-                # without this every later save re-sends the same dead id.
-                # Session capture used to evict it as a side effect; sessions
-                # never name a brain now, so the artifact writers own it.
-                # Only a room that came from the cache or resolver: an explicit
-                # --agent-brain-id is the caller's, never ours to forget.
-                forget_room(room_cwd, env)
-                print("room     : the cached room does not exist on this backend — "
-                      "dropped from the cache; re-run to resolve the room again")
+    session = await open_session(url, headers, auth,
+                                 timeout=mcp_http.SDK_READ_TIMEOUT_S)
+    if want_room and room is None and room_cwd is not None:
+        # Cache miss inside a repo: ask the server, the same exact-name
+        # lookup the `.md` auto-capture does. room_cwd is None only when the
+        # file is outside any repo — never resolve from the process
+        # cwd, that would file it into an unrelated repo's room. A
+        # lookup failure is not a reason to lose the save: fall back
+        # to personal memory and say so.
+        try:
+            room = await resolve_repo_brain(session, room_cwd, env)
+        except Exception as exc:  # noqa: BLE001 — degrade, never abort the save
+            print(f"room     : lookup failed ({exc.__class__.__name__}); saving to personal memory")
+            room = None
+    if room:
+        call_args["agent_brain_id"] = room["brain_id"]
+        # The org that OWNS the room. A brain resolves inside exactly
+        # one org, so its id without the org fails with "Agent brain
+        # not found" whenever the room is outside the caller's default
+        # org.
+        if room.get("org_id"):
+            call_args["org_id"] = room["org_id"]
+    if call_args.get("agent_brain_id"):
+        origin = f' (repo room "{room.get("name", "?")}")' if room else ""
+        print(f"brain    : {call_args['agent_brain_id']}{origin}")
+    print("-" * 56)
+    res = await session.call_tool("save_artifact", arguments=call_args)
+    out = unwrap(res)
+    if room and getattr(res, "isError", False) and is_missing_brain(mcp_http.texts_of(res)):
+        # The cached room is not a brain this backend has — deleted, or
+        # an id cached from the other backend. `resolve_repo_brain`
+        # hands a cached id back on every failed re-resolution, so
+        # without this every later save re-sends the same dead id.
+        # Session capture used to evict it as a side effect; sessions
+        # never name a brain now, so the artifact writers own it.
+        # Only a room that came from the cache or resolver: an explicit
+        # --agent-brain-id is the caller's, never ours to forget.
+        forget_room(room_cwd, env)
+        print("room     : the cached room does not exist on this backend — "
+              "dropped from the cache; re-run to resolve the room again")
     print(json.dumps(out, indent=2))
-    # A refusal (required tags, quota, a stale parent) arrives as a normal
+    # A refusal (required tags or topic, quota, a stale parent) arrives as a normal
     # CallToolResult with isError set — `unwrap` cannot tell it from a saved
     # artifact. Nothing was stored, so this must not exit 0: every caller,
     # a person or onboard_docs.py, reads the exit code as "saved".

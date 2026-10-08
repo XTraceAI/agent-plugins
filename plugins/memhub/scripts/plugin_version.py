@@ -24,6 +24,11 @@ def _loaded_version():
 
 ACTIVE_PLUGIN_VERSION = _loaded_version()
 VERSION_HEADER = "X-MemHub-Plugin-Version"
+# Which release channel this copy came from. scripts/promote_export.py rewrites
+# this exact line to "claude-directory" in the Claude plugin directory build, so
+# its update notice names how directory installs update; every other build
+# ships it as written.
+DISTRIBUTION = "agent-plugins"
 
 
 def request_headers():
@@ -37,12 +42,18 @@ def _update_action(host):
     origin = "https://staging.mem.xtrace.ai" if staging else "https://mem.xtrace.ai"
     suffix = "/" + host if host in {"claude-code", "codex", "cursor"} else ""
     guide = origin + "/plugin" + suffix
-    if host == "claude-code":
+    if host == "claude-code" and DISTRIBUTION == "claude-directory":
+        # Installed from the directory (memhub@claude-plugins-official, or
+        # synced from claude.ai): there is no marketplace of ours to refresh.
+        action = ("Claude Code updates directory plugins once the version is published there; "
+                  "to update now, open /plugin, select memhub on the Installed tab and choose "
+                  "Update now, then restart this agent session.")
+    elif host == "claude-code":
         action = (f"Run /plugin marketplace update {marketplace}, then "
                   f"/plugin update {plugin}@{marketplace}, and restart this agent session.")
     elif host == "codex":
         action = (f"Refresh the {marketplace} marketplace and update {plugin} in Codex Plugins. "
-                  "Rerun /memhub:setup for bridge changes, then restart Codex and review the MemHub hooks.")
+                  f"Rerun /{plugin}:onboard for bridge changes, then restart Codex and review the MemHub hooks.")
     elif host == "cursor":
         action = (f"Open Cursor Settings > Plugins, refresh the {marketplace} marketplace "
                   f"and update {plugin}, then restart this agent session.")
@@ -54,6 +65,8 @@ def _update_action(host):
 def update_message(latest, *, host=None):
     action, guide = _update_action(host)
     channel = "public marketplace" if host != "cursor" else "GitHub marketplace (official-directory availability may lag)"
+    if DISTRIBUTION == "claude-directory":
+        channel = "public release channel (the Claude plugin directory publishes it after review, which may lag)"
     return (f"MemHub update available: {ACTIVE_PLUGIN_VERSION} → {latest} on the {channel}. "
             f"This is an optional update; MemHub continues working. {action} "
             f"Upgrade guide: {guide}")

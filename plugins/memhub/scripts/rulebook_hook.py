@@ -4,140 +4,78 @@
 Lanes (the mode argument):
   session  SessionStart: posture rules (on="session") in full, everything else
            as ONE compact index line. Session start is the weakest attention
-           slot (measured 4% vs 88% for in-flight), so it carries worldview,
-           never enforcement.
-  pre      PreToolUse: proactive advisories at the violation moment (on="bash",
-           "edit", "read", "write_stdlib") and the ordering-rule GATE (on="ordering").
-           A read rule sees the Read tool AND the shell forms that pull a file
-           into context (cat/head/tail/less/more/sed -n on a path).
-  post     PostToolUse: reactive advisories on failing/erroring results
-           (on="result"); ordering-rule ARM (edit-family) and RECEIPT (bash).
+           slot, so it carries worldview, never enforcement.
+  pre      PreToolUse: advisories at the violation moment (on="bash", "edit",
+           "read", "write_stdlib") and the ordering-rule GATE (on="ordering").
+           A read rule sees the Read tool AND shell reads (cat/head/sed -n …).
+  post     PostToolUse: advisories on failing results (on="result");
+           ordering-rule ARM (edit-family) and RECEIPT (bash).
   fetch    Refresh the server book for one repo (GET /rules?view=hook with
-           If-None-Match) into <BASE>/book/<repo>.json. The session lane spawns
-           it DETACHED so SessionStart never waits on the network.
-  flush    Stop / SessionEnd: POST unsent ledger rows to /fires in batches,
-           behind a sent-watermark (ledger/.sent). `flush final` ignores the
-           every-N-fires / every-M-minutes throttle. First, the session's
-           open obligations are closed: a fire still waiting on its
-           conversion at the second Stop after it fired is recorded
-           `converted=false` (`flush final` closes them all), so a rule's
-           record says "not followed" instead of nothing. A conversion that
-           lands later still wins — the hook keeps watching a closed fire,
-           and the server keeps a true over a false.
+           If-None-Match) into <BASE>/book/<repo>.json. Spawned DETACHED.
+  flush    Stop / SessionEnd: POST unsent ledger rows to /fires in batches
+           behind a sent-watermark (ledger/.sent); `flush final` ignores the
+           throttle. Open obligations still unconverted at the second Stop
+           after their fire are first recorded `converted=false`; a later
+           conversion still wins (the server keeps a true over a false).
 
 Book = the server book, cached with its ETag. SessionStart re-fetches a stale
-one BEFORE the digest renders (a fresh one just spawns the detached child), and
-the pre lane refreshes it in the background once it is a minute old.
-Offline → the cached book; no cache → no rules. There is no local rule file:
-rules are authored through the memhub `create_rule` tool.
+one BEFORE the digest renders; the pre lane refreshes it in the background once
+it is a minute old. Offline → the cached book; no cache → no rules. Rules are
+authored through the memhub `create_rule` tool, never a local file.
 
-One book, several rulebooks. A rulebook is a container with its own membership
-(container spec §3, §4), and one person can be bound by more than one — an
-org-wide book plus their team's. The fetched book is the union of the rules
-that bind them, and each rule carries `rulebook_id` and a `rulebook` block
-with the book's `name`, `scope` and `member_count`. The server computes no
-precedence and stores no conflict edges (D14): it ships those facts and the
-hook decides. Here, "wider wins" is an ORDERING and never a suppression —
-`book_rank` puts org-wide rules ahead of a three-person book's so that the
-per-call MAX_ADVISE cap and the session-start posture budget spend on the
-policy that binds the most people first. A rule cut by a cap is logged
-`mode="suppressed"`, exactly as before. A backend that predates the container
-change sends no book facts at all; every rule then ranks alike, both sorts are
-stable, and this build behaves as it did — which is what lets one plugin serve
-a migrated and an unmigrated backend.
+One book, several rulebooks: the fetched book is the union of every rulebook
+that binds the person, each rule carrying `rulebook_id` and a `rulebook` block
+(`name`, `scope`, `member_count`). The server computes no precedence (D14);
+`book_rank` orders wider books first so the caps spend on the policy binding
+the most people — an ordering, never a suppression. A backend that sends no
+book facts ranks every rule alike, and the stable sorts keep old behaviour.
 
 How a fire reaches people (spec §5.3):
-  * Every fire is DISCLOSED, on both channels, in one shape:
-    `📏 Rule fired: <the rule, in 20 words or fewer>` — `⛔️` when a gate
-    actually stopped the call. The USER sees it as the first line of the
-    `systemMessage` stanza, above the detail line this hook has always shown
-    (`XTrace ▸ …`); the AGENT is told, in `additionalContext`, to echo the
-    byte-identical line at the top of its reply. Both are needed: the first is
-    deterministic but invisible to everything downstream, and the second is the
-    only copy that reaches the transcript session capture, a handoff or a PR
-    comment can read. One function (`disclosure_line`) builds both, because a
-    terminal showing one string while the agent says another would be worse
-    than either channel alone.
-  * The agent also gets the rule text under an XTrace Rulebook header, as
-    before. Without the `systemMessage` a fire is invisible to the person the
-    rule was written for.
-  * `mode: gate` rules BLOCK: a pre-hook call matching a gate rule is denied
-    (`permissionDecision: deny`) with the statement and the override its lane
-    accepts. A Bash call takes `RULEBOOK_OVERRIDE='<why>' <command>`, which
-    allows exactly that call; an edit takes a `rulebook-override[<rule>]: <why>`
-    marker in the content, which allows that write and stays in the diff. The
-    edit marker must name its rule BECAUSE it stays: an unnamed one would mean
-    a different thing the day a second edit gate covers that line, and it is
-    the form that content copied from elsewhere satisfies by accident. A Read
-    tool call has neither a prefix nor content, so a blocked read is retried
-    narrower (`offset`/`limit`), delegated to a subagent, or — when the whole
-    file must enter THIS context — run as `RULEBOOK_OVERRIDE='<why>' cat
-    <path>`, which is the Bash lane's override and records like one. Either way the fire
-    records its own `override_reason`, and the next matching call is gated
-    again. Gates are never deduped and never cut by the advisory cap. All
-    three lanes gate because the hook sees them BEFORE they run — an edit rule
-    matches `tool_input`, the content the tool is about to write, and a read
-    rule the path a call is about to pull in. A result
-    rule runs after the fact and cannot gate, and neither can the synthetic
-    lane that finds files a shell command already wrote.
-  * A gate is honoured from whatever book is cached, however old. There is no
-    timer that turns a gate off: a rule retired on the server disappears at
-    the next successful fetch, and a running session refreshes its own book
-    once it is a minute old (pre lane, detached, throttled). A stale gate costs
-    one `RULEBOOK_OVERRIDE`; a gate that silently stops enforcing because the
-    server was unreachable for a day is the failure a gate exists to prevent.
+  * Every fire is DISCLOSED as `📏 Rule fired: <rule, ≤ 20 words>` (`⛔️` when
+    a gate stopped the call): to the user in `systemMessage`, and to the agent,
+    told to echo the byte-identical line, since only the agent's copy reaches
+    the transcript. `disclosure_line` builds both.
+  * `mode: gate` rules BLOCK (`permissionDecision: deny`) with the override
+    their lane accepts: Bash takes `RULEBOOK_OVERRIDE='<why>' <command>`; an
+    edit takes a `rulebook-override[<rule>]: <why>` marker in the content
+    (named, because it stays in the diff); a Read is retried narrower,
+    delegated, or run as an overridden `cat`. The fire records its
+    `override_reason`; the next matching call is gated again. Gates are never
+    deduped nor capped. Result rules and the shell-written-files lane run
+    after the fact and cannot gate.
+  * A gate is honoured from whatever book is cached, however old: a stale gate
+    costs one override, a gate that silently lapses offline is the failure a
+    gate exists to prevent.
 
 What leaves the machine, exactly:
-  * fetch  — the repo name (the origin remote's basename, else the directory's),
-             nothing else.
-  * fires  — identifiers only: rule id, session, repo, branch, tool, timestamps,
-             and the judge's score and verdict when a fire was judged.
-             The matched `excerpt` is written to the LOCAL ledger and is
-             stripped before the POST.
-  * recall — the anchor lane, and the one exception: the server's relevance
-             judge needs the call itself, so it gets the file path, or the
-             command line (heredoc bodies dropped, credential shapes redacted,
-             truncated to 400 chars). Redaction is a denylist, not a guarantee.
-             `MEMHUB_RULEBOOK_RECALL=0` turns this lane off and keeps the rest.
-  * judge  — the second lane that sends CONTENT, and it sends more. When a
-             matcher or anchor rule fires on a call, `POST /judge` asks whether
-             the rule fits the turn, and carries: the person's message for the
-             current turn (≤ 2000 chars), the stripped turn (the agent's text
-             blocks, each tool call as one line, the first 300 chars of each
-             result — no thinking, no system reminders), the call itself (the
-             command line as recall sends it, or the file path, ≤ 600 chars)
-             and the fired rule ids. All of it passes the same denylists the
-             harness window uses (MemHub keys, home directories, e-mail
-             addresses, command-line credentials) — a floor, not a guarantee.
-             The server judges only for an org whose `rule_judge` flag is on.
-             For any other org it answers `disabled` — the request was still
-             sent — and the hook then asks no more than once per ten minutes
-             per machine, not once per matched call. One verdict per rule per
-             turn is cached in the session state.
-             `MEMHUB_RULEBOOK_JUDGE=0` turns this lane off and keeps the rest.
+  * fetch  — the repo name, nothing else.
+  * fires  — identifiers only (rule, session, repo, branch, tool, timestamps,
+             judge score/verdict). The `excerpt` stays in the LOCAL ledger.
+  * anchors — nothing. Anchor rules are matched on this machine against the
+             cached book; `MEMHUB_RULEBOOK_RECALL=0` turns the lane off.
+  * judge  — `POST /judge` sends the person's message (≤ 2000 chars), the
+             stripped turn, the call (≤ 600 chars) and the fired rule ids,
+             through the harness window's denylists — a floor, not a
+             guarantee. An org without `rule_judge` gets `disabled`, and the
+             hook then asks at most once per ten minutes per machine. One
+             verdict per rule per turn is cached. `MEMHUB_RULEBOOK_JUDGE=0`
+             turns it off.
 
 Usage (wired in hooks.json): printf %s "$IN" | python3 rulebook_hook.py {session|pre|post}
 
-State (book cache, ordering state, fire ledger) lives under
-$MEMHUB_RULEBOOK_BASE, else ~/.config/memhub-plugin/rulebook. Stdlib only; every failure path exits 0 with no output — a
-broken hook must never touch the tool call or the session.
+State lives under $MEMHUB_RULEBOOK_BASE, else rulebook_paths.base().
+Stdlib only; every failure path exits 0 with no output.
 
 Two engines, one evaluate():
-  * matcher rules — `evaluate()` is a pure function of (rule, event), so it
-    can be exercised in isolation by the tests.
+  * matcher rules — `evaluate()` is a pure function of (rule, event).
   * ordering rules — "run X after the last edit, before Y": an obligation
     state machine keyed by (worktree_root, branch, rule), never by session,
-    so receipts from subagents and sibling sessions in the same checkout count.
+    so receipts from subagents and sibling sessions count.
 
-A matcher rule may also carry a `given` block — predicates the call must
-satisfy AFTER its regex matched: `repo` facts (branch, what the branch has
-changed against its base, a dirty tree), `user` facts (what the person
-typed this session), `file` facts (how much a read would pull into context)
-and `agent` facts (main agent or subagent). They are answered by `Probes`,
-lazily and once per hook call, from read-only git, the local transcript and
-the file the call names; a fact that cannot be established never satisfies a
-predicate, so the rule stays silent. `given_ok()` is pure over a Probes and
-the event's read facts, which is how the verifier feeds it fixtures.
+A matcher rule's `given` block adds predicates checked AFTER its regex matched
+— `repo`, `user`, `file` and `agent` facts, answered lazily by `Probes`. A
+fact that cannot be established never satisfies a predicate. `given_ok()` is
+pure over a Probes and the event's read facts.
 """
 import fnmatch
 import hashlib
@@ -155,52 +93,41 @@ import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 
-def _load_portable_lock():
-    """Load only the packaged lock shim without broadening module search."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portable_lock.py")
-    spec = importlib.util.spec_from_file_location("_memhub_rulebook_portable_lock", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load portable lock shim from {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _load_shim(name):
+    """A packaged shim beside this file, loaded without broadening module
+    search; None when it cannot be."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+        spec = importlib.util.spec_from_file_location("_memhub_rulebook_" + name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
 
 
-try:
-    portable_lock = _load_portable_lock()
+portable_lock = _load_shim("portable_lock")
+repo_identity = _load_shim("repo_identity")
+rulebook_ledger = _load_shim("rulebook_ledger")   # ledger rotation, append lock
+
+try:  # one dir per backend, so staging and prod never share one (rulebook_paths.py)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import rulebook_paths as _rbp
+    BASE, LEGACY_BASE = _rbp.base(), _rbp.legacy_ledger_base()
 except Exception:
-    portable_lock = None
-
-
-def _load_repo_identity():
-    """Load only the packaged repo-name shim without broadening module search."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo_identity.py")
-    spec = importlib.util.spec_from_file_location("_memhub_rulebook_repo_identity", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load repo identity shim from {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-try:
-    repo_identity = _load_repo_identity()
-except Exception:
-    repo_identity = None
-
-BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or \
-    os.path.expanduser("~/.config/memhub-plugin/rulebook")
+    _rbp, LEGACY_BASE = None, ""
+    BASE = os.environ.get("MEMHUB_RULEBOOK_BASE") or os.path.expanduser("~/.config/memhub-plugin/rulebook")
 MAX_ADVISE = 2          # per tool call — habituation guard
-MAX_POSTURE = 15        # spec §2: session_context is hard-capped at 15 rules / ~2k tokens per scope
+MAX_POSTURE = 15        # spec §2: session_context is hard-capped at 15 rules, across every book
 # One budget with the session-start brief (MEMHUB_BRIEF_TOKEN_BUDGET, default
-# 2,500 tokens, split 2:1 brief:rulebook — navigation spec §4); this is the
-# rulebook's third. The literal fallback only covers a broken sibling import.
+# 2,500 tokens, split 2:3 brief:rulebook — navigation spec §4); this is the
+# rulebook's three fifths. The literal fallback only covers a broken sibling import.
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from brief_budget import rulebook_chars as _rulebook_chars
     POSTURE_BUDGET_CHARS = _rulebook_chars()
 except Exception:
-    POSTURE_BUDGET_CHARS = 3333   # 2,500 tokens × 4 chars ÷ 3
+    POSTURE_BUDGET_CHARS = 6000   # 2,500 tokens × 4 chars × 3/5
 RESULT_WINDOW_CHARS = 8000    # result lane: scanned at EACH end, not just the tail
 LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
@@ -208,24 +135,12 @@ BOOK_DIR = os.path.join(BASE, "book")
 
 # ── forward-test redirect (spec §4.3.3) ─────────────────────────────────────
 #
-# /memhub:create-rule's §4b test has to arm its candidate in a book the hook
-# really reads, and until now that meant editing the SHARED book — one file per
-# repo, read by every session on this machine on every PreToolUse. Two tests
-# that interleave leave an unfiled candidate armed with no backup left to find
-# it by, and a sibling session's fire lands inside the test's own evidence
-# window.
-#
-# So the test may instead redirect ITS OWN calls to a private base. The
-# redirect is keyed on the session cwd, because §4b already confines the test
-# sub-agent to a scratch worktree: calls made in there read the doctored book,
-# every other session on the machine reads the real one. A marker that simply
-# said "use this base" would redirect everybody, which is the opposite of what
-# the test needs.
-#
-# Payload data must not steer where the hook looks (see `_acted_on_dir`). The
-# cwd is the host's, not the model's, so it is the trust boundary here as it is
-# there — and the redirect file itself must be the user's own and not group- or
-# world-writable, or it is ignored.
+# /memhub:create-rule's §4b test arms its candidate in a PRIVATE base instead
+# of the shared book every session reads. The redirect is keyed on the session
+# cwd (the test sub-agent's scratch worktree), so only its own calls read the
+# doctored book. The cwd is the host's, not the model's, so it is the trust
+# boundary (see `_acted_on_dir`); a redirect file not owned by the user, or
+# group-/world-writable, is ignored.
 REDIRECT_NAME = "pretest-redirect.json"
 REDIRECT_MAX_AGE_S = 3600    # a forgotten redirect stops steering anything after an hour
 #: "" = no claim, use BASE. A LAZY handle, never a snapshot of BASE: the
@@ -287,11 +202,8 @@ _HD_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")   # delimiter must be 
 
 
 def shell_only(cmd):
-    """A command string is two languages in one: the shell that executes and
-    the data it carries. Drop heredoc BODY lines; keep every shell line,
-    including commands after a terminator. Measured on 57 real transcripts:
-    first-`<<` truncation hid 44% of real pushes (`commit -F - <<'MSG' … &&
-    git push`); full-string matching made ~half of all fires ghosts.
+    """Drop heredoc BODY lines; keep every shell line, including commands
+    after a terminator (`commit -F - <<'MSG' … && git push`).
     Known edge: a bit-shift in a multi-line command can arm a bogus skip."""
     out, skip_until = [], None
     for line in cmd.split("\n"):
@@ -329,30 +241,16 @@ def and_only_segments(shell):
     """The segments of a chain joined ONLY by `&&`, or [] when it is anything
     else (a pipe, a `;`, a `||`, a background `&`, a second line).
 
-    Such a chain that exits 0 ran every one of its segments and every one of
-    them succeeded — so for that shape, and only that shape, the call's single
-    exit status is each segment's own. Everywhere else the last unpiped
-    segment is still the only one the status belongs to.
+    Such a chain that exits 0 ran every segment successfully, so for that
+    shape only the call's exit status is each segment's own.
 
-    Separators are classified on the BLANKED copy, so an operator character
-    inside a quoted argument is the data it is. This was deliberately left
-    quote-unaware once, on the reasoning that mis-reading a quoted `|` only
-    disqualifies a chain and so costs an extra gate. That reasoning was
-    wrong: `npm test -- --grep 'a|b' && git push` is a chain whose test DID
-    run and pass, and refusing to see it fires the gate at someone who has
-    complied. A rule that fires when you have already done the thing is the
-    one people learn to ignore — the same point `rulebook_verify` presses on
-    every author."""
+    Separators are classified on the BLANKED copy: `npm test -- --grep 'a|b'
+    && git push` is a chain whose test DID pass, and gating it would fire at
+    someone who has complied."""
     shell = trim_terminators(shell)
     blank = blank_quoted(shell)
     # Any separator that is NOT `&&` disqualifies the chain — asked of
-    # `_SEPARATOR_RX`, the one place that knows what a separator is. The raw
-    # character scan this replaces called `git fetch 2>&1 && git log
-    # origin/main` a broken chain, because a redirection `&` looks like a
-    # background `&` to a scan that only reads characters. That gated a call
-    # whose fetch had run and passed — the same false gate on a complying
-    # caller that the quoted-operator fix removed two rounds ago, from the
-    # other direction.
+    # `_SEPARATOR_RX`, which knows a redirection `2>&1` is not a background `&`.
     if any(m.group(0) != "&&" for m in _SEPARATOR_RX.finditer(blank)):
         return []
     out, pos = [], 0
@@ -368,15 +266,11 @@ def and_only_segments(shell):
 # needs the contents neutralised, not the tokens. Length-preserving on
 # purpose: the separator scans below find operators in the blanked copy and
 # slice the ORIGINAL at those offsets, so quoted text survives intact.
-# A double-quoted span honours backslash escapes, so `"a \\"b\\" c"` is ONE
-# span — ending it at the first `\\"` put the rest of the argument back into
-# the shell grammar, where a `|` inside it became an operator. A
-# single-quoted span has no escapes at all in POSIX shell (a backslash is
-# literal and a `'` cannot appear), so it stays the simpler pattern.
+# A double-quoted span honours backslash escapes; a single-quoted span has
+# none in POSIX shell.
 _QUOTED_SINGLE = r"'[^']*'"
 _QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
 _QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
-QUOTED_SINGLE_RX = re.compile(_QUOTED_SINGLE)
 # `&&` and `||` first, so the lone-operator alternatives only see what is
 # left. A standalone `&` backgrounds the command to its left and the next one
 # runs anyway — `gh pr view -R other & git push` is TWO commands. The
@@ -385,14 +279,10 @@ _SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
 _ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
 # A `#` starts a comment at the start of a word: after whitespace, an
-# operator, or a grouping paren/brace. NOT after `{` — `${#files}` is the
-# length expansion, and reading its `#` as a comment blanked the rest of the
-# line, so `n=${#files}; git push` reached the gate with no push in it.
+# operator, or a grouping paren/brace. NOT after `{` — `${#files}` is a length.
 _COMMENT_RX = re.compile(r"(?<![^\s;&|()}])#[^\n]*")
 # A trailing `;` or newline ends the last command; it does not start an empty
-# one. `pytest;` is a run of pytest, and splitting on that `;` made the last
-# segment "" — a passing receipt refused, and the gate fired on a caller
-# who had complied. A trailing `&` is NOT a terminator: it backgrounds.
+# one (`pytest;` is a run of pytest). A trailing `&` is NOT a terminator.
 _TRAILING_TERMINATOR_RX = re.compile(r"[\s;\n]+$")
 
 
@@ -405,21 +295,15 @@ def blank_quoted(text):
     outside them — replaced by spaces, character for character, so every
     offset still points at the same place.
 
-    A `\\|` is not a pipe. `gh pr view --jq .title\\|ascii_downcase -R
-    acme/other` is one command, and reading its escaped pipe as an operator
-    left the `-R` in a fragment that no longer began with `gh`. Quoting was
-    only ever half of "this character is data"."""
+    A `\\|` is not a pipe: an escape is data, just as quoting is."""
     return _COMMENT_RX.sub(lambda m: " " * len(m.group(0)), blank_syntax(text))
 
 
 def blank_syntax(text):
     """Quotes and escapes blanked, comments LEFT IN PLACE, length preserved.
 
-    The stage before comment blanking, exposed because `strip_comments` needs
-    to find comments and `blank_quoted`'s output no longer has any. Escapes
-    become a NON-space placeholder: blanking `\\ ` to a real space made
-    `--jq .title\\ #literal` look like `#literal` starts a word, and `\\ `
-    joins two words in bash, so the placeholder has to join them here too."""
+    Exposed for `strip_comments`. Escapes become a NON-space placeholder,
+    because `\\ ` joins two words in bash (`.title\\ #literal` is no comment)."""
     blanked = _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
                              + m.group(0)[-1], text or "")
     return _ESCAPE_RX.sub("\x01\x01", blanked)
@@ -428,62 +312,28 @@ def blank_syntax(text):
 def unquoted(text):
     """`text` with the CONTENTS of quoted spans removed.
 
-    A regex over a whole segment cannot tell a command from an argument that
-    merely spells one, and everywhere else in this hook that only over-fires.
-    On the two paths that let a call OUT of a gate — the self-discharge
-    exemption and the receipt — it lets it out instead, which is the one
-    direction that must not happen: `echo 'git fetch' && git log origin/main`
-    and `grep 'git fetch' setup.sh && git log origin/main` would both read the
-    stale ref with the obligation cleared. Blanking quoted text costs a
-    receipt whose command is genuinely quoted (`pytest "tests/x"`), and that
-    costs an extra gate rather than a missed one."""
+    Used on the two paths that let a call OUT of a gate (self-discharge and
+    the receipt), where an argument that merely spells a command
+    (`echo 'git fetch' && git log origin/main`) must not count. A genuinely
+    quoted receipt costs an extra gate rather than a missed one."""
     return blank_quoted(text)
-
-
-CMD_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "sudo", "doas",
-                           "nohup", "time", "nice", "stdbuf", "setsid",
-                           "sh", "bash", "zsh", "dash", "ksh"})
-# `cd` is a shell builtin, so only the wrappers that run BUILTINS can carry it
-# — `sudo cd x` cannot move this shell and `env cd x` fails outright.
-CD_WRAPPERS = frozenset({"command", "builtin"})
-EXPANSION_RX = re.compile(r"[$`]")   # `$VAR`, `${…}`, `$(…)`, backticks
-CMD_PREFIXES = frozenset({"!", "if", "elif", "then", "else", "while", "until", "do"})
-BLOCK_END = frozenset({"fi", "done", "esac", "}", ";;"})
-COMPOUND = frozenset({"case", "select", "coproc"})
-
 
 
 def executes(segment, rx):
     """Does this segment run the command `rx` describes?
 
-    SYNTAX ONLY. The hook understands shell syntax — quotes, comments,
-    `&&`/`||`/`;`/pipes/background — and nothing about what any command
-    DOES. So this blanks quoted spans and comments, drops leading `FOO=1`
+    SYNTAX ONLY: blanks quoted spans and comments, drops leading `FOO=1`
     assignments and grouping braces, and searches the rest. There is no list
-    of runners: `timeout 300 pytest`, `.venv/bin/pytest`, `caffeinate -i
-    pytest` and the next wrapper nobody thought of all discharge, because the
-    alternative — a list of commands known to run their argument — was wrong
-    for every wrapper not on it, and a missed receipt blocks someone who
-    complied.
+    of runners, so `timeout 300 pytest` and any unknown wrapper discharge.
 
-    KNOWN AND ACCEPTED RESIDUAL: an UNQUOTED mention discharges. `echo
-    pytest` clears a test obligation; `grep -n pytest README.md` clears it.
-    A quoted one does not (`echo 'git fetch'`, `git commit -m 'ran pytest'`),
-    and a comment does not. This is accepted because the obligation is
-    advisory — whether the run was SUFFICIENT (right tests, right args) was
-    never knowable here either, and a caller who wants past a gate has the
-    recorded `RULEBOOK_OVERRIDE=` door already. What the hook closes is the
-    accidental bypass a quoted string or a comment produces; an unquoted
-    `echo pytest` is not a shape anyone types by accident."""
-    # Grouping is not part of a command's name — `(git fetch -q)` runs the
-    # fetch and propagates its status, so it is as good a receipt as the bare
-    # form.
+    KNOWN AND ACCEPTED RESIDUAL: an UNQUOTED mention (`echo pytest`)
+    discharges; a quoted one or a comment does not. The obligation is
+    advisory and the recorded `RULEBOOK_OVERRIDE=` door exists anyway; what
+    is closed is the accidental bypass."""
+    # Grouping is not part of a command's name — `(git fetch -q)` is a receipt.
     text = strip_leading_assignments(
         unquoted(segment or "").strip("(){} \t")).strip()
-    # `!` inverts a pipeline's status: `! git fetch && git log origin/main`
-    # reaches the log only when the fetch FAILED, and the exit code of `!
-    # pytest` is green exactly when the tests were not. Still syntax, not
-    # command knowledge — a negated segment vouches for nothing.
+    # `!` inverts a pipeline's status — a negated segment vouches for nothing.
     if text.startswith("!"):
         return False
     return bool(text) and bool(re.search(rx, text))
@@ -493,11 +343,8 @@ def self_discharging(shell, spec):
     """Does this one call run the required command BEFORE the gated one, in a
     chain whose single exit status vouches for the required part?
 
-    `&&`-only, and the required segment must come first: those are the two
-    conditions under which the gated segment cannot run unless the required
-    one already ran and passed. Anything else — a `||`, a `;`, a pipe, or the
-    required command written after the gated one — is a command the gate is
-    there for."""
+    `&&`-only, with the required segment first: only then can the gated
+    segment not run unless the required one ran and passed."""
     segs = and_only_segments(shell)
     required = next((i for i, part in enumerate(segs)
                      if executes(part, spec["required_command_rx"])), None)
@@ -509,40 +356,25 @@ def self_discharging(shell, spec):
 
 def receipt_segments(shell, whole_chain=False):
     """The segments of `shell` whose success the call's exit status vouches
-    for. Today's answer — the last segment, unpiped, not backgrounded — is
-    what an arbitrary command line can support. `whole_chain` widens it to
-    every segment of an `&&`-only chain, which is sound (see
-    `and_only_segments`) and is what the session- and prompt-armed rules
-    need: the shape they are about puts the required command FIRST
-    (`git fetch -q && git log origin/main`) and never last."""
+    for: the last segment, unpiped, not backgrounded. `whole_chain` widens it
+    to every segment of an `&&`-only chain (see `and_only_segments`), which
+    the session- and prompt-armed rules need: their required command comes
+    FIRST (`git fetch -q && git log origin/main`)."""
     shell = trim_terminators(shell)
     if whole_chain:
         segs = and_only_segments(shell)
         if segs:
             return segs
-    # The last segment is a receipt only if it NECESSARILY ran. Reached
-    # through `||` it ran only when the one before it FAILED, so `true || git
-    # fetch` exits 0 from `true` and never fetches — and taking that as a
-    # receipt discharged the obligation with the required command unrun. `&&`
-    # and `;` both guarantee it ran, and then the call's status is its own.
-    #
-    # Joiners are read with `last_segment`'s own splitter (single `|` is not
-    # one of them, which is what the pipe test below still relies on).
+    # The last segment is a receipt only if it NECESSARILY ran: after `||` it
+    # ran only when the one before it FAILED (`true || git fetch`).
+    # Joiners use `last_segment`'s splitter (a single `|` is not one).
     joiners = [m.group(0) for m in _LAST_SEG_SPLIT_RX.finditer(blank_quoted(shell))]
     if joiners and joiners[-1] == "||":
         return []
-    # A call that ENDS in a background `&` now yields an empty last segment —
-    # the separator is the final token — and an empty one is no receipt. That
-    # is right: `git fetch &` exits 0 from launching the job, not from the
-    # fetch, which may still be running or about to fail.
+    # A call ending in a background `&` yields an empty last segment — no
+    # receipt, since `git fetch &` exits 0 from launching the job.
     last = last_segment(shell)
-    # On the blanked copy, like everything else that asks whether a character
-    # is an operator. `npm test -- --grep 'a|b'` is not a pipeline, and
-    # reading it as one refused a receipt for a test that had passed —
-    # leaving the obligation armed and blocking the push. This is the FOURTH
-    # finding from raw-vs-blanked (rounds 7, 13, 15, 16); `last_segment`
-    # itself was fixed last round and this line beside it was left reading
-    # raw.
+    # On the blanked copy: `npm test -- --grep 'a|b'` is not a pipeline.
     if last and "|" not in blank_quoted(last):
         return [last]
     return []
@@ -550,17 +382,9 @@ def receipt_segments(shell, whole_chain=False):
 
 # ── a leading assignment is not part of the command ─────────────────────────
 #
-# `FOO=1 git push` execs `git push` — bash strips the assignment before it
-# looks up the command, and a rule has to read it the same way. Otherwise an
-# ANCHORED rule is silently bypassed: `^git\s+push` never sees a command that
-# begins with an assignment, so the call runs with no deny and no fire, which
-# is the one outcome a gate exists to prevent.
-#
-# `strip_override` already makes exactly this statement about the single
-# RULEBOOK_OVERRIDE token ("rules match the command, not the assignment"). It
-# just cannot make it when `find_override` REFUSED the token — and the refused
-# shape is `RULEBOOK_OVERRIDE=` with an empty reason, which is what the deny
-# message invites the caller to type.
+# `FOO=1 git push` execs `git push`, and a rule has to read it the same way,
+# or an ANCHORED rule (`^git\s+push`) is silently bypassed by any prefix —
+# including a refused `RULEBOOK_OVERRIDE=` that `strip_override` leaves in.
 _ASSIGN_TOKEN_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
 _ASSIGN_NAME_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -569,11 +393,9 @@ def strip_leading_assignments(shell):
     """`shell` with the env assignments that BEGIN a segment removed, byte for
     byte identical everywhere else.
 
-    Tokenised per line by the same shlex walk `find_override` uses, so an
-    assignment inside a quoted argument (`echo 'A=1 git push'`) is data and
-    stays put, and a line shlex cannot parse is handed back untouched. A run is
-    stripped whole (`FOO=1 BAR=2 git push` -> `git push`), because bash treats
-    all of it as the command's environment."""
+    Tokenised per line by `find_override`'s shlex walk, so a quoted
+    assignment is data and an unparseable line is handed back untouched. A
+    run is stripped whole (`FOO=1 BAR=2 git push` -> `git push`)."""
     out = []
     for line in shell.split("\n"):
         try:
@@ -607,16 +429,9 @@ def strip_comments(text):
     """`text` with `#` comments blanked and quotes left INTACT, length
     preserved.
 
-    `blank_quoted` answers "which characters are syntax", and blanks quoted
-    content along the way — right for finding operators, wrong for matching a
-    rule, which is deliberately allowed to see inside quotes. This asks only
-    the comment question, off `blank_syntax` (which has not blanked comments
-    yet), then blanks that span in the original.
-
-    A `#` that STARTS a word comments out the rest of the line. `git fetch #
-    git log origin/main` runs only the fetch, and the gate was matching the
-    commented `git log` and blocking a compliant call. Mid-word — `%h#%s`, a
-    URL fragment — is not a comment at all."""
+    A rule may see inside quotes, so unlike `blank_quoted` only comments are
+    blanked (found via `blank_syntax`). A `#` that STARTS a word comments out
+    the rest of the line; mid-word (`%h#%s`, a URL fragment) it does not."""
     out = list(text or "")
     for m in _COMMENT_RX.finditer(blank_syntax(text)):
         for i in range(m.start(), m.end()):
@@ -628,23 +443,14 @@ def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
     """Does `rx` match this command, given that a leading env assignment is not
     part of it, and that a `#` comment is not part of it either?
 
-    Comments are blanked HERE rather than at each caller: this is the one
-    function that answers "does this command match", for the matcher lane and
-    the ordering gate alike, and blanking in `blank_quoted` only reached the
-    callers that happened to use it. `git fetch # git log origin/main` runs
-    only the fetch, and the gate was reading the commented `git log` and
-    blocking a compliant call.
+    Comments are blanked HERE, the one place both the matcher lane and the
+    ordering gate ask "does this command match".
 
-    The command is read as BOTH forms — as written, and with the assignments
-    that begin a segment removed. `rx` fires when EITHER matches, so an anchored
-    rule stops being bypassed by a prefix while a rule written to catch the
-    assignment itself (`AWS_SECRET_ACCESS_KEY=`) still fires on the raw text.
-
-    `not_rx` is a VETO across the same pair, checked first: an exemption its
-    author wrote against either shape exempts the call. Testing it per-form
-    instead would let a prefix delete the very token the exemption keys on, so
-    `FOO=1 cmd` would defeat an exemption that `cmd` honours — stripping would
-    become a way to BREAK an exemption, which is the opposite of the point."""
+    The command is read as BOTH forms — as written, and with leading
+    assignments removed — and `rx` fires when EITHER matches, so a prefix
+    cannot bypass an anchored rule while a rule about the assignment itself
+    still fires. `not_rx` is a VETO across the same pair, checked first, so a
+    prefix cannot delete the token an exemption keys on."""
     text = strip_comments(text)
     forms = [text]
     bare = strip_leading_assignments(text)
@@ -657,20 +463,11 @@ def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
 
 # ── files a Bash call wrote ─────────────────────────────────────────────────
 #
-# An edit rule says `event: edit`, and until now that meant the Edit/Write
-# tools only. But a model writes files through Bash all the time — `cat > f
-# <<EOF` to create, a `python - <<PY … write_text()` to modify, `sed -i` —
-# and in auto mode it is TOLD to. Measured on 302 local sessions: 1464 Bash
-# writes against 3035 Write/Edit calls; 6 of 22 alembic migrations were
-# created with a heredoc. None of those reached an edit rule.
-#
-# Reading the command line back cannot recover the write (the path lives
-# inside the Python program, not the shell), so this reads the DISK instead:
+# A model writes files through Bash too (`cat > f <<EOF`, `sed -i`, a Python
+# heredoc). The command line cannot recover the path, so this reads the DISK:
 # the pre lane stamps the call, the post lane asks git what changed since and
-# feeds each file through the same matcher a Write goes through. One
-# mechanism for every shape, including the ones not seen yet. It lands
-# AFTER the write, which is the only lane edit rules use anyway (they are
-# advise-only by decision; only shell rules gate).
+# feeds each file through the same matcher a Write goes through. It lands
+# AFTER the write, so it advises only.
 
 def _worktrees(root):
     """Every worktree of `root`'s repository, `root` first. Empty on any failure."""
@@ -706,12 +503,10 @@ _PATCH_MOVE = re.compile(r"^\*\*\* Move to: (.+?)\s*$")
 def apply_patch_files(inp, cwd):
     """(path, is_new, added text) for each file a Codex `apply_patch` names.
 
-    Codex edits with `apply_patch`, not Edit/Write: the whole patch arrives in
-    `tool_input.command`, with no `file_path`, and a path may be relative to
-    the call's cwd. Read as edits here, a patch reaches the edit lane and arms
-    an ordering obligation the way Claude's Edit does; unread, every edit rule
-    and every edit-armed obligation stayed silent on Codex. A moved file is
-    judged at its new path; a deleted one is an edit with nothing added."""
+    Codex's patch arrives in `tool_input.command` with no `file_path` (paths
+    may be cwd-relative); read here, it reaches the edit lane and arms
+    ordering obligations like Claude's Edit. A moved file is judged at its
+    new path; a deleted one is an edit with nothing added."""
     patch = inp.get("command") if isinstance(inp, dict) else None
     if not isinstance(patch, str) or "*** Begin Patch" not in patch:
         return []
@@ -736,17 +531,10 @@ def bash_written_files(root, cmd, since):
     """(path, is_new) for each regular file a Bash call left modified or new.
 
     Scanned: the session's worktree, plus any sibling worktree the command
-    names — a `cat > /tmp/wt-x/app/m.py <<EOF` into a scratch worktree is
-    the case that motivated this (the file was 30 directories away from
-    the session's cwd and in the same repository). Not every worktree: the
-    repos this serves carry twenty-odd, and one `git status` each per Bash
-    call is a cost nobody asked for.
-
-    `git status` decides what is a candidate (so .gitignore does the
-    exclusion — a `.venv` refresh or `node_modules` install is invisible),
-    the mtime decides what THIS call touched. Returns [] rather than a
-    partial list past BASH_EDIT_MAX_FILES: forty files in one call is a
-    generator or a tree rewrite, and forty fires is noise, not advice.
+    names (not all of them — one `git status` each per call is too costly).
+    `git status` decides candidates (so .gitignore excludes), the mtime what
+    THIS call touched. Past BASH_EDIT_MAX_FILES it returns [] — a generator
+    or tree rewrite, not an edit.
     """
     if not root or since is None or _TREE_REWRITE_RX.search(shell_only(cmd or "")):
         return []
@@ -781,11 +569,8 @@ def bash_written_files(root, cmd, since):
                 st = os.stat(path)
             except OSError:
                 continue
-            # No slack on the stamp: mtimes are sub-second on APFS/ext4, and a
-            # slack would let the PREVIOUS tool call's file count as this one's
-            # (the two are often within a second). A coarse filesystem (HFS+,
-            # FAT) can miss a write that lands in the stamp's own second —
-            # under-count, the safe direction.
+            # No slack on the stamp, or the PREVIOUS call's file would count;
+            # a coarse filesystem can under-count, the safe direction.
             if not stat.S_ISREG(st.st_mode) or st.st_mtime < since:
                 continue
             out.append((path, is_new))
@@ -796,22 +581,14 @@ def bash_written_files(root, cmd, since):
 
 # ── files a Bash call READS into context ────────────────────────────────────
 #
-# A read rule (`event: read`) is about what enters the model's context. The
-# Read tool is one door; `cat`, `head`, `tail`, `less`, `more` and `sed` on a
-# path are the other, and in auto mode the model is TOLD to use them.
-# Measured on 14 days of local sessions: 3,123 Read calls with a median file
-# of 22 lines, against 1,113 bare cat/head/tail segments — and 67 of the 80
-# largest tool results were whole-file shell dumps. A rule that watched only
-# the Read tool would have missed every one of those.
+# A read rule (`event: read`) is about what enters the model's context: the
+# Read tool, and `cat`/`head`/`tail`/`less`/`more`/`sed` on a path (most of
+# the largest tool results are whole-file shell dumps).
 #
-# Read from the COMMAND, not the disk after the fact: this lane must gate, and
-# a gate can only refuse a call it sees before it runs. A pipe (`cat f |
-# grep`) or a redirect (`cat f > out`) is not a read into context and is
-# skipped, and so is any form this parser cannot name — every doubt resolves
-# to "no read here", which under-counts and never false-fires. `cd` is
-# tracked segment by segment, because `cd <repo> && cat spec.md` is how a
-# real command reads a relative path, and it is the form a prefix-anchored
-# hook (`^cat`) misses entirely.
+# Read from the COMMAND, not the disk, because this lane must gate. A pipe or
+# redirect is not a read into context, and every doubt resolves to "no read
+# here" — under-count, never false-fire. `cd` is tracked segment by segment
+# (`cd <repo> && cat spec.md`).
 
 _READ_CMDS = ("cat", "head", "tail", "less", "more", "sed")
 # stdout going somewhere other than the context: `> f`, `>> f`, `&> f`, and a
@@ -933,11 +710,9 @@ def bash_reads(cwd, cmd):
 
 def read_facts(path, pulled=None, offset=None, limit=None, total=None):
     """{"lines": n, "bytes": b} — what this read would pull into the context:
-    the file's length, narrowed by the Read tool's `offset`/`limit` or by the
-    line count a shell form asks for. None when the path is not a regular
-    file, and None never satisfies a `given.file` predicate: a rule about a
-    file it cannot measure stays silent. `total` pre-answers the line count —
-    the verifier's way in, so a case needs no real file."""
+    the file's length, narrowed by `offset`/`limit` or a shell form's line
+    count. None (which satisfies no `given.file` predicate) for a non-regular
+    file. `total` pre-answers the line count, for the verifier."""
     try:
         size = None
         if total is None:
@@ -976,14 +751,30 @@ def read_facts(path, pulled=None, offset=None, limit=None, total=None):
         return None
 
 
+def added_lines(old, new):
+    """The lines of `new` that `old` does not have — what an Edit wrote, by the
+    same set test the bash lane's `body_rx` uses for a heredoc. A line moved or
+    kept verbatim is not added; one changed by a character is."""
+    kept = set(str(old or "").split("\n"))
+    return "\n".join(line for line in str(new or "").split("\n") if line not in kept)
+
+
+def edit_added_text(inp):
+    """What an Edit / MultiEdit / Write call ADDED, for an edit rule's
+    `content_rx`: each new_string minus its own old_string's lines, a Write's
+    whole content (its previous file is not read here). Same order and joins
+    as the call's body."""
+    edits = [e for e in (inp.get("edits") or []) if isinstance(e, dict)]
+    return added_lines(inp.get("old_string"), inp.get("new_string", "")) + \
+        str(inp.get("content", "")) + \
+        "\n".join(added_lines(e.get("old_string"), e.get("new_string", "")) for e in edits)
+
+
 def read_edit_body(path, is_new=True):
     """What an edit rule reads for a Bash-written file, matching what it
     reads for the tools: a NEW file is the whole file (a Write), a MODIFIED
-    file is the lines this change added (an Edit's new_string) — not the
-    file it landed in. Read whole, a one-line comment dropped into
-    config.py fired the camelCase rule on every snake_case name already
-    there. None when the file is binary (a NUL byte) or past
-    BASH_EDIT_MAX_BYTES, or when a modified file's diff cannot be read."""
+    file only the lines this change added (an Edit's new_string). None when
+    binary, past BASH_EDIT_MAX_BYTES, or the diff cannot be read."""
     try:
         with open(path, "rb") as f:
             raw = f.read(BASH_EDIT_MAX_BYTES + 1)
@@ -1007,16 +798,14 @@ def read_edit_body(path, is_new=True):
 
 
 # ── matcher engine: pure ────────────────────────────────────────────────────
-def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text="", prompt=""):
+def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_text="", prompt="",
+             added=None):
     """True if `rule` fires on this event. No I/O, no dedup. Ordering rules are not matchers (see
-    OrderingEngine)."""
+    OrderingEngine). `added` is what an edit ADDED (`edit_added_text`); None reads `body`."""
     on = rule.get("on")
     try:
         if hook_phase == "prompt" and on == "prompt" and prompt:
-            # The RAW prompt, harness wrappers included: a `/loop` wake-up or a
-            # `<task-notification>` is exactly what a prompt rule is written
-            # about, so nothing here strips them the way `harness_prompt`
-            # does for arming.
+            # The RAW prompt, harness wrappers included (unlike `harness_prompt`).
             if not re.search(rule["rx"], prompt, re.I | re.M):
                 return False
             return not (rule.get("not_rx") and re.search(rule["not_rx"], prompt, re.I | re.M))
@@ -1035,21 +824,23 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
                 return bool(re.search(rule["body_rx"], body_only, re.I | re.M))
             return True
         if hook_phase == "pre" and on == "edit" and tool in EDIT_TOOLS:
-            if re.search(rule["path_rx"], file_path) and not (
+            # The server files an edit rule with path_rx OR content_rx, so a
+            # content-only rule has no path_rx: it means any path, not none.
+            if re.search(rule.get("path_rx") or "", file_path) and not (
                     rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path)):
-                if "content_rx" in rule and not re.search(rule["content_rx"], body, re.M):
+                # content_rx asks what this edit WROTE: a line the old text
+                # already had is not this edit's doing (an Edit that kept a
+                # `create_task` call was blocked as if it added one).
+                written = body if added is None else added
+                if "content_rx" in rule and not re.search(rule["content_rx"], written, re.M):
                     return False
-                # content_not_rx exempts the whole edit — the complied-with
-                # form (a suppression that carries its reason, say) must not
-                # keep firing once the author has done what the rule asked.
+                # content_not_rx exempts the whole edit (the complied-with form).
                 return not (rule.get("content_not_rx")
                             and re.search(rule["content_not_rx"], body, re.M))
             return False
         if hook_phase == "pre" and on == "read" and tool in READ_TOOLS and file_path:
-            # Which file, not how much: size is a `given.file` fact, answered
-            # per event, so the same rule reads the same on the Read tool and
-            # on a `cat`. A read that came through a shell command honours the
-            # rule's command exemption — the veto a bash rule gets.
+            # Which file, not how much (size is a `given.file` fact). A shell
+            # read honours the rule's command exemption.
             if rule.get("path_rx") and not re.search(rule["path_rx"], file_path):
                 return False
             if rule.get("path_not_rx") and re.search(rule["path_not_rx"], file_path):
@@ -1068,20 +859,14 @@ def evaluate(rule, *, hook_phase, tool, cmd="", file_path="", body="", result_te
                 return False
             if rule.get("cmd_not_rx") and cmd and re.search(rule["cmd_not_rx"], cmd, re.I):
                 return False          # the server's command_not_rx, honoured on the post lane too
-            # A long result puts the two things a rule looks for at OPPOSITE
-            # ends: pytest prints the traceback at the top and the failure
-            # summary at the bottom, so a tail-only window silently misses
-            # every exception in a run long enough to need a window at all.
-            # Scan both ends, as separate spans so no pattern can match across
-            # the gap between them.
+            # Scan BOTH ends of a long result (pytest prints the traceback at
+            # the top, the summary at the bottom), as separate spans.
             if len(result_text) <= 2 * RESULT_WINDOW_CHARS:
                 spans = (result_text,)
             else:
                 spans = (result_text[:RESULT_WINDOW_CHARS],
                          result_text[-RESULT_WINDOW_CHARS:])
-            # exclude_rx exempts the whole result (an exempt test name usually
-            # sits outside the matched span), not just the matched substring —
-            # so it is checked over the same spans the match is drawn from
+            # exclude_rx exempts the whole result, over the same spans
             if rule.get("exclude_rx") and any(
                     re.search(rule["exclude_rx"], sp, re.M) for sp in spans):
                 return False
@@ -1101,14 +886,12 @@ class OrderingEngine:
     branch switch before the push. Sibling branches share it (over-gates
     slightly — the safe direction).
     Every read-modify-write holds an exclusive flock on a sidecar lock (bounded
-    LOCK_WAIT_S; past that the hook fails open) and replaces the file atomically.
-    An arm and a discharge from two sessions must never overwrite each other —
-    those are the two outcomes a gate exists to prevent.
+    LOCK_WAIT_S, then fail open) and replaces the file atomically, so an arm
+    and a discharge from two sessions never overwrite each other.
 
-    Arming counters ONLY. Which fires a receipt answers is not this file's
-    business any more (rule-fire-events-spec §4): the receipt is posted as an
-    event carrying this checkout's key, and the server matches it to every
-    fire of the rule in the checkout, whichever session fired it."""
+    Arming counters ONLY: a receipt is posted as an event carrying this
+    checkout's key and the server matches it to the rule's fires
+    (rule-fire-events-spec §4)."""
 
     def __init__(self, worktree_root, branch):
         os.makedirs(os.path.join(_base(), "state"), exist_ok=True)
@@ -1134,10 +917,8 @@ class OrderingEngine:
                 continue
             if portable_lock.still_at(lock.fileno(), self.path + ".lock") \
                     or (replaced >= 2 and time.monotonic() >= deadline):
-                # Keep what we hold once it still mismatches after two
-                # reopens past the deadline: the sweep deletes a lock file
-                # once, so only a filesystem whose inode numbers are not
-                # stable gets here, and it would otherwise spin.
+                # Past the deadline after two reopens, keep it (unstable
+                # inode numbers would otherwise spin).
                 return lock
             # state_sweep.py deleted this lock file after we opened it: reopen.
             replaced += 1
@@ -1161,12 +942,9 @@ class OrderingEngine:
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
         under lock; None on lock timeout (fail open).
 
-        `armed` is the event that armed this obligation OUTSIDE the worktree
-        state — "session" or "prompt" — read by the caller from the SESSION's
-        own state file. A session- or prompt-armed obligation belongs to one
-        session (each session must fetch before it reads `origin/*`; the
-        sibling session down the hall fetching does not answer for this one),
-        so it cannot live in the worktree state every session shares."""
+        `armed` is "session" or "prompt" when the obligation was armed in the
+        SESSION's own state (read by the caller): such an obligation belongs
+        to one session, not the shared worktree state."""
         spec = rule["ordering"]
         armed_by = tuple(spec.get("armed_by_events", ("edit", "write")))
         by_call = any(k in armed_by for k in ("session", "prompt"))
@@ -1176,32 +954,17 @@ class OrderingEngine:
         if is_edit and spec.get("path_rx") and not re.search(spec["path_rx"], file_path):
             return None
         seg = shell_only(cmd) if cmd else ""
-        # A Bash call reports ONE exit status. It is the receipt's own status
-        # only when the receipt is the final segment and not piped (`pytest |
-        # tail` returns tail's status). Earlier segments / pipelines never
-        # discharge — under-counting is the safe direction. A session- or
-        # prompt-armed rule reads an `&&`-only chain whole instead
-        # (`receipt_segments`): its required command sits FIRST in that chain,
-        # never last, and a chain that exits 0 vouches for every segment.
+        # A Bash call reports ONE exit status, the receipt's own only for an
+        # unpiped final segment; session/prompt-armed rules read an `&&`-only
+        # chain whole (`receipt_segments`).
         is_receipt = hook_phase == "post" and tool == "Bash" and seg and \
             any(executes(part, spec["required_command_rx"])
                 for part in receipt_segments(seg, whole_chain=by_call))
         is_gate = hook_phase == "pre" and tool == "Bash" and seg and \
             command_fires(spec["gated_command_rx"], seg, flags=0)
         # One call that runs the required command BEFORE the gated one
-        # discharges its own obligation (`git fetch -q && git log
-        # origin/main`), and blocking it would be a gate firing on the very
-        # call that satisfies it.
-        #
-        # ORDER and JOINER both have to hold. Accepting the required pattern
-        # anywhere in the string — which the miner's offline replay does, and
-        # which this did to agree with it — exempts two commands that are
-        # exactly what the rule exists to catch: `git log origin/main && git
-        # fetch` reads the stale ref and fetches afterwards, and `git fetch ||
-        # git log origin/main` runs the stale read PRECISELY when the fetch
-        # failed. Agreeing with a replay's approximation is not worth a hole
-        # in the gate; the replay counts a few more sessions than the engine
-        # gates, and that is the right direction for the two to differ in.
+        # discharges its own obligation (`git fetch -q && git log origin/main`).
+        # ORDER and JOINER both have to hold (see `self_discharging`).
         if is_gate and by_call and self_discharging(seg, spec):
             return None
         if not (is_edit or is_receipt or is_gate):
@@ -1222,13 +985,9 @@ class OrderingEngine:
             if is_receipt:                                # handler 2: green receipt
                 if ok is True:                            # a red run never discharges
                     s["count"] = 0
-                    # Older builds also kept the rule's open fire ids here so
-                    # the receipt could convert them. Those fires were posted
-                    # WITHOUT a checkout key, so a `receipt` event cannot
-                    # reach them on the server (a sibling's session id is not
-                    # theirs); they are handed to the caller, which answers
-                    # them the old way — a legacy conversion the drain
-                    # re-posts (Codex, #240). Then the keys are gone for good.
+                    # Older builds kept open fire ids here; posted without a
+                    # checkout key, a `receipt` cannot reach them, so they go
+                    # to the caller as legacy conversions (#240).
                     legacy = [f for f in [s.get("open_fire")] + list(s.get("open_fires") or []) if f]
                     rule["_legacy_fires"] = list(dict.fromkeys(legacy))
                     for k in ("open_fire", "open_fires", "resolved_fires"):
@@ -1290,10 +1049,8 @@ _GIVEN = {
     # what a read would pull into context — answered per EVENT (`read_facts`),
     # not per call, so a `cat a b` is measured file by file
     "file": {"lines_gt": "int", "bytes_gt": "int"},
-    # main agent vs subagent (transcript under <session>/subagents/). A rule
-    # about the main context's budget says `main: true`, and a subagent's
-    # reads pass — delegation is the way past the rule, so it must not gate
-    # the delegate.
+    # main agent vs subagent (transcript under <session>/subagents/);
+    # `main: true` lets a delegate's reads pass.
     "agent": {"main": "bool"},
 }
 
@@ -1305,10 +1062,7 @@ _HOOK_VERSION = []          # memo: the manifest is read at most once per proces
 def version_tuple(v):
     """`major.minor.patch` as a comparable tuple, or None.
 
-    Strict on purpose: three ASCII-digit components and nothing else. There is
-    no prerelease in this plugin's history to support, and a grammar that
-    admits one buys a pile of ordering questions ("is 1.0.0-rc older than
-    1.0.0?") to answer a version string nobody publishes."""
+    Strict on purpose: three ASCII-digit components, no prerelease."""
     m = _VERSION_RX.match(v.strip()) if isinstance(v, str) else None
     return tuple(int(g) for g in m.groups()) if m else None
 
@@ -1316,10 +1070,8 @@ def version_tuple(v):
 def hook_version():
     """This hook's own version, from the plugin manifest beside it.
 
-    None when the manifest is missing, unreadable, or does not carry a
-    `major.minor.patch` — and an unknown version satisfies no
-    `min_hook_version`, so a hook that cannot say what it is degrades a rule
-    rather than gating on a condition it may not understand."""
+    None when unreadable — and an unknown version satisfies no
+    `min_hook_version`, so the rule degrades rather than gates."""
     if not _HOOK_VERSION:
         override = os.environ.get("MEMHUB_RULEBOOK_HOOK_VERSION")
         if override is not None:
@@ -1335,10 +1087,8 @@ def hook_version():
     return _HOOK_VERSION[0]
 
 
-# Every key of an `ordering` block this hook knows how to honour. A rule may
-# be written for a NEWER one: the engine reads a block with `spec.get(...)`,
-# so an unknown key is silently ignored and the rule runs as if the author
-# had not written it. That is the 0.40.1 shape — see `degradation`.
+# Every key of an `ordering` block this hook knows how to honour; a rule
+# written for a NEWER hook degrades (see `degradation`).
 _ORDERING_KEYS = frozenset({"required_command_rx", "gated_command_rx", "armed_by_events",
                             "armed_by_rx", "min_edits", "display_name", "path_rx"})
 _ARMED_BY_EVENTS = frozenset({"edit", "write", "session", "prompt"})
@@ -1347,10 +1097,8 @@ _ARMED_BY_EVENTS = frozenset({"edit", "write", "session", "prompt"})
 def given_unsupported(g):
     """The first `block.key` of a `given` this hook does not know, or "".
 
-    A different question from `given_norm`'s: that one refuses a value of the
-    wrong KIND, which is a malformed rule however new the hook. This one finds
-    a predicate written for a hook we are not, which is version skew — and the
-    same `_GIVEN` table answers both, so there is no second list to drift."""
+    Version skew, unlike `given_norm`'s malformed-value check; the same
+    `_GIVEN` table answers both."""
     if not isinstance(g, dict):
         return ""
     for block, spec in g.items():
@@ -1401,25 +1149,12 @@ def degradation(row, given=None, ordering=None):
     where they sit: a server row keeps `given` inside its `matcher`, a pilot
     row at the top level.
 
-    A rule may be newer than the hook reading it, and until now that was
-    silent in the worst direction: the engine reads an `ordering` block with
-    `spec.get(...)`, so a key it does not know is ignored and the rule runs as
-    if the condition were satisfied. Version 0.40.1 did exactly that with a
-    `given` — five spurious overrides in one session, and nothing anywhere
-    said the hook had not read the rule it was enforcing.
+    A rule newer than this hook (`min_hook_version` above ours, or a key we
+    do not know) would otherwise run as if its condition were met. It
+    degrades instead: advises, never gates, and says so once per session.
 
-    A rule that says so itself (`min_hook_version`) and one that merely
-    carries a key we do not know are the same fact, so they degrade the same
-    way: the rule advises, never gates, and says once per session that this is
-    what happened.
-
-    SCOPE, stated plainly: this protects FORWARD skew — this hook reading a
-    rule written for a later one. It cannot protect a hook OLDER than the
-    field itself, because the check is code that only the newer hook has: 0.53
-    loads a rule floored at 0.54 and its ordering engine ignores the condition
-    it cannot read. Closing that needs the server to serve an advice-only
-    representation to a hook below the floor, which is why `fetch_book` sends
-    `hook_version`; the server half is not in this repo."""
+    SCOPE: FORWARD skew only. A hook older than this check cannot protect
+    itself; that needs the server (hence `fetch_book` sends `hook_version`)."""
     want_raw = row.get("min_hook_version")
     if want_raw is not None:
         have = hook_version()
@@ -1439,9 +1174,8 @@ def degradation(row, given=None, ordering=None):
 def given_norm(g):
     """Lint a rule's `given` block off the wire. Returns the block, or None on
     an unknown sub-block, an unknown key, or a value of the wrong kind — and
-    None drops the RULE, as rx_ok does. A rule that passed the server's
-    allowlist yet fails here must not fire with its predicate silently
-    ignored: that is a rule firing when its author said it should not."""
+    None drops the RULE, as rx_ok does, rather than firing with its
+    predicate silently ignored."""
     if not isinstance(g, dict) or not g:
         return None
     out = {}
@@ -1586,13 +1320,9 @@ def command_root(cwd, command):
 
 class Probes:
     """The facts a `given` block asks about, answered lazily and at most once
-    per hook call. Nothing runs unless a rule whose regex already matched
-    carries a `given`, each git call is read-only and bounded by
-    PROBE_TIMEOUT_S, and nothing here leaves the machine. A probe that fails
-    answers None, and None never satisfies a predicate: a rule with a `given`
-    it cannot check stays silent, which is the fail-open direction.
-    `fixture` pre-answers probes by name — the verifier's and the tests' way
-    in, so given_ok() never needs a real repo to be exercised."""
+    per hook call, read-only, bounded by PROBE_TIMEOUT_S, never leaving the
+    machine. A failed probe answers None, which satisfies no predicate (fail
+    open). `fixture` pre-answers probes by name, for the verifier and tests."""
 
     def __init__(self, root, branch, transcript_path=None, fixture=None, command="",
                  agent_id=None):
@@ -1629,28 +1359,12 @@ class Probes:
         """The base branch the in-flight command names (`--base staging`), when
         it is a branch this rule may honestly be measured against.
 
-        Read off the command because that is the only place the answer exists —
-        but the command is written by the party the rule gates, so a named base
-        is CHECKED, never taken on trust. Three ways it is refused, each of
-        which falls through to the remote default and so OVER-measures rather
-        than under-measures:
-
-        * **Not a plain remote branch name.** Rev syntax (`HEAD`, `abc123`,
-          `main~40`) is not a base a PR can merge into, and would let the
-          comparison point be moved anywhere in history.
-        * **Nothing to merge into it** — `merge-base(base, HEAD) == HEAD`. This
-          is the bypass that matters: naming your OWN branch, or any descendant
-          of it, makes the diff measure zero and a 5,000-line branch reads as
-          empty. A PR onto such a base would be empty too, so no honest call
-          names one.
-        * **More than one distinct base named.** `… --base <mine> || … --base
-          staging` would probe the first and open the second. If a command
-          cannot say plainly what it merges into, it does not get to choose.
-
-        None of this makes the gate proof against the party running the shell —
-        nothing here could, and `RULEBOOK_OVERRIDE=` is the sanctioned way past
-        it precisely because it is RECORDED. What this closes is the silent
-        version: a bypass that leaves no fire and no reason behind it.
+        The command is written by the party the rule gates, so a named base is
+        CHECKED. Refused (falling through to the remote default, which
+        over-measures): rev syntax rather than a plain remote branch name; a
+        base with nothing to merge into it (`merge-base == HEAD`, e.g. your own
+        branch, which measures zero); more than one distinct base named. This
+        closes the SILENT bypass; `RULEBOOK_OVERRIDE=` is the recorded one.
         """
         named = {next((g for g in m.groups() if g), "")
                  for m in _BASE_ARG.finditer(self._cmd)}
@@ -1683,36 +1397,15 @@ class Probes:
         None when no candidate exists (a fresh repo) — every diff probe then
         answers None too.
 
-        Guessing `main` first was wrong wherever a repo merges into something
-        else: against `origin/main`, a PR onto a long-lived `staging` measures
-        the whole staging-vs-main delta instead of the branch, so a
-        `diff_lines_gt` rule fires on every PR in that repo no matter how small.
-        The named base fixed that for `gh pr create --base staging`; a plain
-        `git push` names nothing, and in such a repo it fired `spec-owns-
-        untouched` on every push, listing files the branch never touched (they
-        were staging's delta over main — MemHub-Backend #1436, six pushes, six
-        false fires). So when nothing explicit says which branch this one
-        merges into, the guess is the NEAREST of the usual candidates: the one
-        with the fewest commits between its merge-base and HEAD. A branch cut
-        from `staging` is nearer to `staging` than to `main` (staging contains
-        main, so its merge-base is at or after main's); a branch cut from
-        `main` in a repo whose `staging` is a stale release branch is nearer
-        to `main`. Ties keep the old order (remote default first).
+        With nothing explicit, the guess is the NEAREST usual candidate (fewest
+        commits from its merge-base to HEAD), so a branch cut from `staging`
+        is not measured against `main` (MemHub-Backend #1436). Ties keep the
+        order above.
 
-        One candidate is never the guess, for the reason `_named_base`
-        refuses a named own-branch: a NON-default branch that already
-        CONTAINS this one — an integration branch the feature was merged into
-        to deploy it, or the branch's own remote copy when the branch is
-        itself named like a base. Merge-base == HEAD measures zero and would
-        read a 5,000-line branch as empty. Skipped, the guess moves on (to
-        the default, which over-measures in such a repo — the failure
-        direction that fires a reminder, not the one that hides a gate). The
-        DEFAULT containing HEAD is different: that is a session on the
-        default branch itself, a branch with no commits of its own yet (only
-        working-tree edits), or one already merged, and there the empty
-        committed diff is the truth — every `given.repo` probe then measures
-        the working tree, as it always has (the spec-untouched cases work on
-        `main` with an empty origin and depend on exactly this).
+        A NON-default branch that already CONTAINS HEAD (merge-base == HEAD)
+        is skipped, as in `_named_base`, since it would measure zero. The
+        DEFAULT containing HEAD is kept: there the empty committed diff is the
+        truth and probes measure the working tree.
         """
         def compute():
             env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
@@ -1778,11 +1471,8 @@ class Probes:
 
     def untouched_specs(self, spec_dir="docs/specs"):
         """`[(spec, paths)]` for each owning spec the branch left alone, naming
-        only the changed paths no UPDATED spec already answers for. A big
-        shared file is co-owned by several narrow specs; once the branch edits
-        the one that governs the change, flagging the file's other owners too
-        taught people to ignore the reminder (ENG-1153). A spec whose every
-        path is answered for that way is not reported."""
+        only the changed paths no UPDATED spec already answers for (a shared
+        file's other owners are not flagged — ENG-1153)."""
         def compute():
             from spec_owns import load_specs_from_tree, owning_specs, spec_file_changed
             paths = self.diff_paths()
@@ -2011,12 +1701,15 @@ _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_versio
                                  "on", "repo_scope", "_scope_repos", "_scope_paths",
                                  "_scope_exclude_paths", "anchors", "ordering",
                                  "_rulebook_id", "_book_name", "_book_scope", "_book_members",
+                                 "_book_kind", "_book_label",
                                  "min_hook_version", "_degraded"})
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
             "content_rx", "content_not_rx", "exclude_rx", "converted_rx")
-_RX_MAX = 400
+# The server's cap (validation.MAX_REGEX); it floors any pattern past 400 at
+# min_hook_version 0.88.0, so every hook that receives one must load it.
+_RX_MAX = 2000
 # (a+)+, (\d+)+$, (a|a)+, (.*), .*.* — the classic backtracking shapes. A
 # denylist, not a proof: stdlib `re` has no timeout, and a bounded matcher
 # (worker + wall clock) is the Phase 2 answer named in §5.1.
@@ -2100,6 +1793,7 @@ def _why(r):
 
 
 _BOOK_SCOPES = ("all_org", "explicit")
+_BOOK_KINDS = ("org", "workspace", "personal")
 _BOOK_NAME_MAX = 120
 _BOOK_ID_MAX = 64            # a UUID is 36; longer is rejected, never truncated
 # An id is rejected, not repaired: it is a dedup key and a ledger column, so a
@@ -2110,7 +1804,8 @@ _BOOK_MEMBERS_MAX = 10 ** 9  # an org, not a number the server chose to render
 # is server data: left alone, a row that simply spells these keys itself would
 # name its own precedence — and `_book_members: "many"` would take the whole
 # lane down through book_rank. They are stripped on the way in.
-_BOOK_KEYS = ("_rulebook_id", "_book_name", "_book_scope", "_book_members")
+_BOOK_KEYS = ("_rulebook_id", "_book_name", "_book_scope", "_book_members",
+              "_book_kind", "_book_label")
 
 
 def _book_facts(row):
@@ -2118,12 +1813,9 @@ def _book_facts(row):
     which rulebook a rule came from, how wide that book's membership is, and
     what the book is called. The server computes NO precedence and stores no
     conflict edges — it ships `scope` and `member_count` and the hook decides
-    what "wider" means (D14).
-
-    A backend that predates the rulebook container sends neither key. Every
-    rule then carries the same absent facts, `book_rank` returns one value for
-    all of them, and the stable sorts below leave book order exactly as it is
-    today — which is what makes one plugin build work against both backends."""
+    what "wider" means (D14). A pre-container backend sends none: `book_rank`
+    is then one value for all rules and book order is unchanged. `label`
+    (rulebook-scopes) replaces a scope book's stored name ("personal:<id>")."""
     b = row.get("rulebook")
     b = b if isinstance(b, dict) else {}
     out = {}
@@ -2136,11 +1828,39 @@ def _book_facts(row):
         out["_book_name"] = name
     if b.get("scope") in _BOOK_SCOPES:
         out["_book_scope"] = b["scope"]
+    if b.get("kind") in _BOOK_KINDS:
+        out["_book_kind"] = b["kind"]
+    label = _clean_text(b.get("label"))[:_BOOK_NAME_MAX]
+    if label:
+        out["_book_label"] = label
     mc = b.get("member_count")
     # Bounded, because it is rendered: a four-thousand-digit member_count is
     # valid JSON and would spend the session-start budget on digits alone.
     if isinstance(mc, int) and not isinstance(mc, bool) and 0 <= mc <= _BOOK_MEMBERS_MAX:
         out["_book_members"] = mc
+    return out
+
+
+def posture_order(rules):
+    """Session rules in the order they claim the session budget: the books
+    take TURNS — each book's first rule, then each book's second, and so on —
+    with the wider book first in every round (`book_rank`, §11) and, inside a
+    book, title then id. Deterministic, whatever order the book arrived in.
+
+    Not "the wider book spends first": an org-wide book with more session
+    rules than the budget holds then left a repo's own book nothing, in that
+    repo (MemHub-Backend's 4 were cut in every session there, 2026-10-07).
+    Rules with no book facts form one book and keep the old order."""
+    books = {}
+    for r in rules:
+        books.setdefault(str(r.get("_rulebook_id") or ""), []).append(r)
+    for rs in books.values():
+        rs.sort(key=lambda r: (str(r.get("_label") or r.get("title") or r["id"]).casefold(),
+                               str(r["id"])))
+    order = sorted(books.items(), key=lambda kv: (book_rank(kv[1][0]), kv[0]))
+    out = []
+    for i in range(max((len(rs) for _, rs in order), default=0)):
+        out += [rs[i] for _, rs in order if i < len(rs)]
     return out
 
 
@@ -2252,8 +1972,8 @@ def ordering_rx_ok(o):
 def to_hook_rule(row):
     """One `?view=hook` row → the flat shape evaluate()/OrderingEngine read.
     Rows already in the pilot shape (an `on` key) pass through. The book facts
-    (`_rulebook_id`, `_book_name`, `_book_scope`, `_book_members`) ride along
-    on both paths; they are absent, harmlessly, on a pre-container backend.
+    (`_rulebook_id`, `_book_*`) ride along on both paths; they are absent,
+    harmlessly, on a pre-container backend.
     Never raises on a malformed row: returns None and the row is skipped."""
     try:
         if not isinstance(row, dict):
@@ -2374,10 +2094,23 @@ def to_hook_rule(row):
         return None
 
 
+_rc = None      # rulebook_cache, imported under __main__ only
+
+
 def load_rules(repo):
     """The cached server book as hook rules. Returns (rules, "", fetched_at,
     sources) — sources maps rule id → "server" (kept for the audit file)."""
-    book = None if upgrade_status(repo) else load_book(repo)
+    if upgrade_status(repo):
+        return _norm_rules(None)
+    try:
+        if _rc:
+            return _rc.cached_rules(book_path(repo), _norm_rules, __file__, hook_version(), _ACTIVE_BASE)
+    except Exception:
+        pass
+    return _norm_rules(load_book(repo))
+
+
+def _norm_rules(book):
     rules, sources = [], {}
     for row in (book or {}).get("rules", []):
         r = to_hook_rule(row)
@@ -2466,7 +2199,21 @@ def scope_ok(rule, repo, gitdir):
     return scope in repo or (gitdir and f"/{scope}/" in gitdir)
 
 
-# ── server: fetch + flush (lazy imports — the pre/post lanes never pay for them) ──
+# ── server: fetch + flush (lazy imports — the pre/post lanes pay for them only
+#    when an upgrade notice is on disk; see upgrade_status) ──
+
+# plugin_compatibility.STATE_DIR, named here because importing that module
+# pulls in _memhub_auth (~35 ms); tests hold the two equal. When the module is
+# already loaded (a caller in this process, a test that repoints it), its own
+# value wins.
+_COMPAT_DIR = os.path.normpath(os.path.join(os.path.expanduser("~"), ".config", "memhub-plugin", "compatibility"))
+
+
+def _compat_dir():
+    mod = sys.modules.get("plugin_compatibility")
+    return str(getattr(mod, "STATE_DIR", _COMPAT_DIR)) if mod else _COMPAT_DIR
+
+
 def _api():
     """(rest_base, bearer, mcp_http) or None. Non-interactive: a hook can only
     spend a credential /memhub:login already minted."""
@@ -2488,6 +2235,14 @@ def _upgrade_scope(api):
 def upgrade_status(repo):
     # A rejection from capture/search also suspends cached rules, even if a
     # fresh Rulebook cache would otherwise avoid a network fetch this session.
+    # Both notices are local files, and the credential only says WHICH file
+    # is ours; with none on disk the answer is None without resolving it.
+    try:
+        has_compat = any(n.endswith(".json") for n in os.listdir(_compat_dir()))
+    except OSError:
+        has_compat = False
+    if not has_compat and not os.path.exists(book_path(repo) + ".upgrade"):
+        return None
     try:
         api = _api()
         if api:
@@ -2564,25 +2319,14 @@ def show_upgrade(repo, session, event):
 def fetch_book(repo, timeout=None):
     """GET /rules?repo=<repo>&view=hook with If-None-Match.
 
-    No `status=` param: `view=hook` serves ACTIVE rules on its own, and the
-    server's filter grammar changed under us once already (a bare
-    `status=active` became a 400), taking every book fetch down silently.
-    Not sending the parameter is the one form no grammar change can break.
-    200 → rewrite the cache; 304 → touch fetched_at (the book is confirmed
-    current, which is what §5.3 gate freshness measures); anything else →
-    the cache is left exactly as it was.
+    No `status=` param: `view=hook` serves ACTIVE rules on its own, and a
+    server filter-grammar change once turned it into a silent 400.
+    200 → rewrite the cache; 304 → touch fetched_at (confirmed current, what
+    §5.3 gate freshness measures); anything else → the cache is untouched.
 
-    `hook_version` rides along so the SERVER can enforce a rule's
-    `min_hook_version`. That floor cannot be enforced only here, and saying so
-    plainly: the check lives in code that exists only in the hook it is
-    protecting against. A 0.53 hook does not know the field, loads the rule
-    anyway, and its ordering engine ignores the condition it cannot read — the
-    exact 0.40.1 shape. What the local check buys is FORWARD skew (this hook
-    reading a rule written for a later one); the backstop for hooks already
-    installed has to be the server serving them an advice-only representation,
-    and it cannot do that without being told who is asking. An older hook
-    sends no version, which is itself the signal that it predates the field.
-    The shared backend contract verifies support for this query field.
+    `hook_version` rides along so the SERVER can enforce `min_hook_version`
+    for hooks too old to check it themselves (see `degradation`); an older
+    hook sends none. The shared backend contract verifies this query field.
     A structured 426 suspends cached rules and records an agent-visible upgrade
     notice. Only a subsequent valid 200/304 response clears that notice."""
     api = _api()
@@ -2617,21 +2361,15 @@ def fetch_book(repo, timeout=None):
         _breadcrumb("fetch", f"HTTP {reply.status}: unexpected reply shape")
 
 
-# ── what leaves the machine on the recall path ─────────────────────────────
+# ── credentials out of command text ────────────────────────────────────────
 #
-# `/recall` is the one lane that sends content rather than identifiers: the
-# server's relevance judge decides whether an anchor rule applies to THIS call,
-# and it cannot do that from a rule id. So the command line goes with it.
-#
-# A command line is also where credentials live — `curl -H "Authorization:
-# Bearer …"`, `psql postgres://user:pw@host`, `--token=…`. Those are worth
-# nothing to the judge and must not reach a model, so they are replaced before
-# the POST. `shell_only` has already dropped heredoc bodies by this point, so
-# what remains is the shell line itself.
+# A command line is where credentials live — `curl -H "Authorization: Bearer
+# …"`, `psql postgres://user:pw@host`, `--token=…`. Wherever command text is
+# about to leave the machine (the judge's call excerpt, an override reason,
+# the harness window) those values are replaced first.
 #
 # This is a denylist and cannot be complete — the docstring and the README say
-# so, and `MEMHUB_RULEBOOK_RECALL=0` turns the lane off entirely for anyone who
-# would rather not send command text at all. It is a floor, not a guarantee.
+# so. It is a floor, not a guarantee.
 _REDACTIONS = (
     # `--token=x`, `--password x`, `API_KEY=x` — the value, not the flag, so the
     # judge still sees that a credential was passed. A quoted value
@@ -2685,36 +2423,38 @@ def redact_secrets(text):
     return text
 
 
-RECALL_TIMEOUT_S = _timeout(1.5)   # inside the PreToolUse hook budget; fail open past it
+# Anchor rules (§4.7), matched here against the cached book. An anchor fires
+# when it appears in the call's command or path as a WHOLE identifier: not
+# preceded by an identifier character other than `/` (so `SKILL.md` matches
+# `skills/x/SKILL.md` and a relative path matches the tail of an absolute one),
+# and not followed by any (so `agent-plugins` does not match
+# `agent-plugins-internal`). An anchor ending in `/` names a directory and
+# also matches any path under it. Case-sensitive, literal. Whether the rule fits the
+# call is the judge's question (`judge_fires`), not this one's.
+_ANCHOR_RX = {}
 
 
-def recall_anchor_rules(repo, tool, handles, already_fired):
-    """POST /recall — the server runs the book's anchor rules through xmem's
-    directive funnel (identifier extraction → exact anchor match → the SLM
-    relevance judge). Returns the kept server ROWS (not ids: the reply
-    carries title/statement/version/anchors, which is a whole rule, and the
-    caller needs them for a rule its cached book does not have yet), or [] on
-    ANY failure: an anchor being present is not relevance, and a judge outage
-    is never a reason to block or slow the call."""
-    try:
-        api = _api()
-        if not api:
-            return []
-        base, bearer, http = api
-        body = {"tool": tool, "args": handles, "repo": repo,
-                "already_fired": list(already_fired)[:200], "limit": MAX_ADVISE}
-        reply = http.rest(f"{base}{API_PATH}/recall", bearer, "POST", body=body,
-                          timeout=RECALL_TIMEOUT_S)
-        if reply.status != 200 or not isinstance(reply.data, dict):
-            return []
-        # The lane's only record of working. Zero kept rules is still a success:
-        # what is being retracted is "recall is failing", not "a rule matched".
-        _breadcrumb_clear("recall")
-        return [r for r in reply.data.get("rules") or []
-                if isinstance(r, dict) and r.get("rule_id")]
-    except Exception as exc:
-        _breadcrumb("recall", exc)
+def anchor_rx(anchor):
+    """The compiled whole-identifier pattern for one anchor, once per run;
+    None for an anchor with nothing left to match (a bare `/`)."""
+    if anchor not in _ANCHOR_RX:
+        core = anchor.rstrip("/")
+        tail = r"(?:/|(?![A-Za-z0-9_./-]))" if anchor.endswith("/") else r"(?![A-Za-z0-9_./-])"
+        _ANCHOR_RX[anchor] = re.compile(
+            r"(?<![A-Za-z0-9_.-])" + re.escape(core) + tail) if core else None
+    return _ANCHOR_RX[anchor]
+
+
+def anchor_hits(rule, text):
+    """The anchors of `rule` that appear in `text` as whole identifiers."""
+    if not text:
         return []
+    out = []
+    for a in rule.get("anchors") or []:
+        rx = anchor_rx(a) if isinstance(a, str) else None
+        if rx is not None and rx.search(text):
+            out.append(a)
+    return out
 
 
 # ── the rule judge (rule-judge-spec §3, §5) ────────────────────────────────
@@ -2725,14 +2465,15 @@ def recall_anchor_rules(repo, tool, handles, already_fired):
 # answer also changes what is shown is the server's call, per reply: `enforce`
 # false (shadow) changes nothing here.
 #
-# This is the second lane that sends content, and it sends more than recall:
-# the person's message and the stripped turn. Everything goes through
+# This is the lane that sends content: the call's command or path, the
+# person's message and the stripped turn. Everything goes through
 # `judge_redact` first, and `MEMHUB_RULEBOOK_JUDGE=0` turns the lane off.
 JUDGE_TIMEOUT_S = _timeout(1.5)    # inside the hook budget; past it nothing is judged
 JUDGE_MAX_RULES = 10               # the server refuses a longer `rules`
 JUDGE_BACKOFF_S = 600              # an org with the judge off is asked this often, not per call
 JUDGE_CALL_CHARS = 600
 JUDGE_MATCHED_CHARS = 200
+JUDGE_RESULT_CHARS = 3000          # the output an output rule matched; the server takes 4000
 JUDGE_ID_CHARS = 200               # repo / session_id / turn_id, the server's bound
 JUDGE_VERDICTS = frozenset({"fit", "no_fit", "timeout", "failed", "no_rule", "disabled"})
 # Matcher rules and anchor rules. Not `ordering` (an obligation the state
@@ -2750,7 +2491,69 @@ def judge_redact(text):
     if not text:
         return ""
     import redact  # noqa: PLC0415 — beside this file
-    return redact_secrets(redact.redact_identities(redact.redact_text(text)))
+    return redact_echoes(text, redact_secrets(redact.redact_identities(redact.redact_text(text))))
+
+
+def judge_result_excerpt(rule, rtext):
+    """The part of a tool's output an OUTPUT rule fired on, for the judge.
+
+    The judge reads the turn from the transcript, and the call's result is
+    written there after this hook returns — so without this the judge saw the
+    command and "output pattern" and nothing else, and held back nearly every
+    output fire (24 of 25 locally, real `timeout: command not found` among
+    them). Centred on the rule's own match, searched the way `evaluate` does
+    (`re.M`, over the same head and tail spans); the tail when nothing matches.
+    Not redacted here: the caller redacts every field it sends."""
+    if not rtext:
+        return ""
+    half = JUDGE_RESULT_CHARS // 2
+    if len(rtext) <= 2 * RESULT_WINDOW_CHARS:
+        spans = ((0, rtext),)
+    else:
+        spans = ((0, rtext[:RESULT_WINDOW_CHARS]),
+                 (len(rtext) - RESULT_WINDOW_CHARS, rtext[-RESULT_WINDOW_CHARS:]))
+    for offset, span in spans:
+        try:
+            m = re.search(rule["rx"], span, re.M) if rule.get("rx") else None
+        except (re.error, TypeError):
+            m = None
+        if m:
+            at = offset + m.start()
+            lo = max(0, at - half)
+            return rtext[lo:lo + JUDGE_RESULT_CHARS]
+    return rtext[-JUDGE_RESULT_CHARS:]
+
+
+_ECHO_TOKEN = re.compile(r"[A-Za-z0-9_\-./+]{8,}")
+
+
+def redact_echoes(original, redacted):
+    """Redact every further copy of a value the denylists redacted once.
+
+    The denylists find a secret by its position (`Bearer X`, `--api-key=X`),
+    so the same X written bare elsewhere in the text, say in the person's own
+    message ("X is the staging key"), was sent verbatim. A token that occurs
+    fewer times after redaction than before was a secret somewhere, so it goes
+    everywhere. Tokens under 8 characters are left alone: too common to be
+    worth the false positives."""
+    if not original or not redacted:
+        return redacted
+    return scrub_tokens(redacted, redacted_tokens(original, redacted))
+
+
+def redacted_tokens(original, redacted):
+    """The tokens of `original` that redaction removed at least one copy of."""
+    if not original or not redacted:
+        return set()
+    return {tok for tok in set(_ECHO_TOKEN.findall(original))
+            if redacted.count(tok) < original.count(tok)}
+
+
+def scrub_tokens(text, tokens):
+    for tok in tokens:
+        if text and tok in text:
+            text = text.replace(tok, "<redacted>")
+    return text
 
 
 def judgeable(rule):
@@ -2771,8 +2574,7 @@ def judge_matched_on(rule, ev, handle, root):
     matcher rule: its event, as the server names it, and the file when the
     event that fired it was an edit or a read of one. Not yet redacted."""
     if rule.get("on") == "anchor":
-        low = (handle or "").lower()
-        hit = [a for a in rule.get("anchors") or [] if isinstance(a, str) and a.lower() in low]
+        hit = anchor_hits(rule, handle)
         return "anchor '%s'" % ", ".join(hit) if hit else "anchor"
     out = "%s pattern" % ("output" if rule.get("on") == "result" else rule.get("on"))
     path = (ev or {}).get("fp") or ""
@@ -2888,12 +2690,21 @@ def judge_fires(st, data, *, repo, session, tool, cmd, fp, root, fired_now, fire
         answered = {}
         if ask and not judge_backed_off():
             handle = shell_only(cmd) if tool == "Bash" and cmd else fp
+            # An output rule fired on this call's result, which the transcript
+            # does not hold yet: hand the judge the part it fired on.
+            results = [{"kind": "result", "text": judge_redact(judge_result_excerpt(
+                r, (fired_on.get(r["id"]) or {}).get("rtext") or ""))}
+                for r in ask if r.get("on") == "result"]
+            results = [e for e in results if e["text"]][:1]
+            # The server refuses more than MAX_ENTRIES; the newest are kept.
+            prior = (turn.get("turn") or [])[len(results) - rule_judge_turn.MAX_ENTRIES:] \
+                if results else (turn.get("turn") or [])
             body = {
                 "repo": str(repo or "")[:JUDGE_ID_CHARS],
                 "session_id": str(session or "")[:JUDGE_ID_CHARS],
                 "turn_id": turn_id,
                 "person_request": turn.get("person_request") or "",
-                "turn": turn.get("turn") or [],
+                "turn": prior + results,
                 "call": {"tool": str(tool or "")[:200],
                          "text": judge_redact(handle)[:JUDGE_CALL_CHARS]},
                 "rules": [{"rule_id": str(r["id"]),
@@ -2901,6 +2712,15 @@ def judge_fires(st, data, *, repo, session, tool, cmd, fp, root, fired_now, fire
                                r, fired_on.get(r["id"]), handle, root))[:JUDGE_MATCHED_CHARS]}
                           for r in ask],
             }
+            # Each field was redacted on its own, so a secret the call shows in a
+            # credential position (`--api-key=X`) and the person's message shows
+            # bare ("X is the key") would survive in the message. Carry the
+            # call's redacted values across the whole body.
+            secrets = redacted_tokens(handle, judge_redact(handle))
+            if secrets:
+                body["person_request"] = scrub_tokens(body["person_request"], secrets)
+                body["turn"] = [dict(e, text=scrub_tokens(e.get("text") or "", secrets))
+                                if isinstance(e, dict) else e for e in body["turn"]]
             reply = ask_judge(body)
             if reply is not None:
                 got, enforce = reply
@@ -3108,10 +2928,10 @@ def _breadcrumb(what, exc):
 def _breadcrumb_clear(what):
     """Retract the breadcrumb once ``what``'s own lane has worked again.
 
-    Without this a lane that records no success of its own — recall — leaves a
-    single blip standing until some OTHER lane happens to succeed. Recall runs
-    on PreToolUse and the book is only refetched at SessionStart, so one 1.5 s
-    timeout mid-session reliably produced a health banner at the next session
+    Without this a lane that records no success of its own — the judge — leaves
+    a single blip standing until some OTHER lane happens to succeed. The judge
+    runs on PreToolUse and the book is only refetched at SessionStart, so one
+    1.5 s timeout mid-session would produce a health banner at the next session
     start, long after the lane had recovered. A warning that outlives its cause
     is the failure mode this file exists to avoid.
 
@@ -3291,6 +3111,8 @@ def flush_fires(final=False):
         lock.close()
         return
     try:
+        L = rulebook_ledger   # drop confirmed rows from a ledger past 1 MB
+        L and L.rotate(ldir, [x[:2] for x in LEDGERS], _LEDGER_TAIL_BYTES)
         sent = load_sent()
         plan = [(ledger, pending_batches(sent, ledger)[0]) for ledger in LEDGERS]
         legacy, legacy_sent = legacy_verdict_batches(sent)
@@ -3411,6 +3233,8 @@ def _repo_name(root, gitdir):
     if repo_identity is None:
         return os.path.basename(root)
     try:
+        if _rc:
+            return _rc.repo_name(BASE, root, gitdir, repo_identity.resolve)
         return repo_identity.repo_name(root, gitdir)
     except Exception:
         return os.path.basename(root)
@@ -3491,6 +3315,18 @@ def repo_of_call(data):
     with nothing acted on stays silent exactly as before."""
     cwd = data.get("cwd") or os.getcwd()
     seed = _acted_on_dir(cwd, data.get("tool_input") or {})
+    if not seed and data.get("tool_name") == "apply_patch":
+        # Codex edits name their files inside the patch text, not in file_path,
+        # so the parent-folder workflow above resolved nothing on Codex and its
+        # edit rules stayed inert. The first patched file that passes the same
+        # containment checks decides the checkout.
+        try:
+            for path, _new, _added in apply_patch_files(data.get("tool_input") or {}, cwd):
+                seed = _acted_on_dir(cwd, {"file_path": path})
+                if seed:
+                    break
+        except (OSError, ValueError):   # payload strings are untrusted
+            seed = ""
     if seed:
         info = repo_info(seed)
         if info[0]:
@@ -3713,7 +3549,23 @@ _HARNESS_PROMPT_RX = re.compile(
     r"|local-command-stderr|local-command-caveat|system-reminder|task-notification)>"
     r"|This session is being continued"
     r"|Caveat: The messages below"
-    r"|Base directory for this skill:)")
+    r"|Base directory for this skill:"
+    r"|Another Claude session sent a message:)")
+
+# Another agent's message: a subagent's hand-back, or another session's
+# SendMessage, delivered as a user-role prompt. The same sentence
+# `harness_extract` already treats as harness. Nobody typed it, so unlike a
+# wake-up (`<task-notification>`, which `prompt` rules exist to speak at) it
+# is no moment for a prompt rule either: a rule written for "the person asked
+# X" fired on a subagent's report that merely mentioned X.
+_AGENT_MESSAGE_RX = re.compile(r"\s*Another Claude session sent a message:")
+
+
+def agent_message(text):
+    """True when this UserPromptSubmit is another agent's message — see
+    `_AGENT_MESSAGE_RX`. It neither arms an obligation (it is harness text)
+    nor fires a `prompt` rule."""
+    return bool(_AGENT_MESSAGE_RX.match(text or ""))
 
 
 def harness_prompt(text):
@@ -4309,9 +4161,11 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
     if portable_lock is None:
         # Enforcement still runs, but do not create telemetry that cannot drain.
         return {}
-    ids = {}
+    ids, L = {}, rulebook_ledger
+    lock = None
     try:
         path = os.path.join(_ledger_dir(), "fires.jsonl")
+        lock = L and L.append_lock(_ledger_dir())   # no rotation mid-append
         with open(path, "a", encoding="utf-8") as f:
             for r in rules:
                 fid = str(uuid.uuid4())
@@ -4341,6 +4195,8 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                 }) + "\n")
     except Exception:
         pass
+    finally:
+        L and L.release(lock)
     return ids
 
 
@@ -4363,8 +4219,13 @@ def log_event(ctx, kind, *, rule_id=None, reason=None, worktree=None, at=None):
                "worktree": worktree if worktree is not None or kind == "receipt" else ctx.get("worktree"),
                "repo": ctx.get("repo"), "branch": ctx.get("branch"),
                "reason": reason, "at": at or _now()}
-        with open(os.path.join(_ledger_dir(), "events.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        L = rulebook_ledger
+        lock = L and L.append_lock(_ledger_dir())   # no rotation mid-append
+        try:
+            with open(os.path.join(_ledger_dir(), "events.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        finally:
+            L and L.release(lock)
         return row["event_id"]
     except Exception:
         return None
@@ -4487,7 +4348,8 @@ def books_line(carried):
         if not rid:
             continue
         if rid not in books:
-            books[rid] = {"name": r.get("_book_name"), "n": 0, "rank": book_rank(r),
+            books[rid] = {"name": r.get("_book_label") or r.get("_book_name"), "n": 0,
+                          "rank": book_rank(r), "kind": r.get("_book_kind"),
                           "scope": r.get("_book_scope"), "members": r.get("_book_members")}
             order.append(rid)
         books[rid]["n"] += 1
@@ -4496,7 +4358,10 @@ def books_line(carried):
     parts = []
     for rid in sorted(order, key=lambda i: (books[i]["rank"], (books[i]["name"] or "").casefold())):
         b = books[rid]
-        if b["scope"] == "all_org":
+        # An org/personal label already says who it reaches.
+        if b["kind"] in ("org", "personal"):
+            who = None
+        elif b["scope"] == "all_org":
             who = "org-wide"
         elif isinstance(b["members"], int):
             who = f"{b['members']} member{'s' if b['members'] != 1 else ''}"
@@ -4520,13 +4385,10 @@ def session_digest(rules, repo, gitdir, ctx):
     # Spec §2: at most MAX_POSTURE session rules and ~2k tokens per scope.
     # ONE budget across every book the caller is in (container spec §13.1) —
     # books do not know about each other, so four of them could otherwise blow
-    # a cap each of them believes it is under. The wider book spends first
-    # (§11), then title, then id: deterministic rather than book order, and
-    # every rule past either limit is logged SUPPRESSED so the ledger sees it.
-    posture_all = sorted((r for r in in_scope if r.get("on") == "session"),
-                         key=lambda r: (book_rank(r),
-                                        str(r.get("_label") or r.get("title") or r["id"]).casefold(),
-                                        str(r["id"])))
+    # a cap each of them believes it is under. The books take turns
+    # (`posture_order`), and every rule past either limit is logged SUPPRESSED
+    # so the ledger sees it.
+    posture_all = posture_order([r for r in in_scope if r.get("on") == "session"])
     posture, cut, used = [], [], 0
     for r in posture_all:
         cost = len(r.get("text") or "") + len(r.get("why") or "")
@@ -4582,8 +4444,8 @@ def refresh_if_stale(repo, rules, fetched_at, sources):
     old enough to be wrong.
 
     Only when stale: a book younger than the pre lane's refresh window is
-    already current, so the common case keeps the detached spawn and pays
-    nothing. A stale one is worth waiting for, bounded by
+    current, so the common case starts nothing (no child). A stale one is
+    worth waiting for, bounded by
     SESSION_FETCH_TIMEOUT_S — `fetch_book` leaves the cache untouched on every
     failure path, so a timeout proceeds with exactly what we already had.
 
@@ -4597,8 +4459,6 @@ def refresh_if_stale(repo, rules, fetched_at, sources):
         if _age_s(fetched_at) >= REFRESH_AFTER_S:
             fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
             rules, _, fetched_at, sources = load_rules(repo)
-        else:
-            spawn_fetch(repo)
     except Exception:
         pass
     return rules, fetched_at, sources
@@ -4780,6 +4640,8 @@ def main():
                        "host": _host_arg()}, kind,
                       at=turn_end_at(session, started, data.get("transcript_path")))
         flush_fires(final=final)
+        if _rbp:
+            _rbp.drain_legacy(globals(), final)  # the pre-keying shared ledger
         # Once a day, delete the plugin's local state nothing will read again
         # (state_sweep.py). Only on the real install: an overridden base is a
         # test, or create-rule's private forward-test base, and neither may
@@ -4815,8 +4677,7 @@ def main():
                     "formal rules cannot identify that checkout. For repository "
                     "shell commands, use an explicit, shell-quoted absolute "
                     "`cd <repo> && ...` prefix (including when workdir is set), "
-                    "or start the task in the repository. Contextual directive "
-                    "recall is separate from formal Rulebook evaluation."
+                    "or start the task in the repository."
                 )}}))
         return 0
     if mode == "fetch":
@@ -4860,7 +4721,7 @@ def main():
             # A wake-up is not worth making the session wait for the server:
             # it recurs, and the detached refresh reaches the next one.
             maybe_refresh(repo, fetched_at)
-        if text:
+        if text and not agent_message(text):
             prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text)
         return 0
     # Repo facts answer about the tree the COMMAND runs in; which rules bind
@@ -4887,7 +4748,7 @@ def main():
         # from the cache first made it show the PREVIOUS session's rules: a rule
         # activated or paused on the server needed two session starts to appear
         # or to go away. A book younger than the pre lane's refresh window is
-        # already current, so it keeps the detached spawn and SessionStart pays
+        # already current, so SessionStart fetches nothing and spawns
         # nothing — the common case, since the pre lane refreshed it minutes
         # ago. Only a stale book is worth waiting for, and never longer than
         # SESSION_FETCH_TIMEOUT_S: `fetch_book` leaves the cache untouched on
@@ -4939,11 +4800,13 @@ def main():
     fp = str(inp.get("file_path", ""))
     body = str(inp.get("new_string", "")) + str(inp.get("content", "")) + \
         "\n".join(str(e.get("new_string", "")) for e in (inp.get("edits") or []) if isinstance(e, dict))
+    added = edit_added_text(inp)
     # Codex's apply_patch: one Edit/Write event per file it names (below).
     patched = apply_patch_files(inp, cwd) if tool == "apply_patch" else []
     if patched:
         fp = patched[0][0]
         body = "\n".join(text for _, _, text in patched)
+        added = None
     # §5.3: the edit lane's own override. Which gates it actually excuses is
     # decided once the gates are known — a marker naming a rule excuses that
     # rule only.
@@ -4964,7 +4827,7 @@ def main():
     # then receipt — the other order would arm an obligation the same call
     # already discharged.
     real = {"tool": tool, "phase": mode, "order_phase": mode, "cmd": cmd, "fp": fp,
-            "body": body, "rtext": rtext, "resp": resp, "via": None, "read": None}
+            "body": body, "added": added, "rtext": rtext, "resp": resp, "via": None, "read": None}
     events = []
     if tool == "Bash":
         marks = st.setdefault("bash_t0", {})
@@ -5026,7 +4889,12 @@ def main():
     # fire's instant answers it. The old obligation logic converted only fires
     # already open; skipping the rules THIS call fires is the same statement.
     converted_hits = []
-    if mode == "post":
+    # The branch diff costs ~20 git calls (finding the base branch is most of
+    # it), so it is only taken when a `spec_untouched` entry for this root and
+    # branch is waiting to be answered; with none, the loop below finds nothing.
+    if mode == "post" and any(
+            isinstance(p, dict) and p.get("root") == probe_root and p.get("branch") == probe_branch
+            for p in st["spec_pending"].values()):
         changed = probes.diff_paths()
         if changed is not None:
             for rule in rules:
@@ -5069,33 +4937,31 @@ def main():
     marks = {"fired": list(st["fired"]), "counts": dict(st["counts"]),
              "spec_pending": dict(st["spec_pending"])}
 
-    # Anchor rules (§4.7): one server call per tool call, only when the book has
-    # an active anchor rule in scope and the call carries a handle. The server
-    # matches anchors AND judges relevance; the hook just injects what it kept.
-    anchor_rules = {r["id"]: r for r in rules if r.get("on") == "anchor"
-                    and r.get("status", "active") == "active" and scope_ok(r, repo, gitdir)
-                    and r["id"] not in st["fired"]}
-    handles = {}
+    # Anchor rules (§4.7): matched locally, against the command (heredoc
+    # bodies dropped, credentials redacted, ≤ 400 chars — the text the judge is
+    # shown) or the edited file's path. Same filters the server applied: active,
+    # repo scope, path scope, not yet fired this session. Book order; the
+    # advisory cap below keeps at most MAX_ADVISE of them on screen.
+    # `MEMHUB_RULEBOOK_RECALL=0` turns the lane off.
+    handle, apath = "", ""
     if tool == "Bash" and cmd:
-        handles["command"] = redact_secrets(shell_only(cmd))[:400]
+        handle = redact_secrets(shell_only(cmd))[:400]
     elif (tool in EDIT_TOOLS or patched) and fp:
-        handles["file_path"] = fp
-    if mode == "pre" and anchor_rules and handles \
-            and os.environ.get("MEMHUB_RULEBOOK_RECALL", "1") != "0":
-        for row in recall_anchor_rules(repo, tool, handles, st["fired"]):
-            rid = str(row.get("rule_id"))
-            # Prefer the cached rule — it carries scope and the book facts the
-            # wire row omits. Otherwise build one from the reply: the server
-            # matched this rule, judged it relevant and scoped it to this repo,
-            # and dropping it because our book predates it is exactly how a
-            # newly activated anchor rule stayed silent until the next fetch.
-            # Safe unseen: recall rules can only advise (server §4.7) and
-            # `to_hook_rule` defaults `mode` to advise, so no gate arrives here.
-            r = anchor_rules.get(rid) or to_hook_rule(row)
-            if r is not None and r.get("on") == "anchor":
-                st["fired"].append(rid)
-                dedup_keys[rid] = rid
-                fired_now.append(r)
+        handle = apath = fp
+    if mode == "pre" and handle and os.environ.get("MEMHUB_RULEBOOK_RECALL", "1") != "0":
+        n_anchor = 0
+        for r in rules:
+            if n_anchor >= MAX_ADVISE:
+                break
+            if r.get("on") != "anchor" or r.get("status", "active") != "active" \
+                    or r["id"] in st["fired"] or not scope_ok(r, repo, gitdir) \
+                    or not path_in_scope(r, apath, root) \
+                    or not anchor_hits(r, handle):
+                continue
+            st["fired"].append(r["id"])
+            dedup_keys[r["id"]] = r["id"]
+            fired_now.append(r)
+            n_anchor += 1
 
     fired_on = {}          # rule id → the event that fired it (its path, for the ledger and the line)
     for ev in events:
@@ -5169,7 +5035,7 @@ def main():
             key = rid if not scope.startswith("branch") else f"{rid}:{branch}"
             # the regex first (pure, cheap), the given second (probes run only now)
             matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
-                               body=ebody, result_text=ev["rtext"]) \
+                               body=ebody, result_text=ev["rtext"], added=ev.get("added")) \
                 and given_ok(r, probes, read=ev.get("read"))
             if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
                 if matched:
@@ -5343,12 +5209,9 @@ def main():
     # on one call. Stable, so one book's rules keep their order and a backend
     # with no book facts ranks every rule alike and is unaffected.
     #
-    # An anchor rule outranks book width, and is not an exception to "wider
-    # wins" so much as a different question. A matcher rule fired because a
-    # regex matched; an anchor rule fired because the server spent a round trip
-    # and its relevance judge said THIS call. Letting two org-wide regexes
-    # displace it throws that judgment away — and the rule is already marked
-    # spent for the session by then, so it is not offered again.
+    # An anchor rule outranks book width: it fires at most once per session
+    # (it is marked spent as soon as it matches), so letting two org-wide
+    # regexes displace it means it is never offered again.
     advisories = sorted((r for r in fired_now if r["id"] not in gate_ids),
                         key=lambda r: (0 if r.get("on") == "anchor" else 1, book_rank(r)))
     # the advisory cap never cuts a gate — a silently un-gated push is the one
@@ -5526,6 +5389,10 @@ def main():
     return 0
 
 if __name__ == "__main__":
+    try:
+        import rulebook_cache as _rc
+    except Exception:
+        pass
     try:
         rc = main()
     except BaseException:

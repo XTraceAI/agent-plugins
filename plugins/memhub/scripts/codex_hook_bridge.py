@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stable user-hook trampoline for Codex releases without plugin hooks.
 
-The setup skill copies this file to ``$CODEX_HOME/memhub_hook_bridge.py``.
+The onboard skill (``setup_codex_hooks.py install``) copies this file to ``$CODEX_HOME/memhub_hook_bridge.py``.
 User-level hooks can then survive plugin upgrades: this trampoline resolves the
 newest installed MemHub version at invocation time and dispatches into it.
 """
@@ -72,7 +72,7 @@ _UNRESOLVED = "plugin_root_unresolved"
 _UNRESOLVED_MESSAGE = (
     "MemHub: this Codex install is missing the plugin's script files, so "
     "session capture and Rulebook telemetry are OFF. Reinstall the MemHub "
-    "plugin, then run the memhub:setup skill to confirm it is healthy."
+    "plugin, then run the memhub:onboard skill to confirm it is healthy."
 )
 
 

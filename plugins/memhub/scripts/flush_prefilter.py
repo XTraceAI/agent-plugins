@@ -8,8 +8,8 @@ hook JSON — cheap, but it passes when e.g. a `cat`'s stdout merely contains
 runs a commit / PR action, including flagged variants (`git -C <path>
 commit`, `git -c k=v commit`) and compound commands (`cd x && git commit`).
 
-Runs under the system python3 (no uv, no deps) so the expensive
-`uv run ... flush_session.py` spawn only happens on true triggers.
+Runs under the system python3 (stdlib only) so the heavier
+`flush_session.py` run only happens on true triggers.
 """
 from __future__ import annotations
 

@@ -1519,7 +1519,7 @@ def _negative_ttl_s() -> float:
     The module constant is the fallback, so a test that monkeypatches
     ``NEGATIVE_TTL_S`` still steers this.
     """
-    raw = os.environ.get(NEGATIVE_TTL_ENV, "").strip()
+    raw = os.environ.get("MEMHUB_PRLINK_NEGATIVE_TTL_S", "").strip()  # NEGATIVE_TTL_ENV
     if not raw:
         return float(NEGATIVE_TTL_S)
     try:
@@ -1569,7 +1569,8 @@ def _cache_path(api_base: str, scope: str = "", identity: str = "") -> Path:
     it scopes the entry.
 
     ``identity`` is the third: which org answers is ultimately decided by the
-    BEARER, and `resolve_bearer` prefers $MEMHUB_TOKEN, then a stored personal
+    BEARER, and `resolve_bearer` prefers an explicit token (the userConfig
+    option, or $MEMHUB_TOKEN where the build reads it), then a stored personal
     access key, then a cached OAuth token — so the identity behind a check can
     change without the user doing anything deliberate. Without it, a negative
     earned under one identity silenced every later identity on the same machine

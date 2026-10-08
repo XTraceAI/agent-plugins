@@ -103,6 +103,32 @@ def test_the_catalog_is_well_formed() -> None:
             check(f"{r['id']}: ships a fires case", bool((r.get("cases") or {}).get("fires")))
             check(f"{r['id']}: ships a silent case", bool((r.get("cases") or {}).get("silent")))
         check(f"{r['id']}: title is 3-8 words", 3 <= len(r["title"].split()) <= 8, r["title"])
+        # What the rule judge reads (rule-judge-spec §2). A rule without `when` / `do` is judged on its
+        # statement alone; a field over its cap is refused by create_rule, not truncated.
+        when, do, not_for = r.get("when"), r.get("do"), r.get("when_not", [])
+        check(f"{r['id']}: says the situation it is for (`when`, at most 300 characters)",
+              isinstance(when, str) and 0 < len(when.strip()) <= 300, str(when))
+        check(f"{r['id']}: says what it asks (`do`, at most 400 characters)",
+              isinstance(do, str) and 0 < len(do.strip()) <= 400, str(do))
+        check(f"{r['id']}: `when_not` is at most 8 situations of at most 200 characters, and never an empty list",
+              "when_not" not in r or (isinstance(not_for, list) and 0 < len(not_for) <= 8
+                                      and all(isinstance(x, str) and 0 < len(x.strip()) <= 200 for x in not_for)))
+        # A situation is what the agent is doing, never the pattern's own words: no regex syntax in it.
+        check(f"{r['id']}: `when` / `when_not` are prose, not a pattern",
+              not re.search(r"\\[sbdwS]|\(\?|\[\^", " ".join([str(when)] + list(not_for))))
+
+
+def _judge_fields(cands: list, name: str) -> None:
+    """Every seeded body carries the rule judge's fields, filled and inside the server's caps."""
+    for c in cands:
+        b = c["body"]
+        check(f"{name}/{c['id']}: the body carries `when` and `do`", bool(b.get("when")) and bool(b.get("do")))
+        check(f"{name}/{c['id']}: when <= 300, do <= 400, why <= 400",
+              len(b.get("when", "")) <= 300 and len(b.get("do", "")) <= 400 and len(b.get("why", "")) <= 400)
+        check(f"{name}/{c['id']}: when_not is at most 8 entries of at most 200 characters",
+              len(b.get("when_not", [])) <= 8 and all(0 < len(x) <= 200 for x in b.get("when_not", ["x"])))
+        check(f"{name}/{c['id']}: no slot is left unfilled in a judge field",
+              "{{" not in json.dumps([b.get(k) for k in ("when", "when_not", "do", "why")]))
 
 
 def test_a_python_service_seeds_every_rule_and_all_of_them_verify() -> None:
@@ -133,6 +159,25 @@ def test_a_python_service_seeds_every_rule_and_all_of_them_verify() -> None:
         check("notes and anchors carry no mode (they cannot gate; advise is the default)",
               all("mode" not in c["body"] for c in cands if c["body"]["delivery"] != "agent_hook"))
         check("every statement fits the server's 400-character cap", all(len(c["body"]["statement"]) <= 400 for c in cands))
+        _judge_fields(cands, "python")
+        src = {r["id"]: r for r in CATALOG["rules"]}
+        check("a slot in `when` is filled as it is in the statement: the default branch",
+              "`trunk`" in by_id["push-main-refspec"]["when"] and "trunk" in by_id["push-main-refspec"]["why"])
+        check("…a number slot inside a sentence: the read threshold",
+              str(signals["slots"]["read_threshold"]) in by_id["read-large"]["when"]
+              and str(signals["slots"]["read_threshold"]) in by_id["read-large"]["statement"])
+        check("…and a per-record slot: the lockfile rule names its own manifest and lock",
+              "`pyproject.toml`" in by_id["lockfile-drift-uv"]["when"] and "`uv.lock`" in by_id["lockfile-drift-uv"]["when"]
+              and "`uv.lock`" in by_id["lockfile-drift-uv"]["do"])
+        check("`why` is the catalog's own reason, the one the statement ends in",
+              by_id["sleep-poll"]["why"] == src["sleep-poll"]["why"]
+              and by_id["sleep-poll"]["statement"].endswith("Why: " + by_id["sleep-poll"]["why"]))
+        check("a reason over 400 characters keeps its leading sentences, whole",
+              src["plan-only"]["why"].startswith(by_id["plan-only"]["why"]) and by_id["plan-only"]["why"].endswith(".")
+              and 0 < len(by_id["plan-only"]["why"]) <= 400 < len(src["plan-only"]["why"]))
+        check("`when_not` is carried where the catalog names an exclusion, and absent where it names none",
+              by_id["git-irreversible"]["when_not"] == src["git-irreversible"]["when_not"]
+              and "when_not" not in by_id["sleep-poll"])
         check("source_ref names the rule and catalog after '#'", by_id["push-main"]["source_ref"] == "starter-rulebook#push-main|catalog %s" % CATALOG["version"])
         # The server's re-file key base (reimport.source_ref_base): strip a hex @sha, cut at '#'. A version
         # in the base would make every catalog update file a twin of each rule instead of superseding it.
@@ -150,6 +195,7 @@ def test_a_node_repo_gets_node_commands_and_no_python_rules() -> None:
         bad = [r["id"] for r in rows if not r["ok"]]
         check("exit 0", p.returncode == 0, p.stdout[-600:] + p.stderr[-600:])
         check("every seeded rule verifies", not bad, ", ".join(bad))
+        _judge_fields(cands, "node")
         by_id = {c["id"]: c["body"] for c in cands}
         gone = {d["id"] for d in dropped}
         check("the test command is the package manager's", "pnpm" in by_id["suite-before-push"]["ordering"]["required_command_rx"])
@@ -168,6 +214,7 @@ def test_a_bare_repo_gets_only_the_universal_rules() -> None:
         bad = [r["id"] for r in rows if not r["ok"]]
         check("exit 0 with no toolchain at all", p.returncode == 0, p.stdout[-600:] + p.stderr[-600:])
         check("every seeded rule verifies", not bad, ", ".join(bad))
+        _judge_fields(cands, "bare")
         ids = {c["id"] for c in cands}
         check("safety survives with nothing to seed from", {"git-irreversible", "rm-rf-wipe", "secrets-read", "push-main"} <= ids)
         check("nothing that needs a test command is filed on a guess",
@@ -248,9 +295,13 @@ def test_the_skill_asks_before_it_reads_and_warns_before_it_waits() -> None:
     check("says the mined path takes time, and why", "going through your" in skill[ask:first_run] and "10–20" in skill[ask:first_run])
     check("says nothing turns on by itself", "nothing\nI file turns on by itself" in skill[ask:first_run] or "turns on by itself" in skill[ask:first_run])
     check("--all is only ever the person's ask", "only when they ask for all of" in skill)
-    check("a new book is the repo's own, named as create-rule names it, so both skills share one",
-          'create_rulebook(name: "Rulebook: <repo>"' in skill)
-    check("a book that binds nobody is a failure, not a success", "member_count: 0` as a FAILURE" in skill)
+    check("one scope for the whole batch, decided before anything is filed",
+          "one scope for the\nwhole batch" in skill)
+    check("…org-wide unless the person says otherwise, without asking",
+          "**Otherwise `org`** — do not ask" in skill)
+    check("…and the workspace scope only when they ask for it",
+          "never offer the\nworkspace scope unprompted" in skill)
+    check("the skill never makes a rulebook", "create_rulebook" not in skill)
 
 
 def test_an_unknown_default_branch_drops_the_push_rules_instead_of_guessing() -> None:
@@ -618,6 +669,45 @@ def test_a_rule_that_fails_verification_fails_the_run() -> None:
         rows = json.loads((Path(tmp) / "out" / "verified.json").read_text())
         check("exit 1", p.returncode == 1)
         check("and it names the rule", [r["id"] for r in rows if not r["ok"]] == ["sleep-poll"])
+
+
+def test_a_judge_field_the_server_would_refuse_fails_the_run() -> None:
+    """create_rule refuses a `when` / `do` / `why` / `when_not` over its cap; it does not truncate.
+    So the verify step holds the caps, and a rule with no situation at all is a catalog bug too."""
+    def _verify(mutate):
+        broken = json.loads(json.dumps(CATALOG))
+        mutate(next(r for r in broken["rules"] if r["id"] == "sleep-poll"))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make(BARE_REPO, Path(tmp) / "bare")
+            cat = Path(tmp) / "catalog.json"
+            cat.write_text(json.dumps(broken))
+            p = subprocess.run([sys.executable, str(SCRIPT), "all", "--repo", str(repo), "--out", str(Path(tmp) / "out"),
+                                "--catalog", str(cat)], capture_output=True, text=True, timeout=300)
+            load = lambda n: json.loads((Path(tmp) / "out" / n).read_text())
+            return p, load("candidates.json"), load("dropped.json"), load("verified.json")
+
+    for label, mutate, said in (
+            ("a `when` over 300 characters", lambda r: r.update(when="w" * 301), "`when` is over 300"),
+            ("a `do` over 400 characters", lambda r: r.update(do="d" * 401), "`do` is over 400"),
+            ("a `when_not` entry over 200 characters", lambda r: r.update(when_not=["n" * 201]), "`when_not` entry"),
+            ("nine `when_not` entries", lambda r: r.update(when_not=["no"] * 9), "over 8 entries"),
+            ("a rule with no `when`", lambda r: r.pop("when", None), "no `when`"),
+            ("a rule with no `do`", lambda r: r.pop("do", None), "no `do`")):
+        p, _, _, rows = _verify(mutate)
+        failed = [r for r in rows if not r["ok"]]
+        check(f"{label}: exit 1, and only that rule fails", p.returncode == 1 and [r["id"] for r in failed] == ["sleep-poll"])
+        check(f"…and the report says which field", any(said in line for r in failed for line in r["report"]),
+              str([r["report"][-2:] for r in failed]))
+
+    p, cands, dropped, rows = _verify(lambda r: r.update(when="The agent is about to wait on {{no_such_slot}}."))
+    check("a slot the scan cannot fill in `when` drops the rule, as it does in the statement",
+          "sleep-poll" not in {c["id"] for c in cands}
+          and [d["reason"] for d in dropped if d["id"] == "sleep-poll"] == ["the scan could not fill `no_such_slot`"])
+
+    p, cands, _, rows = _verify(lambda r: r.update(why="x" * 401))
+    body = next(c["body"] for c in cands if c["id"] == "sleep-poll")
+    check("a reason with no sentence that fits is left off, and the rule still files",
+          p.returncode == 0 and "why" not in body and body["when"] and body["do"])
 
 
 if __name__ == "__main__":

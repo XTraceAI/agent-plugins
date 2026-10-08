@@ -1,63 +1,93 @@
 {
  "version": "2026-09-20",
- "about": "The starter rulebook: universal coding-agent rules whose repo-specific parts are {{slots}} filled by starter_rulebook.py from a scan of the checkout. `requires` names the slots a rule cannot exist without; a rule whose slot is missing is dropped, never filed with a guess. `cases` are run through the live hook's engine after seeding. Patterns match at command position ({{CMD}} / {{GIT}}), never `^`; paths match `(?:^|/)dir/` because the hook sees absolute paths; no quantified group contains + * or | because the hook's load lint drops those. `same_as` names the session miner's built-in hypothesis (mine_sessions.py) that covers the same ground under a different title and pattern: the deterministic conflict check cannot see those, so both skills read this list. Rules with `given.user` share one limit: `said_rx` / `not_said_rx` see every user turn of the session, unordered, so they cannot tell an approval that came before a request from one that came after. Every such rule is written to fail OPEN on that ambiguity (stay silent), never to block. An ordering rule's `scope_paths` / `scope_exclude_paths` say which edits arm it; the hook honours them from 0.74.0, so every path-scoped gate carries that floor and an older hook advises instead of blocking on an edit the rule was never about.",
+ "about": "The starter rulebook: universal coding-agent rules whose repo-specific parts are {{slots}} filled by starter_rulebook.py from a scan of the checkout. `requires` names the slots a rule cannot exist without; a rule whose slot is missing is dropped, never filed with a guess. `cases` are run through the live hook's engine after seeding. Patterns match at command position ({{CMD}} / {{GIT}}), never `^`; paths match `(?:^|/)dir/` because the hook sees absolute paths; no quantified group contains + * or | because the hook's load lint drops those. `same_as` names the session miner's built-in hypothesis (mine_sessions.py) that covers the same ground under a different title and pattern: the deterministic conflict check cannot see those, so both skills read this list. Rules with `given.user` share one limit: `said_rx` / `not_said_rx` see every user turn of the session, unordered, so they cannot tell an approval that came before a request from one that came after. Every such rule is written to fail OPEN on that ambiguity (stay silent), never to block. An ordering rule's `scope_paths` / `scope_exclude_paths` say which edits arm it; the hook honours them from 0.74.0, so every path-scoped gate carries that floor and an older hook advises instead of blocking on an edit the rule was never about. `memhub_categories` on a category are the MemHub rule categories (ENG-1158) its rules are filed with; a rule's own `memhub_categories` replaces its category's whole list. Labels only: they grant nothing and are not part of a rule's identity.",
  "categories": [
   {
    "id": "budget",
+   "memhub_categories": [
+    "token_efficiency"
+   ],
    "name": "Context budget",
    "ask": "Keep big files, diffs and listings out of the main agent's context",
    "blurb": "Input far larger than the answer is read as a slice or handed to a delegate. Reads are 46-76% of agent tokens; Spotify measured 82-94% savings from the same 350-line gate."
   },
   {
    "id": "verify",
+   "memhub_categories": [
+    "token_efficiency"
+   ],
    "name": "Cheap verification",
    "ask": "Stop the agent burning minutes on full test suites, installs and dev servers",
    "blurb": "The touched test while editing, the suite once before push. Agents run tests ~8.8 times per task for ~1 point of benefit."
   },
   {
    "id": "tests",
+   "memhub_categories": [
+    "code_quality"
+   ],
    "name": "Test hygiene",
    "ask": "Stop tests being skipped, slowed or snapshot-updated to get green",
    "blurb": "Matched against the content about to be written, so a slow or skipped test is caught while it is authored."
   },
   {
    "id": "safety",
+   "memhub_categories": [
+    "reliability"
+   ],
    "name": "Safety",
    "ask": "Block irreversible git, deletes, secrets, production and hook tampering",
    "blurb": "Irreversible operations, secrets and production. Designed as gates: the override records the reason, which is the audit trail."
   },
   {
    "id": "infra",
+   "memhub_categories": [
+    "reliability"
+   ],
    "name": "Infrastructure pack",
    "ask": "Block destructive Docker / Terraform / Kubernetes / AWS commands",
    "blurb": "Enabled only where the scan finds the tool in the repo."
   },
   {
    "id": "traps",
+   "memhub_categories": [
+    "reliability"
+   ],
    "name": "Runtime traps",
    "ask": "Stop calls that hang, never return, or poll with sleep",
    "blurb": "A hung call wastes a turn; an unbounded one wastes context."
   },
   {
    "id": "hygiene",
+   "memhub_categories": [
+    "consistency"
+   ],
    "name": "Repo hygiene",
    "ask": "Commit discipline, dependencies, lockfiles, migrations, PR size",
    "blurb": "Cheap now, expensive in review."
   },
   {
    "id": "intent",
+   "memhub_categories": [
+    "agent_conduct"
+   ],
    "name": "Intent alignment",
    "ask": "Make the agent do what was asked: answer questions, plan when told to plan, reproduce before fixing",
    "blurb": "Fires on the gap between what the person typed and what the agent is about to do."
   },
   {
    "id": "sub",
+   "memhub_categories": [
+    "security"
+   ],
    "name": "Subagent guardrails",
    "ask": "Keep subagents from pushing, installing, or touching CI, infra and databases",
    "blurb": "What makes delegation safe enough to push work toward it."
   },
   {
    "id": "posture",
+   "memhub_categories": [
+    "consistency"
+   ],
    "name": "Posture and anchors",
    "ask": "Four session-start lines plus reminders on this repo's heaviest files",
    "blurb": "Session-start statements shape the plan before any rule fires. Expect partial compliance; they explain the gates rather than replace them."
@@ -517,6 +547,9 @@
   {
    "id": "lint-before-push",
    "category": "verify",
+   "memhub_categories": [
+    "code_quality"
+   ],
    "title": "Lint before push",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -560,6 +593,9 @@
   {
    "id": "suite-before-push",
    "category": "verify",
+   "memhub_categories": [
+    "code_quality"
+   ],
    "title": "Run tests green before push",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1169,6 +1205,9 @@
   {
    "id": "no-verify",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "Never bypass commit hooks",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1611,6 +1650,9 @@
   {
    "id": "secrets-read",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "Never read secrets",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1663,6 +1705,9 @@
   {
    "id": "env-dump",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "Never dump the environment",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1713,6 +1758,9 @@
   {
    "id": "stage-secrets",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "Never stage secrets or build output",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1751,6 +1799,9 @@
   {
    "id": "stage-secrets-bulk",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "No stage-everything over an unignored secret",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1831,6 +1882,9 @@
   {
    "id": "stage-secrets-dot",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "No `git add .` over an unignored secret",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1935,6 +1989,9 @@
   {
    "id": "pipe-to-shell",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "Never pipe a download into a shell",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -1970,6 +2027,9 @@
   {
    "id": "self-oversight",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "Do not edit your own guardrails",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -2041,6 +2101,9 @@
   {
    "id": "chmod-wide",
    "category": "safety",
+   "memhub_categories": [
+    "security"
+   ],
    "title": "No world-writable or recursive ownership changes",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -2620,6 +2683,9 @@
   {
    "id": "commit-unasked",
    "category": "hygiene",
+   "memhub_categories": [
+    "agent_conduct"
+   ],
    "title": "Do not commit unless asked",
    "mode": "advise",
    "delivery": "agent_hook",
@@ -2882,6 +2948,9 @@
   {
    "id": "reproduce-before-fix",
    "category": "intent",
+   "memhub_categories": [
+    "code_quality"
+   ],
    "title": "Run the tests before committing a fix",
    "mode": "advise",
    "delivery": "agent_hook",
@@ -2918,6 +2987,9 @@
   {
    "id": "fetch-before-origin",
    "category": "intent",
+   "memhub_categories": [
+    "reliability"
+   ],
    "title": "Fetch before reading origin",
    "mode": "gate",
    "delivery": "agent_hook",
@@ -3052,13 +3124,13 @@
    "cases": {
     "fires": [
      {
-      "case": "psql $DATABASE_URL -c 'select 1'",
+      "case": "psql -h localhost -d app -c 'select 1'",
       "agent_main": false
      }
     ],
     "silent": [
      {
-      "case": "psql $DATABASE_URL -c 'select 1'",
+      "case": "psql -h localhost -d app -c 'select 1'",
       "agent_main": true
      },
      {
@@ -3113,6 +3185,9 @@
   {
    "id": "posture-paths",
    "category": "posture",
+   "memhub_categories": [
+    "token_efficiency"
+   ],
    "title": "Posture: answer with paths",
    "delivery": "session_context",
    "statement": "Answer with paths and conclusions, not file contents. Read big files as slices, and grep for a symbol before you think about delegating the search.",
@@ -3124,6 +3199,9 @@
   {
    "id": "posture-verify",
    "category": "posture",
+   "memhub_categories": [
+    "token_efficiency"
+   ],
    "title": "Posture: verification order",
    "delivery": "session_context",
    "statement": "Verification order: the linter, then the test file you touched, then a wider run before push.",
@@ -3135,6 +3213,9 @@
   {
    "id": "posture-review",
    "category": "posture",
+   "memhub_categories": [
+    "token_efficiency"
+   ],
    "title": "Posture: large reviews are delegated",
    "delivery": "session_context",
    "statement": "Diffs over 400 lines are reviewed by file or by subagent, one per dimension. You read the stat and the verdicts.",
@@ -3146,6 +3227,10 @@
   {
    "id": "posture-ask",
    "category": "posture",
+   "memhub_categories": [
+    "security",
+    "reliability"
+   ],
    "title": "Posture: irreversible means ask",
    "delivery": "session_context",
    "statement": "Irreversible, production or secret-touching actions stop and ask. RULEBOOK_OVERRIDE='<why>' records the reason when you proceed.",
@@ -3157,6 +3242,9 @@
   {
    "id": "anchor-heavy",
    "category": "posture",
+   "memhub_categories": [
+    "token_efficiency"
+   ],
    "title": "Anchor: this repo's heaviest files",
    "delivery": "anchor_recall",
    "requires": [

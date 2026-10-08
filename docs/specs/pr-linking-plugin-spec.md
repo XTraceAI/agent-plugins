@@ -274,7 +274,7 @@ vary):
 - `touches_github` when the name splits as `mcp__<server>__<tool>` and the **server** segment
   contains "github". The server segment runs to the FIRST `__`, and is not `[^_]*`: server names
   routinely contain underscores (`github_enterprise`, and every plugin-provided server — this
-  repo's own tools arrive as `mcp__plugin_memhub-staging_memhub__add_memory`), and a
+  repo's own tools arrive as `mcp__plugin_memhub_memhub__add_memory`), and a
   no-underscore pattern rejected all of them. Matching `github` anywhere in the WHOLE name would
   instead catch `mcp__notes__github_summary`, which is a note-taking tool — the server segment is
   what separates the two.
@@ -519,7 +519,7 @@ cannot silence the other:
     "type": "command",
     "timeout": 15,
     "statusMessage": "MemHub: checking PR link",
-    "command": "IN=$(cat); case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*) if [ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hook_guard.py\" ignore PostToolUse; then printf %s \"$IN\" | python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/pr_link_trigger.py\"; fi ;; esac"
+    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" PostToolUse pr_link_trigger"
   }]
 }
 ```
@@ -529,19 +529,25 @@ cannot silence the other:
 because matching every MCP tool would start a Python process on every MCP call in every session
 for a check that is almost always going to decline — but it must NOT use `[^_]*` around the
 server segment, which rejects `github_enterprise` and every plugin-provided server. This matcher
-and the `case` guard below are coarse pre-filters that only decide whether a process starts;
+and the payload globs below are coarse pre-filters that only decide whether the trigger starts;
 `pr_link.is_github_mcp_tool` is the precise gate, and it is the one that has to be exactly right.
 
-The `case` pre-filter is a cheap byte test that keeps `python3` from starting on ordinary shell
-traffic — the same trick the flush and babysit entries use. All four alternatives are needed:
+`scripts/hook_entry.py` runs every Claude hook (the plugin directory admits no inline shell in a
+hook command), and its `PostToolUse pr_link_trigger` route matches the shell-`case` globs
+`*gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*` before anything else runs — against the two
+fields `touches_github` reads, the tool name and `tool_input.command` (each also case-folded and
+with shell quotes and backslashes removed, as `pr_link` reads them), never the tool's output.
+That cheap byte test keeps `pr_link_trigger.py` from starting on ordinary shell traffic — the same
+trick the flush and babysit routes use. All four alternatives are needed:
 `*gh*pr*` catches `gh pr create` (which contains no "github"); `*[Gg]it[Hh]ub*` catches the
 `api.github.com` URL in a `curl`/`gh api` command or response and the server name in an MCP tool
 call; and `*api/v3*` plus `*repos/*pulls*` catch the ENTERPRISE forms, which contain neither —
 `curl -X POST https://ghe.corp/api/v3/repos/o/r/pulls` has no "github" anywhere in it, and
 `gh api --hostname ghe.corp … repos/o/r/pulls` has no URL at all. Without those two the whole
 enterprise path is detected by the Python and then never reached, which is a silence no log
-explains. A `gh api repos/o/r/pulls` command matches through the `api.github.com` URL in its own
-*response*, which is in the same payload.
+explains. A `gh api repos/o/r/pulls` command matches through `*repos/*pulls*` in the command
+itself. The globs are pinned as a superset of `touches_github` by `tests/hook_entry_test.py`, so
+tool output — a `cat` of a changelog that cites a PR — no longer starts the trigger at all.
 
 Synchronous (not `async`), because `additionalContext` from an async hook is not delivered; 15s
 covers a 4s HTTP call with room to spare, and the script self-limits regardless.
@@ -638,8 +644,8 @@ frontmatter `allowed-tools`, in **both** the prod and staging spellings, exactly
 skill does:
 
 ```
-mcp__plugin_memhub_memhub__link_pr, mcp__plugin_memhub-staging_memhub__link_pr,
-mcp__plugin_memhub_memhub__unlink_pr, mcp__plugin_memhub-staging_memhub__unlink_pr
+mcp__plugin_memhub_memhub__link_pr, mcp__plugin_memhub_memhub__link_pr,
+mcp__plugin_memhub_memhub__unlink_pr, mcp__plugin_memhub_memhub__unlink_pr
 ```
 
 Nothing in `.mcp.json` / `mcp.json` changes — they name the server, not its tools.
@@ -703,7 +709,7 @@ an error rather than a guess.
 ```yaml
 description: Use when the user wants to link a coding session to a GitHub pull request in MemHub, or to undo such a link (e.g. "link this session to PR 42", "/memhub:link-pr", "attach my work to this PR", "unlink that session from the PR"). Records the link as confirmed, so the PR's session context is published from facts rather than a branch-name guess.
 argument-hint: [pr-number-or-url] [--session <id>...] [--unlink]
-allowed-tools: Bash, mcp__plugin_memhub_memhub__link_pr, mcp__plugin_memhub-staging_memhub__link_pr, mcp__plugin_memhub_memhub__unlink_pr, mcp__plugin_memhub-staging_memhub__unlink_pr, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs
+allowed-tools: Bash, mcp__plugin_memhub_memhub__link_pr, mcp__plugin_memhub_memhub__link_pr, mcp__plugin_memhub_memhub__unlink_pr, mcp__plugin_memhub_memhub__unlink_pr, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub_memhub__list_orgs
 ```
 
 **Body — the steps, in order:**
@@ -748,6 +754,12 @@ they carry the org resolution.
 ---
 
 ## 9. `/memhub:find-contributing-sessions`
+
+> **Superseded in part (v0.78.0, ENG-1128)** by `docs/specs/find-contributing-sessions-unlinked-prs.md`,
+> which owns the skill and `find_sessions.py`: no argument now maps the caller's own unlinked PRs
+> (`list_my_unlinked_prs`), `--pr` is repeatable, and the scanner gained a batch mode that reads
+> PR facts with `gh` itself. The single-PR `--files-from` interface in §9.2 and the scoring below
+> are unchanged.
 
 `plugins/memhub/skills/find-contributing-sessions/SKILL.md` plus its own
 `scripts/find_sessions.py`.
@@ -945,7 +957,7 @@ plugins/memhub/plugin.json
 plugins/memhub/.claude-plugin/plugin.json
 plugins/memhub/.codex-plugin/plugin.json
 plugins/memhub/.cursor-plugin/plugin.json
-plugins/memhub-staging/.claude-plugin/plugin.json
+plugins/memhub/.claude-plugin/plugin.json
 ```
 
 From `0.49.1` → **`0.50.0`** (new user-visible surfaces, not a fix). The base moved
@@ -966,7 +978,7 @@ not be merged until the endpoint exists**, and the manual verification below can
 before then; steps 1–6 are unrun, and saying otherwise would be a claim about behaviour nobody has
 observed.
 
-Verify on staging first: install `memhub-staging@memhub-internal` from the branch
+Verify on staging first: install `memhub@memhub-internal` from the branch
 (`CONTRIBUTING.md` § "Installing the staging build"), and exercise:
 
 1. `gh pr create` in a repo whose org has the flag on → the agent self-links; check the row.

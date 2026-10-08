@@ -1,7 +1,7 @@
 ---
-description: Use when the user wants to hand off the current session/work to a teammate via MemHub (e.g. "hand this off to Alice", "handoff this session to Bob", "share my context with Carol so she can pick this up", "pass this work to X", "hand this to Sebastian and Tristan"). Uploads a handoff brief as an artifact into the standing handoff channel — one shared agent brain per set of people, reused for every handoff between them. A one-off brain only when the user asks for one.
-argument-hint: <teammate>[, <teammate>...] [title...] [--new]
-allowed-tools: mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_agent_brain_access, mcp__plugin_memhub-staging_memhub__list_agent_brain_access, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs, Bash
+description: Use when the user wants to hand their current work to one or more teammates so they can pick it up (e.g. "hand this off to Alice", "hand off this session to Bob", "pass this work to Carol and Dan", "share my context with Alice so she can continue", "write a handoff for Bob"). Writes a handoff brief — goal, current state, decisions, next steps, gotchas — into a shared agent brain the teammates search from their own agent. The same set of people always reuses one standing handoff brain, so the history between them stays in one place; a separate one-off brain only when asked. The session transcript itself is never shared.
+argument-hint: "<teammate>[, <teammate>...] [title...] [--new]"
+allowed-tools: 'Bash(git config user.name), Bash(git remote get-url origin), mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_agent_brain_access, mcp__plugin_memhub-staging_memhub__list_agent_brain_access, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs'
 ---
 
 A handoff is one artifact: a brief you write from this conversation, uploaded
@@ -10,10 +10,10 @@ teammate's agent finds it by searching that brain. Nothing else moves — never
 import or share the session (a session is never brain content), so the brief
 must stand on its own.
 
-**One channel per set of people.** Felix↔Sebastian is one brain;
-Felix↔Sebastian↔Tristan is another. Every handoff between the same people
-lands in the same brain as its own brief, so the channel keeps the running
-history between them instead of a pile of one-shot brains. The channel is
+**One channel per set of people.** You↔Alice is one brain; You↔Alice↔Bob is
+another. Every handoff between the same people lands in the same brain as its
+own brief, so the channel keeps the running history between them instead of a
+pile of one-shot brains. The channel is
 shared as **contributor**, so either side hands work back through it.
 
 Arguments: `$ARGUMENTS`
@@ -41,25 +41,25 @@ tool's schema offers it.
 2. **Find or create the brain.**
 
    a. *Find the channel* (skip with `--new`). `list_agent_brains`; the
-      candidates are brains named `Handoffs: …`. For each, take the grantee
-      ids from `list_agent_brain_access` — active org members only, and never
-      the creator, who holds no grant. Drop yourself from them if present
-      (the grantee id not in `list_teammates`); call the rest **O**. The
-      brain's other members are **O** plus its creator, whom no tool names,
-      so match like this:
-      - `shared_by` null → you created it: match when **O** = **T**.
-      - `shared_by` set → someone else created it (`shared_by` is who
-        granted *you* access — the creator or a contributor who re-shared,
-        not necessarily the creator). Match when **O** ⊆ **T** and exactly
-        one person in **T** is not in **O** — that one is the creator. If
-        `shared_by` is a teammate who is not in **O**, they had access
-        without a grant, so they are the creator and must be that one
-        person.
+      candidates are brains named `Handoffs: …`. For each, call
+      `list_agent_brain_access`. Its reply names the brain's creator as
+      `created_by` (the creator holds no grant, so is not in `access`) and
+      its grantees in `access`. The brain's members **M** are the
+      `created_by` user (when not null — null means the creator has left the
+      org) plus every `access` user. `list_teammates` never lists you, so a
+      member id it does not list is yours. The brain is the channel when
+      **M** is exactly you plus **T**: every id in **T** is in **M**, and the
+      one other id in **M** is yours.
       Decide on members, not on the name after the prefix — the other person
       may have created it under their own spelling. Several match → use the
-      oldest and mention the others. A match where you are only a `viewer`
-      can't take the brief — tell the user to ask its creator for
-      contributor, or use `--new`.
+      oldest and mention the others. A match where you are not its creator
+      and your own `access` row is `viewer` can't take the brief — tell the
+      user to ask its creator or an admin for contributor, or use `--new`.
+
+      If a reply has no `created_by` key at all (an older MemHub server that
+      does not name a brain's creator), members can't be known, so don't
+      guess: tell the user an existing handoff channel can't be matched on
+      this server, then create a new channel (step 2b).
 
    b. *Create* (no channel found, or `--new`). `create_agent_brain`, omitting
       `workspace_id` (your own workspace; as creator you can share it):
@@ -78,7 +78,10 @@ tool's schema offers it.
 
 3. **Upload the brief** with `save_artifact` into that brain:
    `name: "Handoff brief: <title>"`, `artifact_type: "document"`,
-   `tags: ["handoff"]`. A title already in the channel VERSIONS that brief —
+   `tags: ["handoff"]`, `topic: <the subject area of the work>` — an existing
+   topic of the channel when one fits, a new one for a new area of work, else
+   `"unsorted"`; a refusal lists the channel's topics
+   (`${CLAUDE_PLUGIN_ROOT}/references/topics.md`). A title already in the channel VERSIONS that brief —
    right for a follow-up on the same work, wrong for anything else, so make
    the title specific. First line: `From <you> to <teammate(s)>, <YYYY-MM-DD>`
    (plus `, repo <org>/<name>` in a repo). Then, tight:

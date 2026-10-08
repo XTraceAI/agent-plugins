@@ -2,8 +2,8 @@
 """Minimal MCP client over streamable HTTP — stdlib only.
 
 **Why this exists.** The hooks loaded the MCP Python SDK, and paid for it on
-every invocation: measured 1.09s warm for `uv run --with 'mcp<2' python -c
-"import mcp"` against 0.07s for a bare python3. Three of the hooks that paid it
+every invocation: measured 1.09s warm to start an interpreter with the SDK
+resolved and imported, against 0.07s for a bare python3. Three of the hooks that paid it
 were SYNCHRONOUS — the (since retired) PreToolUse directive check had no
 prefilter, so every single file edit waited on interpreter start and dependency
 resolution before the hook had made a single network call.
@@ -24,10 +24,11 @@ to be small.
 * replies come back as SSE frames (``event: message`` / ``data: {json}``) even
   for a plain request/response call, so both framings are handled.
 
-**Static bearer only, by design.** Anything needing an interactive browser flow
-still belongs to the SDK, in ``login.py``. This is the path a background hook
-takes, and a background hook can only ever consume a credential someone else
-provisioned.
+**Calls take a static bearer.** A background hook can only ever consume a
+credential someone else provisioned, and every call here is one header. The
+interactive browser login that MINTS such a credential is at the bottom of this
+file (``oauth_authorize``): the SDK's ``OAuthClientProvider`` flow, step for
+step, so the plugin needs no SDK and no ``uv`` anywhere — not even to log in.
 
 Results mimic the SDK's shape — ``.content[].text``, ``.structuredContent``,
 ``.isError`` — so call sites keep their existing response handling and this
@@ -50,6 +51,14 @@ from plugin_version import request_headers, upgrade_message
 PROTOCOL_VERSION = "2025-06-18"
 
 _DEFAULT_TIMEOUT_S = 60.0
+
+# What a foreground script ported off the SDK should pass as ``timeout``. The
+# SDK's streamable client waited up to 300s for a reply to arrive (its
+# ``sse_read_timeout``), and a large ``import_conversation`` or
+# ``save_artifact`` can legitimately take longer than the 60s a background hook
+# is willing to wait. A port that silently shortened that would turn a slow
+# save into a failed one.
+SDK_READ_TIMEOUT_S = 300.0
 
 
 class McpError(RuntimeError):
@@ -119,10 +128,23 @@ class McpRateLimited(McpError):
 
 
 class _Block:
-    """One content block. Only ``.text`` is consumed by this codebase."""
+    """One content block, shaped like the SDK's ``TextContent``.
 
-    def __init__(self, text: str | None):
+    ``.type`` is carried because the SDK's blocks have it and a caller ported
+    from the SDK may filter on it: md_capture_flush did
+    (``getattr(c, "type", "") == "text"``), and without the attribute every
+    block was dropped — each save read as an empty reply and nothing was ever
+    captured. Callers should prefer ``texts_of``, which needs neither.
+    """
+
+    def __init__(self, text: str | None, type: str | None = None):  # noqa: A002 — mirrors the SDK
         self.text = text
+        self.type = type or ("text" if isinstance(text, str) else None)
+
+    def __repr__(self) -> str:
+        # The SDK's TextContent repr, so `str(result)` below reads the same.
+        return (f"TextContent(type={self.type!r}, text={self.text!r}, "
+                "annotations=None, meta=None)")
 
 
 class ToolResult:
@@ -138,6 +160,15 @@ class ToolResult:
         self.content = content
         self.structuredContent = structured  # noqa: N815 — mirrors the SDK
         self.isError = is_error  # noqa: N815 — mirrors the SDK
+
+    def __str__(self) -> str:
+        # The SDK's pydantic `str()`. Not cosmetic: the artifact and import
+        # scripts fall back to `{"_raw": str(result)}` for a reply with no
+        # content and print it, and a port must not turn that line into
+        # `<mcp_http.ToolResult object at 0x…>`.
+        return (f"meta=None content={self.content!r} "
+                f"structuredContent={self.structuredContent!r} "
+                f"isError={self.isError!r}")
 
 
 def _parse_sse(body: str) -> list[dict]:
@@ -414,14 +445,14 @@ def call_tool(url: str, bearer: str, name: str, arguments: dict,
     result = request(url, bearer, "tools/call",
                      {"name": name, "arguments": arguments}, timeout)
     raise_for_upgrade_result(result, url, bearer)
-    blocks = [_Block(b.get("text") if isinstance(b, dict) else None)
+    blocks = [_Block(b.get("text"), b.get("type")) if isinstance(b, dict) else _Block(None)
               for b in (result.get("content") or [])]
     return ToolResult(blocks, result.get("structuredContent"),
                       bool(result.get("isError")))
 
 
 def raise_for_upgrade_result(result, url=None, bearer=None):
-    """Identical handling for stdlib dictionaries and native SDK result objects."""
+    """Identical handling for result dictionaries and attribute-style result objects."""
     def field(obj, name, default=None):
         return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
 
@@ -431,33 +462,6 @@ def raise_for_upgrade_result(result, url=None, bearer=None):
             text = field(block, "text")
             if isinstance(text, str):
                 _raise_upgrade(text[:16384], url, bearer)
-
-
-class PolicySession:
-    """Wrap a native SDK session without changing initialization or OAuth.
-
-    Foreground imports and background artifact capture must retain the same
-    policy/error behavior as the stdlib capture transport.
-    """
-    def __init__(self, session, url, headers=None):
-        self.session, self.url = session, url
-        self.headers = headers or {}
-
-    def __getattr__(self, name):
-        return getattr(self.session, name)
-
-    async def call_tool(self, *args, **kwargs):
-        auth = self.headers.get("Authorization", "")
-        bearer = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else None
-        if not bearer:
-            from _memhub_auth import resolve_bearer
-            _, bearer = resolve_bearer(self.url, refresh=False)
-        if bearer:
-            from plugin_compatibility import before_operation
-            before_operation(self.url, bearer)
-        result = await self.session.call_tool(*args, **kwargs)
-        raise_for_upgrade_result(result, self.url, bearer)
-        return result
 
 
 def list_tools(url: str, bearer: str,
@@ -593,3 +597,476 @@ def is_compute_budget_rejection(res) -> bool:
         return False
     return any("your organization has used its monthly compute budget" in text.lower()
                for text in texts_of(res))
+
+
+# ---------------------------------------------------------------------------
+# Interactive OAuth — the SDK's ``OAuthClientProvider`` flow, in stdlib.
+#
+# The last thing the SDK was loaded for. It is ported rather than redesigned:
+# the same discovery order, the same scope and ``resource`` choices, the same
+# PKCE parameters, the same token request, and the same error names and
+# messages — ``login.py`` prints ``type(exc).__name__`` to the user, so
+# ``OAuthFlowError: State parameter mismatch: …`` reads exactly as it did.
+# Read against mcp 1.30 ``client/auth/oauth2.py`` and ``utils.py``.
+#
+# Deliberately NOT ported: dynamic client registration and URL-based client
+# ids. The plugin's Auth0 client is pre-registered (``.mcp.json`` names it), so
+# the SDK never reached either branch. Neither is the SDK's refresh, which could
+# not work from a cold process anyway (see ``_memhub_auth``); the stdlib refresh
+# shim there already replaced it.
+# ---------------------------------------------------------------------------
+
+# Metadata GETs and the token POST ran on the SDK's httpx client, whose timeout
+# was 30s; the browser round trip itself is bounded by the callback handler.
+_OAUTH_TIMEOUT_S = 30.0
+
+
+class OAuthFlowError(McpError):
+    """The authorization flow could not proceed. Named after the SDK's."""
+
+
+class OAuthTokenError(McpError):
+    """The token endpoint refused the exchange or answered nonsense."""
+
+
+def www_authenticate_field(header: str | None, name: str) -> str | None:
+    """One ``name="value"`` (or unquoted) field of a WWW-Authenticate header."""
+    if not header:
+        return None
+    match = re.search(rf'{name}=(?:"([^"]+)"|([^\s,]+))', header)
+    return (match.group(1) or match.group(2)) if match else None
+
+
+def _http(url: str, method: str = "GET", data: bytes | None = None,
+          headers: dict | None = None,
+          timeout: float = _OAUTH_TIMEOUT_S) -> tuple[int, dict, bytes]:
+    """``(status, headers, body)`` for ANY status — the OAuth steps branch on it.
+
+    Same no-redirect opener as every other call: discovery documents and the
+    token endpoint are not followed across a redirect either (the SDK did not
+    follow them), so a 30x comes back as its status. A network failure raises.
+    """
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=headers or {})
+    try:
+        with _opener().open(req, timeout=timeout) as resp:
+            return resp.status, dict(resp.headers.items()), resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read(16384)
+        exc.close()
+        return exc.code, dict(exc.headers.items()), body
+    except McpError as exc:
+        if exc.status is not None:      # a refused redirect
+            return exc.status, {}, b""
+        raise
+    except (urllib.error.URLError, OSError) as exc:
+        raise McpError(f"{method} {url} failed: {exc}") from exc
+
+
+def _json_object(body: bytes) -> dict | None:
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _canonical_url(url: str) -> str:
+    """A URL the way the SDK's ``AnyHttpUrl`` renders it — lowercase scheme and
+    host, ``/`` for an empty path — so issuers and resources compare as strings."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(parts._replace(
+        scheme=parts.scheme.lower(), netloc=parts.netloc.lower(),
+        path=parts.path or "/"))
+
+
+def _resource_url(url: str) -> str:
+    """RFC 8707 canonical resource: lowercase scheme/host, no fragment."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(parts._replace(
+        scheme=parts.scheme.lower(), netloc=parts.netloc.lower(), fragment=""))
+
+
+def _resource_allowed(requested: str, configured: str) -> bool:
+    """Same origin, and ``requested``'s path under ``configured``'s."""
+    r, c = urllib.parse.urlparse(requested), urllib.parse.urlparse(configured)
+    if (r.scheme.lower(), r.netloc.lower()) != (c.scheme.lower(), c.netloc.lower()):
+        return False
+    rp = r.path if r.path.endswith("/") else r.path + "/"
+    cp = c.path if c.path.endswith("/") else c.path + "/"
+    return rp.startswith(cp)
+
+
+def _issuers_match(a: str, b: str) -> bool:
+    """String equality, except a root issuer with and without its ``/``."""
+    if a == b:
+        return True
+    shorter, longer = sorted((a, b), key=len)
+    parts = urllib.parse.urlparse(shorter)
+    return longer == f"{shorter}/" and shorter == f"{parts.scheme}://{parts.netloc}"
+
+
+def _origin(url: str) -> str:
+    parts = urllib.parse.urlparse(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def auth_challenge(url: str, timeout: float = _OAUTH_TIMEOUT_S) -> str | None:
+    """The WWW-Authenticate header the server answers an UNAUTHENTICATED call with.
+
+    The SDK learned where to authenticate from the 401 on its first request;
+    a port that starts the flow without having made one asks the same question
+    here. No credential is sent, so nothing needs the https check. None when
+    the server did not challenge (the flow then falls back to well-known URLs,
+    exactly as the SDK did for a challenge without ``resource_metadata``).
+    """
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    status, headers, _ = _http(
+        url, "POST", json.dumps(payload).encode("utf-8"),
+        {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream",
+         "MCP-Protocol-Version": PROTOCOL_VERSION, **request_headers()},
+        timeout)
+    if status not in (401, 403):
+        return None
+    return next((v for k, v in headers.items()
+                 if k.lower() == "www-authenticate"), None)
+
+
+class OAuthDiscovery:
+    """What discovery found: protected-resource metadata (``prm``), the chosen
+    authorization server, its metadata, and the ``scope`` / ``resource`` the
+    authorization request will carry (either may be None, as in the SDK)."""
+
+    def __init__(self, prm, auth_server_url, metadata, scope, resource):
+        self.prm = prm
+        self.auth_server_url = auth_server_url
+        self.metadata = metadata
+        self.scope = scope
+        self.resource = resource
+
+    def endpoint(self, server_url: str, name: str) -> str:
+        """``authorization_endpoint`` / ``token_endpoint``, else the SDK's
+        fallback of ``/authorize`` / ``/token`` on the MCP server's origin."""
+        value = (self.metadata or {}).get(f"{name}_endpoint")
+        if isinstance(value, str) and value:
+            return value
+        return urllib.parse.urljoin(_origin(server_url),
+                                    "/authorize" if name == "authorization" else "/token")
+
+
+def discover_oauth(url: str, www_authenticate: str | None = None,
+                   timeout: float = _OAUTH_TIMEOUT_S) -> OAuthDiscovery:
+    """Steps 1–3 of the SDK flow: protected-resource metadata (RFC 9728, with
+    the SEP-985 fallbacks), authorization-server metadata (RFC 8414 / OIDC),
+    and the scope selection strategy. Raises ``OAuthFlowError`` where the SDK did.
+    """
+    parsed = urllib.parse.urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    proto = {"MCP-Protocol-Version": PROTOCOL_VERSION}
+
+    # Step 1 — protected resource metadata.
+    prm_urls = []
+    challenge_url = www_authenticate_field(www_authenticate, "resource_metadata")
+    if challenge_url:
+        prm_urls.append(challenge_url)
+    if parsed.path and parsed.path != "/":
+        prm_urls.append(urllib.parse.urljoin(
+            base, f"/.well-known/oauth-protected-resource{parsed.path}"))
+    prm_urls.append(urllib.parse.urljoin(base, "/.well-known/oauth-protected-resource"))
+
+    prm = None
+    prm_failed = None
+    for candidate in prm_urls:
+        status, _, body = _http(candidate, headers=proto, timeout=timeout)
+        if status >= 500 or status == 429:
+            prm_failed = status
+        doc = _json_object(body) if status == 200 else None
+        servers = (doc or {}).get("authorization_servers")
+        if (doc and isinstance(doc.get("resource"), str)
+                and isinstance(servers, list) and servers
+                and all(isinstance(s, str) for s in servers)):
+            prm = doc
+            break
+    else:
+        if prm_failed is not None:
+            # A server error says nothing about whether the resource publishes
+            # metadata, so it must not send the flow down the legacy path.
+            raise OAuthFlowError(
+                f"Protected resource metadata request failed: HTTP {prm_failed}")
+
+    resource = _resource_url(url)
+    auth_server_url = None
+    if prm is not None:
+        prm_resource = _canonical_url(prm["resource"])
+        if not _resource_allowed(resource, prm_resource):
+            raise OAuthFlowError(
+                f"Protected resource {prm_resource} does not match expected {resource}")
+        resource = prm_resource
+        auth_server_url = _canonical_url(prm["authorization_servers"][0])
+
+    # Step 2 — authorization server metadata, path-aware, OAuth then OIDC.
+    expected_issuer = auth_server_url or _canonical_url(base)
+    if not auth_server_url:
+        asm_urls = [f"{base}/.well-known/oauth-authorization-server"]
+    else:
+        auth = urllib.parse.urlparse(auth_server_url)
+        auth_base = f"{auth.scheme}://{auth.netloc}"
+        path = auth.path.rstrip("/")
+        if auth.path and auth.path != "/":
+            asm_urls = [urllib.parse.urljoin(auth_base, f"/.well-known/oauth-authorization-server{path}"),
+                        urllib.parse.urljoin(auth_base, f"/.well-known/openid-configuration{path}"),
+                        urllib.parse.urljoin(auth_base, f"{path}/.well-known/openid-configuration")]
+        else:
+            asm_urls = [urllib.parse.urljoin(auth_base, "/.well-known/oauth-authorization-server"),
+                        urllib.parse.urljoin(auth_base, "/.well-known/openid-configuration")]
+
+    metadata = None
+    for candidate in asm_urls:
+        status, _, body = _http(candidate, headers=proto, timeout=timeout)
+        if status == 200:
+            doc = _json_object(body)
+            if doc and all(isinstance(doc.get(k), str) and doc.get(k)
+                           for k in ("issuer", "authorization_endpoint", "token_endpoint")):
+                # RFC 8414 §3.3: the document must name the issuer it was
+                # discovered for, or it is somebody else's.
+                if not _issuers_match(_canonical_url(doc["issuer"]), expected_issuer):
+                    raise OAuthFlowError(
+                        "Authorization server metadata issuer mismatch: "
+                        f"{doc['issuer']} != {expected_issuer}")
+                metadata = doc
+                break
+            continue                    # unparseable: try the next candidate
+        if 300 <= status < 500:
+            continue                    # not served here (redirects not followed)
+        break                           # a server error ends discovery
+
+    # Step 3 — scope: the challenge's, else the resource's, else the server's.
+    scope = www_authenticate_field(www_authenticate, "scope")
+    if scope is None:
+        for doc in (prm, metadata):
+            supported = (doc or {}).get("scopes_supported")
+            if isinstance(supported, list):
+                scope = " ".join(str(s) for s in supported)
+                break
+
+    return OAuthDiscovery(prm, auth_server_url, metadata, scope,
+                          resource if prm is not None else None)
+
+
+def pkce_pair() -> tuple[str, str]:
+    """``(code_verifier, code_challenge)``: 128 unreserved characters, S256."""
+    import base64  # noqa: PLC0415 — only the login path needs these
+    import hashlib  # noqa: PLC0415
+    import secrets  # noqa: PLC0415
+    import string  # noqa: PLC0415
+
+    alphabet = string.ascii_letters + string.digits + "-._~"
+    verifier = "".join(secrets.choice(alphabet) for _ in range(128))
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return verifier, base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def oauth_token(raw) -> dict:
+    """A token response validated the way the SDK's ``OAuthToken`` model did.
+
+    Returns exactly its five fields, in its order, ``token_type`` normalised to
+    ``Bearer`` — the shape the token cache has always held, which
+    ``_memhub_auth`` and ``login.py`` read back. Raises ``OAuthTokenError``.
+    """
+    doc = raw if isinstance(raw, dict) else _json_object(raw)
+    if doc is None:
+        raise OAuthTokenError(f"Invalid token response: {raw[:200]!r}")
+    token_type = doc.get("token_type", "Bearer")
+    if isinstance(token_type, str):
+        token_type = token_type.title()
+    expires_in = doc.get("expires_in")
+    if isinstance(expires_in, str) and expires_in.strip().isdigit():
+        expires_in = int(expires_in)
+    elif isinstance(expires_in, float) and expires_in.is_integer():
+        expires_in = int(expires_in)
+    problems = [name for name, ok in (
+        ("access_token", isinstance(doc.get("access_token"), str)),
+        ("token_type", token_type == "Bearer"),
+        ("expires_in", expires_in is None
+         or (isinstance(expires_in, int) and not isinstance(expires_in, bool))),
+        ("scope", doc.get("scope") is None or isinstance(doc.get("scope"), str)),
+        ("refresh_token", doc.get("refresh_token") is None
+         or isinstance(doc.get("refresh_token"), str)),
+    ) if not ok]
+    if problems:
+        raise OAuthTokenError(
+            f"Invalid token response: bad {', '.join(problems)}")
+    return {"access_token": doc["access_token"], "token_type": "Bearer",
+            "expires_in": expires_in, "scope": doc.get("scope"),
+            "refresh_token": doc.get("refresh_token")}
+
+
+def oauth_token_json(token: dict) -> str:
+    """The cache file's text, byte-identical to the SDK's ``model_dump_json``."""
+    return json.dumps(oauth_token(token), separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+async def _maybe_await(value):
+    import inspect  # noqa: PLC0415
+
+    return await value if inspect.isawaitable(value) else value
+
+
+async def oauth_authorize(url: str, client_id: str, redirect_uri: str,
+                          redirect_handler, callback_handler, *,
+                          www_authenticate: str | None = None,
+                          discovery: OAuthDiscovery | None = None,
+                          timeout: float = _OAUTH_TIMEOUT_S) -> dict:
+    """The browser login: discovery, PKCE authorization, code exchange.
+
+    ``redirect_handler(auth_url)`` opens the browser (or raises — a background
+    caller's ``NonInteractiveAuthRequired`` propagates untouched, no longer
+    buried in an anyio ExceptionGroup); ``callback_handler()`` returns
+    ``(code, state)``. Either may be sync or async — the ones in
+    ``_memhub_auth`` are coroutines and are passed unchanged.
+
+    ``www_authenticate`` is the challenge from a 401 the caller already holds;
+    without one the server is asked (``auth_challenge``). Returns the token in
+    ``oauth_token`` shape. Storing it is the caller's job, as it was the
+    SDK's ``TokenStorage``'s — ``oauth_token_json`` gives the cache text.
+    """
+    import secrets  # noqa: PLC0415
+
+    if discovery is None:
+        if www_authenticate is None:
+            www_authenticate = auth_challenge(url, timeout)
+        discovery = discover_oauth(url, www_authenticate, timeout)
+
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(32)
+    params = {"response_type": "code", "client_id": client_id,
+              "redirect_uri": redirect_uri, "state": state,
+              "code_challenge": challenge, "code_challenge_method": "S256"}
+    # RFC 8707 `resource` only when protected-resource metadata was found: the
+    # SDK's other trigger was the negotiated protocol version, and its first
+    # (unauthenticated) request had not negotiated one.
+    if discovery.resource:
+        params["resource"] = discovery.resource
+    if discovery.scope:
+        params["scope"] = discovery.scope
+    auth_url = f"{discovery.endpoint(url, 'authorization')}?{urllib.parse.urlencode(params)}"
+    await _maybe_await(redirect_handler(auth_url))
+
+    code, returned_state = await _maybe_await(callback_handler())
+    if returned_state is None or not secrets.compare_digest(returned_state, state):
+        raise OAuthFlowError(f"State parameter mismatch: {returned_state} != {state}")
+    if not code:
+        raise OAuthFlowError("No authorization code received")
+
+    token_url = discovery.endpoint(url, "token")
+    # The code and verifier together are a credential for the next minute;
+    # the same cleartext rule as every bearer this module sends.
+    require_secure(token_url)
+    form = {"grant_type": "authorization_code", "code": code,
+            "redirect_uri": redirect_uri, "client_id": client_id,
+            "code_verifier": verifier}
+    if discovery.resource:
+        form["resource"] = discovery.resource
+    status, _, body = _http(
+        token_url, "POST", urllib.parse.urlencode(form).encode(),
+        {"Content-Type": "application/x-www-form-urlencoded"}, timeout)
+    if status != 200:
+        raise OAuthTokenError(
+            f"Token exchange failed ({status}): {body.decode('utf-8', 'replace')}")
+    return oauth_token(body)
+
+
+class DeviceFlowUnavailable(OAuthFlowError):
+    """This authorization server or client does not offer the device grant.
+
+    Not a failed login: the caller falls back to the browser flow."""
+
+
+_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+
+
+async def oauth_device_authorize(url: str, client_id: str, show_code, *,
+                                 www_authenticate: str | None = None,
+                                 discovery: OAuthDiscovery | None = None,
+                                 approval_timeout: float = 300.0,
+                                 timeout: float = _OAUTH_TIMEOUT_S,
+                                 sleep=None) -> dict:
+    """The device login (RFC 8628): no localhost callback, so no port to lose.
+
+    The browser flow needs a listener on the pre-registered callback port,
+    which ``/mcp``'s own sign-in uses too, and which a container, an SSH
+    session or a second login in flight cannot give it. Here the person
+    approves a short code on the authorization server's page and this polls
+    the token endpoint until they do.
+
+    ``show_code(verification_uri_complete, user_code)`` tells the person
+    (opens the page, prints the code). Raises ``DeviceFlowUnavailable`` when
+    the server publishes no device endpoint or refuses this client the grant,
+    ``OAuthFlowError`` when the person denies it or the code expires. Returns
+    the token in ``oauth_token`` shape, like ``oauth_authorize``.
+    """
+    import asyncio  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    sleep = sleep or asyncio.sleep
+    if discovery is None:
+        if www_authenticate is None:
+            www_authenticate = auth_challenge(url, timeout)
+        discovery = discover_oauth(url, www_authenticate, timeout)
+    device_url = (discovery.metadata or {}).get("device_authorization_endpoint")
+    if not isinstance(device_url, str) or not device_url:
+        raise DeviceFlowUnavailable("no device_authorization_endpoint")
+    require_secure(device_url)
+
+    form = {"client_id": client_id}
+    if discovery.scope:
+        form["scope"] = discovery.scope
+    # No `audience` / `resource`: Auth0 rejects the MCP URL as an API name
+    # ("Service not found") and issues the tenant's default audience without
+    # one, which is the token the browser flow ends up with too.
+    status, _, body = _http(
+        device_url, "POST", urllib.parse.urlencode(form).encode(),
+        {"Content-Type": "application/x-www-form-urlencoded"}, timeout)
+    doc = _json_object(body) or {}
+    if status != 200:
+        if doc.get("error") in ("unauthorized_client", "unsupported_grant_type"):
+            raise DeviceFlowUnavailable(doc.get("error"))
+        raise OAuthFlowError(
+            f"Device authorization failed ({status}): {doc.get('error_description') or doc.get('error') or ''}")
+    device_code, user_code = doc.get("device_code"), doc.get("user_code")
+    if not (isinstance(device_code, str) and isinstance(user_code, str)):
+        raise OAuthFlowError("Device authorization answered without a code")
+    page = doc.get("verification_uri_complete") or doc.get("verification_uri")
+    await _maybe_await(show_code(page, user_code))
+
+    interval = float(doc.get("interval") or 5)
+    expires = min(float(doc.get("expires_in") or approval_timeout), approval_timeout)
+    deadline = time.monotonic() + expires
+    token_url = discovery.endpoint(url, "token")
+    require_secure(token_url)
+    poll = {"grant_type": _DEVICE_GRANT, "device_code": device_code,
+            "client_id": client_id}
+    while True:
+        await sleep(interval)
+        if time.monotonic() >= deadline:
+            raise OAuthFlowError(
+                f"Sign-in was not approved within {int(expires)}s. Run login again.")
+        status, _, body = _http(
+            token_url, "POST", urllib.parse.urlencode(poll).encode(),
+            {"Content-Type": "application/x-www-form-urlencoded"}, timeout)
+        if status == 200:
+            return oauth_token(body)
+        error = (_json_object(body) or {}).get("error")
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            interval += 5
+            continue
+        if error == "access_denied":
+            raise OAuthFlowError("Sign-in was declined in the browser.")
+        if error == "expired_token":
+            raise OAuthFlowError("The sign-in code expired. Run login again.")
+        raise OAuthTokenError(
+            f"Token exchange failed ({status}): {body.decode('utf-8', 'replace')[:200]}")

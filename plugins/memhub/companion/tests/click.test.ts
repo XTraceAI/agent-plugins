@@ -6,8 +6,8 @@
 // session, and picked again for the new session a /clear or /resume starts. See docs/specs/companion-upgrades.md.
 //
 // The test's `on` stands for the engine beneath: it answers the session's id,
-// the plugin's store (an in-memory one this test reads back), the processes
-// the plugin runs (rule_decide.py and the browser openers) and takes the blits.
+// the plugin's store (an in-memory one this test reads back), `$.state` and
+// MemHub's REST API (beneath.ts), the browser openers, and takes the blits.
 
 import type { On } from 'claude-code'
 import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
@@ -15,14 +15,15 @@ import { describe, type Engine, expect, mock, test } from 'claude-code/testing'
 import { ANIMALS } from '../animals'
 import { layoutOf } from '../screen'
 import { fnv1a32 } from '../selection'
+import { listed, ran, restBeneath, ruleRow, stateBeneath, STUDIO } from './beneath'
 
 const PLUGIN = 'memhub-staging'
 const SESSION = 'sess-click-1'
 const RULE_ID = 'b43d6914-4cb3-4a91-84ad-cadbeb6dcfe4'
-const RULEBOOK = 'https://staging.mem.xtrace.ai/studio/rulebook'
-const RULE_PAGE = `${RULEBOOK}?open=${RULE_ID}`
-/** rule_decide.py `proposed`'s answer for a session whose harness fork filed one rule. */
-const FILED = JSON.stringify({ proposed: [{ title: 'Run only the touched test suites', rule_id: RULE_ID, env: 'staging' }] })
+/** Where the rule opens in MemHub Studio: the web app api-info pairs with the API. */
+const RULE_PAGE = `${STUDIO}/studio/rulebook?open=${RULE_ID}`
+/** The server's proposed-rules list for a session whose harness fork filed one rule. */
+const FILED = listed(ruleRow(SESSION, RULE_ID, 'Run only the touched test suites'))
 const NAMES = ['goose', 'hippo', 'penguin', 'shiba']
 
 const BAND = {
@@ -63,8 +64,7 @@ type Beneath = {
   store?: Record<string, unknown>
   sessionId?: () => string
   openers?: { open?: number; 'xdg-open'?: number }
-  url?: string
-  /** rule_decide.py `proposed`'s answer; none lists nothing. */
+  /** The server's proposed-rules list; none lists nothing. */
   listed?: string
   context?: string[]
   /** Mount the band BEFORE session.start, as the engine does: it draws the band first. */
@@ -89,23 +89,19 @@ async function started($: Engine, on: On, beneath: Beneath = {}) {
   on('session.id', async () => ({ value: sessionId() }))
   on('session.start', async (_, e) => ({ cwd: e.cwd }))
   on('session.end', async () => ({ sessionId: SESSION }))
-  on('classic.Stop', async () => ({}))
   // what the band hands down when it draws nothing (a companion turned off): the engine's own, empty
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Box({ key: 'engine-band' }))
   on('classic.PostToolUse', async () => ({ additionalContext: beneath.context ?? [] }))
   on('command.register', async (_, e) => ({ value: { command: e.name } }))
+  stateBeneath(on)
+  const rest = restBeneath(on, { list: beneath.listed ?? listed() })
   const runs: (readonly string[])[] = []
   on('process.run', async (_, e) => {
+    const info = rest.apiInfo(e.argv)
+    if (info) return info
     runs.push(e.argv)
     const opener = e.argv[0] as 'open' | 'xdg-open'
-    if (opener === 'open' || opener === 'xdg-open') {
-      return { value: { exitCode: beneath.openers?.[opener] ?? 0, stdout: '', stderr: '' } }
-    }
-    if (e.argv[2] === 'proposed') {
-      return { value: { exitCode: 0, stdout: `${beneath.listed ?? '{"proposed":[]}'}\n`, stderr: '' } }
-    }
-    const url = e.argv.length > 4 ? RULE_PAGE : (beneath.url ?? RULEBOOK)
-    return { value: { exitCode: 0, stdout: `(progress line)\n${JSON.stringify({ url })}\n`, stderr: '' } }
+    return ran(beneath.openers?.[opener] ?? 0)
   })
   const frames: string[] = []
   let columns = 0
@@ -140,7 +136,6 @@ async function started($: Engine, on: On, beneath: Beneath = {}) {
 const TITLES: Record<string, string> = { goose: 'Gus the Goose', hippo: 'Hugo the Hippo', penguin: 'Penelope the Penguin', shiba: 'Popo the Shiba' }
 const hashed = (id: string) => NAMES[fnv1a32(id) % NAMES.length]!
 const openerRuns = (runs: (readonly string[])[]) => runs.filter(r => r[0] === 'open' || r[0] === 'xdg-open')
-const urlRuns = (runs: (readonly string[])[]) => runs.filter(r => r[2] === 'url')
 
 describe('the ♥ that pets it', () => {
   test('sits on the ground row, just left of where the ground begins, drawn as ♥ alone', { timeoutMs: 60_000 }, async ($, on) => {
@@ -178,7 +173,7 @@ describe('a click pets the animal', () => {
       store: { 'companion.pin': 'goose' },
       context: [`📏 Rule fired: ${rule}`],
     })
-    await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: {} })
+    await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: {}, tool_use_id: 'toolu_1' })
     expect(await playUntil(() => frames.some(f => f.includes(rule))), 'the rule was never said').toBe(true)
     await click()
     const after = frames.length
@@ -188,7 +183,6 @@ describe('a click pets the animal', () => {
 
   test('presenting a proposal, a click changes nothing: the bubble and buttons stay', { timeoutMs: 60_000 }, async ($, on) => {
     const { band, frames, click, play, playUntil } = await started($, on, { store: { 'companion.pin': 'goose' }, listed: FILED })
-    await $.classic.Stop({ stop_hook_active: false, session_id: SESSION })
     const hasButtons = async () => (await band.find({ type: 'Button', key: 'rule-activate' })) !== undefined
     expect(await playUntil(hasButtons), 'the buttons never came').toBe(true)
     const before = frames.length
@@ -209,14 +203,12 @@ describe('there is no double click', () => {
     await click()
     await play(1_000)
     expect(openerRuns(runs)).toHaveLength(0)
-    expect(urlRuns(runs)).toHaveLength(0)
   })
 })
 
 describe("a proposal's rule↗ opens the rule in the browser", () => {
   const proposing = async ($: Engine, on: On, openers: Beneath['openers']) => {
     const x = await started($, on, { store: { 'companion.pin': 'goose' }, listed: FILED, openers })
-    await $.classic.Stop({ stop_hook_active: false, session_id: SESSION })
     const pressable = async () => (await x.band.find({ type: 'Button', key: 'rule-link' })) !== undefined
     expect(await x.playUntil(pressable), 'rule↗ never became pressable').toBe(true)
     await x.band.press({ key: 'rule-link' })
@@ -324,7 +316,7 @@ describe('which animal a session shows', () => {
   /** The animal a frame's bubble introduces, played until a rule fire makes it speak. */
   const speaker = async (x: Awaited<ReturnType<typeof started>>) => {
     const from = x.frames.length
-    await $$.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: {} })
+    await $$.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: {}, tool_use_id: 'toolu_1' })
     await x.playUntil(() => titleShown(x.frames.slice(from)).length > 0)
     return titleShown(x.frames.slice(from))
   }

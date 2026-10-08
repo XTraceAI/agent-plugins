@@ -32,8 +32,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -45,21 +43,12 @@ import pak  # noqa: E402 — stdlib-only, sits beside this file
 from plugin_onboarding import HOSTS, LoginCompletion, active_completion, guide_url
 from pak import PakError  # noqa: E402
 
-# The MCP SDK logs the OAuth flow's exception WITH a traceback before letting it
-# propagate. Under --status a missing token is an expected, reported outcome —
-# not a crash — and a stack trace above a one-line "NOT LOGGED IN" reads like
-# the tool broke. Scoped to --status ONLY (checked pre-argparse, so it's set
-# before the SDK import can log): in the INTERACTIVE flow that same silencer
-# hid a real failure completely — a field user saw only "ExceptionGroup:
-# unhandled errors in a TaskGroup" and had to re-enable this logger in a
-# debugger to find the actual broken call underneath.
-if "--status" in sys.argv:
-    logging.getLogger("mcp.client.auth").setLevel(logging.CRITICAL)
-
 from _memhub_auth import (  # noqa: E402
     NonInteractiveAuthRequired,
     _access_token_expiry,
     default_url,
+    explicit_token,
+    open_session,
     resolve_url_and_auth,
     skill_command,
     token_cache_path,
@@ -82,7 +71,7 @@ def _fmt_duration(seconds: float) -> str:
 def _renewal_report(url: str) -> tuple[bool, str]:
     """``(ok, description)`` for whether this login can renew itself.
 
-    Read from the cache the SDK just wrote, because the grant is the only
+    Read from the cache the browser flow just wrote, because the grant is the only
     authority on what was actually issued — asking for ``offline_access`` and
     receiving it are different things, and the difference is invisible until
     the access token lapses.
@@ -106,14 +95,12 @@ async def _verify(url: str, headers, auth) -> int:
     A cached token file is not proof of anything — it can be expired, revoked,
     or issued by the wrong tenant. ``list_tools`` is the cheapest call that
     exercises the full path (transport, auth, server) with no side effects.
+    An OAuth bearer the server refuses runs the browser flow and is retried
+    once (``open_session``); under --status that raises
+    NonInteractiveAuthRequired instead.
     """
-    from mcp.client.session import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-
-    async with streamablehttp_client(url, headers=headers, auth=auth) as (r, w, _):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            return len((await session.list_tools()).tools)
+    session = await open_session(url, headers, auth)
+    return len(await session.list_tools())
 
 
 def _describe_expiry(record: dict | None) -> str:
@@ -240,7 +227,7 @@ async def _run(status_only: bool, force: bool) -> int:
 
     # Set only after the new credential has been VERIFIED against the server.
     # The stash is discarded on this flag and not on `cache.exists()`, because
-    # existence is not success: the SDK writes the token as soon as the grant
+    # existence is not success: the flow writes the token as soon as the grant
     # returns, so a flow that dies during verification — or a truncated write —
     # leaves a file behind that proves nothing. Keying on existence would trade
     # a known-good credential for an unproven one, which is the same durability
@@ -282,7 +269,7 @@ async def _run(status_only: bool, force: bool) -> int:
             # default_url() when passed None, and we pass one), so rebinding it
             # here would add nothing while making `cache`, computed above from
             # the same url, look like it might refer to a different file than
-            # the one the SDK writes. It cannot; keeping one binding is what
+            # the one the browser flow writes. It cannot; keeping one binding is what
             # makes that obvious rather than merely true.
             _, headers, auth = resolve_url_and_auth(url, interactive=not status_only)
         except Exception as exc:  # noqa: BLE001 — report, never traceback
@@ -292,17 +279,18 @@ async def _run(status_only: bool, force: bool) -> int:
         # Three sources now, not two. Inferring from `headers` alone reported a
         # stored access key as "$MEMHUB_TOKEN" — naming the wrong credential in
         # the one command whose job is telling you which credential you are on.
-        if os.environ.get("MEMHUB_TOKEN", "").strip():
-            source = "bearer ($MEMHUB_TOKEN)"
+        explicit = explicit_token()
+        if explicit:
+            source = f"bearer ({explicit[1]})"
         elif headers and headers.get("Authorization"):
             source = "stored access key (mhk_)"
         else:
-            source = "browser OAuth (plugin client)"
+            source = "sign-in (device code; browser callback as fallback)"
         print(f"mode        : {source}")
 
         try:
             tools = await _verify(url, headers, auth)
-        except BaseException as exc:  # noqa: BLE001 — anyio wraps failures in groups
+        except BaseException as exc:  # noqa: BLE001 — a cancelled flow is a failed login too
             if _is_noninteractive(exc):
                 # --status only. Says nothing about whether a browser login
                 # WOULD work; it reports that no usable token is cached now.
@@ -317,10 +305,10 @@ async def _run(status_only: bool, force: bool) -> int:
         verified = True
         print(f"status      : OK — server exposes {tools} tools")
 
-        if os.environ.get("MEMHUB_TOKEN", "").strip():
+        if explicit:
             # Provisioned outside this flow entirely; nothing here owns its
             # lifecycle, so there is no renewal story to tell and no key to mint.
-            print("renewal     : n/a ($MEMHUB_TOKEN is supplied explicitly)")
+            print(f"renewal     : n/a ({explicit[1]} is supplied explicitly)")
             return 0
 
         if headers and headers.get("Authorization"):
@@ -364,9 +352,10 @@ async def _run(status_only: bool, force: bool) -> int:
 
 
 def _leaf(exc: BaseException) -> BaseException:
-    """The deepest single exception under anyio's ExceptionGroup wrapping.
+    """The deepest single exception under any group or ``raise ... from`` wrapping.
 
-    "ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)" names
+    A wrapper ("tools/list failed: <urlopen error ...>") often names less than
+    what it wraps, and a group ("unhandled errors in a TaskGroup") names
     nothing; the leaf ("AttributeError: module 'os' has no attribute
     'fchmod'") names the bug. Walks EVERY member and cause — a group's first
     member is often a benign CancelledError sibling of the real failure, so
@@ -414,9 +403,9 @@ def _leaf(exc: BaseException) -> BaseException:
 def _is_noninteractive(exc: BaseException) -> bool:
     """True if NonInteractiveAuthRequired is anywhere in the exception tree.
 
-    The MCP client runs auth inside anyio task groups, so the raise surfaces
-    wrapped in ExceptionGroups or chained as __cause__ rather than bare. Same
-    walk as the capture hooks use, for the same reason.
+    The stdlib flow raises it bare, but a raise chained as __cause__ or
+    wrapped in a group must still read as "not logged in", not as a crash.
+    Same walk as the capture hooks use.
     """
     seen: set[int] = set()
     stack: list[BaseException] = [exc]
@@ -444,7 +433,7 @@ async def _run_with_onboarding(status_only: bool, force: bool, host: str | None)
         result = await _run(status_only, force)
         return result
     finally:
-        # _run returns success only AFTER MCP verification, following the SDK's
+        # _run returns success only AFTER MCP verification, following the flow's
         # successful token exchange and atomic storage (or a verified cached key).
         completion.finish(result == 0)
         active_completion.reset(context_token)

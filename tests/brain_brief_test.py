@@ -427,23 +427,25 @@ POINTER_HITS = {
         {"id": "ar2", "kind": "artifact", "title": "PR #420 notes", "abstract": "", "score": 0.8},
     ],
 }
-_fake_http = types.ModuleType("mcp_http")
+# Only the HTTP layer is faked: the reply goes through the REAL
+# mcp_http.call_tool, so a result shape brain_brief misreads fails here.
+import mcp_http  # noqa: E402
 
 
-def _fake_call_tool(url, bearer, name, args, timeout=None):
-    search_calls.append({"name": name, **args})
-    return types.SimpleNamespace(isError=False, structuredContent={
-        "items": POINTER_HITS[args["kind"]]})
+def _fake_request(url, bearer, method, params=None, timeout=None):
+    assert method == "tools/call", method
+    args = params["arguments"]
+    search_calls.append({"name": params["name"], **args})
+    return {"content": [{"type": "text", "text": "{}"}], "isError": False,
+            "structuredContent": {"items": POINTER_HITS[args["kind"]]}}
 
 
-_fake_http.call_tool = _fake_call_tool  # type: ignore[attr-defined]
-_saved_http = sys.modules.get("mcp_http")
-sys.modules["mcp_http"] = _fake_http
-got = brain_brief._search_items("https://x", "b", BRAIN, ["brain_brief.py", "PR #42"], 5.0)
-if _saved_http is not None:
-    sys.modules["mcp_http"] = _saved_http
-else:
-    del sys.modules["mcp_http"]
+_saved_request = mcp_http.request
+mcp_http.request = _fake_request
+try:
+    got = brain_brief._search_items("https://x", "b", BRAIN, ["brain_brief.py", "PR #42"], 5.0)
+finally:
+    mcp_http.request = _saved_request
 by_kind = {c["kind"]: c for c in search_calls}
 check("two searches: one per kind, singular kind values, no memory_type",
       [c["name"] for c in search_calls] == ["search_memory", "search_memory"]
@@ -465,11 +467,11 @@ check("a kept pointer carries kind, title text, as_of and the matched identifier
       ep1["type"] == "episode" and ep1["text"] == "Fix brain_brief.py recall"
       and ep1["as_of"] == "2026-09-20" and ep1["match"] == "brain_brief.py")
 
-# ── the budget: one env var, 2:1, trimmed footer ───────────────────────────
+# ── the budget: one env var, 2:3, trimmed footer ───────────────────────────
 os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "300"
-check("budget is tokens × 4 chars, split 2:1",
+check("budget is tokens × 4 chars, split 2:3",
       (brief_budget.total_chars(), brief_budget.brief_chars(), brief_budget.rulebook_chars())
-      == (1200, 800, 400))
+      == (1200, 480, 720))
 ctx = _ctx(_brief({"cwd": "/repo", "session_id": "s6"}))
 check("over budget the brief is trimmed, map intact",
       ctx.endswith(brain_brief._TRIMMED_FOOTER) and "## Map" in ctx and BRAIN in ctx)
@@ -523,9 +525,10 @@ check("a pending cache for another branch is not delivered by the prompt hook, a
 brain_brief._write_json(PCACHE, POINTERS)
 
 # a budget cut at SessionStart leaves the marker alone, so the prompt delivers the rest.
-# 330 is picked to fit some but not all pointers under the head sentence
-# (320-340 does); re-pick it if the head grows.
-os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "330"
+# 550 is picked to fit some but not all pointers under the head sentence
+# (a brief of ~850-900 chars does: 550 tokens × 4 × 2/5 = 880); re-pick it if
+# the head grows or the split moves.
+os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "550"
 bctx = _ctx(_brief({"cwd": "/repo", "session_id": "s10"}))
 shown_at_start = set(brain_brief._ids_in(bctx))
 check("the trimmed brief showed some but not all cached pointers",

@@ -1,11 +1,43 @@
-import type { EngineInterface, On, Timer } from 'claude-code'
+// One entry point: mod/register.ts, the plugin's hooks module (hooks.json),
+// calls `register(on, ctx)` with the mod's Ctx (mod/ctx.ts), last of its
+// parts, so the companion's hooks sit innermost. MemHub calls use
+// `ctx.api()`: the REST base, the bearer, and the Studio web app paired with
+// the base; `ctx.env` says which MemHub it is.
+//
+// It reads what the mod writes to `$.state` (fires, proposals,
+// lanes) and never needs the classic.* events, which the built-in
+// `sec-default` guard skips for user mods on Team/Enterprise sign-ins (Claude
+// Mods Migration Spec §1.4, D3). The classic PreToolUse / PostToolUse hooks
+// stay only as the fallback for lanes the mod has not claimed.
 
+import type { EngineInterface, On, Timer } from 'claude-code'
+import { read, update } from 'claude-code'
+
+import type { Api, Ctx } from '../mod/ctx'
+import type { FireNote, ProposalNote } from '../types'
 import type { Animal, Build, Painted, Tone } from './animal'
 import { ANIMALS, DEFAULT_ANIMAL } from './animals'
-import { type Decision, decisionSaid, nameOf, type Proposed, proposalSaid, proposedOf, RULE_WORD } from './proposed'
+import {
+  decisionOf, envName, firesOf, freshFires, headersOf, isApi, isClassicLane, lanesOf, listedRules,
+  mergedProposals, PROPOSED_PATH, proposalsKey, proposalsOf, proposedOfNote, rulePath, STATUS_OF, studioUrl, UUID,
+  versionOfManifest,
+} from './feed'
+import {
+  announcedIn, announcedOf, type Decision, decisionSaid, nameOf, type Proposed, proposalSaid, RULE_WORD,
+  withAnnounced,
+} from './proposed'
 import { type Fired, firedOf } from './rules'
-import { BUB_BG_HEX, compose, encode, fitBubble, footerOf, type Layout, layoutOf, petAt, SCALES, wordAt } from './screen'
+import { BUB_BG_HEX, CELL_H, CELL_W, compose, DESKTOP_TEXT_LINES, encode, fitBubble, footerOf, type Layout, layoutOf, petAt, SCALES, svgOf, wordAt } from './screen'
 import { pick, poolOf, prefsOf, type Prefs, remember, sessionsOf } from './selection'
+
+/** What the mod's act side writes on each fire (types/index.d.ts). */
+const FIRES = { plugin: 'memhub', key: 'fires' } as const
+/** Rules waiting on an answer: the poll below writes them. */
+const PROPOSALS = { plugin: 'memhub', key: 'proposals' } as const
+/** The Rulebook lanes the mod serves now; the classic hooks announce the rest. */
+const LANES = { plugin: 'memhub', key: 'lanes' } as const
+/** How often the server is asked for proposed rules, besides session start and each turn's end. */
+const POLL_MS = 300_000
 
 /**
  * The companion in the band above the prompt: MemHub's face in the session,
@@ -33,9 +65,17 @@ import { pick, poolOf, prefsOf, type Prefs, remember, sessionsOf } from './selec
  * the click: a Raster takes none, and a surface module laid over it to take
  * them froze the pixels under it, while one laid beneath it never got them. A
  * proposal's `rule↗` opens the rule in MemHub Studio.
+ *
+ * The terminal draws the band as a Raster, repainted in place by `$.ui.blit`.
+ * The desktop lists a Raster but draws nothing for one and refuses its blits,
+ * so there the same cells are drawn as an SVG and each changed frame redraws
+ * the band; its buttons sit in a row of their own, since a Box is placed in
+ * cells and the SVG is sized in CSS pixels, which need not agree.
  */
 
 const FPS = 20
+/** The desktop redraws the band for a frame, not a blit: every frame that changed. */
+const DESKTOP_STRIDE = 1
 const RASTER_KEY = 'companion'
 const STORE_ENABLED = 'companion.enabled'
 // `companion.animal`, the old global pick, is neither read nor written: most
@@ -45,6 +85,8 @@ const STORE_PIN = 'companion.pin'
 const STORE_NEVER = 'companion.never'
 const STORE_SESSIONS = 'companion.sessions'
 const STORE_SCALE = 'companion.scale'
+/** Per session, the proposed rules already announced: a reload must not announce them again. */
+const STORE_ANNOUNCED = 'companion.announced'
 /** How long a keystroke keeps the animal looking, and a finished turn too. */
 const LINGER_FRAMES = 3 * FPS
 /** Announcements waiting their turn; past this the oldest waiting one drops. */
@@ -79,7 +121,11 @@ type Band = {
   queue: Said[]
   /** Proposed rules waiting on the person's answer; the first has the buttons. */
   asks: Proposed[]
-  /** Rule ids already announced this session: the server lists a proposal until it is decided. */
+  /**
+   * Rule ids already announced: the server lists a proposal until it is
+   * decided. Kept in the store too (STORE_ANNOUNCED), per session, since a
+   * reload of this module starts this set empty.
+   */
   announced: Set<string>
   /** An answer is on its way to MemHub; the buttons wait for it. */
   isDeciding: boolean
@@ -113,6 +159,8 @@ type Band = {
   current: Painted
   timer: Timer | null
   requestId: string | null
+  /** Where the band was last drawn: the terminal blits a frame, the desktop redraws it. */
+  surface: 'terminal' | 'desktop'
   layout: Layout | null
   lastCells: string
   /** The session the animal was picked for. */
@@ -139,9 +187,27 @@ type Band = {
   hushedFrame: string
   /** A page is being opened in the browser; another press waits for it. */
   isOpening: boolean
+  /** setUp has run (or is running) for this load of the module. */
+  isSetUp: boolean
+  /** The mod's Ctx, from mod/register.ts: the credential and the env. */
+  ctx: Ctx
+  /**
+   * The `$.state` fires already seen, by feed.fireKey; null until the first
+   * read of this load, which takes what is there as said (a reload must not
+   * say a session's fires again).
+   */
+  seenFires: Set<string> | null
+  /** The proposals last handed to the band (feed.proposalsKey); null before any. */
+  proposalsKey: string | null
+  /** Proposal updates, one after another, so two never announce the same rule. */
+  syncing: Promise<void>
+  pollTimer: Timer | null
+  isPolling: boolean
+  /** The MemHub the poll reached ('staging' | 'production'); '' until it has. */
+  env: string
 }
 
-export function register(on: On) {
+export function register(on: On, ctx: Ctx) {
   const band: Band = {
     animal: DEFAULT_ANIMAL,
     build: DEFAULT_ANIMAL.builds[0]!,
@@ -169,6 +235,7 @@ export function register(on: On) {
     current: { canvas: [] },
     timer: null,
     requestId: null,
+    surface: 'terminal',
     layout: null,
     lastCells: '',
     sessionId: '',
@@ -182,40 +249,23 @@ export function register(on: On) {
     isHushed: false,
     hushedFrame: '',
     isOpening: false,
+    isSetUp: false,
+    ctx,
+    seenFires: null,
+    proposalsKey: null,
+    syncing: Promise.resolve(),
+    pollTimer: null,
+    isPolling: false,
+    env: '',
   }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
-    if (e.surface !== 'terminal' || !e.isInteractive) {
-      return result
-    }
-    band.isEnabled = (await $.store.get(STORE_ENABLED).catch(() => undefined)) !== false
-    const savedScale = await $.store.get(STORE_SCALE).catch(() => undefined)
-    band.scale = SCALES.includes(savedScale as never) ? (savedScale as number) : null
-    band.sessionId = await sessionIdOf($)
-    // The engine has already drawn the band by now — for the fallback animal,
-    // at no saved scale, enabled — and nothing redraws it on its own: switch
-    // the art as well as the name, or the fallback walks in and stays until
-    // the terminal is next resized (a tmux split was how it showed).
-    const animal = await pickFor($, band.sessionId)
-    if (animal !== band.animal || buildFor(animal, band.scale) !== band.build) {
-      switchTo(band, animal)
-    }
-    for (const animal of ANIMALS) {
-      await $.command
-        .register({
-          name: commandOf(animal),
-          description: `The MemHub ${animal.name.toLowerCase()} above the prompt: what the plugin is doing, as it happens`,
-          argumentHint: usageOf(animal),
-          immediate: true,
-        })
-        .catch(() => undefined)
-    }
-    // and redraw whatever the store changed: the animal, the scale's layout,
-    // or a companion turned off, which draws nothing at all
-    $.ui.invalidate('ui.render')
-    if (band.isEnabled) {
-      start($, band)
+    // `claude -p` is a terminal that is not interactive, with no band to draw
+    // in. The desktop reports no surface here and `isInteractive: false` (a
+    // live 2.1.287 session), so it sets up from its first draw instead.
+    if (e.surface === 'terminal' && e.isInteractive) {
+      await setUp($, band)
     }
     return result
   })
@@ -345,46 +395,53 @@ export function register(on: On) {
     return result
   })
 
+  // A rule the harness's background fork filed lands on the server minutes
+  // after the turn that launched it. Besides the clock (setUp), each main
+  // turn's end asks the server, without holding the turn — as each classic
+  // Stop used to, which the guard skips for most customers (D3).
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId === undefined) {
       band.isWorking = false
       band.activeUntil = band.frame + LINGER_FRAMES
+      if (band.isSetUp) void pollProposals($, band)
     }
     return result
   })
 
-  // The rulebook's command hooks sit beneath every hooks module in the classic
-  // chain, so `next(e)` is what they answered for this call.
+  // The fallback for fires: the rulebook's command hooks sit beneath every
+  // hooks module in the classic chain, so `next(e)` is what they answered for
+  // this call. Read only while the mod has not claimed that lane: a claimed
+  // lane's fires come through `$.state` fires (see ui.render), and the Python
+  // hook it suppresses prints nothing here anyway. Where the built-in guard
+  // skips classic.* for user mods, these never run at all.
   on('classic.PreToolUse', async ($, e, next) => {
     const result = await next(e)
-    announce(band, firedOf(result.additionalContext ?? [], result.deny ?? result.ask).map(saidOfFire))
+    if (isClassicLane(await lanesNow($), 'pre')) {
+      announce(band, firedOf(result.additionalContext ?? [], result.deny ?? result.ask).map(saidOfFire))
+    }
     return result
   })
 
   on('classic.PostToolUse', async ($, e, next) => {
     const result = await next(e)
-    announce(band, firedOf(result.additionalContext ?? [], result.block).map(saidOfFire))
+    if (isClassicLane(await lanesNow($), 'post')) {
+      announce(band, firedOf(result.additionalContext ?? [], result.block).map(saidOfFire))
+    }
     return result
   })
 
-  // A rule the harness's background fork filed lands on the server minutes
-  // after the Stop that launched it, and nothing records it locally. So each
-  // Stop asks the server, without holding the Stop, and announces what this
-  // session has not announced yet.
-  on('classic.Stop', async ($, e, next) => {
-    const result = await next(e)
-    if (band.isEnabled && e.session_id) void announceProposed($, band, e.session_id)
-    return result
-  })
-
-  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
-    if (!band.isEnabled || e.surface !== 'terminal' || e.props.hasSurvey) {
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Read while drawing, so a write to either redraws the band and lands here.
+    await feedFromState($, band)
+    if (!band.isEnabled || e.props.hasSurvey || (e.surface !== 'terminal' && e.surface !== 'desktop')) {
       band.requestId = null
       return next(e)
     }
-    const { Box, Text, Raster } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     band.requestId = e.requestId
+    band.surface = e.surface
+    if (e.surface === 'desktop') void setUp($, band)
     // hippo_half.py picks its pixel size from the terminal's height; the band
     // gets less than that, and only says how much by how much it scrolled. So
     // pick from the allowance, and where the drawing did not fit, remember the
@@ -398,7 +455,9 @@ export function register(on: On) {
     // A waiting proposal's buttons sit inside its bubble, where Got it goes.
     // Once the animal has said it and gone, they wait on a row of their own
     // under it; that row is kept while one waits, so the drawing never jumps.
-    const extra = band.mode === 'auto' && band.asks.length > 0 ? 1 : 0
+    // On the desktop they always have that row (see the header).
+    const isRowed = e.surface === 'desktop' ? ask !== undefined : band.mode === 'auto' && band.asks.length > 0
+    const extra = isRowed ? 1 : 0
     const room = Math.max(1, Math.min(e.props.maxRows, band.roomRows ?? e.props.maxRows) - extra)
     const build = buildFor(band.animal, band.scale)
     if (build !== band.build) {
@@ -408,35 +467,84 @@ export function register(on: On) {
       band.seg = segment(band, 'offscreen')
       band.current = { canvas: [] }
     }
-    band.layout = layoutOf(build, e.props.bodyColumns, room, band.scale ?? undefined)
+    band.layout = layoutOf(build, e.props.bodyColumns, room, band.scale ?? undefined, linesOf(band), e.surface === 'desktop' ? 0 : 1)
     if (!band.layout) {
       const name = band.animal.name.toLowerCase()
-      return Text({ dimColor: true, children: `make the terminal a little bigger for the ${name}` })
+      const where = e.surface === 'desktop' ? 'window' : 'terminal'
+      return Text({ dimColor: true, children: `make the ${where} a little bigger for the ${name}` })
     }
     const { bodyRows } = e.props.scroll
     if (bodyRows > 0 && bodyRows < band.layout.rows + extra && band.roomRows !== bodyRows) {
       band.roomRows = bodyRows
       $.ui.invalidate('ui.render')
     }
+    // opens a rule's page in MemHub Studio. A pressable word rather than a
+    // link: a terminal without hyperlinks draws a Link or a Markdown link as
+    // its text and then its URL, which ran down the bubble past its bottom.
+    const opens = (url: string) => () => void openUrl($, band, url)
+    const petButton = () =>
+      Button({ key: PET_KEY, plain: true, dimColor: true, label: '♥', onPress: () => onClick(band) })
+    const at = buttonsAt(band, build, band.layout)
+    band.buttonsKey = keyOfButtons(at)
+    // under the animal, the rule's name opens it (#67's link), as `rule` does
+    const name = (ask: Proposed, width: number) =>
+      ask.url
+        ? Button({ key: 'rule-name', plain: true, label: nameOf(ask, width), hover: { underline: true }, onPress: opens(ask.url) })
+        : Text({ children: nameOf(ask, width) })
+    const controlsFor = (ask: Proposed) => {
+      const isDemo = ask === DEMO_ASK
+      const answer = (action: 'activate' | 'reject') =>
+        isDemo ? () => demoPress($, band, action) : () => void decide($, band, ask, action)
+      // plain, so each reads `1: Activate`: the digit is the key to press
+      return band.isDeciding
+        ? [Text({ color: '#968ca5', children: 'asking MemHub…' })]
+        : isDemo && band.demoNote
+          ? [Text({ color: '#968ca5', wrap: 'truncate-end', children: band.demoNote })]
+          : [
+              Button({ key: 'rule-activate', hotkey: '1', plain: true, label: 'Activate', onPress: answer('activate') }),
+              Button({ key: 'rule-reject', hotkey: '2', plain: true, label: 'Reject', onPress: answer('reject') }),
+              Button({
+                key: 'rule-later', hotkey: '3', plain: true, dimColor: true, label: 'Later',
+                onPress: isDemo ? () => demoPress($, band, 'later') : () => later($, band),
+              }),
+            ]
+    }
+    const waiting = (ask: Proposed) =>
+      Box({ key: 'rule-waiting', gap: 2, children: [Text({ dimColor: true, children: 'new rule waiting:' }), name(ask, 40), ...controlsFor(ask)] })
+
+    if (e.surface === 'desktop') {
+      const buf = compose(band.current, build, titleOf(band.animal), band.layout)
+      band.lastCells = encode(buf)
+      band.wordKey = ''
+      const art = Box({
+        alignItems: 'flex-end',
+        children: [
+          petButton(),
+          // no `key`: an Svg takes none (SvgProps), and Claude Code 2.1.292
+          // drops one from the drawn tree
+          $.ui.resolve(e).Svg({
+            source: svgOf(buf),
+            alt: `${titleOf(band.animal)}, the MemHub companion`,
+            width: band.layout.columns * CELL_W,
+            height: band.layout.rows * CELL_H,
+          }),
+        ],
+      })
+      if (!ask || at === null) return Box({ justifyContent: 'flex-end', children: art })
+      return Box({ flexDirection: 'column', alignItems: 'flex-end', children: [art, waiting(ask)] })
+    }
+
     band.lastCells = cellsOf(band) ?? ''
-    const raster = Raster({
+    const raster = $.ui.resolve(e).Raster({
       key: RASTER_KEY,
       columns: band.layout.columns,
       rows: band.layout.rows,
       cells: band.lastCells,
     })
-    const { Button } = $.ui.resolve(e)
-    // opens a rule's page in MemHub Studio. A pressable word rather than a
-    // link: a terminal without hyperlinks draws a Link or a Markdown link as
-    // its text and then its URL, which ran down the bubble past its bottom.
-    const opens = (url: string) => () => void openUrl($, band, url)
     // a ♥ just left of where the ground begins, on its row: a click on it pets
     // the animal. No hotkey: a plain Button draws one as `p: ♥`.
     const pet = petAt(build, band.layout)
-    const clicks = Box({
-      key: 'companion-clicks', position: 'absolute', top: pet.top, left: pet.left,
-      children: Button({ key: PET_KEY, plain: true, dimColor: true, label: '♥', onPress: () => onClick(band) }),
-    })
+    const clicks = Box({ key: 'companion-clicks', position: 'absolute', top: pet.top, left: pet.left, children: petButton() })
     // a proposal's `rule`, once typed, opens the rule in MemHub Studio: a
     // plain Button labelled `rule`, over the word itself, on the bubble's own
     // background, underlined under the pointer
@@ -451,34 +559,10 @@ export function register(on: On) {
           }),
         })]
       : []
-    const at = buttonsAt(band, build, band.layout)
-    band.buttonsKey = keyOfButtons(at)
     if (!ask || !at) {
       return Box({ justifyContent: 'flex-end', children: Box({ children: [raster, clicks, ...linked] }) })
     }
-    const footer = at === 'below' ? null : at
-    // under the animal, the rule's name opens it (#67's link), as `rule` does
-    const name = (width: number) =>
-      ask.url
-        ? Button({ key: 'rule-name', plain: true, label: nameOf(ask, width), hover: { underline: true }, onPress: opens(ask.url) })
-        : Text({ children: nameOf(ask, width) })
-    const isDemo = ask === DEMO_ASK
-    const answer = (action: 'activate' | 'reject') =>
-      isDemo ? () => demoPress($, band, action) : () => void decide($, band, ask, action)
-    // plain, so each reads `1: Activate`: the digit is the key to press
-    const controls = band.isDeciding
-      ? [Text({ color: '#968ca5', children: 'asking MemHub…' })]
-      : isDemo && band.demoNote
-        ? [Text({ color: '#968ca5', wrap: 'truncate-end', children: band.demoNote })]
-        : [
-            Button({ key: 'rule-activate', hotkey: '1', plain: true, label: 'Activate', onPress: answer('activate') }),
-            Button({ key: 'rule-reject', hotkey: '2', plain: true, label: 'Reject', onPress: answer('reject') }),
-            Button({
-              key: 'rule-later', hotkey: '3', plain: true, dimColor: true, label: 'Later',
-              onPress: isDemo ? () => demoPress($, band, 'later') : () => later($, band),
-            }),
-          ]
-    if (footer) {
+    if (at !== 'below') {
       return Box({
         justifyContent: 'flex-end',
         children: Box({
@@ -487,8 +571,8 @@ export function register(on: On) {
             clicks,
             ...linked,
             Box({
-              position: 'absolute', top: footer.row, left: footer.col, width: footer.width,
-              backgroundColor: BUB_BG_HEX, gap: 2, children: controls,
+              position: 'absolute', top: at.row, left: at.col, width: at.width,
+              backgroundColor: BUB_BG_HEX, gap: 2, children: controlsFor(ask),
             }),
           ],
         }),
@@ -497,13 +581,254 @@ export function register(on: On) {
     return Box({
       flexDirection: 'column',
       alignItems: 'flex-end',
-      children: [
-        Box({ children: [raster, clicks, ...linked] }),
-        Box({ key: 'rule-waiting', gap: 2, children: [Text({ dimColor: true, children: 'new rule waiting:' }), name(40), ...controls] }),
-      ],
+      children: [Box({ children: [raster, clicks, ...linked] }), waiting(ask)],
     })
   })
 }
+
+/**
+ * What the mod wrote to `$.state` since the band last looked: each new fire
+ * announced once (crossly when it blocked the call), and the proposals handed
+ * to the band when their list changed. Called while drawing, so the reads
+ * subscribe the band and every write draws it again. A read that fails is
+ * nothing new.
+ */
+async function feedFromState($: EngineInterface, band: Band) {
+  const fires = firesOf(await readSafe(() => read($, FIRES)))
+  const { fresh, seen } = freshFires(fires, band.seenFires ?? new Set())
+  const isFirstLook = band.seenFires === null
+  band.seenFires = seen
+  // the first look of this load takes what is there as already said
+  if (!isFirstLook && band.isEnabled) announce(band, fresh.map(saidOfNote))
+  const notes = proposalsOf(await readSafe(() => read($, PROPOSALS)))
+  if (notes !== null && proposalsKey(notes) !== band.proposalsKey) {
+    band.proposalsKey = proposalsKey(notes)
+    void syncProposals($, band, notes)
+  }
+}
+
+/** A `$.state` read that cannot throw: undefined for anything that went wrong. */
+async function readSafe(get: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await get()
+  } catch {
+    return undefined
+  }
+}
+
+/** The Rulebook lanes the mod has claimed; none when unknown. */
+async function lanesNow($: EngineInterface) {
+  return lanesOf(await readSafe(() => read($, LANES)))
+}
+
+/**
+ * Ask the server for this session's proposed rules — once at a time — merge
+ * its list into `$.state` proposals and hand the result to the band. A poll
+ * that could not ask changes nothing.
+ */
+async function pollProposals($: EngineInterface, band: Band) {
+  if (band.isPolling || !band.isEnabled) return
+  band.isPolling = true
+  try {
+    const session = await sessionIdOf($)
+    if (!session) return
+    const since = await $.clock.now().catch(() => 0)
+    const listed = await listProposed($, band, session, since)
+    if (!listed) return
+    band.env = envName(band.ctx.env)
+    const merged = await update($, PROPOSALS, current => mergedProposals(proposalsOf(current) ?? [], listed.notes, since))
+      .then(proposalsOf, () => null)
+    // no $.state to write to (or the write refused): the server's list is the list
+    const notes = merged ?? listed.notes
+    band.proposalsKey = proposalsKey(notes)
+    await syncProposals($, band, notes)
+  } catch {
+    // companion-upgrades §1.2: never thrown out of a timer
+  } finally {
+    band.isPolling = false
+  }
+}
+
+/** Hand `notes` to the band after any update still running. */
+function syncProposals($: EngineInterface, band: Band, notes: readonly ProposalNote[]): Promise<void> {
+  band.syncing = band.syncing.then(() => applyProposals($, band, notes)).catch(() => undefined)
+  return band.syncing
+}
+
+/**
+ * `notes` is the whole of what is still waiting: an ask on the band it no
+ * longer names (decided in Studio, or by anyone else) comes off, buttons and
+ * any queued saying of it with it; a rule this session has not announced yet
+ * is said and asked. What was announced is kept in the store per session, so
+ * a reload of this module does not say it again (companion-upgrades §3.11).
+ */
+async function applyProposals($: EngineInterface, band: Band, notes: readonly ProposalNote[]) {
+  const waiting = new Set(notes.map(p => p.ruleId))
+  const gone = band.asks.filter(a => !waiting.has(a.ruleId))
+  if (gone.length > 0) {
+    band.asks = band.asks.filter(a => waiting.has(a.ruleId))
+    const unsaid = new Set(gone.map(proposalSaid))
+    band.queue = band.queue.filter(q => !(q.tone === 'proposed' && unsaid.has(q.text)))
+    $.ui.invalidate('ui.render')
+  }
+  if (!band.isEnabled) return
+  const session = await sessionIdOf($)
+  const stored = announcedOf(await $.store.get(STORE_ANNOUNCED).catch(() => undefined))
+  if (session) for (const id of announcedIn(stored, session)) band.announced.add(id)
+  const fresh = notes.filter(p => !band.announced.has(p.ruleId)).map(p => proposedOfNote(p, band.env))
+  if (fresh.length === 0) return
+  for (const p of fresh) band.announced.add(p.ruleId)
+  if (session) {
+    await $.store.set(STORE_ANNOUNCED, withAnnounced(stored, session, fresh.map(p => p.ruleId))).catch(() => undefined)
+  }
+  announce(band, fresh.map(p => ({ text: proposalSaid(p), tone: 'proposed' as const })))
+  band.asks.push(...fresh)
+  for (const p of fresh) void linkOf($, band, p)
+  $.ui.invalidate('ui.render')
+}
+
+// MemHub over `$.http.fetch` (spec §4.11, W12): the proposal poll, Activate /
+// Reject, and where a rule opens in Studio. They used to shell out to
+// `python3 scripts/rule_decide.py` per call; that script stays for the
+// skills, and its requests are mirrored here (feed.ts). Every call settles:
+// a failure is an answer (null, 'no_key', an error Decision), never a throw
+// (companion-upgrades §1.2). These live in this file because `claude plugin
+// validate` follows `$` into no imported function.
+
+/**
+ * The REST base, bearer and Studio origin: the mod's `ctx.api()`, which runs
+ * `rulebook_mod_cli.py api-info` once a session and keeps the answer in module
+ * memory only (a secret: never `$.state` or `$.store`).
+ */
+async function apiFor(band: Band): Promise<Api | undefined> {
+  return band.ctx.api().then(a => (isApi(a) ? a : undefined), () => undefined)
+}
+
+/** Drop the cached credential (after a 401) so the next apiFor() resolves it again. */
+function forgetApi(band: Band) {
+  try {
+    band.ctx.forgetApi()
+  } catch {
+    // a ctx that cannot forget costs one more 401, never a thrown hook
+  }
+}
+
+/** The plugin's folder: `$.plugin.root` may name its `.claude-plugin`. */
+function rootOf($: EngineInterface) {
+  return $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+}
+
+let manifestVersion: Promise<string> | undefined
+
+/** plugin_version.request_headers()'s value: the manifest's version, '' when unreadable. */
+function versionOf($: EngineInterface): Promise<string> {
+  manifestVersion ??= $.fs.read(`${rootOf($)}/.claude-plugin/plugin.json`).then(versionOfManifest, () => '')
+  return manifestVersion
+}
+
+type Sent = { status: number; text: string; base: string }
+
+/**
+ * One request to MemHub's REST API with the plugin's key, as rule_decide.py
+ * sends it. A 401 drops the cached key and tries once more with a fresh one.
+ * 'no_key' when there is no key to send; null when no answer came.
+ */
+async function send($: EngineInterface, band: Band, path: string, body?: { method: string; body: string }): Promise<Sent | 'no_key' | null> {
+  for (let attempt = 0; ; attempt += 1) {
+    const api = await apiFor(band).catch(() => undefined)
+    if (!api) return 'no_key'
+    const headers = headersOf(api, await versionOf($), body !== undefined)
+    const base = api.base.replace(/\/+$/, '')
+    const res = await $.http.fetch(`${base}${path}`, { ...body, headers }).catch(() => null)
+    if (!res) return null
+    if (res.status === 401 && attempt === 0) {
+      forgetApi(band)
+      continue
+    }
+    return { status: res.status, text: typeof res.text === 'string' ? res.text : '', base }
+  }
+}
+
+/**
+ * This session's rules still `proposed` as the server lists them, and the
+ * base that answered; null when it could not be asked or answered oddly —
+ * then nothing may be taken off the band.
+ */
+async function listProposed($: EngineInterface, band: Band, session: string, at: number): Promise<{ notes: ProposalNote[]; base: string } | null> {
+  const sent = await send($, band, PROPOSED_PATH)
+  if (!sent || sent === 'no_key' || sent.status < 200 || sent.status >= 300) return null
+  const notes = listedRules(sent.text, session, at)
+  return notes ? { notes, base: sent.base } : null
+}
+
+/** rule_decide.py `decide()`: Studio's own PATCH, and what came of it. */
+async function decideRule($: EngineInterface, band: Band, ruleId: string, action: keyof typeof STATUS_OF): Promise<Decision> {
+  if (!UUID.test(ruleId)) return { outcome: 'error', msg: 'not a rule id' }
+  const sent = await send($, band, rulePath(ruleId), { method: 'PATCH', body: JSON.stringify({ status: STATUS_OF[action] }) })
+  if (sent === 'no_key') return { outcome: 'no_key', msg: 'no stored access key; run /memhub:login' }
+  if (!sent) return { outcome: 'error', msg: 'no connection' }
+  // a second 401, with a freshly resolved key: the key itself is refused
+  if (sent.status === 401) return { outcome: 'no_key', msg: 'access key refused' }
+  return decisionOf(sent.status, sent.text, action)
+}
+
+/** Where the rule (or, with no id, the rulebook) opens in MemHub Studio; '' for nowhere. */
+async function studioUrlFor($: EngineInterface, band: Band, ruleId: string): Promise<string> {
+  const api = await apiFor(band).catch(() => undefined)
+  return api ? studioUrl(api.studio ?? '', ruleId) : ''
+}
+
+/** Take a decided rule out of `$.state` proposals, so no reader asks it again. */
+async function forget($: EngineInterface, band: Band, ruleId: string) {
+  const left = await update($, PROPOSALS, current => (proposalsOf(current) ?? []).filter(p => p.ruleId !== ruleId))
+    .then(proposalsOf, () => null)
+  if (left) band.proposalsKey = proposalsKey(left)
+}
+
+/**
+ * The companion's start, once a session: its saved state, its animal, its
+ * commands and its frame clock. The terminal runs it at session.start; the
+ * desktop, whose session.start says nothing of where it draws, at its first
+ * draw of the band.
+ */
+async function setUp($: EngineInterface, band: Band) {
+  if (band.isSetUp) return
+  band.isSetUp = true
+  band.isEnabled = (await $.store.get(STORE_ENABLED).catch(() => undefined)) !== false
+  const savedScale = await $.store.get(STORE_SCALE).catch(() => undefined)
+  band.scale = SCALES.includes(savedScale as never) ? (savedScale as number) : null
+  band.sessionId = await sessionIdOf($)
+  // The engine has already drawn the band by now — for the fallback animal,
+  // at no saved scale, enabled — and nothing redraws it on its own: switch
+  // the art as well as the name, or the fallback walks in and stays until
+  // the terminal is next resized (a tmux split was how it showed).
+  const animal = await pickFor($, band.sessionId)
+  if (animal !== band.animal || buildFor(animal, band.scale) !== band.build) {
+    switchTo(band, animal)
+  }
+  for (const animal of ANIMALS) {
+    await $.command
+      .register({
+        name: commandOf(animal),
+        description: `The MemHub ${animal.name.toLowerCase()} above the prompt: what the plugin is doing, as it happens`,
+        argumentHint: usageOf(animal),
+        immediate: true,
+      })
+      .catch(() => undefined)
+  }
+  // and redraw whatever the store changed: the animal, the scale's layout,
+  // or a companion turned off, which draws nothing at all
+  $.ui.invalidate('ui.render')
+  if (band.isEnabled) {
+    start($, band)
+  }
+  // proposed rules: once now, then on the clock (and at each turn's end)
+  band.pollTimer ??= $.clock.every(POLL_MS, () => void pollProposals($, band))
+  void pollProposals($, band)
+}
+
+/** The most lines a bubble says where the band is drawn; the terminal's default when undefined. */
+const linesOf = (band: Band) => (band.surface === 'desktop' ? DESKTOP_TEXT_LINES : undefined)
 
 const commandOf = (animal: Animal) => animal.name.toLowerCase()
 
@@ -643,45 +968,19 @@ async function openWith($: EngineInterface, url: string) {
   }
 }
 
-/**
- * Where a rule — or, with no id, the rulebook — opens in MemHub Studio, from
- * rule_decide.py's `url`: harness_stop.rule_url(), the Stop notice's own
- * link, against the install's own MemHub. '' when it has none.
- */
-async function studioUrlOf($: EngineInterface, ruleId: string, env: string, timeoutMs: number): Promise<string> {
-  const root = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
-  const argv = ['python3', `${root}/scripts/rule_decide.py`, 'url', ...(ruleId ? [ruleId] : [])]
-  const run = await $.process.run(env ? [...argv, '--env', env] : argv, { timeoutMs })
-  const got = JSON.parse(run.stdout.trim().split('\n').pop() || '{}') as { url?: unknown }
-  return typeof got.url === 'string' && /^https:\/\//.test(got.url) ? got.url : ''
-}
-
 const saidOfFire = (fire: Fired): Said => ({
   text: fire.isBlocked ? `Blocked: ${fire.rule}` : `Rule fired: ${fire.rule}`,
   tone: fire.isBlocked ? 'blocked' : 'advice',
 })
 
-async function proposedFor($: EngineInterface, session: string): Promise<Proposed[]> {
-  const root = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
-  const argv = ['python3', `${root}/scripts/rule_decide.py`, 'proposed', '--session', session]
-  const run = await $.process.run(argv, { timeoutMs: 30_000 }).catch(() => null)
-  return run ? proposedOf(run.stdout) : []
-}
-
-async function announceProposed($: EngineInterface, band: Band, session: string) {
-  const fresh = (await proposedFor($, session)).filter(p => !band.announced.has(p.ruleId))
-  if (fresh.length === 0) return
-  for (const p of fresh) band.announced.add(p.ruleId)
-  announce(band, fresh.map(p => ({ text: proposalSaid(p), tone: 'proposed' as const })))
-  band.asks.push(...fresh)
-  for (const p of fresh) void linkOf($, p)
-  $.ui.invalidate('ui.render')
-}
+/** A `$.state` fire as the animal says it: the same words as one read off the classic answer. */
+const saidOfNote = (note: FireNote): Said => saidOfFire({ rule: note.rule.replace(/\s+/g, ' ').trim(), isBlocked: note.isBlocked })
 
 /**
- * Answer the proposal on the buttons through scripts/rule_decide.py — Studio's
- * own PATCH, sent with the plugin's access key — then say how it went. The
- * buttons go the moment it is sent, so a second press cannot answer twice.
+ * Answer the proposal on the buttons with Studio's own PATCH, sent with the
+ * plugin's access key (decideRule: rule_decide.py's request), then say how it
+ * went. The buttons go the moment it is sent, so a second press cannot
+ * answer twice; a rule that left `proposed` leaves `$.state` proposals too.
  */
 async function decide($: EngineInterface, band: Band, ask: Proposed, action: 'activate' | 'reject') {
   if (band.isDeciding || band.asks[0] !== ask) return
@@ -689,15 +988,15 @@ async function decide($: EngineInterface, band: Band, ask: Proposed, action: 'ac
   $.ui.invalidate('ui.render')
   let d: Decision = { outcome: 'error' }
   try {
-    const root = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
-    const argv = ['python3', `${root}/scripts/rule_decide.py`, ask.ruleId, action]
-    const run = await $.process.run(ask.env ? [...argv, '--env', ask.env] : argv, { timeoutMs: 30_000 })
-    d = JSON.parse(run.stdout.trim().split('\n').pop() || '{}') as Decision
+    d = await decideRule($, band, ask.ruleId, action)
   } catch (err) {
     d = { outcome: 'error', msg: err instanceof Error ? err.name : 'failed' }
   } finally {
     band.isDeciding = false
     band.asks = band.asks.filter(a => a !== ask)
+  }
+  if (d.outcome === 'active' || d.outcome === 'dismissed' || d.outcome === 'decided' || d.outcome === 'gone') {
+    await forget($, band, ask.ruleId).catch(() => undefined)
   }
   announce(band, [{ text: decisionSaid(ask, action, d), tone: 'advice' }])
   $.ui.invalidate('ui.render')
@@ -744,7 +1043,7 @@ function wordOf(band: Band): { ask: Proposed & { url: string }; at: { row: numbe
   const { bubble } = band.current
   if (!band.layout || bubble?.tone !== 'proposed') return null
   const ask = band.mode === 'auto'
-    ? band.asks.find(a => fitBubble(proposalSaid(a)) === bubble.text)
+    ? band.asks.find(a => fitBubble(proposalSaid(a), linesOf(band)) === bubble.text)
     : band.hasDemoAsk ? DEMO_ASK : undefined
   if (!ask?.url) return null
   const at = wordAt(band.current, band.build, band.layout, RULE_WORD)
@@ -772,15 +1071,16 @@ function demoPress($: EngineInterface, band: Band, action: keyof typeof DEMO_SAY
 }
 
 /**
- * Where the rule opens in MemHub Studio, from rule_decide.py's `url` — which
- * is harness_stop.rule_url(), the Stop notice's own link, so the two agree —
- * then a redraw, so the name turns into a link. '' when it has none.
+ * Where the rule opens in MemHub Studio — the web app api-info pairs with the
+ * API the plugin reaches (plugin_onboarding._ORIGINS, which harness_stop's
+ * rule_url() uses too, so it agrees with the Stop notice's link) — then a
+ * redraw, so the name turns into a link. '' when it has none.
  */
-async function linkOf($: EngineInterface, ask: Proposed) {
+async function linkOf($: EngineInterface, band: Band, ask: Proposed) {
   if (ask.url !== undefined) return
   ask.url = ''
   try {
-    ask.url = await studioUrlOf($, ask.ruleId, ask.env, 15_000)
+    ask.url = await studioUrlFor($, band, ask.ruleId)
   } catch {
     ask.url = ''
   }
@@ -824,7 +1124,7 @@ function segment(band: Band, name: PoseName): Segment {
       const said = band.queue.shift()!
       band.fires += 1
       band.speakingTone = said.tone
-      return { name, frames: poses.speak(fitBubble(said.text), band.fires, said.tone) }
+      return { name, frames: poses.speak(fitBubble(said.text, linesOf(band)), band.fires, said.tone) }
     }
   }
 }
@@ -951,7 +1251,7 @@ async function tick($: EngineInterface, band: Band) {
   if (hasDemoAsk !== band.hasDemoAsk) {
     band.hasDemoAsk = hasDemoAsk
     band.demoNote = null
-    if (hasDemoAsk) void linkOf($, DEMO_ASK)
+    if (hasDemoAsk) void linkOf($, band, DEMO_ASK)
     $.ui.invalidate('ui.render')
   }
   if (band.demoNote && band.frame >= band.demoNoteUntil) {
@@ -967,8 +1267,13 @@ async function tick($: EngineInterface, band: Band) {
   const cells = cellsOf(band)
   band.frame += 1
   const { requestId } = band
-  if (requestId && cells && cells !== band.lastCells) {
-    band.lastCells = cells
-    await $.ui.blit({ requestId, key: RASTER_KEY, cells }).catch(() => undefined)
+  if (!requestId || !cells || cells === band.lastCells) return
+  if (band.surface === 'desktop') {
+    // the render draws the frame and records it; one skipped here is drawn
+    // by the next, since its cells still differ from the last drawn
+    if (band.frame % DESKTOP_STRIDE === 0) $.ui.invalidate('ui.render')
+    return
   }
+  band.lastCells = cells
+  await $.ui.blit({ requestId, key: RASTER_KEY, cells }).catch(() => undefined)
 }

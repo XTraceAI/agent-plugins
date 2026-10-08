@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +19,13 @@ PLUGIN_ROOT = SCRIPT_DIR.parent
 BRIDGE_SOURCE = PLUGIN_ROOT / "references" / "codex-hooks-bridge.json"
 RUNNER_SOURCE = SCRIPT_DIR / "codex_hook_bridge.py"
 _RUNNER_NAME = "memhub_hook_bridge.py"
+# Where the bridge's lanes leave files: codex_flush's per-session state, locks
+# and log, capture_health's per-session marker, and the trampoline's own
+# breadcrumb (codex_hook_bridge._STATE_DIR). Codex runs a user hook only after
+# the person trusts it, and once the bridge is installed the bundled plugin
+# hooks defer to it, so a file here newer than the install is the one piece of
+# evidence on disk that Codex has actually run the trusted MemHub handlers.
+_HOOK_STATE_DIR = Path.home() / ".config" / "memhub-plugin" / "codexflush"
 _LEGACY_MARKERS = (
     "codex_flush.py",
     "directive_recall.py",  # retired, but still names an older plugin's bridge
@@ -253,6 +261,46 @@ def status(home: Path) -> tuple[bool, int, int, bool, bool]:
     return hooks_ok and runner_ok, actual, expected, hooks_ok, runner_ok
 
 
+def _onboard_command() -> str:
+    """`/memhub:onboard` as this install names it (e.g. `/memhub-staging:onboard`)."""
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from _memhub_auth import skill_command  # noqa: PLC0415 — stdlib, beside this file
+        return skill_command("onboard")
+    except Exception:  # noqa: BLE001 — a status line never fails over naming
+        return "/memhub:onboard"
+
+
+def hooks_ran_at(home: Path, state_dir: Path | None = None) -> float | None:
+    """When MemHub's hooks last wrote state, if that was after the install.
+
+    The install time is the later of hooks.json's and the copied runner's
+    mtimes, so a re-install that changes either asks for fresh evidence. Any
+    later edit to hooks.json only makes this more conservative. Returns None
+    when there is no such evidence: trust is then unverified, never assumed.
+    """
+    state_dir = _HOOK_STATE_DIR if state_dir is None else state_dir
+    try:
+        installed_at = max(
+            (home / "hooks.json").stat().st_mtime,
+            (home / _RUNNER_NAME).stat().st_mtime,
+        )
+    except OSError:
+        return None
+    newest = None
+    try:
+        for entry in os.scandir(state_dir):
+            try:
+                if entry.is_file():
+                    mtime = entry.stat().st_mtime
+                    newest = mtime if newest is None else max(newest, mtime)
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return newest if newest is not None and newest > installed_at else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("install", "status", "remove"), nargs="?", default="install")
@@ -282,12 +330,17 @@ def main() -> int:
         if healthy:
             state = "OK"
         elif hooks_ok and not runner_ok:
-            state = "STALE BRIDGE — re-run setup to refresh it"
+            state = f"STALE BRIDGE — run {_onboard_command()} again to refresh it"
         else:
             state = "NOT INSTALLED"
         print(f"MemHub Codex hooks: {state} ({actual}/{expected} handlers)")
         if healthy:
-            print(f"trust: Codex-controlled; verify the {expected} MemHub handlers in /hooks")
+            ran_at = hooks_ran_at(home)
+            if ran_at is not None:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ran_at))
+                print(f"trust: confirmed (MemHub hooks ran at {when})")
+            else:
+                print(f"trust: Codex-controlled; verify the {expected} MemHub handlers in /hooks")
         return 0 if healthy else 1
     except (SetupError, OSError) as exc:
         print(f"MemHub Codex hooks: ERROR: {exc}")

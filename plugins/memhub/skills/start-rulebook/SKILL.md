@@ -1,7 +1,7 @@
 ---
-description: Use when the user wants rules for the Rulebook — a first set for a repo that has none, or rules from what their team actually does. "/memhub:start-rulebook", "set up a rulebook for this repo", "what rules should we start with", "give us the default rules", "bootstrap rules for a new client", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. Asks first which the person wants: STARTER rules (a tested catalog of universal coding-agent rules, filled in from a scan of this repo — seconds) and/or rules MINED from their own CLAUDE.md and the last 30 days of local Claude Code / Codex / Cursor sessions (minutes — it reads their sessions). Every candidate is replayed through the real hook and says why it exists, what it cost, and what changes with it on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.
-argument-hint: [--starter | --mine] [--days N | --all] [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--rulebook "<name or id>"] [--dry-run]
-allowed-tools: Bash, Read, Write, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__create_rulebook, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__create_rulebook, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill
+description: 'Use when the user wants rules for the Rulebook — a first set for a repo that has none, or rules from what their team actually does. "/memhub:start-rulebook", "set up a rulebook for this repo", "what rules should we start with", "give us the default rules", "bootstrap rules for a new client", "mine our sessions for rules", "turn our CLAUDE.md into rules", "what should be in the rulebook", "backtest this rule", "did the new rules reduce friction" — or right after a Claude Code /insights run. Asks first which the person wants: STARTER rules (a tested catalog of universal coding-agent rules, filled in from a scan of this repo — seconds) and/or rules MINED from their own CLAUDE.md and the last 30 days of local Claude Code / Codex / Cursor sessions (minutes — it reads their sessions). Every candidate is replayed through the real hook and says why it exists, what it cost, and what changes with it on. Hook rules first, session-start notes last. Files survivors as proposed; never activates anything.'
+argument-hint: '[--starter | --mine] [--days N | --all] [--repo <name>] [--claude-md <path>] [--baseline-date YYYY-MM-DD] [--scope org|personal|workspace] [--workspace "<name>"] [--dry-run]'
+allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/starter_rulebook.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" *), Bash(git rev-parse --show-toplevel), Bash(git rev-parse --short HEAD), Edit(./skills.json), Edit(./mine-out/**), Edit(//tmp/start-rulebook/**), Edit(//var/folders/**/start-rulebook/**), Read, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub_memhub__list_skills, mcp__plugin_memhub_memhub__create_skill, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__list_skills, mcp__plugin_memhub-staging_memhub__create_skill'
 ---
 
 # Rules for the Rulebook — a starter set, their own, or both. One run
@@ -69,7 +69,7 @@ laptop's quirks.
 |---|---|---|
 | **fires at the command** | `agent_hook` + `matcher {event: bash \| edit}` or `ordering` | a pattern over the command / edit, or "green X after edits, before Y" |
 | **fires on the error** | `agent_hook` + `matcher {event: output}` | a pattern over the tool result |
-| **fires when the name comes up** | `anchor_recall` + `anchors: [...]` | identifiers (a repo name, `arxiv.org`, `README.md`); the server matches and judges relevance — not replayable |
+| **fires when the name comes up** | `anchor_recall` + `anchors: [...]` | specific identifiers (a repo name, `arxiv.org`, `README.md`), matched by the hook as whole identifiers in the command or path; the judge decides fit — not replayed |
 | **shown at session start** | `session_context` | nothing checkable — a sentence Claude sees once |
 
 **Hook lanes first, notes last — this is the rule of the skill, not a
@@ -120,49 +120,34 @@ parses.
 - The memhub plugin installed (any host): the script reuses its
   `scripts/readers/` and `scripts/rulebook_hook.py` (`to_hook_rule`,
   `evaluate`, `shell_only`) — the real hook, never a re-implementation.
-- memhub tools `list_rulebooks`, `list_rules`, `create_rule`, `create_rulebook`,
-  `list_skills`, `create_skill`.
-- Arguments: `--rulebook "<name or id>"` → the destination `rulebook_id`
-  (`--brain` is still accepted for it); `--starter` / `--mine` → answers step
+- memhub tools `list_rulebooks`, `list_rules`, `create_rule`, `list_skills`,
+  `create_skill`.
+- Arguments: `--scope org|personal|workspace` (+ `--workspace "<name>"`) →
+  who the rules apply to (below); `--rulebook "<id>"` is a deprecated alias
+  passed through as `rulebook_id` — one that is not an id is ignored ("rulebooks
+  are scopes now"); `--starter` / `--mine` → answers step
   0a without asking; `--days N` / `--all` → the window; `--dry-run` →
   everything except the `create_rule` calls.
 
-**Resolve the rulebook before you file anything.** A rulebook is a container
-with its own membership — every member's agent is bound by its rules — and one
-person can be in several. Call `list_rulebooks` (rows carry `rulebook_id`,
-`name`, `scope`, `member_count`, `rule_count`, `bound`, `is_admin`). Match
-`--rulebook` by id then by name; with it omitted, one visible book is the
-destination and several means **ask** (AskUserQuestion, one option per book
-labelled with who it binds) rather than guess. No books at all → offer
-`create_rulebook(name: "Rulebook: <repo>", scope: "explicit")` — the repo's
-own book, named exactly as `/memhub:create-rule` names it so the two skills
-land in the SAME book instead of making one each — which binds only the user,
-and create it only on a yes; never pass `scope: "all_org"` or name another
-member — both are org-admin acts. Every proposal you show the user names the
-book it would land in, because that is who the rule would reach.
+**Decide who the rules apply to before you file anything — one scope for the
+whole batch.** Every rule goes into one scope: `org` (everyone in the
+organisation — **the default**), `personal` (just the user), or `workspace`
+(the people in one workspace — only when the user asks for it). Call
+`list_rulebooks` and read its `scopes` block (`org` / `personal` with `label`
+and `applies_to`, `supports_workspaces`, `workspaces[]`); do not enumerate
+books. `--scope` given → use it. The user's words say "just me" / "only me" /
+"personal" → `personal`. They name a workspace or teamspace that matches a
+`scopes.workspaces[].name` and `supports_workspaces` is true → `workspace` with
+that `workspace_id`. **Otherwise `org`** — do not ask, and never offer the
+workspace scope unprompted; a workspace they name that is not listed (or a
+plan without workspaces) is said once, and the batch goes to `org`. Every
+proposal you show the user names who it would apply to (the scope's `label`
+and `applies_to`), because that is who the rule would reach.
 
-**Read `member_count` off the create reply before filing anything into a new
-book.** `create_rulebook` seeds an `explicit` book with its creator — *unless
-the creator is an organisation admin*, who is seeded only by naming themselves
-in `member_user_ids`. The person setting MemHub up for a new team is very
-often that admin. Taking the default, they get a book that binds NOBODY: sixty
-rules file, every reply says success, and not one reaches a session. So pass
-the user's own id in `member_user_ids` when you know it, and either way treat
-`member_count: 0` as a FAILURE — stop, say the book exists but binds nobody
-and needs a member added in MemHub, and file nothing until it has one.
-If the server has no `list_rulebooks`, it predates rulebook containers: file
-with no `rulebook_id` and carry on. Never pass `agent_brain_id` to
+If the server has no `list_rulebooks` or its reply has no `scopes` (an older
+server), file with no `scope` and carry on. Never pass `agent_brain_id` to
 `create_rule` — the parameter no longer exists, and the server drops it
-without a word: the rule files wherever `rulebook_id` (or its absence) sends
-it, not into the brain you meant.
-
-**When the create is refused.** The reply is a sentence, not a code — match
-on its wording. `create_rulebook` validates the creator as an active org
-member, so it can answer "*<name> isn't in this organisation, so they can't
-be put in a rulebook*" about *the user themselves* — even though you named nobody. That is not a bug to retry:
-their org membership is inactive, and no rulebook can be created until someone
-fixes it in MemHub. Say that plainly and stop. ("*That rulebook name is too
-long*" means it exceeded 200 characters — shorten it and retry once.)
+without a word.
 
 ## 0a. Ask what they want — first, in plain words
 
@@ -245,8 +230,9 @@ leaves:
   migrations, dev server, generated files, the largest files, `.gitignore`
   exclusions and secrets, protected paths, CI and production workflows, infra.
 - `candidates.json` — one `create_rule` body per seeded rule (`body`), with
-  `category`, `designed_mode`, `seeded_from`, `evidence`, `cases`. Each body
-  carries `when`, `do`, `why` (and `when_not` where the catalog names an
+  `category` (the catalog's own group), `designed_mode`, `seeded_from`,
+  `evidence`, `cases`. Each body carries `categories` (MemHub's, from the
+  catalog's `memhub_categories`) and `when`, `do`, `why` (and `when_not` where the catalog names an
   exclusion): what MemHub's rule judge reads once the rule's check has
   matched, to decide whether the agent is really in the rule's situation.
   They are the catalog's own sentences with this repo's values filled in, the
@@ -287,14 +273,23 @@ PY
 # Starter only: its own quick replay. Both: add this --candidates to the step-4 run instead.
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" \
   --out "$OUT/mine" --candidates "$OUT/starter-bodies.json" --repo "<repo>" --digest-top 0   # + --days N / --all if they asked
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/starter_rulebook.py" attach-evidence \
+  --out "$OUT" --replay "$OUT/mine/proposals.json"       # Both: point --replay at the step-4 run's proposals.json
 ```
+
+`attach-evidence` puts each starter rule's measured count on its body as
+`evidence` — `{sessions_seen, sessions_scanned, window_days}`, what MemHub
+shows as "seen in N sessions". It leaves a ceiling row (below) and anything
+the replay did not measure without one, and removes a count left by an
+earlier run. No replay, no `attach-evidence`: the starter rules file without
+evidence, which is correct — never fill one in by hand.
 
 Three things to know before reading a number off that replay:
 
 - **What the replay covers.** Bash commands, edits, tool output, and reads —
   both the Read tool's path and every file a Bash call would print
-  (`cat .env`), through the hook's own parser. `anchor_recall` and
-  `session_context` rows are never replayed (the server judges those), so
+  (`cat config.yml`), through the hook's own parser. `anchor_recall` and
+  `session_context` rows are never replayed (the replay has no anchors or session lane), so
   they carry no number at all: say "not measurable here", never "0".
 - **A rule with a `given` block or `scope_paths` is replayed WITHOUT them**
   (`candidates.json` marks each such row `replay_is_ceiling: true`) —
@@ -339,7 +334,7 @@ single-select question — **how firm should they be on day one?**
 the user, the field names in the call.) Whatever they pick, the replay
 overrides it downward: a designed gate that came up in more than ~10% of their
 sessions is filed as a reminder, and the report says so. Say once what a block
-means: it stops that command for **everyone the rulebook binds**, and any of
+means: it stops that command for **everyone the rule applies to**, and any of
 them can still run it with `RULEBOOK_OVERRIDE='<why>'`, which records why.
 
 ## S3. Starter: show the shortlist, let them strike rows
@@ -416,19 +411,42 @@ enforced by <what>" in the report). For each rule pick ONE delivery, hook
 lanes first (table above), and write a `create_rule` body into a JSON list:
 
 ```json
-[{"title": "dotenv-not-source",
+[{"title": "no-force-push",
   "delivery": "agent_hook",
-  "matcher": {"event": "bash", "command_rx": "(^|[;&|(]\\s*)(source|\\.)\\s+\\S*\\.env\\b",
-              "command_not_rx": "python3?\\s+-c\\b|\\brulebook\\b", "warn_once_per": "session"},
-  "claude_md": {"heading": "Loading environment variables", "text": "`source .env` will mis-parse it and leak secrets into stderr. Always load it via python-dotenv."},
-  "did": "Claude sourced .env", "what": "Claude is warned at `source .env` and pointed to python-dotenv",
-  "when": "Claude is about to load a .env file into the shell by sourcing it.",
-  "do": "Load it via python-dotenv; never source it.",
-  "why": "Sourcing .env mis-parses it and leaks secrets into stderr.",
-  "quote_rx": "\\.env|secret|dotenv",
+  "matcher": {"event": "bash", "command_rx": "\\bgit\\s+push\\b[^;&|]*\\s(--force|-f)\\b",
+              "command_not_rx": "--force-with-lease", "warn_once_per": "session"},
+  "claude_md": {"heading": "Pushing", "text": "Never force-push a shared branch; use --force-with-lease on your own."},
+  "did": "Claude force-pushed", "what": "Claude is warned at `git push --force` and pointed to --force-with-lease",
+  "when": "Claude is about to force-push a branch.",
+  "do": "Use --force-with-lease, and only on a branch only you push to.",
+  "why": "A plain force push can silently discard teammates' commits.",
+  "quote_rx": "force[- ]push|--force",
   "scope_repos": ["<repo>"], "source": "claude_md_import",
-  "source_ref": "CLAUDE.md@<sha>#loading-environment-variables"}]
+  "source_ref": "CLAUDE.md@<sha>#pushing",
+  "categories": ["reliability"]}]
 ```
+
+- `categories` are the MemHub categories the rule belongs to — the chips the
+  Rules card shows and filters by. A list: usually one, two only when the rule
+  truly spans both, and the key left out when nothing fits; never invent a
+  seventh, and never send the deprecated single `category`:
+
+  | category | the rule is about |
+  |---|---|
+  | `security` | secrets, credentials, permissions, hook tampering, what subagents may touch |
+  | `reliability` | the agent does not break things or leave them hanging: irreversible git, deletes, production writes, destructive infra commands, calls that hang or poll with sleep, releasing DB sessions before slow external calls |
+  | `token_efficiency` | the cost of agent work: keep big files, diffs and listings out of context; cheap verification instead of full suites, installs and dev servers |
+  | `code_quality` | what the shipped code is like: correctness, test hygiene (no skipping, slowing or snapshot-updating to get green), error handling |
+  | `consistency` | the way this team and repo do things: conventions, reuse before reinventing, commit / lockfile / migration discipline, repo facts |
+  | `agent_conduct` | how the agent works with the person driving it: checks before it assumes (asks which repo, names the environment), does what was asked (answers the question, plans when told to plan), says where its claims come from |
+
+  The sorting test for `agent_conduct`: if the rule would still matter with
+  nobody watching the session, it belongs elsewhere.
+
+  The replay echoes them back on the row as `rule_categories`, in the
+  server's order (a value outside the six is warned about and dropped; an
+  older `coding_standards` or `testing` reads as `code_quality`). The
+  built-in hypotheses carry their own.
 
 - `claude_md` is the origin sentence itself — pass it, don't make the
   script guess. `did` = what Claude did (past tense); `what` = what changes
@@ -537,7 +555,9 @@ the starter rule (it is the tested pattern, fitted to their repo) and put the
 mined row's evidence on it — its session count and the user's own words are
 the "why it matters *here*" the starter rule otherwise lacks. A mined row that
 is *narrower* in a way their sessions justify (they only ever force-push, never
-reset) is still one row: the starter rule, with that noted.
+reset) is still one row: the starter rule, with that noted. That mined count is
+for the report only: the starter body files with its own `evidence` (from
+`attach-evidence` over this same run), never the mined row's `rule_evidence`.
 
 The report, in order:
 
@@ -615,10 +635,11 @@ row's own `why` stays the report's reason line.
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
      --candidates <candidates.json> --existing <list_rules.json> --repo "<repo>" \
-     --rulebook-id <the destination rulebook_id>
+     --rulebook-id <scopes.<scope>.rulebook_id>
    ```
-   Omit `--rulebook-id` entirely when there is no id (an older backend);
-   passing it empty is an argparse error and you get no report at all.
+   When that `rulebook_id` is `null` (nothing filed into the scope yet), pass
+   `--new-scope` instead; omit both on an older backend with no `scopes`.
+   Passing `--rulebook-id` empty is an argparse error and you get no report.
    `include_retired=True` matters: a rule someone already
    dismissed is exactly the twin you must not re-file, and the default view
    hides retired rules. `limit` is 200 at most — if the reply says `has_more`,
@@ -642,7 +663,7 @@ row's own `why` stays the report's reason line.
    incoming rule is strictly wider (`git-irreversible` over `no-force-push`),
    which is filed with `supersedes_rule_id`. Retired counterpart → someone
    already said no; skip it. A hit marked **`cross_book`**
-   is in another rulebook: `supersedes_rule_id` cannot reach it and both
+   is in another scope: `supersedes_rule_id` cannot reach it and both
    rules will fire on the same call, so it goes to the user as a decision,
    never absorbed silently.
 3. Skills: only `PROPOSE this skill` rows; host-agnostic SKILL.md citing
@@ -654,7 +675,9 @@ row's own `why` stays the report's reason line.
    `--dry-run`, stop here.
 5. File — every channel ends as something filed or grabbable, never only
    described:
-   - **Rules**: `create_rule` once per row with the destination `rulebook_id`,
+   - **Rules**: `create_rule` once per row with the batch's `scope` (and
+     `workspace_id`) — no `scope` on a row with `supersedes_rule_id`, which
+     stays in the scope of the rule it replaces —
      the row's `delivery` and engine block, the row's `statement` (statements
      are capped at 400 chars server-side), `scope_repos`, `source`
      (`claude_md_import` for declared, `authored` for observed and asserted),
@@ -662,18 +685,28 @@ row's own `why` stays the report's reason line.
      the row's `context` — pass each of `when`, `do`, `why`, `when_not` it
      holds as the `create_rule` field of that name, unchanged (an empty
      `context` passes none, and the rule is judged on its statement) —
-     and `supersedes_rule_id` where step 2 said so. A rule filed with
+     `categories` = the row's `rule_categories` and `evidence` = the row's
+     `rule_evidence` — each **verbatim**, and only when the row has it (an
+     absent `rule_evidence` means the replay did not measure that rule:
+     an anchor, a prompt-armed ordering, a `given` / `scope_paths` ceiling, or
+     an `--all` / over-365-day window). Never compute or round a count by
+     hand, and never pass `measured_at` — the server stamps it.
+     And `supersedes_rule_id` where step 2 said so. A rule filed with
      `supersedes_rule_id` inherits whichever of the four it does not name
-     from the rule it replaces, so a row whose situation changed must carry
-     its own `when`. No `author`: the person
+     from the rule it replaces — and its whole category set when it sends no
+     `categories` — so a row whose situation changed must carry
+     its own `when`, and a replacement whose row has no `rule_categories`
+     sends `categories: []`, so it files the set the person reviewed (none),
+     not the old rule's. No `author`: the person
      approving these rules is their author. Everything lands
-     `proposed`, advise — never pass `activate` from this skill, not even on
-     a book that binds only the user.
+     `proposed`, advise — never pass `activate` from this skill, not even
+     for the `personal` scope.
    - **Starter rules**: pass the candidate's `body` from `candidates.json` as
-     it is (`source: "authored"`, `source_ref: starter-rulebook#<id>|catalog
+     it is — `categories` included, and `evidence` when `attach-evidence`
+     put it there (`source: "authored"`, `source_ref: starter-rulebook#<id>|catalog
      <version>` — the server keys a re-file on the part before `#` plus the
      title, so keep titles stable: that is what makes a re-run after a catalog
-     update supersede instead of twin), plus `rulebook_id`. The body carries
+     update supersede instead of twin), plus the batch's `scope`. The body carries
      `author: "xtrace"` — keep it: MemHub then shows the rule as written by
      XTrace, while the person filing it still owns it and answers for it. It
      also carries the rule's `when`, `do`, `why` and any `when_not` — pass
@@ -691,7 +724,14 @@ row's own `why` stays the report's reason line.
      Only rows that verified (S1) and that they did not strike (S3).
      Sessions are shown at most 15 session-start notes per scope — the rest
      file but never appear — and the catalog ships four, so count what the
-     book already holds first.
+     scope already holds first.
+   - **A create refused `category_invalid` or `evidence_invalid`** means a
+     body was edited by hand into a shape the server will not hold. Re-file
+     that rule once without the offending field; never retry with a guessed
+     value. A tool-argument validation error on `categories` is the same
+     case. A server that does not take `categories` yet usually ignores it
+     (the reply carries no `categories`); if one refuses it, re-file once
+     without it.
    - **CLAUDE.md**: open a PR adding `mine-out/grabs/claude-md-additions.md`'s
      chosen sections to the repo's CLAUDE.md — a PR, never a direct edit.
    - **Skills**: write the full SKILL.md for `PROPOSE this skill` rows and
@@ -704,22 +744,29 @@ row's own `why` stays the report's reason line.
 ## 6. Send the facets to the team, then report
 
 ```bash
-uv run --with 'mcp<2' python "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" \
   --file mine-out/facets.merged.json --name "session-facets" --agent-brain-id <repo brain id> \
-  --tags rulebook
+  --tags rulebook --topic rulebook
 ```
 
 Same name every time, so it versions. That is what makes friction a TEAM
 number: it carries every facet for these sessions, earlier runs' included, so
 each version is the whole picture rather than one run's slice, and the fires ledger shares
 `session_id` with it, so "rule fired, friction still happened" is a join. The tag is there
-because some workspaces refuse an untagged new artifact.
+because some workspaces refuse an untagged new artifact, and the topic because
+a brain with topics on refuses a new artifact without one (`rulebook` is coined
+if the brain has no such topic yet).
 
 **Write the report for someone in their first week.** Lead with the three
 things they need, in this order, before any table:
 
-1. **What you have now** — "N rules proposed in *<rulebook>*, which reaches
-   <you / your N teammates>": how many starter, how many from their own work.
+1. **What you have now** — "N rules proposed for *<the scope's label>*, which
+   reaches <the reply's `applies_to`>": how many starter, how many from their own work,
+   and the split by category ("4 reliability, 2 code quality") — counted
+   from the `categories` the `create_rule` replies carry, where a rule with
+   two counts under each, so the split can add up to more than the rules
+   filed (never present its sum as the total); a server that answers none
+   predates categories, so say nothing about them.
    Say the starter rules show in MemHub as written by XTrace, and that they
    own them — but only for the ones whose `create_rule` reply carried
    `author` `xtrace` (a server without authors, or an `unchanged` re-file of
@@ -744,8 +791,8 @@ Then what was left out and why — `dropped.json` ("no migrations directory"),
 verification failures, their own strikes — so an absent rule reads as a
 decision, not an oversight.
 
-Report per row: filed (with its trigger, and into which rulebook — name who
-that book binds) / replaces which rule / unchanged / skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
+Report per row: filed (with its trigger, and who it applies to — the reply's
+`label` / `applies_to`) / replaces which rule / unchanged / skipped-why; `contradicts` verdicts under **Conflicts to resolve**; rules
 already on with zero historical fires (retire candidates); skills with
 intent ≫ invoked; block candidates with a high bad-outcome rate;
 session- and prompt-armed orderings and the `min_hook_version` each carries.

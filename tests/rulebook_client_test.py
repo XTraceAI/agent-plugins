@@ -10,7 +10,8 @@ refused). What is asserted is the client contract from the spec (§4.1, §4.3,
 * server rules are the only rules (no local book), and the
   merge audit names each rule's source;
 * offline / 500 / slow keep the LAST book; no book at all → silent;
-* the session lane and the tool-call lanes never wait on the network — the
+* the session lane and the tool-call lanes never wait on the network, and a
+  fresh book (younger than REFRESH_AFTER_S) is fetched by nobody — the
   pre lane makes no request of its own (a book older than an hour is refreshed
   by a detached child, at most once per ten minutes while the server is down)
   and its latency with the server down is bounded;
@@ -55,7 +56,6 @@ class Fake:
         self.rules = []
         self.post_reply = {"accepted": None, "rejected": 0}   # None → filled with the batch size
         self.recalls = []
-        self.recall_reply = []
         self.requests = []
         fake = self
 
@@ -99,10 +99,12 @@ class Fake:
                 if fake.mode == "500":
                     return self._send(500, {"detail": "boom"})
                 if self.path.endswith("/recall"):
-                    req = json.loads(body or "{}")
-                    fake.recalls.append(req)
-                    kept = [r for r in fake.recall_reply if r["rule_id"] not in (req.get("already_fired") or [])]
-                    return self._send(200, {"code": 0, "msg": "ok", "data": {"rules": kept, "judge": "gate"}})
+                    # Poisoned: anchor rules are matched locally (ENG-1203). A
+                    # hook that still asks would get a reply that fires the rule.
+                    fake.recalls.append(json.loads(body or "{}"))
+                    return self._send(200, {"code": 0, "msg": "ok", "data": {"rules": [
+                        {"rule_id": "a-bus", "title": "bus", "statement": "Mind the context bus.",
+                         "version": 1, "anchors": ["context_bus.py"]}]}})
                 if self.path.endswith("/fire-events"):
                     # the events ledger's endpoint: always accepts what it is
                     # sent, so the canned `post_reply` shapes below exercise
@@ -158,9 +160,9 @@ def jl(path):
 
 
 def _anchor_lane_checks(check, run, ctx):
-    """§4.7 — anchor rules go through the server judge; everything fails open.
-    Own fake server + temp dir: this lane must not inherit the flush/fetch
-    state the earlier checks leave behind."""
+    """§4.7 — anchor rules are matched LOCALLY against the cached book (ENG-1203):
+    no request leaves the machine for them. Own fake server + temp dir: this
+    lane must not inherit the flush/fetch state the earlier checks leave behind."""
     fake = Fake()
     fake.mode = "ok"
     fake.etag = '"v-anchor"'
@@ -170,8 +172,6 @@ def _anchor_lane_checks(check, run, ctx):
         {"rule_id": "s-post", "title": "posture", "statement": "POSTURE LINE", "delivery": "session_context",
          "status": "active", "mode": "advise", "version": 1, "scope_repos": []},
     ]
-    fake.recall_reply = [{"rule_id": "a-bus", "title": "bus", "statement": "Mind the context bus.",
-                          "version": 1, "anchors": ["context_bus.py"]}]
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")
         os.makedirs(os.path.join(repo, ".git"))
@@ -179,53 +179,41 @@ def _anchor_lane_checks(check, run, ctx):
             f.write("ref: refs/heads/b\n")
         env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_TOKEN": "tok-123",
                "MEMHUB_MCP_BASE_URL": f"http://127.0.0.1:{fake.port}",
-               "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_TIMEOUT_S": "1"}
+               "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_TIMEOUT_S": "1",
+               "MEMHUB_RULEBOOK_JUDGE": "0"}
         run("fetch", {"cwd": repo}, env)
         rc, out = run("session", {"cwd": repo, "session_id": "an1"}, env)
         check("anchor: session_context rule from the server book is served at SessionStart", "POSTURE LINE" in ctx(out))
         ev = {"cwd": repo, "session_id": "an1", "tool_name": "Edit",
               "tool_input": {"file_path": repo + "/xmem/context_bus.py", "new_string": "SECRET BODY"}}
         rc, out = run("pre", ev, env)
-        last = fake.recalls[-1] if fake.recalls else {}
-        check("anchor: kept rule injected; POST /recall carried the file handle only (no body)",
-              "[bus]" in ctx(out) and last.get("args") == {"file_path": repo + "/xmem/context_bus.py"}
-              and "SECRET BODY" not in json.dumps(last), str(last))
-        n = len(fake.recalls)
+        check("anchor: matched locally on the edited path and injected", "[bus]" in ctx(out), out)
+        check("anchor: no /recall request was made", fake.recalls == [], str(fake.recalls))
         rc, out = run("pre", ev, env)
-        check("anchor: fired once per session — second call makes no recall call and injects nothing",
-              out.strip() == "" and len(fake.recalls) == n)
-        rc, out = run("pre", {"cwd": repo, "session_id": "an2", "tool_name": "Read", "tool_input": {"file_path": "x"}}, env)
-        check("anchor: a tool with no handle → no recall call", len(fake.recalls) == n)
+        check("anchor: fired once per session — the second call injects nothing", out.strip() == "", out)
+        rc, out = run("pre", {"cwd": repo, "session_id": "an2", "tool_name": "Read",
+                              "tool_input": {"file_path": repo + "/xmem/context_bus.py"}}, env)
+        check("anchor: a Read carries no handle → no fire", "[bus]" not in ctx(out), out)
         rc, out = run("pre", dict(ev, session_id="an2b"), env)
-        check("anchor: a fresh session re-asks and sends its own already_fired (empty)",
-              "[bus]" in ctx(out) and fake.recalls[-1]["already_fired"] == [])
+        check("anchor: a fresh session fires again", "[bus]" in ctx(out), out)
+        rc, out = run("pre", {"cwd": repo, "session_id": "an3", "tool_name": "Bash",
+                              "tool_input": {"command": "python3 xmem/context_bus.py --check"}}, env)
+        check("anchor: a Bash command naming the anchor fires", "[bus]" in ctx(out), out)
+        rc, out = run("pre", {"cwd": repo, "session_id": "an4", "tool_name": "Bash",
+                              "tool_input": {"command": "cat context_bus.pyc old_context_bus.py"}}, env)
+        check("anchor: a longer identifier containing the anchor does not fire",
+              "[bus]" not in ctx(out), out)
         fake.mode = "500"
-        rc, out = run("pre", dict(ev, session_id="an3"), env)
-        check("anchor: server 500 → silent, exit 0", rc == 0 and out.strip() == "")
-        fake.mode = "slow"
-        import time as _t; t0 = _t.time()
-        rc, out = run("pre", dict(ev, session_id="an4"), env)
-        check("anchor: slow judge → fail open within the hook budget", rc == 0 and out.strip() == "" and _t.time() - t0 < 4.5)
-        fake.mode = "ok"
-
-        # The blip above is exactly the shape that used to warn at the NEXT
-        # session start: recall has no book of its own, so the crumb stood
-        # until an unrelated lane happened to succeed. It clears itself now.
-        crumb = os.path.join(td, "ledger", ".last_error")
-        check("anchor: the timed-out judge leaves a breadcrumb", os.path.exists(crumb))
         rc, out = run("pre", dict(ev, session_id="an5"), env)
-        check("anchor: the next successful recall retracts its own breadcrumb",
-              not os.path.exists(crumb))
-        with open(crumb, "w", encoding="utf-8") as f:
-            json.dump({"at": "2026-01-01T00:00:00-07:00", "what": "fetch",
-                       "error": "unrelated"}, f)
-        rc, out = run("pre", dict(ev, session_id="an6"), env)
-        check("anchor: a successful recall does NOT clear another lane's failure",
-              os.path.exists(crumb))
-        os.unlink(crumb)
+        check("anchor: a server that is down changes nothing — still fires locally",
+              rc == 0 and "[bus]" in ctx(out), out)
+        fake.mode = "ok"
+        rc, out = run("pre", dict(ev, session_id="an6"), dict(env, MEMHUB_RULEBOOK_RECALL="0"))
+        check("anchor: MEMHUB_RULEBOOK_RECALL=0 turns the lane off", out.strip() == "", out)
+        check("anchor: still no /recall request after every call above", fake.recalls == [])
 
         rows = jl(os.path.join(td, "ledger", "fires.jsonl"))
-        check("anchor: the kept rule is logged like any other fire",
+        check("anchor: the local match is logged like any other fire",
               any(r["rule_id"] == "a-bus" and r["hook_phase"] == "pre" for r in rows))
     fake.srv.shutdown()
 
@@ -331,12 +319,11 @@ def main():
         t = time.monotonic()
         rc, out = run("session", {"cwd": repo, "session_id": "lat3"}, dict(env, MEMHUB_RULEBOOK_FETCH="1"))
         t_sess = time.monotonic() - t
-        check("latency: session lane returns before a slow fetch (detached child)",
+        check("latency: session lane on a fresh book returns at once with the slow server",
               t_sess < 1.5 and "Rulebook" in ctx(out), f"{t_sess:.2f}s")
-        deadline = time.monotonic() + 8
-        while len(fake.requests) == n0 and time.monotonic() < deadline:
-            time.sleep(0.1)
-        check("session: the detached child did fetch", len(fake.requests) > n0)
+        time.sleep(1.0)                        # room for a detached child, were one spawned
+        check("session: a fresh book starts no fetch child (ENG-1201)", len(fake.requests) == n0,
+              f"{len(fake.requests) - n0} request(s)")
         fake.mode = "ok"
 
         # ── flush ───────────────────────────────────────────────────────
@@ -662,12 +649,9 @@ def main():
               "FRESHLY ACTIVATED" in ctx(out), ctx(out))
         n2 = len(fake.requests)
         rc, out = run("session", {"cwd": repo, "session_id": "digest2"}, on)
-        deadline = time.monotonic() + 8
-        while len(fake.requests) == n2 and time.monotonic() < deadline:
-            time.sleep(0.1)
-        time.sleep(0.5)                        # room for a second child, if one were spawned
-        check("session: …and a fresh book renders from cache, refreshing detached",
-              "FRESHLY ACTIVATED" in ctx(out) and len(fake.requests) == n2 + 1,
+        time.sleep(1.0)                        # room for a detached child, were one spawned
+        check("session: …and a fresh book renders from cache and fetches nothing",
+              "FRESHLY ACTIVATED" in ctx(out) and len(fake.requests) == n2,
               f"{len(fake.requests) - n2} request(s)")
         rc, out = run("pre", dict(base, session_id="g1", tool_input={"command": "local-cmd"}),
                       dict(env, MEMHUB_TOKEN=""))

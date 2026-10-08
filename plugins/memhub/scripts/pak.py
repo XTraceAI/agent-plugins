@@ -14,10 +14,9 @@ the browser flow already produces is accepted by ``/v1/developer/access-tokens``
 hooks something durable — no curl, no pasting, and no waiting on a Settings
 page to ship.
 
-**Deliberately stdlib-only.** The whole point of a static bearer is that using
-it needs no SDK, so this module must not drag one in: it is imported by the
-health check, which runs before the user's first prompt under a bare python3.
-Measured, ``uv run --with 'mcp<2'`` costs ~1.1s against ~0.07s here.
+**Deliberately stdlib-only**, like every plugin script: it is imported by the
+health check, which runs before the user's first prompt under a bare python3,
+and nothing on that path may wait on a dependency install.
 
 **One key per machine, by label.** The secret is returned exactly once, so a
 key we did not store is unrecoverable — and the account holds at most five.
@@ -44,7 +43,10 @@ from urllib.parse import urlparse
 import atomic_write
 import mcp_http
 
-CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
+# $MEMHUB_CONFIG_DIR moves the credentials (token cache, access key) so a
+# harness can sign in fresh without touching this machine's real key.
+CACHE_DIR = Path(os.environ.get("MEMHUB_CONFIG_DIR")
+                 or Path.home() / ".config" / "memhub-plugin")
 
 # Long enough not to be a chore, short enough that a leaked key is not forever.
 # Cheap to renew precisely because /memhub:login mints it programmatically.

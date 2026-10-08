@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The harness-tied memory sensor. FLAGGED OFF by default.
 
-Nothing in this file runs unless `MEMHUB_HARNESS_EXTRACT` is on (1/on/true/yes).
+Nothing in this file runs when `MEMHUB_HARNESS_EXTRACT` is off (on by default;
+0/off/false/no, or any unrecognised value, turns it off).
 With it on, every Stop judges the PREVIOUS human turn, synchronously, and on a
 signal asks the agent to launch one background fork that files the rule:
 
@@ -26,10 +27,22 @@ the Stop of N+1, the fork launched there already has it in context. Measured
 2026-09-29 on 148 flags: the next message reversed 2% and refined 8%. The cost
 is the session's last turn, which no Stop follows — about 7% of flags.
 
-Nothing is stored. The transcript the host keeps is the only state: no moments
-file, no cursor, no claims, no launch ledger. A Stop that is not the end of a
-person's turn (a fork launch's continuation, a background task's notice, a loop
-wakeup) judges nothing, so no turn is judged twice.
+The transcript the host keeps is the only state the verdicts come from: no
+moments file, no launch ledger. A Stop that is not the end of a person's turn
+(a fork launch's continuation, a background task's notice, a loop wakeup)
+judges nothing. Two small things are stored, none a source of a verdict:
+
+  `offsets/<session>.json`  a read offset: where the transcript read may start
+      so the Stop parses only the last few turns instead of the whole session
+      (`read_turns`). A speed-up only — a missing, stale or mismatched offset
+      means a full read, and the turns it yields are numbered and built exactly
+      as a full read builds them.
+  `judged/<session>/<turn>` one empty file per judged turn, created with
+      O_EXCL before the classifier is asked (`_claim_judgement`). A machine
+      with both installs (memhub and memhub-staging) runs two sensors over one
+      transcript; whichever creates the file first judges the turn, the other
+      skips it, so one moment never costs two classifier calls or two drafters.
+      Both installs share this directory. Pruned after JUDGED_KEEP_S.
 
 What the person sees: one short line per flagged turn ("MemHub: possible team
 rule spotted in turn N, drafting it in the background."), the collapsed
@@ -43,8 +56,9 @@ output. A `none` or `failed` result stays in the transcript and `stop.log`.
 Nothing here fires or activates a rule: a filing lands `proposed` and a person
 activates it. Every path fails open and silent — a broken sensor must never
 touch the session. `stop.log` under $MEMHUB_HARNESS_DIR (default
-~/.config/memhub-plugin/harness) is the one file, one line per Stop, never
-prompt text. Stdlib only.
+~/.config/memhub-plugin/harness) is the log, one line per Stop, never
+prompt text; `offsets/` and `judged/` beside it are described above. Stdlib
+only.
 """
 from __future__ import annotations
 
@@ -178,9 +192,152 @@ def _stamp(session: str, turn: dict, cwd: str) -> dict:
                           default_repo=repo_of(cwd))
 
 
+# ------------------------------------------------- one judge per turn, per machine
+#: How long a judged/ entry is kept: far past any live session's
+#: next Stop, short enough that the directory stays small.
+JUDGED_KEEP_S = 3 * 24 * 3600
+
+
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:128] or "_"
+
+
+def _prune(root: Path, keep_s: float = JUDGED_KEEP_S) -> None:
+    """Drop entries of `root` untouched for `keep_s`. Best effort."""
+    try:
+        cutoff = time.time() - keep_s
+        for entry in root.iterdir():
+            try:
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                if entry.is_dir():
+                    for child in entry.iterdir():
+                        child.unlink()
+                    entry.rmdir()
+                else:
+                    entry.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _claim_judgement(session: str, turn) -> bool:
+    """True when this process is the one to judge `session`'s turn `turn`.
+
+    O_EXCL on `judged/<session>/<turn>` under the harness directory, which
+    every install on the machine shares: the first to create it judges, every
+    other sensor (the other install's Stop) skips. A directory that
+    cannot be written judges anyway, as before this existed — a sensor never
+    fails closed."""
+    root = hx.harness_dir() / "judged"
+    folder = root / _safe(session)
+    try:
+        fresh = not folder.exists()
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(folder / str(int(turn)), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        return False
+    except (OSError, TypeError, ValueError):
+        return True
+    if fresh:
+        _prune(root)
+    return True
+
+
+# ------------------------------------------------------------- read offset
+#: How many of the newest turns a Stop's read must contain: the window takes
+#: turns[-5:] (two earlier messages, the previous turn, the judged turn and
+#: the one after it). The saved offset is the start of the 5th-newest turn of
+#: THIS read, so the next Stop — which has at least these turns, plus any new
+#: ones — still holds every turn its window can name.
+LEAD_TURNS = 5
+
+
+def _offset_path(session: str) -> Path:
+    return hx.harness_dir() / "offsets" / f"{_safe(session)}.json"
+
+
+def _load_offset(session: str, transcript: str) -> dict | None:
+    """The saved offset for this session's transcript, or None when there is
+    none, it names another file, or the file shrank since it was written (a
+    rewrite or rotation: offsets into the old bytes mean nothing)."""
+    try:
+        rec = json.loads(_offset_path(session).read_text(encoding="utf-8"))
+        if not (isinstance(rec, dict) and rec.get("transcript") == transcript):
+            return None
+        offset, before, size = int(rec["offset"]), int(rec["before"]), int(rec["size"])
+        if offset <= 0 or before < 0 or not rec.get("uuid"):
+            return None
+        if os.path.getsize(transcript) < max(size, offset):
+            return None
+        return {"offset": offset, "before": before, "uuid": str(rec["uuid"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_offset(session: str, transcript: str, turns: list[dict], size: int) -> None:
+    """Remember where the next Stop may start reading: the 5th-newest turn's
+    first byte, with the count of turns before it so numbering survives. Only
+    turns this Stop could already see are passed: the turn still unjudged
+    (the newest, judged at the next Stop as turns[-2]) and the window's lead-in
+    all sit at or after the saved byte."""
+    if not turns:
+        return
+    lead = turns[-LEAD_TURNS] if len(turns) >= LEAD_TURNS else turns[0]
+    if not lead.get("uuid") or not isinstance(lead.get("offset"), int):
+        return
+    try:
+        import atomic_write  # noqa: PLC0415 — stdlib, beside this file
+        path = _offset_path(session)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write.publish(path, json.dumps({
+            "transcript": transcript, "offset": lead["offset"],
+            "before": int(lead.get("n") or 1) - 1, "uuid": lead["uuid"], "size": size}))
+    except Exception:
+        pass
+
+
+def read_turns(session: str, transcript: str) -> tuple[list[dict], str]:
+    """`hx.read_transcript`, resumed from this session's saved offset when it
+    is still valid, so a Stop costs O(new turns) and not O(session).
+
+    Identical to a full read for every turn it returns: the saved byte is
+    where a person's message begins (a turn starts fresh there — no state from
+    before it reaches the turn), and `before` numbers the turns as a full read
+    would. Verified on every use: the first turn read must be the one saved,
+    at the byte saved, or the read starts over from 0."""
+    size = os.path.getsize(transcript)
+    saved = _load_offset(session, transcript)
+    turns: list[dict] = []
+    last_prompt = ""
+    if saved is not None:
+        turns, last_prompt = hx.read_transcript(transcript, start=saved["offset"],
+                                                before=saved["before"])
+        first = turns[0] if turns else {}
+        if not (first.get("uuid") == saved["uuid"] and first.get("offset") == saved["offset"]
+                and first.get("n") == saved["before"] + 1):
+            saved = None
+    if saved is None:
+        turns, last_prompt = hx.read_transcript(transcript)
+    _save_offset(session, transcript, turns, size)
+    return turns, last_prompt
+
+
 # ------------------------------------------------------------------- judge
 def judge_previous_turn(session: str, transcript: str, cwd: str) -> dict | None:
     """Turn N at the Stop of turn N+1: the moment on a signal, else None.
+
+    The window ends with the person's following message (turn N+1's), and the
+    judge says which of the two messages carries the lesson (`at`). On
+    `following` the moment is turn N+1 — the turn this Stop ends — not N:
+    handing N to a fork when the correction came one message later was a third
+    of all wasted forks (harness-tied-memory spec §10.8). A server that
+    predates `at` sends none, which reads as `new`, as before. A turn is handed
+    over at most once, so the next Stop, judging N+1 as `new`, launches nothing.
+    A turn is judged at most once on the machine (`_claim_judgement`), whichever
+    install's sensor reaches it first.
 
     Judges only when this Stop ends a PERSON'S turn, i.e. the transcript's last
     prompt is the last person turn. After a fork launch's continuation, a
@@ -188,7 +345,7 @@ def judge_previous_turn(session: str, transcript: str, cwd: str) -> dict | None:
     harness's, and judging would take turn N a second time. An interrupted
     turn resent verbatim is judged once, as the resend: this Stop skips turn N
     when turn N+1 repeats it, and the next Stop takes N+1."""
-    turns, last_prompt = hx.read_transcript(transcript)
+    turns, last_prompt = read_turns(session, transcript)
     if len(turns) < 2 or turns[-1].get("uuid") != last_prompt:
         return None
     turn, after = turns[-2], turns[-1]
@@ -196,16 +353,25 @@ def judge_previous_turn(session: str, transcript: str, cwd: str) -> dict | None:
     if (after.get("user") or "").strip() == (turn.get("user") or "").strip():
         _log(f"judge {session[:8]} t{n}: skipped, resent as t{after.get('n')}")
         return None
+    if not _claim_judgement(session, n):
+        _log(f"judge {session[:8]} t{n}: skipped, judged by another sensor")
+        return None
     prev = turns[-3] if len(turns) >= 3 else None
     state = _stamp(session, turn, cwd)
     window = hx.redact_window(hx.build_window(turn, prev, state, earlier=turns[-5:-3],
                                               following=after.get("user") or ""))
     reply, secs = hx.server_classify(window, repo=state.get("repo", ""))
+    at = "following" if reply.get("at") == "following" else "new"
     _log(f"judge {session[:8]} t{n}: signal={bool(reply.get('signal'))} "
          f"reason={reply.get('reason')} kind={reply.get('kind')} {secs}s "
          f"window={len(window)}c results={window.count(chr(10) + '    -> ')} "
-         f"next={'yes' if (after.get('user') or '').strip() else 'no'}")
+         f"next={'yes' if (after.get('user') or '').strip() else 'no'} at={reply.get('at')}")
     if not reply.get("signal"):
+        return None
+    if at == "following":
+        n, state = after.get("n"), _stamp(session, after, cwd)
+    if _launch_record(session, n) is not None:
+        _log(f"launch {session[:8]} t{n}: skipped, already handed over")
         return None
     return {"source_ref": f"{session}#{n}", "turn": n, "kind": reply.get("kind"),
             "derivable": bool(reply.get("derivable")), "state": state,
@@ -234,18 +400,23 @@ def fork_launch_prompt(moment: dict, env: str, repo: str = "") -> str:
     stamp_cmd = (f'python3 "{script}" stamp --transcript "{moment["transcript"]}" '
                  f'--turn {turn} --cwd "{moment["cwd"]}"')
     worked_in = json.dumps(turn_repos(moment.get("state") or {}, repo))
+    after = (f"The person's next message, turn {turn + 1}, is what happened after it: if "
+             f"that message reversed or abandoned the correction, file nothing."
+             if moment.get("next_known", True) else
+             f"The person has said nothing after turn {turn} yet: judge the correction from "
+             f"turn {turn} and your reply to it.")
     return (
         f"{FORK_MARK}, moment {ref}: you were launched by the MemHub plugin's Stop hook, "
         f"installed by the person running this session, to write at most one team rule "
         f"from turn {turn} of this session, which its classifier flagged as {kind}."
-        f"{derivable} The person's next message, turn {turn + 1}, is what happened after "
-        f"it: if that message reversed or abandoned the correction, file nothing. "
+        f"{derivable} {after} "
         f"Otherwise run the memhub create-rule skill's Harness-draft path on "
         f"source_ref=\"{ref}\", with the state stamp this read-only command prints: "
         f"{stamp_cmd}. The turn worked in {worked_in}; choose scope_repos from the lesson, "
-        f"not from that. Step 4b (the live forward test) cannot run inside a fork, so "
-        f"treat its precondition as missing exactly as Step 4b.6 says. File the rule as "
-        f"`proposed` to the {env} rulebook; activate nothing, ask nothing, touch no "
+        f"not from that. Step 4b (the live forward test) cannot run inside a fork: skip "
+        f"it and file on step 4's verifier, as the Harness-draft path says. File the rule as "
+        f"`proposed` to the {env} rulebook for everyone in the organisation; activate "
+        f"nothing, ask nothing, touch no "
         f"settings or credentials. End with exactly one line: \"{FORK_MARK}: filed "
         f"<title>\", \"{FORK_MARK}: none, <one short reason>\" or \"{FORK_MARK}: failed, "
         f"<why it could not file>\"."
@@ -346,19 +517,28 @@ def _find_transcript(session: str) -> str | None:
 _LAUNCH_LINE = re.compile(r" launch (\S+) t(\d+): fork requested \(([a-z_]{1,40}|None)\) derivable=([01])$")
 
 
+def _launch_record(session: str, turn) -> re.Match | None:
+    """The `launch` line the Stop logged for this session's turn, if any: the
+    record that the turn was handed to a fork. Nothing else is stored."""
+    try:
+        lines = hx.log_path("stop.log").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines[-400:]):
+        m = _LAUNCH_LINE.search(line)
+        if m and m.group(1) == session[:8] and str(m.group(2)) == str(turn):
+            return m
+    return None
+
+
 def _logged_verdict(session: str, turn: int) -> tuple[str, bool]:
     """The classifier's label for a moment, from the `launch` line the Stop
     logged for it. The Stop's visible line carries the turn and nothing else,
     and nothing else is stored; without the line the prompt says "a signal"."""
-    try:
-        lines = hx.log_path("stop.log").read_text(encoding="utf-8").splitlines()
-    except OSError:
+    m = _launch_record(session, turn)
+    if m is None:
         return "", False
-    for line in reversed(lines[-400:]):
-        m = _LAUNCH_LINE.search(line)
-        if m and m.group(1) == session[:8] and int(m.group(2)) == turn:
-            return ("" if m.group(3) == "None" else m.group(3)), m.group(4) == "1"
-    return "", False
+    return ("" if m.group(3) == "None" else m.group(3)), m.group(4) == "1"
 
 
 def cmd_handoff(ref: str, kind: str, derivable: bool) -> int:
@@ -375,12 +555,16 @@ def cmd_handoff(ref: str, kind: str, derivable: bool) -> int:
     if transcript is None:
         print(f"no transcript for session {session}", file=sys.stderr)
         return 2
-    for turn in hx.turns_from_transcript(transcript):
+    turns = hx.turns_from_transcript(transcript)
+    for turn in turns:
         if turn.get("n") == int(turn_s):
             cwd = turn.get("cwd") or os.getcwd()
             moment = {"source_ref": ref, "turn": int(turn_s), "kind": kind or None,
                       "derivable": derivable, "state": _stamp(session, turn, cwd),
-                      "transcript": transcript, "cwd": cwd}
+                      "transcript": transcript, "cwd": cwd,
+                      # a moment handed over on `at=following` is the turn the
+                      # Stop just ended: the person has said nothing after it yet
+                      "next_known": any(t.get("n") == int(turn_s) + 1 for t in turns)}
             print(fork_reason(moment, env_name(), repo_of(cwd)))
             return 0
     print(f"no turn {turn_s} in {transcript}", file=sys.stderr)

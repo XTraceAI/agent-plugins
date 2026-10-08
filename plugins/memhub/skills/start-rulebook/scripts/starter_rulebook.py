@@ -23,6 +23,9 @@ Three steps, each a subcommand, each writing a file the next one reads:
           write verified.json. Exit 1 if any candidate misbehaves, or if one
           of its judge fields is missing, unfilled, or over the server's cap.
 
+  attach-evidence  after mine_sessions.py replayed the starter bodies, copy each
+          one's measured `rule_evidence` into its body as `evidence` (ENG-1158).
+
   starter_rulebook.py all --repo . --out starter-out
 
 Stdlib only; never writes inside the repo it scans.
@@ -601,6 +604,10 @@ _BODY_KEYS = ("title", "statement", "delivery", "mode", "matcher", "ordering", "
 # The catalog is XTrace's writing, so MemHub shows these rules as XTrace's (ENG-1166). A label
 # only: the teammate who files one still owns it. Not a catalog field, so no entry can change it.
 AUTHOR = "xtrace"
+# The server's six rule categories (ENG-1158), in its canonical order. catalog.json gives each of its
+# own categories a `memhub_categories` list, and a rule may replace that list with its own; labels
+# only — they grant nothing and are not part of a rule's identity.
+CATEGORIES = ("security", "reliability", "token_efficiency", "code_quality", "consistency", "agent_conduct")
 
 # dropped.json is read out to the client, so a missing slot is named in their words.
 _SLOT_WORDS = {"test_cmd_rx": "recognised test command", "lint_cmd_rx": "linter or formatter",
@@ -616,6 +623,17 @@ _SLOT_WORDS = {"test_cmd_rx": "recognised test command", "lint_cmd_rx": "linter 
                "src_diff_rx": "clear source root", "tests_diff_rx": "test directory",
                "default_branch_rx": "known default branch (origin/HEAD is not set)",
                "default_branch_esc": "known default branch (origin/HEAD is not set)"}
+
+
+def _memhub_categories(catalog: dict, rule: dict) -> list:
+    """The rule's server categories: its own `memhub_categories` when it has them, else its catalog
+    category's. A set in canonical order; a value the server would refuse is left out, never sent."""
+    got = rule.get("memhub_categories")
+    if got is None:
+        got = next((cat.get("memhub_categories") for cat in catalog.get("categories", [])
+                    if cat.get("id") == rule.get("category")), None)
+    got = set(got) if isinstance(got, list) else set()
+    return [c for c in CATEGORIES if c in got]
 
 
 def _why_for_judge(why: str) -> str:
@@ -647,7 +665,8 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
         if rule.get("for_each"):                   # one candidate per record, each with its own slots
             for item in slots[rule["for_each"]]:
                 one = seed({"slots": {**slots, **item, rule["for_each"]: None}},
-                           {"version": catalog["version"], "rules": [{k: v for k, v in rule.items() if k != "for_each"
+                           {"version": catalog["version"], "categories": catalog.get("categories", []),
+                            "rules": [{k: v for k, v in rule.items() if k != "for_each"
                                                                       and not (k == "requires")}]}, scope_repo)
                 out += one[0]; dropped += one[1]
             continue
@@ -674,6 +693,9 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
         body["scope_repos"] = [slots["repo"]] if scope_repo else []
         body["source"] = "authored"
         body["author"] = AUTHOR
+        categories = _memhub_categories(catalog, rule)
+        if categories:
+            body["categories"] = categories
         # The server keys a re-file on the ref before `#` (a hex `@sha` stripped) plus the title, so the
         # catalog version rides AFTER the `#`: a dated base would twin every rule on each catalog update.
         body["source_ref"] = "starter-rulebook#%s|catalog %s" % (filled["id"], catalog["version"])
@@ -686,6 +708,46 @@ def seed(signals: dict, catalog: dict, scope_repo: bool = True) -> tuple[list, l
                     "seeded_from": rule.get("seeded_from"), "evidence": rule.get("evidence"),
                     "cases": filled.get("cases") or {}, "body": body})
     return out, dropped
+
+
+# ───────────────────────────── attach-evidence ─────────────────────────────
+
+def valid_evidence(ev) -> bool:
+    """The server's exact shape: three ints (never bool/float), seen <= scanned, a 1..365-day window.
+    Anything else is refused there with `evidence_invalid` — and the whole create with it."""
+    if not isinstance(ev, dict) or set(ev) != {"sessions_seen", "sessions_scanned", "window_days"}:
+        return False
+    if not all(type(v) is int for v in ev.values()):
+        return False
+    return (0 <= ev["sessions_seen"] <= ev["sessions_scanned"] and ev["sessions_scanned"] >= 1
+            and 1 <= ev["window_days"] <= 365)
+
+
+def attach_evidence(cands: list, replay: list) -> tuple[list, dict]:
+    """Put each starter rule's replay count on its body. Only rows the skill fed in (their
+    `source_ref` is the starter one) are read, so a built-in hypothesis of the same title never
+    lends its number. A ceiling is never attached: its count bounds how often the pattern is in
+    play, not how often the rule would have fired. A stale `evidence` from an earlier run is
+    always removed first."""
+    by_title = {r["title"]: r for r in replay if isinstance(r, dict) and isinstance(r.get("title"), str)
+                and str(r.get("source_ref") or "").startswith("starter-rulebook#")}
+    tally = {"attached": 0, "ceiling": 0, "absent": 0}
+    for c in cands:
+        body = c.get("body") if isinstance(c, dict) else None
+        if not isinstance(body, dict):              # not a candidate this seeder wrote: leave it exactly as it is
+            tally["absent"] += 1
+            continue
+        body.pop("evidence", None)
+        if c.get("replay_is_ceiling"):
+            tally["ceiling"] += 1
+            continue
+        ev = (by_title.get(c.get("id")) or {}).get("rule_evidence")
+        if valid_evidence(ev):
+            body["evidence"] = dict(ev)
+            tally["attached"] += 1
+        else:
+            tally["absent"] += 1
+    return cands, tally
 
 
 # ───────────────────────────── verify ─────────────────────────────
@@ -790,14 +852,29 @@ def _summary(signals, cands, dropped, rows, catalog) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("step", choices=["scan", "seed", "verify", "all"])
+    ap.add_argument("step", choices=["scan", "seed", "verify", "all", "attach-evidence"])
     ap.add_argument("--repo", default=".", help="the checkout to scan (read-only)")
     ap.add_argument("--out", default="starter-out", help="where signals/candidates/verified land")
     ap.add_argument("--catalog", default=str(CATALOG))
     ap.add_argument("--all-repos", action="store_true",
                     help="leave scope_repos empty so the rules bind every repo the rulebook's members work in")
+    ap.add_argument("--replay", help="attach-evidence: the proposals.json of the mine_sessions.py run that replayed these candidates")
     args = ap.parse_args()
     out = Path(args.out)
+    if args.step == "attach-evidence":
+        try:
+            cands = json.loads((out / "candidates.json").read_text())
+            replay = json.loads(Path(args.replay or "").read_text()) if args.replay else None
+            if not isinstance(cands, list) or not isinstance(replay, list):
+                raise ValueError("candidates.json and --replay must each be a JSON list")
+        except (OSError, ValueError) as exc:
+            print("attach-evidence: %s — candidates.json left as it was, rules file without evidence" % exc)
+            return 2
+        cands, t = attach_evidence(cands, replay)
+        (out / "candidates.json").write_text(json.dumps(cands, indent=2))
+        print("evidence attached to %d of %d candidates (%d ceilings left without, %d not in the replay)"
+              % (t["attached"], len(cands), t["ceiling"], t["absent"]))
+        return 0
     out.mkdir(parents=True, exist_ok=True)
     catalog = json.loads(Path(args.catalog).read_text(encoding="utf-8"))
 

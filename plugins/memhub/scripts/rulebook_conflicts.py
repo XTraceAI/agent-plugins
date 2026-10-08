@@ -21,7 +21,10 @@ Two inputs, three checks:
                           fetched from the server, or --book <file> to read a
                           cached / test book instead — matcher + anchor
                           collisions against what can actually double-fire
-  --rulebook-id <id>      the book the candidates will be filed into
+  --rulebook-id <id>      the book the candidates will be filed into: the
+                          scope's `rulebook_id` from list_rulebooks `scopes`
+  --new-scope             instead of --rulebook-id, when that scope has no
+                          book yet (`rulebook_id: null`)
 
 A rulebook is a container with its own membership, and one person can be bound
 by several (container spec §3, §4) — so both inputs span more than one book and
@@ -45,7 +48,7 @@ failure degrades to "active book unavailable" and says so.
 
 Usage:
   rulebook_conflicts.py --candidates cands.json --existing rules.json --repo xmem
-  rulebook_conflicts.py --candidates - --book ~/.config/memhub-plugin/rulebook/book/xmem-*.json
+  rulebook_conflicts.py --candidates - --book "$(rulebook_hook.py book-path xmem)"
 """
 from __future__ import annotations
 
@@ -123,10 +126,27 @@ def book_of(rule: dict) -> dict:
     # this report: one line, no control characters, capped — the same handling
     # rulebook_hook.py gives server prose. A newline here would let a name
     # forge a line of the summary below.
-    name = _WS.sub(" ", re.sub(r"[\x00-\x1f\x7f]+", " ", str(b.get("name") or ""))).strip()
+    name = _one_line(b.get("name"))
     if name:
-        out["name"] = name[:120]
+        out["name"] = name
+    # A scope book's stored name ("org", "personal:<id>") is an identifier;
+    # its label ("Everyone in Acme", "Just you") is what the user reads
+    # (rulebook-scopes spec S2). A legacy book, or an older backend, has none.
+    # The hook view nests it in the `rulebook` block; the MCP `list_rules`
+    # reply (`--existing`) carries it flat, as `scope_label`.
+    label = _one_line(b.get("label") or rule.get("scope_label"))
+    if label:
+        out["label"] = label
     return out
+
+
+def _one_line(value) -> str:
+    return _WS.sub(" ", re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))).strip()[:120]
+
+
+def _book_text(book: dict) -> str:
+    """How a report names a book: its scope label, else its name, else its id."""
+    return book.get("label") or book.get("name") or book.get("rulebook_id") or ""
 
 
 def _learn_book(hit: dict, rule: dict) -> dict:
@@ -156,7 +176,7 @@ def _hit(rule: dict, reasons: list[str], detail=None) -> dict:
 
 
 def find_conflicts(candidates: list[dict], existing: list[dict], active: list[dict] | None,
-                   target_rulebook_id: str | None = None) -> dict:
+                   target_rulebook_id: str | None = None, new_scope: bool = False) -> dict:
     """Pure. `existing` = list_rules rows (include_retired=True; titles + statements);
     `active` = hook-view rows (engine blocks) or None when unavailable.
 
@@ -166,7 +186,11 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
     it cannot answer a collision with a book you are not writing to. Those
     collide anyway — both books bind the author, so both rules reach the same
     call — and the only fixes are a human one (retire one side, move the rule,
-    narrow a scope). Saying "supersede it" there would be advice that fails."""
+    narrow a scope). Saying "supersede it" there would be advice that fails.
+
+    `new_scope` says the destination is a scope with no rulebook yet
+    (`list_rulebooks` `scopes.<kind>.rulebook_id` is null; filing creates
+    it), so every hit is in another scope — known, not unknown."""
     live = [r for r in existing if r.get("status") not in RETIRED]
     out = []
     hit_ids: set[str] = set()
@@ -200,7 +224,7 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
                  for r in live if str(r.get("rule_id")) not in hit_ids]
     books = sorted({b["rulebook_id"]: b for b in
                     (book_of(r) for r in list(existing) + list(active or []))
-                    if b.get("rulebook_id")}.values(), key=lambda b: b.get("name") or "")
+                    if b.get("rulebook_id")}.values(), key=_book_text)
     # Three states, not two. `False` must mean "same book, CONFIRMED", because
     # it is what licenses the copyable supersede line — so a report that cannot
     # know says `None` and gets a question instead of an answer. The case that
@@ -222,14 +246,16 @@ def find_conflicts(candidates: list[dict], existing: list[dict], active: list[di
     for c in out:
         for h in c["hits"]:
             rid = h.get("rulebook", {}).get("rulebook_id")
-            if target_rulebook_id and rid:
+            if new_scope:
+                h["cross_book"] = True
+            elif target_rulebook_id and rid:
                 h["cross_book"] = rid != target_rulebook_id
             elif not book_dimension:   # no book anywhere: one implicit book, as before
                 h["cross_book"] = False
             else:
                 h["cross_book"] = None
     return {"candidates": out, "judge_by_statement": unmatched, "rulebooks": books,
-            "target_rulebook_id": target_rulebook_id,
+            "target_rulebook_id": target_rulebook_id, "new_scope": new_scope,
             "active_book": "checked" if active is not None else "unavailable"}
 
 
@@ -286,7 +312,7 @@ def _summary(report: dict) -> str:
             continue
         for h in c["hits"]:
             extra = f" shared={','.join(h['anchors_shared'])}" if h.get("anchors_shared") else ""
-            book = h.get("rulebook", {}).get("name") or h.get("rulebook", {}).get("rulebook_id")
+            book = _book_text(h.get("rulebook", {}))
             where = f" in {book}" if book else ""
             lines.append(f"  {c['title']}: {'+'.join(h['reasons'])} -> {h['title']} "
                          f"[{h['status']}]{where}{extra}")
@@ -294,10 +320,10 @@ def _summary(report: dict) -> str:
                 # This script never sees `bound` / membership, so it cannot say
                 # the two books bind the same person — only that anyone in both
                 # gets both rules on one call (check `bound` in list_rulebooks).
-                lines.append("    ANOTHER RULEBOOK — supersedes_rule_id cannot reach it. Anyone both "
-                             "books bind gets both rules on the same call (check `bound` in "
-                             "list_rulebooks): tell the user and let a human retire one side or "
-                             "narrow its scope.")
+                lines.append(f"    in another scope ({book or 'unknown'}) — supersedes_rule_id cannot "
+                             "reach it. Anyone both scopes reach gets both rules on the same call "
+                             "(check `bound` in list_rulebooks): tell the user and let a human "
+                             "retire one side.")
             elif h.get("cross_book") is None:
                 lines.append("    WHICH RULEBOOK? — this rule's own book could not be identified, "
                              "so it cannot be compared to your destination. Ask the user before "
@@ -309,8 +335,8 @@ def _summary(report: dict) -> str:
             elif h["rule_id"]:
                 lines.append(f"    if this is the same rule: create_rule supersedes_rule_id=\"{h['rule_id']}\"")
     if len(report.get("rulebooks") or []) > 1:
-        lines.append("  spans " + str(len(report["rulebooks"])) + " rulebooks: "
-                     + ", ".join(b.get("name") or b["rulebook_id"] for b in report["rulebooks"]))
+        lines.append("  spans " + str(len(report["rulebooks"])) + " scopes: "
+                     + ", ".join(_book_text(b) for b in report["rulebooks"]))
     lines.append(f"  active book: {report['active_book']}; "
                  f"{len(report['judge_by_statement'])} existing rules left to judge by statement")
     return "\n".join(lines)
@@ -323,8 +349,12 @@ def main(argv=None) -> int:
     src = ap.add_mutually_exclusive_group()
     src.add_argument("--repo", help="fetch the ACTIVE book (hook view) for this repo from the server")
     src.add_argument("--book", help="read a cached / test hook-view book file instead of fetching")
-    ap.add_argument("--rulebook-id", help="the rulebook the candidates will be FILED into; a hit in "
-                                          "another book is flagged cross_book (supersede cannot reach it)")
+    dest = ap.add_mutually_exclusive_group()
+    dest.add_argument("--rulebook-id", help="the rulebook the candidates will be FILED into; a hit in "
+                                            "another book is flagged cross_book (supersede cannot reach it)")
+    dest.add_argument("--new-scope", action="store_true",
+                      help="the destination scope has no rulebook yet (its rulebook_id is null), so "
+                           "every hit is in another scope")
     args = ap.parse_args(argv)
 
     candidates = _load(args.candidates)
@@ -353,7 +383,7 @@ def main(argv=None) -> int:
                 print(f"{why} — using the hook's cached active book", file=sys.stderr)
             else:
                 print(f"{why} — no cached active book either", file=sys.stderr)
-    report = find_conflicts(candidates, existing, active, args.rulebook_id)
+    report = find_conflicts(candidates, existing, active, args.rulebook_id, new_scope=args.new_scope)
     print(json.dumps(report, indent=1))
     print("\nCONFLICTS (deterministic; then judge the rest by statement):\n" + _summary(report),
           file=sys.stderr)

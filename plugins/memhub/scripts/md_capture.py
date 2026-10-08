@@ -31,6 +31,12 @@ redirects is a losing game. Instead the Bash matcher records only the
 session's ``cwd`` (plus a session-start stamp, once), and the flush sweeps
 ``git status`` in that repo for modified/untracked ``.md`` files: the
 deliverable is on disk either way, and git already knows which files are new.
+
+Why an activity marker: the flush's sweep runs ``git status`` on every Stop,
+and most turns write nothing. Every call this collector sees touches
+``memhub-md-capture-<sid>.activity`` (an mtime, no read-modify-write of the
+state), and ``md_capture_prefilter.py`` skips a Stop when the last sweep came
+back with nothing outstanding and no watched tool call has run since.
 """
 from __future__ import annotations
 
@@ -44,6 +50,9 @@ import time
 from pathlib import Path
 
 STATE_PREFIX = "memhub-md-capture-"
+# Touched (mtime only) on every call the collector sees; the flush prefilter
+# compares it with the last idle sweep. Swept by age with the state files.
+ACTIVITY_SUFFIX = ".activity"
 # Per-user, 0700 — the same home the other per-session state lives in
 # (flush_turn / codex_flush / cursor_flush). NOT the shared temp dir: the
 # flusher uploads every path in `dirty`, so a world-writable, predictable
@@ -138,6 +147,38 @@ def state_path(session_id: str) -> Path | None:
     return STATE_DIR / f"{STATE_PREFIX}{sid}.json"
 
 
+def activity_path(session_id: str) -> Path | None:
+    sid = UNSAFE.sub("", session_id or "")
+    if not sid:
+        return None
+    return STATE_DIR / f"{STATE_PREFIX}{sid}{ACTIVITY_SUFFIX}"
+
+
+def _ensure_state_dir(directory: Path) -> None:
+    # Born 0700: mkdir under a 077 umask so no directory on the path is ever
+    # world-readable, even briefly.
+    prior = os.umask(0o077)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    finally:
+        os.umask(prior)
+
+
+def touch_activity(session_id: str) -> None:
+    """Stamp "a watched tool call ran in this session just now".
+
+    Only the file's mtime carries meaning, so this never races the state
+    file's read-modify-write. Raises on failure; the caller decides. A
+    missing marker makes the prefilter run the flush, never skip it."""
+    p = activity_path(session_id)
+    if p is None:
+        return
+    _ensure_state_dir(p.parent)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
+    os.utime(p, None)
+
+
 def load_state(session_id: str) -> dict:
     p = state_path(session_id)
     if p is None or not p.exists():
@@ -155,15 +196,9 @@ def save_state(session_id: str, state: dict) -> None:
     p = state_path(session_id)
     if p is None:
         return
-    # Born 0700: mkdir under a 077 umask so no directory on the path is ever
-    # world-readable, even briefly. The chmod covers a leaf that already
-    # existed with a wider mode; if THAT fails we still write (capture must
-    # never block an edit) but say so.
-    prior = os.umask(0o077)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    finally:
-        os.umask(prior)
+    # The chmod covers a leaf that already existed with a wider mode; if THAT
+    # fails we still write (capture must never block an edit) but say so.
+    _ensure_state_dir(p.parent)
     try:
         os.chmod(p.parent, 0o700)
     except OSError as e:
@@ -268,6 +303,12 @@ def main() -> int:
     session_id = payload.get("session_id")
     if not isinstance(session_id, str):
         return 0
+    try:
+        # First, before any early return: whatever this call did to the
+        # worktree, the next Stop's sweep must not be skipped over it.
+        touch_activity(session_id)
+    except OSError:
+        pass  # no marker → the prefilter runs the flush; never a lost capture
     if payload.get("tool_name") == "Bash":
         # Bash mode: there is no path to record — the flush finds what the
         # shell wrote by sweeping git in this cwd. Never look at the command.

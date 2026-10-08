@@ -79,7 +79,6 @@ def test_codex_guide_uses_only_the_plugin_server() -> None:
         "codex mcp login memhub --oauth-client-registration cimd",
         "codex mcp remove memhub",
         "Log in to MemHub",
-        "Set up MemHub",
         "Onboard MemHub for this repo",
     )
     for text in required:
@@ -137,7 +136,7 @@ def test_the_finder_maps_my_unlinked_prs() -> None:
         check(f"find-contributing-sessions says {text!r}", text in flat)
     frontmatter = skill.split("---", 2)[1]
     for spelling in ("mcp__plugin_memhub_memhub__list_my_unlinked_prs",
-                     "mcp__plugin_memhub-staging_memhub__list_my_unlinked_prs"):
+                     "mcp__plugin_memhub_memhub__list_my_unlinked_prs"):
         check(f"allowed-tools lists {spelling}", spelling in frontmatter)
 
 
@@ -189,19 +188,43 @@ def test_the_specs_do_not_prescribe_patterns_the_code_rejects() -> None:
     # …and the manifest the spec quotes must be the manifest that ships.
     shipped = (ROOT / "plugins" / "memhub" / "hooks"
                / "claude-hooks.json").read_text(encoding="utf-8")
+    sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+    import hook_entry  # noqa: PLC0415
     for group in json.loads(shipped)["hooks"]["PostToolUse"]:
         for hook in group["hooks"]:
-            if "pr_link_trigger" in hook.get("command", ""):
+            if hook.get("command", "").endswith(" PostToolUse pr_link_trigger"):
                 check(f"the spec quotes the shipped matcher {group['matcher']}",
                       group["matcher"] in specs)
-                guard = 'case \"$IN\" in *gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*)'
-                check("…and the shipped case guard", guard in hook["command"])
+                check("…and the shipped command", json.dumps(hook["command"]) in specs)
+                globs = hook_entry.ROUTES[("PostToolUse", "pr_link_trigger")].globs
+                check("…and the shipped payload globs",
+                      "`" + "|".join(globs) + "`" in specs)
+
+
+CREATE_RULE = ROOT / "plugins" / "memhub" / "skills" / "create-rule"
+
+
+def _create_rule_text() -> str:
+    """SKILL.md plus the references it sends the agent to read."""
+    return "\n".join(p.read_text(encoding="utf-8") for p in
+                     [CREATE_RULE / "SKILL.md", *sorted((CREATE_RULE / "references").glob("*.md"))])
+
+
+def test_create_rule_skill_stays_cheap_to_load() -> None:
+    """Every rule anyone files loads SKILL.md whole; the harness path, the live
+    test and the per-shape recipes are read only by the runs that need them.
+    Each reference must be named from SKILL.md, or no run ever reads it."""
+    core = (CREATE_RULE / "SKILL.md").read_text(encoding="utf-8")
+    size = len(core.encode())
+    check(f"create-rule SKILL.md stays under 32 KB ({size} bytes)", size < 32_000)
+    for ref in sorted((CREATE_RULE / "references").glob("*.md")):
+        check(f"SKILL.md points at references/{ref.name}",
+              f"${{CLAUDE_PLUGIN_ROOT}}/skills/create-rule/references/{ref.name}" in core)
 
 
 def test_create_rule_skill_keeps_its_authoring_gates() -> None:
     """The skill is prose, and prose silently loses steps."""
-    skill = (ROOT / "plugins" / "memhub" / "skills" / "create-rule"
-             / "SKILL.md").read_text(encoding="utf-8")
+    skill = _create_rule_text()
     for text in ("### 4b.", "scratch worktree", "the mode the rule will ship with",
                  "Never anchor a `command_rx` with `^`",
                  "command position",
@@ -226,17 +249,22 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
                  # setup runs inside the same worktree, so a candidate matching
                  # cp/git/python3/rm can still fire on the parent's shell.
                  "must be the sub-agent's rather than the parent's",
-                 # Step 0 rule 3: ambiguity resolves to the repo's own book
-                 # instead of "file nothing", which read as fail-closed and was
-                 # not — on two bound all_org books it refused once and picked
-                 # a book every other time.
-                 "the repo's own book",
-                 "create_rulebook",
-                 # and the trap under it: an ORG ADMIN gets an empty book by
-                 # default, and a book that binds nobody serves nobody.
-                 "member_count: 0",
-                 "binds nobody"):
+                 # ENG-1195: one rulebook per scope. Step 0 decides who the
+                 # rule applies to without asking: org-wide unless the person
+                 # says "just me" or names a workspace, and the workspace
+                 # scope is never offered unprompted.
+                 "## 0. Who it applies to",
+                 "**Otherwise use `org`.**",
+                 "never offer the workspace scope",
+                 "`scope` from step 0",
+                 # the harness draft path files org-wide and never looks up
+                 # or makes a book
+                 'always files with `scope: "org"`',
+                 # the report names who the rule reaches, never a stored
+                 # book name
+                 "never a\nrulebook's stored name"):
         check(f"create-rule keeps {text!r}", text in skill)
+    check("create-rule never makes a rulebook", "create_rulebook" not in skill)
 
 
 
@@ -277,9 +305,9 @@ def test_the_authoring_skills_send_the_rule_judge_its_four_fields() -> None:
           "with `title`, `statement`, `when`, `do`, `why`" in file_ and "`when_not` when an exclusion was\nnamed" in file_)
     check("…and says a replacing rule inherits the ones it does not name, so a changed situation is re-stated",
           "inherits what it does not name" in file_ and "re-state `when`" in file_)
-    harness = part(create, "## Handed a turn by the harness", "## 0. Which rulebook")
+    harness = (CREATE_RULE / "references" / "harness.md").read_text(encoding="utf-8")
     check("the harness draft's call carries `when`, `do`, `why`",
-          "`rulebook_id`, `title`, `statement`, `when`, `do`, `why`" in harness)
+          '`scope: "org"`, `title`, `statement`, `when`, `do`, `why`' in harness)
     check("…written without asking", "`when`, `do` and `why` are written here without asking" in harness)
 
     start = (skills / "start-rulebook" / "SKILL.md").read_text(encoding="utf-8")
@@ -303,14 +331,16 @@ def test_the_authoring_skills_send_the_rule_judge_its_four_fields() -> None:
 
 # ENG-1178: the backend MCP surface is 34 tools, cut over with no aliases. A
 # shipped file that still names a removed tool (or the old `memory_type`
-# parameter) teaches the agent a call the server refuses.
+# parameter) teaches the agent a call the server refuses. ENG-1195 retired
+# `create_rulebook` (rulebooks are made per scope by the server; the backend
+# keeps a deprecated shim for older plugins), so the plugin's surface is 33.
 _MCP_SURFACE = {
     "list_agent_brains", "get_brain_overview", "search_memory", "read_memory",
     "get_artifact_lineage", "list_tags", "save_artifact", "ingest_document_from_url",
     "tag_memory", "copy_to_agent_brain", "delete_memory", "create_agent_brain",
     "share_agent_brain", "list_agent_brain_access", "list_brain_folders",
     "move_brain_to_folder", "list_sessions", "add_memory", "import_conversation",
-    "list_rulebooks", "create_rulebook", "list_rules", "create_rule", "link_pr",
+    "list_rulebooks", "list_rules", "create_rule", "link_pr",
     "unlink_pr", "list_my_unlinked_prs", "get_spec_workflow", "list_skills",
     "get_skill", "create_skill", "list_orgs", "list_workspaces", "create_workspace",
     "list_teammates",
@@ -320,12 +350,12 @@ _REMOVED_MCP = (
     "diff_artifact_versions", "tag_artifact", "tag_document", "copy_memory_to_brain",
     "add_skill_to_brain", "delete_artifact", "delete_episode", "delete_skill",
     "share_agent_brain_with_workspace", "create_brain_folder",
-    "remove_brain_from_folder", "get_skill_file", "memory_type",
+    "remove_brain_from_folder", "get_skill_file", "memory_type", "create_rulebook",
 )
 
 
-def test_mcp_surface_is_34_tools() -> None:
-    check("the surface this test pins is 34 tools", len(_MCP_SURFACE) == 34)
+def test_mcp_surface_is_33_tools() -> None:
+    check("the surface this test pins is 33 tools", len(_MCP_SURFACE) == 33)
 
 
 def test_shipped_files_name_no_removed_mcp_tool() -> None:
@@ -347,12 +377,33 @@ def test_skill_allowed_tools_are_on_the_surface() -> None:
     for skill in sorted(skills.glob("*/SKILL.md")):
         front = skill.read_text(encoding="utf-8").split("---", 2)[1]
         line = next((ln for ln in front.splitlines() if ln.startswith("allowed-tools:")), "")
-        names = re.findall(r"mcp__plugin_(memhub|memhub-staging)_memhub__([a-z_]+)", line)
+        names = re.findall(r"mcp__plugin_(memhub|memhub)_memhub__([a-z_]+)", line)
         off = sorted({t for _, t in names if t not in _MCP_SURFACE})
         check(f"{skill.parent.name} allowed-tools name only real tools {off}", not off)
-        by_prefix = {p: {t for q, t in names if q == p} for p in ("memhub", "memhub-staging")}
+        by_prefix = {p: {t for q, t in names if q == p} for p in ("memhub", "memhub")}
         check(f"{skill.parent.name} allowed-tools grant both prefixes alike",
-              by_prefix["memhub"] == by_prefix["memhub-staging"])
+              by_prefix["memhub"] == by_prefix["memhub"])
+
+
+def test_skill_descriptions_carry_no_angle_brackets() -> None:
+    # Claude Cowork refuses a plugin whose SKILL.md description holds an angle
+    # bracket ("cannot contain XML tags"); claude.ai strips them. Claude Code
+    # loads the same file without complaint, so only this check sees it.
+    skills = ROOT / "plugins" / "memhub" / "skills"
+    for skill in sorted(skills.glob("*/SKILL.md")):
+        front = skill.read_text(encoding="utf-8").split("---", 2)[1]
+        line = next((ln for ln in front.splitlines() if ln.startswith("description:")), "")
+        check(f"{skill.parent.name} has a description", bool(line))
+        check(f"{skill.parent.name} description has no < or >", "<" not in line and ">" not in line)
+
+
+def test_claude_manifest_description_fits_cowork() -> None:
+    # Claude Cowork refuses a plugin whose manifest description runs past 500
+    # characters; Claude Code loads it at any length.
+    manifest = json.loads((ROOT / "plugins" / "memhub" / ".claude-plugin"
+                           / "plugin.json").read_text(encoding="utf-8"))
+    size = len(manifest["description"])
+    check(f"the Claude manifest description is at most 500 characters ({size})", 0 < size <= 500)
 
 
 def test_search_memory_skill_teaches_the_ladder() -> None:

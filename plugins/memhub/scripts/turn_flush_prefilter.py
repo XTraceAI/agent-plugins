@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Cheap gate for the per-turn Stop-hook flush (stdlib only).
 
-The Stop hook fires after EVERY assistant turn, and the real flush costs a
-``uv run --with mcp`` spawn — measured at ~0.8s warm, ~1.4s cold, before any
-network. Paying that on turns with nothing to send, or while a previous flush
-is still in flight, would burn a laptop's battery for no memory. This script
-runs under the system python3 (~0.02s, no uv, no deps) and exits non-zero to
+The Stop hook fires after EVERY assistant turn, and the real flush loads the
+whole capture pipeline and goes to the network. Paying that on turns with
+nothing to send, or while a previous flush is still in flight, would burn a
+laptop's battery for no memory. This script runs under the system python3
+(~0.02s, stdlib only) and exits non-zero to
 skip the expensive stage — the same two-stage shape the commit/PR flush hook
 uses (``flush_prefilter.py``).
 

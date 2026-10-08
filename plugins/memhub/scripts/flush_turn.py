@@ -75,11 +75,9 @@ from transcript_filter import (  # noqa: E402
     is_harness_child,
 )
 
-# All at module scope now. These used to be deferred into :func:`_flush`
-# because ``_memhub_auth`` dragged in the mcp SDK and this module has to stay
-# importable under a bare python3 — that is what lets the cursor/tail/lock
-# logic, where the silent failures live, be tested without the dependency.
-# Nothing here needs the SDK any more, so the indirection went with it.
+# All at module scope: every one of these is stdlib-only, so this module
+# stays importable under a bare python3 — that is what lets the
+# cursor/tail/lock logic, where the silent failures live, be tested directly.
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
@@ -765,7 +763,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # No connection to open: the server is stateless, so a Session is just
     # the endpoint and the credential. Verified against the live server —
     # it negotiates no session id and does not require `initialize`, so this
-    # is ONE round trip where the SDK did three.
+    # is ONE round trip, with no handshake.
     # Per call, and deliberately less than the whole flush budget, so one
     # stalled call leaves the budget room to record why.
     session = mcp_http.Session(url, bearer, timeout=_flush_timeout_s() / 2)
@@ -1013,20 +1011,25 @@ async def _flush(session_id: str, transcript_path: str) -> None:
          f"draining={out.get('draining')}")
 
 
-class _NoCredential(RuntimeError):
-    """No usable bearer. Replaces the SDK's NonInteractiveAuthRequired.
+def _env_token_hint() -> str:
+    """`` (or set MEMHUB_TOKEN)`` where this build reads that variable, else "".
 
-    A plain exception now, not something buried in an anyio task group, so the
-    handler recognises it by type instead of walking an exception tree — which
-    is what the SDK's wrapping forced.
+    The Claude plugin directory build ships no ``_memhub_env_token``, so there
+    the variable is ignored and the hint would send the user to a dead end.
     """
+    try:
+        import _memhub_env_token  # noqa: F401,PLC0415 — absent in the directory build
+    except ImportError:
+        return ""
+    return " (or set MEMHUB_TOKEN)"
 
 
-# `_auth_required` used to live here: thirty lines walking an exception tree
-# for NonInteractiveAuthRequired, because the SDK raised it inside anyio task
-# groups and it surfaced wrapped in ExceptionGroups or chained as __cause__.
-# Resolving the credential ourselves means the miss is now a plain exception
-# raised on our own stack, so `isinstance` is the whole check.
+class _NoCredential(RuntimeError):
+    """No usable bearer.
+
+    A plain exception raised on our own stack, so the handler recognises it by
+    type — `isinstance` is the whole check, no exception-tree walk.
+    """
 
 
 def main() -> int:
@@ -1058,16 +1061,16 @@ def main() -> int:
         timeout_s = _flush_timeout_s()
         asyncio.run(asyncio.wait_for(
             _flush(session_id, transcript_path), timeout=timeout_s))
-    # BaseException, not Exception: anyio mixes CancelledError into task
-    # groups, producing a BaseExceptionGroup that an Exception handler would
-    # miss — killing the hook with a traceback in the user's session.
+    # BaseException, not Exception: a CancelledError or KeyboardInterrupt
+    # would skip an Exception handler — killing the hook with a traceback in
+    # the user's session.
     except BaseException as e:  # noqa: BLE001 — never fail the hook
         if isinstance(e, (TimeoutError, asyncio.TimeoutError)):
             _log(f"timed out after {_flush_timeout_s():.0f}s — the next turn retries (cursor unmoved)")
             reason, detail = "timeout", f"no response in {_flush_timeout_s():.0f}s"
         elif isinstance(e, _NoCredential):
-            _log(f"no usable credential; run {skill_command('login')} "
-                 "(or set MEMHUB_TOKEN) to enable per-turn capture — skipping")
+            _log(f"no usable credential; run {skill_command('login')}"
+                 f"{_env_token_hint()} to enable per-turn capture — skipping")
             # The one failure the user must act on personally, and the one that
             # stays broken forever until they do: no retry can mint a token.
             reason, detail = "auth", "no usable cached OAuth token"

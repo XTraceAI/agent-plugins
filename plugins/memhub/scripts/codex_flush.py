@@ -5,7 +5,7 @@ The Codex sibling of ``cursor_flush.py``, one seam simpler: rollouts are
 append-only JSONL, so "anything new?" is a byte-size comparison rather than a
 blob-set. Everything downstream is the shared machinery (``readers.codex``
 transform, ``redact``, ``resolve_bearer``, ``room_map``'s git helpers,
-``mcp_http`` — bare python3, no mcp SDK).
+``mcp_http`` — bare python3, stdlib only).
 
 Codex clones Claude's hook contract (same ``hooks.json`` shape, same
 ``${CLAUDE_PLUGIN_ROOT}``), so the payload is EXPECTED Claude-shaped —

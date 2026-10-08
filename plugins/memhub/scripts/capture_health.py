@@ -22,9 +22,25 @@ the day it matters. So: no output at all on the healthy path, and no output when
 capture is switched off on purpose (``MEMHUB_TURN_FLUSH=0``) — that is a
 configuration, not a fault.
 
-Stdlib only and no network: this runs before the user's first prompt, and every
-millisecond here is one they wait. Measured ~20ms. Never raises — a broken
-health check must not be the thing that breaks a session.
+Stdlib only, and at most two network reads, both bounded and both skipped
+when they have already been answered: this runs before the user's first
+prompt, and every millisecond here is one they wait.
+
+* ``plugin_compatibility.startup_message`` GETs ``/v1/plugin/compatibility``
+  on the MemHub backend (2 s timeout) — once per session id: the session is
+  passed in, and a later SessionStart of the same session (resume, /clear)
+  reads the healthy-result marker and makes no call. Two exceptions: with no
+  session id in the payload there is no marker to key on, so the GET runs
+  every time; and while the server says an upgrade is required, the GET is
+  repeated whenever the last one is over 60 s old. No credential: no GET.
+* when that check is healthy, ``plugin_updates.available_message`` may fetch
+  the public plugin manifest from raw.githubusercontent.com (0.75 s timeout
+  per request), at most once an hour per host, and never on the staging
+  plugin (``memhub-staging``).
+
+Everything else — token, flush breadcrumbs, the rulebook's state — is read
+from local files (~20ms). Never raises — a broken health check must not be
+the thing that breaks a session.
 
 Run the self-test:  python3 tests/capture_health_test.py  (from the repo root;
 tests live outside the plugin so they are not shipped to installs)
@@ -41,7 +57,10 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-CACHE_DIR = Path.home() / ".config" / "memhub-plugin"
+# $MEMHUB_CONFIG_DIR moves the credentials (token cache, access key) so a
+# harness can sign in fresh without touching this machine's real key.
+CACHE_DIR = Path(os.environ.get("MEMHUB_CONFIG_DIR")
+                 or Path.home() / ".config" / "memhub-plugin")
 # Claude's flush state. `--host codex` switches to codex_flush's directory:
 # the two writers keep the same last_error / last_error_at / last_ok_at shape,
 # so everything below reads either one unchanged.
@@ -49,10 +68,16 @@ STATE_DIR = CACHE_DIR / "turnflush"
 _STATE_DIRS = {"claude": CACHE_DIR / "turnflush", "codex": CACHE_DIR / "codexflush",
                "cursor": CACHE_DIR / "cursorflush"}
 _PLUGIN_ROOT_ARG: str | None = None     # `--plugin-root`, see _configure
-# The rulebook keeps its own tree, relocatable together for tests (the hook
-# reads the same variable).
-RULEBOOK_DIR = Path(os.environ.get("MEMHUB_RULEBOOK_BASE")
-                    or os.path.expanduser("~/.config/memhub-plugin/rulebook"))
+# The rulebook keeps its own tree, one per backend (rulebook_paths.py), so
+# the health of THIS install's book and ledger is reported, never the other
+# install's. $MEMHUB_RULEBOOK_BASE relocates it for tests, as in the hook.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import rulebook_paths  # noqa: E402
+    RULEBOOK_DIR = Path(rulebook_paths.base())
+except Exception:  # a broken sibling: the pre-keying location
+    RULEBOOK_DIR = Path(os.environ.get("MEMHUB_RULEBOOK_BASE")
+                        or os.path.expanduser("~/.config/memhub-plugin/rulebook"))
 
 # How far back a recorded failure still counts as news. A breadcrumb from last
 # week describes a problem that has probably already been fixed (or a machine
@@ -252,7 +277,8 @@ def _token_problem(host: str) -> str | None:
     An unreadable ``exp`` alone is never treated as a fault — that would be
     guessing — and it does not suppress the refresh-token fact either.
     """
-    if os.environ.get("MEMHUB_TOKEN", "").strip():
+    from _memhub_auth import explicit_token  # noqa: PLC0415 — stdlib, beside this file
+    if explicit_token():
         return None  # explicit bearer (incl. an mhk_ key) — nothing here applies
 
     # A stored access key outranks the OAuth cache, exactly as it does in
@@ -372,9 +398,11 @@ def _succeeded_since(path: Path, when: float) -> bool:
 # Every rulebook lane that can leave a breadcrumb. Declared once, and asserted
 # in `capture_health_test.py`: a lane added here without its own branch in
 # `_message` falls through to a generic line that names no cause and offers no
-# true fix, which is how a recall timeout came to tell people their login was
-# broken. The test fails until the new lane says something true.
-LANES = ("fetch", "flush", "recall")
+# true fix, which is how a timeout came to tell people their login was broken.
+# The test fails until the new lane says something true. (`recall` is gone:
+# anchor rules are matched locally now, so a crumb an older hook left under
+# that name is ignored.)
+LANES = ("fetch", "flush")
 
 
 def _rulebook_problem() -> tuple[str, float] | None:
@@ -430,11 +458,6 @@ def _lane_recovered(what: str, when: float) -> bool:
     fetch  — a book confirmed after the error (`book/*.json:fetched_at`).
     flush  — an accepted batch after the error (`ledger/.sent:last_flush_at`,
              written by the hook only when the server accepted rows).
-    recall — clears its own crumb on the next 200 (`_breadcrumb_clear`), so a
-             surviving crumb already means no recall has succeeded since. The
-             book check below still stands as a second witness: recall only
-             runs on PreToolUse, so a session that has issued none of them
-             would otherwise carry the last one's blip forever.
     """
     def _stamp_after(path: Path, key: str) -> bool:
         try:
@@ -465,11 +488,15 @@ def _message(host: str, token_problem: str | None,
     from _memhub_auth import skill_command  # noqa: PLC0415 — stdlib, beside this file
 
     login = skill_command("login")
-    fix = (f"Run {login} to authenticate "
-           "(the plugin has its own login, separate from /mcp).")
+    fix = f"Run {login} to sign in again."
     if token_problem == "never":
-        return (f"MemHub capture is not authenticated for {host}, so this "
-                f"session is not being saved to memory. {fix}")
+        # Most often a new customer who has not set MemHub up at all. Onboard
+        # signs in AND sets the repo up, and nothing here names /mcp: its
+        # sign-in does not reach capture, so pointing at it only adds a step
+        # that does not help (spec one-command-onboarding § Sign-in).
+        return (f"MemHub isn't signed in on this machine ({host}), so this "
+                f"session is not being saved. Run {skill_command('onboard')} "
+                "to set it up — about 2 minutes.")
     if token_problem == "unrenewable":
         return (f"MemHub capture is broken: the saved login for {host} expired "
                 f"and cannot be renewed automatically, so nothing from this "
@@ -544,8 +571,8 @@ def _message(host: str, token_problem: str | None,
         elif reason == "plugin_root_unresolved":
             # Nothing about the credential is wrong, and nothing retries on its
             # own — the files have to come back first.
-            tail = ("Reinstall the MemHub plugin, then run the memhub:setup "
-                    "skill to confirm the bridge can find it.")
+            tail = ("Reinstall the MemHub plugin, then run "
+                    f"{skill_command('onboard')} to confirm the bridge can find it.")
         else:
             tail = ("It may have recovered since; "
                     f"run {login} --status to check.")
@@ -572,22 +599,58 @@ def _message(host: str, token_problem: str | None,
                     f"fired is not reaching the server (last attempt {when_txt}), "
                     "so the team cannot see whether they are useful. "
                     f"Run {login} --status to check.")
-        if what == "recall":
-            # NOT told to check login: this lane runs on a 1.5 s budget inside
-            # PreToolUse and the overwhelming majority of its failures are a
-            # slow round trip, not a credential — an auth refusal is caught
-            # above by `_AUTH_REFUSAL` and reported as such. Sending someone to
-            # re-authenticate over a timeout spends their trust proving the
-            # advice was wrong. It also says what is and is not lost, because
-            # the cached rules keep firing normally the whole time.
-            return ("Your team's rules are showing, but the ones tied to "
-                    f"specific files or commands went unanswered {when_txt}, so "
-                    "a few may not have been raised. Nothing needs fixing if "
-                    "the next lookup succeeds.")
         return ("A team-rule lookup failed "
                 f"{when_txt}; advice tied to specific files or commands may be "
                 f"missing from this session. Run {login} --status to check.")
     return None
+
+
+#: Sessions in which a signed-in person who has never onboarded is told about
+#: /memhub:onboard. Few on purpose: a hint that never stops is one people
+#: switch off, and brain_brief stays silent in un-onboarded repos for that
+#: reason. Once ANY repo on this machine is onboarded it stops for good, so
+#: someone browsing a checkout that is not theirs is never told.
+NUDGE_SESSIONS = 3
+
+
+def _has_onboarded() -> bool:
+    """A repo on this machine has a brain: cached by onboard, or by spec init."""
+    try:
+        import room_map  # noqa: PLC0415 — stdlib, beside this file
+        if any(isinstance(e, dict) and e.get("brain_id")
+               for e in room_map._load().get("repos", {}).values()):
+            return True
+    except Exception:  # noqa: BLE001 — a hint is never worth a failure
+        pass
+    try:
+        state = json.loads((CACHE_DIR / "onboard_state.json").read_text(encoding="utf-8"))
+        return any(r.get("brain_id") for env in state.values() if isinstance(env, dict)
+                   for r in (env.get("repos") or {}).values() if isinstance(r, dict))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _onboard_nudge(session_id: str) -> str | None:
+    """The one-line hint for a signed-in person who has not set MemHub up."""
+    if not session_id or _has_onboarded():
+        return None
+    path = CACHE_DIR / "onboard_nudge.json"
+    try:
+        seen = json.loads(path.read_text(encoding="utf-8")).get("sessions", [])
+    except (OSError, ValueError, AttributeError):
+        seen = []
+    if session_id not in seen:
+        if len(seen) >= NUDGE_SESSIONS:
+            return None
+        seen.append(session_id)
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"sessions": seen}), encoding="utf-8")
+        except OSError:
+            pass
+    from _memhub_auth import skill_command  # noqa: PLC0415
+    return (f"MemHub is installed but not set up yet. Run {skill_command('onboard')} "
+            "in a repo to set it up — about 2 minutes.")
 
 
 def _already_warned(session_id: str, signature: str) -> bool:
@@ -650,13 +713,17 @@ def main() -> int:
     from plugin_compatibility import startup_message
     # Cursor already delivers compatibility at beforeSubmitPrompt with its
     # session debounce. This subprocess only adds local capture health.
+    # The session id keys startup_message's once-per-session marker: without
+    # it the compatibility GET ran on every SessionStart, resume and /clear.
     upgrade = None if "cursor" in sys.argv else startup_message(
-        host="codex" if "codex" in sys.argv else "claude-code")
+        host="codex" if "codex" in sys.argv else "claude-code",
+        session=session_id or None)
     token_problem = _token_problem(host)
     failure = _recent_failure()
     rulebook = _rulebook_problem()
     health = _message(host, token_problem, failure, rulebook)
-    message = "\n".join(part for part in (upgrade, health) if part)
+    nudge = None if (health or token_problem) else _onboard_nudge(session_id)
+    message = "\n".join(part for part in (upgrade, health, nudge) if part)
     if not message:
         return 0
 
@@ -666,14 +733,14 @@ def main() -> int:
     # should be shown once; only a genuinely DIFFERENT problem should interrupt
     # again.
     signature = (f"{upgrade or ''}|{host}|{token_problem or ''}|{failure[0] if failure else ''}"
-                 f"|{rulebook[0] if rulebook else ''}")
+                 f"|{rulebook[0] if rulebook else ''}|{'nudge' if nudge else ''}")
     if _already_warned(session_id, signature):
         return 0
 
     print(json.dumps({
         # The channel that reaches the USER. Everything else this hook could
         # emit goes only to the model.
-        "systemMessage": f"{'🚨' if upgrade and 'PLUGIN_UPGRADE_REQUIRED' in upgrade else 'ℹ️' if upgrade and not health else '⚠️'}  {message}",
+        "systemMessage": f"{'🚨' if upgrade and 'PLUGIN_UPGRADE_REQUIRED' in upgrade else '⚠️' if health else 'ℹ️'}  {message}",
         # And to the agent, so "is my memory working?" is answerable without
         # re-deriving any of it.
         "hookSpecificOutput": {
