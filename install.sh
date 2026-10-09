@@ -46,13 +46,13 @@ if [ "$MODE" = staging ]; then
   PLUGIN=memhub-staging
   CLAUDE_SRC="$SOURCE";  CLAUDE_MKT=memhub-internal
   CODEX_SRC="$SOURCE";   CODEX_MKT=memhub-internal
-  CURSOR_SRC="$SOURCE"
+  CURSOR_SRC="$SOURCE";  CURSOR_MKT=memhub-internal
   BACKEND=staging
 else
   PLUGIN=memhub
   CLAUDE_SRC=XTraceAI/agent-plugins;                 CLAUDE_MKT=memhub
   CODEX_SRC=XTraceAI/agent-plugins;                  CODEX_MKT=xtrace-plugins
-  CURSOR_SRC=https://github.com/XTraceAI/agent-plugins
+  CURSOR_SRC=https://github.com/XTraceAI/agent-plugins; CURSOR_MKT=xtrace-plugins
   BACKEND=production
 fi
 
@@ -136,22 +136,27 @@ if [ -n "$CODEX_BIN" ]; then
   "$CODEX_BIN" plugin marketplace add "$CODEX_SRC"
   # `add` returns early for a known source without fetching; only `upgrade`
   # refreshes a Git snapshot. A local-directory source is always current.
-  [ "$MODE" = staging ] || "$CODEX_BIN" plugin marketplace upgrade "$CODEX_MKT" \
-    || say "warning: could not refresh the Codex marketplace; re-run this installer, or: codex plugin marketplace upgrade $CODEX_MKT" >&2
-  CODEX_ROOT=$("$CODEX_BIN" plugin add "$PLUGIN@$CODEX_MKT" | sed -n 's/^Installed plugin root: //p')
-  [ -n "$CODEX_ROOT" ] || fail "codex did not report where it installed $PLUGIN"
-  say "installed: $CODEX_ROOT"
-  "$CODEX_BIN" plugin list 2>/dev/null \
-    | awk -v t="$PLUGIN@$CODEX_MKT" '$1 ~ /^memhub(-staging)?@/ && $1 != t && /enabled/ {print $1}' \
-    | while read -r dup; do
-        say "warning: $dup is also enabled in Codex; remove it with: codex plugin remove $dup" >&2
-      done
-  # Codex never dispatches a plugin manifest's own hooks; capture runs only
-  # through this user-level bridge, and only after the person trusts it.
-  python3 "$CODEX_ROOT/scripts/setup_codex_hooks.py" install
-  [ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="$CODEX_ROOT"
-  LOGIN_HOST=${LOGIN_HOST:-codex}
-  note "Codex: restart it, open /hooks and trust only the MemHub handlers — capture stays OFF until you do"
+  if [ "$MODE" != staging ] && ! "$CODEX_BIN" plugin marketplace upgrade "$CODEX_MKT"; then
+    # `plugin add` would reinstall from the stale snapshot and can downgrade a
+    # newer installed MemHub; leave whatever Codex has untouched instead.
+    say "warning: could not refresh the Codex marketplace, so Codex was left as it is; re-run this installer" >&2
+    note "Codex: not installed or updated (marketplace refresh failed) — re-run this installer"
+  else
+    CODEX_ROOT=$("$CODEX_BIN" plugin add "$PLUGIN@$CODEX_MKT" | sed -n 's/^Installed plugin root: //p')
+    [ -n "$CODEX_ROOT" ] || fail "codex did not report where it installed $PLUGIN"
+    say "installed: $CODEX_ROOT"
+    "$CODEX_BIN" plugin list 2>/dev/null \
+      | awk -v t="$PLUGIN@$CODEX_MKT" '$1 ~ /^memhub(-staging)?@/ && $1 != t && /enabled/ {print $1}' \
+      | while read -r dup; do
+          say "warning: $dup is also enabled in Codex; remove it with: codex plugin remove $dup" >&2
+        done
+    # Codex never dispatches a plugin manifest's own hooks; capture runs only
+    # through this user-level bridge, and only after the person trusts it.
+    python3 "$CODEX_ROOT/scripts/setup_codex_hooks.py" install
+    [ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="$CODEX_ROOT"
+    LOGIN_HOST=${LOGIN_HOST:-codex}
+    note "Codex: restart it, open /hooks and trust only the MemHub handlers — capture stays OFF until you do"
+  fi
 fi
 
 if [ -n "$CURSOR_BIN" ]; then
@@ -159,8 +164,8 @@ if [ -n "$CURSOR_BIN" ]; then
   "$CURSOR_BIN" plugin marketplace add "$CURSOR_SRC"
   # As with Codex, `add` does not re-index a known marketplace; `update` does.
   # Not fatal: the install itself is the manual Add step below.
-  [ "$MODE" = staging ] || "$CURSOR_BIN" plugin marketplace update xtrace-plugins \
-    || say "warning: could not refresh the Cursor marketplace; run: cursor-agent plugin marketplace update xtrace-plugins" >&2
+  "$CURSOR_BIN" plugin marketplace update "$CURSOR_MKT" \
+    || say "warning: could not refresh the Cursor marketplace; run: cursor-agent plugin marketplace update $CURSOR_MKT" >&2
   LOGIN_HOST=${LOGIN_HOST:-cursor}
   # Cursor has no command to install or update a plugin, and re-indexing the
   # marketplace does not touch an installed copy's files.
