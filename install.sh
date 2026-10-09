@@ -162,7 +162,9 @@ if [ -n "$CURSOR_BIN" ]; then
   [ "$MODE" = staging ] || "$CURSOR_BIN" plugin marketplace update xtrace-plugins \
     || say "warning: could not refresh the Cursor marketplace; run: cursor-agent plugin marketplace update xtrace-plugins" >&2
   LOGIN_HOST=${LOGIN_HOST:-cursor}
-  note "Cursor: open Customize, find MemHub and select Add (Cursor has no command for this step)"
+  # Cursor has no command to install or update a plugin, and re-indexing the
+  # marketplace does not touch an installed copy's files.
+  note "Cursor: open Customize, find MemHub and select Add — or, if it is already installed, Update (or remove and Add again) to get the new version. Cursor has no command for this step"
 fi
 
 if [ "$LOGIN" = 1 ]; then
