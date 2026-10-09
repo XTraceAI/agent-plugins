@@ -87,6 +87,10 @@ note() { NEXT="$NEXT
 if [ -n "$CLAUDE_BIN" ]; then
   step "Claude Code"
   "$CLAUDE_BIN" plugin install "$PLUGIN" --marketplace "$CLAUDE_SRC"
+  # A re-run must reach the current release: `install` is a no-op for an
+  # installed plugin and does not refresh an already-added marketplace.
+  "$CLAUDE_BIN" plugin marketplace update "$CLAUDE_MKT"
+  "$CLAUDE_BIN" plugin update "$PLUGIN@$CLAUDE_MKT"
   "$CLAUDE_BIN" plugin enable "$PLUGIN@$CLAUDE_MKT" >/dev/null 2>&1 || true
   # Every MemHub copy registers the same hooks and an MCP server named
   # `memhub`; two enabled means every session is captured twice and every rule
@@ -121,6 +125,9 @@ fi
 if [ -n "$CODEX_BIN" ]; then
   step "Codex"
   "$CODEX_BIN" plugin marketplace add "$CODEX_SRC"
+  # `add` returns early for a known source without fetching; only `upgrade`
+  # refreshes a Git snapshot. A local-directory source is always current.
+  [ "$MODE" = staging ] || "$CODEX_BIN" plugin marketplace upgrade "$CODEX_MKT"
   CODEX_ROOT=$("$CODEX_BIN" plugin add "$PLUGIN@$CODEX_MKT" | sed -n 's/^Installed plugin root: //p')
   [ -n "$CODEX_ROOT" ] || fail "codex did not report where it installed $PLUGIN"
   say "installed: $CODEX_ROOT"
