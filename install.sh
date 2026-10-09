@@ -147,6 +147,10 @@ fi
 if [ -n "$CURSOR_BIN" ]; then
   step "Cursor"
   "$CURSOR_BIN" plugin marketplace add "$CURSOR_SRC"
+  # As with Codex, `add` does not re-index a known marketplace; `update` does.
+  # Not fatal: the install itself is the manual Add step below.
+  [ "$MODE" = staging ] || "$CURSOR_BIN" plugin marketplace update xtrace-plugins \
+    || say "warning: could not refresh the Cursor marketplace; run: cursor-agent plugin marketplace update xtrace-plugins" >&2
   LOGIN_HOST=${LOGIN_HOST:-cursor}
   note "Cursor: open Customize, find MemHub and select Add (Cursor has no command for this step)"
 fi
