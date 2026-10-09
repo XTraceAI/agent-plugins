@@ -86,11 +86,18 @@ note() { NEXT="$NEXT
 
 if [ -n "$CLAUDE_BIN" ]; then
   step "Claude Code"
-  "$CLAUDE_BIN" plugin install "$PLUGIN" --marketplace "$CLAUDE_SRC"
-  # A re-run must reach the current release: `install` is a no-op for an
-  # installed plugin and does not refresh an already-added marketplace.
-  "$CLAUDE_BIN" plugin marketplace update "$CLAUDE_MKT"
-  "$CLAUDE_BIN" plugin update "$PLUGIN@$CLAUDE_MKT"
+  # Two commands, not `install --marketplace` (that flag needs Claude Code
+  # 2.1.292+). Both are no-ops when already done.
+  "$CLAUDE_BIN" plugin marketplace add "$CLAUDE_SRC"
+  "$CLAUDE_BIN" plugin install "$PLUGIN@$CLAUDE_MKT" --scope user
+  # A re-run must reach the current release: neither command above refreshes
+  # an already-added marketplace or an installed plugin. --scope user, or
+  # Claude updates a project/local copy instead of the one installed here.
+  # A failed refresh (e.g. a network blip) leaves a working install: warn, and
+  # still sign in.
+  { "$CLAUDE_BIN" plugin marketplace update "$CLAUDE_MKT" \
+      && "$CLAUDE_BIN" plugin update "$PLUGIN@$CLAUDE_MKT" --scope user; } \
+    || say "warning: could not refresh $PLUGIN in Claude Code; re-run this installer, or: claude plugin update $PLUGIN@$CLAUDE_MKT --scope user" >&2
   "$CLAUDE_BIN" plugin enable "$PLUGIN@$CLAUDE_MKT" >/dev/null 2>&1 || true
   # Every MemHub copy registers the same hooks and an MCP server named
   # `memhub`; two enabled means every session is captured twice and every rule
@@ -113,9 +120,11 @@ for p in json.load(sys.stdin):
   if [ -z "$PLUGIN_ROOT" ]; then
     PLUGIN_ROOT=$("$CLAUDE_BIN" plugin list --json | python3 -c '
 import json, sys
+# One row per installed scope; sign in from the user-scoped copy only.
 for p in json.load(sys.stdin):
-    if p["id"] == sys.argv[1]:
+    if p["id"] == sys.argv[1] and p.get("scope") == "user":
         print(p["installPath"])
+        break
 ' "$PLUGIN@$CLAUDE_MKT")
   fi
   LOGIN_HOST=${LOGIN_HOST:-claude-code}
@@ -127,7 +136,8 @@ if [ -n "$CODEX_BIN" ]; then
   "$CODEX_BIN" plugin marketplace add "$CODEX_SRC"
   # `add` returns early for a known source without fetching; only `upgrade`
   # refreshes a Git snapshot. A local-directory source is always current.
-  [ "$MODE" = staging ] || "$CODEX_BIN" plugin marketplace upgrade "$CODEX_MKT"
+  [ "$MODE" = staging ] || "$CODEX_BIN" plugin marketplace upgrade "$CODEX_MKT" \
+    || say "warning: could not refresh the Codex marketplace; re-run this installer, or: codex plugin marketplace upgrade $CODEX_MKT" >&2
   CODEX_ROOT=$("$CODEX_BIN" plugin add "$PLUGIN@$CODEX_MKT" | sed -n 's/^Installed plugin root: //p')
   [ -n "$CODEX_ROOT" ] || fail "codex did not report where it installed $PLUGIN"
   say "installed: $CODEX_ROOT"
