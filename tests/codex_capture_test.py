@@ -12,10 +12,25 @@ Run: python3 codex_capture_test.py
 from __future__ import annotations
 
 import asyncio
+import atexit
+import os
+import shutil
 import sys
 import tempfile
 import types
 from pathlib import Path
+
+# HOME is redirected BEFORE the import: codex_flush fixes STATE_DIR — and so
+# its breadcrumb log — from Path.home() at import time. Without this every run
+# appended synthetic breadcrumbs (`session_id names 'does-not-exist'`, `ack_through
+# null`, `server rejected the import: []`) to the developer's REAL
+# ~/.config/memhub-plugin/codexflush/log, where they were mistaken for a live
+# production failure (ENG-1034). Both spellings: POSIX expanduser reads HOME;
+# Windows reads USERPROFILE and never consults HOME.
+_TMP_HOME = tempfile.mkdtemp(prefix="codex-capture-test-")
+os.environ["HOME"] = _TMP_HOME
+os.environ["USERPROFILE"] = _TMP_HOME
+atexit.register(shutil.rmtree, _TMP_HOME, ignore_errors=True)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
