@@ -98,7 +98,7 @@ if [ -n "$CLAUDE_BIN" ]; then
   # error names — and the add below re-clones from the catalog, keeping the
   # installed plugin and its options (a remove would delete both).
   python3 -c '
-import json, sys
+import json, os, stat, sys
 from pathlib import Path
 mkt, src, mode, home = sys.argv[1:5]
 path = Path(home) / "settings.json"
@@ -114,6 +114,9 @@ print("re-pointing marketplace " + mkt + ": " + json.dumps(entry.get("source")) 
 entry["source"] = want
 tmp = path.with_name(path.name + ".memhub-tmp")
 tmp.write_text(json.dumps(settings, indent=2) + "\n")
+# The rename carries the temp file mode onto settings.json: keep the mode the
+# file already has (0600 on many machines) instead of the umask default.
+os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
 tmp.replace(path)
 ' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME"
   # Two commands, not `install --marketplace` (that flag needs Claude Code
@@ -136,7 +139,7 @@ tmp.replace(path)
     # flag for it. known_marketplaces.json is Claude's materialized copy of the
     # same entry; set it there too so it holds before the next settings sync.
     python3 -c '
-import json, sys
+import json, os, stat, sys
 from pathlib import Path
 mkt, src, mode, home = sys.argv[1:5]
 want = {"source": "github", "repo": src} if mode == "prod" else {"source": "directory", "path": src}
@@ -155,6 +158,9 @@ def flip(path, entry_of):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".memhub-tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n")
+    # Keep the mode the file already has (0600 on many machines); a file this
+    # step creates gets 0600, since settings can hold secrets.
+    os.chmod(tmp, stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600)
     tmp.replace(path)
     return True
 
