@@ -54,6 +54,21 @@ There are two separate authentications on every host:
 
 Completing one does not complete the other.
 
+### One command, every agent
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XTraceAI/agent-plugins/main/install.sh | sh
+```
+
+This installs MemHub into each of Claude Code, Codex and Cursor it finds on
+`PATH` (`sh -s -- --agents claude,codex` for a subset), disables any other
+enabled MemHub copy in Claude Code so sessions are not captured twice, installs
+the Codex hooks bridge, and signs the machine in once — every agent's capture
+hooks read the same credential. It is safe to re-run. It cannot do the steps
+only the host UI can: restarting, trusting the Codex hooks in `/hooks`, and
+selecting **Add** in Cursor; it prints those at the end. The per-host steps
+below are the same install done by hand.
+
 ### Claude Code
 
 ```text
