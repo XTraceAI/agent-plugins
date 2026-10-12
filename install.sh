@@ -112,12 +112,16 @@ if not isinstance(entry, dict) or entry.get("source") == want:
     sys.exit(0)
 print("re-pointing marketplace " + mkt + ": " + json.dumps(entry.get("source")) + " -> " + json.dumps(want))
 entry["source"] = want
-tmp = path.with_name(path.name + ".memhub-tmp")
-tmp.write_text(json.dumps(settings, indent=2) + "\n")
-# The rename carries the temp file mode onto settings.json: keep the mode the
-# file already has (0600 on many machines) instead of the umask default.
-os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
-tmp.replace(path)
+# Written beside the real file and swapped in by rename, so a settings.json
+# that is a symlink (dotfile managers) stays one. The temp file is private
+# from its first byte, then takes the mode the file already has (0600 on
+# many machines) — the rename carries that mode onto settings.json.
+real = path.resolve()
+tmp = real.with_name(real.name + ".memhub-tmp")
+with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    f.write(json.dumps(settings, indent=2) + "\n")
+os.chmod(tmp, stat.S_IMODE(real.stat().st_mode))
+tmp.replace(real)
 ' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME"
   # Two commands, not `install --marketplace` (that flag needs Claude Code
   # 2.1.292+). Both are no-ops when already done.
@@ -155,13 +159,17 @@ def flip(path, entry_of):
     if entry is None or entry.get("autoUpdate") is True:
         return False
     entry["autoUpdate"] = True
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".memhub-tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    # Keep the mode the file already has (0600 on many machines); a file this
-    # step creates gets 0600, since settings can hold secrets.
-    os.chmod(tmp, stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600)
-    tmp.replace(path)
+    # As above: beside the real file (a symlink stays one), private from the
+    # first byte, then the mode the file already has — or 0600 for a file this
+    # step creates, since settings can hold secrets.
+    real = path.resolve()
+    real.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(real.stat().st_mode) if real.exists() else 0o600
+    tmp = real.with_name(real.name + ".memhub-tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(json.dumps(data, indent=2) + "\n")
+    os.chmod(tmp, mode)
+    tmp.replace(real)
     return True
 
 declared = flip(Path(home) / "settings.json",
