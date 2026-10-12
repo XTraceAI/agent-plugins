@@ -12,6 +12,8 @@
 #                    (default: $MEMHUB_PLUGINS_SOURCE, else ~/xtrace/agent-plugins-internal)
 #   --agents LIST    comma-separated subset of claude,codex,cursor (default: all found)
 #   --no-login       skip the sign-in step
+#   --no-auto-update leave Claude Code's marketplace auto-update as it is
+#                    (default: turned on, so the plugin follows each release)
 #
 # Safe to run again: every step checks what is already there. One sign-in
 # covers every agent on the machine, because the capture hooks of all three
@@ -22,6 +24,7 @@ MODE=prod
 SOURCE="${MEMHUB_PLUGINS_SOURCE:-$HOME/xtrace/agent-plugins-internal}"
 AGENTS=""
 LOGIN=1
+AUTO_UPDATE=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -29,7 +32,8 @@ while [ $# -gt 0 ]; do
     --source) [ $# -ge 2 ] || { echo "--source needs a path" >&2; exit 2; }; SOURCE="$2"; shift ;;
     --agents) [ $# -ge 2 ] || { echo "--agents needs a list" >&2; exit 2; }; AGENTS="$2"; shift ;;
     --no-login) LOGIN=0 ;;
-    -h|--help) sed -n '2,20p' "$0" 2>/dev/null || true; exit 0 ;;
+    --no-auto-update) AUTO_UPDATE=0 ;;
+    -h|--help) sed -n '2,22p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -86,6 +90,32 @@ note() { NEXT="$NEXT
 
 if [ -n "$CLAUDE_BIN" ]; then
   step "Claude Code"
+  CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  # A machine that added MemHub's marketplace from its old home
+  # (XTraceAI/memhub-claude-plugin) declares this same name with another
+  # source, and `marketplace add` refuses to change it ("its source doesn't
+  # match its extraKnownMarketplaces entry"). Re-point the entry — the fix that
+  # error names — and the add below re-clones from the catalog, keeping the
+  # installed plugin and its options (a remove would delete both).
+  python3 -c '
+import json, sys
+from pathlib import Path
+mkt, src, mode, home = sys.argv[1:5]
+path = Path(home) / "settings.json"
+try:
+    settings = json.loads(path.read_text())
+except (OSError, ValueError):
+    sys.exit(0)
+entry = (settings.get("extraKnownMarketplaces") or {}).get(mkt)
+want = {"source": "github", "repo": src} if mode == "prod" else {"source": "directory", "path": src}
+if not isinstance(entry, dict) or entry.get("source") == want:
+    sys.exit(0)
+print("re-pointing marketplace " + mkt + ": " + json.dumps(entry.get("source")) + " -> " + json.dumps(want))
+entry["source"] = want
+tmp = path.with_name(path.name + ".memhub-tmp")
+tmp.write_text(json.dumps(settings, indent=2) + "\n")
+tmp.replace(path)
+' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME"
   # Two commands, not `install --marketplace` (that flag needs Claude Code
   # 2.1.292+). Both are no-ops when already done.
   "$CLAUDE_BIN" plugin marketplace add "$CLAUDE_SRC"
@@ -99,6 +129,43 @@ if [ -n "$CLAUDE_BIN" ]; then
       && "$CLAUDE_BIN" plugin update "$PLUGIN@$CLAUDE_MKT" --scope user; } \
     || say "warning: could not refresh $PLUGIN in Claude Code; re-run this installer, or: claude plugin update $PLUGIN@$CLAUDE_MKT --scope user" >&2
   "$CLAUDE_BIN" plugin enable "$PLUGIN@$CLAUDE_MKT" >/dev/null 2>&1 || true
+  if [ "$AUTO_UPDATE" = 1 ]; then
+    # Claude Code refreshes a marketplace and its installed plugins at startup
+    # when the marketplace's entry in user settings says so — the toggle
+    # /plugin offers, declared here so nobody has to find it. The CLI has no
+    # flag for it. known_marketplaces.json is Claude's materialized copy of the
+    # same entry; set it there too so it holds before the next settings sync.
+    python3 -c '
+import json, sys
+from pathlib import Path
+mkt, src, mode, home = sys.argv[1:5]
+want = {"source": "github", "repo": src} if mode == "prod" else {"source": "directory", "path": src}
+
+def flip(path, entry_of):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        return False
+    entry = entry_of(data)
+    if entry is None or entry.get("autoUpdate") is True:
+        return False
+    entry["autoUpdate"] = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".memhub-tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+    return True
+
+declared = flip(Path(home) / "settings.json",
+                lambda d: d.setdefault("extraKnownMarketplaces", {}).setdefault(mkt, {"source": want}))
+flip(Path(home) / "plugins" / "known_marketplaces.json",
+     lambda d: d.get(mkt) if isinstance(d.get(mkt), dict) else None)
+print("auto-update for " + mkt + ": " + ("turned on" if declared else "already on"))
+' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME" \
+      || say "warning: could not turn on auto-update for $CLAUDE_MKT; toggle it in /plugin" >&2
+  fi
   # Every MemHub copy registers the same hooks and an MCP server named
   # `memhub`; two enabled means every session is captured twice and every rule
   # fires twice. Disable (not uninstall) the others, so this is reversible.
