@@ -123,7 +123,8 @@ entry["source"] = want
 # many machines) — the rename carries that mode onto settings.json.
 real = path.resolve()
 tmp = real.with_name(real.name + ".memhub-tmp")
-with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+tmp.unlink(missing_ok=True)  # a leftover from an interrupted run keeps its old mode
+with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
     f.write(json.dumps(settings, indent=2) + "\n")
 os.chmod(tmp, stat.S_IMODE(real.stat().st_mode))
 tmp.replace(real)
@@ -184,7 +185,8 @@ def flip(path, entry_of):
     real.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(real.stat().st_mode) if real.exists() else 0o600
     tmp = real.with_name(real.name + ".memhub-tmp")
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    tmp.unlink(missing_ok=True)  # a leftover from an interrupted run keeps its old mode
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
         f.write(json.dumps(data, indent=2) + "\n")
     os.chmod(tmp, mode)
     tmp.replace(real)
