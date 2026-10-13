@@ -123,6 +123,19 @@ with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") 
 os.chmod(tmp, stat.S_IMODE(real.stat().st_mode))
 tmp.replace(real)
 ' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME"
+  # `marketplace add` rewrites the marketplace's settings entry on a re-run and
+  # drops its autoUpdate. Remember whether it was on, so --no-auto-update keeps
+  # it that way ("as it is") instead of silently turning it off.
+  AUTO_UPDATE_WAS_ON=$(python3 -c '
+import json, sys
+from pathlib import Path
+mkt, home = sys.argv[1:3]
+try:
+    entry = (json.loads((Path(home) / "settings.json").read_text()).get("extraKnownMarketplaces") or {}).get(mkt) or {}
+except (OSError, ValueError, AttributeError):
+    entry = {}
+print("1" if isinstance(entry, dict) and entry.get("autoUpdate") is True else "0")
+' "$CLAUDE_MKT" "$CLAUDE_HOME" 2>/dev/null || echo 0)
   # Two commands, not `install --marketplace` (that flag needs Claude Code
   # 2.1.292+). Both are no-ops when already done.
   "$CLAUDE_BIN" plugin marketplace add "$CLAUDE_SRC"
@@ -136,7 +149,7 @@ tmp.replace(real)
       && "$CLAUDE_BIN" plugin update "$PLUGIN@$CLAUDE_MKT" --scope user; } \
     || say "warning: could not refresh $PLUGIN in Claude Code; re-run this installer, or: claude plugin update $PLUGIN@$CLAUDE_MKT --scope user" >&2
   "$CLAUDE_BIN" plugin enable "$PLUGIN@$CLAUDE_MKT" >/dev/null 2>&1 || true
-  if [ "$AUTO_UPDATE" = 1 ]; then
+  if [ "$AUTO_UPDATE" = 1 ] || [ "$AUTO_UPDATE_WAS_ON" = 1 ]; then
     # Claude Code refreshes a marketplace and its installed plugins at startup
     # when the marketplace's entry in user settings says so — the toggle
     # /plugin offers, declared here so nobody has to find it. The CLI has no
@@ -145,7 +158,7 @@ tmp.replace(real)
     python3 -c '
 import json, os, stat, sys
 from pathlib import Path
-mkt, src, mode, home = sys.argv[1:5]
+mkt, src, mode, home, asked = sys.argv[1:6]
 want = {"source": "github", "repo": src} if mode == "prod" else {"source": "directory", "path": src}
 
 def flip(path, entry_of):
@@ -176,8 +189,11 @@ declared = flip(Path(home) / "settings.json",
                 lambda d: d.setdefault("extraKnownMarketplaces", {}).setdefault(mkt, {"source": want}))
 flip(Path(home) / "plugins" / "known_marketplaces.json",
      lambda d: d.get(mkt) if isinstance(d.get(mkt), dict) else None)
-print("auto-update for " + mkt + ": " + ("turned on" if declared else "already on"))
-' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME" \
+if asked == "1":
+    print("auto-update for " + mkt + ": " + ("turned on" if declared else "already on"))
+else:
+    print("auto-update for " + mkt + ": kept on (it was on before this run; --no-auto-update leaves it as it is)")
+' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME" "$AUTO_UPDATE" \
       || say "warning: could not turn on auto-update for $CLAUDE_MKT; toggle it in /plugin" >&2
   fi
   # Every MemHub copy registers the same hooks and an MCP server named
