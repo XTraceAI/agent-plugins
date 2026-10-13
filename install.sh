@@ -103,7 +103,7 @@ if [ -n "$CLAUDE_BIN" ]; then
   # error names — and the add below re-clones from the catalog, keeping the
   # installed plugin and its options (a remove would delete both).
   python3 -c '
-import json, os, stat, sys
+import json, os, stat, sys, tempfile
 from pathlib import Path
 mkt, src, mode, home = sys.argv[1:5]
 path = Path(home) / "settings.json"
@@ -122,12 +122,11 @@ entry["source"] = want
 # from its first byte, then takes the mode the file already has (0600 on
 # many machines) — the rename carries that mode onto settings.json.
 real = path.resolve()
-tmp = real.with_name(real.name + ".memhub-tmp")
-tmp.unlink(missing_ok=True)  # a leftover from an interrupted run keeps its old mode
-with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+fd, tmp = tempfile.mkstemp(prefix=real.name + ".memhub-", dir=str(real.parent))  # unique, 0600
+with os.fdopen(fd, "w") as f:
     f.write(json.dumps(settings, indent=2) + "\n")
 os.chmod(tmp, stat.S_IMODE(real.stat().st_mode))
-tmp.replace(real)
+os.replace(tmp, real)
 ' "$CLAUDE_MKT" "$CLAUDE_SRC" "$MODE" "$CLAUDE_HOME"
   # `marketplace add` rewrites the marketplace's settings entry on a re-run and
   # drops its autoUpdate. Remember whether it was on, so --no-auto-update keeps
@@ -162,7 +161,7 @@ print("1" if isinstance(entry, dict) and entry.get("autoUpdate") is True else "0
     # flag for it. known_marketplaces.json is Claude's materialized copy of the
     # same entry; set it there too so it holds before the next settings sync.
     python3 -c '
-import json, os, stat, sys
+import json, os, stat, sys, tempfile
 from pathlib import Path
 mkt, src, mode, home, asked = sys.argv[1:6]
 want = {"source": "github", "repo": src} if mode == "prod" else {"source": "directory", "path": src}
@@ -184,12 +183,11 @@ def flip(path, entry_of):
     real = path.resolve()
     real.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(real.stat().st_mode) if real.exists() else 0o600
-    tmp = real.with_name(real.name + ".memhub-tmp")
-    tmp.unlink(missing_ok=True)  # a leftover from an interrupted run keeps its old mode
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+    fd, tmp = tempfile.mkstemp(prefix=real.name + ".memhub-", dir=str(real.parent))  # unique, 0600
+    with os.fdopen(fd, "w") as f:
         f.write(json.dumps(data, indent=2) + "\n")
     os.chmod(tmp, mode)
-    tmp.replace(real)
+    os.replace(tmp, real)
     return True
 
 declared = flip(Path(home) / "settings.json",
