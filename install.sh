@@ -47,6 +47,18 @@ done
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# Run a command for at most $1 seconds; exit 124 when it runs out, as GNU
+# timeout does (macOS has no timeout). The command's own stdin is /dev/null:
+# under `curl | sh` stdin is this script, and a read would eat its rest.
+with_timeout() {
+  python3 -c '
+import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+' "$@"
+}
 
 if [ "$MODE" = staging ]; then
   [ -f "$SOURCE/.claude-plugin/marketplace.json" ] \
@@ -274,10 +286,18 @@ fi
 
 if [ -n "$CURSOR_BIN" ]; then
   step "Cursor"
-  "$CURSOR_BIN" plugin marketplace add "$CURSOR_SRC"
+  # `marketplace add` can wait on Cursor's backend with no timeout of its own,
+  # so a known marketplace skips it, and every call here has a time limit. Not
+  # fatal: Cursor's install is the manual Add step below, and sign-in still runs.
+  if with_timeout 30 "$CURSOR_BIN" plugin marketplace list 2>/dev/null \
+      | awk -v m="$CURSOR_MKT" '$1 == m {f=1} END {exit !f}'; then
+    say "marketplace '$CURSOR_MKT' already added"
+  else
+    rc=0; with_timeout 60 "$CURSOR_BIN" plugin marketplace add "$CURSOR_SRC" || rc=$?
+    [ "$rc" = 0 ] || say "warning: could not add the Cursor marketplace ($([ "$rc" = 124 ] && echo 'timed out after 60s' || echo "exit $rc")); run: cursor-agent plugin marketplace add $CURSOR_SRC" >&2
+  fi
   # As with Codex, `add` does not re-index a known marketplace; `update` does.
-  # Not fatal: the install itself is the manual Add step below.
-  "$CURSOR_BIN" plugin marketplace update "$CURSOR_MKT" \
+  with_timeout 60 "$CURSOR_BIN" plugin marketplace update "$CURSOR_MKT" \
     || say "warning: could not refresh the Cursor marketplace; run: cursor-agent plugin marketplace update $CURSOR_MKT" >&2
   LOGIN_HOST=${LOGIN_HOST:-cursor}
   # Cursor has no command to install or update a plugin, and re-indexing the
