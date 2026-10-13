@@ -14,6 +14,9 @@
 #   --no-login       skip the sign-in step
 #   --no-auto-update leave Claude Code's marketplace auto-update as it is
 #                    (default: turned on, so the plugin follows each release)
+#   --no-fork-agent  leave Claude Code's fork agent setting as it is (default:
+#                    CLAUDE_CODE_FORK_SUBAGENT=1 in settings.json, so rule
+#                    drafts run in the desktop app too, not only the terminal)
 #
 # Safe to run again: every step checks what is already there. One sign-in
 # covers every agent on the machine, because the capture hooks of all three
@@ -25,6 +28,7 @@ SOURCE="${MEMHUB_PLUGINS_SOURCE:-$HOME/xtrace/agent-plugins-internal}"
 AGENTS=""
 LOGIN=1
 AUTO_UPDATE=1
+FORK_AGENT=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -33,7 +37,8 @@ while [ $# -gt 0 ]; do
     --agents) [ $# -ge 2 ] || { echo "--agents needs a list" >&2; exit 2; }; AGENTS="$2"; shift ;;
     --no-login) LOGIN=0 ;;
     --no-auto-update) AUTO_UPDATE=0 ;;
-    -h|--help) sed -n '2,22p' "$0" 2>/dev/null || true; exit 0 ;;
+    --no-fork-agent) FORK_AGENT=0 ;;
+    -h|--help) sed -n '2,25p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -223,6 +228,17 @@ for p in json.load(sys.stdin):
         print(p["installPath"])
         break
 ' "$PLUGIN@$CLAUDE_MKT")
+  fi
+  # Rule drafts run in a background fork of the session. A terminal session
+  # has the fork agent by default; the desktop app, the Agent SDK and
+  # `claude -p` need CLAUDE_CODE_FORK_SUBAGENT=1 in settings.json, or the draft
+  # fails after the person was told it started. /memhub:onboard sets it too;
+  # doing it here covers a desktop-only person from their first session. The
+  # script backs settings.json up, keeps a key set off by hand (exit 1, says
+  # so), and writes nothing when rule drafting is off.
+  if [ "$FORK_AGENT" = 1 ] && [ -f "$PLUGIN_ROOT/scripts/setup_claude_fork.py" ]; then
+    rc=0; python3 "$PLUGIN_ROOT/scripts/setup_claude_fork.py" install --claude-home "$CLAUDE_HOME" || rc=$?
+    [ "$rc" = 2 ] && say "warning: could not set Claude Code's fork agent; add \"CLAUDE_CODE_FORK_SUBAGENT\": \"1\" under env in $CLAUDE_HOME/settings.json" >&2
   fi
   LOGIN_HOST=${LOGIN_HOST:-claude-code}
   note "Claude Code: restart it (or /reload-plugins), then run /$PLUGIN:onboard in a repo"
